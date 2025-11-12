@@ -1,0 +1,214 @@
+Project Outline: RamSleuth Database Logic Module
+
+To: AI Dev / Development Team
+From: madgoat
+Date: 2025-11-10
+
+Re: Detailed logical design for the separate RamSleuth_DB.py module (located in project root).
+
+1. Module Objective
+
+Create a self-contained Python module (RamSleuth_DB.py) imported by ramsleuth.py. This module:
+
+- Loads the comprehensive die_database.json (in project root).
+- Normalizes DIMM metadata.
+- Evaluates deterministic, prioritized heuristic rules.
+- Produces a (die_type, notes) decision for each DIMM.
+- Encapsulates "ground truth" and "lootbox SKU" logic without side effects.
+
+2. Module Functions
+
+Function 1: load_database(filepath="die_database.json")
+
+Purpose:
+- Load the JSON database from disk (same directory as this module by default).
+
+Logic:
+- Resolve script_dir = os.path.dirname(os.path.abspath(__file__)).
+- db_path = os.path.join(script_dir, filepath).
+- Ensure db_path exists; open and json.load(f).
+- Validate:
+  - Top-level is a list.
+  - Each entry has:
+    - priority (int)
+    - die_type (non-empty string)
+- Sort entries by descending priority.
+
+Returns:
+- Sorted list of database entries (dicts).
+
+Errors:
+- Raises FileNotFoundError / ValueError on missing/invalid db.
+
+Function 2: parse_xmp_from_part_number(part_number)
+
+Purpose:
+- Extract a normalized XMP-style timing summary from a DIMM part number.
+
+Logic:
+- Pattern 1: (\d{4})C(\d{2}) => "freqCL" -> "freq-cl"
+  - Example: "F4-3600C16D-16GTZ" -> "3600-16"
+- Pattern 2: (\d{4})-(\d{2})-(\d{2})-(\d{2})
+  - Example: "3200-14-14-14" -> "3200-14-14-14"
+- Prefer the more specific full-timing pattern when both patterns could apply.
+- Return normalized string or None if no pattern matches.
+
+Notes:
+- If part_number is falsy, return None.
+- Implementation is pure and side-effect-free.
+
+Function 3: normalize_dimm_data(dimm)
+
+Purpose:
+- Normalize raw parsed DIMM data (from ramsleuth.parse_output()) into stable fields used by heuristics.
+
+Normalized fields (aligned with RamSleuth_DB.normalize_dimm_data()) include:
+
+- generation (SDRAM generation normalization)
+- module_gb
+- module_ranks
+- chip_org
+- manufacturer
+- dram_mfg
+- module_part_number
+- timings_xmp
+- timings_jdec
+- voltage_xmp
+- voltage_jdec
+- Sticker/IC / lootbox helpers:
+  - corsair_version
+  - gskill_sticker_code
+  - crucial_sticker_suffix
+  - hynix_ic_part_number
+
+SDRAM Generation Normalization:
+- Normalizes various SDRAM generation formats to standard DDRx format
+- Input examples: "DDR4 SDRAM", "DDR-4", "DDR", "DDR1"
+- Output: "DDR1", "DDR2", "DDR3", "DDR4", "DDR5"
+- Normalization rules:
+  - Extracts DDRx prefix from input strings
+  - Handles variants with hyphens (DDR-4 -> DDR4)
+  - Maps generic "DDR" to "DDR1"
+
+Voltage Normalization:
+- voltage_xmp: Retained as string for matching consistency
+  - Extracts numeric portion from values like "1.35V" -> "1.35"
+- voltage_jdec: Normalized numeric value derived from JEDEC/nominal voltage
+  - Extracts and converts to float: "1.2V" -> 1.2
+  - Supports both string and numeric inputs
+
+Notes:
+- Only documented helpers actually present in RamSleuth_DB.py are assumed.
+- Implementation is pure and side-effect-free.
+- Callers typically merge via dimm.update(normalize_dimm_data(dimm)).
+
+Function 4: is_match(dimm, entry)
+
+Purpose:
+- Core rule evaluation: check whether a normalized dimm matches a single heuristic entry.
+
+Semantics:
+- Only recognized keys in entry participate; unknown keys are ignored.
+- All specified constraints are combined with logical AND.
+- Matching rules (as implemented in RamSleuth_DB.is_match()) include:
+  - generation: exact match (case-normalized).
+  - manufacturer: case-insensitive substring match against normalized manufacturer.
+  - dram_mfg: exact, case-insensitive.
+  - module_gb: numeric equality.
+  - module_ranks: exact.
+  - chip_org: exact (e.g., x8, x16).
+  - part_number_contains: substring in module_part_number.
+  - part_number_exact: case-insensitive exact match.
+  - timings_xmp: exact or substring match of normalized timings_xmp.
+  - timings_jdec: exact match.
+  - voltage_xmp: string/normalized equality.
+  - voltage_jdec: numeric equality.
+  - corsair_version:
+    - Prefix / exact semantics as implemented (e.g., trailing "." means prefix).
+  - gskill_sticker_code: substring.
+  - crucial_sticker_suffix: case-insensitive exact.
+  - hynix_ic_parse_8th: Compares the 8th character of hynix_ic_part_number (index 7).
+
+Hynix IC Parsing Logic:
+- Extracts the 8th character (index 7) from the Hynix IC part number
+- Used to identify specific die revisions or variants
+- Example: Hynix part "H5ANAG8NMJR" -> 8th char is "N"
+- Matching is case-insensitive to tolerate database vs SPD casing differences
+- Constraint fails if IC part number is missing or shorter than 8 characters
+
+Result:
+- Returns True only if all applicable constraints pass.
+- Unknown keys in entry never cause failure.
+
+Function 5: find_die_type(dimm, db)
+
+Purpose:
+- Priority-ordered resolution of die_type given one normalized dimm and the loaded db.
+
+Logic:
+- Assume dimm has been normalized (callers typically applied normalize_dimm_data()).
+- Iterate entries in db in priority order (highest priority first).
+- Track matches at the best (highest) priority seen:
+  - For each entry where is_match(dimm, entry) is True:
+    - If no previous match at that priority: record it.
+    - If another match at same best priority:
+      - If die_type matches existing:
+        - Accumulate/merge notes.
+      - If die_type differs:
+        - Mark as ambiguous.
+
+Outcomes:
+- No matches:
+  - Returns ("Unknown", "No heuristic match found in database.").
+- One or more matches at best priority with same die_type:
+  - Returns (that die_type, combined notes).
+- Conflicting matches at best priority:
+  - Returns ("Ambiguous", "Multiple matching heuristics at same priority: ...").
+
+Notes:
+- This behavior matches RamSleuth_DB.find_die_type() and is considered canonical.
+- "Unknown" (with explanatory note) is expected and non-error when no rules match.
+
+3. Integration with RamSleuth
+
+High-level integration (as implemented in ramsleuth.py):
+
+- ramsleuth.py:
+  - Calls RamSleuth_DB.load_database() once at startup.
+  - For each parsed DIMM:
+    - Applies normalize_dimm_data().
+    - Calls find_die_type().
+    - Stores resulting die_type and notes alongside parsed fields.
+- TUI / CLI:
+  - Present die_type and notes per DIMM.
+  - May re-run normalization + heuristics after interactive lootbox/sticker inputs.
+
+4. Heuristic Database Contract (die_database.json)
+
+The die_database.json file must conform to is_match() / find_die_type() expectations:
+
+- Structure:
+  - Top-level: list of rule objects.
+- Each rule:
+  - Required:
+    - priority: integer (higher = evaluated first).
+    - die_type: string used as-is in outputs.
+  - Optional recognized keys:
+    - generation, manufacturer, dram_mfg,
+    - module_gb, module_ranks, chip_org,
+    - part_number_contains, part_number_exact,
+    - timings_xmp, timings_jdec,
+    - voltage_xmp, voltage_jdec,
+    - corsair_version, gskill_sticker_code,
+    - crucial_sticker_suffix, hynix_ic_parse_8th,
+    - notes (human-readable description).
+- Unknown keys:
+  - Ignored by is_match() and must not be relied on for behavior.
+
+Expected behavior:
+
+- Rules are evaluated in descending priority.
+- find_die_type():
+  - Uses is_match() semantics exactly.
+  - Returns "Unknown" when no rule matches; this is normal.
+  - May return "Ambiguous" if conflicting rules at same best priority match.

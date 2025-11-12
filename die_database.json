@@ -1,0 +1,1758 @@
+[
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "dram_mfg": "SK Hynix",
+    "hynix_ic_parse_8th": "A",
+    "module_gb": 16,
+    "die_type": "SK Hynix 16Gbit A-Die",
+    "notes": "P1000 Heuristic: 8th char 'A' in 16Gbit IC P/N (e.g., H5CG48[A]GBD). [S14, Research S2.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "dram_mfg": "SK Hynix",
+    "hynix_ic_parse_8th": "M",
+    "module_gb": 16,
+    "die_type": "SK Hynix 16Gbit M-Die",
+    "notes": "P1000 Heuristic: 8th char 'M' in 16Gbit IC P/N (e.g., H5CG48[M]GBD). [S14, Research S2.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "dram_mfg": "SK Hynix",
+    "hynix_ic_parse_8th": "E",
+    "module_gb": 16,
+    "die_type": "SK Hynix 16Gbit E-Die",
+    "notes": "P1000 Heuristic: 8th char 'E' in 16Gbit IC P/N (e.g., H5CG48[E]GBD). [Research S2.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "dram_mfg": "SK Hynix",
+    "hynix_ic_parse_8th": "A",
+    "module_gb": 24,
+    "die_type": "SK Hynix 24Gbit A-Die",
+    "notes": "P1000 Heuristic: 8th char 'A' in 24Gbit IC P/N (e.g., H5CGD8[A]KBD). [Research S2.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "dram_mfg": "SK Hynix",
+    "hynix_ic_parse_8th": "M",
+    "module_gb": 24,
+    "die_type": "SK Hynix 24Gbit M-Die",
+    "notes": "P1000 Heuristic: 8th char 'M' in 24Gbit IC P/N (e.g., H5CGD8[M]GBD). [Research S2.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "dram_mfg": "SK Hynix",
+    "hynix_ic_parse_8th": "M",
+    "module_gb": 32,
+    "die_type": "SK Hynix 32Gbit M-Die",
+    "notes": "P1000 Heuristic: 8th char 'M' in 32Gbit IC P/N (e.g., H5CG58[M]KBD). [Research S2.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "S820A",
+    "die_type": "SK Hynix 16Gbit A-Die",
+    "notes": "P1000 Heuristic: G.Skill Lot Code ...S820A. [Research S3.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "S821A",
+    "die_type": "SK Hynix 16Gbit A-Die",
+    "notes": "P1000 Heuristic: G.Skill Lot Code ...S821A. [Research S3.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "S820M",
+    "die_type": "SK Hynix 16Gbit M-Die",
+    "notes": "P1000 Heuristic: G.Skill Lot Code ...S820M. [Research S3.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "R821M",
+    "die_type": "SK Hynix 24Gbit M-Die",
+    "notes": "P1000 Heuristic: G.Skill Lot Code ...R821M. [Research S3.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "R820M",
+    "die_type": "SK Hynix 24Gbit M-Die",
+    "notes": "P1000 Heuristic: G.Skill Lot Code ...R820M. [Research S3.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "S810B",
+    "die_type": "Samsung 16Gbit (B-Die Heuristic)",
+    "notes": "P1000 Heuristic: G.Skill Lot Code ...S810B. [Research S3.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "S833G",
+    "die_type": "Micron 16Gbit (G-Die Heuristic)",
+    "notes": "P1000 Heuristic: G.Skill Lot Code ...S833G. [Research S3.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR5",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "S83",
+    "die_type": "Micron 16Gbit (Heuristic)",
+    "notes": "P1000 Heuristic: G.Skill Lot Code ...S83... [Research S3.1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "4.31",
+    "die_type": "Samsung 8Gbit B-Die",
+    "notes": "P1000 Heuristic: Corsair Ver 4.31. [S27, S31]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "4.32",
+    "die_type": "Samsung 8Gbit C-Die",
+    "notes": "P1000 Heuristic: Corsair Ver 4.32. [S32]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "4.34",
+    "die_type": "Samsung 8Gbit E-Die",
+    "notes": "P1000 Heuristic: Corsair Ver 4.34. [Research S1.3, S1.4]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.33",
+    "die_type": "SK Hynix 8Gbit DJR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.33 (Presumed). [Research S1.3, S1.4]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "3.34",
+    "die_type": "Micron 8Gbit Rev.E",
+    "notes": "P1000 Heuristic: Corsair Ver 3.34 (Speculated). [S29, Research S1.4]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "3.40",
+    "die_type": "Micron 16Gbit Rev.B",
+    "notes": "P1000 Heuristic: Corsair Ver 3.40. [S35, Research S1.4]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "3.21",
+    "die_type": "Micron 4Gbit Rev.B",
+    "notes": "P1000 Heuristic: Corsair Ver 3.21. [S29, Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "3.22",
+    "die_type": "Micron 4Gbit Rev.E / Rev.F",
+    "notes": "P1000 Heuristic: Corsair Ver 3.22. [Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "3.31",
+    "die_type": "Micron 8Gbit Rev.B",
+    "notes": "P1000 Heuristic: Corsair Ver 3.31. [Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "3.41",
+    "die_type": "Micron 16Gbit Rev.B",
+    "notes": "P1000 Heuristic: Corsair Ver 3.41. [Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "4.24",
+    "die_type": "Samsung 4Gbit E-Die",
+    "notes": "P1000 Heuristic: Corsair Ver 4.24. [S29, Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "4.40",
+    "die_type": "Samsung 16Gbit A-Die",
+    "notes": "P1000 Heuristic: Corsair Ver 4.40 (Speculated). [S29, Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "4.49",
+    "die_type": "Samsung 16Gbit M-Die",
+    "notes": "P1000 Heuristic: Corsair Ver 4.49 (Speculated). [Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.20",
+    "die_type": "SK Hynix 4Gbit AFR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.20. [S29, Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.29",
+    "die_type": "SK Hynix 4Gbit MFR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.29. [S29, Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.30",
+    "die_type": "SK Hynix 8Gbit AFR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.30. [S29, Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.38",
+    "die_type": "SK Hynix 8Gbit JJR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.38 (Presumed). [Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.49",
+    "die_type": "SK Hynix 16Gbit MJR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.49 (Presumed). [Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "8.31",
+    "die_type": "Nanya 8Gbit Rev.B",
+    "notes": "P1000 Heuristic: Corsair Ver 8.31 (Confirmed). [Research S1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.39",
+    "die_type": "SK Hynix 8Gbit MFR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.39. [S31]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.32",
+    "die_type": "SK Hynix 8Gbit CJR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.32. [S29]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.30",
+    "die_type": "SK Hynix 8Gbit AFR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.30. [S29]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.29",
+    "die_type": "SK Hynix 4Gbit MFR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.29. [S29]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.20",
+    "die_type": "SK Hynix 4Gbit AFR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.20. [S29]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Corsair",
+    "corsair_version": "8.30",
+    "die_type": "Nanya 8Gbit Rev.A",
+    "notes": "P1000 Heuristic: Corsair Ver 8.30. [S29]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Crucial",
+    "part_number_contains": "BL2K16G36C16U4B",
+    "crucial_sticker_suffix": ".M16FE1",
+    "module_gb": 16,
+    "module_ranks": "2R",
+    "die_type": "Micron 8Gbit Rev. E (2Rx8)",
+    "notes": "P1000 Heuristic: Crucial 'Lootbox' Suffix. [S43, Research S3.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Crucial",
+    "part_number_contains": "BL2K16G36C16U4B",
+    "crucial_sticker_suffix": ".M8FB1",
+    "module_gb": 16,
+    "module_ranks": "1R",
+    "die_type": "Micron 16Gbit Rev. B (1Rx8)",
+    "notes": "P1000 Heuristic: Crucial 'Lootbox' Suffix. [S42, Research S3.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "Crucial",
+    "part_number_contains": "BL2K16G36C16U4B",
+    "crucial_sticker_suffix": ".M8FE1",
+    "module_gb": 16,
+    "module_ranks": "1R",
+    "die_type": "Micron 16Gbit Rev. E (1Rx8)",
+    "notes": "P1000 Heuristic: Crucial 'Lootbox' Suffix. [S42]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "10C",
+    "die_type": "Samsung 8Gbit C-Die",
+    "notes": "P1000 Heuristic: G.Skill '042' sticker code ...10C. [Research S3.2]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "8821C",
+    "die_type": "SK Hynix 8Gbit CJR",
+    "notes": "P1000 Heuristic: G.Skill '042' sticker code ...8821C. [Research S3.2]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "8820C",
+    "die_type": "SK Hynix 8Gbit CJR",
+    "notes": "P1000 Heuristic: G.Skill '042' sticker code ...8820C. [Research S3.2]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR4",
+    "manufacturer": "G.Skill",
+    "gskill_sticker_code": "10F",
+    "die_type": "Samsung 4Gbit F-Die",
+    "notes": "P1000 Heuristic: G.Skill '042' sticker code ...10F. [Research S3.2]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "2.1",
+    "die_type": "Elpida 2Gbit Hyper",
+    "notes": "P1000 Heuristic: Corsair Ver 2.1 = Elpida 2Gbit Hyper. [S42, DDR3 Research T1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "2.2",
+    "die_type": "Elpida 4Gbit",
+    "notes": "P1000 Heuristic: Corsair Ver 2.2 = Elpida 4Gbit. [S42, DDR3 Research T1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "3.1",
+    "die_type": "Micron 2Gbit",
+    "notes": "P1000 Heuristic: Corsair Ver 3.1 = Micron 2Gbit. [DDR3 Research T1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "3.2",
+    "die_type": "Micron 4Gbit",
+    "notes": "P1000 Heuristic: Corsair Ver 3.2 = Micron 4Gbit. [DDR3 Research T1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "4.1",
+    "die_type": "Samsung 2Gbit",
+    "notes": "P1000 Heuristic: Corsair Ver 4.1 = Samsung 2Gbit. [S42, DDR3 Research T1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "4.2",
+    "die_type": "Samsung 4Gbit D-Die",
+    "notes": "P1000 Heuristic: Corsair Ver 4.2 = Samsung 4Gbit D-Die. [S42, DDR3 Research T1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.1",
+    "die_type": "SK Hynix 2Gbit CFR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.1 = SK Hynix 2Gbit CFR. [DDR3 Research T1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.2",
+    "die_type": "SK Hynix 4Gbit MFR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.2 = SK Hynix 4Gbit MFR. [DDR3 Research T1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.3",
+    "die_type": "SK Hynix 8Gbit MFR",
+    "notes": "P1000 Heuristic: Corsair Ver 5.3 = SK Hynix 8Gbit. [DDR3 Research T1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR2",
+    "manufacturer": "Corsair",
+    "part_number_contains": "TWIN2X2048-8888C4DF",
+    "corsair_version": "1.",
+    "module_gb": 1,
+    "die_type": "Micron D9GKX",
+    "notes": "P1000 Heuristic: Corsair Dominator 1111 C4 (v1.X). [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR2",
+    "manufacturer": "Corsair",
+    "part_number_contains": "CM2X1024-6400C3",
+    "corsair_version": "1.",
+    "module_gb": 1,
+    "die_type": "Micron D9GMH",
+    "notes": "P1000 Heuristic: Corsair XMS2 800 C3 (v1.X). [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR2",
+    "manufacturer": "Corsair",
+    "part_number_contains": "CM2X1024-8500C5D",
+    "corsair_version": "1.",
+    "module_gb": 1,
+    "die_type": "Micron D9GKX",
+    "notes": "P1000 Heuristic: Corsair Dominator 1066 C5 (v1.X). [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR2",
+    "manufacturer": "Corsair",
+    "part_number_contains": "CM2X512A-4300C3",
+    "corsair_version": "1.",
+    "module_gb": 0.5,
+    "die_type": "Micron D9DQT \"Fatbody\"",
+    "notes": "P1000 Heuristic: Corsair XMS 533 C3 (v1.X). [DDR2 Research P2.3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR2",
+    "manufacturer": "Corsair",
+    "part_number_contains": "TWIN2X4096-8500C5DF",
+    "corsair_version": "1.1",
+    "module_gb": 2,
+    "die_type": "PSC C-Die",
+    "notes": "P1000 Heuristic: Corsair Dominator 1066 C5 4GB Kit (v1.1). [DDR2 Research P3.2]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR2",
+    "manufacturer": "Corsair",
+    "part_number_contains": "TWIN2X4096-8500C5DF",
+    "corsair_version": "1.2",
+    "module_gb": 2,
+    "die_type": "PSC F-Die",
+    "notes": "P1000 Heuristic: Corsair Dominator 1066 C5 4GB Kit (v1.2). [DDR2 Research P3.2]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR1",
+    "manufacturer": "Corsair",
+    "part_number_contains": "XMS3200LL",
+    "corsair_version": "1.1",
+    "die_type": "Winbond BH-5",
+    "notes": "P1000 Heuristic: Legendary 'holy grail' die. [S82, S83, S84, DDR1 Research T1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR1",
+    "manufacturer": "Corsair",
+    "part_number_contains": "XMS3500C2",
+    "corsair_version": "1.1",
+    "die_type": "Winbond BH-5",
+    "notes": "P1000 Heuristic: High-bin 'holy grail' die. [S83, DDR1 Research T1]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR1",
+    "manufacturer": "Corsair",
+    "part_number_contains": "XMS3200C2",
+    "corsair_version": "1.1",
+    "die_type": "Winbond BH-6",
+    "notes": "P1000 Heuristic: 'Holy Grail' BH-5 variant. [DDR1 Research T3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR1",
+    "manufacturer": "Corsair",
+    "part_number_contains": "XMS3200C2",
+    "corsair_version": "1.2",
+    "die_type": "Winbond CH-5",
+    "notes": "P1000 Heuristic: The 'Pretender' die. Not voltage scalable. [S83, DDR1 Research T3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR1",
+    "manufacturer": "Corsair",
+    "part_number_contains": "XMS3200C2",
+    "corsair_version": "1.5",
+    "die_type": "Winbond BH-5",
+    "notes": "P1000 Heuristic: Later 'Holy Grail' batch. [DDR1 Research T3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR1",
+    "manufacturer": "Corsair",
+    "part_number_contains": "XMS3200C2",
+    "corsair_version": "4.1",
+    "die_type": "Samsung TCCD",
+    "notes": "P1000 Heuristic: TCCD die. [DDR1 Research T3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR1",
+    "manufacturer": "Corsair",
+    "part_number_contains": "XMS3200C2",
+    "corsair_version": "4.",
+    "die_type": "Samsung TCCD / TCC5",
+    "notes": "P1000 Heuristic: v4.X = TCCD/TCC5 die. [DDR1 Research T3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR1",
+    "manufacturer": "Corsair",
+    "part_number_contains": "XMS3200XL",
+    "corsair_version": "1.1",
+    "die_type": "Samsung TCCD",
+    "notes": "P1000 Heuristic: 'Holy Grail' TCCD. [S83, DDR1 Research T3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR1",
+    "manufacturer": "Corsair",
+    "part_number_contains": "XMS3200XL",
+    "corsair_version": "1.2",
+    "die_type": "Samsung TCCD (Brainpower PCB)",
+    "notes": "P1000 Heuristic: 'Holy Grail' TCCD on high-perf PCB. [DDR1 Research T3]"
+  },
+  {
+    "priority": 1000,
+    "generation": "DDR1",
+    "manufacturer": "Corsair",
+    "part_number_contains": "XMS4400C25",
+    "corsair_version": "1.1",
+    "die_type": "Samsung TCCD (Brainpower PCB)",
+    "notes": "P1000 Heuristic: 'Golden Bin' TCCD on high-perf PCB. [DDR1 Research T3]"
+  },
+  {
+    "priority": 900,
+    "generation": "DDR5",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.",
+    "dram_mfg": "SK Hynix",
+    "die_type": "SK Hynix (Heuristic)",
+    "notes": "P900 Heuristic: Corsair Ver 5.X = SK Hynix. [Research S3.2]"
+  },
+  {
+    "priority": 900,
+    "generation": "DDR5",
+    "manufacturer": "Corsair",
+    "corsair_version": "4.",
+    "dram_mfg": "Samsung",
+    "die_type": "Samsung (Heuristic)",
+    "notes": "P900 Heuristic: Corsair Ver 4.X = Samsung. [Research S3.2]"
+  },
+  {
+    "priority": 900,
+    "generation": "DDR5",
+    "manufacturer": "Corsair",
+    "corsair_version": "3.",
+    "dram_mfg": "Micron",
+    "die_type": "Micron (Heuristic)",
+    "notes": "P900 Heuristic: Corsair Ver 3.X = Micron. [Research S3.2]"
+  },
+  {
+    "priority": 900,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "3.",
+    "die_type": "Micron (Varies)",
+    "notes": "P900 Heuristic: v3.X = Micron. [S42, S44]"
+  },
+  {
+    "priority": 900,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "5.",
+    "die_type": "Hynix (Varies)",
+    "notes": "P900 Heuristic: v5.X = Hynix. [S42]"
+  },
+  {
+    "priority": 900,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "7.",
+    "die_type": "PSC (Varies)",
+    "notes": "P900 Heuristic: v7.X = PSC. [S42]"
+  },
+  {
+    "priority": 900,
+    "generation": "DDR3",
+    "manufacturer": "Corsair",
+    "corsair_version": "8.",
+    "die_type": "Nanya (Varies)",
+    "notes": "P900 Heuristic: v8.X = Nanya. [S42]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "timings_xmp": "7200-34-45-45",
+    "voltage_xmp": "1.4",
+    "die_type": "SK Hynix 16Gbit A-Die",
+    "notes": "P500 Heuristic: 'Golden Bin' XMP. [Research S4.1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "timings_xmp": "8000-38",
+    "die_type": "SK Hynix 16Gbit A-Die",
+    "notes": "P500 Heuristic: 'Golden Bin' XMP. [Research S4.1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "timings_xmp": "7200-36-46-46",
+    "voltage_xmp": "1.4",
+    "die_type": "SK Hynix 24Gbit M-Die",
+    "notes": "P500 Heuristic: 24GB 'Golden Bin' XMP. [Research S4.2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "timings_xmp": "8000-40",
+    "die_type": "SK Hynix 24Gbit M-Die",
+    "notes": "P500 Heuristic: 24GB 'Golden Bin' XMP. [Research S4.2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "timings_xmp": "8800-42",
+    "die_type": "SK Hynix 24Gbit M-Die",
+    "notes": "P500 Heuristic: 24GB 'Golden Bin' XMP. [Research S4.2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "timings_xmp": "5600-46-45-45",
+    "voltage_xmp": "1.1",
+    "die_type": "Micron 24Gbit C-Die",
+    "notes": "P500 Heuristic: 24GB Baseline XMP. [Research S4.2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "part_number_contains": "F5-6400J3039G16GX2-TR5G",
+    "module_gb": 16,
+    "die_type": "SK Hynix 16Gbit A-Die",
+    "notes": "P500 Heuristic: 6400 C30 'Golden Bin'. [S1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "part_number_contains": "TMXPL1672836SWK",
+    "module_gb": 16,
+    "die_type": "SK Hynix 16Gbit A-Die",
+    "notes": "P500 Heuristic: 7200 C36 'Golden Bin'. [S12]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "part_number_contains": "KF564C32RSK2-96",
+    "module_gb": 48,
+    "die_type": "Micron 24Gbit (Heuristic)",
+    "notes": "P500 Heuristic: 48GB module (2x 24Gbit ranks). [S6]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "part_number_contains": "CT2K48G56C46S5",
+    "module_gb": 48,
+    "die_type": "Micron 24Gbit (Heuristic)",
+    "notes": "P500 Heuristic: 48GB module (2x 24Gbit ranks). [S7]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "part_number_contains": "CMK96GX5M2B5600C40",
+    "module_gb": 48,
+    "die_type": "Micron 24Gbit (Heuristic)",
+    "notes": "P500 Heuristic: 48GB module (2x 24Gbit ranks). [S8]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "part_number_contains": "CT2K32G48C40U5",
+    "module_gb": 32,
+    "module_ranks": "2R",
+    "dram_mfg": "Micron",
+    "die_type": "Micron 16Gbit (2Rx8)",
+    "notes": "P500 Heuristic: 32GB 2Rx8 module confirms 16Gbit dies. [S17]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR5",
+    "part_number_contains": "CP2K32G56C46U5",
+    "module_gb": 32,
+    "module_ranks": "2R",
+    "dram_mfg": "Micron",
+    "die_type": "Micron 16Gbit (2Rx8)",
+    "notes": "P500 Heuristic: 32GB 2Rx8 module confirms 16Gbit dies. [S22]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR4",
+    "part_number_contains": "F4-3600C16D-16GTZ",
+    "module_gb": 8,
+    "die_type": "Samsung 8Gbit B-Die",
+    "notes": "P500 Heuristic: 3600 16-16-16 'Golden Bin'. [S36, Research S3.1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR4",
+    "part_number_contains": "F4-3600C16D-16GVK",
+    "module_gb": 8,
+    "die_type": "Samsung 8Gbit B-Die",
+    "notes": "P500 Heuristic: 3600 16-16-16 'Golden Bin'. [S36]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR4",
+    "part_number_contains": "F4-3200C14D-16GVK",
+    "module_gb": 8,
+    "die_type": "Samsung 8Gbit B-Die",
+    "notes": "P500 Heuristic: 3200 14-14-14 'Golden Bin'. [Research S3.1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR4",
+    "part_number_contains": "F4-3200C14D-32GTZ",
+    "module_gb": 16,
+    "module_ranks": "2R",
+    "die_type": "Samsung 8Gbit B-Die (2Rx8)",
+    "notes": "P500 Heuristic: 16GB 2Rx8 'Golden Bin'. [Research S3.1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR4",
+    "part_number_contains": "F4-3600C16D-32GTZ",
+    "module_gb": 16,
+    "module_ranks": "2R",
+    "die_type": "Samsung 8Gbit B-Die (2Rx8)",
+    "notes": "P500 Heuristic: 16GB 2Rx8 'Golden Bin'. [S40]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR4",
+    "part_number_contains": "F4-3600C16D-32GTZNC",
+    "module_gb": 16,
+    "module_ranks": "2R",
+    "die_type": "SK Hynix 8Gbit DJR (2Rx8)",
+    "notes": "P500 Heuristic: 'NC' Suffix. 16GB 2Rx8 confirms 8Gbit dies. [S41]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR4",
+    "part_number_contains": "BLS8G4D30AESB",
+    "module_gb": 8,
+    "dram_mfg": "Micron",
+    "die_type": "Micron 8Gbit Rev. E",
+    "notes": "P500 Heuristic: Crucial 8GB P/N. [S46]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR4",
+    "part_number_contains": "BL2K8G36C16U4B",
+    "module_gb": 8,
+    "dram_mfg": "Micron",
+    "die_type": "Micron 8Gbit Rev. E",
+    "notes": "P500 Heuristic: Crucial 8GB P/N. [S49]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR3",
+    "part_number_contains": "F3-17600CL7D-4GBPIS",
+    "module_gb": 2,
+    "die_type": "Elpida 2Gbit Hyper",
+    "notes": "P500 Heuristic: G.Skill Pi 'Golden Bin' (2GB Module). [S53, DDR3 Research T3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR3",
+    "part_number_contains": "F3-2400C10D-8GTX",
+    "module_gb": 4,
+    "die_type": "Samsung 4Gbit D-Die",
+    "notes": "P500 Heuristic: G.Skill TridentX 'Golden Bin' (4GB Module). [S57, S59, DDR3 Research T3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR3",
+    "part_number_contains": "KHX16000D3ULT1K3/6GX",
+    "module_gb": 2,
+    "die_type": "Elpida 2Gbit Hyper (Heuristic)",
+    "notes": "P500 Heuristic: Kingston 'Golden Bin' (2GB Module). [S60]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR3",
+    "part_number_contains": "CMG6GX3M3A2000C8",
+    "die_type": "Elpida 2Gbit Hyper",
+    "notes": "P500 Heuristic: Corsair P/N, Confirmed Ver 2.1. [DDR3 Research T3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR3",
+    "part_number_contains": "F3-19200CL10Q-32GBZHD",
+    "die_type": "Samsung 4Gbit D-Die",
+    "notes": "P500 Heuristic: G.Skill P/N, 4x8GB Kit. [DDR3 Research T3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR3",
+    "part_number_contains": "CMD16GX3M2A2400C9",
+    "die_type": "Samsung 4Gbit D-Die",
+    "notes": "P500 Heuristic: Corsair P/N, Confirmed Ver 4.21. [DDR3 Research T3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR3",
+    "part_number_contains": "F3-2666C11Q-16GTXD",
+    "die_type": "SK Hynix 2Gbit CFR",
+    "notes": "P500 Heuristic: G.Skill P/N, 4x4GB Kit. [DDR3 Research T3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR3",
+    "part_number_contains": "KHX24C11T3K2/16X",
+    "die_type": "SK Hynix 4Gbit MFR",
+    "notes": "P500 Heuristic: Kingston P/N, 2x8GB Kit. [DDR3 Research T3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "Crucial",
+    "part_number_contains": "BL2KIT12864AA804",
+    "module_gb": 1,
+    "die_type": "Micron D9GMH",
+    "notes": "P500 Heuristic: Crucial Ballistix 2GB Kit (2x1GB). [S70, DDR2 Research P1.3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "Crucial",
+    "part_number_contains": "BL2KIT6464AA804",
+    "module_gb": 0.5,
+    "die_type": "Micron D9GMH",
+    "notes": "P500 Heuristic: Crucial Ballistix 1GB Kit (2x512MB). [S70, DDR2 Research P1.3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "OCZ",
+    "part_number_contains": "OCZ2RPR10662GK",
+    "module_gb": 1,
+    "die_type": "Micron D9GMH",
+    "notes": "P500 Heuristic: OCZ Reaper 1066 2GB Kit. [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "OCZ",
+    "part_number_contains": "OCZ2FX11502GK",
+    "module_gb": 1,
+    "die_type": "Micron D9GMH",
+    "notes": "P500 Heuristic: OCZ Flex XLC 1150 2GB Kit. [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "OCZ",
+    "part_number_contains": "OCZ2FX800C32GK",
+    "module_gb": 1,
+    "die_type": "Micron D9GMH",
+    "notes": "P500 Heuristic: OCZ Flex XLC 800 C3 2GB Kit. [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "Team",
+    "part_number_contains": "TXDD2048M800HC4DC",
+    "module_gb": 1,
+    "die_type": "Micron D9GMH",
+    "notes": "P500 Heuristic: Team Xtreem 800 C4 2GB Kit. [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "G.Skill",
+    "part_number_contains": "F2-6400PHU2-2GBHZ",
+    "module_gb": 1,
+    "die_type": "Micron D9GMH",
+    "notes": "P500 Heuristic: G.Skill HZ 800 C4 2GB Kit. [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "Crucial",
+    "part_number_contains": "BL2KIT12864AL1065",
+    "module_gb": 1,
+    "die_type": "Micron D9GKX",
+    "notes": "P500 Heuristic: Crucial Ballistix Tracer 1066. [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "Corsair",
+    "part_number_contains": "VS512MB533D2",
+    "module_gb": 0.5,
+    "die_type": "Micron D9DQT \"Fatbody\"",
+    "notes": "P500 Heuristic: Corsair ValueSelect 533 \"Sleeper\". [DDR2 Research P2.3]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "OCZ",
+    "part_number_contains": "OCZ2RPR800C44GK",
+    "module_gb": 2,
+    "die_type": "PSC (Heuristic)",
+    "notes": "P500 Heuristic: OCZ Reaper 800 C4 4GB Kit. [S67, DDR2 Research P3.2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "G.Skill",
+    "part_number_contains": "F2-6400CL4D-4GBPK",
+    "module_gb": 2,
+    "die_type": "PSC (Heuristic)",
+    "notes": "P500 Heuristic: G.Skill PK 800 C4 4GB Kit. [DDR2 Research P3.2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "Mushkin",
+    "part_number_contains": "996593",
+    "module_gb": 2,
+    "die_type": "PSC (Heuristic)",
+    "notes": "P500 Heuristic: Mushkin Redline 1000 C5 4GB Kit. [DDR2 Research P3.2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR2",
+    "manufacturer": "Mushkin",
+    "part_number_contains": "996580",
+    "module_gb": 2,
+    "die_type": "PSC (Heuristic)",
+    "notes": "P500 Heuristic: Mushkin HP 800 C4 4GB Kit. [DDR2 Research P3.2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "OCZ",
+    "part_number_contains": "PC3500 Gold GX",
+    "die_type": "Winbond BH-5 UTT",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N. [S86, S88, S89, DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "OCZ",
+    "part_number_contains": "PC3500 Plat. Ltd. Ed.",
+    "die_type": "Winbond BH-5",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N. [S86, DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Kingston",
+    "part_number_contains": "KHX3500",
+    "die_type": "Winbond BH-5",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N (Old Version). [S86, DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Kingston",
+    "part_number_contains": "KHX3200",
+    "die_type": "Winbond BH-5 (Heuristic)",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N (Old Version). [DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "OCZ",
+    "part_number_contains": "EL PC3200 Gold",
+    "die_type": "Winbond BH-5",
+    "notes": "P500 Heuristic: 'Value BH-5' P/N. [DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "OCZ",
+    "part_number_contains": "EL PC3500 Platinum",
+    "die_type": "Winbond BH-5",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N. [DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Mushkin",
+    "part_number_contains": "PC3200 Level II",
+    "die_type": "Winbond BH-5 (Heuristic)",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N. [DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Mushkin",
+    "part_number_contains": "PC3500 Level II",
+    "die_type": "Winbond BH-5 (Heuristic)",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N. [DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Mushkin",
+    "part_number_contains": "Black Level",
+    "die_type": "Winbond BH-5 (Heuristic)",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N. [DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Twinmos",
+    "part_number_contains": "1A4T",
+    "die_type": "Winbond BH-5 (Heuristic)",
+    "notes": "P500 Heuristic: P/N Suffix ...1A4T. [DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Geil",
+    "part_number_contains": "GeIL ONE",
+    "die_type": "Winbond BH-5 UTT",
+    "notes": "P500 Heuristic: GeIL ONE BH-5 UTT. [DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Geil",
+    "part_number_contains": "Ultra-X PC3200",
+    "timings_jdec": "400-2-2-2",
+    "die_type": "Winbond BH-5 (Heuristic)",
+    "notes": "P500 Heuristic: 'Golden Bin' P/N. [DDR1 Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "G.Skill",
+    "part_number_contains": "F1-3200DSU2-1GBLD",
+    "die_type": "Samsung TCCD",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N. [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "G.Skill",
+    "part_number_contains": "F1-3200DSU2-1GBFX",
+    "die_type": "Samsung TCCD",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N. [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "G.Skill",
+    "part_number_contains": "F1-4800DSU2-1GBFF",
+    "die_type": "Samsung TCCD",
+    "notes": "P500 Heuristic: 'Golden Bin' P/N (PC4800). [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "OCZ",
+    "part_number_contains": "EL PC3200 Platinum",
+    "die_type": "Samsung TCCD (Brainpower PCB)",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N (Rev.2). [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "OCZ",
+    "part_number_contains": "EL PC4800 Plat. Elite",
+    "die_type": "Samsung TCCD",
+    "notes": "P500 Heuristic: 'Golden Bin' P/N (PC4800). [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Kingston",
+    "part_number_contains": "KHX3200ULK2",
+    "die_type": "Samsung TCCD",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N (Ultra Low Latency). [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Geil",
+    "part_number_contains": "GeIL ONE",
+    "timings_jdec": "400-1.5-2-2",
+    "die_type": "Samsung TCCD (Hand-picked)",
+    "notes": "P500 Heuristic: 'Golden Bin' P/N (TCCD variant). [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Geil",
+    "part_number_contains": "Ultra-X PC4000",
+    "die_type": "Samsung TCCD (Brainpower PCB)",
+    "notes": "P500 Heuristic: 'Golden Bin' P/N (PC4000). [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Geil",
+    "part_number_contains": "Ultra-X PC4400",
+    "die_type": "Samsung TCCD (Brainpower PCB)",
+    "notes": "P500 Heuristic: 'Golden Bin' P/N (PC4400). [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "Patriot",
+    "part_number_contains": "PDC1G3200XBLK",
+    "die_type": "Samsung TCCD (Brainpower PCB)",
+    "notes": "P500 Heuristic: 'Holy Grail' P/N (XBL). [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "PQI",
+    "part_number_contains": "Turbo Memory",
+    "timings_jdec": "400-2-2-2",
+    "die_type": "Samsung TCCD (Brainpower PCB)",
+    "notes": "P500 Heuristic: 'Golden Bin' P/N. [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "TwinMOS",
+    "part_number_contains": "TwisterPro",
+    "timings_jdec": "400-2-2-2",
+    "die_type": "Samsung TCCD",
+    "notes": "P500 Heuristic: 'Golden Bin' P/N. [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR1",
+    "manufacturer": "A-Data",
+    "part_number_contains": "Vitesta PC4800",
+    "die_type": "Samsung TCCD",
+    "notes": "P500 Heuristic: 'Golden Bin' P/N (PC4800). [DDR1 Research T2]"
+  },
+  {
+    "priority": 500,
+    "generation": "DDR4",
+    "part_number_contains": "F4-3600C18-32GVK",
+    "timings_xmp": "3600-18-22-22",
+    "dram_mfg": "SK Hynix",
+    "module_gb": 16,
+    "module_ranks": "1R",
+    "chip_org": "x8",
+    "die_type": "SK Hynix 16Gbit MJR (M-Die)",
+    "notes": "P500 Heuristic: 32GB 2Rx8 (16Gbit die) w/ loose 18-22-22 timings. Known 'lackluster' die (aka 'potato RAM') with poor tRFC/OC."
+  },
+  {
+    "priority": 400,
+    "generation": "DDR5",
+    "module_gb": 24,
+    "dram_mfg": "Micron",
+    "die_type": "Micron 24Gbit C-Die",
+    "notes": "P400 Heuristic: Capacity + DRAM Mfg. [Research S4.2]"
+  },
+  {
+    "priority": 400,
+    "generation": "DDR5",
+    "module_gb": 48,
+    "dram_mfg": "Micron",
+    "die_type": "Micron 24Gbit C-Die",
+    "notes": "P400 Heuristic: Capacity + DRAM Mfg. [Research S4.2]"
+  },
+  {
+    "priority": 400,
+    "generation": "DDR5",
+    "module_gb": 32,
+    "dram_mfg": "Micron",
+    "die_type": "Micron 32Gbit B-Die",
+    "notes": "P400 Heuristic: Capacity + DRAM Mfg. [Research S4.2]"
+  },
+  {
+    "priority": 400,
+    "generation": "DDR5",
+    "module_gb": 64,
+    "dram_mfg": "Micron",
+    "die_type": "Micron 32Gbit B-Die",
+    "notes": "P400 Heuristic: Capacity + DRAM Mfg. [Research S4.2]"
+  },
+  {
+    "priority": 400,
+    "generation": "DDR4",
+    "timings_xmp": "3200-14-14-14",
+    "module_ranks": "1R",
+    "dram_mfg": "Samsung",
+    "die_type": "Samsung 8Gbit B-Die (Heuristic, 1Rx8)",
+    "notes": "P400 Heuristic: Infallible 'Golden Bin'. [S40, Research S2.1]"
+  },
+  {
+    "priority": 400,
+    "generation": "DDR4",
+    "timings_xmp": "3200-14-14-14",
+    "module_ranks": "2R",
+    "dram_mfg": "Samsung",
+    "die_type": "Samsung 8Gbit B-Die (Heuristic, 2Rx8)",
+    "notes": "P400 Heuristic: Infallible 'Golden Bin'. [S40, Research S2.1]"
+  },
+  {
+    "priority": 400,
+    "generation": "DDR4",
+    "timings_xmp": "3600-16-16-16",
+    "dram_mfg": "Samsung",
+    "die_type": "Samsung 8Gbit B-Die (Heuristic)",
+    "notes": "P400 Heuristic: Infallible 'Golden Bin'. [Research S2.1]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR5",
+    "timings_xmp": "6000-30-38-38",
+    "voltage_xmp": "1.35",
+    "dram_mfg": "SK Hynix",
+    "die_type": "SK Hynix 16Gbit M-Die",
+    "notes": "P300 Heuristic: Mainstream Hynix M-Die bin. [Research S4.3]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR5",
+    "timings_xmp": "6000-36-36-36",
+    "voltage_xmp": "1.35",
+    "dram_mfg": "Samsung",
+    "die_type": "Samsung 16Gbit (Heuristic)",
+    "notes": "P300 Heuristic: Mainstream Samsung bin. [Research S4.3]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR5",
+    "timings_xmp": "6000-40-40-40",
+    "dram_mfg": "Samsung",
+    "die_type": "Samsung 16Gbit (Heuristic)",
+    "notes": "P300 Heuristic: Mainstream Samsung bin. [Research S4.3]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR5",
+    "timings_xmp": "5600-40-40-40",
+    "voltage_xmp": "1.25",
+    "dram_mfg": "Micron",
+    "die_type": "Micron 16Gbit A-Die",
+    "notes": "P300 Heuristic: Mainstream Micron bin. [Research S4.3]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR5",
+    "timings_xmp": "6400-52-52-52",
+    "voltage_xmp": "1.1",
+    "dram_mfg": "Micron",
+    "die_type": "Micron 32Gbit B-Die",
+    "notes": "P300 Heuristic: JEDEC-spec XMP for 32Gbit. [Research S5.1]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR5",
+    "timings_xmp": "7200-34",
+    "module_gb": 16,
+    "dram_mfg": "SK Hynix",
+    "die_type": "SK Hynix 16Gbit A-Die (Heuristic)",
+    "notes": "P300 Heuristic: 'Golden Bin'. PMIC/Mobo lock may limit OC. [S8, S11]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR5",
+    "timings_xmp": "6400-32",
+    "module_gb": 16,
+    "dram_mfg": "SK Hynix",
+    "die_type": "SK Hynix 16Gbit (A-Die Heuristic)",
+    "notes": "P300 Heuristic: Common Hynix Bin. [S81]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR3",
+    "timings_xmp": "2133-8-8-8",
+    "module_gb": 2,
+    "voltage_xmp": "1.65",
+    "die_type": "Elpida 2Gbit Hyper (Heuristic)",
+    "notes": "P300 Heuristic: Infallible 'Golden Bin'. [S53, DDR3 Research T2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR3",
+    "timings_xmp": "2400-10-12-12",
+    "module_gb": 4,
+    "voltage_xmp": "1.65",
+    "die_type": "Samsung 4Gbit D-Die (Heuristic)",
+    "notes": "P300 Heuristic: 'Golden Bin' for 4GB modules. [S57, S59, DDR3 Research T2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR2",
+    "timings_jdec": "800-4-4-4",
+    "die_type": "Micron D9GMH (Heuristic)",
+    "notes": "P300 Heuristic: JEDEC 'Golden Bin'. [DDR2 Research P1.2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR2",
+    "timings_jdec": "1066-5-5-5",
+    "die_type": "Micron D9GKX (Heuristic)",
+    "notes": "P300 Heuristic: JEDEC 'Golden Bin'. [DDR2 Research P1.2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR2",
+    "timings_jdec": "1000-4-4-4",
+    "die_type": "Micron D9GKX (Heuristic)",
+    "notes": "P300 Heuristic: JEDEC 'Golden Bin'. [DDR2 Research P1.2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR2",
+    "timings_jdec": "800-3-4-4",
+    "die_type": "Micron D9GMH (Heuristic)",
+    "notes": "P300 Heuristic: JEDEC 'Golden Bin'. [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR2",
+    "timings_jdec": "800-3-3-3",
+    "die_type": "Micron D9GMH (Heuristic)",
+    "notes": "P300 Heuristic: JEDEC 'Golden Bin'. [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR2",
+    "timings_jdec": "1111-4-4-4",
+    "die_type": "Micron D9GKX (Heuristic)",
+    "notes": "P300 Heuristic: JEDEC 'Golden Bin'. [DDR2 Research P1.3]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR2",
+    "timings_jdec": "533-4-2-2",
+    "die_type": "Micron D9DQT \"Fatbody\" (Heuristic)",
+    "notes": "P300 Heuristic: JEDEC 'Sleeper' Bin. [DDR2 Research P2.2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR2",
+    "timings_jdec": "800-4-3-3",
+    "die_type": "Micron D9DQT \"Fatbody\" (Heuristic)",
+    "notes": "P300 Heuristic: JEDEC 'Sleeper' Bin. [DDR2 Research P2.2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR2",
+    "timings_jdec": "1066-5-5-5",
+    "module_gb": 2,
+    "die_type": "PSC (Heuristic)",
+    "notes": "P300 Heuristic: 4GB Kit JEDEC Bin. [DDR2 Research P3.2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR2",
+    "timings_jdec": "800-4-4-4",
+    "module_gb": 2,
+    "die_type": "PSC (Heuristic)",
+    "notes": "P300 Heuristic: 4GB Kit JEDEC Bin. [DDR2 Research P3.2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR1",
+    "timings_jdec": "400-2-2-2",
+    "die_type": "Winbond BH-5 (Heuristic)",
+    "notes": "P300 Heuristic: 'Holy Grail' timing. Scales with high voltage (3.0V+). [S86, S88, DDR1 Research T1]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR1",
+    "timings_jdec": "400-2.5-4-4",
+    "die_type": "Samsung TCCD (Heuristic)",
+    "notes": "P300 Heuristic: 'Holy Grail' timing. Scales with frequency at low voltage (<2.9V). [S70, S73, DDR1 Research T2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR1",
+    "timings_jdec": "434-2-2-2",
+    "die_type": "Winbond BH-5 (Heuristic)",
+    "notes": "P300 Heuristic: 'Holy Grail' timing (PC3500). [DDR1 Research T1]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR4",
+    "timings_xmp": "3200-16-18-18",
+    "dram_mfg": "Micron",
+    "die_type": "Micron 8Gbit Rev.E (Heuristic)",
+    "notes": "P300 Heuristic: Asymmetrical XMP. [Research S2.2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR4",
+    "timings_xmp": "3600-16-18-18",
+    "dram_mfg": "Micron",
+    "die_type": "Micron 8Gbit Rev.E (Heuristic)",
+    "notes": "P300 Heuristic: Asymmetrical XMP. [Research S2.2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR4",
+    "timings_xmp": "3000-15-16-16",
+    "dram_mfg": "Micron",
+    "die_type": "Micron 8Gbit Rev.E (Heuristic)",
+    "notes": "P300 Heuristic: Asymmetrical XMP. [Research S2.2]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR4",
+    "timings_xmp": "3600-16-19-19",
+    "dram_mfg": "SK Hynix",
+    "die_type": "SK Hynix 8Gbit CJR/DJR (Heuristic)",
+    "notes": "P300 Heuristic: Loose tRCD/tRP. [Research S2.3]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR4",
+    "timings_xmp": "3600-17-19-19",
+    "dram_mfg": "SK Hynix",
+    "die_type": "SK Hynix 8Gbit CJR/DJR (Heuristic)",
+    "notes": "P300 Heuristic: Loose tRCD/tRP. [Research S2.3]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR4",
+    "timings_xmp": "3600-18-22-22",
+    "dram_mfg": "SK Hynix",
+    "die_type": "SK Hynix 8Gbit CJR/DJR (Heuristic)",
+    "notes": "P300 Heuristic: Loose tRCD/tRP. [Research S2.3]"
+  },
+  {
+    "priority": 300,
+    "generation": "DDR4",
+    "dram_mfg": "SK Hynix",
+    "module_gb": 8,
+    "die_type": "SK Hynix 8Gbit CJR (Heuristic)",
+    "notes": "P300 Heuristic: 8Gbit Hynix die. 'Good value' die with good timing scaling."
+  },
+  {
+    "priority": 300,
+    "generation": "DDR4",
+    "dram_mfg": "SK Hynix",
+    "module_gb": 8,
+    "die_type": "SK Hynix 8Gbit DJR (Heuristic)",
+    "notes": "P300 Heuristic: 8Gbit Hynix die. Excellent 'sought after' overclocking die."
+  },
+  {
+    "priority": 300,
+    "generation": "DDR4",
+    "dram_mfg": "SK Hynix",
+    "module_gb": 16,
+    "die_type": "SK Hynix 16Gbit AJR (Heuristic)",
+    "notes": "P300 Heuristic: 16Gbit Hynix die. Considered an improvement over 16Gbit MJR."
+  },
+  {
+    "priority": 300,
+    "generation": "DDR4",
+    "dram_mfg": "SK Hynix",
+    "module_gb": 16,
+    "die_type": "SK Hynix 16Gbit CJR (Heuristic)",
+    "notes": "P300 Heuristic: 16Gbit Hynix die. Considered a 'good value' 16Gbit option."
+  },
+  {
+    "priority": 200,
+    "generation": "DDR5",
+    "timings_jdec": "4800-40-39-39",
+    "voltage_jdec": "1.1",
+    "dram_mfg": "SK Hynix",
+    "die_type": "SK Hynix 16Gbit E-Die",
+    "notes": "P200 Heuristic: JEDEC/Server bin. [Research S2.1]"
+  },
+  {
+    "priority": 200,
+    "generation": "DDR4",
+    "timings_xmp": "3200-16-18-18",
+    "dram_mfg": "Samsung",
+    "die_type": "Samsung 8Gbit C-Die (Heuristic)",
+    "notes": "P200 Heuristic: Common 'budget' bin, negative voltage scaling. [Research S2.4]"
+  },
+  {
+    "priority": 200,
+    "generation": "DDR4",
+    "timings_xmp": "3600-18-19-19",
+    "dram_mfg": "Samsung",
+    "die_type": "Samsung 8Gbit C/E-Die (Heuristic)",
+    "notes": "P200 Heuristic: Common 'budget' bin, negative voltage scaling. [Research S2.4]"
+  },
+  {
+    "priority": 100,
+    "generation": "DDR5",
+    "timings_xmp": "6000-30",
+    "module_gb": 16,
+    "dram_mfg": "SK Hynix",
+    "die_type": "Hynix 16Gbit M-Die / A-Die (Contested Bin)",
+    "notes": "P100 Heuristic: Contested 'Lootbox' Bin. Could be M-Die or A-Die. Requires P1000 physical check. [S3, S7]"
+  },
+  {
+    "priority": 100,
+    "generation": "DDR5",
+    "timings_xmp": "6000-36",
+    "module_gb": 16,
+    "dram_mfg": "Samsung",
+    "die_type": "Samsung 16Gbit (Heuristic)",
+    "notes": "P100 Heuristic: Common Samsung bin. [S7, S26]"
+  },
+  {
+    "priority": 100,
+    "generation": "DDR4",
+    "module_gb": 16,
+    "module_ranks": "2R",
+    "die_type": "8Gbit Die (Heuristic)",
+    "notes": "P100 Heuristic: Physical layout (16GB 2Rx8) implies 8Gbit dies. [Research S4.2]"
+  },
+  {
+    "priority": 100,
+    "generation": "DDR4",
+    "module_gb": 16,
+    "module_ranks": "1R",
+    "die_type": "16Gbit Die (Heuristic)",
+    "notes": "P100 Heuristic: Physical layout (16GB 1Rx8) implies 16Gbit dies. [Research S4.3]"
+  },
+  {
+    "priority": 100,
+    "generation": "DDR4",
+    "module_gb": 8,
+    "module_ranks": "1R",
+    "die_type": "8Gbit Die (Heuristic)",
+    "notes": "P100 Heuristic: Physical layout (8GB 1Rx8) implies 8Gbit dies. [Research S4.2]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Samsung",
+    "part_number_contains": "-C75",
+    "die_type": "PC133 CL3",
+    "notes": "P800 Heuristic: Samsung P/N Suffix -C75. [SDRAM Research S3.A]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Micron",
+    "part_number_contains": "-13E",
+    "die_type": "PC133 CL2",
+    "notes": "P800 Heuristic: Micron P/N Suffix -13E. [SDRAM Research S3.B]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Micron",
+    "part_number_contains": "-133",
+    "die_type": "PC133 CL3",
+    "notes": "P800 Heuristic: Micron P/N Suffix -133. [SDRAM Research S3.B]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Micron",
+    "part_number_contains": "-10E",
+    "die_type": "PC100 CL2",
+    "notes": "P800 Heuristic: Micron P/N Suffix -10E. [SDRAM Research S3.B]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Hynix",
+    "part_number_contains": "-K",
+    "die_type": "PC133 CL2",
+    "notes": "P800 Heuristic: Hynix P/N Suffix -K. [SDRAM Research S3.C]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Hynix",
+    "part_number_contains": "-H",
+    "die_type": "PC133 CL3",
+    "notes": "P800 Heuristic: Hynix P/N Suffix -H. [SDRAM Research S3.C]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Hynix",
+    "part_number_contains": "-P",
+    "die_type": "PC100 CL2",
+    "notes": "P800 Heuristic: Hynix P/N Suffix -P. [SDRAM Research S3.C]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Hynix",
+    "part_number_contains": "-S",
+    "die_type": "PC100 CL3",
+    "notes": "P800 Heuristic: Hynix P/N Suffix -S. [SDRAM Research S3.C]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Infineon",
+    "part_number_contains": "-7",
+    "die_type": "PC133 CL2",
+    "notes": "P800 Heuristic: Infineon P/N Suffix -7. [SDRAM Research S3.D]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Infineon",
+    "part_number_contains": "-7.5",
+    "die_type": "PC133 CL3",
+    "notes": "P800 Heuristic: Infineon P/N Suffix -7.5. [SDRAM Research S3.D]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Infineon",
+    "part_number_contains": "-8",
+    "die_type": "PC100 CL2",
+    "notes": "P800 Heuristic: Infineon P/N Suffix -8. [SDRAM Research S3.D]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Infineon",
+    "part_number_contains": "-10",
+    "die_type": "PC100 CL3",
+    "notes": "P800 Heuristic: Infineon P/N Suffix -10. [SDRAM Research S3.D]"
+  },
+  {
+    "priority": 800,
+    "generation": "SDRAM",
+    "manufacturer": "Nanya",
+    "part_number_contains": "75B",
+    "die_type": "PC133 CL3",
+    "notes": "P800 Heuristic: Nanya P/N Code 75B. [SDRAM Research S3.E]"
+  },
+  {
+    "priority": 799,
+    "generation": "SDRAM",
+    "manufacturer": "Mosel Vitelic",
+    "part_number_contains": "-75PC",
+    "die_type": "PC133 (CL2 or CL3)",
+    "notes": "P799 Heuristic: Ambiguous Part (CL2/CL3). Requires SPD verification. [SDRAM Research S3.F]"
+  },
+  {
+    "priority": 799,
+    "generation": "SDRAM",
+    "manufacturer": "Mosel Vitelic",
+    "part_number_contains": "-10PC",
+    "die_type": "PC100 (CL2 or CL3)",
+    "notes": "P799 Heuristic: Ambiguous Part (CL2/CL3). Requires SPD verification. [SDRAM Research S3.F]"
+  },
+  {
+    "priority": 500,
+    "generation": "SDRAM",
+    "timings_jdec": "133-2-2-2",
+    "die_type": "PC133 CL2",
+    "notes": "P500 Heuristic: JEDEC PC133 CL2 Timings. [SDRAM Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "SDRAM",
+    "timings_jdec": "100-2-2-2",
+    "die_type": "PC100 CL2",
+    "notes": "P500 Heuristic: JEDEC PC100 CL2 Timings. [SDRAM Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "SDRAM",
+    "timings_jdec": "133-3-3-3",
+    "die_type": "PC133 CL3",
+    "notes": "P500 Heuristic: JEDEC PC133 CL3 Timings. [SDRAM Research T1]"
+  },
+  {
+    "priority": 500,
+    "generation": "SDRAM",
+    "timings_jdec": "100-3-3-3",
+    "die_type": "PC100 CL3",
+    "notes": "P500 Heuristic: JEDEC PC100 CL3 Timings. [SDRAM Research T1]"
+  }
+]

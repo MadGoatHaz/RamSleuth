@@ -1,0 +1,168 @@
+MIT License
+
+Copyright (c) 2024 RamSleuth Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+DEPENDENCIES AND THIRD-PARTY COMPONENTS
+================================================================================
+
+This project relies on the following dependencies and system tools. Proper
+attribution and license information is provided below.
+
+--------------------------------------------------------------------------------
+PYTHON STANDARD LIBRARY MODULES
+--------------------------------------------------------------------------------
+
+The following Python standard library modules are used and are part of the
+Python Software Foundation License:
+
+- argparse - Command-line argument parsing
+- json - JSON data encoding and decoding
+- os - Operating system interfaces
+- pwd - Password database access
+- re - Regular expression operations
+- shutil - High-level file operations
+- subprocess - Subprocess management
+- sys - System-specific parameters and functions
+- pathlib - Object-oriented filesystem paths
+- typing - Type hints support
+- importlib - Import system utilities
+- platform - Platform identification
+- time - Time access and conversions
+- tempfile - Temporary file and directory creation
+
+Python Software Foundation License:
+https://docs.python.org/3/license.html
+
+Copyright (c) 2001-2024 Python Software Foundation. All Rights Reserved.
+
+--------------------------------------------------------------------------------
+EXTERNAL PYTHON PACKAGES
+--------------------------------------------------------------------------------
+
+1. Textual (TUI Framework)
+   - License: MIT License
+   - Copyright (c) 2021 Will McGugan
+   - Source: https://github.com/Textualize/textual
+   - Description: A TUI (Text User Interface) framework for Python inspired by
+     modern web development
+
+2. linkify-it-py
+   - License: MIT License
+   - Copyright (c) 2020 tsutsu3
+   - Source: https://github.com/tsutsu3/linkify-it-py
+   - Description: Python port of linkify-it, a link recognition library
+   - Note: Required by Textual for Markdown widget functionality
+
+--------------------------------------------------------------------------------
+SYSTEM TOOLS AND PROGRAMS
+--------------------------------------------------------------------------------
+
+1. i2c-tools (provides i2cdetect and decode-dimms)
+   - License: GPL-2.0-or-later
+   - Copyright (c) 1999-2007 Frodo Looijaard <frodol@dds.nl>
+   - Copyright (c) 2007-2012 Jean Delvare <jdelvare@suse.de>
+   - Source: https://github.com/groeck/i2c-tools
+   - Description: Set of I²C tools for Linux including EEPROM decoding utilities
+
+2. dmidecode
+   - License: GPL-2.0-or-later
+   - Copyright (C) 1999-2023 Jean Delvare
+   - Copyright (C) 1999-2023 Anton Borisov
+   - Source: https://github.com/mirror/dmidecode
+   - Description: DMI table decoder for Linux systems
+
+3. Linux Kernel Modules (loaded via modprobe)
+   - i2c-dev - I2C/SMBus device interface
+   - ee1004 - EEPROM driver for DDR4/DDR5 SPD
+   - at24 - Generic I2C EEPROM driver
+   - i2c-amd-mp2-pci - AMD SMBus controller driver
+   - i2c-i801 - Intel I801 SMBus controller driver
+   - i2c-piix4 - PIIX4 SMBus controller driver
+   - i2c-amd-mp2 - AMD MP2 SMBus controller driver
+   
+   License: GPL-2.0-or-later
+   Copyright (c) 1996-2024 Linux Kernel Contributors
+   Source: https://www.kernel.org/
+
+4. System Utilities
+   - sudo - Execute commands as superuser (ISC-style license)
+   - lscpu - CPU information utility (GPL-2.0-or-later, part of util-linux)
+   - tee - Read from standard input and write to files (GPL-3.0-or-later,
+     part of GNU coreutils)
+   - chown - Change file owner and group (GPL-3.0-or-later, part of GNU
+     coreutils)
+   - lsb_release - Linux Standard Base release information (GPL-2.0-or-later)
+
+--------------------------------------------------------------------------------
+DATA RESOURCES
+--------------------------------------------------------------------------------
+
+1. RamSleuth Die Heuristic Database (die_database.json)
+   - License: MIT License (same as main project)
+   - Copyright (c) 2024 RamSleuth Contributors
+   - Description: Comprehensive heuristic database for DRAM die identification
+     containing over 200 entries spanning DDR1 through DDR5 generations
+   - Data Sources: Publicly available hardware documentation, community
+     research, and manufacturer specifications
+   - Research Citations: Refer to individual database entries for specific
+     source citations marked as [S#], [Research S#.#], [DDR# Research P#.#],
+     and [DDR# Research T#]
+
+--------------------------------------------------------------------------------
+ADDITIONAL ATTRIBUTIONS
+--------------------------------------------------------------------------------
+
+The die identification heuristics and research compiled in die_database.json
+incorporate knowledge from the following community resources and
+documentation:
+
+- Hardware community research and reverse engineering efforts
+- Manufacturer datasheets and technical documentation from:
+  * Samsung Semiconductor
+  * SK Hynix
+  * Micron Technology
+  * Corsair Memory
+  * G.Skill International
+  * Crucial (Micron Consumer Products Group)
+- Open-source hardware documentation projects
+- Community-maintained DRAM die identification guides
+
+--------------------------------------------------------------------------------
+LICENSE SUMMARY
+--------------------------------------------------------------------------------
+
+Main Project Code: MIT License
+Python Standard Library: Python Software Foundation License
+External Python Packages: MIT License (Textual, linkify-it-py)
+System Tools: GPL-2.0-or-later (i2c-tools, dmidecode, kernel modules)
+System Utilities: GPL-3.0-or-later (core utilities), ISC-style (sudo)
+
+This project combines code under multiple open-source licenses. The MIT
+License for the main project allows for broad compatibility with the GPL
+licenses used by system dependencies.
+
+For questions about licensing or to contribute to the project, please visit:
+https://github.com/your-username/RamSleuth
+
+--------------------------------------------------------------------------------
+END OF LICENSE FILE
+--------------------------------------------------------------------------------

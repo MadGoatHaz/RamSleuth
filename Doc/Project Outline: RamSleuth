@@ -1,0 +1,212 @@
+Project Outline: RamSleuth
+
+To: AI Dev / Development Team
+From: madgoat
+Date: 2025-11-10
+
+Re: Final, detailed build specification for an intelligent, Linux-native SPD/DIMM data extractor.
+
+1. Executive Summary
+
+This document outlines the complete build plan for RamSleuth, a "smart" Python utility designed to be the definitive Linux alternative to Thaiphoon Burner. Its goal is to automate the complex process of system detection, dependency management, and hardware probing to read RAM SPD data. Its primary function is to pass this data to a separate heuristic logic module (RamSleuth_DB.py) which uses a comprehensive database (die_database.json) to identify the specific DRAM die type (e.g., "Samsung 8Gbit B-Die"), including ambiguous "lootbox" SKUs. This utility will feature both a rich TUI and scriptable command-line outputs.
+
+2. Project File Structure
+
+The project is organized with all specification documents in the ./Doc/ folder and all Python/data files in the project root (./).
+
+- ramsleuth.py (Main Executable, in Project Root):
+  - Main orchestrator. Contains logic for system interaction, hardware probing, user-facing prompts (TUI/CLI), decode-dimms integration, and data parsing.
+  - Imports RamSleuth_DB.
+- RamSleuth_DB.py (Logic Module, in Project Root):
+  - Heuristic matching engine responsible for loading the database and running prioritized matching logic.
+  - Design is specified in ./Doc/Project Outline: RamSleuth Database Logic Module.
+- die_database.json (Database, in Project Root):
+  - External JSON file containing heuristic rules.
+  - Source data documented in ./Doc/Heuristic Database.
+- dependency_engine.py (Dependency Management, in Project Root):
+  - System-native dependency engine providing autonomous package management for 15+ Linux distributions.
+  - Eliminates pip-based installation, uses only distribution package managers.
+- settings_service.py (Configuration Management, in Project Root):
+  - Centralized settings service with XDG Base Directory specification compliance.
+  - Handles sudo context, file ownership management, and theme persistence.
+
+3. Core Logic Flow (ramsleuth.py)
+
+[Init] - Privileges Check
+
+- Verify os.geteuid() == 0.
+- Fail with a clear error if not.
+
+[Phase 1] - Dependency Engine Integration & Distro Detection
+
+- check_and_install_dependencies(interactive, requested_features):
+  - Detects distribution using enhanced OS detection (15+ distributions supported).
+  - Checks for missing system tools (i2cdetect, decode-dimms, dmidecode) and Python packages (textual, linkify-it-py).
+  - In interactive mode: attempts autonomous installation using system-native package managers.
+  - In non-interactive mode: fails fast with clear installation guidance.
+  - Never uses pip, only distribution package managers (pacman, apt, dnf, zypper, emerge, etc.).
+- Unified dependency handling replaces manual dependency checking and prompt_install logic.
+- Supports Arch, Debian, Ubuntu, Fedora, RHEL, CentOS, Rocky, AlmaLinux, openSUSE, Gentoo, and derivatives.
+
+[Phase 1.5] - Configuration Loading & Settings Management
+
+- SettingsService class provides centralized configuration management:
+  - XDG Base Directory specification compliance for config paths.
+  - Sudo context awareness (uses original user's home directory, not root's).
+  - File ownership management (recursive chown when using sudo).
+  - Settings validation with predefined rules.
+  - Comprehensive debug logging.
+  - Backward compatibility with existing config file format.
+- Configuration file location: ~/.config/ramsleuth/ramsleuth_config.json
+- Default settings include theme, active_tab, and default_view_tab.
+- Theme persistence across application restarts.
+- Immediate save on setting changes (no deferred writes).
+
+[Phase 2] - Intelligent Bus Discovery
+
+- find_smbus():
+  - Runs i2cdetect -l and parses output.
+  - Includes SMBus/PIIX4/AMD/Intel.
+  - Excludes NVIDIA/GPU/Graphics.
+  - Returns candidate_bus_list (e.g., [5, 6, 7]).
+
+[Phase 3] - Bus Scanning & Device Registration
+
+- scan_bus(bus_id):
+  - Runs i2cdetect -y <bus_id>.
+  - Collects SPD candidate addresses in 0x50-0x57.
+- register_devices(bus_id, addresses):
+  - Best-effort registration of SPD EEPROM devices via /sys/bus/i2c/devices/i2c-<bus_id>/new_device using an ee1004 driver hint where appropriate.
+  - Active as part of normal Phase 3 behavior (no ENABLE_SYSFS_REGISTRATION flag).
+  - Non-fatal: errors (missing paths, permissions, existing devices) are only logged (e.g., under DEBUG), never aborting the run.
+
+[Phase 4] - Data Acquisition, Parsing & Memory Settings
+
+- load_die_database():
+  - Calls RamSleuth_DB.load_database("die_database.json").
+  - Path is relative to this module / script directory.
+
+- run_decoder():
+  - Resolve decode-dimms (required).
+  - Run plain decode-dimms as the primary information source.
+  - Run decode-dimms --side-by-side as a best-effort supplementary source; its failure must not hide usable plain output.
+  - On total failure (no usable output), raise RuntimeError.
+  - Return:
+    - combined_output: plain output plus optional side-by-side output.
+    - raw_individual_output_dumps: per-DIMM blocks from plain output.
+
+- parse_output(raw_output):
+  - Accepts combined_output from run_decoder().
+  - If a matrix-style "Field | DIMM ..." header is present:
+    - Parse matrix-style side-by-side into one DIMM dictionary per column.
+  - Otherwise:
+    - Parse plain "Decoding EEPROM" / "SPD data for" blocks and key/value lines.
+  - Extract canonical fields:
+    - Fundamental Memory type → generation.
+    - Module Manufacturer → manufacturer.
+    - Part Number → module_part_number.
+    - DRAM Manufacturer → dram_mfg.
+    - Size → module_gb.
+    - Ranks → module_ranks.
+    - SDRAM Device Width → chip_org.
+    - PMIC Manufacturer and DDR5 extras.
+    - Module Nominal Voltage → voltage_jdec.
+    - JEDEC timings.
+    - Guessing DIMM is in → slot.
+    - Hynix IC Part Number (when present).
+  - Split grouped / multi-slot labels into one logical record per slot; never emit aggregate "bank 3 bank 4" style rows.
+  - Preserve additional/unknown labels as-is.
+  - Tolerant of malformed lines and extra columns.
+  - Returns:
+    - A list of DIMM dicts where each dict represents one logical record per physical DIMM before de-duplication.
+
+- get_current_memory_settings(spd_output, dimms_data):
+  - Parses dmidecode -t memory to extract current operating speed and voltage from Memory Controller.
+  - Enhanced to also extract:
+    - JEDEC Speed: From SPD via decode-dimms ("Maximum module speed" or "JEDEC Timings") or dmidecode Speed field as fallback.
+    - XMP Profile Speed: From timings_xmp field or part number analysis.
+    - XMP Timings: Directly from timings_xmp field.
+    - Configured Speed: Current actual speed from dmidecode "Configured Memory Speed".
+    - Configured Voltage: From dmidecode "Configured Voltage".
+    - Manufacturer, Part Number, Size: From dmidecode for completeness.
+  - Returns structured dictionary with all memory settings for display in TUI.
+
+- find_die_type(parsed_dimm_data, die_db):
+  - Delegates to RamSleuth_DB.find_die_type() with normalized DIMM data.
+  - Returns (die_type, notes).
+
+[Phase 5] - Command-Line Argument Parsing
+
+- parse_arguments():
+  - Modes (mutually exclusive):
+    - --summary: summary text output.
+    - --full: detailed per-DIMM output with raw blocks.
+    - --json: structured JSON.
+    - --tui: Textual-based TUI.
+  - Flags:
+    - --no-interactive / --ci.
+    - --debug.
+  - Default (no explicit mode):
+    - If interactive, Textual available, and DIMMs detected:
+      - Prefer TUI.
+    - Otherwise:
+      - Use summary.
+
+[Phase 6] - Results Display (TUI & stdout)
+
+- --summary:
+  - Emits one concise line per DIMM (one physical DIMM per record).
+- --full:
+  - Emits one clearly separated block per DIMM with key fields and raw per-DIMM decode-dimms block when available.
+- --json:
+  - Emits a JSON list; each element is one physical DIMM after normalization and de-duplication.
+- --tui (launch_tui(dimms, raw_individual_output_dumps)):
+  - Textual-based TUI with advanced features:
+    - **Layout**: Horizontal split layout:
+      - Left panel (50%): DIMM selector DataTable + Current Settings pane
+      - Right panel (50%): Tabbed interface (Summary/Full views)
+    - **DIMM Selector**: DataTable showing Slot, Capacity, Speed, Manufacturer, Die Type for each DIMM.
+    - **Current Settings Pane**: Bottom-left panel displaying live memory settings from dmidecode:
+      - Size, JEDEC Speed, XMP Profile, Configured Speed, Manufacturer, Part Number, XMP Timings, Configured Voltage
+    - **Tabs**: Summary and Full views with state persistence:
+      - Summary: Structured sections for Identity, Die Info, Config, Timings, DDR5 Extras
+      - Full: Summary data + raw decode-dimms block
+    - **Command Palette**: Accessible via Ctrl+P for theme selection and commands
+    - **Theme Switching**: Ctrl+T toggles between dark/light themes with immediate persistence
+    - **Navigation**: Up/Down or j/k for DIMM selection, Tab to toggle pane focus
+    - **State Persistence**: Active tab and theme saved to config file on change
+    - **Key Bindings**: q (quit), s/ctrl+s (summary), f/ctrl+f (full), ctrl+t (toggle theme), ctrl+p (command palette)
+  - If Textual is not installed:
+    - Warn on stderr.
+    - Fall back to summary.
+
+Lootbox / sticker prompts:
+
+- Only active in interactive default/TUI flows without non-interactive flags.
+- Run after initial parsing and before the final heuristics pass.
+- Used to collect and apply:
+  - corsair_version
+  - gskill_sticker_code
+  - crucial_sticker_suffix
+  - hynix_ic_part_number
+
+Unknown die_type semantics:
+
+- If no heuristic matches for a DIMM:
+  - find_die_type() returns ("Unknown", "No heuristic match found in database.") (or similar descriptive note).
+  - This is an acceptable, non-error outcome.
+
+[Phase 7] - Error Handling
+
+- Robust handling of:
+  - modprobe failures,
+  - i2cdetect/decode-dimms absence/failures,
+  - malformed database,
+  - missing privileges.
+- Clear stderr messages plus non-zero exit codes where appropriate.
+
+[Phase 8] - GitHub & Searchability
+
+- Public-facing description aligned with README.md:
+  - Linux Thaiphoon Burner-style SPD/die identification.
+  - Non-destructive probing, heuristic database-driven identification.
