@@ -302,6 +302,13 @@ If RamSleuth has been helpful for your memory analysis needs, please consider st
 - Follow existing patterns and maintain non-interactive compatibility
 - Never implement automatic package installation without user approval
 
+## Support the Project
+
+- [GitHub Sponsors](https://github.com/sponsors/MadGoatHaz)
+- [PayPal](https://www.paypal.com/paypalme/garretthazlett)
+
+Donations support development. If you donate to the app, any feature requests you have will be pushed to the top of the request list based upon the donation amount.
+
 ---
 
 ## License
