@@ -1,0 +1,40 @@
+Field | DIMM 0 | DIMM 1 | DIMM 2 | DIMM 3
+Fundamental Memory type | DDR3 SDRAM | DDR4 SDRAM | DDR5 SDRAM | DDR4 SDRAM
+Module Manufacturer | Corsair | G.Skill | Crucial | GenericBrand
+Part Number | CMZ8GX3M2A1600C9 | F4-3600C16D-16GTZ | BL2K16G36C16U4B | DDR5-6000-SKH-PMIC
+DRAM Manufacturer | SK Hynix | Samsung | Micron | SK Hynix
+Size/Capacity | 8192 MB | 8192 MB | 16384 MB | 16384 MB
+Ranks | 1R | 1R | 2R | 1R
+SDRAM Device Width | 8 bits | 8 bits | 8 bits | 16 bits
+Module Nominal Voltage | 1.50 V | 1.20 V | 1.35 V | 1.25 V
+Minimum Voltage | 1.45 V | 1.15 V | 1.10 V | 1.20 V
+Maximum Voltage | 1.55 V | 1.25 V | 1.40 V | 1.30 V
+Configured Voltage | 1.50 V | 1.20 V | 1.35 V | 1.25 V
+Configured Memory Speed | 1600 MT/s | 3600 MT/s | 6000 MT/s | 2133 MT/s
+Guessing DIMM is in | DIMM_A1 | DIMM_B1 | DIMM_A2 | DIMM_B2
+JEDEC Timings | DDR3-1333 9-9-9 | DDR4-2133 15-15-15 | DDR4-2133 15-15-15 | DDR5-4800 40-40-40
+Additional JEDEC Timings malformed | malformed_d0 | malformed_d1 | malformed_d2 | malformed_d3
+PMIC Manufacturer |  |  |  | Renesas
+Hynix IC Part Number |  |  |  | H5CG48AGBDX018
+# Extra comments and noise lines below should be safely ignored by parse_output()
+# They intentionally include pipes and non-pipe text to assert robustness.
+Malformed Line With Too Many Columns | a | b | c | d | e
+Random garbage line not using pipes at all
+Noise | this | is | extra
+
+Decoding EEPROM 5-0050 5-0051
+Guessing DIMM is in  bank 3 bank 4
+Module Manufacturer  G.Skill
+Part Number          F4-3600C18-32GVK
+DRAM Manufacturer    SK Hynix
+Fundamental memory type  DDR4 SDRAM
+Module Capacity      16 GB
+Ranks                1R
+SDRAM Device Width   8 bits
+Module Nominal Voltage 1.20 V
+Minimum Voltage      1.20 V
+Maximum Voltage      1.35 V
+Configured Voltage   1.35 V
+Configured Memory Speed 3200 MT/s
+JEDEC Timings        DDR4-2133 15-15-15
+XMP Timings          DDR4-3600 18-22-22

@@ -35,6 +35,18 @@ SYSTEM_PACKAGE_MAP: Dict[str, Dict[str, List[str]]] = {
         "opensuse": ["i2c-tools"],
         "gentoo": ["sys-apps/i2c-tools"],
     },
+    "i2c-tools": {
+        "arch": ["i2c-tools"],
+        "debian": ["i2c-tools"],
+        "ubuntu": ["i2c-tools"],
+        "fedora": ["i2c-tools"],
+        "rhel": ["i2c-tools"],
+        "centos": ["i2c-tools"],
+        "rocky": ["i2c-tools"],
+        "almalinux": ["i2c-tools"],
+        "opensuse": ["i2c-tools"],
+        "gentoo": ["sys-apps/i2c-tools"],
+    },
     "decode-dimms": {
         "arch": ["i2c-tools"],
         "debian": ["i2c-tools"],
@@ -277,6 +289,43 @@ def check_python_package(package_name: str) -> bool:
         return spec is not None
     except Exception:
         return False
+
+
+def check_dependency(package_name: str) -> bool:
+    """
+    Check if a dependency is satisfied.
+    
+    Args:
+        package_name: Name of the package or tool to check.
+        
+    Returns:
+        True if available, False otherwise.
+    """
+    # If it's a known tool key with associated binaries, check for the binary
+    if package_name == "i2c-tools":
+        return check_tool_available("decode-dimms")
+    
+    # Default to checking if it's a tool in the path
+    return check_tool_available(package_name)
+
+
+def install_dependency(package_name: str, interactive: bool = True) -> bool:
+    """
+    Install a dependency using the system package manager.
+    
+    Args:
+        package_name: Name of the package to install (must be in SYSTEM_PACKAGE_MAP)
+        interactive: If True, may prompt user (though auto_install is mostly non-interactive logic)
+        
+    Returns:
+        True if successful, False otherwise.
+    """
+    distro_info = detect_distribution()
+    if distro_info["id"] == "unknown":
+        return False
+        
+    # We use auto_install_dependencies which handles the map lookup
+    return auto_install_dependencies([package_name], distro_info)
 
 
 def get_missing_dependencies(requested_features: Dict[str, bool]) -> Dict[str, List[str]]:

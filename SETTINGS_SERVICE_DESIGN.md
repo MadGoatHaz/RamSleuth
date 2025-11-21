@@ -6,11 +6,11 @@ This document outlines the design and implementation of a dedicated `SettingsSer
 
 ## Current Implementation Analysis
 
-### Existing Functions in [`ramsleuth.py`](ramsleuth.py)
+### Existing Functions in Monolithic [`ramsleuth.py`](ramsleuth.py) (Pre-refactoring)
 
 **Previous Configuration Management:**
-- [`load_config()`](ramsleuth.py:224) - Loads configuration from JSON file
-- [`save_config(config)`](ramsleuth.py:258) - Saves configuration to JSON file
+- `load_config()` - Loads configuration from JSON file (originally in [`ramsleuth.py`](ramsleuth.py))
+- `save_config(config)` - Saves configuration to JSON file (originally in [`ramsleuth.py`](ramsleuth.py))
 - Configuration stored in `~/.config/ramsleuth/ramsleuth_config.json`
 - Used XDG Base Directory specification
 
@@ -625,7 +625,7 @@ except Exception as e:
 
 **Before Migration:**
 ```python
-# ramsleuth.py current implementation
+# ramsleuth.py current implementation (monolithic)
 from ramsleuth import load_config, save_config
 
 def some_function():
@@ -637,7 +637,7 @@ def some_function():
 
 **After Migration:**
 ```python
-# ramsleuth.py new implementation
+# Implementation within the new package structure (e.g., ramsleuth_pkg/tui.py or ramsleuth.py)
 from settings_service import SettingsService
 
 def some_function():

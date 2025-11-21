@@ -7,7 +7,7 @@ sys.path.insert(0, '/home/madgoat/Documents/RamSleuth')
 import ramsleuth
 ramsleuth.DEBUG = True
 
-from ramsleuth import get_current_memory_settings
+from ramsleuth_pkg.scanner import get_current_memory_settings
 
 print("Testing get_current_memory_settings()...")
 settings = get_current_memory_settings()

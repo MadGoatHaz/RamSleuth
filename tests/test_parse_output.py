@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from ramsleuth import parse_output
+from ramsleuth_pkg.parser import parse_output
 
 
 FIXTURE_PATH = Path(__file__).resolve().parent.parent / "test_data.txt"

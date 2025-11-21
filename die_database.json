@@ -1222,6 +1222,7 @@
     "generation": "DDR4",
     "part_number_contains": "F4-3600C18-32GVK",
     "timings_xmp": "3600-18-22-22",
+    "voltage_xmp": "1.35",
     "dram_mfg": "SK Hynix",
     "module_gb": 16,
     "module_ranks": "1R",

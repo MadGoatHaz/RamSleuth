@@ -227,13 +227,15 @@ class TestSettingsService(unittest.TestCase):
         settings2 = SettingsService(debug=False)
         self.assertEqual(settings2.get_setting("theme"), "dark")
     
+    @patch('builtins.open')
+    @patch('pathlib.Path.mkdir')
     @patch('subprocess.run')
-    @patch('os.environ.get')
     @patch('pwd.getpwnam')
-    def test_sudo_ownership_handling(self, mock_getpwnam, mock_env_get, mock_subprocess) -> None:
+    def test_sudo_ownership_handling(self, mock_getpwnam, mock_subprocess, mock_mkdir, mock_open) -> None:
         """Test sudo ownership handling."""
-        # Mock sudo environment
-        mock_env_get.return_value = "testuser"
+        # Set sudo environment
+        os.environ['SUDO_USER'] = "testuser"
+        
         mock_pwd_result = MagicMock()
         mock_pwd_result.pw_dir = "/home/testuser"
         mock_getpwnam.return_value = mock_pwd_result
@@ -332,12 +334,10 @@ class TestSettingsService(unittest.TestCase):
         """Test handling of invalid key types."""
         settings = SettingsService(debug=False)
         
-        # Should handle non-string keys gracefully
-        with self.assertRaises(AssertionError):
-            settings.get_setting(123)  # type: ignore
-        
-        with self.assertRaises(AssertionError):
-            settings.set_setting(123, "value")  # type: ignore
+        # Should handle non-string keys gracefully by returning default/False
+        # instead of raising AssertionError
+        self.assertIsNone(settings.get_setting(123))  # type: ignore
+        self.assertFalse(settings.set_setting(123, "value"))  # type: ignore
     
     def test_backward_compatibility_load_config(self) -> None:
         """Test backward compatibility load_config function."""

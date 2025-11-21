@@ -11,10 +11,13 @@ RamSleuth is a non-destructive memory analysis tool that reads SPD (Serial Prese
 RamSleuth safely inspects your computer's RAM modules to answer key questions:
 - What DRAM die type is used in each memory module?
 - What are the specifications and capabilities of your RAM?
+- What are the detailed SPD timings, including XMP/EXPO profiles?
 - Are your modules running at their rated speeds?
-- What are the detailed SPD timings and voltages?
 
-The tool reads SPD data from hardware, parses it through `decode-dimms`, and applies a curated heuristic database to identify DRAM die manufacturers and types. It supports DDR3, DDR4, and DDR5 memory modules from major vendors including Samsung, SK Hynix, Micron, Corsair, G.Skill, and Crucial.
+The tool primarily reads detailed SPD data from hardware using `i2c-tools` and `decode-dimms`. It applies a curated heuristic database to identify DRAM die manufacturers and types. It supports DDR3, DDR4, and DDR5 memory modules from major vendors including Samsung, SK Hynix, Micron, Corsair, G.Skill, and Crucial.
+
+**Important Note on Timings (Transparency Principle):**
+RamSleuth prioritizes reading full XMP/EXPO and JEDEC timings (CL-RCD-RP-RAS) directly from the SPD chip using `decode-dimms`. However, if the hardware SPD read fails (e.g., due to chipset limitations or locked memory), the tool employs a **Part Number Fallback** mechanism. In this fallback scenario, only the nominal Speed and CAS Latency (CL) are extracted from the module's part number string, and full timing data will be unavailable. This limitation is clearly indicated in the output.
 
 ### Key Features
 
@@ -92,19 +95,25 @@ RamSleuth will detect missing dependencies and offer to install them using your 
 
 ### Architecture
 
-RamSleuth is built with a modular architecture separating concerns for maintainability and testability:
+RamSleuth is structured as a Python package (`ramsleuth_pkg`) with a dedicated entry point (`ramsleuth.py`) for simplified orchestration. This modular approach enhances testability and maintainability.
 
-**Core Components:**
-- `ramsleuth.py`: Main orchestrator handling CLI/TUI, hardware discovery, and output formatting
-- `RamSleuth_DB.py`: Pure heuristic engine for die type identification
-- `settings_service.py`: Centralized configuration management with XDG compliance
-- `dependency_engine.py`: System-native dependency detection and installation
-- `die_database.json`: Curated heuristic rules database
+**Core Components (within `ramsleuth_pkg`):**
+- `tui.py`: Interactive Text-based User Interface.
+- `parser.py`: Handles data parsing, normalization, and heuristic resolution.
+- `dependency_engine.py`: System-native dependency detection and installation.
+- `scanner.py`: Handles hardware discovery (SMBus/I2C bus scanning) and SPD data collection.
+- `utils.py`: Contains utility functions and settings integration.
+
+**Top-Level Components:**
+- `ramsleuth.py`: Main orchestrator and CLI entry point.
+- `RamSleuth_DB.py`: Pure heuristic engine for die type identification.
+- `settings_service.py`: Centralized configuration management with XDG compliance.
+- `die_database.json`: Curated heuristic rules database.
 
 **Execution Flow:**
 1. Environment validation (root check, dependency detection)
 2. Hardware discovery (SMBus/I2C bus scanning)
-3. SPD data collection via `decode-dimms`
+3. SPD data collection via `i2c-tools` / `decode-dimms`
 4. Data parsing and normalization
 5. Heuristic matching against die database
 6. Output formatting based on selected mode
@@ -149,13 +158,13 @@ The dependency engine provides autonomous package management across 15+ Linux di
 
 ### TUI Implementation
 
-The Textual-based TUI provides an interactive interface with several advanced features:
+The interactive Textual-based TUI has been redesigned for improved usability and information density:
 
-**Widget Architecture:**
-- `DataTable`: DIMM list with sortable columns and keyboard navigation
-- `RichLog`: Enhanced text panes supporting line selection and copying
-- `Tabs`: Switch between Summary and Full views
-- `CommandPalette`: Theme switching and future extensibility
+**Layout and Navigation:**
+- **25/75 Split Layout**: A fixed vertical sidebar (25%) on the left for the DIMM inventory list, and a main content area (75%) on the right for detailed information.
+- **DIMM Cards**: The left sidebar uses a `DataTable` to present a concise list of detected DIMMs, acting as navigation cards.
+- **Detail Panes**: The main content area uses tabs (`Summary` and `Full`) to display detailed information for the currently selected DIMM.
+- **Current Settings**: A dedicated pane displays live system memory settings (e.g., current frequency, motherboard timings).
 
 **Key Features:**
 - **Dual Theme Methods**: Both Ctrl+T toggle and Ctrl+P command palette
@@ -165,8 +174,8 @@ The Textual-based TUI provides an interactive interface with several advanced fe
 - **Keyboard Navigation**: Vim-style keys (j/k) and arrow keys
 
 **Enhanced TUI Widgets:**
-Recent enhancements replaced `Static` widgets with `RichLog` to support:
-- Line-by-line keyboard navigation within detail panes
+Recent enhancements ensure detail panes support:
+- Line-by-line keyboard navigation
 - Mouse text selection for copying to clipboard
 - Visual focus indicators
 - Improved scrolling performance

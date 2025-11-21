@@ -52,7 +52,7 @@ settings.set_setting("theme", "light")  # Automatically saves
 
 ### Example 1: Theme Management in TUI
 
-**Current code in [`ramsleuth.py`](ramsleuth.py:1937):**
+**Current code in TUI implementation (e.g., [`ramsleuth_pkg/tui.py`](ramsleuth_pkg/tui.py)):**
 ```python
 def action_toggle_dark(self) -> None:
     """
@@ -116,7 +116,7 @@ class RamSleuthApp(App):
 
 ### Example 2: Tab State Persistence
 
-**Current code in [`ramsleuth.py`](ramsleuth.py:2158):**
+**Current code in TUI implementation (e.g., [`ramsleuth_pkg/tui.py`](ramsleuth_pkg/tui.py)):**
 ```python
 def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
     """Handle tab activation events"""
@@ -142,7 +142,7 @@ def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
 
 ### Example 3: Initial Configuration Load
 
-**Current code in [`ramsleuth.py`](ramsleuth.py:1710):**
+**Current code in TUI launch function (e.g., [`ramsleuth.py`](ramsleuth.py)):**
 ```python
 # Load configuration and determine initial theme
 config = load_config()
@@ -160,7 +160,7 @@ _debug_print(f"launch_tui: initial_theme={initial_theme}")
 
 ### Example 4: Automatic Theme Persistence with Watchers
 
-**Current implementation in [`ramsleuth.py`](ramsleuth.py:1982):**
+**Current implementation in TUI application class (e.g., [`ramsleuth_pkg/tui.py`](ramsleuth_pkg/tui.py)):**
 ```python
 def watch_dark(self, dark: bool) -> None:
     """
@@ -188,7 +188,7 @@ def watch_dark(self, dark: bool) -> None:
 
 ### Example 5: Current Memory Settings Integration
 
-**Current implementation in [`ramsleuth.py`](ramsleuth.py:1888):**
+**Current implementation in TUI application class (e.g., [`ramsleuth_pkg/tui.py`](ramsleuth_pkg/tui.py)):**
 ```python
 # Get current settings with SPD output and DIMM data for XMP extraction
 current_settings = get_current_memory_settings(spd_output=spd_output, dimms_data=self.dimms_data)
@@ -311,7 +311,7 @@ def action_toggle_dark(self) -> None:
 The SettingsService works seamlessly with the dependency engine for configuration management:
 
 ```python
-from dependency_engine import check_and_install_dependencies
+from ramsleuth_pkg.dependency_engine import check_and_install_dependencies
 from settings_service import SettingsService
 
 def main() -> None:
@@ -576,7 +576,7 @@ SettingsService.VALIDATION_RULES["custom_setting"] = lambda x: x in ["option1", 
 
 ## Migration Checklist
 
-- [ ] Import `SettingsService` in [`ramsleuth.py`](ramsleuth.py)
+- [ ] Import `SettingsService` in [`ramsleuth.py`](ramsleuth.py) (the main orchestrator)
 - [ ] Create settings service instance in `main()` function
 - [ ] Update `launch_tui()` to accept settings service parameter
 - [ ] Update `RamSleuthApp.__init__()` to store settings service

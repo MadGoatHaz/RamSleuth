@@ -7,15 +7,21 @@ RamSleuth is structured as a small, testable toolkit for safe SPD inspection and
 Core components:
 
 - `ramsleuth.py`:
-  - Orchestrator and CLI/TUI entrypoint.
-  - Handles root/dependency checks, SMBus discovery, `decode-dimms` integration, parsing, normalization, heuristic resolution, and output modes.
+  - Top-level orchestrator and CLI/TUI entrypoint.
+  - Handles argument parsing, environment checks, and coordinates the execution flow across the package modules.
+- `ramsleuth_pkg/scanner.py`:
+  - Responsible for hardware-level operations: SMBus discovery, `i2c-tools` integration, and SPD data collection.
+- `ramsleuth_pkg/parser.py`:
+  - Handles parsing of `decode-dimms` output, data normalization, and preparation for heuristic resolution.
+- `ramsleuth_pkg/tui.py`:
+  - Contains the Textual application definition and all TUI-specific components (e.g., DIMM list, detail panes).
 - `RamSleuth_DB.py`:
   - Pure heuristic engine:
     - Loads and validates `die_database.json`.
     - Normalizes DIMM metadata.
     - Evaluates `is_match()` constraints.
     - Selects die types via `find_die_type()` using priority-ordered rules.
-- `dependency_engine.py`:
+- `ramsleuth_pkg/dependency_engine.py` (previously `dependency_engine.py`):
   - Autonomous dependency management system:
     - Detects 15+ Linux distributions with appropriate package managers.
     - Checks for missing system tools and Python packages.
@@ -48,69 +54,44 @@ This document describes how these pieces fit together, expected workflows, and t
 
 Responsibilities (high-level):
 
-- Environment and dependency handling:
-  - `check_root()`:
-    - Enforces that RamSleuth runs with sufficient privileges for SMBus/SPD access.
-  - `dependency_engine.check_and_install_dependencies()`:
-    - Detects missing dependencies including system tools (i2c-tools, dmidecode) and Python libraries (textual, linkify-it-py).
+- Core Orchestration:
+  - Handles CLI argument parsing and mode selection.
+  - Manages environment checks (`check_root()`).
+  - Coordinates the flow between package components (`ramsleuth_pkg`).
+
+- Dependency Handling (Delegated to `ramsleuth_pkg.dependency_engine`):
+  - `check_and_install_dependencies()`:
+    - Detects missing dependencies including system tools (`i2c-tools`, `dmidecode`) and Python libraries (`textual`, `linkify-it-py`).
     - Asks for user permission before attempting any installation.
     - Uses the system's native package manager (apt, pacman, dnf, etc.) based on distro detection.
     - Only proceeds with installation after explicit user approval.
     - Provides a "run-and-it-works" experience while maintaining user control.
   - **Removed legacy functions**: `check_distro()`, `_get_pkg_cmds()`, `check_dependencies()`, and `prompt_install()` have been completely removed in favor of the centralized `dependency_engine` approach.
 
-- Kernel module and SMBus handling:
+- Hardware Scanning (Delegated to `ramsleuth_pkg.scanner`):
   - `load_modules()`:
-    - Best-effort, idempotent `modprobe` calls for:
-      - Core: `i2c-dev`, `ee1004`, `at24`.
-      - Vendor SMBus drivers (e.g., `i2c-amd-mp2-pci`, `i2c-i801`) based on detected CPU vendor.
-    - Failures are non-fatal and only surfaced via the lightweight debug logger.
+    - Best-effort, idempotent `modprobe` calls for core and vendor SMBus drivers. Failures are non-fatal and logged via the lightweight debug logger.
   - `find_smbus()`:
-    - Runs `i2cdetect -l` (if available).
-    - Filters candidate adapters based on SMBus-related markers.
-    - Excludes GPU/graphics adapters.
-    - Returns a sorted list of bus IDs.
+    - Runs `i2cdetect -l` to find candidate adapters, filtering out non-SMBus/GPU entries.
   - `scan_bus(bus_id)`:
-    - Runs `i2cdetect -y <bus_id>`.
-    - Collects addresses in `0x50-0x57` as SPD candidates.
-    - Returns sorted unique addresses on success; tolerant of errors.
-
-- Sysfs registration:
+    - Runs `i2cdetect -y <bus_id>` to collect addresses in `0x50-0x57` as SPD candidates.
   - `register_devices(bus_id, addresses)`:
-    - Always attempts best-effort registration of SPD EEPROM devices for the given bus/addresses.
-    - Uses `/sys/bus/i2c/devices/i2c-<bus_id>/new_device` with an `ee1004` driver hint for DDR4/DDR5 SPD EEPROMs.
-    - Must not abort the main flow on errors:
-      - Missing paths, permission issues, or existing devices are non-fatal.
-      - Detailed failures are only surfaced via the lightweight debug logger when DEBUG is enabled.
-    - There is no feature-flag gate in Phase 3; any future opt-out mechanism must be introduced as an explicit design change.
+    - Always attempts best-effort registration of SPD EEPROM devices via sysfs (`ee1004` driver hint). Non-fatal on errors.
 
-- Decoder integration:
+- Decoder Integration (Delegated to `ramsleuth_pkg.scanner`):
   - `run_decoder()`:
-    - Resolves `decode-dimms` (required).
-    - Invokes plain `decode-dimms` as the primary source of structured per-DIMM data.
-    - Invokes `decode-dimms --side-by-side` as a best-effort supplementary source; failures here must not mask a successful plain invocation.
-    - If both plain and side-by-side variants fail to produce usable output, raises `RuntimeError` (handled by `main()` based on mode).
-    - Returns:
-      - `combined_output`: plain output, optionally followed by side-by-side output (consumed by `parse_output()`).
-      - `raw_individual`: mapping of `dimm_N` keys to raw plain decode-dimms blocks used by `--full`/TUI.
+    - Invokes `decode-dimms` to obtain structured per-DIMM data.
+    - Returns `combined_output` (plain + side-by-side) and `raw_individual` blocks.
 
-- Parsing:
+- Data Parsing (Delegated to `ramsleuth_pkg.parser`):
   - `parse_output(raw_output)`:
-    - Accepts the combined output from `run_decoder()`.
-    - If a matrix-style `"Field | DIMM ..."` header is present:
-      - Builds one DIMM dict per column.
-    - Otherwise:
-      - Parses plain `Decoding EEPROM` / `SPD data for` blocks and their key/value lines.
-      - Extracts canonical fields (generation, manufacturer, `module_part_number`, `dram_mfg`, `module_gb`, `module_ranks`, `SDRAM Device Width`, `JEDEC_voltage`, `JEDEC Timings`, slot from `Guessing DIMM is in`, DDR5-specific fields).
-      - Splits grouped slot labels into one logical record per slot; does not emit aggregate `"bank 3 bank 4"` style rows.
-    - Returns a list of DIMM dicts representing one logical record per physical DIMM before de-duplication.
+    - Parses the combined output, handling both matrix-style and block-style formats.
+    - Extracts canonical fields and splits grouped slot labels into one logical record per physical DIMM.
 
 - Heuristic DB integration:
   - `load_die_database()`:
     - Wrapper around `RamSleuth_DB.load_database("die_database.json")`.
-    - On failure (not found, parse errors, structural errors):
-      - Emits clear fatal messages to stderr.
-      - Exits with specific non-zero codes.
+    - On failure, exits with specific non-zero codes.
 
 - Interactive lootbox/sticker prompts:
   - `prompt_for_sticker_code(dimm_index, brand)`:
@@ -118,64 +99,27 @@ Responsibilities (high-level):
     - Returns user-provided codes.
   - `apply_lootbox_prompts(dimms, interactive)`:
     - Only runs when explicitly in an interactive flow.
-    - Adds:
-      - `corsair_version`
-      - `gskill_sticker_code`
-      - `crucial_sticker_suffix`
-      - `hynix_ic_part_number`
-    - Used to refine heuristic matches for supported kits.
+    - Adds sticker/version fields to DIMM data for refined heuristic matches.
 
 - CLI / mode handling:
   - `parse_arguments()`:
-    - Modes (mutually exclusive):
-      - `--summary`
-      - `--full`
-      - `--json`
-      - `--tui`
-    - Flags:
-      - `--no-interactive`
-      - `--ci` (alias)
-      - `--debug`
-  - `output_summary(dimms)`:
-    - Concise, one-line-per-DIMM summary.
-  - `output_full(dimms, raw_individual)`:
-    - Detailed per-DIMM view plus raw `decode-dimms` block where available.
-  - `output_json(dimms)`:
-    - JSON-only output on stdout (no extra noise).
-  - `launch_tui(dimms, raw_individual)`:
-    - Textual-based TUI with enhanced features:
-      - Left: DIMM list with sortable columns and frozen first column.
-      - Right: Summary/Full views for selected DIMM.
-      - Current memory settings pane showing live system data.
-      - Theme management (Ctrl+T toggle, Ctrl+P command palette).
-      - Tab persistence across sessions.
-      - Pane focus toggling for keyboard navigation.
-    - If Textual is missing:
-      - Warns on stderr and falls back to `output_summary()`.
+    - Defines mutually exclusive modes (`--summary`, `--full`, `--json`, `--tui`) and flags (`--no-interactive`, `--ci`, `--debug`).
+  - `output_summary(dimms)`, `output_full(dimms, raw_individual)`, `output_json(dimms)`:
+    - Standard output formatters.
+  - `launch_tui(dimms, raw_individual, settings)`:
+    - Launches the TUI application (`ramsleuth_pkg.tui`) with data and settings.
 
 - Main flow:
   - `main()`:
-    - Parses arguments.
-    - Derives `non_interactive` based on flags and modes.
-    - Enforces root check.
-    - Validates dependencies; guides or exits if missing.
-    - Loads modules (best-effort).
-    - Discovers SMBus busses and SPD addresses; calls `register_devices()` as best-effort Phase 3 behavior.
-    - Calls `run_decoder()` → `combined_output`, `raw_individual`.
-    - Calls `parse_output(combined_output)` to obtain initial DIMM candidates.
-    - Loads `die_database.json` via `load_die_database()`.
-    - Normalizes each DIMM with `RamSleuth_DB.normalize_dimm_data()`.
-    - Resolves `die_type` and `notes` via `RamSleuth_DB.find_die_type()`.
-    - Applies conservative de-duplication:
-      - Treats entries as duplicates when slot (if present), `module_part_number`, manufacturer, and generation all match.
-      - Keeps one record per physical DIMM.
-      - Avoids phantom aggregate entries.
-    - In interactive default/TUI-capable flows without non-interactive flags:
-      - Runs lootbox/sticker prompts after initial parsing, re-normalizes, and re-resolves `die_type`.
-    - Dispatches output:
-      - Precedence: `--json` > `--full` > `--summary` > `--tui` > default behavior.
-    - Maintains strict separation:
-      - Non-interactive modes never trigger interactive prompts.
+    - Parses arguments and checks root access.
+    - Calls `dependency_engine` to ensure tools are present.
+    - Calls `scanner` functions (`load_modules`, `find_smbus`, `register_devices`, `run_decoder`).
+    - Calls `parser.parse_output` to get DIMM candidates.
+    - Loads `die_database.json` and normalizes/resolves die types via `RamSleuth_DB`.
+    - Applies conservative de-duplication.
+    - Runs lootbox/sticker prompts if interactive.
+    - Dispatches output based on mode precedence.
+    - Maintains strict separation: Non-interactive modes never trigger interactive prompts.
 
 ### 2.2 Dependency Engine (`dependency_engine.py`)
 
@@ -365,12 +309,16 @@ The SettingsService provides centralized configuration management with sophistic
 
 ### 2.5 Enhanced TUI Features
 
-The Textual-based TUI includes several advanced features beyond basic display:
+The Textual-based TUI (`ramsleuth_pkg.tui`) has been redesigned for better data presentation and includes several advanced features:
+
+**Layout and Structure**:
+- **25/75 Split Layout**: Uses a fixed vertical sidebar (25%) for the DIMM inventory list and a main content area (75%) for detailed views.
+- **DIMM Cards**: The left sidebar uses a `DataTable` to present a concise, fixed-width list of detected DIMMs, acting as navigation cards.
+- **Current Settings Pane**: Live display of system memory settings from `dmidecode`.
+- **Dual-pane layout**: Independent summary and full views with tab persistence.
 
 **Widget Enhancements**:
 - **DataTable**: Sortable columns with frozen first column for better horizontal scrolling.
-- **Current Settings Pane**: Live display of system memory settings from `dmidecode`.
-- **Dual-pane layout**: Independent summary and full views with tab persistence.
 - **Keyboard navigation**: Vim-style keys (j/k) plus arrow keys, with pane focus toggling.
 
 **Theme Management**:
