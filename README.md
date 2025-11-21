@@ -2,7 +2,7 @@
 
 RamSleuth is a non-destructive memory analysis tool that reads SPD (Serial Presence Detect) data from RAM modules to identify DRAM die types and provide detailed hardware information. Built around the industry-standard `decode-dimms` tool, it offers both command-line and interactive TUI interfaces for analyzing memory modules.
 
-![RamSleuth TUI Interface](Doc/Screenshot.png)
+![RamSleuth TUI Interface](Doc/Screenshot.png?v=20251121071956)
 
 ## Overview
 
