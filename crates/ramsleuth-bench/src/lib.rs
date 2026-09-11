@@ -31,3 +31,7 @@ pub use buffers::{BufferPlan, plan};
 // P1-04: AVX2 streaming read kernel (256-bit aligned loads, P1-01 dispatch).
 mod kernel_read;
 pub use kernel_read::avx2_read;
+
+// P1-05: AVX2 non-temporal streaming write kernel (256-bit NT stores + SFENCE, P1-01 dispatch).
+mod kernel_write;
+pub use kernel_write::avx2_write;
