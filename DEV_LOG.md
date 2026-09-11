@@ -3,12 +3,15 @@
 Base branch: `v2-development`. Phase 1 plan: `plans/PLAN.md`. Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol.
 
 @@@ ACTIVE_WORKERS @@@
-- [ACTIVE] ID: P1-07 | AGENT: general (Implementation) | BRANCH: branch/chunk-P1-07 | FILES: kernel_512.rs, lib.rs
+(no active leases)
 
 @@@ CURRENT_STATE @@@
-P1-06 merged to v2-development; ready for P1-07.
+P1-07 implemented on branch/chunk-P1-07; awaiting review.
 
 ## History
+- [DONE] ID: P1-07 | STATUS: SUCCESS | BRANCH: branch/chunk-P1-07
+  DECISION: Implemented AVX-512F read/write/copy kernels in kernel_512.rs: 512-bit aligned _mm512_load_si512 loads + _mm512_add_epi64 lane accumulation with 8-lane horizontal reduction (P1-04 word-sum checksum), unrolled _mm512_stream_si512 non-temporal stores of eight LE pattern copies + single trailing _mm_sfence() (returns dst.len()), 512-bit copy (load+NT store+SFENCE, checksum of dst via frozen avx2_read); all three always callable via CpuFeatures::detect().avx512f dispatch falling back to the AVX2 kernels (no scalar reimplementation); 64B-aligned / len%64==0 / non-aliasing preconditions debug_asserted and documented; #[target_feature(enable="avx512f")] + cfg(x86_64) gating with #[clippy::msrv = "1.89"] on each 512-bit body (AVX-512F core::arch intrinsics stabilized in Rust 1.89, newer than the workspace MSRV 1.75); wired into lib.rs; 5 unit tests covering all gates (8 KiB checksum parity vs avx2_read + word_sum reference, pattern fill + byte count, copy byte-identity + checksum parity vs avx2_copy/copy_from_slice, minimal 64-B buffers, direct-body run or verified AVX2 fallback); 40/40 green debug and release, clippy -D warnings clean, release build OK on this AVX2-only (no AVX-512F) host.
+  AHEAD: Reviewer: verify the 512-bit body shapes on an AVX-512F host (direct-body test branch (e) did not execute here); workspace MSRV 1.75 < 1.89 required to compile this module on x86_64 is a plan-level follow-up decision (out of this chunk's file scope); P1-08 worker dispatch can consume avx512_read/write/copy as the 512 upgrade path.
 - [DONE] ID: P1-06 REVIEW | STATUS: SUCCESS | BRANCH: branch/chunk-P1-06
   DECISION: Reviewed frozen avx2_copy contract: unrolled 4-wide aligned _mm256_load_si256(src) + _mm256_stream_si256(dst) with tail, single trailing _mm_sfence(), #[target_feature(enable=avx2)] + cfg(x86_64) gating, CpuFeatures-dispatched copy_from_slice scalar fallback, // SAFETY: on every unsafe block, non-aliasing precondition documented + debug_asserted, no timing, module wired in lib.rs, P1-04 avx2_read word-sum checksum reused; zero clippy warnings; 35/35 tests green debug and release; SIMD body genuinely exercised on this AVX2 host; destination byte-identical to a direct copy_from_slice; merged --no-ff into v2-development.
   AHEAD: P1-07 512-bit variants reuse the (src,dst,len) helper + word-sum checksum convention; P1-08 worker dispatch consumes avx2_copy.
