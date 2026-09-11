@@ -3,12 +3,15 @@
 Base branch: `v2-development`. Phase 1 plan: `plans/PLAN.md`. Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol.
 
 @@@ ACTIVE_WORKERS @@@
-- [ACTIVE] ID: P1-06 | AGENT: general (Implementation) | BRANCH: branch/chunk-P1-06 | FILES: crates/ramsleuth-bench/src/kernel_copy.rs, crates/ramsleuth-bench/src/lib.rs
+(no active leases)
 
 @@@ CURRENT_STATE @@@
-P1-05 merged to v2-development; P1-06 in progress on branch/chunk-P1-06.
+P1-06 implemented on branch/chunk-P1-06; awaiting review.
 
 ## History
+- [DONE] ID: P1-06 | STATUS: SUCCESS | BRANCH: branch/chunk-P1-06
+  DECISION: Implemented AVX2 copy kernel: unrolled 4-wide _mm256_load_si256(src) + _mm256_stream_si256(dst) interleaved with tail, single trailing _mm_sfence(); returns P1-04 word-sum checksum of dst via frozen avx2_read (data-sensitive, DCE-defeating); preconditions 32B-aligned both sides, equal 32-multiple length, non-aliasing (debug_asserted, documented); CpuFeatures-dispatched copy_from_slice scalar fallback; 4 unit tests (byte-identical 4 KiB pattern + checksum vs word_sum/direct copy_from_slice, stable/data-sensitive checksum, 32-B minimum, scalar-vs-SIMD identical destination); 35/35 green debug+release on AVX2 host, zero clippy warnings.
+  AHEAD: Reviewer: verify NT-store + SFENCE tail shape, non-aliasing precondition, and avx2_read checksum reuse on host; P1-07 512-bit copy reuses the (src,dst,len) helper + checksum convention; P1-08 worker dispatch consumes avx2_copy.
 - [DONE] ID: P1-05 REVIEW | STATUS: SUCCESS | BRANCH: branch/chunk-P1-05
   DECISION: Reviewed frozen avx2_write contract: NT stores only via _mm256_stream_si256, single trailing _mm_sfence(), AVX2 + cfg gating, scalar fallback with identical contents, SAFETY comments on every unsafe block, no timing, lib.rs wiring, P1-04 pattern reuse; clippy -D warnings zero; 31/31 tests green debug and release; SIMD path exercised on AVX2 host; merged --no-ff into v2-development.
   AHEAD: P1-06 copy kernel reuses (ptr, len) + _mm256_stream_si256 + _mm_sfence tail shape; AVX2 host confirmed.
