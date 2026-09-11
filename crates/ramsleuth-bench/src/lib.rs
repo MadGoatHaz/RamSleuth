@@ -23,3 +23,7 @@ pub use features::CpuFeatures;
 // P1-02: /sys CPU topology enumeration with SMT filter (interface freeze).
 mod topology;
 pub use topology::{CpuTopology, TopologyError, detect};
+
+// P1-03: cache-hierarchy buffer sizing (L1/L2/L3/DRAM + latency ring).
+mod buffers;
+pub use buffers::{BufferPlan, plan};
