@@ -35,3 +35,7 @@ pub use kernel_read::avx2_read;
 // P1-05: AVX2 non-temporal streaming write kernel (256-bit NT stores + SFENCE, P1-01 dispatch).
 mod kernel_write;
 pub use kernel_write::avx2_write;
+
+// P1-06: AVX2 copy kernel (256-bit aligned loads + NT stores + SFENCE, P1-01 dispatch).
+mod kernel_copy;
+pub use kernel_copy::avx2_copy;
