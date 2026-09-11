@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/ramsleuth-bench",
+    "crates/ramsleuth-telemetry",
+    "crates/ramsleuth-daemon",
+    "crates/ramsleuth-client",
+    "crates/ramsleuth-tui",
+    "crates/ramsleuth-gui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["MadGoatHaz"]
+license = "MIT"
+repository = "https://github.com/MadGoatHaz/RamSleuth"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Heavy third-party dependencies (egui/eframe, ratatui/crossterm, tokio,
+# bincode, ryzen_smu, core_affinity) are intentionally NOT added at the
+# scaffold stage. Each is introduced in the phase that consumes it so the
+# initial workspace builds with zero external dependencies.

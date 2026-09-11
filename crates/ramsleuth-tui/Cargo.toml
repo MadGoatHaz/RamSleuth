@@ -1,0 +1,12 @@
+[package]
+name = "ramsleuth-tui"
+description = "RamSleuth terminal user interface (ratatui + crossterm)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Phase 4: add ratatui, crossterm, ramsleuth-client, ramsleuth-bench.

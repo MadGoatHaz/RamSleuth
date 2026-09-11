@@ -1,0 +1,12 @@
+[package]
+name = "ramsleuth-daemon"
+description = "Privileged ramsleuth service: CAP_SYS_RAWIO drivers + Unix socket RPC server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Phase 3: add tokio, ramsleuth-client, ramsleuth-telemetry, ramsleuth-bench.

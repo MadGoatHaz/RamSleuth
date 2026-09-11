@@ -1,0 +1,13 @@
+[package]
+name = "ramsleuth-bench"
+description = "Native AVX2/AVX-512 SIMD memory bandwidth & latency benchmark engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Kernel dependencies (none required for intrinsics — core::arch is std).
+# A [[bin]] target for the verification CLI is added in a later Phase 1 chunk.

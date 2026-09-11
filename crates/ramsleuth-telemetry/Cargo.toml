@@ -1,0 +1,12 @@
+[package]
+name = "ramsleuth-telemetry"
+description = "Hardware telemetry: ryzen_smu (AMD), MCHBAR MMIO (Intel), ee1004 SPD parsers"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Phase 2: add ryzen_smu / nix / memoffset etc. when the providers are built.

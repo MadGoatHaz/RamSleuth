@@ -1,0 +1,12 @@
+[package]
+name = "ramsleuth-gui"
+description = "RamSleuth immediate-mode desktop GUI (egui + eframe)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Phase 4: add egui, eframe, egui_extras, ramsleuth-client, ramsleuth-bench.
