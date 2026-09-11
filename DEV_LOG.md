@@ -6,9 +6,12 @@ Base branch: `v2-development`. Phase 1 plan: `plans/PLAN.md`. Sign in/out under 
 (no active leases)
 
 @@@ CURRENT_STATE @@@
-P1-05 implemented on branch/chunk-P1-05; awaiting review.
+P1-05 merged to v2-development; ready for P1-06.
 
 ## History
+- [DONE] ID: P1-05 REVIEW | STATUS: SUCCESS | BRANCH: branch/chunk-P1-05
+  DECISION: Reviewed frozen avx2_write contract: NT stores only via _mm256_stream_si256, single trailing _mm_sfence(), AVX2 + cfg gating, scalar fallback with identical contents, SAFETY comments on every unsafe block, no timing, lib.rs wiring, P1-04 pattern reuse; clippy -D warnings zero; 31/31 tests green debug and release; SIMD path exercised on AVX2 host; merged --no-ff into v2-development.
+  AHEAD: P1-06 copy kernel reuses (ptr, len) + _mm256_stream_si256 + _mm_sfence tail shape; AVX2 host confirmed.
 - [DONE] ID: P1-05 | STATUS: SUCCESS | BRANCH: branch/chunk-P1-05
   DECISION: Implemented AVX2 non-temporal write kernel: _mm256_set_epi64x pattern vector + _mm256_stream_si256 unrolled 4-wide + tail, single _mm_sfence() after the last store; returns bytes written (dst.len()); CpuFeatures-dispatched safe scalar fallback (LE u64 words, identical contents); 4 unit tests (pattern-filled 4 KiB + spot-check, stable/non-zero return, 32-B minimum, scalar-vs-SIMD contents), 31/31 green debug+release on AVX2 host, zero clippy.
   AHEAD: Reviewer: verify NT-store + SFENCE shape on host; P1-06 copy kernel reuses the (ptr,len) + _mm256_stream_si256 + _mm_sfence tail pattern; PLAN.md P1-05 "returns bytes written" signature is the frozen one.
