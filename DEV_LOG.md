@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Phase 1 plan: `plans/PLAN.md`. Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [ACTIVE] ID: P1-04 | AGENT: general (Implementation) | BRANCH: branch/chunk-P1-04 | FILES: kernel_read.rs, lib.rs
 
 @@@ CURRENT_STATE @@@
 P1-03 merged to v2-development; ready for P1-04.
