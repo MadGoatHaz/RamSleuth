@@ -19,3 +19,7 @@
 // P1-01: runtime CPU feature detection (interface freeze).
 mod features;
 pub use features::CpuFeatures;
+
+// P1-02: /sys CPU topology enumeration with SMT filter (interface freeze).
+mod topology;
+pub use topology::{CpuTopology, TopologyError, detect};
