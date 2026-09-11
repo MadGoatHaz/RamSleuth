@@ -27,3 +27,7 @@ pub use topology::{CpuTopology, TopologyError, detect};
 // P1-03: cache-hierarchy buffer sizing (L1/L2/L3/DRAM + latency ring).
 mod buffers;
 pub use buffers::{BufferPlan, plan};
+
+// P1-04: AVX2 streaming read kernel (256-bit aligned loads, P1-01 dispatch).
+mod kernel_read;
+pub use kernel_read::avx2_read;
