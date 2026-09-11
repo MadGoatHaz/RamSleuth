@@ -6,7 +6,7 @@ Base branch: `v2-development`. Phase 1 plan: `plans/PLAN.md`. Sign in/out under 
 (no active leases)
 
 @@@ CURRENT_STATE @@@
-P1-04 implemented on branch/chunk-P1-04; awaiting review.
+P1-04 merged to v2-development; ready for P1-05.
 
 ## History
 - [DONE] ID: P1-04 | STATUS: SUCCESS | BRANCH: branch/chunk-P1-04
