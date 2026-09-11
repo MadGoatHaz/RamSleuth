@@ -16,4 +16,6 @@
 //! No third-party dependencies are required: all kernels use `core::arch`
 //! intrinsics from the standard library.
 
-// Intentionally minimal at scaffold stage — kernels land in later chunks.
+// P1-01: runtime CPU feature detection (interface freeze).
+mod features;
+pub use features::CpuFeatures;
