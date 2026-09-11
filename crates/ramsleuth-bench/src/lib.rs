@@ -39,3 +39,8 @@ pub use kernel_write::avx2_write;
 // P1-06: AVX2 copy kernel (256-bit aligned loads + NT stores + SFENCE, P1-01 dispatch).
 mod kernel_copy;
 pub use kernel_copy::avx2_copy;
+
+// P1-07: AVX-512F read/write/copy kernels (512-bit aligned loads + NT stores + SFENCE,
+// runtime-gated on CpuFeatures.avx512f with fallback to the AVX2 kernels).
+mod kernel_512;
+pub use kernel_512::{avx512_copy, avx512_read, avx512_write};
