@@ -6,9 +6,12 @@ Base branch: `v2-development`. Phase 1 plan: `plans/PLAN.md`. Sign in/out under 
 (no active leases)
 
 @@@ CURRENT_STATE @@@
-P1-06 implemented on branch/chunk-P1-06; awaiting review.
+P1-06 merged to v2-development; ready for P1-07.
 
 ## History
+- [DONE] ID: P1-06 REVIEW | STATUS: SUCCESS | BRANCH: branch/chunk-P1-06
+  DECISION: Reviewed frozen avx2_copy contract: unrolled 4-wide aligned _mm256_load_si256(src) + _mm256_stream_si256(dst) with tail, single trailing _mm_sfence(), #[target_feature(enable=avx2)] + cfg(x86_64) gating, CpuFeatures-dispatched copy_from_slice scalar fallback, // SAFETY: on every unsafe block, non-aliasing precondition documented + debug_asserted, no timing, module wired in lib.rs, P1-04 avx2_read word-sum checksum reused; zero clippy warnings; 35/35 tests green debug and release; SIMD body genuinely exercised on this AVX2 host; destination byte-identical to a direct copy_from_slice; merged --no-ff into v2-development.
+  AHEAD: P1-07 512-bit variants reuse the (src,dst,len) helper + word-sum checksum convention; P1-08 worker dispatch consumes avx2_copy.
 - [DONE] ID: P1-06 | STATUS: SUCCESS | BRANCH: branch/chunk-P1-06
   DECISION: Implemented AVX2 copy kernel: unrolled 4-wide _mm256_load_si256(src) + _mm256_stream_si256(dst) interleaved with tail, single trailing _mm_sfence(); returns P1-04 word-sum checksum of dst via frozen avx2_read (data-sensitive, DCE-defeating); preconditions 32B-aligned both sides, equal 32-multiple length, non-aliasing (debug_asserted, documented); CpuFeatures-dispatched copy_from_slice scalar fallback; 4 unit tests (byte-identical 4 KiB pattern + checksum vs word_sum/direct copy_from_slice, stable/data-sensitive checksum, 32-B minimum, scalar-vs-SIMD identical destination); 35/35 green debug+release on AVX2 host, zero clippy warnings.
   AHEAD: Reviewer: verify NT-store + SFENCE tail shape, non-aliasing precondition, and avx2_read checksum reuse on host; P1-07 512-bit copy reuses the (src,dst,len) helper + checksum convention; P1-08 worker dispatch consumes avx2_copy.
