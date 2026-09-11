@@ -3,10 +3,10 @@
 Base branch: `v2-development`. Phase 1 plan: `plans/PLAN.md`. Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [ACTIVE] ID: P1-03 | AGENT: general (Implementation Agent) | BRANCH: branch/chunk-P1-03 | FILES: crates/ramsleuth-bench/src/buffers.rs, crates/ramsleuth-bench/src/lib.rs
 
 @@@ CURRENT_STATE @@@
-P1-02 merged to v2-development; ready for P1-03.
+P1-02 merged to v2-development; P1-03 in progress on branch/chunk-P1-03.
 
 ## History
 - [DONE] ID: P1-02 | STATUS: SUCCESS | BRANCH: branch/chunk-P1-02
