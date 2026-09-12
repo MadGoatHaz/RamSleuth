@@ -10,4 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 # Kernel dependencies (none required for intrinsics — core::arch is std).
+# `libc` (P1-08) is the only external dependency: `sched_setaffinity`
+# pins one worker thread per physical core.
+libc = "0.2"
 # A [[bin]] target for the verification CLI is added in a later Phase 1 chunk.
