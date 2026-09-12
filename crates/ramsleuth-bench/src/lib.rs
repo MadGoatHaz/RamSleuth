@@ -50,3 +50,9 @@ pub use kernel_512::{avx512_copy, avx512_read, avx512_write};
 // CpuTopology.physical_cores entry; sched_setaffinity pinning with unpinned fallback).
 mod worker;
 pub use worker::{BenchOp, WorkerError, WorkerResult, run_pinned};
+
+// P1-09: pointer-chase latency kernel (single-cycle ring, 64-byte chase stride,
+// serialized __rdtscp timing with Instant self-calibration; rdtscp x86_64 +
+// Instant fallback).
+mod latency;
+pub use latency::{build_chase_ring, chase_latency_ns};
