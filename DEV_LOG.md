@@ -4,6 +4,10 @@ Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retain
 
 @@@ ACTIVE_WORKERS @@@
 @@@ HISTORY @@@
+- [DONE] ID: review-P2-06-r2 | STATUS: SUCCESS | BRANCH: v2-development
+DECISION: Re-review PASS on 85114a6 - F1: classify_devmem nested raw_os_error() arm maps EIO/ENODATA (STRICT_DEVMEM non-RAM rejections, surfaced as ErrorKind::Other) to InsufficientPrivilege { hint: PRIV_HINT_DEVMEM } before the Io fallback; new test strict_devmem_rejections_classify_as_insufficient_privilege covers both codes via from_raw_os_error. F2: read_u32 uses ptr::read_volatile on all four bytes with check_read_bounds + // SAFETY: preserved; module doc aligned. Clippy --all-targets -D warnings clean; 48/48 tests pass. Merged --no-ff to v2-development.
+AHEAD: P2-07 (Intel readout) unblocked - read_u32 is now a volatile MMIO read primitive; all IMC register reads must stay inside the 1 MiB MCHBAR window.
+
 - [DONE] ID: P2-06-fix | STATUS: SUCCESS | BRANCH: branch/chunk-P2-06
 DECISION: Fixed review F1 — classify_devmem now has a raw_os_error arm mapping EIO/ENODATA (STRICT_DEVMEM rejections, which surface as ErrorKind::Other) to InsufficientPrivilege{PRIV_HINT_DEVMEM} before the Io fallback, with module doc aligned to the real mapping; fixed F2 — read_u32 uses ptr::read_volatile (MMIO reads not hoisted/cached/deduped), bounds/overflow checks (OOB→Parse, never panic) and // SAFETY: preserved; new test strict_devmem_rejections_classify_as_insufficient_privilege (EIO + ENODATA → InsufficientPrivilege) passes; clippy --all-targets -D warnings clean; 48/48 tests green (AMD-host gate test still UnsupportedHardware).
 AHEAD: branch/chunk-P2-06 re-submitted for re-review (F1 verified fixed; "verified passing" list in the review write-up may be skipped); P2-07 still blocked on the P2-06 merge.
@@ -44,9 +48,11 @@ AHEAD: clippy clean, 14/14 tests green, release build ok; plan §D5/P2-02 text s
 DECISION: Merged P2-02 (no-ff): code matches the shipped freeze — 6 TelemetryError variants, manual Clone/PartialEq/Eq sound (Io by kind+raw_os_code, Clone reconstructs), source() Some only for Io, NaReason(6), Section<T> value/is_na/na + From<T>→Value; zero warnings under clippy -D warnings, 14/14 tests, release build ok, no new deps, no hardware access.
 AHEAD: plan text is stale vs the freeze (§D5 + P2-02 scope: old variants UnsupportedVendor/NoDevmem/InvalidValue, Section{Na(TelemetryError)} + is_value/as_option/reason) — reconcile via plan edit before P2-03; downstream P2-06/P2-07/P2-10 specs cite those removed identifiers.
 
-## P2-06 REVIEW FAILURE
+## P2-06 REVIEW FAILURE (RESOLVED)
 
 **Verdict: FAIL — not merged to `v2-development`.** One blocking frozen-contract deviation (F1); all other audit items verified passing (F2 is a non-blocking recommendation; the "verified passing" list may be skipped on re-review).
+
+**RESOLVED (round 2, review-P2-06-r2, fix commit 85114a6, merged --no-ff to v2-development):** both findings verified fixed. F1: classify_devmem now has a nested raw_os_error() arm mapping EIO/ENODATA (STRICT_DEVMEM non-RAM rejections, which Rust surfaces as ErrorKind::Other) to InsufficientPrivilege { hint: PRIV_HINT_DEVMEM } before the Io catch-all, so the catch-all no longer misroutes them; the module doc (lines 27-28) now accurately describes EIO/ENODATA->InsufficientPrivilege instead of falsely claiming the kind-based arm covers STRICT_DEVMEM; new test strict_devmem_rejections_classify_as_insufficient_privilege proves EIO and ENODATA classify as InsufficientPrivilege. F2: MchBar::read_u32 reads all four bytes via ptr::read_volatile with bounds/overflow checks and // SAFETY: preserved. cargo clippy -p ramsleuth-telemetry --all-targets -- -D warnings is clean and the full suite passes 48/48.
 
 ### F1 (blocking) — STRICT_DEVMEM rejections classified as `Io`, not `InsufficientPrivilege`
 - Frozen contract (P2-06 brief): "open /dev/mem (fallback /dev/fmem) → mmap PROT_READ+MAP_PRIVATE (1 MiB) via nix; **EACCES/EPERM/STRICT_DEVMEM → `InsufficientPrivilege`**, missing node → `DriverMissing`."
@@ -72,4 +78,4 @@ AHEAD: plan text is stale vs the freeze (§D5 + P2-02 scope: old variants Unsupp
 - Toolchain: `cargo check` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` **47/47 pass** (8 new `intel_mchbar` tests; none require root, an Intel CPU, or `/dev/mem`).
 
 @@@ CURRENT_STATE @@@
-P2-06 fixes applied on branch/chunk-P2-06; awaiting re-review.
+P2-06 merged to v2-development (post-fix); ready for P2-07 (Intel readout).
