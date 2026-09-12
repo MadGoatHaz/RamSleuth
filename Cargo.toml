@@ -2,6 +2,7 @@
 members = [
     "crates/ramsleuth-bench",
     "crates/ramsleuth-telemetry",
+    "crates/ramsleuth-protocol",
     "crates/ramsleuth-daemon",
     "crates/ramsleuth-client",
     "crates/ramsleuth-tui",
@@ -18,7 +19,15 @@ repository = "https://github.com/MadGoatHaz/RamSleuth"
 rust-version = "1.75"
 
 [workspace.dependencies]
-# Heavy third-party dependencies (egui/eframe, ratatui/crossterm, tokio,
-# bincode, ryzen_smu, core_affinity) are intentionally NOT added at the
-# scaffold stage. Each is introduced in the phase that consumes it so the
-# initial workspace builds with zero external dependencies.
+# Phase 3 (P3-10) introduces the wire-protocol dependencies, each in the
+# phase that consumes it (plan D7 dependency ledger; MSRV 1.75, plan D1 —
+# every entry resolves to an MSRV-<=1.75 release, verified at build).
+# `serde` (derive) backs the wire-type derives in telemetry/bench/protocol;
+# `bincode` 1.3 is the frame codec format (plan D3), owned at runtime by
+# ramsleuth-protocol; `tokio` is declared now for the daemon (P3-12) — the
+# only tokio consumer in the workspace (no tokio outside the daemon, D2).
+# The remaining heavy deps (egui/eframe, ratatui/crossterm, ryzen_smu,
+# core_affinity) stay out until the phases that consume them.
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "signal", "macros"] }

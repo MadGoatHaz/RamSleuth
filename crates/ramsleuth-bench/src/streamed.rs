@@ -77,8 +77,10 @@ const OP_ORDER: [BenchOp; 3] = [BenchOp::Read, BenchOp::Write, BenchOp::Copy];
 ///
 /// A *cell* is one (tier, [`BenchOp`]) bandwidth pair; see the module
 /// docs for the full model (latency is a per-tier bonus of whole-tier
-/// targets, never a cell).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// targets, never a cell). It is the wire payload of the protocol's
+/// `Request::StartBenchmark` arm (P3-10), so it is bincode-serializable
+/// (P3-10 contract addendum, plan D2 — no duplication).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StreamTarget {
     /// All 12 bandwidth cells plus the four per-tier latency passes
     /// (the complete 4×4 grid).

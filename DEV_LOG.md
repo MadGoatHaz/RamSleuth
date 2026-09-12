@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [ACTIVE] ID: P3-10 | AGENT: general (Implementation Agent) | BRANCH: branch/chunk-P3-10 | FILES: [Cargo.toml, crates/ramsleuth-protocol/*, crates/ramsleuth-bench/src/streamed.rs, crates/ramsleuth-bench/src/orchestrator.rs, DEV_LOG.md]
 
 @@@ CURRENT_STATE @@@
 Cycle 3 (Phase 3) - both foundation chains merged into v2-development: P3-02..P3-06 (telemetry serde: cpuid/amd/intel/spd/facade derives + whole-snapshot round-trip, merged as merge: P3-02..P3-06) and P3-07..P3-09 (bench serde: worker/orchestrator derives, new streamed.rs with run_streamed + 7 tests, WorkerError serde via String mirror, AlignedBuf pub(crate) widening, merged as merge: P3-07..P3-09). Workspace green post-merge (tests, clippy -D warnings, build). Next: P3-10 + P3-11 (protocol crate - the payload root SystemMemoryTelemetry and WorkerResult/BenchmarkGrid are wire-ready) and P3-15 (bench_job calls run_streamed).

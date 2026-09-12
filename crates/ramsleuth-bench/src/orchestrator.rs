@@ -86,7 +86,7 @@ pub enum Metric {
 ///
 /// Every array is indexed by [`Tier`] (discriminant order
 /// `Memory, L1, L2, L3`); [`BenchmarkGrid::cell`] is the lookup.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BenchmarkGrid {
     /// Read bandwidth, GB/s, per tier.
     pub read_gbps: [f64; 4],

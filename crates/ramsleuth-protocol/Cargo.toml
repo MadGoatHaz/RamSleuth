@@ -1,0 +1,30 @@
+[package]
+name = "ramsleuth-protocol"
+description = "Shared ramsleuth wire protocol: Unix-socket RPC messages (Bincode frames) for the daemon + unprivileged clients"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# P3-10: the shared wire protocol (plan D2 single source of truth — the
+# payload types are REUSED from the telemetry + bench crates; this crate
+# owns only the Request/Response/BenchMode/Message wire enums, the
+# socket-path constant, and the frame codec that lands in P3-11).
+# `serde` (workspace): the derives on the four wire enums.
+serde = { workspace = true }
+# `bincode` (workspace, 1.3 per plan D3): the frame codec runtime
+# (u32-LE length prefix + payload), owned here; telemetry/bench carry
+# bincode only as a dev-dependency for their round-trip tests
+# (P3-01/P3-07 precedent).
+bincode = { workspace = true }
+# Payload roots, reused verbatim — nothing from these crates is
+# duplicated (plan D2):
+#   ramsleuth_telemetry::SystemMemoryTelemetry (P3-06 serde, the
+#   Response::Telemetry payload),
+#   ramsleuth_bench::{StreamTarget, StreamProgress, BenchmarkGrid}
+#   (P3-08/09 serde, the benchmark request/progress/result payloads).
+ramsleuth-telemetry = { path = "../ramsleuth-telemetry" }
+ramsleuth-bench = { path = "../ramsleuth-bench" }
