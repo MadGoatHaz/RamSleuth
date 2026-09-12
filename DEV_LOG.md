@@ -4,6 +4,10 @@ Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retain
 
 @@@ ACTIVE_WORKERS @@@
 @@@ HISTORY @@@
+- [DONE] ID: review-P2-04 | STATUS: SUCCESS | BRANCH: v2-development
+DECISION: Merged P2-04 (no-ff): safety (the critical property) verified — every read goes through bounds-checked read_u8/u16le/u32le (slice .get + saturating_add; OOB -> Err(Parse), never panics, never indexes), PmLayout::from_version guard (7.11.x/12.x/13.x else UnknownPmTableVersion, propagated before any blob read), header cross-check + min-length gate; contract verified (AmdPmSnapshot fields 27x u16 timings / 8x u16 CAD / 4x u16 mV, parse(&SmuContext) -> TelemetryResult, PmLayout+offsets()+name(), pub mod amd_pm in lib.rs, no I/O, no unsafe, no new deps); clippy --all-targets -D warnings clean, 29/29 tests (9/9 amd_pm; truncation sweep of every length 0..end -> Err(Parse), no crash).
+AHEAD: NOTE (format reconciliation): P2-04 AMD PM offsets are a plan-mandated skeleton (packed-u16); the real ryzen_smu blob is reported as an f32 array with the version in a separate attribute. Byte-exact format reconciliation + live tick verification (tick-identical to ryzen_smu CLI, clocks ±1 MHz, voltages ±10 mV) is BLOCKED on this host until the ryzen_smu module is loaded AND run as root. Reconcile at P2-11/QA.
+
 - [DONE] ID: P2-04 | STATUS: SUCCESS | BRANCH: branch/chunk-P2-04
 DECISION: Implemented amd_pm.rs: frozen AmdPmSnapshot (version + mclk/uclk/fclk MHz + div_mode/gdm/pdm + 19 primary + 8 tertiary timings + 8 CAD codes + 4 voltages mV) + parse(ctx) (PmLayout::from_version: 7.11.x->Smu711, 12.x->Smu12, 13.x->Smu13, else UnknownPmTableVersion; header cross-check; min-length gate; per-read bounds checks via read_u8/u16le/u32le — no unsafe, no panic) + 3 PmTableLayout const skeletons (per-family region anchors; relative placement mirrors published ryzen_smu metrics-table float indices Z3 48/50/51, Z4 70/74/78, Z5 71/75/79); 9 new tests cover brief (a)-(e) + header drift; wired pub mod amd_pm.
 AHEAD: Byte offsets are the P2-04 SKELETON table (plan D2) — absolute anchors are a compact packed-u16 model, NOT the real driver's f32 metrics table (official README: blob = array of 32-bit floats; version is a separate attribute, so live P2-03 version words may not map); byte-exact reconciliation + live tick-identical verification still needs the ryzen_smu module loaded AND root (P2-11 acceptance).
@@ -22,4 +26,4 @@ DECISION: Merged P2-02 (no-ff): code matches the shipped freeze — 6 TelemetryE
 AHEAD: plan text is stale vs the freeze (§D5 + P2-02 scope: old variants UnsupportedVendor/NoDevmem/InvalidValue, Section{Na(TelemetryError)} + is_value/as_option/reason) — reconcile via plan edit before P2-03; downstream P2-06/P2-07/P2-10 specs cite those removed identifiers.
 
 @@@ CURRENT_STATE @@@
-P2-04 implemented on branch/chunk-P2-04; awaiting review. NOTE: ryzen_smu module not loaded on this host — live AMD telemetry returns DriverMissing (graceful); skeleton layout byte offsets need live module+root verification at P2-11.
+P2-04 merged to v2-development; ready for P2-05. AMD PM offsets are skeleton — live reconciliation needs ryzen_smu module + root.
