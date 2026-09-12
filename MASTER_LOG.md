@@ -2,6 +2,54 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## RamSleuth v2 — Cycle 2 (Phase 2: Live Memory Controller Telemetry) — 2026-09-12
+
+### What was delivered
+`ramsleuth-telemetry` complete (11 chunks, P2-01…P2-11):
+- CPUID vendor / Zen-family detection (interface freeze) — P2-01.
+- Error + `Section<T>` no-panic contract (interface freeze) — P2-02.
+- Privilege-guarded AMD SMU access (sysfs→char-dev, sole `nix` dep) — P2-03.
+- Version-guarded bounds-checked AMD PM parse (SMU 7.11.x / 12.x / 13.x) — P2-04.
+- Shared display types + AMD mapping (sanity-gated) — P2-05.
+- Intel MCHBAR acquire + read-only /dev/mem mmap guard (Intel-gated; STRICT_DEVMEM EIO/ENODATA→InsufficientPrivilege; volatile MMIO read) — P2-06.
+- Intel per-channel IMC decode — P2-07.
+- Unprivileged SPD EEPROM acquisition — P2-08.
+- SPD decode (JEP106, rank, XMP/EXPO) — P2-09.
+- `SystemMemoryTelemetry` facade + `collect()` (per-branch error containment) — P2-10.
+- Verification CLI (`cargo run -p ramsleuth-telemetry [--json]`) — P2-11.
+
+### Quality
+- 159/159 tests green (debug + release, whole workspace); zero clippy warnings (`clippy --workspace --all-targets -- -D warnings`); release build OK; live telemetry CLI exit 0 (text + `--json`).
+- QA audit 2026-09-12 on `v2-development` @ 367bef9: all 8 runnable gates PASS.
+
+### Live result (this host: Zen 3 / DDR4, `ryzen_smu` module absent)
+- `CPU: Amd(Zen3) — AMD Ryzen 9 5950X`; `AMD: N/A (DriverMissing)`; `Intel: N/A (UnsupportedHardware)`; SPD 2× DDR4 modules (rank=1, speed=3200 MT/s, maker `0xC1` raw-hex, density `0x0D` → Na). No panic in any privilege/CPU state.
+
+### Key decisions
+- Direct SMU access (no `ryzen_smu` crate): sysfs-first + char-dev read; `nix` (features `fs`/`ioctl`/`mman`) is the only new dependency of Phase 2.
+- AMD PM + Intel IMC byte offsets are plan-mandated SKELETONS pending live-silicon reconciliation.
+
+### BLOCKED acceptance gates (hardware/driver, not code)
+1. AMD tick-identical ground truth — needs `ryzen_smu` module loaded + root.
+2. Intel live MCHBAR decode — needs Intel silicon.
+3. Model reconciliation — AMD PM byte offsets, Intel IMC offsets, SPD maker `0xC1` + density `0x0D` codes.
+
+### Per-chunk history (summarized from DEV_LOG.md)
+- P2-01: CPUID vendor/Zen-family detection (interface freeze).
+- P2-02: `TelemetryError` + `Section<T>` no-panic contract (interface freeze); 14/14 tests.
+- P2-03: AMD SMU acquire (sysfs→char-dev; `nix` 0.29 sole new dep); 20/20; live → `DriverMissing{ryzen_smu}`.
+- P2-04: version-guarded bounds-checked AMD PM parse; 29/29; offsets = plan skeleton.
+- P2-05: shared display types + sanity-gated AMD mapping; 39/39.
+- P2-06: Intel MCHBAR + read-only /dev/mem guard; 48/48. *Process note:* review FAILED (F1 STRICT_DEVMEM EIO/ENODATA→InsufficientPrivilege, F2 volatile read) → fix `85114a6` → re-review PASS.
+- P2-07: Intel per-channel IMC decode; 66/66; offsets = documented model/skeleton.
+- P2-08: unprivileged SPD EEPROM acquire (world-readable sysfs `eeprom`); 74/74; live → 2× 512B DDR4.
+- P2-09: SPD decode (JEP106, rank, XMP/EXPO); 85/85. *Process note:* recovered prior subagent's uncommitted/empty payload (3 compile fixes + missing 11-test module).
+- P2-10: `SystemMemoryTelemetry` facade + `collect()` (per-branch containment); 90/90.
+- P2-11: verification CLI (hand-rolled JSON, no serde/clap); 96/96. *Process note:* recovered prior subagent's empty payload.
+- phase2-qa: full audit 2026-09-12 — 8/8 runnable gates PASS; 159/159 tests.
+
+Cycle 2 close-out (2026-09-12): all 11 `branch/chunk-P2-*` branches verified fully merged into `v2-development` and pruned; no unmerged branch touched.
+
 ## RamSleuth v2 — Cycle 1 (Phase 1: Native Benchmark Engine) — 2026-09-11
 
 ### Delivered
