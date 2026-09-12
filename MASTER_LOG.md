@@ -2,6 +2,16 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Dev-Cycle Decisions & Hardware Context — 2026-09-12
+
+Confirmed by director/user 2026-09-12; captured in `Docs/RamSleuth-v2.md`, `Docs/Grand Design & Architecture Specification.md`, and `Docs/HANDOVER.md`.
+
+- **Push policy:** stay 100% local on `v2-development`; do NOT push to the GitHub upstream (`https://github.com/MadGoatHaz/RamSleuth`, divergent legacy `master`) until there is a confirmed, tested, working end-result app. No force-pushes without explicit sign-off.
+- **AMD host / `ryzen_smu`:** the `ryzen_smu` kernel module is NOT installed on the primary dev host (AMD Ryzen 9 5950X, Zen 3, 16C/32T, 64 MiB L3, DDR4, AVX2; **CachyOS, kernel `7.2.3-1-cachyos-custom`**): `sudo modprobe ryzen_smu` → `FATAL: Module ryzen_smu not found in directory /lib/modules/7.2.3-1-cachyos-custom`; `/sys/kernel/ryzen_smu/` absent. For AMD live subtiming verification the module MUST be built + installed + loaded (headers for `7.2.3-1-cachyos-custom` → build out-of-tree → `depmod -a` → `modprobe` → verify `pm_table`); steps documented in `Docs/RamSleuth-v2.md`. The codebase degrades gracefully today: `N/A (DriverMissing)`, never panics.
+- **Intel test machine:** LGA-1151 **Intel i5-6600 (Skylake, 6th-gen), dual-channel (2 DIMM channels)** — available for live Intel MCHBAR decode verification; matches `channel_count(Skylake) = 2`.
+- **Cycle position:** Phase 1 (Native Benchmark Engine, 11 chunks) and Phase 2 (Live Memory Controller Telemetry, 11 chunks) are COMPLETE and QA-passed (159/159 tests, clippy clean). **The next development cycle starts at Phase 3** (privilege-separated daemon + Unix socket + clients).
+- **CPUID note:** the frozen P2-01 map classifies the 5950X reference host as family `0x19` → `Amd(Zen3)`; desktop Zen 4/5 silicon also reports family `0x19` on some boards, so the AMD PM parse (P2-04) keys on the **SMU version** (7.11.x / 12.x / 13.x), not on `AmdZen` — generation ambiguity cannot break the PM layout.
+
 ## RamSleuth v2 — Cycle 2 (Phase 2: Live Memory Controller Telemetry) — 2026-09-12
 
 ### What was delivered

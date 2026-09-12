@@ -8,6 +8,37 @@ GUI Framework: egui + eframe
 
 TUI Framework: ratatui + crossterm
 
+Status (2026-09-12)
+
+- Phase 1 — Native Benchmark Engine (`ramsleuth-bench`): **COMPLETE** (11 chunks, P1-01…P1-11; QA audit 2026-09-12, 7/7 runnable gates PASS; 63/63 tests green).
+- Phase 2 — Live Memory Controller Telemetry (`ramsleuth-telemetry`): **COMPLETE** (11 chunks, P2-01…P2-11; QA audit 2026-09-12, 8/8 runnable gates PASS; 159/159 whole-workspace tests green, debug + release; clippy clean).
+- Phase 3 — Privilege-Separated Daemon + Unix Socket + Clients (`ramsleuth-daemon`, `ramsleuth-client`): **NEXT** (planning not started; stub crates exist in the workspace).
+- Phases 4–5 (TUI/GUI presentation, packaging & distribution) remain future cycles.
+
+Development-Cycle Decisions & Constraints (confirmed 2026-09-12)
+
+1. **Push policy — local only.** All development stays 100% local on branch `v2-development`. Nothing is pushed to the GitHub upstream (`https://github.com/MadGoatHaz/RamSleuth`, whose `master` carries divergent legacy history) until there is a **confirmed, tested, working end-result app** that works as intended. No force-pushes, ever, without explicit sign-off.
+2. **Pure-Rust mandate.** 100% Rust, Cargo workspace, Edition 2021. Kernels and CLIs use `std` + `core::arch` intrinsics; third-party crates are added only in the phase that consumes them (Phase 1: `libc` only; Phase 2: `nix` only — features `fs`, `ioctl`, `mman`).
+3. **Phased gating.** Each phase/cycle must compile, run, and pass its exit criteria before the next phase starts; each chunk is reviewed and merged (`branch/chunk-N` → `v2-development`, `--no-ff`) before the next; QA audit + compaction per cycle; no silent signature changes to frozen interfaces.
+
+Verification Environment (confirmed 2026-09-12)
+
+(a) **Primary AMD dev host — Ryzen 9 5950X (Zen 3), 16C/32T, 64 MiB L3, DDR4, AVX2 (no AVX-512); CachyOS, kernel `7.2.3-1-cachyos-custom`.**
+- The `ryzen_smu` kernel module is **NOT installed** on this host: `sudo modprobe ryzen_smu` → `FATAL: Module ryzen_smu not found in directory /lib/modules/7.2.3-1-cachyos-custom`; `/sys/kernel/ryzen_smu/` does not exist.
+- Consequence: live AMD telemetry degrades to `N/A (DriverMissing)` (verified; never panics). The tick-identical ground-truth gate is **BLOCKED** until the module is built, installed, and loaded.
+- ryzen_smu integration steps (operator-performed environment setup; the codebase already handles the module-absent case gracefully):
+  1. Install kernel headers matching the running kernel (`uname -r` = `7.2.3-1-cachyos-custom`) — e.g. the matching CachyOS headers package.
+  2. Obtain the ryzen_smu project source (kernel module + userspace tool); verify the correct upstream repo/URL at setup time.
+  3. Build the out-of-tree kernel module against the running kernel (`make` in the module source).
+  4. Install it into `/lib/modules/$(uname -r)/` (e.g. `extra/`) and run `sudo depmod -a`.
+  5. Load it: `sudo modprobe ryzen_smu` (or `sudo insmod ryzen_smu.ko`).
+  6. Verify: `ls /sys/kernel/ryzen_smu/` should show `pm_table`; then `sudo cargo run -p ramsleuth-telemetry --release` should populate the AMD section (clocks/timings/CAD/voltages) instead of `N/A (DriverMissing)`.
+  - Note: building an out-of-tree module against a custom CachyOS kernel may require the exact matching headers and could need adjustments.
+
+(b) **Intel test machine — LGA-1151 Intel i5-6600 (Skylake, 6th-gen), dual-channel (2 DIMM channels).**
+- Available for **live Intel MCHBAR decode verification** (the Phase 2 Intel path is Intel-gated and returns `N/A (UnsupportedHardware)` on the AMD host).
+- The i5-6600 is dual-channel, which matches the `channel_count(Skylake) = 2` model in the Intel decode path.
+
 Workspace Structure
 
 The project is structured as a modular Cargo workspace in the repository root:
@@ -130,6 +161,14 @@ Part numbers, serial numbers, rank organization, and XMP 2.0/3.0 / EXPO profiles
 Telemetry library produces a populated SystemMemoryTelemetry struct containing verified live timings on test hardware.
 
 Gracefully returns structured errors (UnsupportedHardware, DriverMissing) without panicking.
+
+2.3 Status & Acceptance Notes (2026-09-12)
+
+- Code status: all 11 chunks merged and QA-passed; crate builds, tests green (159/159 whole-workspace, debug + release), clippy clean.
+- **AMD tick-identical ground truth: BLOCKED** pending `ryzen_smu` module install + root on the 5950X host (see Verification Environment (a); the module is currently not installed on `7.2.3-1-cachyos-custom`).
+- **Intel live decode: to be verified on the i5-6600** (Skylake, LGA-1151, dual-channel) machine — not yet run.
+- **Model reconciliation pending live silicon:** AMD PM byte offsets, Intel IMC register offsets (both currently plan-mandated SKELETONS), and SPD decode of maker `0xC1` + density `0x0D` codes observed on this host (raw-hex fallback today; no die-maker mapping for these codes yet).
+- Verified live on the 5950X host: `CPU: Amd(Zen3)`; `AMD: N/A (DriverMissing)`; `Intel: N/A (UnsupportedHardware)`; SPD: 2× DDR4 modules (rank=1, 3200 MT/s) — exit 0, no panic in any privilege/CPU state.
 
 Phase 3: Daemon Architecture & Privileged IPC (ramsleuth-daemon, ramsleuth-client)
 

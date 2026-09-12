@@ -174,6 +174,12 @@ StartBenchmark { target, mode }: Initiates bandwidth/latency passes and streams 
 
 CancelBenchmark: Terminates active worker threads cleanly.
 
+4.2 Graceful Degradation & Safety (verified 2026-09-12)
+
+- The **daemon (Phase 3) holds `CAP_SYS_RAWIO`** (plus root where the driver requires it); the GUI/TUI/CLI frontends run completely unprivileged and consume data over the Unix socket.
+- Every privileged hardware access — AMD SMU (ryzen_smu sysfs/char-dev), Intel MCHBAR (`/dev/mem` MMIO), SPD — **degrades to `N/A (<reason>)`** when privilege, driver, or hardware is absent: `InsufficientPrivilege`, `DriverMissing`, `UnsupportedHardware`, `NoDevmem`, `UnknownPmTableVersion`, … The telemetry crate has **no panic path on hardware-derived data** (no `unwrap`/`expect`, no unguarded deref; every read bounds-checked), verified live on the reference host with the `ryzen_smu` module *absent*: AMD → `N/A (DriverMissing)`, Intel → `N/A (UnsupportedHardware)`, SPD → live, exit 0.
+- The daemon inherits this contract: a failing or unprivileged hardware section is a structured `N/A` in the payload — never a crash of the service or the client.
+
 5. Hardware Telemetry & Register Extraction
 
 5.1 AMD Architecture (Zen 1 through Zen 5)
@@ -221,6 +227,13 @@ Reads the raw 512-byte (DDR4) or 1024-byte (DDR5) EEPROM image exposed by the ke
 Parses JEDEC JEP106 manufacturer IDs to identify module and DRAM die makers (e.g., SK Hynix A-die vs M-die, Samsung B-die, Micron).
 
 Decodes Intel XMP 2.0 / 3.0 and AMD EXPO profiles to show factory-rated profiles alongside live trained values.
+
+5.4 Verification Environment & Driver Requirements (confirmed 2026-09-12)
+
+- **AMD live data requires the `ryzen_smu` kernel module to be built, installed, and loaded** on the dev host. The access channel is **sysfs-first**: read `/sys/kernel/ryzen_smu/pm_table` (plain `std::fs`), falling back to the `/dev/ryzen_smu` character device (ioctl via `nix`). The `ryzen_smu` Rust crate is deliberately *not* a dependency (direct driver access; self-owned version-guarded PM parse).
+- Primary dev host: **AMD Ryzen 9 5950X (Zen 3), 16C/32T, 64 MiB L3, DDR4, AVX2; CachyOS, kernel `7.2.3-1-cachyos-custom`** — `ryzen_smu` is **NOT installed** there (`modprobe` fails: module not found; `/sys/kernel/ryzen_smu/` absent). Integration steps (matching headers for `7.2.3-1-cachyos-custom` → build out-of-tree → `depmod -a` → `modprobe` → verify `pm_table`) are documented in `Docs/RamSleuth-v2.md` §"Verification Environment". Until done, AMD sections render `N/A (DriverMissing)`.
+- Intel MCHBAR/IMC path: to be **verified live on the i5-6600 (Skylake, LGA-1151, dual-channel = `channel_count(Skylake) = 2`) test machine**; on the AMD host the path is Intel-gated and returns `N/A (UnsupportedHardware)` with zero `/dev/mem` access.
+- SPD (ee1004) needs no privilege and no extra module: live on both hosts (2× DDR4 modules on the 5950X host).
 
 6. Native Benchmark Engine: Matching AIDA64
 
