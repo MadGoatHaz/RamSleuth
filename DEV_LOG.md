@@ -3,10 +3,10 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-- [ACTIVE] ID: P3-10 | AGENT: general (Implementation Agent) | BRANCH: branch/chunk-P3-10 | FILES: [Cargo.toml, crates/ramsleuth-protocol/*, crates/ramsleuth-bench/src/streamed.rs, crates/ramsleuth-bench/src/orchestrator.rs, DEV_LOG.md]
+(no active leases)
 
 @@@ CURRENT_STATE @@@
-Cycle 3 (Phase 3) - both foundation chains merged into v2-development: P3-02..P3-06 (telemetry serde: cpuid/amd/intel/spd/facade derives + whole-snapshot round-trip, merged as merge: P3-02..P3-06) and P3-07..P3-09 (bench serde: worker/orchestrator derives, new streamed.rs with run_streamed + 7 tests, WorkerError serde via String mirror, AlignedBuf pub(crate) widening, merged as merge: P3-07..P3-09). Workspace green post-merge (tests, clippy -D warnings, build). Next: P3-10 + P3-11 (protocol crate - the payload root SystemMemoryTelemetry and WorkerResult/BenchmarkGrid are wire-ready) and P3-15 (bench_job calls run_streamed).
+Cycle 3 (Phase 3) - P3-10 (protocol crate birth) complete on branch/chunk-P3-10, awaiting review/merge: wire enums BenchMode/Request/Response/Message (serde-derived, payloads reused verbatim) + DEFAULT_SOCKET_PATH; root Cargo.toml gained the member + [workspace.dependencies] (serde/bincode/tokio); contract-forced bench addenda: StreamTarget serde derive + BenchmarkGrid PartialEq. Workspace 183/183, clippy -D warnings clean, build green. Next: review + merge P3-10, then P3-11 (frame codec) and P3-12 (daemon birth).
 @@@ HISTORY @@@
 - [DONE] ID: P3-01-Review | STATUS: SUCCESS | BRANCH: branch/chunk-P3-01
 DECISION: Merged P3-01 (serde derives on NaReason + Section<T>) after clean scope/test/clippy/build audit; committed worker Cargo.lock (serde 1.0.229 + bincode 1.3.3) as 34543f8.
@@ -33,3 +33,6 @@ AHEAD: P3-15 must call ramsleuth_bench::run_streamed(&StreamOptions { target, th
 - [DONE] ID: P3-06/09-Review | STATUS: SUCCESS | BRANCH: v2-development
 DECISION: Reviewed + merged both foundation chains (A: c5c745c telemetry serde; B: bd6115a bench serde + streamed) after scope/test/clippy/build audits; resolved the DEV_LOG.md merge conflict as the union of P3-04..P3-09 history entries; post-merge tree 178/178 green, clippy -D warnings clean, build clean.
 AHEAD: P3-10 (protocol) builds on the wire-ready payload roots: SystemMemoryTelemetry (facade), WorkerResult/BenchOp (worker), Tier/Metric/BenchmarkGrid (orchestrator), StreamProgress/StreamError (streamed); WorkerError is now wire-serializable.
+- [DONE] ID: P3-10 | STATUS: SUCCESS | BRANCH: branch/chunk-P3-10
+DECISION: born ramsleuth-protocol - BenchMode{Full,MemoryOnly}/Request{GetTelemetry,StartBenchmark{target:StreamTarget,mode},CancelBenchmark{run_id}}/Response{Telemetry,BenchStarted,BenchProgress,BenchResult{run_id,grid},BenchCancelled,Error}/Message (all serde-derived, payloads reused verbatim from telemetry+bench; justified clippy::large_enum_variant allows on Response/Message - boxing would break the frozen arm shapes) + DEFAULT_SOCKET_PATH; root Cargo.toml member + [workspace.dependencies] serde/bincode/tokio; two contract-forced bench addenda (recipe scope was 4 files): StreamTarget serde derive (streamed.rs) + BenchmarkGrid PartialEq (orchestrator.rs); 5/5 protocol tests, workspace 183/183, clippy -D warnings clean, build green.
+AHEAD: P3-11 (frame codec) imports ramsleuth_protocol::{Message, Request, Response, BenchMode, DEFAULT_SOCKET_PATH} exactly as declared; P3-12/15/16 construct the unboxed arm shapes (Response::Telemetry(SystemMemoryTelemetry), BenchResult{run_id, grid: BenchmarkGrid}) - any boxing now is a frozen-contract change.
