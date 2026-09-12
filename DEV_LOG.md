@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [ACTIVE] ID: P3-11 | AGENT: general (impl-P3-11) | BRANCH: branch/chunk-P3-11 | FILES: crates/ramsleuth-protocol/src/frame.rs, crates/ramsleuth-protocol/src/lib.rs
 
 @@@ CURRENT_STATE @@@
 Cycle 3 (Phase 3) - P3-10 (protocol crate birth) complete on branch/chunk-P3-10, awaiting review/merge: wire enums BenchMode/Request/Response/Message (serde-derived, payloads reused verbatim) + DEFAULT_SOCKET_PATH; root Cargo.toml gained the member + [workspace.dependencies] (serde/bincode/tokio); contract-forced bench addenda: StreamTarget serde derive + BenchmarkGrid PartialEq. Workspace 183/183, clippy -D warnings clean, build green. Next: review + merge P3-10, then P3-11 (frame codec) and P3-12 (daemon birth).

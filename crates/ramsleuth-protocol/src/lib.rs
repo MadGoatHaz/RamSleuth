@@ -18,6 +18,8 @@
 //! for the daemon and every client (plan D5: the daemon accepts a
 //! `--socket` override so it can run unprivileged for local dev).
 
+pub mod frame;
 pub mod messages;
 
+pub use frame::{decode_frame, encode_frame, Frame, FrameError, MAX_FRAME_SIZE};
 pub use messages::{BenchMode, DEFAULT_SOCKET_PATH, Message, Request, Response};
