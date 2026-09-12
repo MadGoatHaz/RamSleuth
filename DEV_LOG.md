@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [branch/chunk-P3-06] P3-06 serde facade.rs (impl-P3-06) STARTED
 
 @@@ CURRENT_STATE @@@
 Cycle 3 (Phase 3) - P3-05 COMPLETE on branch/chunk-P3-05 (unmerged, awaiting review): serde derives on SpdProfile + SpdModule; 97/97 lib + 6/6 bin tests green incl. new 2-module bincode round-trip, clippy -D warnings clean, workspace build green. Next: P3-05 review/merge, then P3-06.
