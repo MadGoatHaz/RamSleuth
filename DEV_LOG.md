@@ -111,5 +111,70 @@ AHEAD: plan text is stale vs the freeze (§D5 + P2-02 scope: old variants Unsupp
 - `pub mod intel_mchbar;` wired in `lib.rs` (line 20); `Cargo.toml` untouched vs `v2-development` (nix 0.29 reused — sole Phase-2 dep, added in P2-03).
 - Toolchain: `cargo check` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` **47/47 pass** (8 new `intel_mchbar` tests; none require root, an Intel CPU, or `/dev/mem`).
 
+## PHASE 2 QA AUDIT
+
+**Auditor:** general (QA Auditor) | **Branch:** `v2-development` @ `367bef9` (clean tree confirmed before start) | **Date:** 2026-09-12 | **Host:** AMD Ryzen 9 5950X (Zen 3, 16C/32T, AVX2, no AVX-512); `ryzen_smu` kernel module NOT loaded; no Intel silicon; SPD EEPROM live (2x512B DDR4 images).
+
+### Gate results (8 gates + clean-tree precondition)
+
+| Gate | Command | Result |
+|------|---------|--------|
+| Clean tree / branch | `git status --porcelain` on `v2-development` | PASS — empty, HEAD 367bef9 |
+| 1. clippy | `cargo clippy --workspace --all-targets -- -D warnings` | PASS — zero warnings, exit 0 |
+| 2. tests debug | `cargo test --workspace` | PASS — 159/159, 0 failed (bench lib 60 + bench bin 3 + telemetry lib 90 + telemetry bin 6) |
+| 3. tests release | `cargo test --workspace --release` | PASS — 159/159, 0 failed (same breakdown) |
+| 4. release build | `cargo build --workspace --release` | PASS — exit 0 |
+| 5. telemetry live | `cargo run -p ramsleuth-telemetry --release` | PASS — exit 0, no panic/segfault; expected host state rendered (output below) |
+| 6. JSON valid | `--json` + `python3 -m json.tool` | PASS — exit 0, parses clean; keys {cpu, amd, intel, spd}; amd=null, intel=null, spd count=2 |
+| 7. help / exit codes | `--help` exit 0; `--bogus` exit 2 | PASS — usage printed exit 0; "unknown flag: --bogus" exit 2 |
+| 8. bench regression | `cargo run -p ramsleuth-bench --release` | PASS — exit 0, 4x4 grid printed (Memory/L3/L2/L1 x Read/Write/Copy/Latency) |
+
+**OVERALL: PASS — all gates executed, zero failures, no source modifications (QA is read + run + log only; not pushed per instruction).**
+
+### Live dashboard output (actual printed lines, exit 0)
+
+```
+CPU: Amd(Zen3) — AMD Ryzen 9 5950X 16-Core Processor
+AMD: N/A (DriverMissing)
+Intel: N/A (UnsupportedHardware)
+SPD[0]: SpdModule { index: 82, is_ddr5: false, maker: Value("0xC1"), part: Na(NotApplicable), serial: Na(NotApplicable), rank: Value(1), density_mbit: Na(ParseError("DDR4 density code 0x0D not recognized")), speed_mts: Value(3200), profiles: [] }
+SPD[1]: SpdModule { index: 83, is_ddr5: false, maker: Value("0xC1"), part: Na(NotApplicable), serial: Na(NotApplicable), rank: Value(1), density_mbit: Na(ParseError("DDR4 density code 0x0D not recognized")), speed_mts: Value(3200), profiles: [] }
+```
+
+Sanity checks: CPU vendor Amd (Zen3) OK; AMD graceful `N/A (DriverMissing)` (no panic — ryzen_smu absent) OK; Intel `N/A (UnsupportedHardware)` OK (AMD silicon); SPD lists 2 modules, both DDR4 with rank Value(1) and speed Value(3200) OK; exit 0, no panic/segfault OK.
+
+### Live JSON output (validated with python3 json.tool)
+
+```
+{"cpu":{"vendor":"Amd(Zen3)","brand":"AMD Ryzen 9 5950X 16-Core Processor"},"amd":null,"intel":null,"spd":["SpdModule { index: 82, is_ddr5: false, maker: Value(\"0xC1\"), part: Na(NotApplicable), serial: Na(NotApplicable), rank: Value(1), density_mbit: Na(ParseError(\"DDR4 density code 0x0D not recognized\")), speed_mts: Value(3200), profiles: [] }","SpdModule { index: 83, is_ddr5: false, maker: Value(\"0xC1\"), part: Na(NotApplicable), serial: Na(NotApplicable), rank: Value(1), density_mbit: Na(ParseError(\"DDR4 density code 0x0D not recognized\")), speed_mts: Value(3200), profiles: [] }"]}
+```
+
+### Bench regression output (Phase 1, exit 0)
+
+```
+ramsleuth-bench: 16 physical cores (32 logical, SMT on), total L3 64 MiB, AVX2 yes, AVX-512 no
+Tier             Read (GB/s) Write (GB/s)  Copy (GB/s) Latency (ns)
+Memory (DRAM)          49.83        44.03        16.05         79.0
+L3                     68.96        31.49        17.45         34.6
+L2                      1.43         1.39         1.43          5.1
+L1                      0.08         0.08         0.09          1.4
+```
+
+### BLOCKED gates (hardware/driver availability — NOT code failures)
+
+1. **AMD tick-identical ground truth** (v2 sec 2.2.1 acceptance: tick-identical to ryzen_smu, clocks +/-1 MHz, voltages +/-10 mV) — BLOCKED: `ryzen_smu` kernel module is not loaded on this host and module load + root execution is unavailable here. Code path degrades gracefully to `N/A (DriverMissing)` as designed.
+2. **Intel live MCHBAR decode** — BLOCKED: no Intel silicon on this host (AMD-only). Vendor gate correctly returns `N/A (UnsupportedHardware)` with zero /dev/mem or PCI access (frozen P2-06/07 contract).
+3. **Model reconciliation vs live silicon** — three skeleton/model items remain unverifiable on this host:
+   - AMD PM byte offsets: P2-04 packed-u16 skeleton vs the real driver f32 metrics blob — needs a live ryzen_smu blob.
+   - Intel IMC register offsets (0x5058 global, 0x5400+ch*0x100 block): documented P2-07 model — needs live Intel silicon.
+   - SPD model: live modules report maker `0xC1` (raw hex, outside the frozen JEP106 12-entry table) and DDR4 density code `0x0D` (outside the documented 0x10..=0x17 model, renders `Na(ParseError(...))`). Both render per the no-panic contract; table/encoding reconciliation is a model decision (carried since P2-09).
+
+### Anomalies
+
+None blocking. Non-blocking observations:
+- Live SPD density code 0x0D is outside the documented DDR4 model -> `Na(ParseError("DDR4 density code 0x0D not recognized"))` while rank Value(1) and speed Value(3200) still decode — expected graceful degradation; reconciliation item 3 above.
+- JSON `spd` entries are escaped Debug strings (frozen P2-11 hand-rolled design, no serde), not nested objects — confirmed valid JSON and parseable.
+- All counts match expectation: telemetry 96/96 (90 lib + 6 bin) plus Phase 1 bench 63 (60 lib + 3 bin) = 159, in both debug and release.
+
 @@@ CURRENT_STATE @@@
-Phase 2 (telemetry) complete — all 11 chunks merged to v2-development; ready for QA.
+Phase 2 QA audit COMPLETE (2026-09-12, HEAD 367bef9, clean tree): OVERALL PASS — all 8 gates (clippy 0 warnings; tests 159/159 debug; tests 159/159 release; release build; telemetry live exit 0 with expected graceful N/A state; JSON valid; --help exit 0 / --bogus exit 2; bench 4x4 regression). BLOCKED on hardware only: (a) AMD tick-identical ground truth (ryzen_smu module + root absent), (b) Intel live MCHBAR decode (no Intel silicon), (c) AMD PM offsets / Intel IMC offsets / SPD maker-0xC1 + density-0x0D model reconciliation (skeleton offsets need live silicon). No source modifications; not pushed per QA instruction.
