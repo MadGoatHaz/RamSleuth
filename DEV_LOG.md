@@ -6,4 +6,4 @@ Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retain
 (no active leases)
 
 @@@ CURRENT_STATE @@@
-P2-01 implemented on branch/chunk-P2-01; awaiting review.
+P2-01 merged to v2-development; ready for P2-02.
