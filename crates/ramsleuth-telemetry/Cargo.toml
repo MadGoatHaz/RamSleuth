@@ -18,3 +18,16 @@ rust-version.workspace = true
 # (D6; the driver's companion RSMU_IOC_GET_VERSION). All features are
 # added up front so P2-06 need not touch this manifest again.
 nix = { version = "0.29", features = ["fs", "ioctl", "mman"] }
+# P3-01: serde for the wire-contract types `NaReason` + `Section<T>`
+# (plan D2/D7, dependency ledger: the telemetry `serde` entry is owned
+# by P3-01). The `derive` feature backs `#[derive(serde::Serialize,
+# serde::Deserialize)]` in src/error.rs. `TelemetryError` deliberately
+# gets no serde: its `Io` arm holds a non-serializable
+# `std::io::Error` and never crosses the wire (plan D2).
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# P3-01: test-only bincode round-trips of `NaReason` / `Section<T>`
+# (plan D3: bincode 1.3 is the wire codec format; the runtime
+# dependency on it stays owned by ramsleuth-protocol, P3-10).
+bincode = "1.3"
