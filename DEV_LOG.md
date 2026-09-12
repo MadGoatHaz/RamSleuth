@@ -6,7 +6,7 @@ Base branch: `v2-development`. Phase 1 plan: `plans/PLAN.md`. Sign in/out under 
 (no active leases)
 
 @@@ CURRENT_STATE @@@
-P1-10 review passed on branch/chunk-P1-10; merging to v2-development.
+P1-10 merged to v2-development; ready for P1-11 (verification CLI).
 
 ## History
 - [DONE] ID: P1-10 REVIEW | STATUS: SUCCESS | BRANCH: branch/chunk-P1-10
