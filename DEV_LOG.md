@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [branch/chunk-P3-07] P3-07 serde bench worker.rs (impl-P3-07) STARTED
 
 @@@ CURRENT_STATE @@@
 Cycle 3 (Phase 3) - P3-01 MERGED to v2-development: serde derives on NaReason + Section<T> (wire-contract foundation, bincode round-trips green). Next: P3-02.

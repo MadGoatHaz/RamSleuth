@@ -81,7 +81,7 @@ const AVX512_BLOCK_BYTES: usize = 64;
 const WRITE_PATTERN: u64 = 0xA5A5_5AA5_5AA5_A55A;
 
 /// Bandwidth operation a worker pool runs over the caller's buffers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BenchOp {
     /// Stream-read `src`; the checksum covers the read data.
     Read,
@@ -93,7 +93,7 @@ pub enum BenchOp {
 }
 
 /// Aggregated outcome of one [`run_pinned`] pass over the full buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkerResult {
     /// The operation that was run.
     pub op: BenchOp,
@@ -819,5 +819,47 @@ mod tests {
         assert_eq!(res.checksum, 0, "zeroed buffer checksums to 0");
         dealloc_aligned(src_ptr, LEN);
         dealloc_aligned(dst_ptr, LEN);
+    }
+
+    /// (P3-07) Every `BenchOp` arm round-trips through bincode (the Phase 3
+    /// frame codec, plan D3), proving the op tag is wire-serializable.
+    #[test]
+    fn bench_op_bincode_round_trip() {
+        let ops = vec![BenchOp::Read, BenchOp::Write, BenchOp::Copy];
+        let bytes = bincode::serialize(&ops).expect("BenchOp must serialize");
+        let back: Vec<BenchOp> = bincode::deserialize(&bytes).expect("BenchOp must deserialize");
+        assert_eq!(ops, back);
+    }
+
+    /// (P3-07) Representative `WorkerResult`s (one per op; mixed pinning;
+    /// the write arm keeps its `checksum == total_bytes` invariant)
+    /// round-trip through bincode - the aggregated pass outcome is
+    /// wire-serializable (P3-07 exit criterion).
+    #[test]
+    fn worker_result_bincode_round_trip() {
+        let results = vec![
+            WorkerResult {
+                op: BenchOp::Read,
+                total_bytes: 1024,
+                checksum: 0xDEAD_BEEF,
+                pinned: true,
+            },
+            WorkerResult {
+                op: BenchOp::Write,
+                total_bytes: 65536,
+                checksum: 65536,
+                pinned: false,
+            },
+            WorkerResult {
+                op: BenchOp::Copy,
+                total_bytes: 0,
+                checksum: 0,
+                pinned: true,
+            },
+        ];
+        let bytes = bincode::serialize(&results).expect("WorkerResult must serialize");
+        let back: Vec<WorkerResult> =
+            bincode::deserialize(&bytes).expect("WorkerResult must deserialize");
+        assert_eq!(results, back);
     }
 }

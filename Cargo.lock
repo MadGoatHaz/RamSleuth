@@ -69,7 +69,9 @@ dependencies = [
 name = "ramsleuth-bench"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "libc",
+ "serde",
 ]
 
 [[package]]
