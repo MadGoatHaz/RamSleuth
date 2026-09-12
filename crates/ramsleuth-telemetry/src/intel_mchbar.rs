@@ -24,8 +24,8 @@
 //! 4. **Read-only map:** open `/dev/mem` (fallback `/dev/fmem`) and
 //!    `mmap(PROT_READ, MAP_PRIVATE)` the 1 MiB MCHBAR window at the decoded
 //!    base, owned by the RAII [`MchBar`] guard.
-//!    - EACCES/EPERM (incl. STRICT_DEVMEM range rejections) →
-//!      [`TelemetryError::InsufficientPrivilege`].
+//!    - EACCES/EPERM, or a STRICT_DEVMEM range rejection surfaced by the
+//!      kernel as EIO/ENODATA, → [`TelemetryError::InsufficientPrivilege`].
 //!    - Neither node present → [`TelemetryError::DriverMissing`].
 //!
 //! # Safety
@@ -134,14 +134,16 @@ impl MchBar {
         // `region + offset .. region + offset + 4` lies fully inside the
         // live `len`-byte mapping this `MchBar` owns (it is not dropped
         // until after this call returns). The mapping is `PROT_READ`, and a
-        // byte-wise read imposes no alignment requirement.
+        // byte-wise read imposes no alignment requirement. The reads are
+        // `read_volatile` because the target is MMIO: the compiler must not
+        // hoist, cache, or deduplicate these accesses across calls.
         let p = self.region.as_ptr().wrapping_add(offset);
         Ok(unsafe {
             u32::from_le_bytes([
-                p.read(),
-                p.wrapping_add(1).read(),
-                p.wrapping_add(2).read(),
-                p.wrapping_add(3).read(),
+                p.read_volatile(),
+                p.wrapping_add(1).read_volatile(),
+                p.wrapping_add(2).read_volatile(),
+                p.wrapping_add(3).read_volatile(),
             ])
         })
     }
@@ -402,6 +404,11 @@ fn mmap_devmem(fd: RawFd, base: u64) -> TelemetryResult<NonNull<u8>> {
 /// and STRICT_DEVMEM range rejections (EIO/ENODATA) →
 /// [`TelemetryError::InsufficientPrivilege`]; absent node →
 /// [`TelemetryError::DriverMissing`]; anything else → [`TelemetryError::Io`].
+///
+/// The STRICT_DEVMEM arm matches on the raw OS code rather than
+/// [`std::io::ErrorKind`]: the kernel rejects a non-RAM (PCI MMIO) `mmap`
+/// through `/dev/mem` with EIO (ENODATA in some configs), which Rust
+/// surfaces as `ErrorKind::Other` — the kind-based arms above never see it.
 #[cfg(target_os = "linux")]
 fn classify_devmem(e: &std::io::Error) -> TelemetryError {
     match e.kind() {
@@ -409,7 +416,14 @@ fn classify_devmem(e: &std::io::Error) -> TelemetryError {
             hint: PRIV_HINT_DEVMEM,
         },
         std::io::ErrorKind::NotFound => TelemetryError::DriverMissing { driver: DEV_MEM },
-        _ => TelemetryError::Io(reconstruct_io(e)),
+        _ => match e.raw_os_error() {
+            // STRICT_DEVMEM range rejection (drivers/char/mem.c): EIO, or
+            // ENODATA in some kernel configs.
+            Some(code) if code == nix::libc::EIO || code == nix::libc::ENODATA => {
+                TelemetryError::InsufficientPrivilege { hint: PRIV_HINT_DEVMEM }
+            }
+            _ => TelemetryError::Io(reconstruct_io(e)),
+        },
     }
 }
 
@@ -587,5 +601,26 @@ mod tests {
             check_read_bounds(usize::MAX, 1024),
             Err(TelemetryError::Parse { .. })
         ));
+    }
+
+    /// STRICT_DEVMEM (review fix F1): on a root host with
+    /// `CONFIG_STRICT_DEVMEM`, `mmap` of a non-RAM (PCI MMIO) range through
+    /// `/dev/mem` fails with EIO (ENODATA in some kernel configs). Rust
+    /// surfaces those as `ErrorKind::Other` with the raw OS code — so the
+    /// classification must match the raw code and still yield
+    /// [`TelemetryError::InsufficientPrivilege`] with the devmem hint per the
+    /// frozen contract (never `Io`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_devmem_rejections_classify_as_insufficient_privilege() {
+        for code in [nix::libc::EIO, nix::libc::ENODATA] {
+            assert_eq!(
+                classify_devmem(&std::io::Error::from_raw_os_error(code)),
+                TelemetryError::InsufficientPrivilege {
+                    hint: PRIV_HINT_DEVMEM
+                },
+                "raw OS code {code} (STRICT_DEVMEM rejection) must classify as InsufficientPrivilege, not Io"
+            );
+        }
     }
 }

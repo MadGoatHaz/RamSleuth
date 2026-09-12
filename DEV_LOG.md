@@ -3,6 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retained as `plans/PLAN.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
+- [ACTIVE] ID: P2-06-fix | AGENT: general (Implementation Agent) | BRANCH: branch/chunk-P2-06 | FILES: crates/ramsleuth-telemetry/src/intel_mchbar.rs, DEV_LOG.md
 @@@ HISTORY @@@
 - [DONE] ID: review-P2-06 | STATUS: FAILED | BRANCH: branch/chunk-P2-06
 DECISION: P2-06 review did not merge — one blocking frozen-contract deviation: classify_devmem (intel_mchbar.rs:406-414) maps only PermissionDenied->InsufficientPrivilege and NotFound->DriverMissing; STRICT_DEVMEM mmap rejections (EIO=5 / ENODATA=61, kernel drivers/char/mem.c) fall to the catch-all `_` arm -> TelemetryError::Io, violating the shipped "EACCES/EPERM/STRICT_DEVMEM -> InsufficientPrivilege"; module doc (lines 27-28) and the P2-06 entry below both falsely claim that mapping; all other audit items verified passing.
