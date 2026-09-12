@@ -3,7 +3,8 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retained as `plans/PLAN.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-@@@ HISTORY @@@
+- [ACTIVE] ID: review-P2-11 | AGENT: general (Code Reviewer) | BRANCH: branch/chunk-P2-11 | FILES: [DEV_LOG.md, crates/ramsleuth-telemetry/src/main.rs]
+@@@ HISTORY @@@@@@ HISTORY @@@
 - [DONE] ID: P2-11 | STATUS: SUCCESS | BRANCH: branch/chunk-P2-11
 DECISION: Implemented main.rs — the thin P2-11 verification CLI (no serde, no clap; Cargo.toml/lib.rs/providers untouched): hand-parsed flags (--json; -h/--help short-circuit to usage + exit 0; unknown flag -> stderr + exit 2), dashboard render (CPU line, AMD/Intel lines via render_section, one SPD[i] line per module or a single N/A line when empty), hand-rolled to_json (Section: Na -> null, Value -> escaped Debug string; each SpdModule -> escaped Debug string; json_escape covers \"/\//\n/\t/\r + \u00XX control arm), and exit 0 after every successful render even when all sections are Na (no-panic contract D5); 6 new pure tests (render_section Value/Na, dashboard all-Na + SPD-module lines, to_json structural keys + null + module string, json_escape full table, parse_opts flags incl. Err verbatim); zero warnings (check + clippy --all-targets -D warnings), 96/96 tests pass (90 lib + 6 bin), bin builds; tests never call collect() (QA runs the live path).
 AHEAD: Awaiting review — do NOT merge yet; QA live run on this host expected: amd=Na(DriverMissing) (ryzen_smu absent), intel=Na(UnsupportedHardware) (AMD silicon), spd=2 modules (0x52/0x53), exit 0 in both text and --json modes.
