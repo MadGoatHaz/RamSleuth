@@ -3,8 +3,11 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retained as `plans/PLAN.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-- [ACTIVE] ID: P2-05 | AGENT: general (Implementation) | BRANCH: branch/chunk-P2-05 | FILES: amd_readout.rs, lib.rs
 @@@ HISTORY @@@
+- [DONE] ID: P2-05 | STATUS: SUCCESS | BRANCH: branch/chunk-P2-05
+DECISION: Implemented amd_readout.rs — froze the four vendor-neutral display types (ClockReadout/TimingSet/CadBus/VoltageSet, every field Section<T>) + DivMode/GearMode/RttValue + map_amd(AmdPmSnapshot→AmdReadout); sanity-gated (clock [1,4096] MHz, tick [1,2048], mV [100,4000], RZQ=240Ω code table, AMD gear_mode=Na); no I/O, no unsafe; 10 new tests; wired pub mod amd_readout.
+AHEAD: Frozen shared types use mV (not volts) and ticks (not ns) per the brief — P2-07 (Intel) and P2-10 (facade) must target these exact Section<T> types; CAD RZQ/driver byte layout is still a P2-04 skeleton pending P2-11 live reconciliation.
+
 - [DONE] ID: review-P2-04 | STATUS: SUCCESS | BRANCH: v2-development
 DECISION: Merged P2-04 (no-ff): safety (the critical property) verified — every read goes through bounds-checked read_u8/u16le/u32le (slice .get + saturating_add; OOB -> Err(Parse), never panics, never indexes), PmLayout::from_version guard (7.11.x/12.x/13.x else UnknownPmTableVersion, propagated before any blob read), header cross-check + min-length gate; contract verified (AmdPmSnapshot fields 27x u16 timings / 8x u16 CAD / 4x u16 mV, parse(&SmuContext) -> TelemetryResult, PmLayout+offsets()+name(), pub mod amd_pm in lib.rs, no I/O, no unsafe, no new deps); clippy --all-targets -D warnings clean, 29/29 tests (9/9 amd_pm; truncation sweep of every length 0..end -> Err(Parse), no crash).
 AHEAD: NOTE (format reconciliation): P2-04 AMD PM offsets are a plan-mandated skeleton (packed-u16); the real ryzen_smu blob is reported as an f32 array with the version in a separate attribute. Byte-exact format reconciliation + live tick verification (tick-identical to ryzen_smu CLI, clocks ±1 MHz, voltages ±10 mV) is BLOCKED on this host until the ryzen_smu module is loaded AND run as root. Reconcile at P2-11/QA.
@@ -27,4 +30,4 @@ DECISION: Merged P2-02 (no-ff): code matches the shipped freeze — 6 TelemetryE
 AHEAD: plan text is stale vs the freeze (§D5 + P2-02 scope: old variants UnsupportedVendor/NoDevmem/InvalidValue, Section{Na(TelemetryError)} + is_value/as_option/reason) — reconcile via plan edit before P2-03; downstream P2-06/P2-07/P2-10 specs cite those removed identifiers.
 
 @@@ CURRENT_STATE @@@
-P2-04 merged to v2-development; ready for P2-05. AMD PM offsets are skeleton — live reconciliation needs ryzen_smu module + root.
+P2-05 implemented on branch/chunk-P2-05; awaiting review.
