@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Phase 1 plan: `plans/PLAN.md`. Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [ACTIVE] ID: P1-10 | AGENT: general (Implementation Agent) | BRANCH: branch/chunk-P1-10 | FILES: crates/ramsleuth-bench/src/orchestrator.rs, crates/ramsleuth-bench/src/lib.rs
 
 @@@ CURRENT_STATE @@@
 P1-09 merged to v2-development; ready for P1-10 (orchestrator must materialize 64B-strided tier buffer for DRAM latency).

@@ -56,3 +56,9 @@ pub use worker::{BenchOp, WorkerError, WorkerResult, run_pinned};
 // Instant fallback).
 mod latency;
 pub use latency::{build_chase_ring, chase_latency_ns};
+
+// P1-10: benchmark orchestrator — runs all tiers × ops, aggregates the
+// AIDA64-style 4×4 grid, and materializes the 64-byte-strided chase buffer
+// for true DRAM latency.
+mod orchestrator;
+pub use orchestrator::{BenchmarkGrid, Metric, OrchestratorError, Tier, run_all};
