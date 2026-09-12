@@ -47,7 +47,7 @@ use crate::spd_eeprom;
 ///   or when the MCHBAR map is unavailable.
 /// - `spd`: the decoded SPD modules, one per bound `ee1004` device;
 ///   empty when the driver is absent or no device is bound.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SystemMemoryTelemetry {
     /// The detected CPU (vendor + brand).
     pub cpu: CpuInfo,
@@ -192,6 +192,7 @@ fn section_from<T>(result: TelemetryResult<T>) -> Section<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::amd_readout::{CadBus, ClockReadout, DivMode, RttValue, TimingSet, VoltageSet};
     use crate::cpuid::{AmdZen, IntelGen};
 
     /// (a) `reason_from` maps each of the six frozen `TelemetryError`
@@ -350,5 +351,124 @@ mod tests {
             speed_mts: Section::Value(3200),
             profiles: Vec::new(),
         }
+    }
+    // ------------------------------------------------------------------
+    // (d) P3-06: serde wire contract - whole-snapshot round-trips.
+    // ------------------------------------------------------------------
+
+    /// A representative [`AmdReadout`] fixture (mixed `Value` + `Na`
+    /// cells across all four display sets), host-independent.
+    fn fixture_amd() -> AmdReadout {
+        AmdReadout {
+            clocks: ClockReadout {
+                mclk_mhz: Section::Value(1600.0),
+                uclk_mhz: Section::Value(1600.0),
+                fclk_mhz: Section::Value(1800.0),
+                div_mode: Section::Value(DivMode::OneToOne),
+                gear_mode: Section::na(NaReason::NotApplicable),
+                gdm: Section::Value(false),
+                pdm: Section::Value(true),
+            },
+            timings: TimingSet {
+                cl: Section::Value(16),
+                rcwdwr: Section::Value(16),
+                rcdrd: Section::Value(16),
+                rp: Section::Value(16),
+                ras: Section::Value(34),
+                rc: Section::Value(50),
+                rrds: Section::Value(4),
+                rrld: Section::Value(8),
+                faw: Section::Value(16),
+                wtrs: Section::Value(4),
+                wtrl: Section::Value(12),
+                wr: Section::Value(20),
+                rfc1: Section::Value(75),
+                rfc2: Section::na(NaReason::ParseError("fixture".to_owned())),
+                rfcsb: Section::Value(38),
+                cwl: Section::Value(12),
+                rtp: Section::Value(8),
+                rdwr: Section::Value(8),
+                wrrd: Section::Value(4),
+                rdrd_sd: Section::Value(4),
+                rdrd_dd: Section::Value(8),
+                rdrd_scl: Section::Value(8),
+                rdrd_sc: Section::Value(8),
+                wrwr_sd: Section::Value(4),
+                wrwr_dd: Section::Value(8),
+                wrwr_scl: Section::Value(8),
+                wrwr_sc: Section::Value(8),
+            },
+            cad_bus: CadBus {
+                proc_odt: Section::Value(33.0),
+                rtt_nom: Section::Value(RttValue::Rzq(10)),
+                rtt_wr: Section::Value(RttValue::Ohms(45.0)),
+                rtt_park: Section::na(NaReason::NotApplicable),
+                clk_drv: Section::Value(48.0),
+                addr_cmd_drv: Section::Value(48.0),
+                cs_odt_drv: Section::Value(33.0),
+                cke_drv: Section::Value(48.0),
+            },
+            voltages: VoltageSet {
+                vddcr_soc_mv: Section::Value(1150),
+                vddio_mem_mv: Section::Value(1350),
+                vdd_misc_mv: Section::Value(1100),
+                vpp_mv: Section::Value(1800),
+            },
+        }
+    }
+
+    /// The full snapshot root is wire-safe: a representative
+    /// [`SystemMemoryTelemetry`] (a `Value` AMD readout with mixed
+    /// `Value`/`Na` cells, a `Na` Intel branch, two SPD modules) and a
+    /// fully-degraded all-`Na` snapshot each round-trip through bincode
+    /// and compare equal — every field of the Phase 2 exit-criteria
+    /// struct crosses the wire.
+    #[test]
+    fn system_memory_telemetry_bincode_round_trip() {
+        // representative: Value + Na sections across CPU / AMD / Intel / SPD
+        let t = SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Amd(AmdZen::Zen3),
+                brand: "Ryzen 9 5950X".to_owned(),
+            },
+            amd: Section::Value(fixture_amd()),
+            intel: Section::Na(NaReason::UnsupportedHardware),
+            spd: vec![fixture_module(0x52), fixture_module(0x53)],
+        };
+
+        let bytes = bincode::serialize(&t)
+            .expect("SystemMemoryTelemetry must serialize (no-panic contract)");
+        let back: SystemMemoryTelemetry =
+            bincode::deserialize(&bytes).expect("SystemMemoryTelemetry must deserialize");
+        assert_eq!(t, back);
+
+        // fully degraded: every branch `Na`, no SPD modules
+        let all_na = SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Unknown,
+                brand: "Unknown".to_owned(),
+            },
+            amd: Section::Na(NaReason::DriverMissing),
+            intel: Section::Na(NaReason::InsufficientPrivilege),
+            spd: Vec::new(),
+        };
+        let bytes = bincode::serialize(&all_na)
+            .expect("SystemMemoryTelemetry must serialize (no-panic contract)");
+        let back: SystemMemoryTelemetry =
+            bincode::deserialize(&bytes).expect("SystemMemoryTelemetry must deserialize");
+        assert_eq!(all_na, back);
+    }
+
+    /// (d') Live snapshot: `collect()` on this host (root or not)
+    /// bincode-serializes, round-trips, and compares equal — the whole
+    /// Phase 2 snapshot is wire-safe in every privilege state.
+    #[test]
+    fn collect_on_this_host_bincode_round_trip() {
+        let t = collect();
+        let bytes = bincode::serialize(&t)
+            .expect("SystemMemoryTelemetry must serialize (no-panic contract)");
+        let back: SystemMemoryTelemetry =
+            bincode::deserialize(&bytes).expect("SystemMemoryTelemetry must deserialize");
+        assert_eq!(t, back);
     }
 }

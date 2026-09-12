@@ -19,7 +19,7 @@
 ///
 /// Keyed by the CPUID family observed on real Zen silicon (the reference test
 /// host, a Ryzen 9 5950X / Zen 3, reports family `0x19`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AmdZen {
     /// Zen 1 (family `0x15`).
     Zen1,
@@ -36,7 +36,7 @@ pub enum AmdZen {
 /// Intel microarchitecture generation, for MCHBAR IMC decoding (P2-07).
 ///
 /// Best-effort model table covering Skylake through Arrow Lake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IntelGen {
     /// 6th gen (Skylake, 2015) — DDR4.
     Skylake,
@@ -69,7 +69,7 @@ pub enum IntelGen {
 ///   [`IntelGen::Unrecognized`]).
 /// - [`CpuVendor::Unknown`]: unrecognized vendor, or an AMD CPU whose family
 ///   is outside the frozen [`AmdZen`] set (e.g. a future Zen).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CpuVendor {
     Amd(AmdZen),
     Intel(IntelGen),
@@ -79,7 +79,7 @@ pub enum CpuVendor {
 /// Detected CPU information, produced by [`CpuInfo::detect()`].
 ///
 /// `vendor` is the frozen dispatch key; `brand` is the CPUID brand string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CpuInfo {
     pub vendor: CpuVendor,
     pub brand: String,
@@ -322,5 +322,20 @@ mod tests {
             info.vendor,
             CpuVendor::Amd(_) | CpuVendor::Intel(_) | CpuVendor::Unknown
         ));
+    }
+
+    /// (P3-02) The CPUID types are wire-serializable: the live
+    /// `detect()` snapshot (vendor + generation + brand) round-trips
+    /// through bincode (the Phase 3 frame codec, plan D3) and
+    /// compares equal. The host is self-consistent, so equality holds
+    /// for any vendor/generation combination.
+    #[test]
+    fn cpu_info_bincode_round_trip() {
+        let info = CpuInfo::detect();
+        let bytes = bincode::serialize(&info)
+            .expect("CpuInfo must serialize (no-panic contract)");
+        let back: CpuInfo =
+            bincode::deserialize(&bytes).expect("CpuInfo must deserialize");
+        assert_eq!(info, back);
     }
 }

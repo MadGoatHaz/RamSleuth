@@ -136,7 +136,7 @@ pub const JEP106: &[(u8, &str)] = &[
 /// invalid field degrades to `Na`, never a panic. `speed_mts` is the
 /// profile data rate (2x the profile clock); `voltage` is in
 /// millivolts (consistent with the P2-05 mV display contract).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SpdProfile {
     /// 1-based profile slot number.
     pub index: u8,
@@ -159,7 +159,7 @@ pub struct SpdProfile {
 /// Frozen (P2-09). The P2-10 facade carries `Vec<SpdModule>` into
 /// `SystemMemoryTelemetry.spd`. `index` is the I2C address from the
 /// P2-08 [`SpdImage`]; every other field is a [`Section`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SpdModule {
     /// Module index: the I2C address of the `ee1004` device
     /// ([`SpdImage::index`]).
@@ -909,6 +909,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // (f) P3-05: serde wire contract - bincode round-trips.
+    // ------------------------------------------------------------------
+
+    /// A representative `SpdModule` (a decoded DDR4 module carrying one
+    /// XMP 2.0 profile), the 2-module DDR4 + DDR5 fixture, and an all-`Na`
+    /// module with empty `profiles` each round-trip through bincode,
+    /// proving the SPD field tree (`Section<String/u8/u16>`,
+    /// `Vec<SpdProfile>`) is wire-safe.
+    #[test]
+    fn spd_module_bincode_round_trip() {
+        let ddr4 = decode(&ddr4_image());
+        let ddr5 = decode(&ddr5_image());
+        // all-Na degradation: blank image -> every field `Na`, no profiles
+        let all_na = decode(&SpdImage {
+            index: 0x53,
+            data: vec![0u8; 1024],
+        });
+
+        for m in [&ddr4, &ddr5, &all_na] {
+            let bytes = bincode::serialize(m)
+                .expect("SpdModule must serialize (no-panic contract)");
+            let back: SpdModule =
+                bincode::deserialize(&bytes).expect("SpdModule must deserialize");
+            assert_eq!(*m, back);
+        }
+
+        // the 2-module fixture (the `SystemMemoryTelemetry.spd` shape) too
+        let modules = vec![ddr4, ddr5];
+        let bytes = bincode::serialize(&modules)
+            .expect("Vec<SpdModule> must serialize (no-panic contract)");
+        let back: Vec<SpdModule> =
+            bincode::deserialize(&bytes).expect("Vec<SpdModule> must deserialize");
+        assert_eq!(modules, back);
     }
 }
 
