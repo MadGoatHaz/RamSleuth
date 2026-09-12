@@ -26,6 +26,7 @@ pub mod caps;
 pub mod socket;
 pub mod cache;
 pub mod bench_job;
+pub mod rpc;
 
 // P3-12: the SOFT privilege probe, re-exported at the root (workspace
 // re-export style) — the daemon's "warn, keep serving" contract
@@ -53,3 +54,14 @@ pub use cache::TelemetryCache;
 // connection; `JobError::Busy` maps onto the wire's
 // `Response::Error("benchmark already running")` (plan D6).
 pub use bench_job::{BenchJobManager, JobError, JobEvent, JobHandle};
+// P3-16: the per-connection async RPC loop, re-exported at the root
+// (workspace re-export style) — P3-17 (main) builds one
+// `DaemonContext` (the P3-14 cache behind a mutex + the P3-15 job
+// manager, both `Arc`-ed) at startup and spawns
+// `handle_connection(stream, ctx.clone())` per accepted connection:
+// it incrementally reads P3-11 frames, serves `GetTelemetry` off the
+// blocking pool, forwards a started run's `JobEvent` stream (progress
+// + exactly one terminal) to the owning connection, and acks
+// `CancelBenchmark`; protocol violations close the connection with
+// `RpcError::Protocol`.
+pub use rpc::{DaemonContext, handle_connection, RpcError};
