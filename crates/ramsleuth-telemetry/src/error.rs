@@ -148,7 +148,7 @@ pub type TelemetryResult<T> = std::result::Result<T, TelemetryError>;
 /// Frozen (P2-02). Deliberately distinct from [`TelemetryError`]: a cell
 /// displays this compact tag, while [`TelemetryResult`] carries the rich
 /// error with the full cause.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum NaReason {
     /// The detected hardware is not supported by this telemetry source.
     UnsupportedHardware,
@@ -172,7 +172,7 @@ pub enum NaReason {
 /// telemetry facade returns `Section<T>` per field so *any* unsupported /
 /// privileged / unknown state degrades to [`Section::Na`] instead of
 /// panicking.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Section<T> {
     /// The field was read successfully.
     Value(T),
@@ -419,5 +419,42 @@ mod tests {
         }
         assert_eq!(ok(), Ok(1));
         assert!(err().is_err());
+    }
+
+    /// (P3-01) The no-panic contract types are wire-serializable:
+    /// every `NaReason` arm — including the `ParseError(String)`
+    /// payload arm — round-trips through bincode (the Phase 3 frame
+    /// codec, plan D3).
+    #[test]
+    fn na_reason_bincode_round_trip() {
+        let reasons = vec![
+            NaReason::UnsupportedHardware,
+            NaReason::DriverMissing,
+            NaReason::InsufficientPrivilege,
+            NaReason::UnknownPmTableVersion,
+            NaReason::NotApplicable,
+            NaReason::ParseError("truncated at 0x1A".to_owned()),
+        ];
+        let bytes = bincode::serialize(&reasons)
+            .expect("NaReason must serialize (no-panic contract)");
+        let back: Vec<NaReason> =
+            bincode::deserialize(&bytes).expect("NaReason must deserialize");
+        assert_eq!(reasons, back);
+    }
+
+    /// (P3-01) `Section<T>` round-trips through bincode for both
+    /// arms (`Section::<u16>` fixture per the P3-01 scope boundary).
+    #[test]
+    fn section_bincode_round_trip() {
+        let sections: Vec<Section<u16>> = vec![
+            Section::Value(4800),
+            Section::Na(NaReason::DriverMissing),
+            Section::na(NaReason::ParseError("bad nibble".to_owned())),
+        ];
+        let bytes = bincode::serialize(&sections)
+            .expect("Section must serialize (no-panic contract)");
+        let back: Vec<Section<u16>> =
+            bincode::deserialize(&bytes).expect("Section must deserialize");
+        assert_eq!(sections, back);
     }
 }
