@@ -144,7 +144,7 @@ const FREQ_RATIO_STEP_MHZ: f64 = 10.0;
 // ---------------------------------------------------------------------------
 
 /// One decoded memory channel of an Intel platform.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IntelChannel {
     /// 0-based channel index (`index < channel_count(gen)`).
     pub index: u8,
@@ -162,7 +162,7 @@ pub struct IntelChannel {
 }
 
 /// The full Intel readout: one [`IntelChannel`] per detected channel.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IntelReadout {
     /// Decoded channels (0-based indices, `channels.len() == channel_count`).
     pub channels: Vec<IntelChannel>,
@@ -986,5 +986,38 @@ mod tests {
         assert_eq!(ro.channels.len(), 2);
         assert_eq!(ro.channels[0].index, 0);
         assert_eq!(ro.channels[1].index, 0);
+    }
+
+    /// (f) P3-04: a multi-channel `IntelReadout` — a fully populated
+    /// channel plus an all-`Na` degradation channel — round-trips through
+    /// bincode, proving the Intel readout (every field type of
+    /// `IntelChannel`) is wire-safe.
+    #[test]
+    fn intel_readout_bincode_round_trip() {
+        let ro = IntelReadout {
+            channels: vec![
+                decode_channel(0, Some(160), full_regs()),
+                decode_channel(1, None, [None; 4]), // all-Na channel
+            ],
+        };
+
+        let bytes = bincode::serialize(&ro)
+            .expect("IntelReadout must serialize (no-panic contract)");
+        let back: IntelReadout =
+            bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
+        assert_eq!(ro, back);
+
+        // the fully degraded readout (every channel all-Na) is wire-safe too
+        let all_na = IntelReadout {
+            channels: vec![
+                decode_channel(0, None, [None; 4]),
+                decode_channel(1, None, [None; 4]),
+            ],
+        };
+        let bytes = bincode::serialize(&all_na)
+            .expect("IntelReadout must serialize (no-panic contract)");
+        let back: IntelReadout =
+            bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
+        assert_eq!(all_na, back);
     }
 }
