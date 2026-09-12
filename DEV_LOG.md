@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [branch/chunk-P3-13] P3-13 daemon socket.rs (impl-P3-13) STARTED
 
 @@@ CURRENT_STATE @@@
 Cycle 3 (Phase 3) - P3-12 (daemon crate birth + SOFT capability probe) complete on branch/chunk-P3-12 (fork of v2-development): ramsleuth-daemon is now lib+bin (explicit [lib] ramsleuth_daemon + [[bin]] ramsleuth-daemon; tokio 1.53.1 MSRV 1.71, libc 0.2, protocol/telemetry/bench path deps) and caps.rs implements the D5 soft probe — PrivilegeReport{is_root, has_cap_sys_rawio, warnings} via geteuid + /proc/self/status CapEff bit 21, pure cap_sys_rawio_from_cappeff (false on any parse error; never panics/exits); daemon 4/4, workspace 195/195, clippy -D warnings clean, build green, stub bin runs exit 0. Next: review + merge P3-12, then P3-13 (socket listener).

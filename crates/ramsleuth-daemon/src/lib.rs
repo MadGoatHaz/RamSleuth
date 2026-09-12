@@ -23,9 +23,17 @@
 //! The binary entry (`src/main.rs`) is rewritten in P3-17.
 
 pub mod caps;
+pub mod socket;
 
 // P3-12: the SOFT privilege probe, re-exported at the root (workspace
 // re-export style) — the daemon's "warn, keep serving" contract
 // (plan D5). P3-17 (main) calls `probe()` and emits its warnings to
 // stderr.
 pub use caps::{probe, PrivilegeReport};
+
+// P3-13: the Unix socket listener setup, re-exported at the root
+// (workspace re-export style) — P3-17 (main) calls `setup_listener`
+// once at startup (with the `--socket` override, default
+// `ramsleuth_protocol::DEFAULT_SOCKET_PATH`) and hands the returned
+// tokio listener to the P3-16 async accept loop.
+pub use socket::{setup_listener, SocketSetupError};
