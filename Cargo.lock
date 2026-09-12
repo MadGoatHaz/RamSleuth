@@ -87,6 +87,16 @@ name = "ramsleuth-gui"
 version = "0.1.0"
 
 [[package]]
+name = "ramsleuth-protocol"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "ramsleuth-bench",
+ "ramsleuth-telemetry",
+ "serde",
+]
+
+[[package]]
 name = "ramsleuth-telemetry"
 version = "0.1.0"
 dependencies = [
