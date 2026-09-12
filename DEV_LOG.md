@@ -3,6 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retained as `plans/PLAN.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
+- [ACTIVE] ID: P2-04 | AGENT: general (Implementation) | BRANCH: branch/chunk-P2-04 | FILES: crates/ramsleuth-telemetry/src/amd_pm.rs, crates/ramsleuth-telemetry/src/lib.rs
 @@@ HISTORY @@@
 - [DONE] ID: review-P2-03 | STATUS: SUCCESS | BRANCH: v2-development
 DECISION: Merged P2-03 (no-ff): frozen contract confirmed — SmuContext{version,pm} + acquire() (pure AMD vendor-gate pre-I/O -> sysfs /sys/kernel/ryzen_smu/pm_table -> /dev/ryzen_smu chardev read via nix open/read/close, FdGuard RAII, zero unsafe) + version = LE u32 @ offset 0 (<4B -> Parse) + NotFound->DriverMissing / PermissionDenied->InsufficientPrivilege / other->Io. Both flagged deviations VERIFIED against the nix 0.29.0 registry manifest: (1) [fs,ioctl,mman] is the correct feature set (no mmap/err features exist; err=always-on nix::errno; mman=nix::sys::mmap for P2-06's /dev/mem read-only map) and (2) read(2) uAPI in lieu of a bespoke ioctl is sound (the driver's only ioctl is RSMU_IOC_GET_VERSION and the frozen version=blob-offset-0 contract precludes it as the version source; ioctl feature stays enabled per D6) with zero unsafe acceptable (no raw ptr/FFI/deref -> no // SAFETY: needed). clippy -D warnings clean, 20/20 tests, nix is the sole new dep, no panic/unwrap/expect anywhere.
