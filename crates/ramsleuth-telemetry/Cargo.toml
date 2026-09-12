@@ -9,4 +9,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Phase 2: add ryzen_smu / nix / memoffset etc. when the providers are built.
+# P2-03: the single new Phase 2 dependency (plan D6 / dependency ledger):
+# `nix` for the ryzen_smu char-device fallback. Feature names below are the
+# *actual* nix 0.29 names for the brief's ["mmap", "ioctl", "err"] set:
+#   "mmap" -> "mman"   (nix::sys::mmap for P2-06's /dev/mem read-only map)
+#   "err"  -> always-on nix::errno module (no feature exists)
+# plus "fs" (OFlag / fcntl::open for the char-device read) and "ioctl"
+# (D6; the driver's companion RSMU_IOC_GET_VERSION). All features are
+# added up front so P2-06 need not touch this manifest again.
+nix = { version = "0.29", features = ["fs", "ioctl", "mman"] }

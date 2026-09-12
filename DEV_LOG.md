@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retained as `plans/PLAN.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [ACTIVE] ID: P2-03 | AGENT: general (Implementation) | BRANCH: branch/chunk-P2-03 | FILES: crates/ramsleuth-telemetry/src/amd_smu.rs, crates/ramsleuth-telemetry/src/lib.rs, crates/ramsleuth-telemetry/Cargo.toml
 
 @@@ HISTORY @@@
 - [DONE] ID: P2-02 | STATUS: SUCCESS | BRANCH: branch/chunk-P2-02

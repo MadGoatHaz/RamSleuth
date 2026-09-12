@@ -14,3 +14,4 @@
 // reachable (`crate::cpuid::CpuInfo`, …); P2-10 adds root re-exports.
 pub mod cpuid; // P2-01 — CPUID vendor + family/generation detection (interface freeze).
 pub mod error; // P2-02 — Telemetry error + Section<T> no-panic contract (interface freeze).
+pub mod amd_smu; // P2-03 — privilege-guarded AMD SMU access (sysfs pm_table -> char-dev read).
