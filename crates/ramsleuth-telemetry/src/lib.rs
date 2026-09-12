@@ -21,3 +21,7 @@ pub mod intel_mchbar; // P2-06 — Intel MCHBAR PCI decode + read-only /dev/mem 
 pub mod intel_readout; // P2-07 — Intel per-channel IMC register decode -> shared display types.
 pub mod spd_eeprom; // P2-08 — ee1004 raw SPD image acquisition (sysfs, unprivileged).
 pub mod spd_decode; // P2-09 — pure SPD decode: JEP106 / rank / density / speed + XMP 2.0 / EXPO profiles.
+pub mod facade; // P2-10 — SystemMemoryTelemetry facade + collect() (per-branch containment).
+
+// P2-10: the crate's public snapshot API, re-exported at the root.
+pub use facade::{collect, SystemMemoryTelemetry};
