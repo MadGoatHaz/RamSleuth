@@ -18,3 +18,4 @@ pub mod amd_smu; // P2-03 — privilege-guarded AMD SMU access (sysfs pm_table -
 pub mod amd_pm; // P2-04 — version-guarded, bounds-checked AMD PM-table parse (AmdPmSnapshot).
 pub mod amd_readout; // P2-05 — shared display types + AMD mapping (sanity-gated, no I/O).
 pub mod intel_mchbar; // P2-06 — Intel MCHBAR PCI decode + read-only /dev/mem mmap guard.
+pub mod intel_readout; // P2-07 — Intel per-channel IMC register decode -> shared display types.

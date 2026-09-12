@@ -5,6 +5,10 @@ Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retain
 @@@ ACTIVE_WORKERS @@@
 - [ACTIVE] ID: review-P2-07 | AGENT: general (Code Reviewer) | BRANCH: v2-development | FILES: [DEV_LOG.md]
 @@@ HISTORY @@@
+- [DONE] ID: P2-07 | STATUS: SUCCESS | BRANCH: branch/chunk-P2-07
+DECISION: Implemented intel_readout.rs — frozen IntelChannel/IntelReadout + read_intel(&MchBar) (pure intel_gen_gate -> channel_count 2/4 per IntelGen -> per-channel MCS decode into the P2-05 shared types): tCL/tRCD/tRP/tRAS/RTL/tCCD_S/tCCD_L/tRDRD/tRDWR/tWRWR/tWRRD in ticks (sanity-gated [1,2048]), 1N/2N -> div_mode, gear 1/2/4 -> gear_mode, mclk from IMC_FREQ_RATIO (10 MHz units), uclk = mclk/gear, derived tRC = tRAS+tRP; CAD bus + voltages all Na(NotApplicable); failed register reads degrade only sourced fields to Na(ParseError), never panic. Const IMC offset table (0x5058 global + 0x5400 + ch*0x100 block, max 0x570C) compile-asserted inside the 1 MiB window; no new unsafe (only MchBar::read_u32 consumed); lib.rs wiring only; 18 new tests (brief a-e) green, 66/66 total, clippy --all-targets -D warnings clean.
+AHEAD: IMC byte offsets + bit fields are a documented model (P2-04-style skeleton; live reconciliation on Intel silicon at P2-11/QA — not verifiable on this AMD host); tCCD_S/tCCD_L render in the rrds/rrld slots, RTL is carried channel-level (no frozen TimingSet slot), rcwdwr + 9 unexposed timings are Na(NotApplicable); P2-10 facade consumes IntelReadout/IntelChannel + read_intel.
+
 - [DONE] ID: review-P2-06-r2 | STATUS: SUCCESS | BRANCH: v2-development
 DECISION: Re-review PASS on 85114a6 - F1: classify_devmem nested raw_os_error() arm maps EIO/ENODATA (STRICT_DEVMEM non-RAM rejections, surfaced as ErrorKind::Other) to InsufficientPrivilege { hint: PRIV_HINT_DEVMEM } before the Io fallback; new test strict_devmem_rejections_classify_as_insufficient_privilege covers both codes via from_raw_os_error. F2: read_u32 uses ptr::read_volatile on all four bytes with check_read_bounds + // SAFETY: preserved; module doc aligned. Clippy --all-targets -D warnings clean; 48/48 tests pass. Merged --no-ff to v2-development.
 AHEAD: P2-07 (Intel readout) unblocked - read_u32 is now a volatile MMIO read primitive; all IMC register reads must stay inside the 1 MiB MCHBAR window.
@@ -79,4 +83,4 @@ AHEAD: plan text is stale vs the freeze (§D5 + P2-02 scope: old variants Unsupp
 - Toolchain: `cargo check` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` **47/47 pass** (8 new `intel_mchbar` tests; none require root, an Intel CPU, or `/dev/mem`).
 
 @@@ CURRENT_STATE @@@
-P2-06 merged to v2-development (post-fix); ready for P2-07 (Intel readout).
+P2-07 implemented on branch/chunk-P2-07; awaiting review.
