@@ -1,0 +1,62 @@
+# ramsleuth.service — the ramsleuth daemon's sandboxed systemd unit (P3-17).
+#
+# **Packaging artifact.** Operator-installed: copy this file to
+# /etc/systemd/system/ramsleuth.service, `systemctl daemon-reload`, then
+# `systemctl enable --now ramsleuth` — nothing in the build installs it
+# (Phase 5 finalizes packaging). The daemon binary is expected at
+# /usr/bin/ramsleuth-daemon.
+#
+# **Privilege model (plan D5):** the daemon runs as root but holds
+# *only* CAP_SYS_RAWIO — the capability the SMU (/dev/ryzen_smu) and
+# /dev/mem MCHBAR reads require. The bounding set is clamped to just
+# that one capability, no new privileges are allowed, and the
+# filesystem is read-only except the socket's runtime directory.
+#
+# **Live AMD subtimings** additionally require the `ryzen_smu` kernel
+# module to be loaded (e.g. `modprobe ryzen_smu`, or the distro's
+# autoload); the unit does not load it. Without the module the daemon
+# degrades per D5 (AMD subtiming fields report `N/A (DriverMissing)`)
+# and keeps serving everything else.
+#
+# The socket file lands in /run/ramsleuth (created by systemd via
+# RuntimeDirectory below; mode 0660, group-owned — clients join that
+# group for access).
+
+[Unit]
+Description=RamSleuth privileged memory telemetry and benchmark daemon
+Documentation=https://github.com/MadGoatHaz/RamSleuth
+
+[Service]
+Type=simple
+User=root
+# The socket's owning group (the daemon's best-effort chown target,
+# P3-13). Use `Group=wheel` on systems without a `ramsleuth` group.
+Group=ramsleuth
+ExecStart=/usr/bin/ramsleuth-daemon --socket /run/ramsleuth/ramsleuth.sock
+
+# systemd creates /run/ramsleuth (owned root:Group, mode 0755) before
+# start so the sandboxed daemon never has to create it itself;
+# ReadWritePaths below grants write access inside it (the socket file).
+RuntimeDirectory=ramsleuth
+ReadWritePaths=/run/ramsleuth
+
+# Plan D5 sandbox: only CAP_SYS_RAWIO is granted (ambient into the
+# root process) and the bounding set is clamped to just that one
+# capability — no setuid escalation, no other capabilities.
+CapabilityBoundingSet=CAP_SYS_RAWIO
+AmbientCapabilities=CAP_SYS_RAWIO
+NoNewPrivileges=true
+
+# Read-only filesystem everywhere except the socket's runtime
+# directory; no home directories; a private /tmp.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+# The daemon exits non-zero only on fatal startup errors (a bad CLI,
+# socket setup, or signal-handler install) and restarts on those; a
+# clean signal shutdown (SIGTERM/SIGINT) exits 0 and is not a failure.
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
