@@ -57,7 +57,7 @@ const CHASE_HOPS: usize = 1_000_000;
 ///
 /// The discriminants are the grid-array indices: `Memory = 0, L1 = 1,
 /// L2 = 2, L3 = 3`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tier {
     /// Main memory (DRAM).
     Memory,
@@ -70,7 +70,7 @@ pub enum Tier {
 }
 
 /// The four benchmark metrics — the grid's column order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Metric {
     /// Read bandwidth (GB/s).
     Read,
@@ -86,7 +86,7 @@ pub enum Metric {
 ///
 /// Every array is indexed by [`Tier`] (discriminant order
 /// `Memory, L1, L2, L3`); [`BenchmarkGrid::cell`] is the lookup.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BenchmarkGrid {
     /// Read bandwidth, GB/s, per tier.
     pub read_gbps: [f64; 4],
@@ -203,7 +203,10 @@ pub(crate) fn run_all_sized(
 
 /// Round `size` up to a 64-byte (cache-line) multiple, enforcing a
 /// 64-byte minimum (one slot is the smallest usable chase unit).
-fn normalize_size(size: usize) -> usize {
+///
+/// `pub(crate)`: the streaming run (`streamed::run_streamed`, P3-09)
+/// sizes per-tier windows with it.
+pub(crate) fn normalize_size(size: usize) -> usize {
     let rem = size % STRIDE_BYTES;
     let aligned = if rem == 0 { size } else { size + STRIDE_BYTES - rem };
     aligned.max(STRIDE_BYTES)
@@ -218,7 +221,10 @@ fn normalize_size(size: usize) -> usize {
 /// take the aligned window `[offset, offset + size)`: since `offset ≤ 63`,
 /// `offset + size ≤ size + 64 = owner.len()`. The owning `Vec` keeps the
 /// storage alive for the window's lifetime.
-struct AlignedBuf {
+///
+/// `pub(crate)`: the streaming run (`streamed::run_streamed`, P3-09)
+/// allocates per-tier bandwidth windows with it.
+pub(crate) struct AlignedBuf {
     owner: Vec<u8>,
     offset: usize,
     size: usize,
@@ -227,7 +233,7 @@ struct AlignedBuf {
 impl AlignedBuf {
     /// Allocate a zeroed `size`-byte window with a guaranteed 64-byte
     /// aligned base (see the struct docs for the padding strategy).
-    fn new(size: usize) -> Self {
+    pub(crate) fn new(size: usize) -> Self {
         let owner = vec![0u8; size.checked_add(STRIDE_BYTES).expect("aligned buffer size overflow")];
         let offset = (STRIDE_BYTES - (owner.as_ptr() as usize % STRIDE_BYTES)) % STRIDE_BYTES;
         debug_assert!(offset + size <= owner.len());
@@ -235,7 +241,7 @@ impl AlignedBuf {
     }
 
     /// The aligned window as a shared slice.
-    fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         // SAFETY: the window `[offset, offset + size)` lies inside
         // `owner` (the 64-byte pad guarantees `offset + size ≤
         // owner.len()`), its base is 64-byte aligned by construction,
@@ -245,7 +251,7 @@ impl AlignedBuf {
     }
 
     /// The aligned window as a mutable slice.
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as in [`AlignedBuf::as_slice`]; the exclusive
         // `&mut self` guarantees no other view of the window is live.
         unsafe { std::slice::from_raw_parts_mut(self.owner.as_mut_ptr().add(self.offset), self.size) }
@@ -256,7 +262,10 @@ impl AlignedBuf {
 /// data-dependent pattern: slot `i` holds the little-endian encoding of
 /// `i` repeated in every 8-byte word. The read checksum is non-zero for
 /// any buffer beyond the first slot, and the fill is reproducible.
-fn fill_pattern(buf: &mut [u8]) {
+///
+/// `pub(crate)`: the streaming run (`streamed::run_streamed`, P3-09)
+/// arms `src` with the same deterministic pattern.
+pub(crate) fn fill_pattern(buf: &mut [u8]) {
     debug_assert!(buf.len() % STRIDE_BYTES == 0);
     for (slot, chunk) in buf.chunks_exact_mut(STRIDE_BYTES).enumerate() {
         let word = slot as u64;
@@ -270,7 +279,10 @@ fn fill_pattern(buf: &mut [u8]) {
 /// aligned `src`/`dst` windows, wall-timing each with [`Instant`];
 /// report GB/s as `total_bytes / best_elapsed` (the fastest run —
 /// best-of-3 trims the first run's cold start).
-fn bench_bandwidth(
+///
+/// `pub(crate)`: the streaming run (`streamed::run_streamed`, P3-09)
+/// reuses this best-of-3 bandwidth kernel.
+pub(crate) fn bench_bandwidth(
     topo: &CpuTopology,
     op: BenchOp,
     src: &[u8],
@@ -295,7 +307,10 @@ fn bench_bandwidth(
 /// Latency pass for one tier: materialize the tier-sized chase buffer
 /// (P1-09 ring, seed `tier_idx + 1`), then chase it
 /// `BENCH_ITERATIONS` times and report the **median** ns/hop.
-fn bench_latency(size: usize, seed: u64) -> f64 {
+///
+/// `pub(crate)`: the streaming run (`streamed::run_streamed`, P3-09)
+/// reuses this median-of-3 latency kernel.
+pub(crate) fn bench_latency(size: usize, seed: u64) -> f64 {
     let ring = build_chase_ring(size, seed);
     let buf = materialize_chase(&ring, size);
     // At least one full traversal of the cycle, and a stable minimum.
@@ -555,5 +570,27 @@ mod tests {
         let topo = OrchestratorError::Topology(TopologyError::NoCpus);
         assert!(format!("{topo}").contains("cpu topology detection failed"));
         assert!(std::error::Error::source(&topo).is_some());
+    }
+
+    /// (P3-08) A small representative `BenchmarkGrid` round-trips through
+    /// bincode (plan D3: the wire codec) — the grid (and the `Tier`/
+    /// `Metric` enums it indexes) is wire-serializable (P3-08 exit
+    /// criterion). Bincode is bit-exact on `f64`, so each array compares
+    /// equal after the round-trip.
+    #[test]
+    fn grid_bincode_round_trip() {
+        let grid = BenchmarkGrid {
+            read_gbps: [1.5, 2.5, 3.5, 4.5],
+            write_gbps: [5.5, 6.5, 7.5, 8.5],
+            copy_gbps: [9.5, 10.5, 11.5, 12.5],
+            latency_ns: [13.5, 14.5, 15.5, 16.5],
+        };
+        let bytes = bincode::serialize(&grid).expect("BenchmarkGrid must serialize");
+        let back: BenchmarkGrid =
+            bincode::deserialize(&bytes).expect("BenchmarkGrid must deserialize");
+        assert_eq!(back.read_gbps, grid.read_gbps);
+        assert_eq!(back.write_gbps, grid.write_gbps);
+        assert_eq!(back.copy_gbps, grid.copy_gbps);
+        assert_eq!(back.latency_ns, grid.latency_ns);
     }
 }

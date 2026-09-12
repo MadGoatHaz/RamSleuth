@@ -10,7 +10,22 @@ rust-version.workspace = true
 
 [dependencies]
 # Kernel dependencies (none required for intrinsics — core::arch is std).
-# `libc` (P1-08) is the only external dependency: `sched_setaffinity`
+# `libc` (P1-08) was the only external dependency: `sched_setaffinity`
 # pins one worker thread per physical core.
 libc = "0.2"
+# P3-07: serde for the wire-contract types `BenchOp` + `WorkerResult`
+# (plan D2/D7, dependency ledger: the bench `serde` entry is owned by
+# P3-07). The `derive` feature backs
+# `#[derive(serde::Serialize, serde::Deserialize)]` in src/worker.rs.
+# P3-09 also makes `WorkerError` wire-ready (the `StreamError::Worker`
+# payload crosses the wire verbatim): `Serialize` derived, and
+# `Deserialize` hand-written in src/worker.rs (the `&'static str`
+# `Misaligned.buffer` field cannot derive for a generic `'de`).
+serde = { version = "1", features = ["derive"] }
 # A [[bin]] target for the verification CLI is added in a later Phase 1 chunk.
+
+[dev-dependencies]
+# P3-07: test-only bincode round-trips of `BenchOp` / `WorkerResult`
+# (plan D3: bincode 1.3 is the wire codec format; the runtime
+# dependency on it stays owned by ramsleuth-protocol, P3-10).
+bincode = "1.3"

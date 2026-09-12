@@ -81,7 +81,7 @@ const AVX512_BLOCK_BYTES: usize = 64;
 const WRITE_PATTERN: u64 = 0xA5A5_5AA5_5AA5_A55A;
 
 /// Bandwidth operation a worker pool runs over the caller's buffers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BenchOp {
     /// Stream-read `src`; the checksum covers the read data.
     Read,
@@ -93,7 +93,7 @@ pub enum BenchOp {
 }
 
 /// Aggregated outcome of one [`run_pinned`] pass over the full buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkerResult {
     /// The operation that was run.
     pub op: BenchOp,
@@ -119,7 +119,15 @@ pub struct WorkerResult {
 ///
 /// Pinning failure is deliberately **not** an error: an unpinned run
 /// still completes and [`WorkerResult::pinned`] records the skip.
-#[derive(Debug)]
+///
+/// **Serde (P3-07/P3-09):** `Serialize` is derived; `Deserialize` is
+/// hand-written below because the [`Misaligned`](Self::Misaligned) `buffer`
+/// field is a `&'static str`, whose serde impl only deserializes for
+/// `'de: 'static` — the manual impl goes through a `String`-bearing
+/// mirror (byte-identical wire layout) and maps the two known buffer
+/// names back to their static originals, so `WorkerError` deserializes
+/// for any `'de` (required by `StreamError::Worker`'s derive, P3-09).
+#[derive(Debug, PartialEq, serde::Serialize)]
 pub enum WorkerError {
     /// `src` and `dst` have different lengths.
     LengthMismatch {
@@ -168,6 +176,66 @@ impl fmt::Display for WorkerError {
 }
 
 impl std::error::Error for WorkerError {}
+
+/// Mirror of [`WorkerError`] whose `Misaligned` `buffer` field is a
+/// `String` (deserializable for any `'de`, unlike `&'static str`); the
+/// wire layout is byte-identical (same variants, same field order).
+///
+/// Private: it exists only to back the manual [`serde::Deserialize`]
+/// impl for [`WorkerError`] below.
+#[derive(serde::Deserialize)]
+enum WorkerErrorMirror {
+    LengthMismatch {
+        src: usize,
+        dst: usize,
+    },
+    Misaligned {
+        buffer: String,
+        required: usize,
+    },
+    NotBlockMultiple {
+        len: usize,
+        block: usize,
+    },
+    WorkerPanic {
+        index: usize,
+    },
+}
+
+impl<'de> serde::Deserialize<'de> for WorkerError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Deserialize the layout-identical mirror, then recover the
+        // `&'static str` by mapping the wire value back to its static
+        // original (an unknown name is a decode error, never UB).
+        WorkerErrorMirror::deserialize(deserializer).and_then(|mirror| match mirror {
+            WorkerErrorMirror::LengthMismatch { src, dst } => {
+                Ok(WorkerError::LengthMismatch { src, dst })
+            }
+            WorkerErrorMirror::Misaligned { buffer, required } => Ok(WorkerError::Misaligned {
+                buffer: static_buffer(&buffer)?,
+                required,
+            }),
+            WorkerErrorMirror::NotBlockMultiple { len, block } => {
+                Ok(WorkerError::NotBlockMultiple { len, block })
+            }
+            WorkerErrorMirror::WorkerPanic { index } => Ok(WorkerError::WorkerPanic { index }),
+        })
+    }
+}
+
+/// Map a wire `buffer` name back to its `&'static str` original.
+fn static_buffer<E: serde::de::Error>(buffer: &str) -> Result<&'static str, E> {
+    match buffer {
+        "src" => Ok("src"),
+        "dst" => Ok("dst"),
+        other => Err(E::custom(format!(
+            "unknown buffer name {other:?} in WorkerError::Misaligned (expected 'src' or 'dst')"
+        ))),
+    }
+}
 
 /// Run one Read/Write/Copy pass over the whole buffer with one
 /// barrier-synced worker per physical core. See the module docs for the
@@ -819,5 +887,47 @@ mod tests {
         assert_eq!(res.checksum, 0, "zeroed buffer checksums to 0");
         dealloc_aligned(src_ptr, LEN);
         dealloc_aligned(dst_ptr, LEN);
+    }
+
+    /// (P3-07) Every `BenchOp` arm round-trips through bincode (the Phase 3
+    /// frame codec, plan D3), proving the op tag is wire-serializable.
+    #[test]
+    fn bench_op_bincode_round_trip() {
+        let ops = vec![BenchOp::Read, BenchOp::Write, BenchOp::Copy];
+        let bytes = bincode::serialize(&ops).expect("BenchOp must serialize");
+        let back: Vec<BenchOp> = bincode::deserialize(&bytes).expect("BenchOp must deserialize");
+        assert_eq!(ops, back);
+    }
+
+    /// (P3-07) Representative `WorkerResult`s (one per op; mixed pinning;
+    /// the write arm keeps its `checksum == total_bytes` invariant)
+    /// round-trip through bincode - the aggregated pass outcome is
+    /// wire-serializable (P3-07 exit criterion).
+    #[test]
+    fn worker_result_bincode_round_trip() {
+        let results = vec![
+            WorkerResult {
+                op: BenchOp::Read,
+                total_bytes: 1024,
+                checksum: 0xDEAD_BEEF,
+                pinned: true,
+            },
+            WorkerResult {
+                op: BenchOp::Write,
+                total_bytes: 65536,
+                checksum: 65536,
+                pinned: false,
+            },
+            WorkerResult {
+                op: BenchOp::Copy,
+                total_bytes: 0,
+                checksum: 0,
+                pinned: true,
+            },
+        ];
+        let bytes = bincode::serialize(&results).expect("WorkerResult must serialize");
+        let back: Vec<WorkerResult> =
+            bincode::deserialize(&bytes).expect("WorkerResult must deserialize");
+        assert_eq!(results, back);
     }
 }
