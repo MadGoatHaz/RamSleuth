@@ -13,8 +13,9 @@
 //! A standalone verification CLI (`src/main.rs`, `cargo run -p ramsleuth-bench`)
 //! printing the AIDA64-style grid is added in the final Phase 1 chunk.
 //!
-//! No third-party dependencies are required: all kernels use `core::arch`
-//! intrinsics from the standard library.
+//! The kernels require no third-party dependencies (`core::arch`
+//! intrinsics from the standard library); the worker dispatch (P1-08)
+//! adds `libc` solely for `sched_setaffinity` pinning.
 
 // P1-01: runtime CPU feature detection (interface freeze).
 mod features;
@@ -44,3 +45,8 @@ pub use kernel_copy::avx2_copy;
 // runtime-gated on CpuFeatures.avx512f with fallback to the AVX2 kernels).
 mod kernel_512;
 pub use kernel_512::{avx512_copy, avx512_read, avx512_write};
+
+// P1-08: pinned per-physical-core worker dispatch (one barrier-synced worker per
+// CpuTopology.physical_cores entry; sched_setaffinity pinning with unpinned fallback).
+mod worker;
+pub use worker::{BenchOp, WorkerError, WorkerResult, run_pinned};
