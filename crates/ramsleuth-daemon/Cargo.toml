@@ -8,5 +8,28 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "ramsleuth_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ramsleuth-daemon"
+path = "src/main.rs"
+
 [dependencies]
-# Phase 3: add tokio, ramsleuth-client, ramsleuth-telemetry, ramsleuth-bench.
+# P3-12: the daemon crate is born (plan D7 dependency ledger; the three
+# path deps below are the workspace's single source of truth — D2: the
+# protocol owns the wire vocabulary + frame codec, telemetry the
+# snapshot root, bench the streaming contract; nothing is duplicated).
+# `tokio` (workspace entry) is the daemon's async runtime — the only
+# tokio consumer in the workspace (no tokio outside the daemon, D2);
+# its API lands in use in P3-13 (listener) / P3-15 (spawn_blocking) /
+# P3-16 (per-connection loops) / P3-17 (runtime + signals).
+# `libc` (0.2; the bench P1-08 precedent) backs the SOFT privilege
+# probe in caps.rs (`geteuid`) and the P3-13 socket setup
+# (`chown`/`getgrnam`).
+tokio = { workspace = true }
+libc = "0.2"
+ramsleuth-protocol = { path = "../ramsleuth-protocol" }
+ramsleuth-telemetry = { path = "../ramsleuth-telemetry" }
+ramsleuth-bench = { path = "../ramsleuth-bench" }
