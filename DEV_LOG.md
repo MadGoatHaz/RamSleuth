@@ -3,8 +3,11 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retained as `plans/PLAN.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-- [ACTIVE] ID: P2-06-fix | AGENT: general (Implementation Agent) | BRANCH: branch/chunk-P2-06 | FILES: crates/ramsleuth-telemetry/src/intel_mchbar.rs, DEV_LOG.md
 @@@ HISTORY @@@
+- [DONE] ID: P2-06-fix | STATUS: SUCCESS | BRANCH: branch/chunk-P2-06
+DECISION: Fixed review F1 — classify_devmem now has a raw_os_error arm mapping EIO/ENODATA (STRICT_DEVMEM rejections, which surface as ErrorKind::Other) to InsufficientPrivilege{PRIV_HINT_DEVMEM} before the Io fallback, with module doc aligned to the real mapping; fixed F2 — read_u32 uses ptr::read_volatile (MMIO reads not hoisted/cached/deduped), bounds/overflow checks (OOB→Parse, never panic) and // SAFETY: preserved; new test strict_devmem_rejections_classify_as_insufficient_privilege (EIO + ENODATA → InsufficientPrivilege) passes; clippy --all-targets -D warnings clean; 48/48 tests green (AMD-host gate test still UnsupportedHardware).
+AHEAD: branch/chunk-P2-06 re-submitted for re-review (F1 verified fixed; "verified passing" list in the review write-up may be skipped); P2-07 still blocked on the P2-06 merge.
+
 - [DONE] ID: review-P2-06 | STATUS: FAILED | BRANCH: branch/chunk-P2-06
 DECISION: P2-06 review did not merge — one blocking frozen-contract deviation: classify_devmem (intel_mchbar.rs:406-414) maps only PermissionDenied->InsufficientPrivilege and NotFound->DriverMissing; STRICT_DEVMEM mmap rejections (EIO=5 / ENODATA=61, kernel drivers/char/mem.c) fall to the catch-all `_` arm -> TelemetryError::Io, violating the shipped "EACCES/EPERM/STRICT_DEVMEM -> InsufficientPrivilege"; module doc (lines 27-28) and the P2-06 entry below both falsely claim that mapping; all other audit items verified passing.
 AHEAD: Required fix = classify_devmem raw_os_error arm EIO/ENODATA -> InsufficientPrivilege{PRIV_HINT_DEVMEM} + doc alignment (+ non-blocking: ptr::read_volatile in read_u32 before P2-07); re-submit for review; P2-07 blocked on P2-06 merge.
@@ -69,4 +72,4 @@ AHEAD: plan text is stale vs the freeze (§D5 + P2-02 scope: old variants Unsupp
 - Toolchain: `cargo check` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` **47/47 pass** (8 new `intel_mchbar` tests; none require root, an Intel CPU, or `/dev/mem`).
 
 @@@ CURRENT_STATE @@@
-P2-06 review FAILED — held on branch/chunk-P2-06 (NOT merged); implementer to fix classify_devmem STRICT_DEVMEM (EIO/ENODATA) -> InsufficientPrivilege + doc alignment (+ read_volatile recommendation), re-submit for review; P2-07 blocked on P2-06 merge.
+P2-06 fixes applied on branch/chunk-P2-06; awaiting re-review.
