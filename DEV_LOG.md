@@ -4,6 +4,9 @@ Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retain
 
 @@@ ACTIVE_WORKERS @@@
 @@@ HISTORY @@@
+- [DONE] ID: review-P2-05 | STATUS: SUCCESS | BRANCH: v2-development
+DECISION: Merged P2-05 (no-ff): frozen contract verified line-by-line vs the brief — DivMode{OneToOne,OneToTwo}, GearMode{One,Two,Four}, RttValue{Disabled,Rzq(u32),Ohms(f64)}+ohms(); ClockReadout 7 Section fields (mclk/uclk/fclk f64 MHz, div_mode, gear_mode, gdm, pdm); TimingSet 27 Section<u16> ticks; CadBus 5 Section<f64> ohms + 3 Section<RttValue>; VoltageSet 4 Section<u16> mV; AmdReadout{clocks,timings,cad_bus,voltages}+map_amd(&AmdPmSnapshot) pure (imports only amd_pm+error; no I/O, no unsafe, no unwrap/panic/index). Sanity gates degrade to Na, never garbage: clock 0 or >4096 MHz -> Na(ParseError); tick 0 or >2048 -> Na(ParseError); mV <100 or >4000 -> Na(ParseError); RZQ base 240 ohm code table [1,2,3,4,5,6,8,10,12,15,16,20,24,30,40,60] -> 240/N ohm, code 0 or unknown -> Na(NotApplicable); AMD gear_mode always Na(NotApplicable). Shared types Clone+Debug+PartialEq (enums also Copy); pub mod amd_readout wired in lib.rs; Cargo.toml untouched (no new deps); clippy --all-targets zero warnings; 39/39 tests pass (10 new amd_readout).
+AHEAD: Plan P2-05 scope body is stale vs this freeze (sketch showed f32 volts + Option fields; shipped contract is Section<T> mV/ticks) — P2-07 (Intel) and P2-10 (facade) must code against the Section<T> freeze, not the sketch; CAD RZQ/driver byte layout remains the P2-04 skeleton pending P2-11 live reconciliation.
 - [DONE] ID: P2-05 | STATUS: SUCCESS | BRANCH: branch/chunk-P2-05
 DECISION: Implemented amd_readout.rs — froze the four vendor-neutral display types (ClockReadout/TimingSet/CadBus/VoltageSet, every field Section<T>) + DivMode/GearMode/RttValue + map_amd(AmdPmSnapshot→AmdReadout); sanity-gated (clock [1,4096] MHz, tick [1,2048], mV [100,4000], RZQ=240Ω code table, AMD gear_mode=Na); no I/O, no unsafe; 10 new tests; wired pub mod amd_readout.
 AHEAD: Frozen shared types use mV (not volts) and ticks (not ns) per the brief — P2-07 (Intel) and P2-10 (facade) must target these exact Section<T> types; CAD RZQ/driver byte layout is still a P2-04 skeleton pending P2-11 live reconciliation.
@@ -30,4 +33,4 @@ DECISION: Merged P2-02 (no-ff): code matches the shipped freeze — 6 TelemetryE
 AHEAD: plan text is stale vs the freeze (§D5 + P2-02 scope: old variants UnsupportedVendor/NoDevmem/InvalidValue, Section{Na(TelemetryError)} + is_value/as_option/reason) — reconcile via plan edit before P2-03; downstream P2-06/P2-07/P2-10 specs cite those removed identifiers.
 
 @@@ CURRENT_STATE @@@
-P2-05 implemented on branch/chunk-P2-05; awaiting review.
+P2-05 merged to v2-development; ready for P2-06 (Intel MCHBAR).
