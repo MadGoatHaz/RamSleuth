@@ -3,6 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retained as `plans/PLAN.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
+- [ACTIVE] ID: review-P2-09 | AGENT: general (Code Reviewer) | BRANCH: branch/chunk-P2-09 | FILES: [DEV_LOG.md (review entry only)]
 @@@ HISTORY @@@
 - [DONE] ID: P2-09 | STATUS: SUCCESS | BRANCH: branch/chunk-P2-09
 DECISION: Recovered & completed the prior subagent's uncommitted P2-09 work — spd_decode.rs matches the frozen contract (SpdProfile{index,speed_mts,cas,trcd,trp,tras,voltage}/SpdModule{index,is_ddr5,maker,part,serial,rank,density_mbit,speed_mts,profiles} + decode(&SpdImage)->SpdModule; pure get()-bounds-checked decode, pub JEP106 table, XMP 2.0 + XMP 3.0/EXPO profiles, zero unsafe, zero deps); fixed 3 pre-existing compile blockers minimally (redundant Some() around xmp_profile's Option return, is_value() -> value().is_some() per the frozen Section API, removed dead xmp_profile index param; plus a doc_lazy_continuation blank line); added the missing 11-test module (synthetic DDR4/DDR5 ground truth, corrupted-checksum skip, truncated/empty/prefix-sweep no-panic, unknown/0xF/absent/die-fallback JEP106, live acquire+decode); cargo check + clippy --all-targets -D warnings clean, 85/85 tests green.
