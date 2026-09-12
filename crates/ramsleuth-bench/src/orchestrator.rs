@@ -233,7 +233,7 @@ pub(crate) struct AlignedBuf {
 impl AlignedBuf {
     /// Allocate a zeroed `size`-byte window with a guaranteed 64-byte
     /// aligned base (see the struct docs for the padding strategy).
-    fn new(size: usize) -> Self {
+    pub(crate) fn new(size: usize) -> Self {
         let owner = vec![0u8; size.checked_add(STRIDE_BYTES).expect("aligned buffer size overflow")];
         let offset = (STRIDE_BYTES - (owner.as_ptr() as usize % STRIDE_BYTES)) % STRIDE_BYTES;
         debug_assert!(offset + size <= owner.len());
@@ -241,7 +241,7 @@ impl AlignedBuf {
     }
 
     /// The aligned window as a shared slice.
-    fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         // SAFETY: the window `[offset, offset + size)` lies inside
         // `owner` (the 64-byte pad guarantees `offset + size ≤
         // owner.len()`), its base is 64-byte aligned by construction,
@@ -251,7 +251,7 @@ impl AlignedBuf {
     }
 
     /// The aligned window as a mutable slice.
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as in [`AlignedBuf::as_slice`]; the exclusive
         // `&mut self` guarantees no other view of the window is live.
         unsafe { std::slice::from_raw_parts_mut(self.owner.as_mut_ptr().add(self.offset), self.size) }

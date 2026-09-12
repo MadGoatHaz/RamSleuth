@@ -62,3 +62,10 @@ pub use latency::{build_chase_ring, chase_latency_ns};
 // for true DRAM latency.
 mod orchestrator;
 pub use orchestrator::{BenchmarkGrid, Metric, OrchestratorError, Tier, run_all};
+
+// P3-09: targeted streaming runs — the wire-ready streaming contract
+// (`StreamTarget`/`StreamOptions`/`StreamProgress`/`StreamError` +
+// `run_streamed`) behind the daemon's single-flight benchmark job
+// (P3-15); reuses the P3-08-widened passes.
+mod streamed;
+pub use streamed::{StreamError, StreamOptions, StreamProgress, StreamTarget, run_streamed};

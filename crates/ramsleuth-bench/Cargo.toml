@@ -17,8 +17,10 @@ libc = "0.2"
 # (plan D2/D7, dependency ledger: the bench `serde` entry is owned by
 # P3-07). The `derive` feature backs
 # `#[derive(serde::Serialize, serde::Deserialize)]` in src/worker.rs.
-# `WorkerError` deliberately gets no serde: it never crosses the wire -
-# the protocol maps worker failures to its own error text.
+# P3-09 also makes `WorkerError` wire-ready (the `StreamError::Worker`
+# payload crosses the wire verbatim): `Serialize` derived, and
+# `Deserialize` hand-written in src/worker.rs (the `&'static str`
+# `Misaligned.buffer` field cannot derive for a generic `'de`).
 serde = { version = "1", features = ["derive"] }
 # A [[bin]] target for the verification CLI is added in a later Phase 1 chunk.
 

@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [branch/chunk-P3-09] P3-09 bench streamed.rs (impl-P3-09) STARTED
 
 @@@ CURRENT_STATE @@@
 Cycle 3 (Phase 3) - P3-08 COMPLETE on branch/chunk-P3-08 (unmerged, awaiting review): serde derives on Tier/Metric/BenchmarkGrid (orchestrator.rs; run_all + grid/run logic untouched) with a bincode round-trip test, and the five P3-09 pass helpers widened private -> pub(crate) (AlignedBuf, normalize_size, fill_pattern, bench_bandwidth, bench_latency; no signature edits, materialize_chase/chase_materialized/run_all_sized stay as-is); 66/66 bench tests green, clippy -D warnings clean, workspace build green. Next: P3-08 review/merge, then P3-09 (streamed.rs run_streamed).
