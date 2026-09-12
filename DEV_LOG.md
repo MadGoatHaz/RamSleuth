@@ -6,9 +6,51 @@ Base branch: `v2-development`. Phase 1 plan: `plans/PLAN.md`. Sign in/out under 
 (no active leases)
 
 @@@ CURRENT_STATE @@@
-Phase 1 (benchmark engine) complete — all 11 chunks merged to v2-development; ready for QA.
+Phase 1 QA audit complete (2026-09-12): all 7 runnable gates PASS on v2-development (clean tree, single worker); AIDA64 parity gate (±5% bandwidth, ±2 ns latency, 60–75 ns band) deferred to the DDR5-6000 AM5 machine — this host is Zen 3 / DDR4. See PHASE 1 QA AUDIT.
+
+## PHASE 1 QA AUDIT
+
+Run: 2026-09-12 on `v2-development` @ b5eea35 (clean tree at start; single active worker, no lease contention). Host: Ryzen 9 5950X (Zen 3), 16 phys / 32 logical, 64 MiB total L3 (32 MiB per CCD), DDR4, AVX2 yes / AVX-512F no.
+
+### Gates
+
+| Gate | Result | Detail |
+| --- | --- | --- |
+| Static analysis | PASS | `cargo clippy --workspace --all-targets -- -D warnings` → exit 0, zero warnings |
+| Regression (debug) | PASS | `cargo test --workspace` → 63/63 (60 lib + 3 bin), 0 failed |
+| Regression (release) | PASS | `cargo test --workspace --release` → 63/63 (60 lib + 3 bin), 0 failed |
+| Release build | PASS | `cargo build --workspace --release` → exit 0 |
+| Live bench (default AVX2) | PASS | `cargo run -p ramsleuth-bench --release` → exit 0; header + full 4×4 grid below |
+| Live bench `--json` | PASS | exit 0; output parsed with python3 `json.loads` — keys read_gbps/write_gbps/copy_gbps/latency_ns, all arrays length 4, all values finite and positive |
+| Live bench `--avx512` | PASS | exit 0; emitted the documented fallback note ("--avx512 requested but AVX-512F is absent; the AVX-512 kernels fall back to AVX2") and ran on the AVX2 path |
+| AIDA64 parity (§1.3: BW ±5%, latency ±2 ns, 60–75 ns band) | DEFERRED | Not evaluable on this Zen 3 / DDR4 host; must be confirmed on the DDR5-6000 AM5 machine. Per the QA brief this is not a failure on this host. |
+
+### Measured grid (default AVX2 run)
+
+    ramsleuth-bench: 16 physical cores (32 logical, SMT on), total L3 64 MiB, AVX2 yes, AVX-512 no
+    Tier             Read (GB/s) Write (GB/s)  Copy (GB/s) Latency (ns)
+    Memory (DRAM)          49.13        43.83        15.75         81.5
+    L3                     59.03        31.28        16.29         56.5
+    L2                      1.33         1.41         1.40          5.6
+    L1                      0.08         0.09         0.09          1.2
+
+Repeat runs (variance context): `--json` → DRAM 47.58 / 43.37 / 15.68 GB/s, 81.4 ns; L3 63.04 / 32.02 / 16.88 GB/s, 39.5 ns. `--avx512` → DRAM 48.89 / 43.48 / 15.67 GB/s, 82.9 ns; L3 44.39 / 16.79 / 15.84 GB/s, 31.0 ns.
+
+### Sanity checks
+
+- Latency ordering monotonic: L1 1.2 < L2 5.6 < L3 56.5 < DRAM 81.5 ns ✓
+- No negative, zero, or NaN cells; every value finite and positive ✓
+- DRAM read 49.13 GB/s ≈ 48% of the DDR4-3200 4-channel theoretical peak (102.4 GB/s) — physically reasonable for a streaming-read kernel on this host ✓ (the hundreds-of-GB/s expectation applies to the AM5 DDR5 target, not here)
+- ANOMALY (design): L1 (0.04–0.09 GB/s) and L2 (0.98–1.41 GB/s) bandwidth cells sit up to ~3 orders of magnitude below L3/DRAM. The L1/L2 tiers benchmark the full host-size working set (L1d = 32 KiB, L2 = 1 MiB) split across all 16 pinned workers (~2 KiB / ~64 KiB per worker), so per-pass thread-spawn / barrier / timing overhead dominates the sub-millisecond pass. These cells are overhead-limited, not cache-limited, and the bandwidth column is not comparable across tiers. Will reproduce on the AM5 machine — Phase 2 design note, not a host defect.
+- ANOMALY (variance): L3 read 44.4–63.0 GB/s and L3 latency 31.0–56.5 ns drift ~±25% between runs (best-of-3 at these sizes is noisy); expected to tighten on the target machine — watch during the parity gate.
+- DRAM latency 81.4–83.5 ns is outside the 60–75 ns DDR5-6000 band, as expected on DDR4 — reported, not failed, per the QA brief.
+
+Overall: PASS (7/7 runnable gates; AIDA64 parity gate deferred to the AM5 machine).
 
 ## History
+- [DONE] ID: phase1-qa | STATUS: SUCCESS | BRANCH: v2-development
+  DECISION: QA audited v2-development @ b5eea35 on the Zen 3 / DDR4 host: clippy -D warnings zero, 63/63 tests green debug and release, release build OK, live bench exit 0 with full 4x4 grid, --json parses (4 keys x 4 finite-positive values), --avx512 falls back to AVX2 with the documented note and exits 0; recorded the PHASE 1 QA AUDIT section and flagged the overhead-limited L1/L2 bandwidth cells plus ~25% L3 run-to-run variance as design notes; AIDA64 parity gate deferred to the AM5 machine.
+  AHEAD: Phase 2: confirm the §1.3 AIDA64 parity gates on the DDR5-6000 AM5 machine and address the L1/L2 tier working-set design so bandwidth cells are cache-limited rather than overhead-limited.
 - [DONE] ID: P1-11 REVIEW | STATUS: SUCCESS | BRANCH: branch/chunk-P1-11
   DECISION: Verified the frozen P1-11 contract against the branch: main.rs is a thin std-only harness (no benchmark logic — only parse_opts/to_json/render_grid plus detect/run_all calls); parse_opts(&[String]) -> Result<Opts,String> rejects unknown flags naming the offending one (exit 2, stderr, no panic); --help/-h recognized (exit 0); to_json is serde-free with keys read_gbps/write_gbps/copy_gbps/latency_ns in Tier order [Memory,L1,L2,L3] (python json.load validated: exact key order, all arrays len 4, non-finite -> null); render_grid rows Memory (DRAM)/L3/L2/L1 x Read/Write/Copy GB/s 2dp + Latency ns 1dp (4 rows x 4 cols confirmed in live output); run_all(opts.avx512) wired to --avx512 with documented AVX-512F-absent fallback note; on Err: stderr + exit 1 (no panic) for both detect() and run_all() failures; all 9 other src files (orchestrator, worker, latency, kernel_read/write/copy/512, lib, features, topology, buffers) byte-identical to v2-development and Cargo.toml unchanged (no new deps); zero compiler warnings (check clean) and zero clippy warnings (clippy --all-targets -D warnings clean); 63/63 tests green (60 lib + 3 bin); release/debug bin builds; full live run: header (16 phys/32 logical/SMT on/64 MiB L3/AVX2 yes/AVX-512 no), grid populated, --json valid, --avx512 exit 0, unknown flag exit 2.
   AHEAD: QA: run the full pass on the DDR5-6000 AM5 test machine and check the §1.3 grid exit criteria, including ±5% bandwidth / ±2 ns latency parity; this review host is AVX2-only (64 MiB L3), so DRAM read 26.3 GB/s and 85.5 ns/hop are not the target-band claim.
