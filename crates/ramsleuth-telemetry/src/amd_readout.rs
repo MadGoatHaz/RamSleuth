@@ -95,7 +95,7 @@ const VOLTAGE_MAX_MV: u16 = 4000;
 // ---------------------------------------------------------------------------
 
 /// UCLK:MCLK divide mode (the "1:1 / 1:2" ratio shown on the dashboard).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DivMode {
     /// UCLK runs at the same rate as MCLK (1:1).
     OneToOne,
@@ -107,7 +107,7 @@ pub enum DivMode {
 ///
 /// An Intel-side concept; AMD PM tables do not report it, so the AMD mapping
 /// leaves [`ClockReadout::gear_mode`] as `Na(NotApplicable)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GearMode {
     /// Gear 1.
     One,
@@ -125,7 +125,7 @@ pub enum GearMode {
 /// - [`RttValue::Ohms`] — a value already expressed in ohms (kept for sources
 ///   that report ohms directly; the AMD code table produces
 ///   [`RttValue::Rzq`] / [`RttValue::Disabled`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RttValue {
     /// The RTT path is disabled.
     Disabled,
@@ -151,7 +151,7 @@ impl RttValue {
 }
 
 /// Clocks and clock ratios (MHz), the vendor-neutral readout.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClockReadout {
     /// Memory clock (MHz).
     pub mclk_mhz: Section<f64>,
@@ -170,7 +170,7 @@ pub struct ClockReadout {
 }
 
 /// The 27 DRAM subtimings, in ticks (the plan's display unit).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TimingSet {
     /// tCL — CAS latency.
     pub cl: Section<u16>,
@@ -232,7 +232,7 @@ pub struct TimingSet {
 ///
 /// The five ODT/driver fields are ohms; the three RTT fields are
 /// [`RttValue`] (disabled / RZQ divisor / ohms).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CadBus {
     /// Processor ODT (ohms).
     pub proc_odt: Section<f64>,
@@ -253,7 +253,7 @@ pub struct CadBus {
 }
 
 /// Memory/SOC rail voltages, in millivolts.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VoltageSet {
     /// VDDCR_SOC (mV).
     pub vddcr_soc_mv: Section<u16>,
@@ -268,7 +268,7 @@ pub struct VoltageSet {
 /// The AMD-specific aggregate of the four vendor-neutral display sets.
 ///
 /// Produced by [`map_amd`] from the frozen [`AmdPmSnapshot`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AmdReadout {
     /// Clocks + ratios.
     pub clocks: ClockReadout,
@@ -765,5 +765,133 @@ mod tests {
         assert_eq!(RttValue::Disabled.ohms(), None);
         assert_eq!(RttValue::Rzq(5).ohms(), Some(48.0));
         assert_eq!(RttValue::Ohms(33.5).ohms(), Some(33.5));
+    }
+
+    /// A `Section` in the fully degraded state: `Na(UnsupportedHardware)`.
+    /// `T` is inferred from the struct field at each call site.
+    fn na_cell<T>() -> Section<T> {
+        Section::na(NaReason::UnsupportedHardware)
+    }
+
+    /// A fully degraded [`AmdReadout`]: every cell
+    /// [`NaReason::UnsupportedHardware`] (the no-panic state for an
+    /// unsupported platform, plan D5).
+    fn all_na_readout() -> AmdReadout {
+        AmdReadout {
+            clocks: ClockReadout {
+                mclk_mhz: na_cell(),
+                uclk_mhz: na_cell(),
+                fclk_mhz: na_cell(),
+                div_mode: na_cell(),
+                gear_mode: na_cell(),
+                gdm: na_cell(),
+                pdm: na_cell(),
+            },
+            timings: TimingSet {
+                cl: na_cell(),
+                rcwdwr: na_cell(),
+                rcdrd: na_cell(),
+                rp: na_cell(),
+                ras: na_cell(),
+                rc: na_cell(),
+                rrds: na_cell(),
+                rrld: na_cell(),
+                faw: na_cell(),
+                wtrs: na_cell(),
+                wtrl: na_cell(),
+                wr: na_cell(),
+                rfc1: na_cell(),
+                rfc2: na_cell(),
+                rfcsb: na_cell(),
+                cwl: na_cell(),
+                rtp: na_cell(),
+                rdwr: na_cell(),
+                wrrd: na_cell(),
+                rdrd_sd: na_cell(),
+                rdrd_dd: na_cell(),
+                rdrd_scl: na_cell(),
+                rdrd_sc: na_cell(),
+                wrwr_sd: na_cell(),
+                wrwr_dd: na_cell(),
+                wrwr_scl: na_cell(),
+                wrwr_sc: na_cell(),
+            },
+            cad_bus: CadBus {
+                proc_odt: na_cell(),
+                rtt_nom: na_cell(),
+                rtt_wr: na_cell(),
+                rtt_park: na_cell(),
+                clk_drv: na_cell(),
+                addr_cmd_drv: na_cell(),
+                cs_odt_drv: na_cell(),
+                cke_drv: na_cell(),
+            },
+            voltages: VoltageSet {
+                vddcr_soc_mv: na_cell(),
+                vddio_mem_mv: na_cell(),
+                vdd_misc_mv: na_cell(),
+                vpp_mv: na_cell(),
+            },
+        }
+    }
+
+    /// (f) P3-03: a representative `AmdReadout` — `Value` and `Na` cells
+    /// across every field type — round-trips through bincode, as does the
+    /// all-`Na` degradation state (the full AMD readout is wire-safe).
+    #[test]
+    fn amd_readout_bincode_round_trip() {
+        // values + `Na`: the good snapshot (all `Value` except the
+        // AMD-not-applicable gear mode) with a clock and a CAD code pushed
+        // out of band → `Na(ParseError)` / `Na(NotApplicable)`.
+        let mut s = good_snapshot();
+        s.mclk_mhz = 0; // zero clock → Na(ParseError)
+        s.cad_bus.proc_odt = 7; // unknown code → Na(NotApplicable)
+        let ro = map_amd(&s);
+        assert!(ro.clocks.mclk_mhz.is_na());
+        assert!(ro.cad_bus.proc_odt.is_na());
+        assert!(ro.clocks.gear_mode.is_na());
+
+        let bytes = bincode::serialize(&ro)
+            .expect("AmdReadout must serialize (no-panic contract)");
+        let back: AmdReadout =
+            bincode::deserialize(&bytes).expect("AmdReadout must deserialize");
+        assert_eq!(ro, back);
+
+        // the fully degraded state must be wire-safe too
+        let all_na = all_na_readout();
+        let bytes = bincode::serialize(&all_na)
+            .expect("AmdReadout must serialize (no-panic contract)");
+        let back: AmdReadout =
+            bincode::deserialize(&bytes).expect("AmdReadout must deserialize");
+        assert_eq!(all_na, back);
+    }
+
+    /// (g) P3-03: every [`RttValue`] arm survives a bincode round-trip —
+    /// `Disabled`, `Rzq(code)`, `Ohms(value)` — both bare and as the
+    /// `Section` cells the CAD bus fields use.
+    #[test]
+    fn rtt_value_arms_round_trip() {
+        let values = vec![
+            RttValue::Disabled,
+            RttValue::Rzq(2),
+            RttValue::Ohms(33.5),
+        ];
+        let bytes = bincode::serialize(&values)
+            .expect("RttValue must serialize (no-panic contract)");
+        let back: Vec<RttValue> =
+            bincode::deserialize(&bytes).expect("RttValue must deserialize");
+        assert_eq!(values, back);
+
+        let sections: Vec<Section<RttValue>> = vec![
+            Section::Value(RttValue::Disabled),
+            Section::Value(RttValue::Rzq(10)),
+            Section::Value(RttValue::Ohms(45.0)),
+            Section::na(NaReason::NotApplicable),
+        ];
+        let bytes = bincode::serialize(&sections)
+            .expect("Section<RttValue> must serialize (no-panic contract)");
+        let back: Vec<Section<RttValue>> =
+            bincode::deserialize(&bytes).expect("Section<RttValue> must deserialize");
+        assert_eq!(sections, back);
     }
 }
