@@ -7,6 +7,9 @@
 //! - **Intel 6th–15th gen**: MCHBAR MMIO register decoding via `/dev/mem`.
 //! - **SPD EEPROM**: `ee1004` raw-block parsing (JEP106 makers, XMP/EXPO).
 //!
-//! See `plans/PLAN.md` for the Phase 2 chunk decomposition.
+//! See `plans/PLAN-PHASE2.md` for the Phase 2 chunk decomposition.
 
-// Intentionally minimal at scaffold stage — providers land in Phase 2.
+// Phase 2 modules land one per chunk (wiring only, not counted against the
+// per-chunk line budget). Each is `pub mod` so its frozen interface is
+// reachable (`crate::cpuid::CpuInfo`, …); P2-10 adds root re-exports.
+pub mod cpuid; // P2-01 — CPUID vendor + family/generation detection (interface freeze).
