@@ -3,7 +3,6 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retained as `plans/PLAN.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-- [ACTIVE] ID: review-P2-11 | AGENT: general (Code Reviewer) | BRANCH: branch/chunk-P2-11 | FILES: [DEV_LOG.md, crates/ramsleuth-telemetry/src/main.rs]
 @@@ HISTORY @@@@@@ HISTORY @@@
 - [DONE] ID: P2-11 | STATUS: SUCCESS | BRANCH: branch/chunk-P2-11
 DECISION: Implemented main.rs — the thin P2-11 verification CLI (no serde, no clap; Cargo.toml/lib.rs/providers untouched): hand-parsed flags (--json; -h/--help short-circuit to usage + exit 0; unknown flag -> stderr + exit 2), dashboard render (CPU line, AMD/Intel lines via render_section, one SPD[i] line per module or a single N/A line when empty), hand-rolled to_json (Section: Na -> null, Value -> escaped Debug string; each SpdModule -> escaped Debug string; json_escape covers \"/\//\n/\t/\r + \u00XX control arm), and exit 0 after every successful render even when all sections are Na (no-panic contract D5); 6 new pure tests (render_section Value/Na, dashboard all-Na + SPD-module lines, to_json structural keys + null + module string, json_escape full table, parse_opts flags incl. Err verbatim); zero warnings (check + clippy --all-targets -D warnings), 96/96 tests pass (90 lib + 6 bin), bin builds; tests never call collect() (QA runs the live path).
@@ -109,4 +108,4 @@ AHEAD: plan text is stale vs the freeze (§D5 + P2-02 scope: old variants Unsupp
 - Toolchain: `cargo check` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` **47/47 pass** (8 new `intel_mchbar` tests; none require root, an Intel CPU, or `/dev/mem`).
 
 @@@ CURRENT_STATE @@@
-P2-11 implemented on branch/chunk-P2-11; awaiting review. Phase 2 complete pending review/QA.
+P2-11 review PASS (96/96 tests, clippy -D warnings clean, frozen contract verified, facade + providers byte-identical to v2-development); awaiting merge to v2-development.
