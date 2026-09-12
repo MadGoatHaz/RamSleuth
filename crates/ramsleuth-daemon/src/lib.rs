@@ -24,6 +24,7 @@
 
 pub mod caps;
 pub mod socket;
+pub mod cache;
 
 // P3-12: the SOFT privilege probe, re-exported at the root (workspace
 // re-export style) — the daemon's "warn, keep serving" contract
@@ -37,3 +38,9 @@ pub use caps::{probe, PrivilegeReport};
 // `ramsleuth_protocol::DEFAULT_SOCKET_PATH`) and hands the returned
 // tokio listener to the P3-16 async accept loop.
 pub use socket::{setup_listener, SocketSetupError};
+// P3-14: the TTL lazy telemetry cache over an injectable collector,
+// re-exported at the root (workspace re-export style) — P3-16 (rpc)
+// serves `GetTelemetry` from it (a `get()` inside the TTL is a cheap
+// clone, never a re-collect) and P3-17 (main) constructs it with
+// `ramsleuth_telemetry::collect` + the `--max-age` default (5 s).
+pub use cache::TelemetryCache;

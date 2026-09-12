@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [branch/chunk-P3-14] P3-14 daemon cache.rs (impl-P3-14) STARTED
 
 @@@ CURRENT_STATE @@@
 Cycle 3 (Phase 3) - P3-13 (Unix socket listener setup) complete on branch/chunk-P3-13 (fork of branch/chunk-P3-12): socket.rs adds synchronous setup_listener(&Path) -> Result<tokio UnixListener, SocketSetupError> — parent create_dir_all (DirCreate + `--socket` hint, no silent fallback), pre-existing socket probed via UnixStream::connect (live -> AlreadyRunning, stale -> remove + rebind), bind, chmod 0660 (hard Chmod error), best-effort chown ramsleuth->wheel (warning only, no error arm), set_nonblocking + from_std (caller must be inside a tokio runtime context); io::Error is not Clone/PartialEq -> both hand-implemented (variant + kind + message); lib.rs re-exports setup_listener + SocketSetupError; daemon 8/8 (4 new #[tokio::test]s), workspace 199/199, clippy -D warnings clean, build green; lease signed out on this branch — no push, no merge (local only per recipe). Next: review + merge P3-12 then P3-13 (both local branches); P3-14 (TTL cache) / P3-15 (bench job) can fork from P3-13 once it merges.
