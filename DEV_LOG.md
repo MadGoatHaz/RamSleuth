@@ -3,6 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE2.md` (Phase 1 plan retained as `plans/PLAN.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
+- [ACTIVE] ID: P2-05 | AGENT: general (Implementation) | BRANCH: branch/chunk-P2-05 | FILES: amd_readout.rs, lib.rs
 @@@ HISTORY @@@
 - [DONE] ID: review-P2-04 | STATUS: SUCCESS | BRANCH: v2-development
 DECISION: Merged P2-04 (no-ff): safety (the critical property) verified — every read goes through bounds-checked read_u8/u16le/u32le (slice .get + saturating_add; OOB -> Err(Parse), never panics, never indexes), PmLayout::from_version guard (7.11.x/12.x/13.x else UnknownPmTableVersion, propagated before any blob read), header cross-check + min-length gate; contract verified (AmdPmSnapshot fields 27x u16 timings / 8x u16 CAD / 4x u16 mV, parse(&SmuContext) -> TelemetryResult, PmLayout+offsets()+name(), pub mod amd_pm in lib.rs, no I/O, no unsafe, no new deps); clippy --all-targets -D warnings clean, 29/29 tests (9/9 amd_pm; truncation sweep of every length 0..end -> Err(Parse), no crash).
