@@ -25,6 +25,7 @@
 pub mod caps;
 pub mod socket;
 pub mod cache;
+pub mod bench_job;
 
 // P3-12: the SOFT privilege probe, re-exported at the root (workspace
 // re-export style) — the daemon's "warn, keep serving" contract
@@ -44,3 +45,11 @@ pub use socket::{setup_listener, SocketSetupError};
 // clone, never a re-collect) and P3-17 (main) constructs it with
 // `ramsleuth_telemetry::collect` + the `--max-age` default (5 s).
 pub use cache::TelemetryCache;
+// P3-15: the single-flight benchmark job manager, re-exported at the
+// root (workspace re-export style) — P3-16 (rpc) starts a run from
+// the wire's `StartBenchmark { target, mode }` via `start`, services
+// `CancelBenchmark { run_id }` via `cancel`, and forwards the handle's
+// `JobEvent` stream (progress + exactly one terminal) to the owning
+// connection; `JobError::Busy` maps onto the wire's
+// `Response::Error("benchmark already running")` (plan D6).
+pub use bench_job::{BenchJobManager, JobError, JobEvent, JobHandle};

@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [branch/chunk-P3-15] P3-15 daemon bench_job.rs (impl-P3-15) STARTED
 
 @@@ CURRENT_STATE @@@
 Cycle 3 (Phase 3) - P3-14 (TTL telemetry cache) complete on branch/chunk-P3-14 (fork of branch/chunk-P3-13): cache.rs adds TelemetryCache{collector: Box<dyn Fn() -> SystemMemoryTelemetry + Send + Sync>, ttl, last, last_at} — new(impl Fn() -> SystemMemoryTelemetry + Send + Sync + 'static, Duration) takes an INJECTABLE collector (production: ramsleuth_telemetry::collect, no-panic by the Phase 2 contract; tests: a mock), get(&mut self) returns a clone of the cached snapshot while last_at.elapsed() < ttl (no re-collect) and otherwise re-collects (stores snapshot + Instant::now(), returns it); never panics by itself; ttl() accessor; lib.rs gains `pub mod cache` + crate-root `pub use cache::TelemetryCache` (workspace re-export style; the module doc list already anticipated cache); 4 mock-collector tests (Arc<AtomicUsize> call counter + all-Na SystemMemoryTelemetry built via the telemetry public API — no real collect(), no hardware): first get = exactly 1 call, second get within TTL = still 1 call + equal clone, 1 ms TTL + 20 ms sleep = 2 calls, field-for-field mock equality + ttl accessor; daemon 12/12, workspace clippy -D warnings clean, build green; lease signed out on this branch — no push, no merge (local only per recipe). Next: review + merge P3-13 then P3-14; P3-15 (bench job) can fork from P3-14; P3-16 (rpc) consumes TelemetryCache via the briefing's &mut self API.
