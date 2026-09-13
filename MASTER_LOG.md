@@ -12,6 +12,52 @@ Confirmed by director/user 2026-09-12; captured in `Docs/RamSleuth-v2.md`, `Docs
 - **Cycle position:** Phase 1 (Native Benchmark Engine, 11 chunks) and Phase 2 (Live Memory Controller Telemetry, 11 chunks) are COMPLETE and QA-passed (159/159 tests, clippy clean). **The next development cycle starts at Phase 3** (privilege-separated daemon + Unix socket + clients).
 - **CPUID note:** the frozen P2-01 map classifies the 5950X reference host as family `0x19` → `Amd(Zen3)`; desktop Zen 4/5 silicon also reports family `0x19` on some boards, so the AMD PM parse (P2-04) keys on the **SMU version** (7.11.x / 12.x / 13.x), not on `AmdZen` — generation ambiguity cannot break the PM layout.
 
+## RamSleuth v2 — Cycle 3 (Phase 3: Privilege-Separated Architecture) — 2026-09-13
+
+### What was delivered
+Privilege-separated architecture: one privileged daemon owns all hardware probing; all clients are fully unprivileged and reach it over a Unix socket. Five new crates + a serde wire foundation:
+- **`ramsleuth-protocol`** — the wire contract: `Request` / `Response` / `BenchMode` / `Message` (serde-derived, payloads reused verbatim from telemetry + bench) + `DEFAULT_SOCKET_PATH` + a length-prefixed Bincode frame codec (`frame.rs`) with a 16 MiB `MAX_FRAME_SIZE` guard (`encode_frame` / `decode_frame` / `Frame` / `FrameError`); zero `unsafe`, tokio-free.
+- **`ramsleuth-daemon`** (lib + bin) — `caps` SOFT privilege probe (geteuid + `CapEff` bit 21; never panics/exits, warns softly); `socket` listener (mode **0660**, stale-file probe → live `AlreadyRunning` / dead rebind, best-effort `chown ramsleuth:wheel`); `TelemetryCache` (TTL-gated, injectable collector, clone-within-TTL); `BenchJobManager` (single-flight, clean cancel, per-cell progress); `rpc` (per-connection async RPC over the frozen wire contract); `main` bin (`--socket` / `--max-age`, SIGTERM/SIGINT → graceful stop + socket removed, no-panic contract) + **`systemd/ramsleuth.service`** (packaging artifact; CAP_SYS_RAWIO-only unit).
+- **`ramsleuth-client`** (lib + bin) — synchronous `UnixStream` transport (read/write timeouts, 3-retry backoff, friendly `DaemonDown` hint); pure `dump` dashboard renderer (full hardware timings, every N/A cell with a reason); `bench` / `status` commands; CLI (`dump` / `bench` / `status` + `--socket` / `--tier` / `--mode`, exit codes 0/1/2).
+- **`ramsleuth-tui`** (lib + bin) — ratatui 0.29 + crossterm 0.28; pure `key_to_action` (R / S / Q); 3-zone non-scrolling dashboard; terminal loop with a background 2 s updater; MSRV-safe lockfile pins for ratatui transitive deps.
+- **`ramsleuth-gui`** (lib + bin) — egui / eframe / egui_extras 0.27.2; semantic palette + **F2** PNG / **F3** JSON export to `$HOME`; `TelemetryData` + background poller with a bench command channel + cancel; 3 zones; eframe app 1400×900 @ ~60 FPS.
+- **Serde foundation** — serde derives on all telemetry (CPUID / AMD / Intel / SPD / facade) + bench (worker / orchestrator / streamed) public wire types; `SystemMemoryTelemetry`, `BenchmarkGrid`, `StreamProgress` (and `WorkerError`) are wire-serializable, each with bincode round-trip tests.
+
+### Quality
+- **327/327 tests green (debug AND release, whole workspace)**; **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); release build OK.
+- **MSRV = 1.75** (max `rust_version` across all **441 packages**); ratatui / egui transitive deps held ≤ 1.75 via lockfile pins (`instability` ≤ 0.3.10, `unicode-segmentation` ≤ 1.12.0; existing tokio 1.53.1 / serde 1.0.229 pins untouched).
+- **Live end-to-end verified** (this host, unprivileged): daemon up with a 0660 socket; unprivileged `ramsleuth-client` `dump` / `status` / `bench` all **exit 0** (bench: `BenchStarted` + live progress + full 4×4 grid); TUI rendered under a PTY (3 zones live); GUI ran on Wayland (1400×900, all zones, F2/F3 export, clean Q); daemon `SIGTERM` → graceful stop, exit 0, socket removed; no-daemon path → **exit 1** + friendly `DaemonDown` start hint; **zero panics / segfaults**.
+- QA audit on `v2-development` (post-merge, live unprivileged run): **CORE GATE PASSED** — unprivileged `ramsleuth-client -- dump` prints full hardware timings against a running daemon (the Phase 3 exit criterion).
+
+### Live result (this host: Ryzen 9 5950X / Zen 3 / DDR4, `ryzen_smu` absent, unprivileged)
+- Graceful degradation confirmed end-to-end: **AMD N/A (`DriverMissing`, no `ryzen_smu`)**; **Intel N/A (`UnsupportedHardware`)**; **SPD density `0x0D` parse-error → N/A**; **SPD maker `0xC1` shown raw-hex**; 2× DDR4 SPD modules at 3200 MT/s with per-profile timings; live CPU readout (Amd(Zen3), brand string). No panic in any privilege/CPU state.
+
+### Key decisions
+- One privileged daemon is the sole privilege boundary: all hardware I/O (SMU/IMC/SPD) stays daemon-side; the client/TUI/GUI chain is tokio-free and never touches hardware.
+- Synchronous length-prefixed Bincode frames with a 16 MiB size guard over a 0660 Unix socket; tokio confined to the daemon (async accept loop + `spawn_blocking` pumps); std-only client transport.
+- Serde added to every wire-crossing public type up front, so the protocol crate reuses payload types verbatim (no duplication, no boxing of frozen arm shapes).
+
+### Open items carried to Cycle 4
+1. AMD tick-identical ground truth — needs `ryzen_smu` module built + loaded + root on the 5950X host.
+2. Intel live MCHBAR decode — on the LGA-1151 i5-6600 (Skylake, dual-channel) test machine.
+3. Model reconciliation — AMD PM + Intel IMC byte offsets are plan-mandated skeletons; SPD maker `0xC1` + density `0x0D` codes are outside the frozen tables.
+4. P1 L1/L2 bandwidth overhead refinement (inner-loop iterations for the small-tier working sets).
+5. MSRV 1.75 → 1.89 bump decision (deferred; workspace deliberately kept at 1.75 via lockfile pins).
+6. Push to GitHub — condition met (confirmed working app) but **held local per policy**; ready on explicit go-ahead. No force-pushes without sign-off.
+
+### Per-chunk history (summarized from DEV_LOG.md)
+30 single-file micro-chunks (P3-01…P3-30) + 2 doc-drift fixes (DocFix, DocFix2), all reviewed and merged into `v2-development` via `--no-ff` (local only, never pushed):
+- P3-01…P3-06: serde foundation — derives + bincode round-trip tests on the telemetry wire types (`NaReason` / `Section<T>`, CPUID, AMD, Intel channel/readout, SPD decode, `SystemMemoryTelemetry` facade root + `PartialEq`).
+- P3-07…P3-09: bench serde + streaming — `BenchOp` / `WorkerResult` (+ `WorkerError` wire-serializable), `Tier` / `Metric` / `BenchmarkGrid`, `streamed.rs` (`run_streamed` with clean cancel + per-cell progress, `StreamTarget` / `StreamProgress` / `StreamError`).
+- P3-10…P3-11: `ramsleuth-protocol` birth — `Request` / `Response` / `BenchMode` / `Message` + `DEFAULT_SOCKET_PATH`; length-prefixed Bincode frame codec + 16 MiB guard.
+- P3-12…P3-17: `ramsleuth-daemon` birth — crate scaffold + `caps` SOFT probe; `socket` (0660 + stale-rebind + chown); `cache` (TTL, injectable collector); `bench_job` (single-flight + cancel); `rpc` (per-connection async); `main` bin + `systemd/ramsleuth.service`.
+- P3-18…P3-21: `ramsleuth-client` — `UnixStream` transport (timeouts / retries / `DaemonDown`); pure `dump` renderer (the exit-criterion command); `bench` / `status` commands; CLI (`dump` / `bench` / `status` + `--socket` / `--tier` / `--mode`, exit codes).
+- P3-22…P3-24: `ramsleuth-tui` — crate birth + `events` (`key_to_action` R/S/Q, MSRV lockfile pins); 3-zone dashboard; terminal loop + background 2 s updater.
+- P3-25…P3-30: `ramsleuth-gui` — style/semantic palette; shared state + background poller (bench command channel + cancel); telemetry zone (matrix); bench zone (4×4 + progress + run/cancel); status zone (SPD cards + daemon status + F2/F3/Q actions); eframe app shell (1400×900, ~60 FPS).
+- DocFix / DocFix2: residual `--max-age` doc-drift fixes (`5 s` → `2 s` to match the real 2 s daemon default); doc-only, zero code/behavior change.
+
+Cycle 3 close-out (2026-09-13): all 30 `branch/chunk-P3-*` plus `branch/chunk-docfix` / `branch/chunk-docfix2` verified fully merged into `v2-development` and pruned (`git branch -d` only; no unmerged branch touched). `DEV_LOG.md` reset (ACTIVE_WORKERS = no leases, CURRENT_STATE = Cycle 3 complete + ready for Cycle 4).
+
 ## RamSleuth v2 — Cycle 2 (Phase 2: Live Memory Controller Telemetry) — 2026-09-12
 
 ### What was delivered
