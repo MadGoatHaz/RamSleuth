@@ -14,6 +14,10 @@
 //!   `StartBenchmark` send, then the reply stream — a `BenchStarted`
 //!   ack, the `BenchProgress` events, and exactly one terminal — into
 //!   `state.bench`;
+//! - watches the shared `AtomicBool` cancel flag (the bench zone's
+//!   Cancel button, P3-28): [`run_bench`] checks it before each
+//!   frame — once set, the run is stopped daemon-side with a
+//!   best-effort `CancelBenchmark` and ends with `running = false`;
 //! - ticks every 200 ms so an in-flight run's progress frames stay
 //!   responsive, and stops on the shared `AtomicBool` (or when the
 //!   channel disconnects).
@@ -58,6 +62,10 @@ pub struct BenchState {
     /// A benchmark run is in flight (the status zone + the bench
     /// zone's progress bar key off this).
     pub running: bool,
+    /// The in-flight run's daemon-assigned id (the `BenchStarted`
+    /// ack; `None` between runs — the Cancel button addresses the run
+    /// with it, P3-28).
+    pub run_id: Option<u64>,
     /// Streamed [`StreamProgress`] events of the current / last run
     /// (cleared when a new run starts).
     pub progress: Vec<StreamProgress>,
@@ -166,15 +174,33 @@ pub fn poll_telemetry(socket: &Path, state: &mut TelemetryData) -> Result<(), St
 /// `BenchStarted` ack, the `BenchProgress` events, and exactly one
 /// terminal — into `state.bench`.
 ///
-/// Testable, no thread. The run starts with `running = true` and the
-/// progress list cleared (a stale run's events never mix into a new
-/// one); the terminal frame (`BenchResult` → the grid, `BenchCancelled`,
-/// or the daemon's `Error`) sets `running = false`; a transport failure
-/// (a closed stream, a timeout, …) or a contract-violating frame
-/// records `state.error` and the same. Always returns `Ok(())` (the
-/// no-panic contract, as in [`poll_telemetry`]) — the poller loop must
-/// survive every failure.
-pub fn run_bench(socket: &Path, cmd: BenchCmd, state: &mut TelemetryData) -> Result<(), String> {
+/// Testable, no thread. The run starts with `running = true`, the
+/// progress list cleared, and a stale `run_id` dropped (a stale run's
+/// events never mix into a new one); the terminal frame (`BenchResult`
+/// → the grid, `BenchCancelled`, or the daemon's `Error`) sets
+/// `running = false`; a transport failure (a closed stream, a timeout,
+/// …) or a contract-violating frame records `state.error` and the
+/// same. Always returns `Ok(())` (the no-panic contract, as in
+/// [`poll_telemetry`]) — the poller loop must survive every failure.
+///
+/// **Cancel (P3-28):** `cancel` is the flag the bench zone's Cancel
+/// button sets (shared with the poller). It is reset to `false` at the
+/// start of every run (a stale cancel never kills a new one) and
+/// checked before each `recv()`: once set, the run is stopped
+/// daemon-side with a best-effort `CancelBenchmark` for the current
+/// `run_id` (only once the `BenchStarted` ack has landed — the
+/// daemon's reply is never read) and the loop breaks with
+/// `running = false` (the clean stop, plan D6: the in-flight pass
+/// finishes, the run ends at the next gate).
+pub fn run_bench(
+    socket: &Path,
+    cmd: BenchCmd,
+    state: &mut TelemetryData,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    // The shared cancel flag is reset per run: a stale `true` from a
+    // cancelled run must not abort this one before its first frame.
+    cancel.store(false, Ordering::Relaxed);
     let mut client = match Client::connect(socket) {
         Ok(client) => client,
         Err(error) => {
@@ -185,6 +211,8 @@ pub fn run_bench(socket: &Path, cmd: BenchCmd, state: &mut TelemetryData) -> Res
     };
     state.bench.running = true;
     state.bench.progress.clear();
+    // The new run's id arrives with the `BenchStarted` ack.
+    state.bench.run_id = None;
     if let Err(error) = client.send(&Request::StartBenchmark {
         target: cmd.target,
         mode: cmd.mode,
@@ -194,8 +222,20 @@ pub fn run_bench(socket: &Path, cmd: BenchCmd, state: &mut TelemetryData) -> Res
         return Ok(());
     }
     loop {
+        // The Cancel button set the shared flag: ask the daemon for a
+        // clean stop (best-effort — the reply is never read) and break
+        // before the next frame.
+        if cancel.load(Ordering::Relaxed) {
+            if let Some(run_id) = state.bench.run_id {
+                let _ = client.send(&Request::CancelBenchmark { run_id });
+            }
+            state.bench.running = false;
+            break;
+        }
         match client.recv() {
-            Ok(Response::BenchStarted { .. }) => {} // the ack: progress follows
+            Ok(Response::BenchStarted { run_id }) => {
+                state.bench.run_id = Some(run_id);
+            }
             Ok(Response::BenchProgress(progress)) => {
                 state.bench.progress.push(progress);
             }
@@ -241,18 +281,22 @@ pub fn run_bench(socket: &Path, cmd: BenchCmd, state: &mut TelemetryData) -> Res
 ///
 /// The loop: check `stop`; service at most one [`BenchCmd`] from
 /// `bench_rx` (a run streams to its terminal before the next tick —
-/// runs are single-flight daemon-side anyway, P3-15); otherwise poll
-/// telemetry when the last poll is ≥ [`TELEMETRY_INTERVAL`] old (a
-/// thread-local stamp, so a flapping daemon polls on the fixed cadence
-/// instead of every tick); tick [`POLLER_TICK`] (200 ms, so bench
-/// progress stays responsive); exit when `stop` is set or the channel
-/// disconnects. The `RwLock` is written from this thread only, so the
-/// `unwrap` is the workspace's one-writer precedent (TUI P3-24).
+/// runs are single-flight daemon-side anyway, P3-15) handing the
+/// shared `cancel` flag to [`run_bench`] (the bench zone's Cancel
+/// button sets it, P3-28; `run_bench` resets it per run); otherwise
+/// poll telemetry when the last poll is ≥ [`TELEMETRY_INTERVAL`] old
+/// (a thread-local stamp, so a flapping daemon polls on the fixed
+/// cadence instead of every tick); tick [`POLLER_TICK`] (200 ms, so
+/// bench progress stays responsive); exit when `stop` is set or the
+/// channel disconnects. The `RwLock` is written from this thread
+/// only, so the `unwrap` is the workspace's one-writer precedent (TUI
+/// P3-24).
 pub fn spawn_poller(
     socket: PathBuf,
     state: Arc<RwLock<TelemetryData>>,
     bench_rx: Receiver<BenchCmd>,
     stop: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         // Primed due: the first telemetry poll runs at once.
@@ -263,7 +307,7 @@ pub fn spawn_poller(
             }
             match bench_rx.try_recv() {
                 Ok(cmd) => {
-                    let _ = run_bench(&socket, cmd, &mut state.write().unwrap());
+                    let _ = run_bench(&socket, cmd, &mut state.write().unwrap(), &cancel);
                 }
                 Err(TryRecvError::Empty) => {
                     if last_poll.elapsed() >= TELEMETRY_INTERVAL {
@@ -389,6 +433,7 @@ mod tests {
     fn default_state_is_idle_and_never_polled() {
         let state = TelemetryData::default();
         assert!(!state.bench.running, "a fresh state must not run a bench");
+        assert!(state.bench.run_id.is_none(), "a fresh state has no run id");
         assert!(state.bench.progress.is_empty());
         assert!(state.bench.grid.is_none());
         assert!(state.telemetry.is_none());
@@ -510,6 +555,9 @@ mod tests {
         });
 
         let cmd = BenchCmd { target: StreamTarget::Tier(Tier::Memory), mode: BenchMode::Full };
+        // A false cancel flag: this run is never cancelled (it is
+        // reset per run anyway).
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut state = TelemetryData::default();
         // A stale pre-run progress entry must be cleared at run start.
         state.bench.progress.push(StreamProgress {
@@ -520,9 +568,12 @@ mod tests {
             value: 1.0,
             label: "stale".to_owned(),
         });
-        run_bench(sock.path(), cmd, &mut state).expect("run_bench must not error");
+        // A stale pre-run id must be dropped at run start.
+        state.bench.run_id = Some(99);
+        run_bench(sock.path(), cmd, &mut state, &cancel).expect("run_bench must not error");
 
         assert!(!state.bench.running, "the terminal result must clear running");
+        assert_eq!(state.bench.run_id, Some(1), "the ack's run_id must be recorded");
         assert_eq!(
             state.bench.progress.len(),
             1,
@@ -552,8 +603,15 @@ mod tests {
         let state = Arc::new(RwLock::new(TelemetryData::default()));
         let (_tx, rx) = mpsc::channel::<BenchCmd>();
         let stop = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
 
-        let handle = spawn_poller(sock.path().to_path_buf(), state.clone(), rx, stop.clone());
+        let handle = spawn_poller(
+            sock.path().to_path_buf(),
+            state.clone(),
+            rx,
+            stop.clone(),
+            cancel.clone(),
+        );
         stop.store(true, Ordering::Relaxed);
         handle.join().expect("the poller thread must not panic");
 
@@ -561,5 +619,71 @@ mod tests {
         // left in flight.
         let state = state.read().expect("the poller must not poison the lock");
         assert!(!state.bench.running);
+    }
+
+    /// (f) CANCEL (P3-28): after the `BenchStarted` ack lands in the
+    /// state, the shared `cancel` flag is set — `run_bench` ends the
+    /// run with `running = false` (sending the daemon a best-effort
+    /// `CancelBenchmark` when the run has an id) — no hang (the
+    /// stand-in ends the run within a beat either way), no panic, no
+    /// error recorded.
+    #[test]
+    fn run_bench_cancel_flag_stops_the_run() {
+        let sock = TempSocket::new("bench-cancel");
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::StartBenchmark { .. })) => {}
+                other => panic!("stand-in expected StartBenchmark, got {other:?}"),
+            }
+            let started =
+                encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
+                    .expect("must encode");
+            stream.write_all(&started).expect("stand-in write must not fail");
+            // Mimic the daemon: end the run after a beat — the worker
+            // either sees the cancel flag before the terminal frame
+            // (sends a `CancelBenchmark` and breaks) or receives the
+            // terminal `BenchCancelled` while blocked in `recv`.
+            thread::sleep(Duration::from_millis(200));
+            let _ = stream.write_all(
+                &encode_frame(&Message::Response(Response::BenchCancelled { run_id: 42 }))
+                    .expect("must encode"),
+            );
+            let _ = read_one_message(&mut stream); // drain the cancel (best-effort)
+        });
+
+        let socket = sock.path().to_path_buf();
+        let state = Arc::new(RwLock::new(TelemetryData::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let state = Arc::clone(&state);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                let cmd = BenchCmd { target: StreamTarget::Full, mode: BenchMode::Full };
+                run_bench(&socket, cmd, &mut state.write().unwrap(), &cancel)
+                    .expect("run_bench must not error");
+            })
+        };
+
+        // Wait for the run to start (the ack's run_id lands in the
+        // state), then set the shared cancel flag.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if state.read().expect("the poller must not poison the lock").bench.run_id.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the run never started (no BenchStarted within 5 s)"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        cancel.store(true, Ordering::Relaxed);
+        worker.join().expect("run_bench must return on cancel (no hang)");
+
+        let state = state.read().expect("the poller must not poison the lock");
+        assert!(!state.bench.running, "the cancel must clear running");
+        assert_eq!(state.bench.run_id, Some(42), "the run id must stay recorded");
+        assert!(state.error.is_none(), "a clean cancel must not record an error");
+        stand_in.join();
     }
 }
