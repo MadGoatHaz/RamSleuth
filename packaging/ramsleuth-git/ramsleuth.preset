@@ -1,0 +1,3 @@
+# RamSleuth systemd preset: enables ramsleuth.service by default on install.
+# Installed to /usr/lib/systemd/system-preset/ramsleuth.preset; applied via `systemctl preset`.
+00 enable ramsleuth.service

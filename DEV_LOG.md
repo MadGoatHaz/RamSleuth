@@ -3,7 +3,8 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE5.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases — Cycle 4 / Phase 5 planning complete 2026-09-13)
+(no active leases — P5-01 on branch/chunk-p5-01, awaiting review)
 
 @@@ CURRENT_STATE @@@
-Phase 5 (Packaging & Distribution) PLANNED — 7 single-file micro-chunks (P5-01…P5-07) in `plans/PLAN-PHASE5.md`; zero source changes; the 327/327 (debug+release) + clippy-clean baseline must be preserved; MSRV 1.75 KEPT this cycle (open item 5, operator decision); push = fast-forward `v2-development` → origin only, NEVER force-push, on explicit go-ahead (tag vs fresh branch decided at push time). Ready for gated pipeline.
+P5-01 IMPLEMENTED — packaging/ramsleuth-git/ramsleuth.preset (3 lines: preset(5) header + `00 enable ramsleuth.service` per D4), commit eeaf131 pushed to origin/branch/chunk-p5-01; zero source changes; awaiting code review + --no-ff merge into v2-development. Next: P5-02 PKGBUILD (coupled to Chunk 1 — installs the preset to /usr/lib/systemd/system-preset/ramsleuth.preset).
+- [DONE] ID: P5-01 | STATUS: SUCCESS | BRANCH: branch/chunk-p5-01
