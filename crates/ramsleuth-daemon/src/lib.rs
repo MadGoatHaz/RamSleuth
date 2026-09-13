@@ -44,7 +44,7 @@ pub use socket::{setup_listener, SocketSetupError};
 // re-exported at the root (workspace re-export style) — P3-16 (rpc)
 // serves `GetTelemetry` from it (a `get()` inside the TTL is a cheap
 // clone, never a re-collect) and P3-17 (main) constructs it with
-// `ramsleuth_telemetry::collect` + the `--max-age` default (5 s).
+// `ramsleuth_telemetry::collect` + the `--max-age` default (2 s).
 pub use cache::TelemetryCache;
 // P3-15: the single-flight benchmark job manager, re-exported at the
 // root (workspace re-export style) — P3-16 (rpc) starts a run from
