@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE5.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [ACTIVE] ID: P5-10 | AGENT: general (Implementation Agent) | BRANCH: branch/chunk-p5-10-readme | FILES: [packaging/README.md, DEV_LOG.md] — README: ryzen_smu_drv path + amkillam upstream
 
 @@@ HISTORY @@@
 - [DONE] ID: P5-08 | STATUS: SUCCESS | BRANCH: branch/chunk-p5-08-sysfs

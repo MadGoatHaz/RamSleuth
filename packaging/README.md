@@ -87,13 +87,15 @@ To enable live AMD subtimings on an AMD host:
    sudo ryzen-smu-dkms-install
    ```
 
-   Or, from a source checkout (no package needed): `scripts/install-ryzen-smu-dkms.sh`. The helper is idempotent, re-execs under `sudo`, requires the matching kernel headers (build tree `/lib/modules/$(uname -r)/build` — for custom-kernel hosts it lists candidate packages and stops, never guessing), clones the verified upstream (default `https://github.com/53XU/ryzen_smu.git`, overridable via `RYZEN_SMU_URL`) to `/opt/ryzen-smu-src`, then runs `dkms install`, `modprobe`, and persists `/etc/modules-load.d/ryzen_smu.conf`.
+   Or, from a source checkout (no package needed): `scripts/install-ryzen-smu-dkms.sh`. The helper is idempotent, re-execs under `sudo`, requires the matching kernel headers (build tree `/lib/modules/$(uname -r)/build` — for custom-kernel hosts it lists candidate packages and stops, never guessing), clones the verified upstream (default `https://github.com/amkillam/ryzen_smu.git`, branch `main` v0.1.7, overridable via `RYZEN_SMU_URL`) to `/opt/ryzen-smu-src`, then runs `dkms install`, `modprobe`, and persists `/etc/modules-load.d/ryzen_smu.conf`.
 
 `AUTOINSTALL=yes` in the `dkms.conf` auto-rebuilds the module on kernel updates. Verify:
 
 ```sh
-ls /sys/kernel/ryzen_smu/pm_table
+ls /sys/kernel/ryzen_smu_drv/pm_table
 ```
+
+The module also ships a `monitor_cpu` CLI for ground-truth comparison: run it side-by-side with RamSleuth and expect clocks within ±1 MHz, voltages within ±10 mV, and matching CAD/subtimings.
 
 ## CI
 
