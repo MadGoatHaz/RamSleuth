@@ -17,10 +17,19 @@ set -euo pipefail
 # --- Constants --------------------------------------------------------------
 KERNEL="$(uname -r)"
 MODULE="ryzen_smu"
-# Upstream default from the code's uAPI hint (53XU/ryzen_smu). VERIFY the
-# correct upstream at setup time — do NOT trust a cached URL (HANDOVER §7
-# step 2); override with RYZEN_SMU_URL if it moves.
-UPSTREAM_URL="${RYZEN_SMU_URL:-https://github.com/53XU/ryzen_smu.git}"
+# Upstream default (VERIFIED): amkillam/ryzen_smu — default branch `main`,
+# v0.1.7, actively maintained; builds module `ryzen_smu`, exposes
+# /sys/kernel/ryzen_smu_drv/pm_table, ships its own dkms.conf + monitor_cpu
+# CLI (Zen3+, kernel 7.2+). The former 53XU/ryzen_smu default is DEAD
+# (HTTP 404 -> credential prompt). Still overridable via RYZEN_SMU_URL, and
+# verify the upstream at setup time (HANDOVER §7 step 2) — do NOT trust a
+# cached URL if it moves.
+UPSTREAM_URL="${RYZEN_SMU_URL:-https://github.com/amkillam/ryzen_smu.git}"
+# Verified sysfs kobject (amkillam drv.c; matches the daemon, P5-08):
+# canonical ryzen_smu_drv path first, legacy ryzen_smu path as a secondary
+# existence check only.
+PM_TABLE="/sys/kernel/ryzen_smu_drv/pm_table"
+PM_TABLE_LEGACY="/sys/kernel/${MODULE}/pm_table"
 SRC_DIR="/opt/ryzen-smu-src"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"    # this script sits in <repo>/scripts
 
@@ -42,7 +51,8 @@ resolve_dkms_conf() {
 
 # --- Idempotent fast path ------------------------------------------------------
 # Already loaded (re-run, or AUTOINSTALL=yes rebuilt after a kernel update).
-if [[ -e "/sys/kernel/${MODULE}/pm_table" ]]; then
+# Canonical ryzen_smu_drv path first, legacy ryzen_smu path as fallback.
+if [[ -e "${PM_TABLE}" || -e "${PM_TABLE_LEGACY}" ]]; then
   log "${MODULE} already loaded (pm_table present) — nothing to do."
   exit 0
 fi
@@ -98,10 +108,13 @@ modprobe "${MODULE}" || die "modprobe ${MODULE} failed — run 'dmesg | tail' to
 printf '%s\n' "${MODULE}" > "/etc/modules-load.d/${MODULE}.conf"   # idempotent overwrite
 
 # --- Step 6: verify ------------------------------------------------------------------
-if [[ -e "/sys/kernel/${MODULE}/pm_table" ]]; then
-  log "SUCCESS: ${MODULE} loaded; /sys/kernel/${MODULE}/pm_table present."
-  log "Start the daemon for live subtimings: systemctl start ramsleuth (or sudo ramsleuth-daemon)"
+# Matches the daemon (P5-08): canonical ryzen_smu_drv path first, legacy
+# ryzen_smu path second.
+if [[ -e "${PM_TABLE}" ]]; then
+  log "SUCCESS: ${MODULE} loaded; ${PM_TABLE} present."
+elif [[ -e "${PM_TABLE_LEGACY}" ]]; then
+  log "SUCCESS: ${MODULE} loaded; legacy ${PM_TABLE_LEGACY} present (daemon prefers ${PM_TABLE})."
 else
-  die "pm_table missing after load — run 'dmesg | tail' to inspect. Without the
+  die "pm_table missing after load (looked for ${PM_TABLE}, then ${PM_TABLE_LEGACY}) — run 'dmesg | tail' to inspect. Without the
 module the app still works: N/A (DriverMissing), exit 0, no panic."
 fi
