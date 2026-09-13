@@ -34,7 +34,7 @@ Packaging & distribution for the completed 7-crate pure-Rust workspace — 7 chu
 `v2-development` (== e415306) and all 9 `branch/chunk-p5-*` branches were fast-forwarded to origin during the cycle (no force-push); `origin/v2-development` == local HEAD. Remote chunk-branch pruning and an optional tag remain pending explicit operator go-ahead — this compaction performs no push and deletes no remote branch.
 
 ### Open items carried to Cycle 5
-1. AMD tick-identical ground truth — needs the `ryzen_smu` module built + loaded + root on the 5950X host (P5-03/P5-04/P5-05 now make this a buildable/installable path).
+1. AMD tick-identical ground truth — needs the `ryzen_smu` module built + loaded + root on the 5950X host (P5-03/P5-04/P5-05 now make this a buildable/installable path; P5-08/09/10 reconciled the upstream to `amkillam/ryzen_smu` + the canonical `ryzen_smu_drv` sysfs path — install now unblocked).
 2. Intel live MCHBAR decode — on the LGA-1151 i5-6600 (Skylake, dual-channel) test machine.
 3. Model reconciliation — AMD PM byte offsets + Intel IMC offsets are plan-mandated skeletons; SPD maker `0xC1` + density `0x0D` codes are outside the frozen tables.
 4. P1 L1/L2 bandwidth overhead refinement (inner-loop iterations for the small-tier working sets).
@@ -53,7 +53,21 @@ Packaging & distribution for the completed 7-crate pure-Rust workspace — 7 chu
 - P5-07: packaging README (operator/end-user guide) (cf15137 → merge 63b1ea4).
 - P5-QA: full audit @ e415306 — 327/327 debug + release, clippy 0, 9/9 files valid, zero `.rs` / zero `Cargo.*` in range; green cycle.
 
-Cycle 4 close-out (2026-09-13): Phase 5 compacted — cycle summary appended to `MASTER_LOG.md`; `DEV_LOG.md` reset (ACTIVE_WORKERS = no leases, CURRENT_STATE = Cycle 4 complete + ready for Cycle 5). Local-only commit; no push, no remote branch deletion.
+### ryzen_smu uAPI reconciliation (post-merge, 2026-09-13)
+Post-compaction follow-up: operator ran `scripts/install-ryzen-smu-dkms.sh` on the 5950X host; the default `git clone` of the dead `53XU/ryzen_smu` repo 404'd and fell back to an interactive GitHub credential prompt. Upstream review of 3 candidates:
+- `leogx9r/ryzen_smu` — original, frozen 2021 (exact `ryzen_smu` module, `/sys/kernel/ryzen_smu`).
+- `FlyGoat/ryzen_nb_smu` — unrelated experiment (module `ry_nb_pp`) — rejected.
+- `amkillam/ryzen_smu` — active fork, v0.1.7 (2026-08), kernel 7.2+ fix; exact `ryzen_smu` module, exposes `/sys/kernel/ryzen_smu_drv/pm_table` (kobject `ryzen_smu_drv`), `monitor_cpu` CLI, Zen 3 + kernel 7.2+ support. **CHOSEN: `amkillam/ryzen_smu` (branch `main`)**.
+
+**CRITICAL pre-existing bug fixed:** the daemon read the wrong sysfs path (`/sys/kernel/ryzen_smu/pm_table`); the real module exposes `/sys/kernel/ryzen_smu_drv/pm_table`.
+
+- **P5-08** `crates/ramsleuth-telemetry/src/amd_smu.rs` — candidate list: canonical `/sys/kernel/ryzen_smu_drv/pm_table` first + legacy `/sys/kernel/ryzen_smu/pm_table` fallback; +1 regression test (327→328).
+- **P5-09** `scripts/install-ryzen-smu-dkms.sh` — default upstream now `amkillam/ryzen_smu` (`RYZEN_SMU_URL` override kept) + `ryzen_smu_drv` path in fast-path/verify.
+- **P5-10** `packaging/README.md` — path + upstream consistency (verify step, `monitor_cpu` ground-truth note).
+
+**QA re-audit: PASS** (66c3122) — 328/328 (debug + release), clippy 0 warnings; daemon/script/README consistent; no-panic graceful degradation preserved (`acquire_on_this_host_is_graceful`). Residual `53XU` / non-`_drv` references are intentional: legacy-fallback candidate list, the script's explicit "53XU is DEAD" warning, historical/spec docs — no doc-scrub needed.
+
+Cycle 4 close-out (2026-09-13, updated): initial compaction recorded P5-01…P5-07 + 2 fixes + P5-QA @ e415306 (327/327); this update records the ryzen_smu uAPI reconciliation (P5-08/09/10 + QA re-audit @ 66c3122, 328/328, clippy 0). `DEV_LOG.md` reset (ACTIVE_WORKERS = no leases, CURRENT_STATE = Cycle 4 + reconciliation complete + ready for Cycle 5 with module install unblocked). Local-only commit; no push, no remote branch deletion.
 
 ## RamSleuth v2 — Cycle 3 (Phase 3: Privilege-Separated Architecture) — 2026-09-13
 
