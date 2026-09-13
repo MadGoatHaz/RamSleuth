@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [branch/chunk-P3-26] P3-26 GUI update.rs (impl-P3-26) STARTED
 
 @@@ CURRENT_STATE @@@
 Cycle 3 (Phase 3) - P3-25 ramsleuth-gui crate birth + style.rs (branch/chunk-P3-25, local only, NOT merged): the GUI is born as lib+bin (the daemon/client/TUI precedent) — lib ramsleuth_gui holds the P3-25 visual contract (style.rs: exact §3.2 palette consts, build_style dark-slate + cyan accents, GuiError no-panic export errors, F3 export_json over the reused SystemMemoryTelemetry wire root, F2 snapshot_png = a valid 312×312 RGB8 data-grid PNG of the BenchmarkGrid colored on the CYAN→AMBER→CRIMSON log ramp), the stub main.rs is re-documented for the P3-30 eframe shell (still exits 0). Deps per the §7 ledger: eframe/egui/egui_extras 0.27.2 (the newest 1.75-compatible egui line — 0.28+ declares 1.76), png 0.17.16, serde_json 1.0.151, + the four path deps (no tokio, no hardware, no type duplication, D2). The eframe default-feature closure needed 21 lockfile pins for the MSRV 1.75 gate (list in the crate Cargo.toml comment); audit: all 441 locked packages ≤1.75, TUI/daemon pins untouched. 8/8 GUI tests, 290/290 workspace, clippy -D warnings clean, build green.
