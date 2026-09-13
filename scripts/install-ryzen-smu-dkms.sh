@@ -3,31 +3,29 @@
 # install-ryzen-smu-dkms.sh — idempotent operator helper (HANDOVER §7).
 #
 # Installs the ryzen_smu AMD kernel module via DKMS so ramsleuth can serve
-# live AMD subtimings. OPTIONAL recommended extra: without the module the app
-# degrades to N/A (DriverMissing) (exit 0, no panic); the frozen systemd unit
-# never loads the module itself.
+# live AMD subtimings. OPTIONAL recommended extra: without the module the
+# app degrades to N/A (DriverMissing) (exit 0, no panic); the frozen systemd
+# unit never loads the module itself.
 #
 # Usage: scripts/install-ryzen-smu-dkms.sh (re-execs under sudo if not root —
 # the operator's sudo prompt appears there). Safe to re-run: every step is
-# guarded and any failure prints a clear message + exits non-zero, never
-# leaving DKMS in a silent half-state. Never touches ramsleuth state.
+# guarded; any failure prints a clear message + exits non-zero, never leaving
+# DKMS in a silent half-state. Never touches ramsleuth state.
 
 set -euo pipefail
 
 # --- Constants --------------------------------------------------------------
 KERNEL="$(uname -r)"
 MODULE="ryzen_smu"
-# Upstream default (VERIFIED): amkillam/ryzen_smu — default branch `main`,
-# v0.1.7, actively maintained; builds module `ryzen_smu`, exposes
+# Upstream default (VERIFIED): amkillam/ryzen_smu — branch `main`, v0.1.7,
+# actively maintained; builds module `ryzen_smu`, exposes
 # /sys/kernel/ryzen_smu_drv/pm_table, ships its own dkms.conf + monitor_cpu
 # CLI (Zen3+, kernel 7.2+). The former 53XU/ryzen_smu default is DEAD
-# (HTTP 404 -> credential prompt). Still overridable via RYZEN_SMU_URL, and
-# verify the upstream at setup time (HANDOVER §7 step 2) — do NOT trust a
-# cached URL if it moves.
+# (HTTP 404). Still overridable via RYZEN_SMU_URL — verify the upstream at
+# setup time (HANDOVER §7 step 2), do NOT trust a cached URL if it moves.
 UPSTREAM_URL="${RYZEN_SMU_URL:-https://github.com/amkillam/ryzen_smu.git}"
 # Verified sysfs kobject (amkillam drv.c; matches the daemon, P5-08):
-# canonical ryzen_smu_drv path first, legacy ryzen_smu path as a secondary
-# existence check only.
+# canonical ryzen_smu_drv path first, legacy ryzen_smu path as secondary.
 PM_TABLE="/sys/kernel/ryzen_smu_drv/pm_table"
 PM_TABLE_LEGACY="/sys/kernel/${MODULE}/pm_table"
 SRC_DIR="/opt/ryzen-smu-src"
@@ -36,10 +34,10 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"    # this scr
 # --- Helpers -----------------------------------------------------------------
 log() { printf '[ryzen-smu-dkms] %s\n' "$*"; }
 die() { printf '[ryzen-smu-dkms] ERROR: %s\n' "$*" >&2; exit 1; }
-# Fallback dkms.conf (P5-03): first existing of the repo-relative path (run
-# from the repo) or the installed /usr/share path (the P5-05 package installs
-# this helper to /usr/bin, where REPO_ROOT resolves to /usr and the repo
-# path does not exist). Prints the chosen path; fails if neither exists.
+# Fallback dkms.conf (P5-03; dual-location, P5-04-fix): first existing of the
+# repo-relative path (run from the repo) or the installed /usr/share path (the
+# P5-05 package installs this helper to /usr/bin, where REPO_ROOT resolves to
+# /usr). Prints the chosen path; fails if neither exists.
 resolve_dkms_conf() {
   local c
   for c in "${REPO_ROOT}/packaging/ryzen-smu-dkms/dkms.conf" \
@@ -66,15 +64,15 @@ fi
 # --- Step 1: prereqs + kernel build tree ---------------------------------------
 log "Installing build tooling: dkms + base-devel (pacman, idempotent)..."
 pacman -S --needed dkms base-devel
-# DKMS needs a kernel build tree. We never guess a custom-kernel headers
+# DKMS needs a kernel build tree; we never guess a custom-kernel headers
 # package (HANDOVER §7 step 1) — list candidates and stop with instructions.
 if [[ ! -d "/lib/modules/${KERNEL}/build" ]]; then
   log "Kernel build tree MISSING for ${KERNEL} — candidate headers packages:"
   CANDIDATES="$(pacman -Qs headers 2>/dev/null | grep -iE 'cachyos|custom|linux-headers' || true)"
   [[ -n "${CANDIDATES}" ]] && printf '%s\n' "${CANDIDATES}"
   die "cannot determine the ${KERNEL} headers package automatically. Install it
-manually (e.g. the matching 'linux-headers' / cachyos-custom package),
-then re-run this script."
+ manually (e.g. the matching 'linux-headers' / cachyos-custom package),
+ then re-run this script."
 fi
 log "Kernel build tree OK: /lib/modules/${KERNEL}/build"
 
@@ -90,31 +88,72 @@ else
     || die "git clone of ${UPSTREAM_URL} failed — verify the URL (and network) and retry"
 fi
 
-# --- Step 3: dkms.conf fallback (P5-03; repo-relative or installed /usr/share) --
-if [[ ! -f "${SRC_DIR}/dkms.conf" ]]; then
-  DKMS_CONF="$(resolve_dkms_conf)" \
-    || die "No fallback dkms.conf found (looked in <repo>/packaging/ryzen-smu-dkms/ and /usr/share/ryzen-smu-dkms/)."
-  log "Source lacks dkms.conf — installing fallback from ${DKMS_CONF}..."
-  install -m 644 "${DKMS_CONF}" "${SRC_DIR}/dkms.conf"
+# --- Step 3: stage source into /usr/src/<module>-<version> (P5-11 fix) -----------
+# DKMS only discovers a module whose source is staged in
+# /usr/src/<module>-<version>/ containing a dkms.conf; the original script
+# cloned to $SRC_DIR and never staged it -> "Arguments <module> and
+# <module-version> are not specified". Flow follows the working AUR
+# ryzen_smu-dkms-git PKGBUILD (pkgver = rev-count . short-hash).
+PKGVER="$(cd -- "${SRC_DIR}" && printf '%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)")"
+STAGE_DIR="/usr/src/${MODULE}-${PKGVER}"
+install -d "${STAGE_DIR}"
+for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
+  [[ -f "${SRC_DIR}/${f}" ]] || continue      # tolerate absent extras
+  install -m 644 "${SRC_DIR}/${f}" "${STAGE_DIR}/${f}"
+done
+# Concrete dkms.conf: prefer the repo's (dual-location fallback, P5-04-fix);
+# the AUR placeholder variant is NOT used. Align its PACKAGE_VERSION with the
+# staged dir (proven AUR pattern) so the MAKE M= path resolves; if the repo's
+# is absent, keep the source's own and substitute its @VERSION@/@CFLGS@.
+REPO_CONF="$(resolve_dkms_conf || true)"
+if [[ -n "${REPO_CONF}" ]]; then
+  install -m 644 "${REPO_CONF}" "${STAGE_DIR}/dkms.conf"
+  sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${PKGVER}\"/" "${STAGE_DIR}/dkms.conf"
+else
+  [[ -f "${STAGE_DIR}/dkms.conf" ]] || die "No dkms.conf available (repo fallback missing; source ${SRC_DIR}/dkms.conf absent)."
+  sed -i "s/@VERSION@/${PKGVER}/g; s/@CFLGS@//g" "${STAGE_DIR}/dkms.conf"
+fi
+log "Staged ${MODULE} source to ${STAGE_DIR} (version ${PKGVER})"
+# depmod conf so the out-of-tree /extra module resolves cleanly (idempotent overwrite).
+install -d /usr/lib/depmod.d
+printf '%s\n' '# RamSleuth P5-11: resolve the out-of-tree ryzen_smu module from /extra.' \
+  "override ${MODULE} /extra/${MODULE}.ko" > "/usr/lib/depmod.d/${MODULE}.conf"
+# Userspace CLI (bonus, ground truth): build monitor_cpu; non-fatal if absent — the module install is the priority.
+if [[ -d "${SRC_DIR}/userspace" ]] && make -C "${SRC_DIR}/userspace" && [[ -f "${SRC_DIR}/userspace/monitor_cpu" ]]; then
+  install -Dm 700 "${SRC_DIR}/userspace/monitor_cpu" /usr/bin/monitor_cpu \
+    || log "WARNING: could not install monitor_cpu to /usr/bin — continuing (module install is priority)"
+else
+  log "WARNING: monitor_cpu unavailable (no userspace dir / build failed) — continuing"
 fi
 
 # --- Step 4: dkms add + build + install -----------------------------------------
-dkms add "${MODULE}" || true   # "already present" is fine (idempotent)
-dkms install "${MODULE}" -k "${KERNEL}" \
-  || die "dkms install failed — run 'dmesg | tail' / 'dkms status' to inspect build errors"
+# `dkms add <module>/<version>` now finds the staged /usr/src tree above.
+if ! dkms add "${MODULE}/${PKGVER}"; then
+  dkms status | grep -q "${MODULE}/${PKGVER}" \
+    && log "${MODULE}/${PKGVER} already registered with DKMS — continuing" \
+    || die "dkms add ${MODULE}/${PKGVER} failed — run 'dkms status' to inspect"
+fi
+dkms build "${MODULE}" -k "${KERNEL}" \
+  || die "dkms build ${MODULE} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect build errors"
+if [[ -d "/var/lib/dkms/${MODULE}/${PKGVER}/${KERNEL}" ]]; then
+  log "${MODULE}/${PKGVER} already installed for ${KERNEL} — skipping dkms install"
+else
+  dkms install "${MODULE}" -k "${KERNEL}" \
+    || die "dkms install ${MODULE} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect"
+fi
 
 # --- Step 5: load now + at boot ---------------------------------------------------
 modprobe "${MODULE}" || die "modprobe ${MODULE} failed — run 'dmesg | tail' to inspect load errors"
 printf '%s\n' "${MODULE}" > "/etc/modules-load.d/${MODULE}.conf"   # idempotent overwrite
 
 # --- Step 6: verify ------------------------------------------------------------------
-# Matches the daemon (P5-08): canonical ryzen_smu_drv path first, legacy
-# ryzen_smu path second.
+# Matches the daemon (P5-08): canonical ryzen_smu_drv path first, legacy second.
 if [[ -e "${PM_TABLE}" ]]; then
   log "SUCCESS: ${MODULE} loaded; ${PM_TABLE} present."
 elif [[ -e "${PM_TABLE_LEGACY}" ]]; then
   log "SUCCESS: ${MODULE} loaded; legacy ${PM_TABLE_LEGACY} present (daemon prefers ${PM_TABLE})."
 else
-  die "pm_table missing after load (looked for ${PM_TABLE}, then ${PM_TABLE_LEGACY}) — run 'dmesg | tail' to inspect. Without the
+  die "pm_table missing after load (looked for ${PM_TABLE}, then ${PM_TABLE_LEGACY}) — run 'dmesg | tail' + 'dkms status' to inspect. Without the
 module the app still works: N/A (DriverMissing), exit 0, no panic."
 fi
+log "Next: start the ramsleuth daemon; ground-truth CLI is now at /usr/bin/monitor_cpu."
