@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [v2-development]
+  pull_request:
+    branches: [v2-development]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.75", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GUI system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev \
+            libgl1-mesa-dev pkgconf
+
+      - name: Install Rust ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test (debug)
+        run: cargo test --workspace
+
+      - name: Test (release)
+        run: cargo test --workspace --release
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GUI system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev \
+            libgl1-mesa-dev pkgconf
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --workspace
+
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ramsleuth-release-binaries
+          path: |
+            target/release/ramsleuth-daemon
+            target/release/ramsleuth-client
+            target/release/ramsleuth-tui
+            target/release/ramsleuth-gui
+            target/release/ramsleuth-bench
+            target/release/ramsleuth-telemetry
