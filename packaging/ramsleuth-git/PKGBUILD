@@ -73,6 +73,6 @@ package() {
     install -Dm644 "packaging/ramsleuth-git/ramsleuth.preset" \
         "$pkgdir/usr/lib/systemd/system-preset/ramsleuth.preset"
 
-    # (4) the ramsleuth group — idempotent, the one real install gap (D3)
-    getent group ramsleuth >/dev/null 2>&1 || groupadd -r ramsleuth
+    # NOTE: the ramsleuth group is created on the TARGET system by the .install
+    # pre_install/pre_upgrade hooks (package() runs in the build env, not the target).
 }

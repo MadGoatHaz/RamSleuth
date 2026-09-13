@@ -7,6 +7,16 @@
 # (N/A (DriverMissing), exit 0, no panic) and is not removed from
 # unit files on upgrade.
 
+pre_install() {
+    # The daemon unit uses Group=ramsleuth; the group must exist on the
+    # target system or the service fails to start. Create it idempotently.
+    getent group ramsleuth >/dev/null 2>&1 || groupadd -r ramsleuth
+}
+
+pre_upgrade() {
+    getent group ramsleuth >/dev/null 2>&1 || groupadd -r ramsleuth
+}
+
 post_install() {
     systemctl daemon-reload 2>/dev/null || true
     if ! systemctl enable --now ramsleuth.service 2>/dev/null; then
