@@ -110,6 +110,11 @@ dependencies = [
 [[package]]
 name = "ramsleuth-client"
 version = "0.1.0"
+dependencies = [
+ "ramsleuth-bench",
+ "ramsleuth-protocol",
+ "ramsleuth-telemetry",
+]
 
 [[package]]
 name = "ramsleuth-daemon"
