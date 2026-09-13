@@ -161,7 +161,7 @@ mod tests {
 
     /// (c) A `get()` after the TTL expires re-collects (counter == 2).
     /// A 1 ms TTL + a 20 ms sleep makes staleness deterministic without
-    /// sleeping anywhere near the production 5 s default.
+    /// sleeping anywhere near the production 2 s default.
     #[test]
     fn get_after_ttl_expiry_recollects() {
         let counter = Arc::new(AtomicUsize::new(0));
