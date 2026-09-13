@@ -6,7 +6,7 @@ Base branch: `v2-development`. Plan: `plans/PLAN-PHASE5.md` (Phase 1 retained as
 (no active leases)
 
 @@@ CURRENT_STATE @@@
-Cycle 4 (Phase 5: Packaging & Distribution + ryzen_smu uAPI reconciliation) COMPLETE + QA passed (328/328, clippy clean); compacted to MASTER_LOG. Packaging: AUR ramsleuth-git + ryzen-smu-dkms extra + systemd group install + GitHub Actions CI. ryzen_smu upstream = amkillam/ryzen_smu (main); daemon reads /sys/kernel/ryzen_smu_drv/pm_table. Ready for Cycle 5 (AMD ryzen_smu ground truth [P5-11 MERGED: staging-before-add + dkms add module/version fixed; P5-12 (branch/chunk-p5-12-dkmsconf, awaiting review): dkms.conf MAKE/CLEAN aligned to the upstream amkillam /build pattern — M= missing-/build defect fixed], Intel i5-6600 MCHBAR, model reconciliation, P1 L1/L2 refinement, MSRV decision, finalize GitHub push/tag on operator go-ahead).
+Cycle 4 (Phase 5: Packaging & Distribution + ryzen_smu uAPI reconciliation) COMPLETE + QA passed (328/328, clippy clean); compacted to MASTER_LOG. Packaging: AUR ramsleuth-git + ryzen-smu-dkms extra + systemd group install + GitHub Actions CI. ryzen_smu upstream = amkillam/ryzen_smu (main); daemon reads /sys/kernel/ryzen_smu_drv/pm_table. Ready for Cycle 5 (AMD ryzen_smu ground truth [P5-11 + P5-12 MERGED: ryzen_smu install path fully fixed (staging + dkms.conf MAKE line aligned to upstream amkillam /build pattern); operator re-run is the ground-truth test], Intel i5-6600 MCHBAR, model reconciliation, P1 L1/L2 refinement, MSRV decision, finalize GitHub push/tag on operator go-ahead).
 
 ## History
 - [DONE] ID: P5-11 | STATUS: SUCCESS | BRANCH: branch/chunk-p5-11-dkms
@@ -18,3 +18,6 @@ AHEAD: CRITICAL separate defect (P5-03, NOT in P5-11): packaging/ryzen-smu-dkms/
 - [DONE] ID: P5-12 | STATUS: SUCCESS | BRANCH: branch/chunk-p5-12-dkmsconf
 DECISION: Rewrote packaging/ryzen-smu-dkms/dkms.conf MAKE/CLEAN to the authoritative upstream amkillam/ryzen_smu pattern (DKMS runs `make TARGET=${kernelver}` in the staged .../build dir; the staged Makefile resolves the kernel KDIR + M=$(CURDIR) so the .ko lands where DKMS looks); DEST_MODULE_LOCATION stays /extra to match the P5-11 depmod override; PACKAGE_VERSION keeps the upstream @VERSION@ placeholder (script's whole-line sed aligns it to $PKGVER); install script untouched.
 AHEAD: Reviewer to verify DKMS-syntax + that `dkms build` now resolves the .ko in .../build; full ground truth needs the operator re-run (sudo, real kernel + headers).
+- [DONE] ID: P5-12-REVIEW | STATUS: SUCCESS (merged) | BRANCH: v2-development
+DECISION: Reviewed + merged P5-12 (branch deleted): valid DKMS syntax, MAKE="make TARGET=${kernelver}" matches upstream amkillam pattern (broken M=${dkms_tree}/... missing-/build line gone), @CFLGS@ hook deliberately omitted (documented), single ^PACKAGE_VERSION= line sed-aligned to $PKGVER by the script, DEST_MODULE_LOCATION /extra matches the depmod override, zero other-file changes; cargo test skipped (no source changes).
+AHEAD: ryzen_smu install path fully fixed (staging + dkms.conf); operator re-run is the ground-truth test (sudo, real kernel + headers).
