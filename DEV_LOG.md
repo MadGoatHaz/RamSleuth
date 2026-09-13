@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [branch/chunk-P3-19] P3-19 client dump.rs (impl-P3-19) STARTED
 
 @@@ CURRENT_STATE @@@
 Cycle 3 (Phase 3) - P3-18 ramsleuth-client transport landed on branch/chunk-P3-18 (a1412b4, local only, NOT merged): the client is now a lib+bin crate (lib ramsleuth_client root-re-exports Client + ClientError, workspace style) - a synchronous UnixStream transport over the frozen P3-10/P3-11 frame codec: connect with RETRIES=3 / 100 ms backoff on NotFound/ConnectionRefused then the friendly DaemonDown "start it with" diagnostic (documented std quirk: UnixStream has no connect_timeout and an expired read timeout surfaces as WouldBlock, not TimedOut - both mapped in), 5 s default read/write timeouts (tunable), send/recv with a persistent leftover buffer (streaming-safe across recv calls), request = one round trip; 6 unit tests on a real in-process daemon stand-in (thread + UnixListener, pid-qualified temp socket); client 6/6, workspace 231/231, clippy -D warnings clean, build green, MSRV 1.75-safe. Next: review + merge P3-18 into v2-development; P3-19 (dump.rs: render + GetTelemetry) and P3-20 (commands.rs: streaming bench + status) fork from the merge tip, P3-21 rewrites the main.rs placeholder.

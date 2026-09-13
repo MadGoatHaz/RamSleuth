@@ -15,14 +15,26 @@
 //!   timeout + retries, send/recv frames, one round-trip `request`,
 //!   structured `ClientError` diagnostics (daemon-down hint, timeouts,
 //!   protocol violations).
+//! - `dump` — P3-19 — the `dump` command: the pure dashboard-style
+//!   `render` over a `SystemMemoryTelemetry` snapshot (every cell prints
+//!   its value or `N/A (<reason>)`, never a panic) + the one-RPC `dump`
+//!   (`GetTelemetry` → render → stdout).
 //!
-//! `dump` (P3-19), `commands` (P3-20) and the rewritten binary entry
-//! (`main.rs`, P3-21) build on the transport this crate exposes.
+//! `commands` (P3-20) and the rewritten binary entry (`main.rs`, P3-21)
+//! build on the transport this crate exposes.
 
 pub mod client;
+pub mod dump;
 
 // P3-18: the synchronous RPC transport, re-exported at the root
 // (workspace re-export style) — P3-19 (`dump`), P3-20 (`bench`/`status`)
 // and P3-21 (bin) all call `Client::connect` + `request`; the TUI/GUI
 // frontends (P3-22+/P3-25+) consume the same `Client` via this library.
 pub use client::{Client, ClientError};
+
+// P3-19: the dump command, re-exported at the root (workspace
+// re-export style) — P3-21 (bin) calls `dump::dump` on its connected
+// `Client`, and the TUI snapshot export (P3-24) + the GUI (P3-25) reuse
+// the pure `render` (the module `dump` and the function `dump` coexist:
+// different namespaces).
+pub use dump::{dump, render};
