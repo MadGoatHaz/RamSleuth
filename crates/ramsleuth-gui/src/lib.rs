@@ -20,11 +20,16 @@
 //! - `update` — P3-26 — the shared [`TelemetryData`] + the background
 //!   poller (`spawn_poller`) the app shell runs behind
 //!   `Arc<RwLock<TelemetryData>>` (no render-thread I/O, D6).
+//! - `telemetry_zone` — P3-27 — zone 1: the live memory controller &
+//!   subtimings matrix — [`timing_cells`] (the pure, deterministic cell
+//!   builder over the AMD / Intel readout) + [`render_telemetry_zone`]
+//!   (the titled, bounded-height `egui::Grid` renderer).
 //!
-//! (`telemetry_zone` / `bench_zone` / `status_zone` land in P3-27…
-//! P3-29; the eframe app shell in `main.rs` lands in P3-30.)
+//! (`bench_zone` / `status_zone` land in P3-28 / P3-29; the eframe app
+//! shell in `main.rs` lands in P3-30.)
 
 pub mod style;
+pub mod telemetry_zone;
 pub mod update;
 
 // P3-25: the semantic style contract, re-exported at the root
@@ -40,3 +45,11 @@ pub use style::{build_style, export_json, snapshot_png, GuiError, AMBER, CRIMSON
 // zones (P3-27…P3-29) render `TelemetryData` / `BenchState` verbatim,
 // and `poll_telemetry` / `run_bench` are the testable units both share.
 pub use update::{poll_telemetry, run_bench, spawn_poller, BenchCmd, BenchState, TelemetryData};
+
+// P3-27: zone 1 (the live memory controller & subtimings), re-exported
+// at the root (workspace re-export style) — the app shell (P3-30)
+// calls `render_telemetry_zone` with a read-only `&TelemetryData`
+// snapshot (the zone draws its own titled frame + bounded grid), and
+// `timing_cells` is the pure, deterministic cell builder the tests
+// exercise without an egui context.
+pub use telemetry_zone::{render_telemetry_zone, timing_cells};
