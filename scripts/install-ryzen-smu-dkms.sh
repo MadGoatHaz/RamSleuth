@@ -23,11 +23,22 @@ MODULE="ryzen_smu"
 UPSTREAM_URL="${RYZEN_SMU_URL:-https://github.com/53XU/ryzen_smu.git}"
 SRC_DIR="/opt/ryzen-smu-src"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"    # this script sits in <repo>/scripts
-DKMS_CONF_SRC="${REPO_ROOT}/packaging/ryzen-smu-dkms/dkms.conf"       # repo-provided fallback (P5-03)
 
 # --- Helpers -----------------------------------------------------------------
 log() { printf '[ryzen-smu-dkms] %s\n' "$*"; }
 die() { printf '[ryzen-smu-dkms] ERROR: %s\n' "$*" >&2; exit 1; }
+# Fallback dkms.conf (P5-03): first existing of the repo-relative path (run
+# from the repo) or the installed /usr/share path (the P5-05 package installs
+# this helper to /usr/bin, where REPO_ROOT resolves to /usr and the repo
+# path does not exist). Prints the chosen path; fails if neither exists.
+resolve_dkms_conf() {
+  local c
+  for c in "${REPO_ROOT}/packaging/ryzen-smu-dkms/dkms.conf" \
+           "/usr/share/ryzen-smu-dkms/dkms.conf"; do
+    if [[ -f "${c}" ]]; then printf '%s\n' "${c}"; return 0; fi
+  done
+  return 1
+}
 
 # --- Idempotent fast path ------------------------------------------------------
 # Already loaded (re-run, or AUTOINSTALL=yes rebuilt after a kernel update).
@@ -69,11 +80,12 @@ else
     || die "git clone of ${UPSTREAM_URL} failed — verify the URL (and network) and retry"
 fi
 
-# --- Step 3: dkms.conf fallback (repo-provided, P5-03) --------------------------
+# --- Step 3: dkms.conf fallback (P5-03; repo-relative or installed /usr/share) --
 if [[ ! -f "${SRC_DIR}/dkms.conf" ]]; then
-  [[ -f "${DKMS_CONF_SRC}" ]] || die "source lacks dkms.conf and repo fallback ${DKMS_CONF_SRC} is missing"
-  log "Source lacks dkms.conf — installing repo-provided fallback..."
-  install -m 644 "${DKMS_CONF_SRC}" "${SRC_DIR}/dkms.conf"
+  DKMS_CONF="$(resolve_dkms_conf)" \
+    || die "No fallback dkms.conf found (looked in <repo>/packaging/ryzen-smu-dkms/ and /usr/share/ryzen-smu-dkms/)."
+  log "Source lacks dkms.conf — installing fallback from ${DKMS_CONF}..."
+  install -m 644 "${DKMS_CONF}" "${SRC_DIR}/dkms.conf"
 fi
 
 # --- Step 4: dkms add + build + install -----------------------------------------
