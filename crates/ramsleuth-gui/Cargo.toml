@@ -8,5 +8,60 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "ramsleuth_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ramsleuth-gui"
+path = "src/main.rs"
+
 [dependencies]
-# Phase 4: add egui, eframe, egui_extras, ramsleuth-client, ramsleuth-bench.
+# P3-25: the GUI crate is born (plan §7 dependency ledger). The frontend
+# is unprivileged (plan D2): it never touches hardware — it talks to the
+# daemon over the Unix socket through the shared `ramsleuth-client`
+# library, and the telemetry/bench path deps ride along because the
+# zones (P3-26+) render `SystemMemoryTelemetry` snapshots +
+# `BenchmarkGrid`/progress verbatim from those crates (no type
+# duplication, D2); `ramsleuth-protocol` supplies the wire vocabulary
+# (request/response + `DEFAULT_SOCKET_PATH`) the update loop (P3-26)
+# speaks.
+#
+# MSRV 1.75 gate (plan D1): egui **0.28** (2024-07-03) is the first
+# release to declare rust-version 1.76 and 0.30+ declares 1.80, so the
+# newest 1.75-compatible line is egui / eframe / egui_extras **0.27.2**
+# (declared rust-version 1.72, verified on crates.io) — the plan's
+# 0.29 suggestion is 1.76 and is ruled out by the MSRV. `png` 0.17
+# (0.17.16, declared 1.57) and `serde_json` 1 (1.0.151, declared 1.71)
+# are MSRV-safe as declared. The eframe 0.27 default-feature closure
+# (glow + wayland + x11 + accesskit) resolves a few latest-in-range
+# transitive releases past 1.75 (resolver = "2" has no MSRV-aware
+# resolution, plan D1); they are pinned in Cargo.lock — re-verify with
+# `cargo metadata` if the lock is ever regenerated:
+#   ahash 0.8.11 (0.8.12 pulls getrandom 0.3, declared 1.63+),
+#   tempfile 3.14.0 (3.27 pulls getrandom 0.3), fastrand 2.1.1
+#   (2.5 pulls getrandom 0.4, declared 1.85), async-io 2.4.0
+#   (2.6 pulls getrandom 0.3 + wasip2/wit-bindgen), idna_adapter 1.1.0
+#   (1.2.1+ pulls the icu4x 2.x stack, declared 1.82-1.88),
+#   proc-macro-crate 3.2.0 (3.5 pulls toml_edit 0.25 / toml_parser 1.1
+#   / winnow 1.0, declared 1.85+), indexmap 2.9.0 (2.12+ declared
+#   1.82/1.85; drops hashbrown 0.17), rustc-hash 2.1.1 (2.1.2+
+#   declared 1.77), wasm-bindgen 0.2.93 + js-sys/web-sys 0.3.70 +
+#   wasm-bindgen-futures 0.4.43 (the 0.2.128 / 0.3.105 / 0.4.78 set
+#   declares 1.77), wayland-client 0.31.14 + wayland-scanner 0.31.10
+#   (the 0.31.15 / 0.31.11 pair pulls quick-xml 0.41, declared 1.79 —
+#   now 0.39.4), wayland-protocols 0.32.12 (0.32.13 declared 1.86),
+#   smithay-clipboard 0.7.2 (0.7.3 declared 1.85), async-lock 3.4.0 +
+#   async-signal 0.2.8 (3.4.2 / 0.2.14 declare 1.85), uds_windows
+#   1.1.0 (1.2.1 declared 1.85), jobserver 0.1.32 (0.1.34+ pull
+#   getrandom, declared 1.85), home 0.5.9 (0.5.11+ declare 1.81/1.88),
+#   jni-sys 0.3.0 + 0.4.0 (0.3.1 / 0.4.1 declare 1.77 / 1.76).
+egui = "0.27"
+eframe = "0.27"
+egui_extras = "0.27"
+png = "0.17"
+serde_json = "1"
+ramsleuth-bench = { path = "../ramsleuth-bench" }
+ramsleuth-client = { path = "../ramsleuth-client" }
+ramsleuth-protocol = { path = "../ramsleuth-protocol" }
+ramsleuth-telemetry = { path = "../ramsleuth-telemetry" }
