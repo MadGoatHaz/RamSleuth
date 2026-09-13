@@ -15,15 +15,21 @@
 //!   timeout + retries, send/recv frames, one round-trip `request`,
 //!   structured `ClientError` diagnostics (daemon-down hint, timeouts,
 //!   protocol violations).
+//! - `commands` — P3-20 — the `bench` + `status` commands: `bench`
+//!   streams a benchmark run (a `BenchStarted` ack, one progress line
+//!   per completed cell, the terminal 4×4 grid through the pure
+//!   `render_grid`); `status` is the one-RPC per-section summary. Both
+//!   print their output and return the same text.
 //! - `dump` — P3-19 — the `dump` command: the pure dashboard-style
 //!   `render` over a `SystemMemoryTelemetry` snapshot (every cell prints
 //!   its value or `N/A (<reason>)`, never a panic) + the one-RPC `dump`
 //!   (`GetTelemetry` → render → stdout).
 //!
-//! `commands` (P3-20) and the rewritten binary entry (`main.rs`, P3-21)
-//! build on the transport this crate exposes.
+//! The rewritten binary entry (`main.rs`, P3-21) dispatches `dump` /
+//! `bench` / `status` over the transport this crate exposes.
 
 pub mod client;
+pub mod commands;
 pub mod dump;
 
 // P3-18: the synchronous RPC transport, re-exported at the root
@@ -38,3 +44,10 @@ pub use client::{Client, ClientError};
 // the pure `render` (the module `dump` and the function `dump` coexist:
 // different namespaces).
 pub use dump::{dump, render};
+
+// P3-20: the bench + status commands, re-exported at the root (the
+// workspace re-export style) — P3-21 (bin) calls `bench` / `status` on
+// its connected `Client` and `render_grid` for any grid export; the
+// returned `String` is exactly the text printed (the unit tests assert
+// on it, the bin may ignore it).
+pub use commands::{bench, render_grid, status};
