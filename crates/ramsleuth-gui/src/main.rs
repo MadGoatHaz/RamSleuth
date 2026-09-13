@@ -1,9 +1,12 @@
-//! ramsleuth-gui — Immediate-mode desktop GUI (Phase 4, egui + eframe).
+//! ramsleuth-gui — the eframe app shell (P3-30).
 //!
-//! Renders the dark-slate unified dashboard: timing matrix, AIDA64-style
-//! benchmark grid, interactive Run/controls, and single-button PNG snapshot
-//! export. Targets a steady 60 FPS without freezes during benchmark runs.
+//! This binary is the P3-30 target: the 60 FPS eframe window (1400×900
+//! initial viewport, `style::build_style` on the context), the
+//! `update::start_updater` background poller behind
+//! `Arc<RwLock<TelemetryData>>` (no render-thread I/O, D6), the three
+//! Grand Design §3 zones, and the F2 / F3 / Q actions. Until P3-30 it
+//! is a placeholder that exits 0.
 
 fn main() {
-    // Scaffold stub: no behavior yet.
+    // P3-30: the eframe app shell lands here (see `src/lib.rs`).
 }
