@@ -12,8 +12,14 @@
 //!    AMD vendor; anything else yields
 //!    [`TelemetryError::UnsupportedHardware`] *before any file access*
 //!    (plan §D4 gate discipline).
-//! 2. **Primary — sysfs:** read `/sys/kernel/ryzen_smu/pm_table` with
-//!    `std::fs`. NotFound → fall through to step 3. Permission error →
+//! 2. **Primary — sysfs:** read the PM table with `std::fs` from the
+//!    driver kobject directory. The upstream module registers that
+//!    kobject as `ryzen_smu_drv` (verified in amkillam/ryzen_smu
+//!    `drv.c`), so the canonical path is
+//!    `/sys/kernel/ryzen_smu_drv/pm_table`; the legacy
+//!    `/sys/kernel/ryzen_smu/pm_table` is tried second for older or
+//!    renamed builds. NotFound on every candidate → fall through to
+//!    step 3. Permission error on an existing candidate →
 //!    [`TelemetryError::InsufficientPrivilege`]. Any other I/O error →
 //!    [`TelemetryError::Io`].
 //! 3. **Fallback — char device:** open `/dev/ryzen_smu` read-only and fetch
@@ -46,8 +52,17 @@
 use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{TelemetryError, TelemetryResult};
 
-/// `ryzen_smu` sysfs PM-table blob (primary acquisition path).
-const SYSFS_PM_TABLE: &str = "/sys/kernel/ryzen_smu/pm_table";
+/// `ryzen_smu` sysfs PM-table paths, tried in order (primary acquisition).
+///
+/// The upstream module registers its kobject as `ryzen_smu_drv`
+/// (amkillam/ryzen_smu `drv.c`: `kobject_create_and_add("ryzen_smu_drv",
+/// kernel_kobj)`), so the canonical path is
+/// `/sys/kernel/ryzen_smu_drv/pm_table`; the legacy `ryzen_smu` directory
+/// name is kept as a fallback for older or renamed builds.
+const SYSFS_PM_TABLE_CANDIDATES: [&str; 2] = [
+    "/sys/kernel/ryzen_smu_drv/pm_table",
+    "/sys/kernel/ryzen_smu/pm_table",
+];
 
 /// `ryzen_smu` character device (fallback acquisition path).
 const DEV_NODE: &str = "/dev/ryzen_smu";
@@ -193,17 +208,29 @@ pub fn classify_io_error(e: &std::io::Error) -> TelemetryError {
 
 #[cfg(target_os = "linux")]
 fn acquire_linux() -> TelemetryResult<SmuContext> {
-    // Primary path: the sysfs PM-table blob.
-    match std::fs::read(SYSFS_PM_TABLE) {
-        Ok(blob) => blob_to_context(blob),
-        Err(e) => match classify_io_error(&e) {
-            // The sysfs interface is absent -> fall through to the char
-            // device (module may expose only one of the two).
-            TelemetryError::DriverMissing { .. } => chardev_acquire(),
-            // Present but unreadable (-> InsufficientPrivilege) or some
-            // other raw failure (-> Io): report as classified.
-            other => Err(other),
-        },
+    // Primary path: the sysfs PM-table blob — try the canonical kobject
+    // name first, then the legacy one.
+    let mut found: Option<TelemetryResult<SmuContext>> = None;
+    for &path in SYSFS_PM_TABLE_CANDIDATES.iter() {
+        match std::fs::read(path) {
+            Ok(blob) => {
+                found = Some(blob_to_context(blob));
+                break;
+            }
+            Err(e) => match classify_io_error(&e) {
+                // Absent at this candidate -> try the next one; if it was
+                // the last, fall through to the char device (the module
+                // may expose only one of the two interfaces).
+                TelemetryError::DriverMissing { .. } => continue,
+                // Present but unreadable (-> InsufficientPrivilege) or some
+                // other raw failure (-> Io): report as classified.
+                other => return Err(other),
+            },
+        }
+    }
+    match found {
+        Some(result) => result,
+        None => chardev_acquire(),
     }
 }
 
@@ -392,6 +419,20 @@ mod tests {
                     | Err(TelemetryError::Parse { .. })
             ),
             "acquire() returned an unexpected variant: {res:?}"
+        );
+    }
+
+    /// (e) The sysfs candidate list pins the verified upstream kobject
+    /// (`ryzen_smu_drv`, amkillam/ryzen_smu `drv.c`) before the legacy
+    /// directory name, so the correct path is always tried first.
+    #[test]
+    fn sysfs_candidates_try_verified_path_first() {
+        assert_eq!(
+            SYSFS_PM_TABLE_CANDIDATES,
+            [
+                "/sys/kernel/ryzen_smu_drv/pm_table",
+                "/sys/kernel/ryzen_smu/pm_table"
+            ]
         );
     }
 }

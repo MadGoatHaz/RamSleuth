@@ -5,5 +5,10 @@ Base branch: `v2-development`. Plan: `plans/PLAN-PHASE5.md` (Phase 1 retained as
 @@@ ACTIVE_WORKERS @@@
 - [ACTIVE] ID: P5-08-review | AGENT: general (Code Reviewer) | BRANCH: v2-development | FILES: [DEV_LOG.md]
 
+@@@ HISTORY @@@
+- [DONE] ID: P5-08 | STATUS: SUCCESS | BRANCH: branch/chunk-p5-08-sysfs
+DECISION: Corrected the AMD SMU PM-table sysfs path in amd_smu.rs to the verified kobject /sys/kernel/ryzen_smu_drv/pm_table (amkillam drv.c); legacy /sys/kernel/ryzen_smu kept as fallback candidate; full regression 328/328 + clippy clean.
+AHEAD: Reviewer merges branch/chunk-p5-08-sysfs into v2-development; docs/packaging still cite the legacy path until a later chunk.
+
 @@@ CURRENT_STATE @@@
-Cycle 4 (Phase 5: Packaging & Distribution) COMPLETE + QA passed; compacted to MASTER_LOG. 327/327, clippy clean, zero Rust source changes. Packaging: AUR ramsleuth-git + ryzen-smu-dkms extra + systemd group install + GitHub Actions CI. Ready for Cycle 5 (live-hardware verification: AMD ryzen_smu ground truth + Intel i5-6600 MCHBAR; model reconciliation; P1 L1/L2 refinement; MSRV decision; finalize GitHub push/tag on operator go-ahead).
+P5-08 (AMD SMU sysfs PM-table path fix) implemented on branch/chunk-p5-08-sysfs (commit f4493c5), awaiting review/merge into v2-development. 328/328 debug + release, clippy -D warnings clean, no-panic graceful degradation preserved (driver absent -> N/A (DriverMissing)). Prior: Cycle 4 COMPLETE + QA passed (327/327); packaging AUR + ryzen-smu-dkms + systemd + CI; ready for Cycle 5 (live-hardware verification, model reconciliation, P1 refinement, MSRV decision, finalize push/tag).
