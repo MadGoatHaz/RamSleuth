@@ -12,6 +12,49 @@ Confirmed by director/user 2026-09-12; captured in `Docs/RamSleuth-v2.md`, `Docs
 - **Cycle position:** Phase 1 (Native Benchmark Engine, 11 chunks) and Phase 2 (Live Memory Controller Telemetry, 11 chunks) are COMPLETE and QA-passed (159/159 tests, clippy clean). **The next development cycle starts at Phase 3** (privilege-separated daemon + Unix socket + clients).
 - **CPUID note:** the frozen P2-01 map classifies the 5950X reference host as family `0x19` → `Amd(Zen3)`; desktop Zen 4/5 silicon also reports family `0x19` on some boards, so the AMD PM parse (P2-04) keys on the **SMU version** (7.11.x / 12.x / 13.x), not on `AmdZen` — generation ambiguity cannot break the PM layout.
 
+## RamSleuth v2 — Cycle 4 (Phase 5: Packaging & Distribution) — 2026-09-13
+
+### What was delivered
+Packaging & distribution for the completed 7-crate pure-Rust workspace — 7 chunks (P5-01…P5-07) + 2 fixes, all `--no-ff` merged into `v2-development` (range `51f872f..e415306`):
+- **P5-01** `packaging/ramsleuth-git/ramsleuth.preset` — systemd preset, enables `ramsleuth.service` (eeaf131 → merge 3f98513).
+- **P5-02** `packaging/ramsleuth-git/PKGBUILD` + `packaging/ramsleuth-git/ramsleuth-git.install` — AUR package: builds the 7-crate workspace, installs the 6 binaries (`ramsleuth-daemon`, `ramsleuth-client`, `ramsleuth-tui`, `ramsleuth-gui`, `ramsleuth-bench`, `ramsleuth-telemetry`) to `/usr/bin` plus the daemon unit and preset (merged 396a72d). **P5-02-fix**: the `ramsleuth` group is created on the TARGET system by the `.install` `pre_install`/`pre_upgrade` hooks (idempotent `getent || groupadd -r`, runs as root); the ineffective build-env `groupadd` is removed from `package()` (replaced by a NOTE comment) (ddf9650 → merge a27d976).
+- **P5-03** `packaging/ryzen-smu-dkms/dkms.conf` — `AUTOINSTALL=yes` (module auto-rebuilds on kernel change), optional AMD extra (2c2346e → merge 093f497).
+- **P5-04** `scripts/install-ryzen-smu-dkms.sh` — idempotent operator-run DKMS helper implementing HANDOVER §7 (pm_table fast-path, sudo re-exec, never-guess kernel-headers guard with candidate listing, verified-upstream shallow clone, `dkms add`/`install`, modprobe + `/etc/modules-load.d`, `pm_table` verify with dmesg hint) (150d88f → merge 28071d1). **P5-04-fix**: the dkms.conf fallback now resolves the repo path first, then the installed `/usr/share/ryzen-smu-dkms/` path, so the helper works both from a checkout and from the AUR package (e41d4ae → merge 46c4b8e).
+- **P5-05** `packaging/ryzen-smu-dkms/PKGBUILD` — optional provisioning AUR package with a safe no-in-chroot design: ships the P5-03 dkms.conf + P5-04 helper as `/usr/bin/ryzen-smu-dkms-install`; the operator runs the helper on the target (430b2f3 → merge c93410e).
+- **P5-06** `.github/workflows/ci.yml` — GitHub Actions: `cargo test --workspace` (debug + release) and clippy `-D warnings` on a `["1.75", "stable"]` matrix (`fail-fast: false`), plus a release build job uploading a 6-binary artifact (d5c384b → merge f3c6d25). Committed `Cargo.lock` untouched — the MSRV 1.75 leg is verified by CI (host has no rustup; local MSRV check skipped and documented).
+- **P5-07** `packaging/README.md` — operator/end-user packaging guide: install table (6 binaries → `/usr/bin`, unit + preset → systemd paths, group via `.install` hooks), AUR + `makepkg -si` paths, `usermod` / `Group=wheel` fallback, sandboxed unit day-2 commands, ryzen-smu-dkms extra, CI matrix summary, no-panic note (cf15137 → merge 63b1ea4).
+
+### Quality
+- **327/327 tests green (debug AND release, whole workspace), 0 failures**; **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); release build OK.
+- **9/9 packaging/CI/systemd files valid**: all present and non-empty (`ci.yml`, `packaging/README.md`, ramsleuth-git `PKGBUILD` + `ramsleuth-git.install` + `ramsleuth.preset`, ryzen-smu-dkms `PKGBUILD` + `dkms.conf`, install script, `systemd/ramsleuth.service`); `bash -n` PASS ×4; shellcheck zero findings; `ci.yml` YAML-valid (python3 + pyyaml); install script mode 755.
+- **ZERO Rust source changes**: range `51f872f..e415306` touched no `.rs` and no `Cargo.*` files (packaging/CI/docs only); committed `Cargo.lock` untouched by any Phase 5 chunk; no-panic / graceful-degradation contract preserved.
+- QA audit on `v2-development` @ e415306: **PASS** (green cycle) — full re-verification after the P5-02-fix target-group follow-up; P5-QA closed.
+
+### Push state (operator gate)
+`v2-development` (== e415306) and all 9 `branch/chunk-p5-*` branches were fast-forwarded to origin during the cycle (no force-push); `origin/v2-development` == local HEAD. Remote chunk-branch pruning and an optional tag remain pending explicit operator go-ahead — this compaction performs no push and deletes no remote branch.
+
+### Open items carried to Cycle 5
+1. AMD tick-identical ground truth — needs the `ryzen_smu` module built + loaded + root on the 5950X host (P5-03/P5-04/P5-05 now make this a buildable/installable path).
+2. Intel live MCHBAR decode — on the LGA-1151 i5-6600 (Skylake, dual-channel) test machine.
+3. Model reconciliation — AMD PM byte offsets + Intel IMC offsets are plan-mandated skeletons; SPD maker `0xC1` + density `0x0D` codes are outside the frozen tables.
+4. P1 L1/L2 bandwidth overhead refinement (inner-loop iterations for the small-tier working sets).
+5. MSRV 1.75 → 1.89 decision (deferred for AVX-512F; workspace deliberately kept at 1.75 via lockfile pins; the first GitHub Actions run is the MSRV 1.75 checkpoint).
+6. Push to GitHub — `v2-development` already fast-forwarded to origin during the cycle; remote chunk-branch prune + optional tag pending explicit operator go-ahead.
+
+### Per-chunk history (summarized from DEV_LOG.md)
+9 branches (P5-01…P5-07 + P5-02-fix + P5-04-fix), all reviewed and `--no-ff` merged into `v2-development`, then fast-forwarded to origin:
+- P5-01: systemd preset enabling `ramsleuth.service` (eeaf131 → merge 3f98513).
+- P5-02: ramsleuth-git AUR PKGBUILD + `.install` (6 bins, daemon unit, ramsleuth group; merged 396a72d); P5-02-fix: target-side `ramsleuth` group via `pre_install`/`pre_upgrade`, build-env `groupadd` removed (ddf9650 → merge a27d976).
+- P5-03: ryzen-smu-dkms `dkms.conf` (`AUTOINSTALL=yes`, optional AMD extra) (2c2346e → merge 093f497).
+- P5-04: idempotent operator-run DKMS install helper (HANDOVER §7) (150d88f → merge 28071d1).
+- P5-04-fix: dkms.conf fallback resolves repo + installed `/usr/share` (e41d4ae → merge 46c4b8e).
+- P5-05: optional ryzen-smu-dkms provisioning AUR package (safe no-in-chroot design) (430b2f3 → merge c93410e).
+- P5-06: GitHub Actions CI — 1.75/stable matrix (test debug+release, clippy `-D warnings`) + 6-binary artifact (d5c384b → merge f3c6d25).
+- P5-07: packaging README (operator/end-user guide) (cf15137 → merge 63b1ea4).
+- P5-QA: full audit @ e415306 — 327/327 debug + release, clippy 0, 9/9 files valid, zero `.rs` / zero `Cargo.*` in range; green cycle.
+
+Cycle 4 close-out (2026-09-13): Phase 5 compacted — cycle summary appended to `MASTER_LOG.md`; `DEV_LOG.md` reset (ACTIVE_WORKERS = no leases, CURRENT_STATE = Cycle 4 complete + ready for Cycle 5). Local-only commit; no push, no remote branch deletion.
+
 ## RamSleuth v2 — Cycle 3 (Phase 3: Privilege-Separated Architecture) — 2026-09-13
 
 ### What was delivered
