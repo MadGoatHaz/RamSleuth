@@ -29,11 +29,16 @@
 //!   16-cell builder over the terminal result grid) +
 //!   [`render_bench_zone`] (the titled-frame `egui_extras::TableBuilder`
 //!   renderer + the `BenchCmd` / cancel-flag controls).
+//! - `status_zone` — P3-29 — zone 3: the hardware/SPD module
+//!   cards, the daemon status line, and the F2 / F3 / Q actions
+//!   row — [`spd_cards`] (the pure per-slot card builder) and
+//!   [`render_status_zone`] (the titled-frame renderer reporting
+//!   the clicked action as a [`GuiAction`] for the app shell).
 //!
-//! (`status_zone` lands in P3-29; the eframe app shell in `main.rs`
-//! lands in P3-30.)
+//! (The eframe app shell in `main.rs` lands in P3-30.)
 
 pub mod bench_zone;
+pub mod status_zone;
 pub mod style;
 pub mod telemetry_zone;
 pub mod update;
@@ -67,3 +72,13 @@ pub use telemetry_zone::{render_telemetry_zone, timing_cells};
 // shared cancel flag, and `grid_cells` is the pure 16-cell builder
 // the tests exercise without an egui context.
 pub use bench_zone::{grid_cells, render_bench_zone};
+
+// P3-29: zone 3 (the hardware/SPD module cards + the daemon
+// status line + the F2 / F3 / Q actions row), re-exported at the
+// root (workspace re-export style) — the app shell (P3-30) calls
+// `render_status_zone` with a read-only `&TelemetryData` snapshot
+// and executes the returned `GuiAction` (F2 writes the PNG,
+// F3 the JSON, Q closes the viewport — the render thread does no
+// I/O itself, D6), and `spd_cards` is the pure per-slot card
+// builder the tests exercise without an egui context.
+pub use status_zone::{render_status_zone, spd_cards, GuiAction};
