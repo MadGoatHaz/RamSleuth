@@ -33,7 +33,7 @@ use ramsleuth_telemetry::SystemMemoryTelemetry;
 /// - `collector`: the snapshot source — `ramsleuth_telemetry::collect`
 ///   in production, a counting mock in tests.
 /// - `ttl`: maximum age of a cached snapshot before `get()` re-collects
-///   (the daemon's `--max-age`, default 5 s, P3-17).
+///   (the daemon's `--max-age`, default 2 s, P3-17).
 /// - `last` / `last_at`: the most recent snapshot and the instant it was
 ///   collected; both `None` while the cache is cold.
 pub struct TelemetryCache {
