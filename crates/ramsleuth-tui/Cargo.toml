@@ -8,5 +8,36 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "ramsleuth_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ramsleuth-tui"
+path = "src/main.rs"
+
 [dependencies]
-# Phase 4: add ratatui, crossterm, ramsleuth-client, ramsleuth-bench.
+# P3-22: the TUI crate is born (plan §7 dependency ledger). The frontend
+# is unprivileged (plan D2): it never touches hardware — it talks to the
+# daemon over the Unix socket through the shared `ramsleuth-client`
+# library, and the telemetry/bench path deps ride along because the
+# three-zone dashboard (P3-23) renders `SystemMemoryTelemetry` snapshots
+# + `BenchmarkGrid`/progress verbatim from those crates (no type
+# duplication, D2); `ramsleuth-protocol` supplies the wire vocabulary
+# (request/response + `DEFAULT_SOCKET_PATH`) the main loop (P3-24) speaks.
+#
+# ratatui 0.29 (declared MSRV 1.74) + crossterm 0.28 (declared MSRV 1.63)
+# are the latest releases verified against the workspace MSRV 1.75
+# (plan D1): crossterm owns raw mode + the event stream, ratatui owns the
+# renderer. Their transitive closure needs two lockfile pins to stay
+# MSRV-<=1.75 (resolver = "2" has no MSRV-aware resolution, plan D1):
+# `instability 0.3.10` (0.3.11+ declares 1.88; pulls darling 0.20.11,
+# MSRV 1.56) and `unicode-segmentation 1.12.0` (1.13.2+ declares 1.85;
+# 1.13.0/1.13.1 are yanked) — pinned in Cargo.lock, re-verify with
+# `cargo metadata` if the lock is ever regenerated.
+crossterm = "0.28"
+ratatui = "0.29"
+ramsleuth-bench = { path = "../ramsleuth-bench" }
+ramsleuth-client = { path = "../ramsleuth-client" }
+ramsleuth-protocol = { path = "../ramsleuth-protocol" }
+ramsleuth-telemetry = { path = "../ramsleuth-telemetry" }
