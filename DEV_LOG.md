@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE3.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [branch/chunk-P3-23] P3-23 TUI ui.rs (impl-P3-23) STARTED
 
 @@@ CURRENT_STATE @@@
 Cycle 3 (Phase 3) - P3-22 ramsleuth-tui crate birth + frozen key contract (branch/chunk-P3-22, 872b87d, local only, NOT merged): the TUI is now lib+bin (lib ramsleuth_tui + bin ramsleuth-tui) with deps ratatui 0.29.0 (MSRV 1.74) + crossterm 0.28.1 (MSRV 1.63) + protocol/client/telemetry/bench; events.rs freezes the input contract — Action { Refresh, Snapshot, Quit } + pure key_to_action(KeyEvent) (r/s/q case-insensitive, modifiers ignored, all else None) + poll_event(Duration) -> Result<Option<Event>, io::Error> as the single crossterm I/O point; MSRV gate satisfied via two lockfile pins (instability 0.3.10, unicode-segmentation 1.12.0 — full 86-package audit all rust-version <= 1.75). ramsleuth-tui 7/7, workspace 267/267, clippy -D warnings clean, build green. CORE GATE remains PASSED (P3-18..P3-21, e9082af). Next: P3-23 (ui.rs, the 3-zone dashboard over AppState) then P3-24 (main loop); both consume ramsleuth_tui::{key_to_action, Action, events::poll_event} — note the plan's "TUI is bin-only, no lib.rs" is superseded by the P3-22 brief (lib.rs exists).

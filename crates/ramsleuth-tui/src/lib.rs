@@ -22,8 +22,15 @@
 //!   restore), the background 2 s telemetry updater, the draw/poll loop.
 
 pub mod events;
+pub mod ui;
 
 // P3-22: the frozen input contract, re-exported at the root (workspace
 // re-export style, the client/lib.rs precedent) — P3-23 (`ui`) and P3-24
 // (bin) dispatch on `Action` via `key_to_action` from the crate root.
 pub use events::{key_to_action, Action};
+
+// P3-23: the three-zone dashboard, re-exported at the root (workspace
+// re-export style) — P3-24 (bin) holds one `AppState` (telemetry snapshot,
+// bench state, daemon status, error) behind an `Arc<RwLock<_>>` and calls
+// `render` each tick.
+pub use ui::{render, AppState, BenchState};
