@@ -1,0 +1,78 @@
+# Maintainer: MadGoatHaz
+#
+# RamSleuth v2 — Phase 5 AUR git package (ramsleuth-git), plan D2:
+# `makepkg -si` from packaging/ramsleuth-git/ is the single install path.
+#
+# Ships:
+#   - 6 binaries -> /usr/bin: ramsleuth-daemon (the unit's ExecStart),
+#     ramsleuth-client, ramsleuth-tui, ramsleuth-gui, ramsleuth-bench,
+#     ramsleuth-telemetry (ramsleuth-protocol is lib-only — never installed)
+#   - the frozen daemon unit systemd/ramsleuth.service -> /usr/lib/systemd/system/
+#     (verbatim copy, never modified — plan D4)
+#   - the systemd preset -> /usr/lib/systemd/system-preset/ramsleuth.preset
+#     (enables ramsleuth.service by default — plan D4, chunk P5-01)
+#   - the system group `ramsleuth` — THE ONE REAL INSTALL GAP: the unit's
+#     Group=ramsleuth fails to start without it (plan D3, idempotent)
+#
+# No-panic contract (plan D7): installation never fails on the absence of
+# the ryzen_smu module, AVX-512, or a display; after a bare install the
+# daemon starts and serves N/A (DriverMissing) sections with exit 0.
+#
+# The C toolchain (cc/linker for the Rust build) comes from the makepkg
+# base environment — AUR convention: base toolchain packages are not
+# listed in makedepends. libxkbcommon is the only strict build-time link
+# dep (xkbcommon-sys); the X11/Wayland/GL entries cover pkgconf probes
+# plus the eframe 0.27 / winit dlopen + fallback runtime surface.
+
+pkgname=ramsleuth-git
+pkgver=0.1.0   # placeholder — makepkg recomputes via pkgver() below
+pkgrel=1
+pkgdesc="Pure-Rust RAM latency/bandwidth telemetry: privileged daemon + unprivileged CLI/TUI/GUI clients"
+arch=(x86_64)
+url="https://github.com/MadGoatHaz/RamSleuth"
+license=(MIT)
+source=("$pkgname::git+https://github.com/MadGoatHaz/RamSleuth.git#branch=v2-development")
+makedepends=(rust cargo pkgconf libx11 libxkbcommon wayland wayland-protocols libxrandr libxi libxcursor libxinerama mesa)
+depends=(libx11 libxkbcommon wayland libxrandr libxi libxcursor libxinerama mesa)
+
+# No sha256sums: -git source, computed/ignored by makepkg.
+
+pkgver() {
+    cd "$srcdir/ramsleuth-git"
+    if git describe --tags --long --dirty >/dev/null 2>&1; then
+        # v1.2.3-4-gabc1234[-dirty] -> 1.2.3.4.gabc1234 (pkgver forbids '-')
+        git describe --tags --long --dirty | sed -E 's/^v//; s/-/./g; s/\.dirty$//'
+    else
+        # No tag yet (open item, plan §7): fall back to the short SHA so
+        # the package builds either way.
+        git rev-parse --short HEAD
+    fi
+}
+
+build() {
+    cd "$srcdir/ramsleuth-git"
+    # --locked: build the committed pins verbatim (reproducible, plan D6).
+    cargo build --release --locked
+}
+
+package() {
+    cd "$srcdir/ramsleuth-git"
+
+    # (1) the 6 installable binaries
+    for bin in ramsleuth-daemon ramsleuth-client ramsleuth-tui \
+               ramsleuth-gui ramsleuth-bench ramsleuth-telemetry; do
+        install -Dm755 "target/release/$bin" "$pkgdir/usr/bin/$bin"
+    done
+
+    # (2) the frozen daemon unit — verbatim copy (plan D4)
+    install -Dm644 "systemd/ramsleuth.service" \
+        "$pkgdir/usr/lib/systemd/system/ramsleuth.service"
+
+    # (3) the systemd preset — enables ramsleuth.service by default
+    # (plan D4; content per chunk P5-01)
+    install -Dm644 "packaging/ramsleuth-git/ramsleuth.preset" \
+        "$pkgdir/usr/lib/systemd/system-preset/ramsleuth.preset"
+
+    # (4) the ramsleuth group — idempotent, the one real install gap (D3)
+    getent group ramsleuth >/dev/null 2>&1 || groupadd -r ramsleuth
+}
