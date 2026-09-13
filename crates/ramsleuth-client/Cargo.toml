@@ -8,7 +8,24 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "ramsleuth_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ramsleuth-client"
+path = "src/main.rs"
+
 [dependencies]
-# Phase 3: add bincode/tokio and workspace dep on ramsleuth-telemetry.
-# NOTE: the v2 roadmap treats client as a shared library; a [lib] target is
-# added when TUI/GUI begin consuming it (see plans/PLAN.md, Phase 3).
+# P3-18: the client crate is born (plan D7 dependency ledger). The
+# three path deps are the workspace's single source of truth (D2):
+# `ramsleuth-protocol` owns the wire vocabulary + frame codec the
+# transport speaks; `ramsleuth-telemetry` owns the `SystemMemoryTelemetry`
+# snapshot root and `ramsleuth-bench` owns the streaming/benchmark types
+# — both are needed verbatim (the client renders telemetry + benchmark
+# results, and the P3-18 unit tests build canned snapshots through the
+# public API, never duplicating a type). The transport itself is
+# synchronous std I/O (plan D2: no tokio outside the daemon).
+ramsleuth-protocol = { path = "../ramsleuth-protocol" }
+ramsleuth-telemetry = { path = "../ramsleuth-telemetry" }
+ramsleuth-bench = { path = "../ramsleuth-bench" }
