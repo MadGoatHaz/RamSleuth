@@ -1,0 +1,29 @@
+# ramsleuth-git.install — pacman hooks for ramsleuth.service
+#
+# All systemctl calls are guarded (2>/dev/null || true) so install,
+# upgrade, and removal never fail the transaction (no-panic contract,
+# plan D7): missing systemd or a failed service start is non-fatal.
+# The daemon degrades gracefully without the ryzen_smu module
+# (N/A (DriverMissing), exit 0, no panic) and is not removed from
+# unit files on upgrade.
+
+post_install() {
+    systemctl daemon-reload 2>/dev/null || true
+    if ! systemctl enable --now ramsleuth.service 2>/dev/null; then
+        echo "ramsleuth-git: ramsleuth.service not started (non-fatal);" \
+             "run: systemctl enable --now ramsleuth" >&2
+    fi
+}
+
+post_upgrade() {
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+pre_remove() {
+    systemctl stop ramsleuth.service 2>/dev/null || true
+}
+
+post_remove() {
+    systemctl disable ramsleuth.service 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+}
