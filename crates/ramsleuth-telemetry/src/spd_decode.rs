@@ -108,7 +108,10 @@ const SPD_IMAGE_LEN_DDR5: usize = 1024;
 /// Recognized JEP106-0001 manufacturer codes (full 8-bit code -> name).
 ///
 /// Frozen (P2-09): the named `const` table consumed by [`decode_maker`];
-/// codes outside the table degrade to their raw hex form.
+/// codes outside the table degrade to their raw hex form. P6-04 added
+/// `0xC1` = G.Skill, reconciled against the live 5950X module part
+/// number (`F4-3600C18-32GVK`): its module-maker field carries `0xC1`,
+/// an assigned maker code rather than a spec gap.
 pub const JEP106: &[(u8, &str)] = &[
     (0x01, "Intel"),
     (0x02, "AMD"),
@@ -122,6 +125,7 @@ pub const JEP106: &[(u8, &str)] = &[
     (0x96, "Winbond"),
     (0x97, "Macronix"),
     (0x98, "Nanya"),
+    (0xC1, "G.Skill"),
     (0xC2, "Micron"),
 ];
 
@@ -336,7 +340,11 @@ fn decode_rank(data: &[u8]) -> Section<u8> {
 }
 
 /// Decode the SDRAM density (byte `0x13`) into Mbit:
-/// - DDR4: code `0x10..=0x17` -> 2^(code-0x10) Gb (1..128 Gb);
+/// - DDR4: code `0x10..=0x17` -> 2^(code-0x10) Gb (1..128 Gb); `0x0D`
+///   -> 16 Gb (P6-04 live reconciliation: the 5950X G.Skill module
+///   `F4-3600C18-32GVK` - a 2x16 GiB kit, rank 1, i.e. 16 Gb per die
+///   in the standard 8x8-die config - carries `0x0D`, a vendor/legacy
+///   encoding outside the `0x10..=0x17` published family);
 /// - DDR5: documented model, code `0x11..=0x18` -> 1..64 Gb.
 ///
 /// An unrecognized code -> `Na(ParseError)`; a result >= 64 Gb
@@ -361,6 +369,13 @@ fn decode_density(data: &[u8], is_ddr5: bool) -> Section<u16> {
                 )))
             }
         }
+    } else if code == 0x0D {
+        // P6-04 live reconciliation (2026-09-14): the 5950X G.Skill
+        // F4-3600C18-32GVK module (a 2x16 GiB kit, rank 1) has 16 Gb
+        // per die in the standard 8x8-die config and carries 0x0D at
+        // byte 0x13 - a vendor/legacy encoding outside the
+        // 0x10..=0x17 published family.
+        16
     } else if (0x10..=0x17).contains(&code) {
         1u32 << (code - 0x10)
     } else {
@@ -671,6 +686,34 @@ mod tests {
         }
     }
 
+    /// A synthetic reconstruction of the live 5950X host module
+    /// (P6-04): G.Skill `F4-3600C18-32GVK` - a 32 GiB kit (2x16 GiB),
+    /// rank 1, 3200 MT/s minimum. The module-maker field carries
+    /// `0xC1` and the density byte carries `0x0D` (the two codes
+    /// P6-04 reconciles); the serial is blank and no XMP profiles
+    /// are present, as observed live.
+    fn live_5950x_image() -> SpdImage {
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A; // DDR4 signature
+        // Module manufacturer 0xC1 (vendor nibble 0x01, continuation 0x0C).
+        data[0x01] = 0x11;
+        data[0x02] = 0x0C;
+        // Density 0x0D - the live code; 16 Gb per die (P6-04).
+        data[0x13] = 0x0D;
+        // Minimum data rate 3200 MT/s (32 x 100).
+        data[0x20] = 0x20;
+        // Rank config: 1 total device, 1 per rank -> 1 rank.
+        data[0x80] = 0x11;
+        // The live part number: 16 ASCII chars, filling the whole
+        // 16-byte field (the live image NUL-pads it at the field end).
+        data[0x81..0x81 + 16].copy_from_slice(b"F4-3600C18-32GVK");
+        // Serial is blank on the live module -> Na(NotApplicable).
+        SpdImage {
+            index: 0x52,
+            data,
+        }
+    }
+
     // ------------------------------------------------------------------
     // (a) Synthetic DDR4 decode.
     // ------------------------------------------------------------------
@@ -945,6 +988,137 @@ mod tests {
         let back: Vec<SpdModule> =
             bincode::deserialize(&bytes).expect("Vec<SpdModule> must deserialize");
         assert_eq!(modules, back);
+    }
+
+    // ------------------------------------------------------------------
+    // (g) P6-04: live 5950X reconciliation (maker 0xC1 / density 0x0D).
+    // ------------------------------------------------------------------
+
+    /// The codes observed on the live 5950X module now decode: maker
+    /// `0xC1` -> G.Skill (reconciled against the part number
+    /// `F4-3600C18-32GVK`), density `0x0D` -> 16 Gb = 16384 Mbit (16
+    /// GiB rank-1 module, standard 8x8-die config), rank 1, 3200 MT/s,
+    /// and the part number as observed live.
+    #[test]
+    fn live_5950x_reconciled_codes_decode() {
+        let m = decode(&live_5950x_image());
+        assert!(!m.is_ddr5);
+        assert_eq!(m.maker, Section::Value("G.Skill".to_owned()));
+        assert_eq!(m.density_mbit, Section::Value(16384));
+        assert_eq!(m.rank, Section::Value(1));
+        assert_eq!(m.speed_mts, Section::Value(3200));
+        assert_eq!(m.part, Section::Value("F4-3600C18-32GVK".to_owned()));
+        assert_eq!(m.serial, Section::Na(NaReason::NotApplicable));
+        assert!(m.profiles.is_empty(), "the live module carries no XMP");
+    }
+
+    /// Regression: every entry of the frozen [`JEP106`] table (all
+    /// pre-existing codes plus the P6-04 `0xC1` addition) decodes to
+    /// its recorded name from its vendor/continuation nibbles.
+    #[test]
+    fn jep106_table_regression_all_entries_decode() {
+        assert!(
+            JEP106.iter().any(|(c, _)| *c == 0xC1),
+            "the P6-04 0xC1 entry must be present"
+        );
+        for (code, name) in JEP106 {
+            let mut data = vec![0u8; 512];
+            data[0x00] = 0x0A;
+            data[0x01] = *code & 0x0F; // vendor nibble (non-zero for every entry)
+            data[0x02] = *code >> 4; // continuation nibble
+            let m = decode(&SpdImage { index: 0x50, data });
+            assert_eq!(
+                m.maker,
+                Section::Value(name.to_string()),
+                "JEP106 entry 0x{code:02X} must decode to {name}"
+            );
+        }
+    }
+
+    /// Regression: the DDR4 density published family `0x10..=0x17`
+    /// is unchanged (1..=32 Gb decode to Mbit; 64 / 128 Gb overflow the
+    /// u16 cell -> `Na(ParseError)`), the P6-04 `0x0D` -> 16 Gb is
+    /// present, and codes outside both sets degrade to `Na(ParseError)`
+    /// naming the code (no panic).
+    #[test]
+    fn ddr4_density_regression_family_plus_0x0d() {
+        // 0x10..=0x15 -> 1..=32 Gb fit the u16 Mbit cell.
+        for code in 0x10..=0x15u8 {
+            let mut data = vec![0u8; 512];
+            data[0x00] = 0x0A;
+            data[0x13] = code;
+            let m = decode(&SpdImage { index: 0x50, data });
+            assert_eq!(
+                m.density_mbit,
+                Section::Value(((1u32 << (code - 0x10)) * 1024) as u16),
+                "DDR4 density 0x{code:02X} must keep its published value"
+            );
+        }
+        // 0x16 / 0x17 (64 / 128 Gb) overflow the u16 cell -> Na.
+        for code in [0x16u8, 0x17] {
+            let mut data = vec![0u8; 512];
+            data[0x00] = 0x0A;
+            data[0x13] = code;
+            let m = decode(&SpdImage { index: 0x50, data });
+            let Section::Na(NaReason::ParseError(detail)) = &m.density_mbit else {
+                panic!("density 0x{code:02X} must be Na(ParseError)");
+            };
+            assert!(
+                detail.contains("exceeds the u16 density cell"),
+                "{detail}"
+            );
+        }
+        // The P6-04 reconciled code: 0x0D -> 16 Gb = 16384 Mbit.
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A;
+        data[0x13] = 0x0D;
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert_eq!(m.density_mbit, Section::Value(16384));
+        // Unknown codes remain Na(ParseError) and name the code.
+        for code in [0x00u8, 0x0F, 0x80] {
+            let mut data = vec![0u8; 512];
+            data[0x00] = 0x0A;
+            data[0x13] = code;
+            let m = decode(&SpdImage { index: 0x50, data });
+            let Section::Na(NaReason::ParseError(detail)) = &m.density_mbit else {
+                panic!("density 0x{code:02X} must be Na(ParseError)");
+            };
+            assert!(
+                detail.contains(&format!("0x{code:02X}")),
+                "detail must name the code: {detail}"
+            );
+        }
+    }
+
+    /// Regression: the DDR5 density documented model `0x11..=0x18` is
+    /// unchanged: 1..32 Gb decode to their Mbit values and `0x18`
+    /// (64 Gb) overflows the u16 Mbit cell -> `Na(ParseError)`.
+    #[test]
+    fn ddr5_density_regression_family() {
+        for (code, mbit) in [
+            (0x11u8, 1024u16),
+            (0x12, 2048),
+            (0x13, 4096),
+            (0x14, 8192),
+            (0x15, 16384),
+            (0x16, 24576),
+            (0x17, 32768),
+        ] {
+            let mut data = vec![0u8; 1024];
+            data[0x00] = 0x0C; // DDR5 signature
+            data[0x13] = code;
+            let m = decode(&SpdImage { index: 0x51, data });
+            assert_eq!(m.density_mbit, Section::Value(mbit), "DDR5 0x{code:02X}");
+        }
+        // 0x18 = 64 Gb = 65536 Mbit overflows the u16 cell.
+        let mut data = vec![0u8; 1024];
+        data[0x00] = 0x0C;
+        data[0x13] = 0x18;
+        let m = decode(&SpdImage { index: 0x51, data });
+        assert!(matches!(
+            m.density_mbit,
+            Section::Na(NaReason::ParseError(_))
+        ));
     }
 }
 
