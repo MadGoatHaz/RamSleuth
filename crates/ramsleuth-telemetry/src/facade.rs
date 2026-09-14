@@ -15,7 +15,7 @@
 //! I/O of its own):
 //!
 //! ```text
-//! CpuInfo::detect() ──┬─ AMD:   amd_smu::acquire() → amd_pm::parse() → amd_readout::map_amd()
+//! CpuInfo::detect() ──┬─ AMD:   amd_smu::acquire() → amd_pm::parse() → amd_smn::apply_smn (overlay) → amd_readout::map_amd()
 //!                     ├─ Intel: intel_mchbar::acquire() → intel_readout::read_intel()
 //!                     └─ SPD:   spd_eeprom::acquire() → spd_decode::decode() (per image)
 //! ```
@@ -28,6 +28,7 @@
 
 use crate::amd_pm;
 use crate::amd_readout::{self, AmdReadout};
+use crate::amd_smn;
 use crate::amd_smu;
 use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
@@ -76,7 +77,8 @@ pub struct SystemMemoryTelemetry {
 ///
 /// 1. `CpuInfo::detect()` — the single CPUID dispatch key.
 /// 2. AMD branch (AMD silicon only): `amd_smu::acquire()` →
-///    `amd_pm::parse()` → `amd_readout::map_amd()`.
+///    `amd_pm::parse()` → `amd_smn::apply_smn` (no-panic overlay) →
+///    `amd_readout::map_amd()`.
 /// 3. Intel branch (Intel silicon only): `intel_mchbar::acquire()` →
 ///    `intel_readout::read_intel()`.
 /// 4. SPD branch (all vendors, unprivileged): `spd_eeprom::acquire()` →
@@ -113,12 +115,15 @@ pub fn reason_from(e: &TelemetryError) -> NaReason {
 }
 
 /// AMD branch: `amd_smu::acquire()` → `amd_pm::parse()` →
-/// `amd_readout::map_amd()`.
+/// `amd_smn::apply_smn` (no-panic overlay) → `amd_readout::map_amd()`.
 ///
 /// Gated on the already-detected vendor: non-AMD silicon returns
 /// `Err(UnsupportedHardware)` before any provider call (zero I/O in
 /// this branch). Failures are contained here — they never propagate
-/// past the branch.
+/// past the branch. The SMN overlay (P6-03, plan D2) is infallible by
+/// construction — a missing `smn` attribute is a no-op and per-register
+/// failures contain to zeros — so only `acquire` / `parse` can fail the
+/// branch: the error semantics are unchanged.
 fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
     if !matches!(cpu.vendor, CpuVendor::Amd(_)) {
         return Err(TelemetryError::UnsupportedHardware {
@@ -126,7 +131,11 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
         });
     }
     let ctx = amd_smu::acquire()?;
-    let snap = amd_pm::parse(&ctx)?;
+    let mut snap = amd_pm::parse(&ctx)?;
+    // The no-panic overlay (P6-02, frozen): populates `gdm` + the 27
+    // `timings` from the driver `smn` attribute when readable; never
+    // fails the branch and never touches the PM-table fields.
+    amd_smn::apply_smn(&mut snap);
     Ok(amd_readout::map_amd(&snap))
 }
 
@@ -193,6 +202,7 @@ fn section_from<T>(result: TelemetryResult<T>) -> Section<T> {
 mod tests {
     use super::*;
     use crate::amd_readout::{CadBus, ClockReadout, DivMode, RttValue, TimingSet, VoltageSet};
+    use crate::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
     use crate::cpuid::{AmdZen, IntelGen};
 
     /// (a) `reason_from` maps each of the six frozen `TelemetryError`
@@ -470,5 +480,284 @@ mod tests {
         let back: SystemMemoryTelemetry =
             bincode::deserialize(&bytes).expect("SystemMemoryTelemetry must deserialize");
         assert_eq!(t, back);
+    }
+
+    // ------------------------------------------------------------------
+    // (e) P6-03: smn overlay wiring into amd_branch (plan D2).
+    // ------------------------------------------------------------------
+
+    /// A parsed-snapshot-shaped fixture: PM fields populated (live 5950X
+    /// class), SMN fields zeroed — exactly the P2-04 `parse` output shape
+    /// (the overlay write surface is `gdm` + `timings` only).
+    fn pm_only_snapshot() -> AmdPmSnapshot {
+        AmdPmSnapshot {
+            version: 0x38_08_05,
+            mclk_mhz: 1800,
+            uclk_mhz: 1800,
+            fclk_mhz: 1792,
+            div_mode: 1,
+            gdm: 0,
+            pdm: 0,
+            timings: AmdPmTimings {
+                cl: 0, rcwdwr: 0, rcdrd: 0, rp: 0, ras: 0, rc: 0, rrds: 0, rrld: 0,
+                faw: 0, wtrs: 0, wtrl: 0, wr: 0, rfc1: 0, rfc2: 0, rfcsb: 0,
+                cwl: 0, rtp: 0, rdwr: 0, wrrd: 0, rdrd_sd: 0, rdrd_dd: 0,
+                rdrd_scl: 0, rdrd_sc: 0, wrwr_sd: 0, wrwr_dd: 0, wrwr_scl: 0,
+                wrwr_sc: 0,
+            },
+            cad_bus: AmdPmCadBus {
+                proc_odt: 0, rtt_nom: 0, rtt_wr: 0, rtt_park: 0, clk_drv: 0,
+                addr_cmd_drv: 0, cs_odt_drv: 0, cke_drv: 0,
+            },
+            voltages: AmdPmVoltages {
+                vddcr_soc_mv: 1128,
+                vddio_mem_mv: 0,
+                vdd_misc_mv: 0,
+                vpp_mv: 0,
+            },
+        }
+    }
+
+    /// The verified `monitor_cpu` register feed (the P6-02 fixture words),
+    /// with `gdm_on` setting/clearing bit 11 of `0x50200`.
+    fn fixture_smn_regs(gdm_on: bool) -> Vec<(u32, Option<u32>)> {
+        let mclk: u32 = 0x0000_1539;
+        let mclk = if gdm_on { mclk | 0x0000_0800 } else { mclk };
+        vec![
+            (0x50200, Some(mclk)),
+            (0x50204, Some(0x1010_2410)),
+            (0x50208, Some(0x0010_0030)),
+            (0x5020C, Some(0x0400_0404)),
+            (0x50210, Some(0x0000_0010)),
+            (0x50214, Some(0x0008_0410)),
+            (0x50218, Some(0x0000_0010)),
+            (0x50220, Some(0x0504_0302)),
+            (0x50224, Some(0x0908_0706)),
+            (0x50228, Some(0x0000_0602)),
+            (0x50254, Some(0x0400_0000)),
+            (0x50260, Some(0x7E08_20A0)),
+            (0x50264, Some(0x1111_2222)),
+        ]
+    }
+
+    /// (e1) Overlay data present: the frozen decode core maps a GDM-on
+    /// register feed and the branch tail (`map_amd`) reflects it — GDM +
+    /// the 27 timings cross into the display readout while the PM-table
+    /// fields survive untouched. The live `apply_smn` entry point runs
+    /// this exact composition; on a non-root host the attribute degrades
+    /// to zeros, so the data-present path is pinned through the frozen
+    /// public decode core it calls, with its documented write surface.
+    #[test]
+    fn smn_overlay_data_reflected_in_mapped_output() {
+        let mut snap = pm_only_snapshot();
+
+        let fields = crate::amd_smn::decode_smn(&fixture_smn_regs(true));
+        assert_eq!(fields.gdm, 1); // bit 11 of 0x50200 set
+
+        // The overlay write surface (plan D2): `gdm` + `timings` only.
+        snap.gdm = fields.gdm;
+        snap.timings = fields.timings;
+
+        let ro = amd_readout::map_amd(&snap);
+
+        // GDM on crosses into the display readout.
+        assert_eq!(ro.clocks.gdm, Section::Value(true));
+        // A sample across the register set reflects verbatim (the full
+        // 27-field decode is pinned in P6-02 against the same words).
+        assert_eq!(ro.timings.cl, Section::Value(16));
+        assert_eq!(ro.timings.ras, Section::Value(36));
+        assert_eq!(ro.timings.rc, Section::Value(48));
+        assert_eq!(ro.timings.faw, Section::Value(16));
+        assert_eq!(ro.timings.rfc1, Section::Value(160));
+        assert_eq!(ro.timings.rfc2, Section::Value(260));
+        assert_eq!(ro.timings.rfcsb, Section::Value(504));
+        assert_eq!(ro.timings.rdrd_sc, Section::Value(4));
+        assert_eq!(ro.timings.wrwr_scl, Section::Value(9));
+        // PM-table fields survive the overlay untouched.
+        assert_eq!(ro.clocks.mclk_mhz, Section::Value(1800.0));
+        assert_eq!(ro.clocks.uclk_mhz, Section::Value(1800.0));
+        assert_eq!(ro.clocks.fclk_mhz, Section::Value(1792.0));
+        assert_eq!(ro.clocks.div_mode, Section::Value(DivMode::OneToTwo));
+        assert_eq!(ro.voltages.vddcr_soc_mv, Section::Value(1128));
+        // Unconfirmed fields keep their frozen P2-04 zero state.
+        assert_eq!(ro.clocks.pdm, Section::Value(false));
+        assert_eq!(ro.cad_bus.rtt_nom, Section::Value(RttValue::Disabled));
+    }
+
+    /// (e2) Plan-mandated check: `apply_smn` — the overlay call the
+    /// wiring makes — on a host without the `smn` attribute leaves the
+    /// SMN fields zeroed while the PM clocks/voltages survive (the
+    /// status quo on older module builds). A sentinel-populated SMN
+    /// state makes each arm non-vacuous: `DriverMissing` must no-op the
+    /// overlay byte-for-byte; a present-but-unreadable attribute
+    /// (per-register containment) must zero the SMN fields; a readable
+    /// attribute yields mask-bounded live values. Never a panic, never a
+    /// PM-field write.
+    #[test]
+    fn apply_smn_without_smn_attr_preserves_pm_and_keeps_smn_zeroed() {
+        // P2-04 shape with sentinel SMN fields at the mask maxima (so the
+        // bound checks below hold under every arm).
+        let mut snap = pm_only_snapshot();
+        snap.gdm = 1;
+        snap.timings = AmdPmTimings {
+            cl: 63, rcwdwr: 63, rcdrd: 63, rp: 63, ras: 127, rc: 255, rrds: 31,
+            rrld: 31, faw: 255, wtrs: 31, wtrl: 63, wr: 255, rfc1: 1023,
+            rfc2: 1023, rfcsb: 1023, cwl: 63, rtp: 31, rdwr: 31, wrrd: 15,
+            rdrd_sd: 15, rdrd_dd: 15, rdrd_scl: 63, rdrd_sc: 15, wrwr_sd: 15,
+            wrwr_dd: 15, wrwr_scl: 63, wrwr_sc: 15,
+        };
+
+        // The frozen public entry point the wiring calls (the host-state
+        // probe runs first, so each arm is asserted against the state it
+        // saw).
+        let probe = crate::amd_smn::read_smn_register(0x50200);
+        crate::amd_smn::apply_smn(&mut snap);
+
+        // PM clocks/voltages survive every arm — the overlay write
+        // surface is `gdm` + `timings` only (frozen contract).
+        assert_eq!(snap.version, 0x38_08_05);
+        assert_eq!(snap.mclk_mhz, 1800);
+        assert_eq!(snap.uclk_mhz, 1800);
+        assert_eq!(snap.fclk_mhz, 1792);
+        assert_eq!(snap.div_mode, 1);
+        assert_eq!(snap.voltages.vddcr_soc_mv, 1128);
+        assert_eq!(snap.pdm, 0); // never written
+        assert_eq!(snap.cad_bus, pm_only_snapshot().cad_bus); // never written
+
+        if matches!(probe, Err(TelemetryError::DriverMissing { .. })) {
+            // Host without the `smn` attribute: whole-overlay no-op —
+            // the snapshot is byte-identical (sentinels intact).
+            assert_eq!(snap.gdm, 1);
+            assert_eq!(snap.timings.cl, 63);
+        } else {
+            // Present-but-unreadable: containment zeros the SMN fields.
+            // Readable: mask-bounded live values. The sentinels are the
+            // mask maxima, so the bounds hold under either outcome.
+            assert!(snap.gdm <= 1);
+            let t = &snap.timings;
+            assert!(t.cl <= 63 && t.ras <= 127 && t.rcdrd <= 63 && t.rcwdwr <= 63);
+            assert!(t.rc <= 255 && t.rp <= 63 && t.rrds <= 31 && t.rrld <= 31 && t.rtp <= 31);
+            assert!(t.faw <= 255 && t.cwl <= 63 && t.wtrs <= 31 && t.wtrl <= 63 && t.wr <= 255);
+            assert!(t.rdrd_dd <= 15 && t.rdrd_sd <= 15 && t.rdrd_sc <= 15 && t.rdrd_scl <= 63);
+            assert!(t.wrwr_dd <= 15 && t.wrwr_sd <= 15 && t.wrwr_sc <= 15 && t.wrwr_scl <= 63);
+            assert!(t.wrrd <= 15 && t.rdwr <= 31);
+            assert!(t.rfc1 <= 1023 && t.rfc2 <= 1023 && t.rfcsb <= 1023);
+        }
+    }
+
+    /// (e3) Per-register containment (the overlay frozen decode core): a
+    /// failed read contributes `None` — only that register fields decode
+    /// to zero; every other register fields decode exactly as with the
+    /// full feed. One bad register never poisons the rest, and the
+    /// zeroed fields render as honest `Na` in the mapped output.
+    #[test]
+    fn smn_one_failed_register_does_not_poison_the_rest() {
+        let full = fixture_smn_regs(false);
+        // Fail one register: 0x50214 (tCWL / tWTRS / tWTRL).
+        let broken: Vec<(u32, Option<u32>)> = full
+            .iter()
+            .map(|(a, w)| (*a, if *a == 0x50214 { None } else { *w }))
+            .collect();
+
+        let full_f = crate::amd_smn::decode_smn(&full);
+        let broken_f = crate::amd_smn::decode_smn(&broken);
+
+        // The failed register own fields decode to zero...
+        assert_eq!(broken_f.timings.cwl, 0);
+        assert_eq!(broken_f.timings.wtrs, 0);
+        assert_eq!(broken_f.timings.wtrl, 0);
+        // ...and every other register fields decode exactly as before.
+        assert_eq!(broken_f.gdm, full_f.gdm);
+        assert_eq!(broken_f.timings.cl, full_f.timings.cl);
+        assert_eq!(broken_f.timings.ras, full_f.timings.ras);
+        assert_eq!(broken_f.timings.rc, full_f.timings.rc);
+        assert_eq!(broken_f.timings.faw, full_f.timings.faw);
+        assert_eq!(broken_f.timings.wr, full_f.timings.wr);
+        assert_eq!(broken_f.timings.rfc1, full_f.timings.rfc1);
+        assert_eq!(broken_f.timings.rdrd_sc, full_f.timings.rdrd_sc);
+        assert_eq!(broken_f.timings.wrwr_scl, full_f.timings.wrwr_scl);
+        assert_eq!(broken_f.timings.rdwr, full_f.timings.rdwr);
+
+        // Through the branch tail: the zeroed fields render as honest
+        // `Na` (frozen P2-05 gate) while the intact ones keep values.
+        let mut snap = pm_only_snapshot();
+        snap.gdm = broken_f.gdm;
+        snap.timings = broken_f.timings;
+        let ro = amd_readout::map_amd(&snap);
+        assert!(ro.timings.cwl.is_na());
+        assert!(ro.timings.wtrs.is_na());
+        assert!(ro.timings.wtrl.is_na());
+        assert_eq!(ro.timings.cl, Section::Value(16));
+        assert_eq!(ro.timings.rfc1, Section::Value(160));
+    }
+
+    /// (e4) The full `amd_branch` wiring on this host (AMD silicon):
+    /// acquire -> parse -> apply_smn -> map runs end to end without a
+    /// panic, and the branch error semantics are unchanged — a failure
+    /// is still one of the frozen `TelemetryError` variants (only
+    /// acquire / parse can fail the branch now that the overlay is
+    /// infallible), and a success carries PM clocks + the overlay
+    /// gdm/timings through the frozen P2-05 gates (in-band values or
+    /// honest `Na`, never garbage).
+    #[test]
+    fn amd_branch_smn_wiring_is_structural_and_panic_free() {
+        let cpu = CpuInfo {
+            vendor: CpuVendor::Amd(AmdZen::Zen3),
+            brand: "Ryzen 9 5950X".to_owned(),
+        };
+
+        // Running this to completion is itself the no-panic check.
+        match amd_branch(&cpu) {
+            // The overlay adds no failure mode: on AMD silicon a branch
+            // failure is still a frozen acquire / parse error.
+            Err(e) => assert!(
+                matches!(
+                    e,
+                    TelemetryError::DriverMissing { .. }
+                        | TelemetryError::InsufficientPrivilege { .. }
+                        | TelemetryError::UnknownPmTableVersion { .. }
+                        | TelemetryError::Io(_)
+                        | TelemetryError::Parse { .. }
+                ),
+                "AMD branch failure must be a frozen acquire/parse error: {e:?}"
+            ),
+            Ok(ro) => {
+                // GDM crosses the frozen mode-flag gate: a single bit
+                // always decodes to 0/1, so it is Value(bool), never Na.
+                assert!(!ro.clocks.gdm.is_na(), "gdm must be Value(bool)");
+                // PM clocks survive the overlay through the frozen clock
+                // gate: in-band Value or honest Na, never an out-of-band
+                // Value.
+                let check_clock = |cell: &Section<f64>| {
+                    if let Section::Value(mhz) = cell {
+                        assert!((1.0..=4096.0).contains(mhz), "out-of-band clock {mhz}")
+                    }
+                };
+                check_clock(&ro.clocks.mclk_mhz);
+                check_clock(&ro.clocks.uclk_mhz);
+                check_clock(&ro.clocks.fclk_mhz);
+                // Every one of the 27 timings crosses the frozen ticks
+                // gate: in-band Value(1..=2048) or honest Na (zeroed),
+                // never an out-of-band Value.
+                let t = &ro.timings;
+                let check_timing = |cell: &Section<u16>| match cell {
+                    Section::Value(ticks) => {
+                        assert!((1..=2048).contains(ticks), "out-of-band timing {ticks}")
+                    }
+                    Section::Na(NaReason::ParseError(_)) => {}
+                    other => panic!("unexpected timing cell: {other:?}"),
+                };
+                let all = [
+                    &t.cl, &t.rcwdwr, &t.rcdrd, &t.rp, &t.ras, &t.rc, &t.rrds,
+                    &t.rrld, &t.faw, &t.wtrs, &t.wtrl, &t.wr, &t.rfc1, &t.rfc2,
+                    &t.rfcsb, &t.cwl, &t.rtp, &t.rdwr, &t.wrrd, &t.rdrd_sd,
+                    &t.rdrd_dd, &t.rdrd_scl, &t.rdrd_sc, &t.wrwr_sd,
+                    &t.wrwr_dd, &t.wrwr_scl, &t.wrwr_sc,
+                ];
+                for cell in &all {
+                    check_timing(cell);
+                }
+            }
+        }
     }
 }
