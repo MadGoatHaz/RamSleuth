@@ -6,7 +6,7 @@ Base branch: `v2-development`. Plan: `plans/PLAN-PHASE5.md` (Phase 1 retained as
 (no active leases)
 
 @@@ CURRENT_STATE @@@
-Cycle 4 (Phase 5: Packaging + ryzen_smu uAPI/install reconciliation) COMPLETE + QA passed (328/328, clippy clean); compacted to MASTER_LOG. ryzen_smu: upstream amkillam/ryzen_smu (main), daemon reads /sys/kernel/ryzen_smu_drv/pm_table, install script stages to /usr/src + upstream dkms.conf MAKE + monitor_cpu; P5-13 MERGED (branch deleted): dkms build/install pass ${MODULE}/${PKGVER} (symmetric with dkms add), deprecated CLEAN directive removed; ryzen_smu dkms build/install version args fixed; operator re-run is ground truth (no dkms remove needed). Operator re-run of scripts/install-ryzen-smu-dkms.sh is the live ground-truth. Ready for Cycle 5 (AMD ground truth, Intel i5-6600 MCHBAR, model reconciliation, P1 L1/L2 refinement, MSRV decision, finalize GitHub push/tag on operator go-ahead).
+Cycle 4 (Phase 5: Packaging + ryzen_smu uAPI/install reconciliation) COMPLETE + QA passed (328/328, clippy clean); compacted to MASTER_LOG. ryzen_smu: upstream amkillam/ryzen_smu (main), daemon reads /sys/kernel/ryzen_smu_drv/pm_table, install script stages to /usr/src + upstream dkms.conf MAKE + dkms build/install passes MODULE/VERSION + monitor_cpu. Operator re-run of scripts/install-ryzen-smu-dkms.sh is the live ground-truth. Ready for Cycle 5 (AMD ground truth, Intel i5-6600 MCHBAR, model reconciliation, P1 L1/L2 refinement, MSRV decision, finalize GitHub push/tag on operator go-ahead).
 
 ## History
 - [DONE] ID: P5-11 | STATUS: SUCCESS | BRANCH: branch/chunk-p5-11-dkms
