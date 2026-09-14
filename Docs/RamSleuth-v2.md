@@ -8,12 +8,14 @@ GUI Framework: egui + eframe
 
 TUI Framework: ratatui + crossterm
 
-Status (2026-09-12)
+Status (2026-09-13 — Cycle 4 close-out)
 
-- Phase 1 — Native Benchmark Engine (`ramsleuth-bench`): **COMPLETE** (11 chunks, P1-01…P1-11; QA audit 2026-09-12, 7/7 runnable gates PASS; 63/63 tests green).
-- Phase 2 — Live Memory Controller Telemetry (`ramsleuth-telemetry`): **COMPLETE** (11 chunks, P2-01…P2-11; QA audit 2026-09-12, 8/8 runnable gates PASS; 159/159 whole-workspace tests green, debug + release; clippy clean).
-- Phase 3 — Privilege-Separated Daemon + Unix Socket + Clients (`ramsleuth-daemon`, `ramsleuth-client`): **NEXT** (planning not started; stub crates exist in the workspace).
-- Phases 4–5 (TUI/GUI presentation, packaging & distribution) remain future cycles.
+- Phase 1 — Native Benchmark Engine (`ramsleuth-bench`): **COMPLETE** (Cycle 1, 11 chunks, P1-01…P1-11; QA 2026-09-12, 7/7 runnable gates PASS).
+- Phase 2 — Live Memory Controller Telemetry (`ramsleuth-telemetry`): **COMPLETE** (Cycle 2, 11 chunks, P2-01…P2-11; QA 2026-09-12, 8/8 runnable gates PASS). The AMD PM-table model was **reconciled for Vermeer in Phase 5 (P5-15)** — f32 layout + `TableVersionId` version sets; live decode on the 5950X (clocks + VDDCR_SOC; CAD/timings honest `Na` until the SMN-attr follow-up).
+- Phase 3 — Privilege-Separated Daemon + Unix Socket + Clients (`ramsleuth-protocol`, `ramsleuth-daemon`, `ramsleuth-client`): **COMPLETE** (Cycle 3, 30 chunks + 2 doc-drift fixes; CORE GATE passed).
+- Phase 4 — TUI / GUI presentation (`ramsleuth-tui`, `ramsleuth-gui`): **COMPLETE** (folded into Cycle 3).
+- Phase 5 — Packaging & Distribution: **COMPLETE** (Cycle 4, 15 chunks P5-01…P5-15: AUR `ramsleuth-git` + optional `ryzen-smu-dkms` extra + install helper + GitHub Actions CI + README; ryzen_smu uAPI + install-path reconciliation; AMD PM-table model reconciliation).
+- Workspace QA baseline (2026-09-13): **337/337 tests green (debug + release), clippy `-D warnings` clean, MSRV 1.75 (lockfile-pinned), release build OK.** `ryzen_smu` (amkillam v0.1.7) is installed + loaded on the AMD dev host — live AMD subtimings work. **Ready for Cycle 5** (live-hardware verification + remaining model reconciliation — see `Docs/HANDOVER.md` §5).
 
 Development-Cycle Decisions & Constraints (confirmed 2026-09-12)
 
@@ -23,17 +25,10 @@ Development-Cycle Decisions & Constraints (confirmed 2026-09-12)
 
 Verification Environment (confirmed 2026-09-12)
 
-(a) **Primary AMD dev host — Ryzen 9 5950X (Zen 3), 16C/32T, 64 MiB L3, DDR4, AVX2 (no AVX-512); CachyOS, kernel `7.2.3-1-cachyos-custom`.**
-- The `ryzen_smu` kernel module is **NOT installed** on this host: `sudo modprobe ryzen_smu` → `FATAL: Module ryzen_smu not found in directory /lib/modules/7.2.3-1-cachyos-custom`; `/sys/kernel/ryzen_smu/` does not exist.
-- Consequence: live AMD telemetry degrades to `N/A (DriverMissing)` (verified; never panics). The tick-identical ground-truth gate is **BLOCKED** until the module is built, installed, and loaded.
-- ryzen_smu integration steps (operator-performed environment setup; the codebase already handles the module-absent case gracefully):
-  1. Install kernel headers matching the running kernel (`uname -r` = `7.2.3-1-cachyos-custom`) — e.g. the matching CachyOS headers package.
-  2. Obtain the ryzen_smu project source (kernel module + userspace tool); verify the correct upstream repo/URL at setup time.
-  3. Build the out-of-tree kernel module against the running kernel (`make` in the module source).
-  4. Install it into `/lib/modules/$(uname -r)/` (e.g. `extra/`) and run `sudo depmod -a`.
-  5. Load it: `sudo modprobe ryzen_smu` (or `sudo insmod ryzen_smu.ko`).
-  6. Verify: `ls /sys/kernel/ryzen_smu/` should show `pm_table`; then `sudo cargo run -p ramsleuth-telemetry --release` should populate the AMD section (clocks/timings/CAD/voltages) instead of `N/A (DriverMissing)`.
-  - Note: building an out-of-tree module against a custom CachyOS kernel may require the exact matching headers and could need adjustments.
+(a) **Primary AMD dev host — Ryzen 9 5950X (Zen 3, Vermeer), 16C/32T, 64 MiB L3, DDR4-3200, AVX2 (no AVX-512); CachyOS, kernel `7.2.3-1-cachyos-custom`.**
+- The `ryzen_smu` kernel module is **NOW INSTALLED + LOADED** (amkillam/ryzen_smu v0.1.7 via DKMS — `dkms status` = `ryzen_smu/1.d298366, 7.2.3-1-cachyos-custom, x86_64: installed`). The canonical sysfs kobject is **`/sys/kernel/ryzen_smu_drv/`** — `pm_table` (2288 B blob), sibling `pm_table_version` (`TableVersionId` = 0x380805 on this host), `pm_table_size`, the `smn` attr (the CAD/timings follow-up channel), `codename`/`drv_version`/`version` + the SMU command attrs. The legacy `/sys/kernel/ryzen_smu/` path remains a secondary candidate in the code.
+- Consequence: live AMD telemetry **works** — the daemon decodes the PM table (MCLK/UCLK/FCLK ≈ 1792 MHz OneToOne, VDDCR_SOC ≈ 1.128 V; CAD/timings/other rails honest `Na` until the SMN-attr path). The tick-identical ground-truth gate is **UNBLOCKED** (open item 1: cross-check vs `sudo monitor_cpu`, installed at `/usr/bin/monitor_cpu`, mode 700 root).
+- Install / management: `scripts/install-ryzen-smu-dkms.sh` (idempotent operator helper; re-execs under sudo) — fast path when `pm_table` is present; `pacman -S --needed dkms base-devel`; kernel build-tree guard (never guesses a custom-kernel headers package — lists candidates and stops); shallow clone of the verified upstream `amkillam/ryzen_smu` (`RYZEN_SMU_URL` override — the former `53XU/ryzen_smu` default is DEAD, HTTP 404); stages the source into `/usr/src/ryzen_smu-$PKGVER` + the repo `dkms.conf`; `dkms add/build/install ${MODULE}/${PKGVER} -k ${KERNEL}`; `modprobe` + `/etc/modules-load.d/ryzen_smu.conf`; verifies `pm_table`. DKMS `AUTOINSTALL=yes` rebuilds the module on kernel updates. Without the module the app degrades gracefully (`N/A (DriverMissing)`, exit 0, no panic). Full details: `Docs/HANDOVER.md` §6.
 
 (b) **Intel test machine — LGA-1151 Intel i5-6600 (Skylake, 6th-gen), dual-channel (2 DIMM channels).**
 - Available for **live Intel MCHBAR decode verification** (the Phase 2 Intel path is Intel-gated and returns `N/A (UnsupportedHardware)` on the AMD host).
@@ -122,7 +117,7 @@ AMD Zen Telemetry (ryzen_smu Provider):
 
 Inspect CPUID family/model (Zen 1 through Zen 5).
 
-Open /dev/ryzen_smu or read /sys/kernel/ryzen_smu/pm_table.
+Open /dev/ryzen_smu or read `/sys/kernel/ryzen_smu_drv/pm_table` (+ the sibling `pm_table_version` / `pm_table_size` attrs; the legacy `/sys/kernel/ryzen_smu/pm_table` path remains a secondary candidate).
 
 Parse SMU PM tables to extract:
 
@@ -169,6 +164,7 @@ Gracefully returns structured errors (UnsupportedHardware, DriverMissing) withou
 - **Intel live decode: to be verified on the i5-6600** (Skylake, LGA-1151, dual-channel) machine — not yet run.
 - **Model reconciliation pending live silicon:** AMD PM byte offsets, Intel IMC register offsets (both currently plan-mandated SKELETONS), and SPD decode of maker `0xC1` + density `0x0D` codes observed on this host (raw-hex fallback today; no die-maker mapping for these codes yet).
 - Verified live on the 5950X host: `CPU: Amd(Zen3)`; `AMD: N/A (DriverMissing)`; `Intel: N/A (UnsupportedHardware)`; SPD: 2× DDR4 modules (rank=1, 3200 MT/s) — exit 0, no panic in any privilege/CPU state.
+- **Current state (2026-09-13, supersedes the above snapshot):** `ryzen_smu` is installed + loaded on this host (amkillam/ryzen_smu v0.1.7, DKMS) — the AMD section is **populated live** (clocks ≈ 1792 MHz OneToOne + VDDCR_SOC ≈ 1.128 V, decoded from the reconciled Vermeer f32 PM-table model — P5-15; CAD/timings honest `Na` until the SMN-attr follow-up); the tick-identical ground-truth cross-check is **UNBLOCKED** (open item 1, vs `sudo monitor_cpu`). Intel live decode still pending the i5-6600 (open item 2); model reconciliation partially done (open item 3). See `Docs/HANDOVER.md` §4–§5.
 
 Phase 3: Daemon Architecture & Privileged IPC (ramsleuth-daemon, ramsleuth-client)
 
