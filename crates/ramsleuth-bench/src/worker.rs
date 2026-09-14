@@ -30,13 +30,18 @@
 //!    remainder tail**, so every byte is covered exactly once (see
 //!    [`slice_boundaries`]). Each worker runs the requested kernel
 //!    (`avx2_*` or `avx512_*` per `use_avx512`; the 512 kernels carry
-//!    their own AVX2 fallback per P1-07) on its slice.
+//!    their own AVX2 fallback per P1-07) on its slice — re-run `iters`
+//!    times after the barrier for sub-4 MiB buffers (`small_tier_iters`)
+//!    to amortize the per-pass thread/barrier/timing overhead; large
+//!    tiers run exactly one pass.
 //! 4. **Aggregation**: the joiner sums the per-worker byte counters
-//!    (which equals the full buffer length) and wrapping-sums the
-//!    per-slice checksums. The word-sum checksum is an order-independent
-//!    wrapping addition over 64-bit words and every slice is a whole
-//!    number of blocks (hence of words), so the aggregate exactly equals
-//!    the checksum of running the kernel over the whole buffer.
+//!    (which equals the full buffer length times `iters`) and
+//!    wrapping-sums the per-slice checksums (likewise times `iters`).
+//!    The word-sum checksum is an order-independent wrapping addition
+//!    over 64-bit words and every slice is a whole number of blocks
+//!    (hence of words), so the aggregate over `iters` passes exactly
+//!    equals `iters ×` the checksum of running the kernel over the
+//!    whole buffer once.
 //!
 //! # Caller contract (checked; violations are a [`WorkerError`], never UB)
 //!
@@ -97,13 +102,19 @@ pub enum BenchOp {
 pub struct WorkerResult {
     /// The operation that was run.
     pub op: BenchOp,
-    /// Total bytes moved: the sum over the workers' slices, which equals
-    /// the full buffer length (the partition covers it exactly once).
+    /// Total bytes moved across all inner iterations: the sum over the
+    /// workers' slices, which equals the full buffer length times
+    /// `iters` (the partition covers the buffer exactly once per inner
+    /// iteration; `iters = 1` for large tiers, `small_tier_iters` for
+    /// sub-4 MiB tiers).
     pub total_bytes: u64,
-    /// Combined checksum. For `Read`/`Copy`: the wrapping sum of the
-    /// per-slice word-sum checksums — exactly the checksum of running
-    /// the kernel over the whole buffer. For `Write`: the byte counter
-    /// (the write kernels' frozen return), so `checksum == total_bytes`.
+    /// Combined checksum across the inner iterations. For `Read`/`Copy`:
+    /// the wrapping sum of the per-pass slice word-sum checksums =
+    /// `iters ×` the checksum of one kernel pass over the whole buffer
+    /// (per-pass checksums keep the frozen convention; the word sum is
+    /// order-independent). For `Write`: the summed byte counters (the
+    /// write kernels' frozen return), so `checksum == total_bytes` still
+    /// holds.
     pub checksum: u64,
     /// `true` when **every** worker was pinned to its physical core via
     /// `sched_setaffinity`. `false` records that pinning was skipped:
@@ -237,6 +248,28 @@ fn static_buffer<E: serde::de::Error>(buffer: &str) -> Result<&'static str, E> {
     }
 }
 
+/// Small-tier inner-loop iteration multiplier (P6-05): for sub-4 MiB
+/// working sets the per-pass fixed cost (thread spawn/join, barrier,
+/// timing) dominates the measured latency, so each worker re-runs its
+/// kernel this many times to amortize it. `total < 4 MiB →
+/// clamp(32 MiB / total, 1..=65536)`, else `1` — large tiers stay
+/// byte-identical to the single-pass behavior. The 32 MiB budget and
+/// the 65536 cap together bound the work per pass to ≤ 32 MiB even for
+/// tiny buffers.
+///
+/// u32-safe: for `total >= 1` the quotient is at most `32 MiB`, far
+/// below `u32::MAX`.
+fn small_tier_iters(total: usize) -> u32 {
+    const TIER_THRESHOLD: usize = 4 * 1024 * 1024; // sub-4 MiB tiers
+    const TARGET_WORK: usize = 32 * 1024 * 1024; // ≤ 32 MiB work per pass
+    const MAX_ITERS: usize = 65536; // hard cap on inner iterations
+    if total < TIER_THRESHOLD {
+        (TARGET_WORK / total).clamp(1, MAX_ITERS) as u32
+    } else {
+        1
+    }
+}
+
 /// Run one Read/Write/Copy pass over the whole buffer with one
 /// barrier-synced worker per physical core. See the module docs for the
 /// dispatch model, the caller contract, and the no-timing boundary.
@@ -247,6 +280,12 @@ fn static_buffer<E: serde::de::Error>(buffer: &str) -> Result<&'static str, E> {
 /// mismatch, misaligned base, non-block-multiple length) or when a
 /// worker thread panics. Pinning failure is *not* an error: the pass
 /// completes and [`WorkerResult::pinned`] records the skip.
+///
+/// **Small-tier inner loop (P6-05):** for sub-4 MiB buffers each worker
+/// re-runs its kernel `small_tier_iters(total)` times after the barrier
+/// (large tiers: exactly one pass) so the measured cost approaches pure
+/// memory access; [`WorkerResult::total_bytes`] and
+/// [`WorkerResult::checksum`] scale by `iters`.
 pub fn run_pinned(
     topo: &CpuTopology,
     op: BenchOp,
@@ -289,6 +328,12 @@ pub fn run_pinned(
             pinned: false,
         });
     }
+
+    // P6-05 small-tier overhead refinement: sub-4 MiB buffers are
+    // dominated by the per-pass fixed cost (thread spawn/join, barrier,
+    // timing), so each worker re-runs its kernel `iters` times to
+    // amortize it; large tiers keep `iters = 1` (byte-identical).
+    let iters = small_tier_iters(total);
 
     // Pre-flight probe: prove that affinity works (and that the first
     // representative CPU is inside the process's allowed set) before
@@ -341,7 +386,16 @@ pub fn run_pinned(
                     None => false,
                 };
                 gate.wait();
-                let (bytes, checksum) = run_kernel(op, src_slice, dst_slice, use_avx512);
+                // Inner loop (P6-05): re-run the kernel `iters` times
+                // over the same slice, accumulating the per-pass bytes
+                // and checksum (wrapping) across the passes.
+                let mut bytes = 0u64;
+                let mut checksum = 0u64;
+                for _ in 0..iters {
+                    let (pass_bytes, pass_checksum) = run_kernel(op, src_slice, dst_slice, use_avx512);
+                    bytes = bytes.wrapping_add(pass_bytes);
+                    checksum = checksum.wrapping_add(pass_checksum);
+                }
                 (pinned, bytes, checksum)
             }));
         }
@@ -365,8 +419,8 @@ pub fn run_pinned(
     }
     debug_assert_eq!(
         total_bytes,
-        total as u64,
-        "the partition must cover the buffer exactly once"
+        (total as u64).wrapping_mul(iters as u64),
+        "the partition must cover the buffer exactly `iters` times"
     );
     Ok(WorkerResult {
         op,
@@ -595,10 +649,11 @@ mod tests {
         }
     }
 
-    /// (a)+(c): a 1 MiB aligned buffer, every op × both kernel families:
-    /// no panic, `total_bytes` equals the full buffer length, the
-    /// checksum matches the kernel's semantics, and the run is fully
-    /// pinned on this Linux host.
+    /// (a)+(c): a 1 MiB aligned buffer (small tier: `iters` = 32),
+    /// every op × both kernel families: no panic, `total_bytes` equals
+    /// the full buffer length × `iters`, the checksum matches the
+    /// kernel's semantics × `iters`, and the run is fully pinned on
+    /// this Linux host.
     #[test]
     fn run_pinned_covers_buffer_once_per_op() {
         const LEN: usize = 1024 * 1024;
@@ -622,6 +677,7 @@ mod tests {
             std::slice::from_raw_parts_mut(dst_ptr, LEN)
         };
         let expected = word_sum(src);
+        let iters = small_tier_iters(LEN);
 
         for op in [BenchOp::Read, BenchOp::Write, BenchOp::Copy] {
             for use_avx512 in [false, true] {
@@ -630,8 +686,8 @@ mod tests {
                 assert_eq!(res.op, op);
                 assert_eq!(
                     res.total_bytes,
-                    LEN as u64,
-                    "{op:?} 512={use_avx512}: whole buffer covered exactly once"
+                    (LEN as u64).wrapping_mul(iters as u64),
+                    "{op:?} 512={use_avx512}: whole buffer covered exactly `iters` times"
                 );
                 // (c) sched_setaffinity is available on Linux → the
                 // pool must report itself as pinned.
@@ -641,13 +697,15 @@ mod tests {
                     "{op:?} 512={use_avx512}: pinning must succeed on a Linux host"
                 );
                 let expected_checksum = match op {
-                    BenchOp::Read | BenchOp::Copy => expected,
-                    BenchOp::Write => LEN as u64, // write checksum = byte counter
+                    BenchOp::Read | BenchOp::Copy => {
+                        expected.wrapping_mul(iters as u64) // iters × whole-buffer word sum
+                    }
+                    BenchOp::Write => (LEN as u64).wrapping_mul(iters as u64), // write checksum = byte counter
                 };
                 assert_eq!(
                     res.checksum,
                     expected_checksum,
-                    "{op:?} 512={use_avx512}: combined checksum"
+                    "{op:?} 512={use_avx512}: combined checksum across `iters` passes"
                 );
             }
         }
@@ -660,9 +718,11 @@ mod tests {
         dealloc_aligned(dst_ptr, LEN);
     }
 
-    /// (b): the aggregated Read checksum equals the kernel's checksum
-    /// of the *whole* buffer — proving the slice partition has neither
-    /// overlap nor gap (word sums are additive over an exact partition).
+    /// (b): the aggregated Read checksum equals `iters ×` the kernel's
+    /// checksum of the *whole* buffer — proving the slice partition has
+    /// neither overlap nor gap (word sums are additive over an exact
+    /// partition) and the inner loop preserves the frozen per-pass
+    /// convention.
     #[test]
     fn read_aggregate_checksum_matches_whole_buffer() {
         const LEN: usize = 1024 * 1024;
@@ -682,23 +742,29 @@ mod tests {
             std::slice::from_raw_parts_mut(dst_ptr, LEN)
         };
 
+        let iters = small_tier_iters(LEN);
         let r32 = run_pinned(&topo, BenchOp::Read, src, dst_view(), false).expect("Read/AVX2");
         assert_eq!(
-            r32.checksum,
-            avx2_read(src),
-            "AVX2 aggregate must equal whole-buffer avx2_read"
+            r32.total_bytes,
+            (LEN as u64).wrapping_mul(iters as u64),
+            "AVX2: full buffer covered `iters` times"
         );
         assert_eq!(
             r32.checksum,
-            word_sum(src),
-            "AVX2 aggregate must equal the word-sum reference"
+            avx2_read(src).wrapping_mul(iters as u64),
+            "AVX2 aggregate must equal `iters x` whole-buffer avx2_read"
+        );
+        assert_eq!(
+            r32.checksum,
+            word_sum(src).wrapping_mul(iters as u64),
+            "AVX2 aggregate must equal `iters x` the word-sum reference"
         );
 
         let r512 = run_pinned(&topo, BenchOp::Read, src, dst_view(), true).expect("Read/AVX-512");
         assert_eq!(
             r512.checksum,
-            avx512_read(src),
-            "AVX-512 aggregate must equal whole-buffer avx512_read"
+            avx512_read(src).wrapping_mul(iters as u64),
+            "AVX-512 aggregate must equal `iters x` whole-buffer avx512_read"
         );
         // On a host without AVX-512F, `avx512_read` falls back to the
         // AVX2 kernel → both aggregates must agree either way.
@@ -743,18 +809,19 @@ mod tests {
                 std::slice::from_raw_parts_mut(dst_ptr, len)
             };
             let expected = word_sum(src);
+            let iters = small_tier_iters(len);
 
             for op in [BenchOp::Read, BenchOp::Write, BenchOp::Copy] {
                 let res = run_pinned(&topo, op, src, dst_view(), use_avx512)
                     .unwrap_or_else(|e| panic!("run_pinned {op:?} (512={use_avx512}) failed: {e}"));
                 assert_eq!(
                     res.total_bytes,
-                    len as u64,
-                    "{op:?} 512={use_avx512}: tail handled, whole buffer covered once"
+                    (len as u64).wrapping_mul(iters as u64),
+                    "{op:?} 512={use_avx512}: tail handled, buffer covered `iters` times"
                 );
                 let expected_checksum = match op {
-                    BenchOp::Read | BenchOp::Copy => expected,
-                    BenchOp::Write => len as u64,
+                    BenchOp::Read | BenchOp::Copy => expected.wrapping_mul(iters as u64),
+                    BenchOp::Write => (len as u64).wrapping_mul(iters as u64),
                 };
                 assert_eq!(
                     res.checksum,
@@ -797,10 +864,15 @@ mod tests {
             std::slice::from_raw_parts_mut(dst_ptr, LEN)
         };
 
+        let iters = small_tier_iters(LEN);
         let res = run_pinned(&topo, BenchOp::Read, src, dst_view(), false).expect("fallback run");
         assert!(!res.pinned, "no physical cores → no pinning to report");
-        assert_eq!(res.total_bytes, LEN as u64);
-        assert_eq!(res.checksum, avx2_read(src), "fallback run must checksum the whole buffer");
+        assert_eq!(res.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
+        assert_eq!(
+            res.checksum,
+            avx2_read(src).wrapping_mul(iters as u64),
+            "fallback run must checksum the whole buffer `iters` times"
+        );
         dealloc_aligned(src_ptr, LEN);
         dealloc_aligned(dst_ptr, LEN);
     }
@@ -881,10 +953,104 @@ mod tests {
             // SAFETY: `dst_ptr` is a fresh 64-aligned allocation of LEN bytes.
             std::slice::from_raw_parts_mut(dst_ptr, LEN)
         };
+        let iters = small_tier_iters(LEN);
         let res = run_pinned(&topo, BenchOp::Read, src, dst_view(), false).expect("post-probe run");
         assert!(res.pinned, "run must still be fully pinned after the probe");
-        assert_eq!(res.total_bytes, LEN as u64);
-        assert_eq!(res.checksum, 0, "zeroed buffer checksums to 0");
+        assert_eq!(res.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
+        assert_eq!(res.checksum, 0, "zeroed buffer checksums to 0 across all inner iterations");
+        dealloc_aligned(src_ptr, LEN);
+        dealloc_aligned(dst_ptr, LEN);
+    }
+
+    /// (P6-05) The small-tier multiplier table: sub-4 MiB buffers scale
+    /// toward 32 MiB of work per pass (hard-capped at 65536), large
+    /// tiers (>= 4 MiB) stay single-pass.
+    #[test]
+    fn small_tier_iters_pins_the_scaling_table() {
+        assert_eq!(small_tier_iters(32 * 1024), 1024, "L1 32 KiB -> 1024");
+        assert_eq!(small_tier_iters(1024 * 1024), 32, "L2 1 MiB -> 32");
+        assert_eq!(small_tier_iters(64), 65536, "64 B hits the 65536 cap");
+        assert_eq!(small_tier_iters(3 * 1024 * 1024), 10, "3 MiB -> floor(32/3) = 10");
+        assert_eq!(small_tier_iters(4 * 1024 * 1024 - 64), 8, "just under 4 MiB -> 8");
+        assert_eq!(small_tier_iters(4 * 1024 * 1024), 1, "4 MiB boundary -> large tier");
+        assert_eq!(small_tier_iters(8 * 1024 * 1024), 1, "L3 8 MiB -> 1");
+        assert_eq!(small_tier_iters(256 * 1024 * 1024), 1, "DRAM 256 MiB -> 1");
+    }
+
+    /// (P6-05) Large tiers (>= 4 MiB) keep `iters = 1`: `total_bytes`
+    /// and `checksum` are byte-identical to today's single-pass behavior
+    /// for every op.
+    #[test]
+    fn large_tier_runs_single_pass_unchanged() {
+        const LEN: usize = 8 * 1024 * 1024;
+        assert_eq!(small_tier_iters(LEN), 1, "8 MiB is a large tier");
+        let topo = detect().expect("detect() succeeds on the test host");
+
+        let src_ptr = aligned_zeroed(LEN);
+        let dst_ptr = aligned_zeroed(LEN);
+        // SAFETY: fresh 64-aligned allocations of LEN bytes; the mutable
+        // view is dead before the shared view is created.
+        let src = unsafe {
+            let view = std::slice::from_raw_parts_mut(src_ptr, LEN);
+            fill_pattern(view);
+            std::slice::from_raw_parts(src_ptr, LEN)
+        };
+        let dst_view = || unsafe {
+            // SAFETY: `dst_ptr` is a fresh 64-aligned allocation of LEN bytes.
+            std::slice::from_raw_parts_mut(dst_ptr, LEN)
+        };
+        let expected = word_sum(src);
+
+        for op in [BenchOp::Read, BenchOp::Write, BenchOp::Copy] {
+            let res = run_pinned(&topo, op, src, dst_view(), false)
+                .unwrap_or_else(|e| panic!("run_pinned {op:?} failed: {e}"));
+            assert_eq!(res.total_bytes, LEN as u64, "{op:?}: one pass only");
+            let expected_checksum = match op {
+                BenchOp::Read | BenchOp::Copy => expected,
+                BenchOp::Write => LEN as u64, // write checksum = byte counter
+            };
+            assert_eq!(res.checksum, expected_checksum, "{op:?}: single-pass checksum");
+        }
+        dealloc_aligned(src_ptr, LEN);
+        dealloc_aligned(dst_ptr, LEN);
+    }
+
+    /// (P6-05) The inner loop preserves the frozen checksum convention:
+    /// the aggregate over `iters` passes equals `iters ×` the single-pass
+    /// whole-buffer checksum (the word sum is order-independent), and the
+    /// write invariant `checksum == total_bytes` survives the multiplier.
+    #[test]
+    fn inner_loop_preserves_frozen_checksum_convention() {
+        const LEN: usize = 1024 * 1024; // L2 tier: `iters` = 32
+        let iters = small_tier_iters(LEN);
+        assert_eq!(iters, 32, "1 MiB -> 32 inner iterations");
+        let topo = detect().expect("detect() succeeds on the test host");
+
+        let src_ptr = aligned_zeroed(LEN);
+        let dst_ptr = aligned_zeroed(LEN);
+        // SAFETY: fresh 64-aligned allocations of LEN bytes; the mutable
+        // view is dead before the shared view is created.
+        let src = unsafe {
+            let view = std::slice::from_raw_parts_mut(src_ptr, LEN);
+            fill_pattern(view);
+            std::slice::from_raw_parts(src_ptr, LEN)
+        };
+        let dst_view = || unsafe {
+            // SAFETY: `dst_ptr` is a fresh 64-aligned allocation of LEN bytes.
+            std::slice::from_raw_parts_mut(dst_ptr, LEN)
+        };
+
+        let single_pass = avx2_read(src);
+        let res_read = run_pinned(&topo, BenchOp::Read, src, dst_view(), false).expect("Read");
+        assert_eq!(res_read.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
+        assert_eq!(
+            res_read.checksum,
+            single_pass.wrapping_mul(iters as u64),
+            "aggregate = iters x single-pass whole-buffer checksum"
+        );
+        let res_write = run_pinned(&topo, BenchOp::Write, src, dst_view(), false).expect("Write");
+        assert_eq!(res_write.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
+        assert_eq!(res_write.checksum, res_write.total_bytes, "write: checksum == total_bytes");
         dealloc_aligned(src_ptr, LEN);
         dealloc_aligned(dst_ptr, LEN);
     }
