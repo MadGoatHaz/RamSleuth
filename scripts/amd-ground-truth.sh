@@ -8,7 +8,11 @@
 # driver's `smn_result` is one shared global, so never run `monitor_cpu`
 # concurrently with the daemon's SMN reads (plan D3):
 #
-#   (a) monitor_cpu        — one PM-table frame (timeout 2)
+#   (a) monitor_cpu -f     — one PM-table frame (timeout 2; -f is required —
+#                            without it an unsupported PM table version (this
+#                            host: 0x380805 vs supported 0x240903) makes
+#                            monitor_cpu print a notice to stderr and exit
+#                            with ZERO stdout frames)
 #   (b) ramsleuth-client   — dump (dashboard, root daemon)
 #   (c) monitor_cpu -m     — one-shot SMN memory timings (the reference)
 #
@@ -19,11 +23,18 @@
 #                                          an N/A cell is deferred, not failed)
 # Recorded (informational, never gated):
 #   CAD bus (8 cells)            : populated values recorded; still-N/A cells
-#                                  note the deferred gate (SMN CAD bitfields
-#                                  unconfirmed until P6-02/03)
+#                                  note the pending gate (the CAD/RTT/drive
+#                                  SMN bitfields are unconfirmed in the
+#                                  ryzen_smu driver source — driver-side
+#                                  confirmation pending, not deferred to any
+#                                  chunk)
 #   1792-vs-1800 MCLK delta      : set-point register 0x50200[6:0] via the
-#                                  driver's `smn` attr + both MCLK sources +
-#                                  the raw PM f32 @0x0CC
+#                                  driver's `smn` attr (two-stage protocol:
+#                                  marker 0x300 -> +0x100000 re-read; a
+#                                  0xffffffff read is the driver's
+#                                  failed-PCI sentinel -> READ-FAILED, never
+#                                  computed) + both MCLK sources + the raw
+#                                  PM f32 @0x0CC
 #
 # Precondition misses and capture failures that block a verdict exit 2 with
 # an actionable message — never a partial/ambiguous verdict. A degraded
@@ -100,7 +111,8 @@ smn_field() { awk -v k="$1" 'index($0,k": ")==1{v=substr($0,length(k)+3); sub(/[
 # A driver text attr: trimmed value, or (absent).
 attr() { local f="${SYSFS_DIR}/$1" v=""; [[ -r "$f" ]] && v="$(cat "$f" 2>/dev/null || true)"; printf '%s' "${v:-(absent)}"; }
 # Read one SMN register: $1 = the 4-byte LE address as printf-\x text
-# (e.g. '\x00\x02\x50\x00' = 0x00050200) -> "0x<big-endian hex> <decimal>".
+# (e.g. '\x00\x02\x05\x00' = 0x00050200; the driver parses the written
+# word as a native LE u32 — drv.c smn_store) -> "0x<big-endian hex> <decimal>".
 smn_read_word() {
   local f="${SYSFS_DIR}/smn" h
   { printf '%b' "$1" >"$f"; } 2>/dev/null || return 1
@@ -134,13 +146,20 @@ log "daemon probe: $(grep -m 1 '^AMD:' "$WORK/probe.txt" || echo 'AMD: ok')"
 log "settling ${SETTLE}s (idle), then capturing sequentially (monitor_cpu -> dump -> monitor_cpu -m)..."
 sleep "$SETTLE"
 # (a) one monitor_cpu PM-table frame: `timeout 2` sends SIGTERM; the
-# monitor's handler exits cleanly 0. Label values use the LAST occurrence
-# (the most recent frame).
-mon_rc=0; timeout 2 "$MONITOR" >"$WORK/mon.raw" 2>"$WORK/mon.err" || mon_rc=$?
+# monitor's handler exits cleanly 0. -f is REQUIRED — without it, an
+# unsupported PM table version (0x380805 on this host vs 0x240903) makes
+# monitor_cpu print a notice to stderr and exit with ZERO stdout frames
+# (start_pm_monitor(); the Cycle-5 live run's empty-frame no-verdicts).
+# Label values use the LAST occurrence (the most recent frame).
+mon_rc=0; timeout 2 "$MONITOR" -f >"$WORK/mon.raw" 2>"$WORK/mon.err" || mon_rc=$?
 [[ "$mon_rc" -eq 0 ]] || die2 "monitor_cpu PM-frame capture failed (rc=${mon_rc}: $(head -n 1 "$WORK/mon.err" 2>/dev/null || true))"
 # Strip ANSI escapes; map box char U+2502 (E2 94 82) to '|'; drop remaining
-# non-ASCII (corners) — the frame rows become `| <label> | <value> |` (GNU sed).
-sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\xe2\x94\x82/|/g' <"$WORK/mon.raw" | LC_ALL=C tr -d '\200-\377' >"$WORK/pm.txt"
+# non-ASCII (corners) — the frame rows become `| <label> | <value> |`
+# (print_line: "│ %46s │ %47s │"; LC_ALL=C pins byte semantics in both stages).
+LC_ALL=C sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\xe2\x94\x82/|/g' <"$WORK/mon.raw" | LC_ALL=C tr -d '\200-\377' >"$WORK/pm.txt"
+if ! grep -q '^|' "$WORK/pm.txt"; then
+  log "NOTE: no PM-table frame rows parsed from the monitor_cpu -f capture ($(wc -l <"$WORK/pm.txt") lines; stderr: $(head -n 1 "$WORK/mon.err" 2>/dev/null || true)) — the PM clock/voltage gates will be no-verdict"
+fi
 # (b) the ramsleuth dashboard from the root daemon.
 dump_rc=0; "$CLIENT" dump --socket "$SOCKET" >"$WORK/dump.txt" 2>&1 || dump_rc=$?
 [[ "$dump_rc" -eq 0 ]] || die2 "ramsleuth-client dump failed (rc=${dump_rc}: $(head -n 1 "$WORK/dump.txt" 2>/dev/null || true))"
@@ -196,7 +215,7 @@ else
   [[ "$t_noref" -eq 0 ]] || { log "  -> an active timing gate lacks its monitor_cpu -m reference: no verdict (exit 2)"; no_verdict=1; }
 
   # --- Record: CAD bus (informational only; the gate is deferred) ---------------
-  log "--- record: CAD bus (informational; gate deferred) ---"
+  log "--- record: CAD bus (informational; gate pending driver confirmation) ---"
   cad_na=0
   for key in "${CAD_KEYS[@]}"; do
     ds="$(dump_field "$key")"
@@ -204,33 +223,59 @@ else
     elif [[ "$ds" == NA* ]]; then log "  ${key}: N/A — $(trim "${ds#NA}")"; cad_na=1
     else log "  ${key}: $(trim "${ds#VAL}")"; fi
   done
-  if [[ "$cad_na" -eq 1 ]]; then log "  CAD gate: DEFERRED — SMN CAD bitfields unconfirmed (lands with P6-02/03); non-fatal"
+  if [[ "$cad_na" -eq 1 ]]; then log "  CAD gate: PENDING DRIVER-SIDE CONFIRMATION — the CAD/RTT/drive SMN bitfields are unconfirmed in the ryzen_smu driver source (P6-02 audit); the cells stay honest N/A until that confirmation lands (not deferred to any chunk); non-fatal"
   else log "  CAD: populated values recorded above (no CAD reference exists in monitor_cpu -m)"; fi
 
 fi
 # --- Record: the 1792-vs-1800 MCLK delta (set-point vs measured) --------------
 # The driver's `smn` attr is a write-address -> read-value protocol (plan
-# §1). Address 0x50200 = LE bytes 00 02 50 00; when the first read returns
-# 0x300 the platform offsets UMC registers by +0x100000 (the monitor_cpu
-# rule -> 0x10050200 = bytes 00 02 50 10).
+# §1; drv.c smn_store parses the written word as a native LE u32).
+# Two-stage protocol, replicated verbatim from monitor_cpu.c
+# print_memory_timings(): read 0x50200 (LE 00 02 05 00); if it returns the
+# marker 0x300 the platform offsets UMC registers by +0x100000; re-read
+# 0x50200(+offset) (0x10050200 = LE 00 02 05 10). The MCLK set-point is
+# `(value1 & 0x7f) / 3.f * 100.f` printed %.0f (source line 232). A failed
+# PCI read leaves 0xffffffff in the driver's smn_result while the userspace
+# read() still "succeeds" — that word is the read-failure sentinel, never
+# data: computed, (0xffffffff & 0x7f) = 127 misreads as "4233 MHz" (the
+# Cycle-5 live run), so a sentinel is reported as READ-FAILED. (The P6-01
+# draft also swapped the address bytes — '\x00\x02\x50\x00' is 0x500200,
+# not 0x50200 — a register that fails the SMU read: the sentinel's origin.)
 log "--- record: 1792-vs-1800 MCLK delta (set-point 0x50200[6:0] vs measured) ---"
-setpoint_raw="$(smn_read_word '\x00\x02\x50\x00' || true)"
-[[ "$setpoint_raw" == "0x00000300 768" ]] && setpoint_raw="$(smn_read_word '\x00\x02\x50\x10' || true)"
+sp_probe="$(smn_read_word '\x00\x02\x05\x00' || true)"
+sp_addr='\x00\x02\x05\x00'; [[ "$sp_probe" == "0x00000300 768" ]] && sp_addr='\x00\x02\x05\x10'
+setpoint_raw="$(smn_read_word "$sp_addr" || true)"
 gdm_bit="?"; cr_text=""
-if [[ -n "$setpoint_raw" ]]; then
-  w="${setpoint_raw#* }"; sp=$(( (w & 127) * 100 / 3 )); gdm_bit=$(( (w >> 11) & 1 ))
+if [[ -n "$setpoint_raw" && "$setpoint_raw" != "0xffffffff 4294967295" ]]; then
+  w="${setpoint_raw#* }"; k=$((w & 127)); sp="$(awk -v k="$k" 'BEGIN{printf "%.0f", k / 3.0 * 100.0}')"
+  gdm_bit=$(( (w >> 11) & 1 ))
   [[ $(( (w & 1024) >> 10 )) -eq 1 ]] && cr_text="2T" || cr_text="1T"
-  log "  smn 0x50200 raw=${setpoint_raw%% *}: set-point=${sp} MHz ((raw & 0x7F)/3 x 100), GDM bit=${gdm_bit}, CR=${cr_text}"
+  log "  smn 0x50200 raw=${setpoint_raw%% *}: set-point=${sp} MHz ((raw & 0x7F) / 3 x 100, %.0f per source), GDM bit=${gdm_bit}, CR=${cr_text}"
   [[ "$sp" -gt 0 ]] || log "  (note: set-point 0 is implausible — likely a stale smn_result after a failed SMU read, plan D3)"
+elif [[ -n "$setpoint_raw" ]]; then
+  gdm_bit="UNKNOWN"
+  log "  smn 0x50200 set-point: READ-FAILED (sentinel 0xffffffff — the driver's failed-PCI-read marker; no set-point computed)"
 else
   log "  smn 0x50200 set-point: N/A (smn write/read failed — check the driver)"
 fi
+# Three-source GDM cross-check: smn 0x50200 bit 11 (this script),
+# `monitor_cpu -m` ("GDM: Enabled|Disabled"), and the dump (flag() renders
+# "on"/"off"). A sentinel/failed smn read displays as unknown — never as
+# bit-11-of-all-ones; any source disagreement is reported explicitly.
 gdm_m=""; [[ "$smn_rc" -eq 0 ]] && gdm_m="$(smn_field GDM || true)"
 dump_gdm="$(dump_field GDM || true)"
 if [[ "$dump_gdm" == VAL* ]]; then dump_gdm_disp="$(trim "${dump_gdm#VAL}")"
 elif [[ "$dump_gdm" == NA* ]]; then dump_gdm_disp="N/A $(trim "${dump_gdm#NA}")"
 else dump_gdm_disp="n/a"; fi
-log "  GDM: smn bit=${gdm_bit}  monitor_cpu -m=${gdm_m:-n/a}  dump=${dump_gdm_disp}"
+gdm_s=unknown; case "$gdm_bit" in 1) gdm_s=Enabled ;; 0) gdm_s=Disabled ;; esac
+gdm_m_n=unavailable; case "$gdm_m" in Enabled|Disabled) gdm_m_n="$gdm_m" ;; esac
+gdm_d_n=unavailable; case "$dump_gdm_disp" in on) gdm_d_n=Enabled ;; off) gdm_d_n=Disabled ;; esac
+log "  GDM: smn=${gdm_s}  monitor_cpu -m=${gdm_m_n}  dump=${gdm_d_n}"
+if [[ "$gdm_s" == unknown ]]; then
+  log "  GDM cross-check: smn source unavailable (read failed / sentinel 0xffffffff — no bit displayed); monitor_cpu -m=${gdm_m_n}, dump=${gdm_d_n} carry the bit"
+elif [[ ( "$gdm_m_n" != unavailable && "$gdm_m_n" != "$gdm_s" ) || ( "$gdm_d_n" != unavailable && "$gdm_d_n" != "$gdm_s" ) ]]; then
+  log "  GDM DISAGREEMENT across sources: smn=${gdm_s}, monitor_cpu -m=${gdm_m_n}, dump=${gdm_d_n} — investigate (transient SMU read, driver state, or PM-table divergence)"
+fi
 log "  monitor_cpu PM-frame Memory Clock: $(pm_field "Memory Clock" || true)"
 dump_mclk="$(dump_field MCLK || true)"
 if [[ "$dump_mclk" == VAL* ]]; then dump_mclk_disp="$(trim "${dump_mclk#VAL}")"
@@ -249,5 +294,5 @@ log "  -> classification: set-point register (discrete steps) vs measured PM f32
 # --- Verdict ------------------------------------------------------------------
 if [[ "$no_verdict" -eq 1 ]]; then log "VERDICT: NO-VERDICT — at least one required gate could not be evaluated (see the NO-VERDICT lines)"; exit 2; fi
 if [[ "$fail_count" -gt 0 ]]; then log "VERDICT: FAIL — ${fail_count} active gate(s) out of tolerance (${pass_count} in tolerance)"; exit 1; fi
-log "VERDICT: PASS — ${pass_count} active gate(s) in tolerance (timing/CAD deferrals noted, non-fatal)"
+log "VERDICT: PASS — ${pass_count} active gate(s) in tolerance (timing deferrals + CAD pending note recorded, non-fatal)"
 exit 0
