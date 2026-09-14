@@ -133,12 +133,12 @@ if ! dkms add "${MODULE}/${PKGVER}"; then
     && log "${MODULE}/${PKGVER} already registered with DKMS — continuing" \
     || die "dkms add ${MODULE}/${PKGVER} failed — run 'dkms status' to inspect"
 fi
-dkms build "${MODULE}" -k "${KERNEL}" \
+dkms build "${MODULE}/${PKGVER}" -k "${KERNEL}" \
   || die "dkms build ${MODULE} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect build errors"
 if [[ -d "/var/lib/dkms/${MODULE}/${PKGVER}/${KERNEL}" ]]; then
   log "${MODULE}/${PKGVER} already installed for ${KERNEL} — skipping dkms install"
 else
-  dkms install "${MODULE}" -k "${KERNEL}" \
+  dkms install "${MODULE}/${PKGVER}" -k "${KERNEL}" \
     || die "dkms install ${MODULE} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect"
 fi
 
