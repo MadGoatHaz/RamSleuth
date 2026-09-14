@@ -135,11 +135,11 @@ if ! dkms add "${MODULE}/${PKGVER}"; then
 fi
 dkms build "${MODULE}/${PKGVER}" -k "${KERNEL}" \
   || die "dkms build ${MODULE} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect build errors"
-if [[ -d "/var/lib/dkms/${MODULE}/${PKGVER}/${KERNEL}" ]]; then
+if dkms status | grep -qE "^${MODULE}/${PKGVER},[[:space:]]*${KERNEL},[[:space:]]*[^:]*:[[:space:]]*installed[[:space:]]*$"; then
   log "${MODULE}/${PKGVER} already installed for ${KERNEL} — skipping dkms install"
 else
   dkms install "${MODULE}/${PKGVER}" -k "${KERNEL}" \
-    || die "dkms install ${MODULE} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect"
+    || die "dkms install ${MODULE}/${PKGVER} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect"
 fi
 
 # --- Step 5: load now + at boot ---------------------------------------------------
