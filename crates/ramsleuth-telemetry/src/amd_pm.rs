@@ -1,185 +1,130 @@
 //! AMD SMU PM-table parse — version-guarded, bounds-checked (P2-04).
 //!
-//! Turns the raw PM-table blob acquired by [`crate::amd_smu`] (P2-03) into a
-//! structured [`AmdPmSnapshot`]:
+//! Turns the raw PM-table blob acquired by [`crate::amd_smu`] (P2-03) into
+//! a structured [`AmdPmSnapshot`]:
 //!
-//! - **Clocks** — MCLK / UCLK / FCLK (MHz), the UCLK:MCLK divide mode, Gear
-//!   Down Mode (GDM) and Power Down Mode (PDM);
-//! - **Timings** — the 19 primary DRAM subtimings plus the 8
-//!   tertiary/turnaround timings (ticks);
-//! - **CAD bus** — ProcODT / RttNom / RttWr / RttPark / ClkDrv / AddrCmdDrv /
-//!   CsOdtDrv / CkeDrv as raw RZQ/driver codes;
-//! - **Voltages** — VDDCR_SOC / VDDIO_MEM / VDD_MISC / VPP (mV).
+//! - **Clocks** — MCLK / UCLK / FCLK (MHz) and the UCLK:MCLK divide mode
+//!   (derived: `UCLK == MCLK` → 1:1 coupled, otherwise 1:2);
+//! - **Voltage** — VDDCR_SOC (mV, converted from the table's volt unit).
 //!
-//! The snapshot holds *raw PM units* only; display mapping (code→Ω, mV→V,
-//! ratio computation, sanity ranges) belongs to P2-05 (`amd_readout.rs`).
+//! The remaining fields of the frozen snapshot shape (GDM / PDM mode
+//! flags, the 27 DRAM subtimings, the 8 CAD-bus codes, VDDIO_MEM /
+//! VDD_MISC / VPP) are **not present in this table** on the verified
+//! driver model (P5-15): [`parse`] sets them to `0`, which degrades to an
+//! honest `Disabled` / `N/A` under P2-05's sanity gates (code `0` →
+//! `Disabled`/`NotApplicable`, `0` ticks/mV → out-of-band Na). Display
+//! mapping (code→Ω, mV→V, ratio computation, sanity ranges) belongs to
+//! P2-05 (`amd_readout.rs`).
 //!
-//! # Version guard
+//! # Version guard (P5-15 reconciliation)
 //!
-//! [`SmuContext::version`] (frozen in P2-03 as the little-endian `u32` at
-//! blob offset [`VERSION_OFF`]) encodes the SMU firmware version as
-//! `(major << 16) | (minor << 8) | patch` — the same scheme the `ryzen_smu`
-//! driver prints via `"%d.%d.%d"`. [`PmLayout::from_version`] maps it to one
-//! of the three supported table layouts:
+//! [`SmuContext::version`] is the PM table's **`TableVersionId`** — the
+//! little-endian `u32` the driver publishes in the sibling
+//! `pm_table_version` sysfs attribute (P2-03). The blob itself is a
+//! **headerless** array of little-endian `f32` values (byte offset =
+//! index × 4) and carries no version word of its own.
+//! [`PmLayout::from_version`] guards on the exact accepted
+//! `TableVersionId` sets:
 //!
-//! | version word          | layout               | family |
-//! |-----------------------|----------------------|--------|
-//! | `0x0007_0Bxx` (7.11.x)| [`PmLayout::Smu711`] | Zen 3  |
-//! | `0x000C_xxxx` (12.x)  | [`PmLayout::Smu12`]  | Zen 4  |
-//! | `0x000D_xxxx` (13.x)  | [`PmLayout::Smu13`]  | Zen 5  |
+//! | `TableVersionId` set                 | layout              | family          |
+//! |--------------------------------------|---------------------|-----------------|
+//! | [`VERMEER_TABLE_VERSIONS`] (10 ids)  | [`PmLayout::Vermeer`] | Zen 3 (5950X) |
+//! | [`MATISSE_TABLE_VERSIONS`] (8 ids)   | [`PmLayout::Matisse`] | Zen 2         |
 //!
 //! Any other version word yields [`TelemetryError::UnknownPmTableVersion`].
 //!
-//! # Layout tables (P2-04 skeleton)
-//!
-//! Each layout is a [`PmTableLayout`] — named region anchors (byte offsets
-//! from the start of the blob) holding packed little-endian fields in the
-//! plan's field order:
+//! # Field layout (f32 offsets, verified on 5950X silicon via monitor_cpu)
 //!
 //! ```text
-//! 0x00   version        u32 LE   (P2-03 frozen header)
-//! anchor clocks         3 × u16  (mclk, uclk, fclk — MHz)
-//! +3     modes          3 × u8   (div_mode, gdm, pdm; 1 reserved byte)
-//! +4     voltages       4 × u16  (VDDCR_SOC, VDDIO_MEM, VDD_MISC, VPP — mV)
-//! +8     cad            8 × u16  (RZQ/driver codes)
-//! +54    timings        27 × u16 (19 primary + 8 tertiary ticks)
+//! 0x0B0   VDDCR_SOC   f32 LE   (volts; ×1000 → mV)
+//! 0x0C0   FCLK        f32 LE   (MHz)
+//! 0x0C8   UCLK        f32 LE   (MHz)
+//! 0x0CC   MCLK        f32 LE   (MHz)
 //! ```
 //!
-//! The three families place the region block at different depths
-//! ([`SMU711`] shallowest → [`SMU12`] → [`SMU13`] deepest), mirroring the
-//! *relative* placement of the published `ryzen_smu` metrics-table indices
-//! (Zen 3 clock floats at 48/50/51, Zen 4 at 70/74/78, Zen 5 at 71/75/79).
-//! The absolute anchors are the P2-04 **skeleton** table (plan D2): concrete,
-//! named, auditable constants to be re-verified byte-for-byte against a live
-//! blob at P2-11 (needs the `ryzen_smu` module loaded + root; per the
-//! DEV_LOG the module is not currently loaded on the test host). Until then,
-//! live data degrades gracefully: a non-mapping version word returns
-//! [`TelemetryError::UnknownPmTableVersion`], a blob truncated for its layout
-//! returns [`TelemetryError::Parse`], and no code path can panic or read out
+//! Minimum blob length [`MIN_LEN`] = 0x518 (326 × f32). Every field read
+//! goes through the bounds-checked [`read_f32le`]; a non-finite float
+//! (NaN / ±inf) or a negative value degrades to the field's zero value
+//! instead of poisoning the snapshot — no code path can panic or read out
 //! of bounds.
 //!
 //! # Safety
 //!
-//! No `unsafe`: every field read goes through the bounds-checked helpers
-//! `read_u8` / `read_u16le` / `read_u32le`, which return
-//! [`TelemetryError::Parse`] when `off + width > blob.len()` (they never
-//! index and never panic). [`parse`] additionally cross-checks the blob's
-//! version header against [`SmuContext::version`] and gates on the layout's
-//! minimum length before reading fields.
+//! No `unsafe`: every field read goes through [`read_f32le`], which
+//! returns [`TelemetryError::Parse`] when `off + 4 > blob.len()` (it
+//! never indexes and never panics). [`parse`] gates on the minimum blob
+//! length before reading fields.
 
 use crate::amd_smu::SmuContext;
 use crate::error::{TelemetryError, TelemetryResult};
 
-/// Byte offset of the SMU version word: the little-endian `u32` at the start
-/// of the blob (P2-03 frozen header contract).
-const VERSION_OFF: usize = 0x00;
+/// Byte offset of the VDDCR_SOC voltage (volts) — little-endian f32.
+const VDDCR_SOC_OFF: usize = 0x0B0;
 
-/// Fixed packed-region sizes in bytes: 3×u16 clocks, 3×u8 modes + 1 reserved
-/// byte, 4×u16 voltages, 8×u16 CAD codes, 27×u16 timings.
-const CLOCKS_LEN: usize = 6;
-const MODES_LEN: usize = 4;
-const VOLTAGES_LEN: usize = 8;
-const CAD_LEN: usize = 16;
-const TIMINGS_LEN: usize = 54;
+/// Byte offset of the FCLK frequency (MHz) — little-endian f32.
+const FCLK_OFF: usize = 0x0C0;
 
-/// One supported PM-table family layout (plan D2: 7.11.x / 12.x / 13.x).
+/// Byte offset of the UCLK frequency (MHz) — little-endian f32.
+const UCLK_OFF: usize = 0x0C8;
+
+/// Byte offset of the MCLK frequency (MHz) — little-endian f32.
+const MCLK_OFF: usize = 0x0CC;
+
+/// Minimum PM-table blob length in bytes: 326 × f32 (0x518).
+const MIN_LEN: usize = 0x518;
+
+/// Vermeer / Zen 3 accepted `TableVersionId`s (exact set; verified on
+/// 5950X silicon against the amkillam/ryzen_smu driver model — the live
+/// driver reports 0x380805).
+pub const VERMEER_TABLE_VERSIONS: [u32; 10] = [
+    0x2D_08_03, 0x2D_09_03, 0x38_00_05, 0x38_05_05, 0x38_06_05, 0x38_07_05,
+    0x38_08_04, 0x38_08_05, 0x38_09_04, 0x38_09_05,
+];
+
+/// Matisse / Zen 2 accepted `TableVersionId`s (shares Vermeer's f32
+/// layout).
+pub const MATISSE_TABLE_VERSIONS: [u32; 8] = [
+    0x24_00_03, 0x24_05_03, 0x24_06_03, 0x24_07_03,
+    0x24_08_02, 0x24_08_03, 0x24_09_02, 0x24_09_03,
+];
+
+/// One supported PM-table family (P5-15: exact `TableVersionId` sets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmLayout {
-    /// SMU 7.11.x — Zen 3 (e.g. Ryzen 9 5950X, the test host).
-    Smu711,
-    /// SMU 12.x — Zen 4.
-    Smu12,
-    /// SMU 13.x — Zen 5.
-    Smu13,
+    /// Vermeer / Zen 3 (e.g. Ryzen 9 5950X, the test host) — the 10
+    /// accepted `TableVersionId`s in [`VERMEER_TABLE_VERSIONS`].
+    Vermeer,
+    /// Matisse / Zen 2 — the 8 accepted `TableVersionId`s in
+    /// [`MATISSE_TABLE_VERSIONS`]; same f32 layout as Vermeer.
+    Matisse,
 }
 
 impl PmLayout {
-    /// Maps a raw SMU version word to its PM-table layout.
+    /// Maps a raw `TableVersionId` to its PM-table family.
     ///
-    /// The word encodes `major.minor.patch` as `(major << 16) | (minor << 8) |
-    /// patch` (P2-03 `extract_version`; the `ryzen_smu` driver prints the same
-    /// encoding). `7.11.x` → [`Self::Smu711`], `12.x` → [`Self::Smu12`],
-    /// `13.x` → [`Self::Smu13`]; anything else (including 7.10.x / 7.12.x and
-    /// major ≥ 14) → [`TelemetryError::UnknownPmTableVersion`].
+    /// The version is the driver's sibling `pm_table_version` value
+    /// (P2-03/P5-15), not a word inside the blob. Each accepted id maps
+    /// to its family; anything else (including the legacy 7.11.x / 12.x /
+    /// 13.x major.minor encodings the P2-04 skeleton once matched) yields
+    /// [`TelemetryError::UnknownPmTableVersion`] with the id preserved.
     pub fn from_version(version: u32) -> TelemetryResult<Self> {
-        let major = (version >> 16) & 0xFF;
-        let minor = (version >> 8) & 0xFF;
-        match major {
-            7 if minor == 11 => Ok(Self::Smu711),
-            12 => Ok(Self::Smu12),
-            13 => Ok(Self::Smu13),
-            _ => Err(TelemetryError::UnknownPmTableVersion { version }),
-        }
-    }
-
-    /// The region anchors for this layout.
-    pub fn offsets(self) -> &'static PmTableLayout {
-        match self {
-            Self::Smu711 => &SMU711,
-            Self::Smu12 => &SMU12,
-            Self::Smu13 => &SMU13,
+        if VERMEER_TABLE_VERSIONS.contains(&version) {
+            Ok(Self::Vermeer)
+        } else if MATISSE_TABLE_VERSIONS.contains(&version) {
+            Ok(Self::Matisse)
+        } else {
+            Err(TelemetryError::UnknownPmTableVersion { version })
         }
     }
 
     /// Short layout name for diagnostics.
     pub fn name(self) -> &'static str {
         match self {
-            Self::Smu711 => "Smu711",
-            Self::Smu12 => "Smu12",
-            Self::Smu13 => "Smu13",
+            Self::Vermeer => "Vermeer (Zen 3)",
+            Self::Matisse => "Matisse (Zen 2)",
         }
     }
 }
-
-/// The byte layout of one PM-table family.
-///
-/// Region anchors are offsets from the start of the blob; the regions pack
-/// back-to-back in the order `clocks → modes → voltages → cad → timings`
-/// (fixed sizes [`CLOCKS_LEN`] … [`TIMINGS_LEN`]). `end` is one past the last
-/// required byte — the minimum blob length for the layout. All fields are
-/// little-endian.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PmTableLayout {
-    /// Clock region start: `mclk_mhz, uclk_mhz, fclk_mhz` (3×u16, MHz).
-    pub clocks: usize,
-    /// Mode region start: `div_mode, gdm, pdm` (3×u8; 4th byte reserved).
-    pub modes: usize,
-    /// Voltage region start: `vddcr_soc, vddio_mem, vdd_misc, vpp` (4×u16, mV).
-    pub voltages: usize,
-    /// CAD region start: 8×u16 RZQ/driver codes ([`AmdPmCadBus`]).
-    pub cad: usize,
-    /// Timing region start: 27×u16 tick values ([`AmdPmTimings`]).
-    pub timings: usize,
-    /// One past the last required byte (minimum blob length).
-    pub end: usize,
-}
-
-/// Derives a full layout from its clock-region anchor: the remaining regions
-/// pack back-to-back at fixed sizes, so non-overlap and the `end` boundary
-/// hold by construction.
-const fn derived_layout(clocks: usize) -> PmTableLayout {
-    let modes = clocks + CLOCKS_LEN;
-    let voltages = modes + MODES_LEN;
-    let cad = voltages + VOLTAGES_LEN;
-    let timings = cad + CAD_LEN;
-    PmTableLayout {
-        clocks,
-        modes,
-        voltages,
-        cad,
-        timings,
-        end: timings + TIMINGS_LEN,
-    }
-}
-
-/// SMU 7.11.x (Zen 3) skeleton layout — shallowest region block (0x04).
-pub const SMU711: PmTableLayout = derived_layout(0x04);
-
-/// SMU 12.x (Zen 4) skeleton layout — region block at 0x10.
-pub const SMU12: PmTableLayout = derived_layout(0x10);
-
-/// SMU 13.x (Zen 5) skeleton layout — deepest region block (0x14).
-pub const SMU13: PmTableLayout = derived_layout(0x14);
 
 /// The DRAM subtimings in ticks, packed in plan order: the 19 primary
 /// (tCL … tWRRD) followed by the 8 tertiary/turnaround timings
@@ -282,14 +227,14 @@ pub struct AmdPmVoltages {
 /// A structured, version-guarded parse of the AMD SMU PM table (frozen
 /// public API, P2-04).
 ///
-/// All values are raw PM-table units (MHz, ticks, RZQ/driver codes, mV); the
-/// display mapping (code→Ω, mV→V, UCLK:MCLK ratio, sanity ranges) is P2-05's
-/// job. Built by [`parse`] from a [`SmuContext`]: every field is populated,
-/// or the call returns `Err` — never a partially populated snapshot, never a
-/// panic.
+/// In-table values are raw PM-table units (MHz, mV, derived div mode);
+/// fields the table does not carry are zeroed and degrade to honest Na /
+/// Disabled under P2-05's sanity gates. Built by [`parse`] from a
+/// [`SmuContext`]: every field is populated, or the call returns `Err` —
+/// never a partially populated snapshot, never a panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AmdPmSnapshot {
-    /// The SMU version word this snapshot was parsed from
+    /// The PM-table `TableVersionId` this snapshot was parsed from
     /// ([`SmuContext::version`]).
     pub version: u32,
     /// Memory clock (MCLK) in MHz.
@@ -321,153 +266,141 @@ fn truncated(off: usize, width: usize, len: usize) -> TelemetryError {
     }
 }
 
-/// Reads one byte from the blob at `off`.
-///
-/// Bounds-checked: returns [`TelemetryError::Parse`] when `off >= len` —
-/// never indexes, never panics.
-fn read_u8(blob: &[u8], off: usize) -> TelemetryResult<u8> {
-    match blob.get(off) {
-        Some(b) => Ok(*b),
-        None => Err(truncated(off, 1, blob.len())),
-    }
-}
-
-/// Reads one little-endian 16-bit value from the blob at `off`.
-///
-/// Bounds-checked: returns [`TelemetryError::Parse`] when `off + 2 > len` —
-/// never indexes, never panics.
-fn read_u16le(blob: &[u8], off: usize) -> TelemetryResult<u16> {
-    match blob.get(off..off.saturating_add(2)) {
-        Some(s) => Ok(u16::from_le_bytes([s[0], s[1]])),
-        None => Err(truncated(off, 2, blob.len())),
-    }
-}
-
-/// Reads one little-endian 32-bit value from the blob at `off`.
+/// Reads one little-endian IEEE-754 `f32` from the blob at `off`.
 ///
 /// Bounds-checked: returns [`TelemetryError::Parse`] when `off + 4 > len` —
 /// never indexes, never panics.
-fn read_u32le(blob: &[u8], off: usize) -> TelemetryResult<u32> {
+fn read_f32le(blob: &[u8], off: usize) -> TelemetryResult<f32> {
     match blob.get(off..off.saturating_add(4)) {
-        Some(s) => Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]])),
+        Some(s) => {
+            let b = [s[0], s[1], s[2], s[3]];
+            Ok(f32::from_bits(u32::from_le_bytes(b)))
+        }
         None => Err(truncated(off, 4, blob.len())),
     }
+}
+
+/// Converts a finite, non-negative `f32` to a saturating `u16` field
+/// value (MHz or mV).
+///
+/// Non-finite (NaN / ±inf) and negative inputs degrade to `0` — under
+/// P2-05's gates `0` renders as an honest `Disabled` / out-of-band Na.
+/// Oversized values saturate at `u16::MAX`. The `f32 -> u32` cast
+/// saturates by construction, so no path can trap or panic.
+fn to_u16(v: f32) -> u16 {
+    if !v.is_finite() || v < 0.0 {
+        return 0;
+    }
+    let rounded = v.round() as u32;
+    u16::try_from(rounded).unwrap_or(u16::MAX)
 }
 
 /// Parses the raw PM-table blob in `ctx` into a structured
 /// [`AmdPmSnapshot`] (frozen public API, P2-04).
 ///
-/// Version-guarded flow:
+/// Version-guarded flow (P5-15):
 ///
-/// 1. [`PmLayout::from_version`] maps `ctx.version` to a layout; an
-///    unrecognized version word → [`TelemetryError::UnknownPmTableVersion`].
-/// 2. The blob's own version header (the LE `u32` at [`VERSION_OFF`]) must
-///    match `ctx.version` (defends against a context/blob drift) → a
-///    mismatch is [`TelemetryError::Parse`].
-/// 3. The blob must be at least the layout's [`PmTableLayout::end`] bytes
-///    (shorter → [`TelemetryError::Parse`]); every field read is
-///    additionally bounds-checked individually, so the parse is safe even if
-///    a layout table is edited out of sync later.
+/// 1. [`PmLayout::from_version`] maps the `TableVersionId` (the sibling
+///    `pm_table_version` value, not a word inside the blob) to a family;
+///    an unrecognized id → [`TelemetryError::UnknownPmTableVersion`].
+/// 2. The blob (a headerless f32 array) must be at least [`MIN_LEN`]
+///    bytes (shorter → [`TelemetryError::Parse`]); every field read is
+///    additionally bounds-checked via [`read_f32le`], so the parse is
+///    safe even if an offset constant is edited later.
 ///
-/// Pure: no I/O, no `unsafe`, no panic on any input.
+/// Fields: FCLK / UCLK / MCLK (MHz, f32 at [`FCLK_OFF`] / [`UCLK_OFF`] /
+/// [`MCLK_OFF`], rounded to integer MHz) and VDDCR_SOC (volts, f32 at
+/// [`VDDCR_SOC_OFF`], ×1000 → mV). The divide mode is derived (`UCLK ==
+/// MCLK` → 1:1, else 1:2). GDM / PDM, the 27 timings, the 8 CAD codes,
+/// and the other three voltages are not present in this table → `0`
+/// (honest Na / Disabled under the P2-05 gates).
+///
+/// Pure: no I/O, no `unsafe`, no panic on any input (non-finite floats
+/// and negative values degrade to `0`).
 pub fn parse(ctx: &SmuContext) -> TelemetryResult<AmdPmSnapshot> {
     let layout = PmLayout::from_version(ctx.version)?;
     let pm = &ctx.pm;
-    let off = layout.offsets();
 
-    // Header integrity: the blob's version word must be the one P2-03
-    // extracted into the context.
-    let header = read_u32le(pm, VERSION_OFF)?;
-    if header != ctx.version {
+    // Minimum-length gate: the blob is a headerless f32 array — there is
+    // no version word inside it to cross-check (P5-15).
+    if pm.len() < MIN_LEN {
         return Err(TelemetryError::Parse {
             detail: format!(
-                "PM blob header version {header:#010x} does not match SmuContext version {:#010x}",
-                ctx.version
-            ),
-        });
-    }
-
-    // Minimum-length gate for the selected layout.
-    if pm.len() < off.end {
-        return Err(TelemetryError::Parse {
-            detail: format!(
-                "PM blob too short for {} layout: {} byte(s), need at least {} (0x{:x})",
+                "PM blob too short for {} layout: {} byte(s), need at least {MIN_LEN} (0x{MIN_LEN:x})",
                 layout.name(),
-                pm.len(),
-                off.end,
-                off.end
+                pm.len()
             ),
         });
     }
 
-    let mclk_mhz = read_u16le(pm, off.clocks)?;
-    let uclk_mhz = read_u16le(pm, off.clocks + 2)?;
-    let fclk_mhz = read_u16le(pm, off.clocks + 4)?;
-
-    let div_mode = read_u8(pm, off.modes)?;
-    let gdm = read_u8(pm, off.modes + 1)?;
-    let pdm = read_u8(pm, off.modes + 2)?;
-
-    let voltages = AmdPmVoltages {
-        vddcr_soc_mv: read_u16le(pm, off.voltages)?,
-        vddio_mem_mv: read_u16le(pm, off.voltages + 2)?,
-        vdd_misc_mv: read_u16le(pm, off.voltages + 4)?,
-        vpp_mv: read_u16le(pm, off.voltages + 6)?,
-    };
-
-    let cad_bus = AmdPmCadBus {
-        proc_odt: read_u16le(pm, off.cad)?,
-        rtt_nom: read_u16le(pm, off.cad + 2)?,
-        rtt_wr: read_u16le(pm, off.cad + 4)?,
-        rtt_park: read_u16le(pm, off.cad + 6)?,
-        clk_drv: read_u16le(pm, off.cad + 8)?,
-        addr_cmd_drv: read_u16le(pm, off.cad + 10)?,
-        cs_odt_drv: read_u16le(pm, off.cad + 12)?,
-        cke_drv: read_u16le(pm, off.cad + 14)?,
-    };
-
-    let t = off.timings;
-    let timings = AmdPmTimings {
-        cl: read_u16le(pm, t)?,
-        rcwdwr: read_u16le(pm, t + 2)?,
-        rcdrd: read_u16le(pm, t + 4)?,
-        rp: read_u16le(pm, t + 6)?,
-        ras: read_u16le(pm, t + 8)?,
-        rc: read_u16le(pm, t + 10)?,
-        rrds: read_u16le(pm, t + 12)?,
-        rrld: read_u16le(pm, t + 14)?,
-        faw: read_u16le(pm, t + 16)?,
-        wtrs: read_u16le(pm, t + 18)?,
-        wtrl: read_u16le(pm, t + 20)?,
-        wr: read_u16le(pm, t + 22)?,
-        rfc1: read_u16le(pm, t + 24)?,
-        rfc2: read_u16le(pm, t + 26)?,
-        rfcsb: read_u16le(pm, t + 28)?,
-        cwl: read_u16le(pm, t + 30)?,
-        rtp: read_u16le(pm, t + 32)?,
-        rdwr: read_u16le(pm, t + 34)?,
-        wrrd: read_u16le(pm, t + 36)?,
-        rdrd_sd: read_u16le(pm, t + 38)?,
-        rdrd_dd: read_u16le(pm, t + 40)?,
-        rdrd_scl: read_u16le(pm, t + 42)?,
-        rdrd_sc: read_u16le(pm, t + 44)?,
-        wrwr_sd: read_u16le(pm, t + 46)?,
-        wrwr_dd: read_u16le(pm, t + 48)?,
-        wrwr_scl: read_u16le(pm, t + 50)?,
-        wrwr_sc: read_u16le(pm, t + 52)?,
-    };
+    let vddcr_soc_v = read_f32le(pm, VDDCR_SOC_OFF)?;
+    let fclk = read_f32le(pm, FCLK_OFF)?;
+    let uclk = read_f32le(pm, UCLK_OFF)?;
+    let mclk = read_f32le(pm, MCLK_OFF)?;
 
     Ok(AmdPmSnapshot {
         version: ctx.version,
-        mclk_mhz,
-        uclk_mhz,
-        fclk_mhz,
-        div_mode,
-        gdm,
-        pdm,
-        timings,
-        cad_bus,
-        voltages,
+        mclk_mhz: to_u16(mclk),
+        uclk_mhz: to_u16(uclk),
+        fclk_mhz: to_u16(fclk),
+        // DivMode is derived, not stored: coupled (1:1) when UCLK ==
+        // MCLK, 1:2 otherwise.
+        div_mode: u8::from(uclk != mclk),
+        // GDM / PDM are not present in this table: `0` degrades to an
+        // honest "Disabled" under the P2-05 mode-flag gate.
+        gdm: 0,
+        pdm: 0,
+        // The 27 DRAM subtimings are not present in this table: `0`
+        // ticks degrade to an honest Na under the P2-05 timing gate.
+        timings: AmdPmTimings {
+            cl: 0,
+            rcwdwr: 0,
+            rcdrd: 0,
+            rp: 0,
+            ras: 0,
+            rc: 0,
+            rrds: 0,
+            rrld: 0,
+            faw: 0,
+            wtrs: 0,
+            wtrl: 0,
+            wr: 0,
+            rfc1: 0,
+            rfc2: 0,
+            rfcsb: 0,
+            cwl: 0,
+            rtp: 0,
+            rdwr: 0,
+            wrrd: 0,
+            rdrd_sd: 0,
+            rdrd_dd: 0,
+            rdrd_scl: 0,
+            rdrd_sc: 0,
+            wrwr_sd: 0,
+            wrwr_dd: 0,
+            wrwr_scl: 0,
+            wrwr_sc: 0,
+        },
+        // The 8 CAD-bus codes are not present in this table: `0`
+        // degrades to Disabled / NotApplicable under the P2-05 CAD gates.
+        cad_bus: AmdPmCadBus {
+            proc_odt: 0,
+            rtt_nom: 0,
+            rtt_wr: 0,
+            rtt_park: 0,
+            clk_drv: 0,
+            addr_cmd_drv: 0,
+            cs_odt_drv: 0,
+            cke_drv: 0,
+        },
+        voltages: AmdPmVoltages {
+            vddcr_soc_mv: to_u16(vddcr_soc_v * 1000.0),
+            // VDDIO_MEM / VDD_MISC / VPP are not present in this table:
+            // `0` mV degrades to an honest Na under the P2-05 voltage gate.
+            vddio_mem_mv: 0,
+            vdd_misc_mv: 0,
+            vpp_mv: 0,
+        },
     })
 }
 
@@ -475,300 +408,285 @@ pub fn parse(ctx: &SmuContext) -> TelemetryResult<AmdPmSnapshot> {
 mod tests {
     use super::*;
 
-    /// Representative version words for the three supported layouts.
-    const V711: u32 = 0x0007_0B02; // 7.11.2 — the test-host family
-    const V12: u32 = 0x000C_0001; // 12.0.1
-    const V13: u32 = 0x000D_0001; // 13.0.1
+    /// A representative Vermeer / Zen 3 `TableVersionId` (the live driver
+    /// on the test host reports 0x380805).
+    const V_VERMEER: u32 = 0x38_08_05;
+    /// A representative Matisse / Zen 2 `TableVersionId`.
+    const V_MATISSE: u32 = 0x24_09_03;
 
-    fn write_u16le(buf: &mut [u8], off: usize, v: u16) {
-        buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
-    }
-
-    fn write_u32le(buf: &mut [u8], off: usize, v: u32) {
+    fn write_f32le(buf: &mut [u8], off: usize, v: f32) {
         buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
     }
 
-    fn layouts() -> [(PmLayout, u32); 3] {
-        [(PmLayout::Smu711, V711), (PmLayout::Smu12, V12), (PmLayout::Smu13, V13)]
-    }
-
-    /// Builds a blob of exactly the layout's minimum length with known
-    /// values written at the same derived offsets `parse` reads.
-    fn synthetic_blob(layout: PmLayout, version: u32) -> Vec<u8> {
-        let l = *layout.offsets();
-        let mut blob = vec![0u8; l.end];
-        write_u32le(&mut blob, VERSION_OFF, version);
-        // clocks (MHz)
-        write_u16le(&mut blob, l.clocks, 1600); // mclk
-        write_u16le(&mut blob, l.clocks + 2, 1600); // uclk
-        write_u16le(&mut blob, l.clocks + 4, 1600); // fclk
-        // modes
-        blob[l.modes] = 0; // div_mode 1:1
-        blob[l.modes + 1] = 1; // gdm on
-        blob[l.modes + 2] = 0; // pdm off
-        // voltages (mV)
-        write_u16le(&mut blob, l.voltages, 1050); // VDDCR_SOC
-        write_u16le(&mut blob, l.voltages + 2, 1350); // VDDIO_MEM
-        write_u16le(&mut blob, l.voltages + 4, 1000); // VDD_MISC
-        write_u16le(&mut blob, l.voltages + 6, 1800); // VPP
-        // CAD codes
-        for (i, code) in [1u16, 2, 3, 4, 5, 6, 7, 8].into_iter().enumerate() {
-            write_u16le(&mut blob, l.cad + i * 2, code);
-        }
-        // timings (ticks): 19 primary + 8 tertiary
-        let primary: [u16; 19] = [
-            16, 16, 16, 16, 32, 48, 4, 4, 16, 8, 8, 8, 160, 160, 160, 16, 8, 8, 4,
-        ];
-        let tertiary: [u16; 8] = [100, 101, 102, 103, 104, 105, 106, 107];
-        for (i, v) in primary.iter().chain(tertiary.iter()).enumerate() {
-            write_u16le(&mut blob, l.timings + i * 2, *v);
-        }
+    /// Builds a blob of exactly [`MIN_LEN`] with the given f32 values
+    /// written at the field offsets `parse` reads.
+    fn synthetic_blob(fclk: f32, uclk: f32, mclk: f32, vddcr_soc_v: f32) -> Vec<u8> {
+        let mut blob = vec![0u8; MIN_LEN];
+        write_f32le(&mut blob, VDDCR_SOC_OFF, vddcr_soc_v);
+        write_f32le(&mut blob, FCLK_OFF, fclk);
+        write_f32le(&mut blob, UCLK_OFF, uclk);
+        write_f32le(&mut blob, MCLK_OFF, mclk);
         blob
     }
 
-    /// The snapshot every synthetic blob above must parse to (distinct
-    /// per-field values so any offset swap is caught).
-    fn known_snapshot(version: u32) -> AmdPmSnapshot {
+    /// The snapshot a synthetic blob must parse to: in-table fields
+    /// populated, every not-in-table field zeroed.
+    fn known_snapshot(
+        version: u32,
+        mclk_mhz: u16,
+        uclk_mhz: u16,
+        fclk_mhz: u16,
+        div_mode: u8,
+        vddcr_soc_mv: u16,
+    ) -> AmdPmSnapshot {
         AmdPmSnapshot {
             version,
-            mclk_mhz: 1600,
-            uclk_mhz: 1600,
-            fclk_mhz: 1600,
-            div_mode: 0,
-            gdm: 1,
+            mclk_mhz,
+            uclk_mhz,
+            fclk_mhz,
+            div_mode,
+            gdm: 0,
             pdm: 0,
             timings: AmdPmTimings {
-                cl: 16,
-                rcwdwr: 16,
-                rcdrd: 16,
-                rp: 16,
-                ras: 32,
-                rc: 48,
-                rrds: 4,
-                rrld: 4,
-                faw: 16,
-                wtrs: 8,
-                wtrl: 8,
-                wr: 8,
-                rfc1: 160,
-                rfc2: 160,
-                rfcsb: 160,
-                cwl: 16,
-                rtp: 8,
-                rdwr: 8,
-                wrrd: 4,
-                rdrd_sd: 100,
-                rdrd_dd: 101,
-                rdrd_scl: 102,
-                rdrd_sc: 103,
-                wrwr_sd: 104,
-                wrwr_dd: 105,
-                wrwr_scl: 106,
-                wrwr_sc: 107,
+                cl: 0,
+                rcwdwr: 0,
+                rcdrd: 0,
+                rp: 0,
+                ras: 0,
+                rc: 0,
+                rrds: 0,
+                rrld: 0,
+                faw: 0,
+                wtrs: 0,
+                wtrl: 0,
+                wr: 0,
+                rfc1: 0,
+                rfc2: 0,
+                rfcsb: 0,
+                cwl: 0,
+                rtp: 0,
+                rdwr: 0,
+                wrrd: 0,
+                rdrd_sd: 0,
+                rdrd_dd: 0,
+                rdrd_scl: 0,
+                rdrd_sc: 0,
+                wrwr_sd: 0,
+                wrwr_dd: 0,
+                wrwr_scl: 0,
+                wrwr_sc: 0,
             },
             cad_bus: AmdPmCadBus {
-                proc_odt: 1,
-                rtt_nom: 2,
-                rtt_wr: 3,
-                rtt_park: 4,
-                clk_drv: 5,
-                addr_cmd_drv: 6,
-                cs_odt_drv: 7,
-                cke_drv: 8,
+                proc_odt: 0,
+                rtt_nom: 0,
+                rtt_wr: 0,
+                rtt_park: 0,
+                clk_drv: 0,
+                addr_cmd_drv: 0,
+                cs_odt_drv: 0,
+                cke_drv: 0,
             },
             voltages: AmdPmVoltages {
-                vddcr_soc_mv: 1050,
-                vddio_mem_mv: 1350,
-                vdd_misc_mv: 1000,
-                vpp_mv: 1800,
+                vddcr_soc_mv,
+                vddio_mem_mv: 0,
+                vdd_misc_mv: 0,
+                vpp_mv: 0,
             },
         }
     }
 
-    /// (a) For EACH supported layout: a synthetic blob of the correct length
-    /// with known values at the plan offsets parses to exactly those values
-    /// in every field.
+    /// (a) Every accepted Vermeer `TableVersionId` maps to
+    /// [`PmLayout::Vermeer`].
     #[test]
-    fn parse_each_layout_extracts_every_field() {
-        for (layout, version) in layouts() {
-            let ctx = SmuContext {
-                version,
-                pm: synthetic_blob(layout, version),
-            };
+    fn from_version_accepts_every_vermeer_id() {
+        for v in VERMEER_TABLE_VERSIONS {
             assert_eq!(
-                parse(&ctx),
-                Ok(known_snapshot(version)),
-                "layout {layout:?} (version {version:#010x})"
+                PmLayout::from_version(v),
+                Ok(PmLayout::Vermeer),
+                "{v:#010x}"
             );
         }
     }
 
-    /// (a) A blob longer than the layout minimum (trailing data present)
-    /// still parses — the gate is a minimum length, not an exact match.
+    /// (a) Every accepted Matisse `TableVersionId` maps to
+    /// [`PmLayout::Matisse`].
     #[test]
-    fn oversized_blob_still_parses() {
-        let (layout, version) = (PmLayout::Smu711, V711);
-        let mut blob = synthetic_blob(layout, version);
-        blob.extend_from_slice(&[0u8; 16]);
-        let ctx = SmuContext { version, pm: blob };
-        assert_eq!(parse(&ctx), Ok(known_snapshot(version)));
+    fn from_version_accepts_every_matisse_id() {
+        for v in MATISSE_TABLE_VERSIONS {
+            assert_eq!(
+                PmLayout::from_version(v),
+                Ok(PmLayout::Matisse),
+                "{v:#010x}"
+            );
+        }
     }
 
-    /// (b) Truncated blobs — every length from 0 up to one byte short of the
-    /// layout minimum — yield `Err(Parse)`; no panic, no out-of-bounds read.
+    /// (c) Out-of-set version words — including the legacy 7.11.x / 12.x /
+    /// 13.x major.minor encodings the P2-04 skeleton once matched — yield
+    /// `Err(UnknownPmTableVersion { version })` with the id preserved.
+    #[test]
+    fn from_version_rejects_out_of_set_ids() {
+        for version in [
+            0x0007_0B02u32, // legacy 7.11.2 major.minor encoding
+            0x000C_0001,    // legacy 12.0.1
+            0x000D_0001,    // legacy 13.0.1
+            0x38_00_06,      // near-miss (not in the Vermeer set)
+            0x24_08_04,      // near-miss (not in the Matisse set)
+            0x0000_0000,
+            0xFFFF_FFFF,
+        ] {
+            assert_eq!(
+                PmLayout::from_version(version),
+                Err(TelemetryError::UnknownPmTableVersion { version }),
+                "{version:#010x}"
+            );
+        }
+    }
+
+    /// (d) A known Vermeer blob parses to exactly the in-table fields:
+    /// rounded MHz clocks, derived 1:1 div mode, VDDCR_SOC volts → mV, and
+    /// every not-in-table field zeroed.
+    #[test]
+    fn parse_known_vermeer_blob() {
+        let ctx = SmuContext {
+            version: V_VERMEER,
+            pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05),
+        };
+        assert_eq!(
+            parse(&ctx),
+            Ok(known_snapshot(V_VERMEER, 1800, 1800, 1800, 0, 1050))
+        );
+    }
+
+    /// (d) UCLK ≠ MCLK derives the 1:2 div mode (fractional MHz values
+    /// round to the nearest integer; volts ×1000 round to mV).
+    #[test]
+    fn parse_div_mode_derived_1to2() {
+        let ctx = SmuContext {
+            version: V_VERMEER,
+            pm: synthetic_blob(1792.8, 800.4, 1600.6, 0.95),
+        };
+        // fclk 1792.8 → 1793, uclk 800.4 → 800, mclk 1600.6 → 1601,
+        // 0.95 V → 950 mV, div mode 1:2.
+        assert_eq!(
+            parse(&ctx),
+            Ok(known_snapshot(V_VERMEER, 1601, 800, 1793, 1, 950))
+        );
+    }
+
+    /// (d) A known Matisse blob parses with the same f32 layout.
+    #[test]
+    fn parse_known_matisse_blob() {
+        let ctx = SmuContext {
+            version: V_MATISSE,
+            pm: synthetic_blob(1200.0, 1200.0, 1200.0, 0.9),
+        };
+        assert_eq!(
+            parse(&ctx),
+            Ok(known_snapshot(V_MATISSE, 1200, 1200, 1200, 0, 900))
+        );
+    }
+
+    /// (e) Non-finite floats (NaN / ±inf) at any field offset degrade to
+    /// the zero value — no panic, no poisoning of the snapshot.
+    #[test]
+    fn non_finite_fields_degrade_to_zero() {
+        let ctx = SmuContext {
+            version: V_VERMEER,
+            pm: synthetic_blob(f32::NAN, f32::INFINITY, f32::INFINITY, f32::NAN),
+        };
+        // uclk == mclk (both +inf) -> derived 1:1; everything else 0.
+        assert_eq!(parse(&ctx), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 0, 0)));
+    }
+
+    /// (e) Negative (but finite) floats degrade to the zero value.
+    #[test]
+    fn negative_fields_degrade_to_zero() {
+        let ctx = SmuContext {
+            version: V_VERMEER,
+            pm: synthetic_blob(-1.0, -2.0, -4.0, -0.5),
+        };
+        // -2.0 != -4.0 -> derived 1:2.
+        assert_eq!(parse(&ctx), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 1, 0)));
+    }
+
+    /// (b) Truncated blobs — every length from 0 up to one byte short of
+    /// [`MIN_LEN`] — yield `Err(Parse)`; no panic, no out-of-bounds read.
     #[test]
     fn truncated_blobs_yield_parse_error_not_panic() {
-        for (layout, version) in layouts() {
-            let full = synthetic_blob(layout, version);
-            let end = layout.offsets().end;
-            assert_eq!(full.len(), end);
-            for len in 0..end {
-                let ctx = SmuContext {
-                    version,
-                    pm: full[..len].to_vec(),
-                };
-                let res = parse(&ctx);
-                assert!(
-                    matches!(res, Err(TelemetryError::Parse { .. })),
-                    "layout {layout:?}: len {len} must be Err(Parse), got {res:?}"
-                );
-            }
-        }
-    }
-
-    /// (c) An unrecognized version word — including the 9.0.1 example and
-    /// near-miss 7.10.x / 7.12.x — yields `Err(UnknownPmTableVersion {
-    /// version })` with the exact word preserved.
-    #[test]
-    fn unknown_versions_yield_unknown_pm_table_version() {
-        for version in [
-            0x0009_0001u32, // 9.0.1 (brief example)
-            0x0007_0A00, // 7.10.0
-            0x0007_0C00, // 7.12.0
-            0x0000_0000,
-            0x000E_0000, // 14.0.0
-            0xFFFF_FFFF,
-        ] {
+        let full = synthetic_blob(1600.0, 1600.0, 1600.0, 1.0);
+        assert_eq!(full.len(), MIN_LEN);
+        for len in 0..MIN_LEN {
             let ctx = SmuContext {
-                version,
-                pm: vec![0u8; 256],
+                version: V_VERMEER,
+                pm: full[..len].to_vec(),
             };
-            assert_eq!(
-                parse(&ctx),
-                Err(TelemetryError::UnknownPmTableVersion { version }),
-                "version {version:#010x}"
-            );
-        }
-    }
-
-    /// (d) The version→layout mapping at its boundary versions: every
-    /// 7.11.x → Smu711, every 12.x → Smu12, every 13.x → Smu13, everything
-    /// else → `UnknownPmTableVersion`.
-    #[test]
-    fn version_to_layout_boundaries() {
-        for version in [0x0007_0B00u32, 0x0007_0B01, 0x0007_0B02, 0x0007_0B03, 0x0007_0BFF] {
-            assert_eq!(
-                PmLayout::from_version(version),
-                Ok(PmLayout::Smu711),
-                "{version:#010x}"
-            );
-        }
-        for version in [0x000C_0000u32, 0x000C_0102, 0x000C_FFFF] {
-            assert_eq!(
-                PmLayout::from_version(version),
-                Ok(PmLayout::Smu12),
-                "{version:#010x}"
-            );
-        }
-        for version in [0x000D_0000u32, 0x000D_0005, 0x000D_FFFF] {
-            assert_eq!(
-                PmLayout::from_version(version),
-                Ok(PmLayout::Smu13),
-                "{version:#010x}"
-            );
-        }
-        for version in [
-            0x0000_0000u32,
-            0x0001_0000, // 1.0.0
-            0x0007_0A00, // 7.10.0
-            0x0007_0C00, // 7.12.0
-            0x0009_0001, // 9.0.1
-            0x0011_0000, // 17.0.0
-            0xFFFF_FFFF,
-        ] {
-            assert_eq!(
-                PmLayout::from_version(version),
-                Err(TelemetryError::UnknownPmTableVersion { version }),
-                "{version:#010x}"
-            );
-        }
-    }
-
-    /// (e) `read_u8`: correct in-bounds values; `Err(Parse)` out of bounds
-    /// (off == len, off > len, empty blob).
-    #[test]
-    fn read_u8_bounds() {
-        assert_eq!(read_u8(&[0xAB], 0), Ok(0xAB));
-        assert_eq!(read_u8(&[0x01, 0x02, 0x03], 2), Ok(0x03));
-        for (blob, off) in [(&[0xABu8][..], 1usize), (&[][..], 0), (&[0xABu8, 0xCDu8][..], 5)] {
+            let res = parse(&ctx);
             assert!(
-                matches!(read_u8(blob, off), Err(TelemetryError::Parse { .. })),
-                "blob {blob:?} off {off}"
+                matches!(res, Err(TelemetryError::Parse { .. })),
+                "len {len} must be Err(Parse), got {res:?}"
             );
         }
     }
 
-    /// (e) `read_u16le`: little-endian decode in bounds; `Err(Parse)` when
-    /// off + 2 > len (including off == len).
+    /// (b) A blob longer than [`MIN_LEN`] (trailing data present) still
+    /// parses — the gate is a minimum length, not an exact match.
     #[test]
-    fn read_u16le_bounds() {
-        assert_eq!(read_u16le(&[0x34, 0x12], 0), Ok(0x1234));
-        assert_eq!(read_u16le(&[0x00, 0x34, 0x12, 0x00], 1), Ok(0x1234));
-        for (blob, off) in [
-            (&[0x34u8][..], 0usize), // 1 < 2
-            (&[0x34u8, 0x12u8][..], 1), // off == len - 1
-            (&[0x34u8, 0x12u8][..], 2), // off == len
-            (&[][..], 0),
-        ] {
-            assert!(
-                matches!(read_u16le(blob, off), Err(TelemetryError::Parse { .. })),
-                "blob {blob:?} off {off}"
-            );
-        }
-    }
-
-    /// (e) `read_u32le`: little-endian decode in bounds; `Err(Parse)` when
-    /// off + 4 > len (including off == len).
-    #[test]
-    fn read_u32le_bounds() {
-        assert_eq!(read_u32le(&[0x01, 0x02, 0x03, 0x04], 0), Ok(0x0403_0201));
-        assert_eq!(read_u32le(&[0x00, 0x01, 0x02, 0x03, 0x04, 0x00], 1), Ok(0x0403_0201));
-        for (blob, off) in [
-            (&[0x01u8, 0x02u8, 0x03u8][..], 0usize), // 3 < 4
-            (&[0x01u8, 0x02u8, 0x03u8, 0x04u8][..], 1), // off + 4 = 5 > 4
-            (&[0x01u8, 0x02u8, 0x03u8, 0x04u8][..], 4), // off == len
-            (&[][..], 0),
-        ] {
-            assert!(
-                matches!(read_u32le(blob, off), Err(TelemetryError::Parse { .. })),
-                "blob {blob:?} off {off}"
-            );
-        }
-    }
-
-    /// The blob's version header must match `SmuContext::version`; a
-    /// drifted header is `Err(Parse)` (the consistent case parses).
-    #[test]
-    fn header_version_mismatch_is_parse_error() {
-        let version = V711;
+    fn oversized_blob_still_parses() {
+        let mut blob = synthetic_blob(1600.0, 1600.0, 1600.0, 1.0);
+        blob.extend_from_slice(&[0u8; 16]);
         let ctx = SmuContext {
-            version,
-            pm: synthetic_blob(PmLayout::Smu711, version),
+            version: V_VERMEER,
+            pm: blob,
         };
-        assert_eq!(parse(&ctx), Ok(known_snapshot(version)));
+        assert_eq!(
+            parse(&ctx),
+            Ok(known_snapshot(V_VERMEER, 1600, 1600, 1600, 0, 1000))
+        );
+    }
 
-        let mut drifted = ctx.clone();
-        drifted.pm[..4].copy_from_slice(&0x0007_0B03u32.to_le_bytes());
-        assert!(matches!(parse(&drifted), Err(TelemetryError::Parse { .. })));
+    /// (e) `read_f32le`: little-endian IEEE-754 decode in bounds;
+    /// `Err(Parse)` when off + 4 > len (including off == len).
+    #[test]
+    fn read_f32le_bounds() {
+        // 1.5f32 = 0x3FC00000 -> LE bytes 00 00 C0 3F
+        assert_eq!(read_f32le(&[0x00, 0x00, 0xC0, 0x3F], 0), Ok(1.5));
+        // 2.0f32 = 0x40000000 at offset 1
+        let mut buf = [0u8; 6];
+        buf[1..5].copy_from_slice(&2.0f32.to_le_bytes());
+        assert_eq!(read_f32le(&buf, 1), Ok(2.0));
+        for (blob, off) in [
+            (&[0x00u8, 0x00u8, 0xC0u8][..], 0usize), // 3 < 4
+            (
+                &[0x00u8, 0x00u8, 0xC0u8, 0x3Fu8][..],
+                1, // off + 4 = 5 > 4
+            ),
+            (&[0x00u8, 0x00u8, 0xC0u8, 0x3Fu8][..], 4), // off == len
+            (&[][..], 0),
+        ] {
+            assert!(
+                matches!(read_f32le(blob, off), Err(TelemetryError::Parse { .. })),
+                "blob {blob:?} off {off}"
+            );
+        }
+    }
+
+    /// (e) `to_u16`: rounds finite non-negative values, saturates
+    /// oversized values at `u16::MAX`, and degrades non-finite / negative
+    /// values to `0` (never a panic).
+    #[test]
+    fn to_u16_bounds_and_graceful_degradation() {
+        assert_eq!(to_u16(1600.0), 1600);
+        assert_eq!(to_u16(949.4), 949);
+        assert_eq!(to_u16(949.6), 950);
+        assert_eq!(to_u16(0.0), 0);
+        assert_eq!(to_u16(65535.0), 65535);
+        assert_eq!(to_u16(70000.0), 65535); // saturate
+        assert_eq!(to_u16(1.0e30), 65535); // saturate, no panic
+        assert_eq!(to_u16(f32::NAN), 0);
+        assert_eq!(to_u16(f32::INFINITY), 0);
+        assert_eq!(to_u16(f32::NEG_INFINITY), 0);
+        assert_eq!(to_u16(-5.0), 0);
+        assert_eq!(to_u16(-0.0), 0);
     }
 }

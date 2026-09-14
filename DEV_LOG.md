@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE5.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [ACTIVE] ID: P5-15 | AGENT: general (Implementation) | BRANCH: branch/chunk-p5-15-pmtable | FILES: crates/ramsleuth-telemetry/src/amd_smu.rs, crates/ramsleuth-telemetry/src/amd_pm.rs
 
 @@@ CURRENT_STATE @@@
 Cycle 4 (Phase 5: Packaging + ryzen_smu uAPI/install reconciliation) COMPLETE + QA passed (328/328, clippy clean); compacted to MASTER_LOG. ryzen_smu: upstream amkillam/ryzen_smu (main), daemon reads /sys/kernel/ryzen_smu_drv/pm_table, install script stages to /usr/src + upstream dkms.conf MAKE + dkms build/install MODULE/VERSION + dkms status install-state check + monitor_cpu. Operator re-run of scripts/install-ryzen-smu-dkms.sh is the live ground-truth. Ready for Cycle 5 (AMD ground truth, Intel i5-6600 MCHBAR, model reconciliation, P1 L1/L2 refinement, MSRV decision, finalize GitHub push/tag on operator go-ahead).
