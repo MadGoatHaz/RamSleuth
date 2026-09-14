@@ -3,10 +3,10 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-PHASE5.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-- [ACTIVE] ID: P5-13 | AGENT: general (Implementation) | BRANCH: branch/chunk-p5-13-dkmsver | FILES: [scripts/install-ryzen-smu-dkms.sh, packaging/ryzen-smu-dkms/dkms.conf] | NOTE: fix dkms build/install to pass MODULE/VERSION
+(no active leases)
 
 @@@ CURRENT_STATE @@@
-Cycle 4 (Phase 5: Packaging + ryzen_smu uAPI/install reconciliation) COMPLETE + QA passed (328/328, clippy clean); compacted to MASTER_LOG. ryzen_smu: upstream amkillam/ryzen_smu (main), daemon reads /sys/kernel/ryzen_smu_drv/pm_table, install script stages to /usr/src + upstream dkms.conf MAKE + monitor_cpu. Operator re-run of scripts/install-ryzen-smu-dkms.sh is the live ground-truth. Ready for Cycle 5 (AMD ground truth, Intel i5-6600 MCHBAR, model reconciliation, P1 L1/L2 refinement, MSRV decision, finalize GitHub push/tag on operator go-ahead).
+Cycle 4 (Phase 5: Packaging + ryzen_smu uAPI/install reconciliation) COMPLETE + QA passed (328/328, clippy clean); compacted to MASTER_LOG. ryzen_smu: upstream amkillam/ryzen_smu (main), daemon reads /sys/kernel/ryzen_smu_drv/pm_table, install script stages to /usr/src + upstream dkms.conf MAKE + monitor_cpu; P5-13 makes dkms build/install pass ${MODULE}/${PKGVER} (symmetric with dkms add) and drops the deprecated CLEAN directive. P5-13 is on branch/chunk-p5-13-dkmsver awaiting review + merge. Operator re-run of scripts/install-ryzen-smu-dkms.sh is the live ground-truth. Ready for Cycle 5 (AMD ground truth, Intel i5-6600 MCHBAR, model reconciliation, P1 L1/L2 refinement, MSRV decision, finalize GitHub push/tag on operator go-ahead).
 
 ## History
 - [DONE] ID: P5-11 | STATUS: SUCCESS | BRANCH: branch/chunk-p5-11-dkms
@@ -21,3 +21,6 @@ AHEAD: Reviewer to verify DKMS-syntax + that `dkms build` now resolves the .ko i
 - [DONE] ID: P5-12-REVIEW | STATUS: SUCCESS (merged) | BRANCH: v2-development
 DECISION: Reviewed + merged P5-12 (branch deleted): valid DKMS syntax, MAKE="make TARGET=${kernelver}" matches upstream amkillam pattern (broken M=${dkms_tree}/... missing-/build line gone), @CFLGS@ hook deliberately omitted (documented), single ^PACKAGE_VERSION= line sed-aligned to $PKGVER by the script, DEST_MODULE_LOCATION /extra matches the depmod override, zero other-file changes; cargo test skipped (no source changes).
 AHEAD: ryzen_smu install path fully fixed (staging + dkms.conf); operator re-run is the ground-truth test (sudo, real kernel + headers).
+- [DONE] ID: P5-13 | STATUS: SUCCESS | BRANCH: branch/chunk-p5-13-dkmsver
+DECISION: Root-caused + fixed the ryzen_smu dkms build/install failure: L136/L141 now pass the staged ${MODULE}/${PKGVER} (symmetric with L131 dkms add) instead of the bare ${MODULE}, since DKMS 3.4.3 does not resolve a bare name to the single registered version (do_build fell into add_module with an empty version and died on the hardcoded Usage: add message); also dropped the deprecated CLEAN directive from dkms.conf and adjusted its two comment references.
+AHEAD: Reviewer to merge into v2-development; the operator re-run of scripts/install-ryzen-smu-dkms.sh is the ground truth - current DKMS state is added plus an empty build dir, so a fixed re-run hits the already-registered-continuing path and proceeds to a real build; no dkms remove is needed to recover.
