@@ -23,16 +23,27 @@
 //!    [`TelemetryError::InsufficientPrivilege`]. Any other I/O error →
 //!    [`TelemetryError::Io`].
 //! 3. **Fallback — char device:** open `/dev/ryzen_smu` read-only and fetch
-//!    the PM table through the driver's `read(2)` interface. The
-//!    `ryzen_smu` uAPI (53XU/ryzen_smu) exposes the table via `read()`; the
-//!    device's only ioctl, `RSMU_IOC_GET_VERSION`
-//!    (`_IOR('R', 0x01, u32)`), reports the PMFW version. Missing device
-//!    node → [`TelemetryError::DriverMissing`]; permission error →
-//!    [`TelemetryError::InsufficientPrivilege`].
-//! 4. **Version extraction:** the SMU version word is the first four bytes
-//!    of the blob, little-endian ([`extract_version`]); a shorter blob is
-//!    [`TelemetryError::Parse`]. The `nix` `ioctl` feature is enabled per
-//!    plan D6 for the companion version ioctl.
+//!    the PM table through the driver's `read(2)` interface (the 53XU/
+//!    ryzen_smu uAPI). The installed amkillam/ryzen_smu build registers
+//!    **only the sysfs kobject** — no `/dev/ryzen_smu` node — so this path
+//!    is dead on that module and is kept purely as 53XU-fork tolerance:
+//!    missing device node → [`TelemetryError::DriverMissing`], permission
+//!    error → [`TelemetryError::InsufficientPrivilege`].
+//! 4. **Version sourcing (P5-15 reconciliation):** the SMU version is the
+//!    PM table's `TableVersionId` — the little-endian `u32` the driver
+//!    publishes in the sibling sysfs attribute
+//!    `/sys/kernel/ryzen_smu_drv/pm_table_version`
+//!    ([`SYSFS_PM_VERSION_CANDIDATES`]). The `pm_table` blob itself is a
+//!    **headerless** array of little-endian `f32` values (byte offset =
+//!    index × 4) and carries **no** version word. The sibling
+//!    `pm_table_size` attribute (8-byte LE `u64`,
+//!    [`SYSFS_PM_SIZE_CANDIDATES`]) cross-checks the blob length when
+//!    present; a disagreement is [`TelemetryError::Parse`]. When the
+//!    version attribute is **absent** (older module builds, or the char
+//!    device fallback), the version degrades to the legacy
+//!    first-word-of-blob extraction ([`extract_version`]) so the outcome
+//!    stays structured (`UnknownPmTableVersion` downstream) — never a hard
+//!    error and never a panic.
 //!
 //! # Safety
 //!
@@ -64,7 +75,31 @@ const SYSFS_PM_TABLE_CANDIDATES: [&str; 2] = [
     "/sys/kernel/ryzen_smu/pm_table",
 ];
 
+/// Sibling sysfs attributes carrying the PM table's `TableVersionId`
+/// (little-endian `u32`), tried in order (P5-15).
+///
+/// The `pm_table` blob is a headerless f32 array with no version word of
+/// its own; on module builds that publish it, the version lives in this
+/// sibling attribute.
+const SYSFS_PM_VERSION_CANDIDATES: [&str; 2] = [
+    "/sys/kernel/ryzen_smu_drv/pm_table_version",
+    "/sys/kernel/ryzen_smu/pm_table_version",
+];
+
+/// Sibling sysfs attributes carrying the PM table size (little-endian
+/// `u64`), tried in order (P5-15).
+///
+/// When present, the reported size must equal the blob length; a
+/// disagreement is a malformed payload ([`TelemetryError::Parse`]).
+const SYSFS_PM_SIZE_CANDIDATES: [&str; 2] = [
+    "/sys/kernel/ryzen_smu_drv/pm_table_size",
+    "/sys/kernel/ryzen_smu/pm_table_size",
+];
+
 /// `ryzen_smu` character device (fallback acquisition path).
+///
+/// Dead on the installed amkillam/ryzen_smu build (which registers only
+/// the sysfs kobject); kept as 53XU-fork tolerance.
 const DEV_NODE: &str = "/dev/ryzen_smu";
 
 /// Driver name carried by [`TelemetryError::DriverMissing`].
@@ -83,15 +118,20 @@ const MAX_PM_TABLE_SIZE: usize = 256 * 1024;
 
 /// Raw SMU acquisition result (frozen public API, P2-03).
 ///
-/// - `version`: the SMU/PMFW version word — the first four bytes of `pm`,
-///   little-endian (see [`extract_version`]).
+/// - `version`: the PM table's `TableVersionId` — the little-endian `u32`
+///   from the driver's sibling `pm_table_version` sysfs attribute
+///   (P5-15). The `pm_table` blob itself is a headerless f32 array and
+///   carries no version word; on module builds without that attribute
+///   (or via the char device fallback) it degrades to the legacy first
+///   four bytes of `pm` ([`extract_version`]).
 /// - `pm`: the full raw PM-table blob, preserved verbatim for P2-04's
 ///   version-guarded parse.
 #[derive(Debug, Clone)]
 pub struct SmuContext {
-    /// SMU/PMFW version word (first 4 bytes of the blob, little-endian).
+    /// PM-table `TableVersionId` (sibling `pm_table_version` attribute, or
+    /// the legacy first word of `pm` as fallback).
     pub version: u32,
-    /// Raw PM-table blob from the `ryzen_smu` driver.
+    /// Raw PM-table blob from the `ryzen_smu` driver (headerless f32 array).
     pub pm: Vec<u8>,
 }
 
@@ -108,8 +148,10 @@ pub struct SmuContext {
 ///   char device exists (module not loaded).
 /// - [`TelemetryError::InsufficientPrivilege`] — the interface exists but
 ///   is not readable without elevation.
-/// - [`TelemetryError::Parse`] — the blob is empty or too short to carry
-///   the version header.
+/// - [`TelemetryError::Parse`] — the sibling `pm_table_version` attribute is
+///   truncated, the blob is empty or too short for the legacy version
+///   fallback, or the sibling `pm_table_size` disagrees with the blob
+///   length.
 /// - [`TelemetryError::Io`] — any other raw I/O failure.
 pub fn acquire() -> TelemetryResult<SmuContext> {
     // 1. Vendor gate: pure, so non-AMD hardware is rejected before any
@@ -159,10 +201,15 @@ fn vendor_string(info: &CpuInfo) -> String {
     }
 }
 
-/// Extract the SMU version word from a raw PM-table blob.
+/// Extract the SMU version word from a raw PM-table blob (legacy fallback).
 ///
-/// Frozen contract (P2-03): the version is the first four bytes of the
-/// blob, little-endian. A blob shorter than four bytes is malformed.
+/// P5-15 reconciliation: the current `ryzen_smu` model carries the
+/// `TableVersionId` in the sibling `pm_table_version` sysfs attribute, not
+/// in the blob (a headerless f32 array). This extraction — the first four
+/// bytes, little-endian — is retained as the fallback for older module
+/// builds that publish no sibling attribute, and for blobs acquired via
+/// the char device; an unrecognized word degrades downstream to
+/// `UnknownPmTableVersion`.
 ///
 /// # Errors
 ///
@@ -176,6 +223,79 @@ pub fn extract_version(blob: &[u8]) -> TelemetryResult<u32> {
                 blob.len()
             ),
         }),
+    }
+}
+
+/// Parse the PM table's `TableVersionId` from the sibling
+/// `pm_table_version` attribute payload: the first four bytes,
+/// little-endian.
+///
+/// Trailing bytes (e.g. a newline on some builds) are ignored.
+///
+/// # Errors
+///
+/// [`TelemetryError::Parse`] when fewer than four bytes are present.
+pub fn parse_version_word(bytes: &[u8]) -> TelemetryResult<u32> {
+    match bytes.get(..4) {
+        Some(h) => Ok(u32::from_le_bytes([h[0], h[1], h[2], h[3]])),
+        None => Err(TelemetryError::Parse {
+            detail: format!(
+                "pm_table_version attribute too short: {} byte(s), need 4",
+                bytes.len()
+            ),
+        }),
+    }
+}
+
+/// Parse the PM table size from the sibling `pm_table_size` attribute
+/// payload: the first eight bytes, little-endian `u64`.
+///
+/// Trailing bytes are ignored.
+///
+/// # Errors
+///
+/// [`TelemetryError::Parse`] when fewer than eight bytes are present.
+pub fn parse_table_size(bytes: &[u8]) -> TelemetryResult<u64> {
+    match bytes.get(..8) {
+        Some(h) => {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(h);
+            Ok(u64::from_le_bytes(b))
+        }
+        None => Err(TelemetryError::Parse {
+            detail: format!(
+                "pm_table_size attribute too short: {} byte(s), need 8",
+                bytes.len()
+            ),
+        }),
+    }
+}
+
+/// Cross-check the sibling `pm_table_size` value against the blob length.
+///
+/// # Errors
+///
+/// [`TelemetryError::Parse`] when the two disagree.
+pub fn check_size_matches(expected: u64, actual: usize) -> TelemetryResult<()> {
+    if expected != actual as u64 {
+        return Err(TelemetryError::Parse {
+            detail: format!(
+                "pm_table_size attribute reports {expected} byte(s) but the blob is {actual} byte(s)"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Source the PM table's version word: the sibling `pm_table_version`
+/// attribute payload when present (P5-15), else the legacy first word of
+/// the blob.
+///
+/// Pure: no I/O, no panic.
+pub fn version_from_sources(blob: &[u8], version_attr: Option<&[u8]>) -> TelemetryResult<u32> {
+    match version_attr {
+        Some(bytes) => parse_version_word(bytes),
+        None => extract_version(blob),
     }
 }
 
@@ -214,7 +334,7 @@ fn acquire_linux() -> TelemetryResult<SmuContext> {
     for &path in SYSFS_PM_TABLE_CANDIDATES.iter() {
         match std::fs::read(path) {
             Ok(blob) => {
-                found = Some(blob_to_context(blob));
+                found = Some(context_from_blob(blob));
                 break;
             }
             Err(e) => match classify_io_error(&e) {
@@ -234,8 +354,13 @@ fn acquire_linux() -> TelemetryResult<SmuContext> {
     }
 }
 
-/// Fallback path: open the `ryzen_smu` char device read-only and fetch the
-/// PM table through the driver's `read(2)` interface.
+/// Fallback path: open the `ryzen_smu` char device read-only and fetch
+/// the PM table through the driver's `read(2)` interface.
+///
+/// The installed amkillam/ryzen_smu build registers only the sysfs
+/// kobject (no `/dev/ryzen_smu` node), so this path is **dead on that
+/// module** and is kept purely as 53XU-fork tolerance: an absent node
+/// degrades to [`TelemetryError::DriverMissing`].
 #[cfg(target_os = "linux")]
 fn chardev_acquire() -> TelemetryResult<SmuContext> {
     use nix::fcntl::OFlag;
@@ -244,7 +369,7 @@ fn chardev_acquire() -> TelemetryResult<SmuContext> {
     let fd = nix::fcntl::open(DEV_NODE, OFlag::O_RDONLY, Mode::empty()).map_err(nix_err)?;
     let _guard = FdGuard(fd);
     let blob = read_pm_table(fd)?;
-    blob_to_context(blob)
+    context_from_blob(blob)
 }
 
 /// Read the full PM table from the char device, looping until EOF.
@@ -279,12 +404,44 @@ fn read_pm_table(fd: std::os::unix::io::RawFd) -> TelemetryResult<Vec<u8>> {
     Ok(blob)
 }
 
-/// Convert a fetched PM-table blob into a [`SmuContext`], extracting the
-/// version word from the blob header.
+/// Build a [`SmuContext`] from a fetched PM-table blob (P5-15 model).
+///
+/// Version sourcing: the sibling `pm_table_version` attribute (first
+/// candidate that exists) decodes the `TableVersionId`; when no candidate
+/// exists (older module builds, or the char device) the version degrades
+/// to the legacy first word of the blob. The sibling `pm_table_size`
+/// attribute must equal the blob length when present; a disagreement is
+/// [`TelemetryError::Parse`] (never a panic).
 #[cfg(target_os = "linux")]
-fn blob_to_context(blob: Vec<u8>) -> TelemetryResult<SmuContext> {
-    let version = extract_version(&blob)?;
+fn context_from_blob(blob: Vec<u8>) -> TelemetryResult<SmuContext> {
+    let version_attr = read_sibling(&SYSFS_PM_VERSION_CANDIDATES)?;
+    let version = version_from_sources(&blob, version_attr.as_deref())?;
+    if let Some(size_attr) = read_sibling(&SYSFS_PM_SIZE_CANDIDATES)? {
+        let expected = parse_table_size(&size_attr)?;
+        check_size_matches(expected, blob.len())?;
+    }
     Ok(SmuContext { version, pm: blob })
+}
+
+/// Read the first existing sibling sysfs attribute in `candidates`.
+///
+/// NotFound on a candidate skips to the next one (older module builds
+/// omit the sibling attributes); PermissionDenied on an existing file is
+/// reported as [`TelemetryError::InsufficientPrivilege`]; any other I/O
+/// error as [`TelemetryError::Io`]. Returns `None` when no candidate
+/// exists.
+#[cfg(target_os = "linux")]
+fn read_sibling(candidates: &[&str]) -> TelemetryResult<Option<Vec<u8>>> {
+    for &path in candidates {
+        match std::fs::read(path) {
+            Ok(bytes) => return Ok(Some(bytes)),
+            Err(e) => match classify_io_error(&e) {
+                TelemetryError::DriverMissing { .. } => continue,
+                other => return Err(other),
+            },
+        }
+    }
+    Ok(None)
 }
 
 /// Turn a `nix` syscall error into a structured [`TelemetryError`] via
@@ -313,15 +470,17 @@ mod tests {
     use super::*;
     use crate::cpuid::{AmdZen, IntelGen};
 
-    /// (a) The version word is the first four bytes, little-endian.
+    /// (a, legacy fallback) The version word is the first four bytes,
+    /// little-endian — the fallback for builds without the sibling
+    /// `pm_table_version` attribute.
     #[test]
     fn extract_version_le_header() {
         let blob = [0x01, 0x0B, 0x07, 0x00, 0, 0, 0, 0];
         assert_eq!(extract_version(&blob), Ok(0x0007_0B01));
     }
 
-    /// (a) A blob shorter than four bytes is a `Parse` error (never a
-    /// panic, never an out-of-bounds read).
+    /// (a, legacy fallback) A blob shorter than four bytes is a `Parse`
+    /// error (never a panic, never an out-of-bounds read).
     #[test]
     fn extract_version_short_blob_is_parse_error() {
         for blob in [&[] as &[u8], &[0x11], &[0x11, 0x22], &[0x11, 0x22, 0x33]] {
@@ -330,6 +489,90 @@ mod tests {
                 "expected Parse error for {blob:?}"
             );
         }
+    }
+
+    /// (a, P5-15) The sibling `pm_table_version` attribute decodes to the
+    /// `TableVersionId` from its first four bytes, little-endian; trailing
+    /// bytes (e.g. a newline) are ignored.
+    #[test]
+    fn parse_version_word_le() {
+        assert_eq!(parse_version_word(&[0x05, 0x08, 0x38, 0x00]), Ok(0x0038_0805));
+        assert_eq!(
+            parse_version_word(&[0x03, 0x08, 0x2D, 0x00, 0x0A]),
+            Ok(0x002D_0803)
+        );
+    }
+
+    /// (a, P5-15) A `pm_table_version` payload shorter than four bytes is
+    /// a `Parse` error (never a panic).
+    #[test]
+    fn parse_version_word_short_is_parse_error() {
+        for bytes in [&[] as &[u8], &[0x11], &[0x11, 0x22], &[0x11, 0x22, 0x33]] {
+            assert!(
+                matches!(parse_version_word(bytes), Err(TelemetryError::Parse { .. })),
+                "expected Parse error for {bytes:?}"
+            );
+        }
+    }
+
+    /// (a, P5-15) The sibling `pm_table_size` attribute decodes to the
+    /// table size from its first eight bytes, little-endian; trailing
+    /// bytes are ignored.
+    #[test]
+    fn parse_table_size_le() {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&2288u64.to_le_bytes());
+        assert_eq!(parse_table_size(&b), Ok(2288));
+
+        let mut b2 = vec![0u8; 9];
+        b2[..8].copy_from_slice(&2288u64.to_le_bytes());
+        b2[8] = 0x0A;
+        assert_eq!(parse_table_size(&b2), Ok(2288));
+    }
+
+    /// (a, P5-15) A `pm_table_size` payload shorter than eight bytes is a
+    /// `Parse` error (never a panic).
+    #[test]
+    fn parse_table_size_short_is_parse_error() {
+        for bytes in [&[] as &[u8], &[1u8, 2, 3, 4, 5, 6, 7]] {
+            assert!(
+                matches!(parse_table_size(bytes), Err(TelemetryError::Parse { .. })),
+                "expected Parse error for {bytes:?}"
+            );
+        }
+    }
+
+    /// (a, P5-15) The size cross-check passes on agreement and yields
+    /// `Parse` on disagreement (never a panic).
+    #[test]
+    fn size_cross_check() {
+        assert_eq!(check_size_matches(2288, 2288), Ok(()));
+        assert!(matches!(
+            check_size_matches(2288, 2287),
+            Err(TelemetryError::Parse { .. })
+        ));
+        assert!(matches!(
+            check_size_matches(0, 1),
+            Err(TelemetryError::Parse { .. })
+        ));
+    }
+
+    /// (a, P5-15) Version sourcing prefers the sibling attribute when
+    /// present (decoding it, ignoring the blob's first word) and falls
+    /// back to the blob's first word when the attribute is absent; a
+    /// truncated attribute payload is `Parse` (never a panic).
+    #[test]
+    fn version_sourcing_sibling_preferred_then_fallback() {
+        let blob = [0x01, 0x0B, 0x07, 0x00, 0, 0, 0, 0];
+        assert_eq!(
+            version_from_sources(&blob, Some(&[0x05, 0x08, 0x38, 0x00])),
+            Ok(0x0038_0805)
+        );
+        assert_eq!(version_from_sources(&blob, None), Ok(0x0007_0B01));
+        assert!(matches!(
+            version_from_sources(&blob, Some(&[0x05, 0x08])),
+            Err(TelemetryError::Parse { .. })
+        ));
     }
 
     /// (b) Error classification by kind: NotFound -> DriverMissing,
@@ -422,9 +665,10 @@ mod tests {
         );
     }
 
-    /// (e) The sysfs candidate list pins the verified upstream kobject
+    /// (e) The sysfs candidate lists pin the verified upstream kobject
     /// (`ryzen_smu_drv`, amkillam/ryzen_smu `drv.c`) before the legacy
-    /// directory name, so the correct path is always tried first.
+    /// directory name — for the blob and both sibling attributes — so the
+    /// correct paths are always tried first.
     #[test]
     fn sysfs_candidates_try_verified_path_first() {
         assert_eq!(
@@ -432,6 +676,20 @@ mod tests {
             [
                 "/sys/kernel/ryzen_smu_drv/pm_table",
                 "/sys/kernel/ryzen_smu/pm_table"
+            ]
+        );
+        assert_eq!(
+            SYSFS_PM_VERSION_CANDIDATES,
+            [
+                "/sys/kernel/ryzen_smu_drv/pm_table_version",
+                "/sys/kernel/ryzen_smu/pm_table_version"
+            ]
+        );
+        assert_eq!(
+            SYSFS_PM_SIZE_CANDIDATES,
+            [
+                "/sys/kernel/ryzen_smu_drv/pm_table_size",
+                "/sys/kernel/ryzen_smu/pm_table_size"
             ]
         );
     }
