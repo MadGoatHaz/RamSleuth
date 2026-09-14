@@ -1,12 +1,12 @@
 # RamSleuth v2 — Developer Log / Lease Board
 
-Base branch: `v2-development`. Plan: `plans/PLAN-PHASE5.md` (Phase 1 retained as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
+Base branch: `v2-development`. Plan: `plans/PLAN-PHASE6.md` (Phase 5 retained as `plans/PLAN-PHASE5.md`; Phase 1 as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
 (no active leases)
 
 @@@ CURRENT_STATE @@@
-Cycle 4 (Phase 5: Packaging + ryzen_smu install + AMD PM-table model reconciliation) COMPLETE + QA passed (337/337, clippy clean); compacted to MASTER_LOG. ryzen_smu: amkillam/ryzen_smu installed + loaded; daemon reads /sys/kernel/ryzen_smu_drv/pm_table + sibling pm_table_version (TableVersionId, Vermeer set incl. 0x380805) + f32 offsets (FCLK/UCLK/MCLK/VDDCR_SOC). AMD live subtimings now decode (clocks + VDDCR_SOC); CAD/timings honest Na (SMN path = follow-up). Ready for Cycle 5 (AMD ground-truth cross-check vs monitor_cpu, Intel i5-6600 MCHBAR, model reconciliation of remaining fields, P1 L1/L2 refinement, MSRV decision, finalize GitHub push/tag on operator go-ahead).
+Cycle 5 (Phase 6: Live-Hardware Verification & Remaining Reconciliation) PLANNED — 8 chunks P6-01..P6-08; pipeline starting at P6-01
 
 ## History
 - [DONE] ID: P5-15 | STATUS: SUCCESS | BRANCH: branch/chunk-p5-15-pmtable
