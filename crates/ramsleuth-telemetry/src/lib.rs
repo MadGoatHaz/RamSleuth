@@ -17,6 +17,7 @@ pub mod error; // P2-02 — Telemetry error + Section<T> no-panic contract (inte
 pub mod amd_smu; // P2-03 — privilege-guarded AMD SMU access (sysfs pm_table -> char-dev read).
 pub mod amd_pm; // P2-04 — version-guarded, bounds-checked AMD PM-table parse (AmdPmSnapshot).
 pub mod amd_readout; // P2-05 — shared display types + AMD mapping (sanity-gated, no I/O).
+pub mod amd_smn; // P6-02 — ryzen_smu `smn` sysfs accessor + verified SMN bitfield table + no-panic overlay.
 pub mod intel_mchbar; // P2-06 — Intel MCHBAR PCI decode + read-only /dev/mem mmap guard.
 pub mod intel_readout; // P2-07 — Intel per-channel IMC register decode -> shared display types.
 pub mod spd_eeprom; // P2-08 — ee1004 raw SPD image acquisition (sysfs, unprivileged).
