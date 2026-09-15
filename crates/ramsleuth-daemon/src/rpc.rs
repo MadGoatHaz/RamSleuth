@@ -315,13 +315,15 @@ mod tests {
     use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::SystemMemoryTelemetry;
+    use ramsleuth_telemetry::SystemPlatform;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
-    /// All-`Na` mock snapshot built via the telemetry crate's public
-    /// API (host-independent — the real `collect()` is never
-    /// exercised in these tests).
+    /// Mock snapshot built via the telemetry crate's public API
+    /// (host-independent — the real `collect()` is never exercised in
+    /// these tests): vendor branches all-`Na` + empty SPD,
+    /// representative platform / capacity values (C6-13/14).
     fn mock_snapshot() -> SystemMemoryTelemetry {
         SystemMemoryTelemetry {
             cpu: CpuInfo {
@@ -331,6 +333,14 @@ mod tests {
             amd: Section::na(NaReason::NotApplicable),
             intel: Section::na(NaReason::NotApplicable),
             spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3500.0),
+                motherboard: Section::Value("Test Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(32.0),
+            dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
         }
     }
 
