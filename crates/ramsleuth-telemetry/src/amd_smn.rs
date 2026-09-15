@@ -64,9 +64,13 @@
 //!
 //! The driver's `smn_result` is a single shared global: a concurrent
 //! `monitor_cpu` run can race this daemon's 2 s collection, and on a failed
-//! SMU read the driver leaves `smn_result` stale. Stale/corrupt words
-//! degrade per field through the P2-05 sanity gates, and the ground-truth
-//! cross-check samples the two tools **sequentially, never concurrently**.
+//! SMU read the driver leaves the `0xFFFF_FFFF` failed-read sentinel in
+//! `smn_result` — the userspace `read(2)` still "succeeds", so a sentinel
+//! arrives as `Ok` data. The overlay treats that word as a failed read
+//! (per-register containment: its fields decode to `0`, never as data —
+//! P6-10); any other stale/corrupt word degrades per field through the
+//! P2-05 sanity gates. The ground-truth cross-check samples the two tools
+//! **sequentially, never concurrently**.
 //!
 //! # No-panic contract
 //!
@@ -153,6 +157,11 @@ const SMN_HIGH_BASE: u32 = 0x100000;
 /// while differing from the `0x50264` mirror — switches the tRFC fields to
 /// the mirror word.
 const SMN_RFC_SENTINEL: u32 = 0x2106_0138;
+/// Driver failed-read sentinel: when the SMU/PCI read fails, `ryzen_smu`
+/// leaves `0xFFFF_FFFF` in the shared `smn_result` and the userspace
+/// `read(2)` still "succeeds" — the overlay treats that word as a failed
+/// read (per-register containment), never as data (P6-10).
+const SMN_READ_FAILURE_SENTINEL: u32 = 0xFFFF_FFFF;
 
 // ---------------------------------------------------------------------------
 // Pure decoders (fixture-testable without I/O; the `intel_readout::decode_*`
@@ -326,12 +335,19 @@ pub struct SmnFields {
 }
 
 /// The raw word for `addr` in a register list: the **first** occurrence's
-/// value, or `0` when the address is absent or its word is `None` (no
-/// panic, no garbage). Unknown addresses are ignored.
+/// value, or `0` when the address is absent, its word is `None`, or its
+/// word is the driver's `0xFFFF_FFFF` failed-read sentinel (no panic, no
+/// garbage — the sentinel never decodes as data, P6-10). Unknown
+/// addresses are ignored.
 fn word_at(regs: &[(u32, Option<u32>)], addr: u32) -> u32 {
     regs.iter()
         .find(|(a, _)| *a == addr)
-        .map(|(_, w)| w.unwrap_or(0))
+        .and_then(|(_, word)| {
+            word
+                .as_ref()
+                .filter(|w| **w != SMN_READ_FAILURE_SENTINEL)
+                .copied()
+        })
         .unwrap_or(0)
 }
 
@@ -339,9 +355,11 @@ fn word_at(regs: &[(u32, Option<u32>)], addr: u32) -> u32 {
 /// panic on any input).
 ///
 /// `regs` is the register set as `(address, word)` pairs; a failed read is
-/// `None` (its fields decode to `0` → honest `Na` / `Disabled` downstream).
-/// The `0x50264` mirror/sentinel rule applies to the tRFC fields (module
-/// docs); every field is bounded by the reference's mask width.
+/// `None`, and the driver's `0xFFFF_FFFF` failed-read sentinel is treated
+/// the same (both decode to `0` → honest `Na` / `Disabled` downstream —
+/// the sentinel never decodes as data, P6-10). The `0x50264`
+/// mirror/sentinel rule applies to the tRFC fields (module docs); every
+/// field is bounded by the reference's mask width.
 pub fn decode_smn(regs: &[(u32, Option<u32>)]) -> SmnFields {
     // tRFC mirror rule (reference lines 275–277): sentinel word in
     // `0x50260` that differs from the `0x50264` mirror -> use the mirror.
@@ -397,6 +415,12 @@ pub fn decode_smn(regs: &[(u32, Option<u32>)]) -> SmnFields {
 /// write the 4-byte LE address → `lseek(0)` → read the 4-byte LE
 /// `smn_result` (exactly `libsmu` `smu_read_smn_addr`). Only the address
 /// word is ever written — never a register value.
+///
+/// The protocol returns the raw `smn_result` verbatim: on a failed SMU
+/// read the driver leaves the `0xFFFF_FFFF` failed-read sentinel there and
+/// the `read(2)` still succeeds, so a failed read may arrive as
+/// `Ok(0xFFFF_FFFF)`. The overlay normalizes that word to a failed read
+/// (module docs, P6-10) — do not decode it as data.
 ///
 /// # Errors
 ///
@@ -566,6 +590,14 @@ pub fn apply_smn(snap: &mut AmdPmSnapshot) {
     apply_smn_with(read_smn_register, snap);
 }
 
+/// Collapse one register read to its overlay word: any error and the
+/// driver's `0xFFFF_FFFF` failed-read sentinel become `None` (per-register
+/// containment — the word's fields decode to `0`, never as data, P6-10);
+/// every other word is data.
+fn read_word(res: TelemetryResult<u32>) -> Option<u32> {
+    res.ok().filter(|w| *w != SMN_READ_FAILURE_SENTINEL)
+}
+
 /// The overlay core with an **injectable register reader** (the hermetic
 /// test seam: tests feed synthetic words or synthetic errors; production
 /// injects [`read_smn_register`]). No vendor gate here — that belongs to
@@ -575,8 +607,12 @@ pub fn apply_smn(snap: &mut AmdPmSnapshot) {
 /// Register flow (module docs): probe `0x50200` (offset rule) → read the
 /// remaining 12 at the resolved base → [`decode_smn`] → write `gdm` +
 /// `timings` only. `DriverMissing` on the probe is a whole-overlay no-op;
-/// any other probe failure degrades to per-register containment (a failed
-/// read contributes `None` → its fields decode to `0`).
+/// any other probe failure — including the driver's `0xFFFF_FFFF`
+/// failed-read sentinel (P6-10) — degrades to per-register containment (a
+/// failed read contributes `None` → its fields decode to `0`). The offset
+/// rule is decided by the first read only (monitor_cpu semantics): a
+/// sentinel on the relocated re-read keeps the relocated base with no
+/// set-point.
 fn apply_smn_with<R: FnMut(u32) -> TelemetryResult<u32>>(
     mut reader: R,
     snap: &mut AmdPmSnapshot,
@@ -586,8 +622,15 @@ fn apply_smn_with<R: FnMut(u32) -> TelemetryResult<u32>>(
         // the UMC block; the set-point word is re-read at the relocated
         // address and the rest follow the same base.
         Ok(word) if word == SMN_HIGH_BASE_MARKER => {
-            (reader(SMN_MCLK + SMN_HIGH_BASE).ok(), SMN_HIGH_BASE)
+            // The re-read's error / sentinel collapses to `None` (no
+            // set-point); the relocated base stays — the offset decision
+            // is the first read's (monitor_cpu semantics, P6-10).
+            (read_word(reader(SMN_MCLK + SMN_HIGH_BASE)), SMN_HIGH_BASE)
         }
+        // Driver failed-read sentinel (P6-10): a failed probe read — no
+        // set-point, no relocation; the 12-register loop still runs at
+        // the bare base addresses.
+        Ok(word) if word == SMN_READ_FAILURE_SENTINEL => (None, 0),
         Ok(word) => (Some(word), 0),
         // No `smn` attribute at all (older module builds): no-op — the
         // snapshot keeps exactly what the PM table provided.
@@ -601,14 +644,19 @@ fn apply_smn_with<R: FnMut(u32) -> TelemetryResult<u32>>(
     let mut regs: Vec<(u32, Option<u32>)> = Vec::with_capacity(SMN_REGISTER_SET.len());
     regs.push((SMN_MCLK, setpoint));
     for &addr in SMN_REGISTER_SET.iter().skip(1) {
-        regs.push((addr, reader(addr + base).ok()));
+        // A failed read or the driver's `0xFFFF_FFFF` sentinel is `None`
+        // (per-register containment — its fields decode to `0`, P6-10).
+        regs.push((addr, read_word(reader(addr + base))));
     }
 
     let fields = decode_smn(&regs);
-    // Only the zeroed SMN fields are written. `pdm` and the 8 `cad_bus`
-    // codes are deliberately untouched: their bitfields are unconfirmed
-    // (plan D3 confirm-or-Na) and they render as honest `Disabled` / `Na`
-    // under the P2-05 gates.
+    // Only the SMN fields are written. `pdm` and the 8 `cad_bus` codes
+    // are deliberately untouched: their bitfields are unconfirmed (plan
+    // D3 confirm-or-Na) and they render as honest `Disabled` / `Na` under
+    // the P2-05 gates. A failed-read word (`None` or the sentinel) decodes
+    // to `0` — exactly the PM-table parse value for `gdm` / `timings`
+    // (P2-04 zeroes them), so the write preserves the parse output: on a
+    // sentinel probe the snapshot's `gdm` keeps the parse value (P6-10).
     snap.gdm = fields.gdm;
     snap.timings = fields.timings;
 }
@@ -743,12 +791,45 @@ mod tests {
         assert_eq!(trfc4(0x7E08_20A0), 504);
     }
 
-    /// (b) All-ones words pin every mask width: no field can decode above
-    /// the reference's max (and the not-stored extractors are pinned too).
+    /// The per-register max word: exactly that register's field bits set
+    /// (all other bits 0) — the mask-width pin for every extractor.
+    fn max_mask_word(addr: u32) -> u32 {
+        match addr {
+            // 0x50200: set-point 6:0, command rate 10, GDM 11.
+            SMN_MCLK => 0x0000_007F | 0x0000_0400 | 0x0000_0800,
+            // 0x50204: tCL 5:0, tRAS 14:8, tRCDRD 20:16, tRCDWR 28:24.
+            SMN_CMD0 => 0x0000_003F | (0x7F << 8) | (0x3F << 16) | (0x3F << 24),
+            // 0x50208: tRC 7:0, tRP 21:16.
+            SMN_CMD1 => 0x0000_00FF | (0x3F << 16),
+            // 0x5020C: tRRDS 4:0, tRRDL 12:8, tRTP 28:24.
+            SMN_CMD2 => 0x0000_001F | (0x1F << 8) | (0x1F << 24),
+            // 0x50210: tFAW 7:0.
+            SMN_CMD3 => 0x0000_00FF,
+            // 0x50214: tCWL 5:0, tWTRS 12:8, tWTRL 20:16.
+            SMN_CMD4 => 0x0000_003F | (0x1F << 8) | (0x3F << 16),
+            // 0x50218: tWR 7:0.
+            SMN_CMD5 => 0x0000_00FF,
+            // 0x50220 / 0x50224: dd 3:0, sd 11:8, sc 19:16, scl 29:24.
+            SMN_RDRD | SMN_WRWR => 0x0000_000F | (0xF << 8) | (0xF << 16) | (0x3F << 24),
+            // 0x50228: tWRRD 3:0, tRDWR 12:8.
+            SMN_TURN => 0x0000_000F | (0x1F << 8),
+            // 0x50254: tCKE 28:24.
+            SMN_CKE => 0x1F << 24,
+            // 0x50260 / 0x50264: tRFC 9:0, tRFC2 20:11, tRFC4 31:22.
+            SMN_RFC | SMN_RFC_MIRROR => 0x0000_03FF | (0x3FF << 11) | (0x3FF << 22),
+            // Not a member of the verified set: no field.
+            _ => 0,
+        }
+    }
+
+    /// (b) Targeted max words pin every mask width: no field can decode
+    /// above the reference's max (and the not-stored extractors are pinned
+    /// too). The all-ones word is deliberately **not** used — it is the
+    /// driver's failed-read sentinel and decodes to no data (P6-10).
     #[test]
-    fn all_ones_words_pin_every_mask_width() {
+    fn max_mask_words_pin_every_mask_width() {
         let regs: Vec<(u32, Option<u32>)> =
-            SMN_REGISTER_SET.iter().map(|a| (*a, Some(0xFFFF_FFFF))).collect();
+            SMN_REGISTER_SET.iter().map(|a| (*a, Some(max_mask_word(*a)))).collect();
         let f = decode_smn(&regs);
         assert_eq!(f.gdm, 1);
         let t = f.timings;
@@ -779,9 +860,9 @@ mod tests {
         assert_eq!(t.rfc1, 1023);
         assert_eq!(t.rfc2, 1023);
         assert_eq!(t.rfcsb, 1023);
-        assert_eq!(mclk_setpoint_mhz(0xFFFF_FFFF), 4200); // 127/3 × 100
-        assert_eq!(command_rate(0xFFFF_FFFF), 1);
-        assert_eq!(tcke(0xFFFF_FFFF), 31);
+        assert_eq!(mclk_setpoint_mhz(max_mask_word(SMN_MCLK)), 4200); // 127/3 × 100
+        assert_eq!(command_rate(max_mask_word(SMN_MCLK)), 1);
+        assert_eq!(tcke(max_mask_word(SMN_CKE)), 31);
     }
 
     /// (b) `decode_smn` maps the fixture words onto all 27 timings + GDM
@@ -803,12 +884,14 @@ mod tests {
     }
 
     /// (b) GDM is exactly bit 11 of `0x50200` (all lower / all upper bits
-    /// irrelevant).
+    /// irrelevant); the driver's `0xFFFF_FFFF` failed-read sentinel never
+    /// decodes — bit 11 of the all-ones word (which happens to be set) is
+    /// a read failure, not `GDM=on` (P6-10).
     #[test]
     fn gdm_is_bit_11_of_50200() {
         assert_eq!(decode_smn(&[(SMN_MCLK, Some(0x0000_0800u32))]).gdm, 1);
         assert_eq!(decode_smn(&[(SMN_MCLK, Some(0x0000_07FFu32))]).gdm, 0);
-        assert_eq!(decode_smn(&[(SMN_MCLK, Some(0xFFFF_FFFFu32))]).gdm, 1);
+        assert_eq!(decode_smn(&[(SMN_MCLK, Some(SMN_READ_FAILURE_SENTINEL))]).gdm, 0);
     }
 
     /// (c) The `0x50264` mirror/sentinel rule (reference lines 275–277):
@@ -1137,6 +1220,140 @@ mod tests {
         }
         assert_eq!(snap.timings.cl, 16); // from the relocated 0x50204 word
         assert_eq!(snap.gdm, 0);
+    }
+
+    /// (e) P6-10: the read-to-word mapping — any error and the
+    /// `0xFFFF_FFFF` failed-read sentinel are `None`; every other word is
+    /// data (the offset marker included — the rule decides it).
+    #[test]
+    fn read_word_maps_errors_and_sentinel_to_none() {
+        assert_eq!(read_word(Ok(0x1539)), Some(0x1539));
+        assert_eq!(read_word(Ok(SMN_HIGH_BASE_MARKER)), Some(SMN_HIGH_BASE_MARKER));
+        assert_eq!(read_word(Ok(SMN_READ_FAILURE_SENTINEL)), None);
+        assert_eq!(
+            read_word(Err(TelemetryError::InsufficientPrivilege { hint: "run as root" })),
+            None
+        );
+        assert_eq!(
+            read_word(Err(TelemetryError::Parse { detail: "x".to_owned() })),
+            None
+        );
+    }
+
+    /// (e) P6-10: the driver's `0xFFFF_FFFF` sentinel on the probe — no
+    /// set-point, no relocation: the 12-register loop still runs at the
+    /// bare addresses, GDM decodes to `0` (the parse value — never the
+    /// coincidental bit 11 of the all-ones word), the other words decode
+    /// normally (containment is per-register).
+    #[test]
+    fn apply_smn_with_probe_sentinel_no_setpoint_bare_base() {
+        let mut seen: Vec<u32> = Vec::new();
+        let mut snap = base_snapshot();
+        apply_smn_with(
+            |addr| {
+                seen.push(addr);
+                if addr == SMN_MCLK {
+                    Ok(SMN_READ_FAILURE_SENTINEL) // failed probe read
+                } else {
+                    fixture_regs()
+                        .into_iter()
+                        .find(|(a, _)| *a == addr)
+                        .map(|(_, w)| Ok(w.expect("fixture words are all Some")))
+                        .unwrap_or(Ok(0))
+                }
+            },
+            &mut snap,
+        );
+        // 1 probe + 12 bare reads — no relocation, no re-read.
+        assert_eq!(seen.len(), 13);
+        assert_eq!(seen[0], SMN_MCLK);
+        for a in &seen[1..] {
+            assert!(*a < SMN_HIGH_BASE, "relocated address on a sentinel probe: {a:#x}");
+        }
+        assert_eq!(snap.gdm, 0); // sentinel -> no set-point -> parse value
+        // The bare-address words still decode (per-register containment).
+        assert_eq!(snap.timings.cl, 16);
+        assert_eq!(snap.timings.rfc1, 160);
+        assert_eq!(snap.timings.wrwr_scl, 9);
+    }
+
+    /// (e) P6-10: containment — one timing register reading the sentinel
+    /// decodes its own fields to `0` (honest `Na` downstream); every other
+    /// register's fields are unaffected.
+    #[test]
+    fn apply_smn_with_one_sentinel_register_contains_to_zero() {
+        let mut snap = base_snapshot();
+        apply_smn_with(
+            |addr| {
+                if addr == SMN_CMD4 {
+                    Ok(SMN_READ_FAILURE_SENTINEL) // tCWL/tWTRS/tWTRL failed
+                } else {
+                    fixture_regs()
+                        .into_iter()
+                        .find(|(a, _)| *a == addr)
+                        .map(|(_, w)| Ok(w.expect("fixture words are all Some")))
+                        .unwrap_or(Ok(0))
+                }
+            },
+            &mut snap,
+        );
+        let t = snap.timings;
+        // The sentinel register's own fields decode to 0 (honest Na).
+        assert_eq!(t.cwl, 0);
+        assert_eq!(t.wtrs, 0);
+        assert_eq!(t.wtrl, 0);
+        // Every other register decodes normally.
+        assert_eq!(t.cl, 16);
+        assert_eq!(t.ras, 36);
+        assert_eq!(t.rc, 48);
+        assert_eq!(t.faw, 16);
+        assert_eq!(t.rfc1, 160);
+        assert_eq!(t.rfc2, 260);
+        assert_eq!(t.rfcsb, 504);
+        assert_eq!(snap.gdm, 0); // the fixture's 0x50200 = 0x1539 (bit 11 clear)
+    }
+
+    /// (e) P6-10: marker then sentinel — the first read is the offset
+    /// marker (`0x300`), the relocated re-read returns the failed-read
+    /// sentinel: the offset decision is the first read's only (monitor_cpu
+    /// semantics) — the loop still runs at the relocated base with no
+    /// set-point (GDM = parse value).
+    #[test]
+    fn apply_smn_with_marker_then_sentinel_keeps_relocated_base() {
+        let mut seen: Vec<u32> = Vec::new();
+        let mut snap = base_snapshot();
+        apply_smn_with(
+            |addr| {
+                seen.push(addr);
+                if addr == SMN_MCLK {
+                    Ok(SMN_HIGH_BASE_MARKER) // first read: the marker
+                } else if addr == SMN_MCLK + SMN_HIGH_BASE {
+                    Ok(SMN_READ_FAILURE_SENTINEL) // re-read: failed
+                } else {
+                    fixture_regs()
+                        .into_iter()
+                        .find(|(a, _)| *a == addr - SMN_HIGH_BASE)
+                        .map(|(_, w)| Ok(w.expect("fixture words are all Some")))
+                        .unwrap_or(Ok(0))
+                }
+            },
+            &mut snap,
+        );
+        // 1 probe + 1 relocated re-read + 12 relocated reads.
+        assert_eq!(seen.len(), 14);
+        assert_eq!(seen[0], SMN_MCLK);
+        assert_eq!(seen[1], SMN_MCLK + SMN_HIGH_BASE);
+        for a in &seen[2..] {
+            assert!(
+                (*a - SMN_HIGH_BASE) >= SMN_CMD0,
+                "bare address after relocation: {a:#x}"
+            );
+        }
+        // The sentinel re-read gives no set-point ...
+        assert_eq!(snap.gdm, 0);
+        // ... but the relocated base is kept (first read's decision only).
+        assert_eq!(snap.timings.cl, 16);
+        assert_eq!(snap.timings.rfc1, 160);
     }
 
     /// (f) On this host the overlay is graceful and preserves the PM fields
