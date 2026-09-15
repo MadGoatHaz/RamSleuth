@@ -11,21 +11,24 @@
 //! in AMBER (a 1:2 UCLK:MCLK divide = gear desync; a SOC rail above
 //! 1.30 V = out of spec on AM5).
 //!
-//! **Grouped layout (C6-21, items 2+3):** the flat single-column grid
-//! is now the 2-subcolumn × 3-section-pair matrix of §3.1 —
-//! `[Clocks & Ratios] | [Tertiary & Turnarounds]`,
-//! `[Primary Timings] | [CAD Bus Drive & Termination]`,
-//! `[Secondary Timings] | [Active System Voltages]` — one uniform
-//! four-column `egui::Grid` per vendor block (left label, left value,
-//! right label, right value), the section titles as each pair's bold
-//! header row, and the new `GDM / CR` row in `[Clocks & Ratios]`
-//! (gear down mode + DRAM command rate — e.g. `Gear 1 / 1T` or
-//! `Disabled / 2T`; an Intel channel's not-applicable cells degrade it
-//! to a crimson N/A pair). The zone sits in a titled, bounded-height
-//! `egui::ScrollArea` so it fits the non-scrolling dashboard; a whole
-//! `Na` vendor branch collapses to a single row (`AMD` / `Intel` +
-//! the reason), and no telemetry at all renders one crimson
-//! placeholder — never a panic (the no-panic contract, plan D5).
+//! **Grouped layout (C6-21, items 2+3; C7-12 3×2):** the flat
+//! single-column grid is now the §3.1 3-column × 2-row matrix —
+//! column 1 = `[Clocks & Ratios]` over `[Primary Timings]`,
+//! column 2 = `[Secondary Timings]` over `[Tertiary & Turnarounds]`,
+//! column 3 = `[CAD Bus Drive & Termination]` over `[Active System
+//! Voltages]` (the six sections, related content vertically adjacent)
+//! — each section a bold CYAN title row over its own 2-column
+//! `egui::Grid` (label/value, the compact 8.0 / 60.0 spacing so the
+//! three columns fit the zone width), and the new `GDM / CR` row in
+//! `[Clocks & Ratios]` (gear down mode + DRAM command rate — e.g.
+//! `Gear 1 / 1T` or `Disabled / 2T`; an Intel channel's
+//! not-applicable cells degrade it to a crimson N/A pair). The zone
+//! lays out at its natural height — no scroll area: at the default
+//! 1400×900 window the 3×2 grid (worst column ≈ 25 rows) fits the
+//! left column without vertical scrolling (C7-12); a whole `Na`
+//! vendor branch collapses to a single row (`AMD` / `Intel` + the
+//! reason), and no telemetry at all renders one crimson placeholder —
+//! never a panic (the no-panic contract, plan D5).
 //!
 //! **Pure core:** [`timing_cells`] is I/O-free and deterministic (the
 //! unit tests exercise it without an egui context);
@@ -47,9 +50,22 @@ const ZONE_TITLE: &str = "1 · MEMORY CONTROLLER & SUBTIMINGS";
 const AMD: &str = "AMD";
 /// The Intel vendor-section label (the same role as [`AMD`]).
 const INTEL: &str = "Intel";
-/// The bounded height (pixels) of the zone's scroll area: the dashboard
-/// is non-scrolling, so the matrix scrolls inside this bound.
-const ZONE_MAX_HEIGHT: f32 = 420.0;
+/// The compact section-grid spacing (C7-12): the 8.0 pt label↔value
+/// gap (down from 12.0) + the 1.0 pt row pitch.
+const SECTION_SPACING: egui::Vec2 = egui::vec2(8.0, 1.0);
+/// The compact section-grid minimum column width (C7-12: down from
+/// 80.0 so the three columns fit the zone width at the default size).
+const MIN_COL_WIDTH: f32 = 60.0;
+/// The gap between the two sections stacked in one 3×2 column
+/// (C7-12: down from the old breathing row).
+const SECTION_GAP: f32 = 4.0;
+/// The 3×2 column map (C7-12): the six stored sections (the §3.1
+/// pair-row order — Clocks, Tertiary, Primary, CAD, Secondary,
+/// Voltages) read as three columns of two stacked sections: column 1
+/// = `[Clocks & Ratios]` over `[Primary Timings]`, column 2 =
+/// `[Secondary Timings]` over `[Tertiary & Turnarounds]`, column 3 =
+/// `[CAD Bus Drive & Termination]` over `[Active System Voltages]`.
+const COLUMN_SECTIONS: [(usize, usize); 3] = [(0, 2), (4, 1), (3, 5)];
 /// The AM5 SOC-rail limit (volts): a VDDCR_SOC reading above it is an
 /// out-of-spec warning (AMBER).
 const SOC_MAX_VOLTS: f64 = 1.30;
@@ -72,7 +88,8 @@ const ACTIVE_VOLTAGES: &str = "Active System Voltages";
 /// 2-subcolumn matrix (e.g. `[Clocks & Ratios]`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimingSection {
-    /// The section title (the bold CYAN header row of its subcolumn).
+    /// The section title (the bold CYAN title row of its 3×2 column,
+    /// above the section's own grid).
     pub title: String,
     /// The section's key/value rows, in canonical order.
     pub rows: Vec<(String, String)>,
@@ -85,8 +102,10 @@ pub struct TimingSection {
 pub struct VendorTiming {
     /// The block header label (AMD / Intel ch N).
     pub header: String,
-    /// The six sections, in layout order (left 1, right 1, left 2,
-    /// right 2, left 3, right 3); empty when the block is degraded.
+    /// The six sections in storage order (the §3.1 pair rows
+    /// interleaved: Clocks, Tertiary, Primary, CAD, Secondary,
+    /// Voltages — the 3×2 layout reads them by column,
+    /// [`COLUMN_SECTIONS`]); empty when the block is degraded.
     pub sections: Vec<TimingSection>,
     /// The whole-block `N/A (<reason>)` display (the degraded state);
     /// `None` when the sections are present.
@@ -172,11 +191,13 @@ fn degraded_block(header: &str, reason: &NaReason) -> VendorTiming {
 }
 
 /// The six §3.1 sections of one readout (the AMD block or one Intel
-/// channel), in layout order: left subcolumn `[Clocks & Ratios]`
-/// (MCLK / UCLK / FCLK / UCLK:MCLK / gear / `GDM / CR` / PDM),
-/// `[Primary Timings]`, `[Secondary Timings]`; right subcolumn
-/// `[Tertiary & Turnarounds]`, `[CAD Bus Drive & Termination]`,
-/// `[Active System Voltages]`. The `GDM / CR` row (C6-21, item 3)
+/// channel), in storage order (the §3.1 pair rows interleaved):
+/// `[Clocks & Ratios]` (MCLK / UCLK / FCLK / UCLK:MCLK / gear /
+/// `GDM / CR` / PDM), `[Tertiary & Turnarounds]`, `[Primary Timings]`,
+/// `[CAD Bus Drive & Termination]`, `[Secondary Timings]`, `[Active
+/// System Voltages]` — the 3×2 layout (C7-12) reads them as columns
+/// of two stacked sections ([`COLUMN_SECTIONS`]). The `GDM / CR` row
+/// (C6-21, item 3)
 /// shows the gear down mode + the DRAM command rate (e.g.
 /// `Gear 1 / 1T`, `Disabled / 2T`); an Intel channel's not-applicable
 /// GDM + command-rate cells degrade it to a crimson N/A pair. The
@@ -189,7 +210,7 @@ fn readout_sections(
     voltages: &VoltageSet,
     rtl: Option<&Section<u16>>,
 ) -> Vec<TimingSection> {
-    // Left subcolumn.
+    // The first three stored sections.
     let mut clocks_rows: Vec<(String, String)> = vec![
         row("MCLK", mhz(&clocks.mclk_mhz)),
         row("UCLK", mhz(&clocks.uclk_mhz)),
@@ -219,7 +240,7 @@ fn readout_sections(
         row("tFAW", ticks(&timings.faw)),
     ];
 
-    // Right subcolumn.
+    // The last three stored sections.
     let tertiary_rows: Vec<(String, String)> = vec![
         row("tWTRS", ticks(&timings.wtrs)),
         row("tWTRL", ticks(&timings.wtrl)),
@@ -411,9 +432,10 @@ fn volts(section: &Section<u16>) -> String {
 // ---------------------------------------------------------------------
 
 /// Zone 1: render the timing matrix from `data` — a titled SLATE
-/// frame with a bounded-height vertical scroll area holding the §3.1
-/// 2-subcolumn × 3-section-pair grid per vendor block (it fits the
-/// non-scrolling dashboard; the grid scrolls inside the bound).
+/// frame holding the §3.1 3-column × 2-row section grid per vendor
+/// block (C7-12): the zone lays out at its natural height — no
+/// scroll area — and at the default 1400×900 window the grid (worst
+/// column ≈ 25 rows) fits the left column without vertical scrolling.
 ///
 /// Rows: the label in default text, the value in CYAN, an absent cell
 /// (`N/A (…)`) in CRIMSON, and the two warnings in AMBER — a 1:2
@@ -431,16 +453,12 @@ pub fn render_telemetry_zone(ui: &mut egui::Ui, data: &TelemetryData) {
         match &data.telemetry {
             Some(telemetry) => {
                 let blocks = timing_cells(telemetry);
-                let _ = egui::ScrollArea::vertical()
-                    .max_height(ZONE_MAX_HEIGHT)
-                    .show(ui, |ui| {
-                        for (index, block) in blocks.iter().enumerate() {
-                            if index > 0 {
-                                ui.add_space(6.0);
-                            }
-                            render_vendor_block(ui, index, block);
-                        }
-                    });
+                for (index, block) in blocks.iter().enumerate() {
+                    if index > 0 {
+                        ui.add_space(6.0);
+                    }
+                    render_vendor_block(ui, index, block);
+                }
             }
             None => {
                 ui.label(egui::RichText::new("N/A (no telemetry)").color(CRIMSON));
@@ -450,8 +468,8 @@ pub fn render_telemetry_zone(ui: &mut egui::Ui, data: &TelemetryData) {
 }
 
 /// One vendor block: the bold CYAN header (AMD / Intel ch N) and
-/// either the 2-subcolumn section grid, or the single N/A row of a
-/// degraded whole branch (CRIMSON via [`cell_color`]).
+/// either the 3-column × 2-row section grid, or the single N/A row
+/// of a degraded whole branch (CRIMSON via [`cell_color`]).
 fn render_vendor_block(ui: &mut egui::Ui, index: usize, block: &VendorTiming) {
     ui.add(egui::Label::new(
         egui::RichText::new(block.header.as_str()).strong().color(CYAN),
@@ -469,79 +487,59 @@ fn render_vendor_block(ui: &mut egui::Ui, index: usize, block: &VendorTiming) {
     }
 }
 
-/// The §3.1 2-subcolumn body: one uniform four-column `egui::Grid`
-/// (left label, left value, right label, right value) — the block's
-/// six sections laid out as three row pairs
-/// (`[Clocks & Ratios] | [Tertiary & Turnarounds]`,
-/// `[Primary Timings] | [CAD Bus Drive & Termination]`,
-/// `[Secondary Timings] | [Active System Voltages]`). Each pair's
-/// title row is bold CYAN; the pair's key/value rows run to the
-/// longer section's depth (the shorter subcolumn rests on empty
-/// cells), with a breathing row between pairs.
+/// The §3.1 3-column × 2-row body (C7-12): the block's six sections
+/// (stored in the pair-row order) read as three columns of two
+/// stacked sections each — column 1 = `[Clocks & Ratios]` over
+/// `[Primary Timings]`, column 2 = `[Secondary Timings]` over
+/// `[Tertiary & Turnarounds]`, column 3 = `[CAD Bus Drive &
+/// Termination]` over `[Active System Voltages]` — each section a
+/// bold CYAN title row over its own 2-column `egui::Grid` (label /
+/// value) with the compact [`SECTION_SPACING`] / [`MIN_COL_WIDTH`],
+/// a [`SECTION_GAP`] between the stacked sections, and the columns
+/// separated by the surrounding layout's item spacing.
 fn render_section_grid(ui: &mut egui::Ui, index: usize, sections: &[TimingSection]) {
-    let _ = egui::Grid::new(format!("ramsleuth_telemetry_sections_{index}"))
-        .spacing(egui::vec2(12.0, 1.0))
-        .min_col_width(80.0)
+    ui.horizontal(|ui| {
+        for (column, (top, bottom)) in COLUMN_SECTIONS.iter().enumerate() {
+            ui.vertical(|ui| {
+                render_section(ui, index, column * 2, sections.get(*top));
+                ui.add_space(SECTION_GAP);
+                render_section(ui, index, column * 2 + 1, sections.get(*bottom));
+            });
+        }
+    });
+}
+
+/// One §3.1 section (C7-12): the bold CYAN title row + its own
+/// 2-column `egui::Grid` (label/value), each value in its semantic
+/// color ([`cell_color`]); a missing section renders nothing —
+/// [`timing_cells`] returns exactly six (or zero, whose degraded path
+/// never reaches the grid), so this is the no-panic guard for any
+/// future shorter section list.
+fn render_section(
+    ui: &mut egui::Ui,
+    block_index: usize,
+    slot: usize,
+    section: Option<&TimingSection>,
+) {
+    let Some(section) = section else {
+        return;
+    };
+    ui.add(egui::Label::new(
+        egui::RichText::new(section.title.as_str()).strong().color(CYAN),
+    ));
+    let _ = egui::Grid::new(format!("ramsleuth_telemetry_section_{block_index}_{slot}"))
+        .spacing(SECTION_SPACING)
+        .min_col_width(MIN_COL_WIDTH)
         .show(ui, |ui| {
-            let mut i = 0;
-            while i + 1 < sections.len() {
-                let (left, right) = (&sections[i], &sections[i + 1]);
-                section_pair(ui, left, right);
-                if i + 2 < sections.len() {
-                    // The breathing row between section pairs.
-                    ui.add(egui::Label::new(egui::RichText::new(" ")));
-                    ui.end_row();
-                }
-                i += 2;
+            for (label, display) in &section.rows {
+                ui.add(egui::Label::new(egui::RichText::new(label.as_str())));
+                ui.add(egui::Label::new(
+                    egui::RichText::new(display.as_str())
+                        .color(cell_color(label.as_str(), display.as_str())),
+                ));
+                ui.end_row();
             }
         });
-}
-
-/// One row pair: the two section titles (bold CYAN, the other two
-/// columns empty), then the pair's key/value rows — each cell is a
-/// label and its semantic-color value, or two empty cells for the
-/// column whose section ran dry.
-fn section_pair(ui: &mut egui::Ui, left: &TimingSection, right: &TimingSection) {
-    ui.add(egui::Label::new(
-        egui::RichText::new(left.title.as_str()).strong().color(CYAN),
-    ));
-    ui.add(empty_cell());
-    ui.add(egui::Label::new(
-        egui::RichText::new(right.title.as_str()).strong().color(CYAN),
-    ));
-    ui.add(empty_cell());
-    ui.end_row();
-
-    let rows = left.rows.len().max(right.rows.len());
-    for row_index in 0..rows {
-        grid_cell(ui, left.rows.get(row_index));
-        grid_cell(ui, right.rows.get(row_index));
-        ui.end_row();
-    }
-}
-
-/// One subcolumn cell: the label + its semantic-color value, or two
-/// empty cells when that section has no such row.
-fn grid_cell(ui: &mut egui::Ui, cell: Option<&(String, String)>) {
-    match cell {
-        Some((label, display)) => {
-            ui.add(egui::Label::new(egui::RichText::new(label.as_str())));
-            ui.add(egui::Label::new(
-                egui::RichText::new(display.as_str())
-                    .color(cell_color(label.as_str(), display.as_str())),
-            ));
-        }
-        None => {
-            ui.add(empty_cell());
-            ui.add(empty_cell());
-        }
-    }
-}
-
-/// The empty grid cell (a subcolumn with no such row, or the title-
-/// row gap between the subcolumns).
-fn empty_cell() -> egui::Label {
-    egui::Label::new(egui::RichText::new(" "))
 }
 
 /// The semantic color of one grid cell: CYAN for values, CRIMSON for
@@ -573,8 +571,9 @@ fn cell_color(label: &str, display: &str) -> egui::Color32 {
 
 // ---------------------------------------------------------------------
 // Tests (headless: `timing_cells` + `cell_color` + `gdm_cr` are pure —
-// no egui context, no I/O; the render path is compile-checked and
-// verified live in the QA phase).
+// no egui context, no I/O; the render path runs no-panic in a
+// headless `egui::Context` (C7-12) + the row-depth no-scroll
+// assertion, with the live render verified in the QA phase).
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
@@ -944,5 +943,111 @@ mod tests {
         assert_eq!(cell_color("GDM / CR", "Disabled / 2T"), CYAN);
         assert_eq!(cell_color("GDM / CR", "N/A (not applicable) / N/A (not applicable)"), CRIMSON);
         assert_eq!(cell_color("GDM / CR", "Disabled / N/A (driver missing)"), CRIMSON);
+    }
+
+    /// The zone's content budget at the default 1400×900 size
+    /// (C7-12): the 900 pt window minus the header strip (~70 pt),
+    /// the column-row bottom gap (8 pt), the zone frame's inner
+    /// margin (2×6 pt), and the zone title row + space (~26 pt)
+    /// ≈ 784 pt — the full column, since the history strip's removal
+    /// (C7-19) returns its ~165 pt budget to the columns.
+    const ZONE_CONTENT_BUDGET: f32 = 900.0 - 70.0 - 8.0 - 12.0 - 26.0;
+
+    /// One headless frame on a fresh context (the `begin_frame`
+    /// pattern from the `egui` docs — the fonts load there; the
+    /// `history` module's `run_headless_frame` precedent), running
+    /// `draw` inside a central panel.
+    fn run_headless_frame(draw: impl FnOnce(&mut egui::Ui)) {
+        let ctx = egui::Context::default();
+        ctx.begin_frame(egui::RawInput::default());
+        egui::CentralPanel::default().show(&ctx, |ui| draw(ui));
+    }
+
+    /// (h) Row depth (C7-12, the no-scroll gate's unit stand-in): the
+    /// worst column of the 3×2 layout — two stacked sections + their
+    /// two titles — stays within [`ZONE_CONTENT_BUDGET`] at the
+    /// default 1400×900 size. The worst column (5 + 18 rows + 2
+    /// titles = 25) at the 18 pt row pitch is ≈ 450 pt (the plan's
+    /// number) — no vertical scroll (the QA live gate measures the
+    /// rendered window).
+    #[test]
+    fn worst_column_depth_fits_the_default_size() {
+        const ROW_PITCH: f32 = 18.0;
+        for snapshot in [representative(), intel_populated(), all_na()] {
+            for block in &timing_cells(&snapshot) {
+                let depth = if block.sections.is_empty() {
+                    1 // a degraded block renders one N/A row
+                } else {
+                    COLUMN_SECTIONS
+                        .iter()
+                        .map(|(top, bottom)| {
+                            let top_rows = block.sections.get(*top).map_or(0, |s| s.rows.len());
+                            let bottom_rows =
+                                block.sections.get(*bottom).map_or(0, |s| s.rows.len());
+                            top_rows + bottom_rows + 2 // + the two section titles
+                        })
+                        .max()
+                        .unwrap_or(0)
+                };
+                assert!(
+                    depth as f32 * ROW_PITCH <= ZONE_CONTENT_BUDGET,
+                    "the worst column ({depth} rows ≈ {} pt) must fit the {ZONE_CONTENT_BUDGET:.0} pt budget",
+                    depth as f32 * ROW_PITCH
+                );
+            }
+        }
+    }
+
+    /// (i) The render path is no-panic headless (C7-12): every fixture
+    /// snapshot (plus the no-telemetry state) renders the zone into a
+    /// headless context at its natural height — no scroll area, no
+    /// panic — and every non-degraded vendor block's rendered height
+    /// (the header + the 3-column grid = the worst column) stays
+    /// within [`ZONE_CONTENT_BUDGET`].
+    #[test]
+    fn renders_headlessly_without_panic_and_within_budget() {
+        // The zone's column allocation (main.rs: 55% of the panel
+        // width, clamped): 1400 × 0.55 ≈ 770 pt; the full 900 pt
+        // height — the zone lays out at its natural height (no
+        // scroll area).
+        const ZONE_W: f32 = 770.0;
+        const ZONE_H: f32 = 900.0;
+        for telemetry in [
+            Some(representative()),
+            Some(intel_populated()),
+            Some(all_na()),
+            None,
+        ] {
+            let blocks = telemetry.as_ref().map(timing_cells);
+            let data = TelemetryData { telemetry, ..Default::default() };
+            run_headless_frame(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::Vec2::new(ZONE_W, ZONE_H),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| render_telemetry_zone(ui, &data),
+                );
+            });
+            for block in blocks.iter().flatten() {
+                if block.sections.is_empty() {
+                    continue; // a degraded block is one row — trivially in budget
+                }
+                let mut height = 0.0_f32;
+                run_headless_frame(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::Vec2::new(ZONE_W, ZONE_H),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            render_vendor_block(ui, 0, block);
+                            height = ui.cursor().min.y - ui.max_rect().min.y;
+                        },
+                    );
+                });
+                assert!(
+                    height <= ZONE_CONTENT_BUDGET,
+                    "the {header} block renders {height:.1} pt tall — the {ZONE_CONTENT_BUDGET:.0} pt budget",
+                    header = block.header
+                );
+            }
+        }
     }
 }
