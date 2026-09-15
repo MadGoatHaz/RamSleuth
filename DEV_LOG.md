@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-CYCLE6.md` (Cycle 6 GUI workstream — the handover §13 primary name, alt `PLAN-PHASE7.md`; Phase 6/Cycle 5 retained as `plans/PLAN-PHASE6.md`, Phase 5 as `plans/PLAN-PHASE5.md`; Phase 1 as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [ACTIVE] ID: C6-07+C6-02-Review | AGENT: general (Code Reviewer) | BRANCH: v2-development | FILES: [DEV_LOG.md]
 
 @@@ CURRENT_STATE @@@
 Cycle 6 (GUI workstream) — C6-03 + C6-05 MERGED into v2-development (--no-ff) under plan rev 3's refined gate (per-merge: `cargo test -p ramsleuth-telemetry` + clippy `-D warnings` + `cargo check --workspace` production-clean; the cross-crate red window is test-fixture-only, closed by C6-09…C6-19 with the HARD `cargo test --workspace` gate post-C6-19): C6-05 gates all pass (telemetry 156/156 lib + 6/6 main; clippy exit 0; production check exit 0) and add no cross-crate sites (SmnFields internal to amd_smn.rs) → post-merge red window is still exactly the 3 scheduled E0063 `ClockReadout` fixtures (tui/ui.rs:737, client/dump.rs:487, gui/telemetry_zone.rs:387 → C6-16/C6-10/C6-18); next = C6-06 (facade.rs SystemMemoryTelemetry wire-shape hub), then C6-07 (lib.rs root re-export).
