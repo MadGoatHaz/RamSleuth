@@ -3,12 +3,14 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-CYCLE6.md` (Cycle 6 GUI workstream — the handover §13 primary name, alt `PLAN-PHASE7.md`; Phase 6/Cycle 5 retained as `plans/PLAN-PHASE6.md`, Phase 5 as `plans/PLAN-PHASE5.md`; Phase 1 as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
 
 @@@ CURRENT_STATE @@@
-Cycle 6 (GUI workstream) PLANNED — executing micro-chunks; baseline 371/371 green at 19f56a2.
+Cycle 6 (GUI workstream) — C6-01 implemented on branch/chunk-c6-01 (pushed, awaiting review/merge); telemetry 154/154 + main 6/6 green; clippy -D warnings clean.
 
 ## History
+- [DONE] ID: C6-01 | STATUS: SUCCESS | BRANCH: branch/chunk-c6-01
+DECISION: Added crates/ramsleuth-telemetry/src/platform.rs (frozen SystemPlatform: cpu_clock_mhz/motherboard/bios/agesa, all Section<T>, per-field Na(NotApplicable) fallback — no panic/unwrap on I/O) + mem_total_gib() + collect_platform(); sources = DMI sysfs (/sys/class/dmi/id/{board_name,board_vendor,product_name,bios_version,bios_date}), /proc/cpuinfo `cpu MHz` (first core), /proc/meminfo `MemTotal` (kB→GiB), best-effort AGESA token from the BIOS string or the ryzen_smu `version` attr (text — 0xFFFFFFFF SMN sentinel rule N/A); 14 new tests (pure parse happy+fallback, AGESA chain, graceful-host run, bincode round-trips); minimal `pub mod platform;` in lib.rs (pre-steps C6-07, which then only adds the root re-export); telemetry 154/154 + main 6/6 green, clippy -D warnings clean.
+AHEAD: Reviewer merges C6-01 into v2-development (--no-ff); C6-02 (spd_decode.rs) forks from the post-merge tip; facade.rs untouched (C6-06).
 - [DONE] ID: P5-13-REVIEW | STATUS: SUCCESS (merged) | BRANCH: v2-development
 DECISION: Reviewed + merged P5-13 (branch deleted): L136/L141 dkms build/install now pass ${MODULE}/${PKGVER}, symmetric with L131 dkms add; die/guard strings (L137/L142) intact; dkms.conf CLEAN line gone (grep empty) with all other directives intact; rest of script unchanged; bash -n clean, shellcheck info-only (pre-existing SC2015 on the add guard); zero other-file changes; cargo test skipped (no source changes).
 AHEAD: Operator re-run of scripts/install-ryzen-smu-dkms.sh is the live ground truth (no dkms remove needed); ready for Cycle 5.
