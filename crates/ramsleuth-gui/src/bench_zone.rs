@@ -2,10 +2,17 @@
 //! + live progress (P3-28).
 //!
 //! Grand Design §3.1 right panel: the 4×4 grid — Memory / L1 / L2 / L3
-//! rows × Read / Write / Copy / Latency columns — from the terminal
-//! result grid of the live [`BenchState`], every cell its formatted
-//! value (two-decimal GB/s for a bandwidth metric, ns for latency) or
-//! `N/A` for an unmeasured cell (0.0 on the wire), in an
+//! rows × Read / Write / Copy / Latency columns. The grid is **live
+//! during a run**: [`live_grid`] accumulates each streamed
+//! [`StreamProgress`] event's (tier, op, value) — the latest per cell
+//! wins — and every measured cell renders its in-flight value dimmed
+//! with a `…` suffix as the events arrive (egui repaints every
+//! frame); the cells not started yet — and the latency column, the
+//! stream carrying no latency events — keep the `N/A` placeholder.
+//! Once the run is not in flight, the grid shows the terminal result
+//! grid of the last completed run, every cell its formatted value
+//! (two-decimal GB/s for a bandwidth metric, ns for latency) or `N/A`
+//! for an unmeasured cell (0.0 on the wire), in an
 //! `egui_extras::TableBuilder` table (bandwidth values CYAN, latency
 //! cells AMBER — the palette's low-latency accent — `N/A` CRIMSON); a
 //! progress bar driven by the last streamed [`StreamProgress`] event
@@ -25,16 +32,18 @@
 //! absent daemon degrades to the placeholder + `idle` — never a
 //! panic.
 //!
-//! **Pure core:** [`grid_cells`] is I/O-free and deterministic (the
-//! 16 `(tier · op, value-or-N/A)` pairs the table renders — the unit
-//! tests exercise it without an egui context); [`render_bench_zone`]
-//! is the thin `egui` surface over it (the live render is verified in
-//! the QA phase).
+//! **Pure core:** [`live_grid`] (the in-flight grid accumulated from
+//! the streamed events — the latest value per cell wins) and
+//! [`grid_cells`] (the 16 `(tier · op, value-or-N/A)` pairs of the
+//! terminal result grid) are I/O-free and deterministic — the unit
+//! tests exercise them without an egui context; [`render_bench_zone`]
+//! is the thin `egui` surface over them (the live render is verified
+//! in the QA phase).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
-use ramsleuth_bench::{BenchmarkGrid, Metric, StreamProgress, StreamTarget, Tier};
+use ramsleuth_bench::{BenchOp, BenchmarkGrid, Metric, StreamProgress, StreamTarget, Tier};
 use ramsleuth_protocol::BenchMode;
 
 use crate::update::{BenchCmd, TelemetryData};
@@ -94,7 +103,8 @@ fn cell_text(grid: &BenchmarkGrid, tier: Tier, metric: Metric) -> String {
 /// Pure and deterministic: the same grid always yields the same `Vec`.
 /// Each pair is the cell's `"tier · op"` label (the progress label's
 /// form) and its [`cell_text`] display (a formatted value, or `N/A`).
-/// The table renderer consumes these verbatim (4 per row, in order).
+/// It is the pure 16-cell view of the terminal result grid — the
+/// unit tests exercise it without an egui context.
 pub fn grid_cells(grid: &BenchmarkGrid) -> Vec<(String, String)> {
     let mut cells = Vec::with_capacity(16);
     for tier in &TIERS {
@@ -149,6 +159,101 @@ fn cell_color(metric: Metric, display: &str) -> egui::Color32 {
     }
 }
 
+/// The live in-flight grid: accumulate each streamed
+/// [`StreamProgress`] event's (tier, op, value) into a zero grid —
+/// the latest event per cell wins. The (tier, op) → grid-cell
+/// mapping: the row is the tier (its discriminant is the grid-array
+/// slot: `Memory = 0, L1 = 1, L2 = 2, L3 = 3`) and the column is the
+/// op (`Read` → `read_gbps`, `Write` → `write_gbps`, `Copy` →
+/// `copy_gbps`); the stream carries bandwidth ops only (no latency
+/// events — the streamed.rs contract), so the `latency_ns` column
+/// stays 0.0. A non-finite or non-positive value is ignored (never
+/// renders as data), and unmeasured cells stay 0.0 (which
+/// [`cell_text`] renders as `N/A`).
+fn live_grid(progress: &[StreamProgress]) -> BenchmarkGrid {
+    let mut grid = BenchmarkGrid {
+        read_gbps: [0.0; 4],
+        write_gbps: [0.0; 4],
+        copy_gbps: [0.0; 4],
+        latency_ns: [0.0; 4],
+    };
+    for event in progress {
+        if !event.value.is_finite() || event.value <= 0.0 {
+            continue; // a malformed reading never renders as data
+        }
+        let slot = event.tier as usize;
+        match event.op {
+            BenchOp::Read => grid.read_gbps[slot] = event.value,
+            BenchOp::Write => grid.write_gbps[slot] = event.value,
+            BenchOp::Copy => grid.copy_gbps[slot] = event.value,
+        }
+    }
+    grid
+}
+
+/// One cell's render phase within the zone's current run state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellPhase {
+    /// The run is not in flight: the cell shows its terminal value
+    /// from the result grid (or the `N/A` placeholder when
+    /// unmeasured).
+    Terminal,
+    /// A run is in flight and the cell has a streamed value: the live
+    /// in-flight fill (dimmed CYAN + a `…` suffix).
+    Live,
+    /// A run is in flight and the cell has no streamed value yet —
+    /// not started, or a latency cell (no progress events): the
+    /// `N/A` placeholder.
+    NotStarted,
+}
+
+/// One cell's render [`CellPhase`]: not running → `Terminal` (the
+/// result grid); running → `Live` when the live grid carries a
+/// (finite, positive) streamed value for the cell, else
+/// `NotStarted` (a cell not started yet, or a latency cell — the
+/// stream carries no latency events).
+fn cell_phase(running: bool, live: &BenchmarkGrid, tier: Tier, metric: Metric) -> CellPhase {
+    if !running {
+        return CellPhase::Terminal;
+    }
+    let value = live.cell(tier, metric);
+    if value.is_finite() && value > 0.0 {
+        CellPhase::Live
+    } else {
+        CellPhase::NotStarted
+    }
+}
+
+/// One cell's display text for its render [`CellPhase`]: the terminal
+/// value in the [`cell_text`] form, the live in-flight value (the
+/// same GB/s form + a `…` suffix — the run is still settling the
+/// rest of the grid), or the `N/A` placeholder.
+fn phase_cell_text(
+    phase: CellPhase,
+    grid: &BenchmarkGrid,
+    live: &BenchmarkGrid,
+    tier: Tier,
+    metric: Metric,
+) -> String {
+    match phase {
+        CellPhase::Terminal => cell_text(grid, tier, metric),
+        CellPhase::Live => format!("{:.2} GB/s…", live.cell(tier, metric)),
+        CellPhase::NotStarted => "N/A".to_owned(),
+    }
+}
+
+/// One cell's color for its render [`CellPhase`]: the terminal
+/// semantics (the existing [`cell_color`]: CYAN / AMBER / CRIMSON),
+/// the live fill (dimmed CYAN — visually distinct from the final
+/// value's full CYAN), or the not-started placeholder (CRIMSON).
+fn phase_cell_color(phase: CellPhase, metric: Metric, text: &str) -> egui::Color32 {
+    match phase {
+        CellPhase::Terminal => cell_color(metric, text),
+        CellPhase::Live => CYAN.gamma_multiply(0.6),
+        CellPhase::NotStarted => CRIMSON,
+    }
+}
+
 // ---------------------------------------------------------------------
 // The egui surface (compile-checked here; the live render is verified
 // in the QA phase).
@@ -176,7 +281,7 @@ pub fn render_bench_zone(
     let _ = frame.show(ui, |ui| {
         ui.label(egui::RichText::new(ZONE_TITLE).strong().color(CYAN));
         ui.add_space(4.0);
-        render_grid_table(ui, data.bench.grid.as_ref());
+        render_grid_table(ui, data);
         ui.add_space(4.0);
         render_progress(ui, data);
         ui.add_space(4.0);
@@ -185,23 +290,38 @@ pub fn render_bench_zone(
 }
 
 /// The 4×4 `egui_extras::TableBuilder` table: a header row (the four
-/// metric names) + one row per tier, every cell its [`grid_cells`]
-/// display in its semantic color. No terminal grid yet renders the
-/// all-`N/A` placeholder (the same 16 labels — the layout never shifts
-/// when the result lands).
-fn render_grid_table(ui: &mut egui::Ui, grid: Option<&BenchmarkGrid>) {
-    let cells = match grid {
-        Some(grid) => grid_cells(grid),
-        None => {
-            let empty = BenchmarkGrid {
-                read_gbps: [0.0; 4],
-                write_gbps: [0.0; 4],
-                copy_gbps: [0.0; 4],
-                latency_ns: [0.0; 4],
-            };
-            grid_cells(&empty)
-        }
+/// metric names) + one row per tier. Every cell renders its phase:
+/// while a run is in flight, a cell with a streamed value shows the
+/// live in-flight fill (dimmed CYAN + a `…` suffix, [`live_grid`])
+/// and the rest keep the `N/A` placeholder; once the run is not in
+/// flight, the cells show the terminal result grid's values (CYAN /
+/// AMBER / CRIMSON). No terminal grid yet renders the all-`N/A`
+/// placeholder (the layout never shifts when the result lands).
+fn render_grid_table(ui: &mut egui::Ui, data: &TelemetryData) {
+    // The terminal result grid of the last completed run, or the
+    // all-`N/A` zero grid when none has landed yet.
+    let grid = match data.bench.grid.as_ref() {
+        Some(grid) => grid.clone(),
+        None => BenchmarkGrid {
+            read_gbps: [0.0; 4],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [0.0; 4],
+        },
     };
+    // The live in-flight grid: the streamed events' latest value per
+    // cell (bandwidth ops only — the latency column stays 0.0).
+    let live = live_grid(&data.bench.progress);
+    // The 16 per-cell render views (text + color), row-major.
+    let mut cells = Vec::with_capacity(16);
+    for tier in &TIERS {
+        for metric in &METRICS {
+            let phase = cell_phase(data.bench.running, &live, *tier, *metric);
+            let text = phase_cell_text(phase, &grid, &live, *tier, *metric);
+            let color = phase_cell_color(phase, *metric, &text);
+            cells.push((text, color));
+        }
+    }
     egui_extras::TableBuilder::new(ui)
         .striped(false)
         .column(egui_extras::Column::initial(90.0))
@@ -224,9 +344,9 @@ fn render_grid_table(ui: &mut egui::Ui, grid: Option<&BenchmarkGrid>) {
                     row.col(|ui| {
                         ui.label(egui::RichText::new(tier_name(*tier)).strong());
                     });
-                    for (metric, (_, display)) in METRICS.iter().zip(row_cells.iter()) {
-                        let text = display.clone();
-                        let color = cell_color(*metric, &text);
+                    for (text, color) in row_cells.iter() {
+                        let text = text.clone();
+                        let color = *color;
                         row.col(move |ui| {
                             ui.label(egui::RichText::new(text).color(color));
                         });
@@ -424,5 +544,135 @@ mod tests {
         assert_eq!(cell_color(Metric::Read, "26.35 GB/s"), CYAN);
         assert_eq!(cell_color(Metric::Latency, "86.84 ns"), AMBER);
         assert_eq!(cell_color(Metric::Copy, "N/A"), CRIMSON);
+    }
+
+    /// One synthetic streamed progress event (the label is unused by
+    /// the pure core).
+    fn progress_event(tier: Tier, op: BenchOp, value: f64) -> StreamProgress {
+        StreamProgress {
+            cell_index: 0,
+            total_cells: 12,
+            tier,
+            op,
+            value,
+            label: "test (GB/s)".to_owned(),
+        }
+    }
+
+    /// (g) `live_grid`: each streamed event fills its (tier, op)
+    /// cell; the latest event per cell wins; the latency column and
+    /// the unmeasured cells stay 0.0.
+    #[test]
+    fn live_grid_fills_streamed_cells_latest_wins() {
+        let events = vec![
+            progress_event(Tier::Memory, BenchOp::Read, 26.0),
+            progress_event(Tier::Memory, BenchOp::Write, 43.0),
+            progress_event(Tier::L1, BenchOp::Read, 35.0),
+            progress_event(Tier::Memory, BenchOp::Read, 27.5), // latest wins
+        ];
+        let grid = live_grid(&events);
+        assert_eq!(grid.cell(Tier::Memory, Metric::Read), 27.5, "latest per cell wins");
+        assert_eq!(grid.cell(Tier::Memory, Metric::Write), 43.0);
+        assert_eq!(grid.cell(Tier::L1, Metric::Read), 35.0);
+        // Unmeasured cells — and the whole latency column (no
+        // progress events) — stay 0.0.
+        assert_eq!(grid.cell(Tier::Memory, Metric::Copy), 0.0);
+        assert_eq!(grid.cell(Tier::L2, Metric::Read), 0.0);
+        assert_eq!(grid.cell(Tier::L3, Metric::Copy), 0.0);
+        assert_eq!(grid.cell(Tier::L1, Metric::Latency), 0.0);
+        assert_eq!(grid.cell(Tier::L3, Metric::Latency), 0.0);
+    }
+
+    /// (h) `live_grid`: an empty stream and a stream of malformed
+    /// (non-finite / non-positive) values never panic and never
+    /// render as data — every cell stays 0.0.
+    #[test]
+    fn live_grid_empty_and_malformed_streams_stay_zero() {
+        let empty = live_grid(&[]);
+        assert_eq!(empty.cell(Tier::Memory, Metric::Read), 0.0);
+        assert_eq!(empty.cell(Tier::L3, Metric::Latency), 0.0);
+
+        let broken = vec![
+            progress_event(Tier::L1, BenchOp::Read, f64::NAN),
+            progress_event(Tier::L2, BenchOp::Write, f64::INFINITY),
+            progress_event(Tier::L3, BenchOp::Copy, -4.0),
+        ];
+        let grid = live_grid(&broken);
+        assert_eq!(grid.cell(Tier::L1, Metric::Read), 0.0, "NaN never renders");
+        assert_eq!(grid.cell(Tier::L2, Metric::Write), 0.0, "+inf never renders");
+        assert_eq!(grid.cell(Tier::L3, Metric::Copy), 0.0, "negative never renders");
+    }
+
+    /// (i) `cell_phase`: not running → `Terminal` for every cell (the
+    /// result grid); running → `Live` only for the cells the live
+    /// grid carries a value for, `NotStarted` otherwise (a cell not
+    /// started yet, or a latency cell — no progress events).
+    #[test]
+    fn cell_phase_tracks_running_and_streamed_values() {
+        let live = live_grid(&[
+            progress_event(Tier::Memory, BenchOp::Read, 26.0),
+            progress_event(Tier::L1, BenchOp::Copy, 31.8),
+        ]);
+        // Not running: every cell renders its terminal value.
+        for tier in &TIERS {
+            for metric in &METRICS {
+                assert_eq!(
+                    cell_phase(false, &live, *tier, *metric),
+                    CellPhase::Terminal
+                );
+            }
+        }
+        // Running: the streamed cells are live, the rest not started.
+        assert_eq!(cell_phase(true, &live, Tier::Memory, Metric::Read), CellPhase::Live);
+        assert_eq!(cell_phase(true, &live, Tier::L1, Metric::Copy), CellPhase::Live);
+        assert_eq!(
+            cell_phase(true, &live, Tier::Memory, Metric::Write),
+            CellPhase::NotStarted
+        );
+        assert_eq!(
+            cell_phase(true, &live, Tier::L2, Metric::Read),
+            CellPhase::NotStarted
+        );
+        assert_eq!(
+            cell_phase(true, &live, Tier::L3, Metric::Latency),
+            CellPhase::NotStarted
+        );
+    }
+
+    /// (j) The phase render: terminal cells keep the existing
+    /// [`cell_text`] / [`cell_color`] semantics; live cells show the
+    /// in-flight GB/s value + a `…` suffix in a dimmed CYAN (distinct
+    /// from the final value's full CYAN); not-started cells keep the
+    /// `N/A` placeholder in CRIMSON.
+    #[test]
+    fn phase_text_and_color_render_live_and_terminal_cells() {
+        let grid = fixture_grid();
+        let live = live_grid(&[progress_event(Tier::Memory, BenchOp::Read, 26.0)]);
+
+        // Terminal: the existing semantics.
+        let text = phase_cell_text(CellPhase::Terminal, &grid, &live, Tier::Memory, Metric::Read);
+        assert_eq!(text, "26.35 GB/s");
+        assert_eq!(phase_cell_color(CellPhase::Terminal, Metric::Read, &text), CYAN);
+        let text =
+            phase_cell_text(CellPhase::Terminal, &grid, &live, Tier::Memory, Metric::Latency);
+        assert_eq!(text, "86.84 ns");
+        assert_eq!(phase_cell_color(CellPhase::Terminal, Metric::Latency, &text), AMBER);
+        let text = phase_cell_text(CellPhase::Terminal, &grid, &live, Tier::L2, Metric::Write);
+        assert_eq!(text, "N/A");
+        assert_eq!(phase_cell_color(CellPhase::Terminal, Metric::Write, &text), CRIMSON);
+
+        // Live: the in-flight value + the `…` suffix, dimmed.
+        let text = phase_cell_text(CellPhase::Live, &grid, &live, Tier::Memory, Metric::Read);
+        assert_eq!(text, "26.00 GB/s…");
+        let color = phase_cell_color(CellPhase::Live, Metric::Read, &text);
+        assert_eq!(color, CYAN.gamma_multiply(0.6), "the live fill is dimmed");
+        assert_ne!(color, CYAN, "the live fill is distinct from the final value");
+
+        // NotStarted: the `N/A` placeholder.
+        assert_eq!(
+            phase_cell_text(CellPhase::NotStarted, &grid, &live, Tier::L3, Metric::Read),
+            "N/A"
+        );
+        assert_eq!(phase_cell_color(CellPhase::NotStarted, Metric::Read, "N/A"), CRIMSON);
     }
 }
