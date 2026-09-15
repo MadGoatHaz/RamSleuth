@@ -2606,6 +2606,7 @@ dependencies = [
  "ramsleuth-client",
  "ramsleuth-protocol",
  "ramsleuth-telemetry",
+ "serde",
  "serde_json",
 ]
 

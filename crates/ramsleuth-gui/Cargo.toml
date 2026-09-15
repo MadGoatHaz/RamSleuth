@@ -60,6 +60,12 @@ egui = "0.27"
 eframe = "0.27"
 egui_extras = "0.27"
 png = "0.17"
+# C6-26: the in-memory settings state's serde derives (D-C5 — the
+# XDG persistence follow-up round-trips `GuiSettings` through JSON).
+# The entry is the EXISTING workspace `serde` (derive) — no new
+# dependency, no `Cargo.lock` change (serde is already locked via
+# the wire crates + `serde_json`).
+serde = { workspace = true }
 serde_json = "1"
 ramsleuth-bench = { path = "../ramsleuth-bench" }
 ramsleuth-client = { path = "../ramsleuth-client" }
