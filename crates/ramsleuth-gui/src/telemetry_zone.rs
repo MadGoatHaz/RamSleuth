@@ -1,26 +1,39 @@
-//! Zone 1 renderer: the live memory-controller & subtimings matrix (P3-27).
+//! Zone 1 renderer: the live memory-controller & subtimings matrix
+//! (P3-27, regrouped per Grand Design §3.1 in C6-21).
 //!
 //! Grand Design §3.1 left panel: every cell of the AMD (and Intel, if
-//! present) readout as a `label / value` row of an `egui::Grid` — clocks &
-//! ratios (MCLK / UCLK / FCLK, UCLK:MCLK, gear, GDM / PDM), the 27 DRAM
-//! subtimings (primary / secondary / tertiary + turnarounds, ticks), the
-//! CAD bus (drive / termination, ohms), the voltages (mV→V) — each
-//! [`Section::Value`] printed in CYAN, each [`Section::Na`] printed
-//! `N/A (<reason>)` in CRIMSON, and the two semantic warnings in AMBER
-//! (a 1:2 UCLK:MCLK divide = gear desync; a SOC rail above 1.30 V = out of
-//! spec on AM5). The zone sits in a titled, bounded-height
-//! `egui::ScrollArea` so it fits the non-scrolling dashboard; a whole
-//! `Na` branch collapses to a single row (`AMD` / `Intel` + the reason),
-//! and no telemetry at all renders one crimson placeholder — never a
-//! panic (the no-panic contract, plan D5).
+//! present) readout as a `label / value` row — clocks & ratios
+//! (MCLK / UCLK / FCLK, UCLK:MCLK, gear, GDM / CR, PDM), the 27 DRAM
+//! subtimings (primary / secondary / tertiary + turnarounds, ticks),
+//! the CAD bus (drive / termination, ohms), the voltages (mV→V) —
+//! each [`Section::Value`] printed in CYAN, each [`Section::Na`]
+//! printed `N/A (<reason>)` in CRIMSON, and the two semantic warnings
+//! in AMBER (a 1:2 UCLK:MCLK divide = gear desync; a SOC rail above
+//! 1.30 V = out of spec on AM5).
 //!
-//! **Pure core:** [`timing_cells`] is I/O-free and deterministic (the unit
-//! tests exercise it without an egui context); [`render_telemetry_zone`]
-//! is the thin `egui` surface over it (the live render is verified in the
-//! QA phase).
+//! **Grouped layout (C6-21, items 2+3):** the flat single-column grid
+//! is now the 2-subcolumn × 3-section-pair matrix of §3.1 —
+//! `[Clocks & Ratios] | [Tertiary & Turnarounds]`,
+//! `[Primary Timings] | [CAD Bus Drive & Termination]`,
+//! `[Secondary Timings] | [Active System Voltages]` — one uniform
+//! four-column `egui::Grid` per vendor block (left label, left value,
+//! right label, right value), the section titles as each pair's bold
+//! header row, and the new `GDM / CR` row in `[Clocks & Ratios]`
+//! (gear down mode + DRAM command rate — e.g. `Gear 1 / 1T` or
+//! `Disabled / 2T`; an Intel channel's not-applicable cells degrade it
+//! to a crimson N/A pair). The zone sits in a titled, bounded-height
+//! `egui::ScrollArea` so it fits the non-scrolling dashboard; a whole
+//! `Na` vendor branch collapses to a single row (`AMD` / `Intel` +
+//! the reason), and no telemetry at all renders one crimson
+//! placeholder — never a panic (the no-panic contract, plan D5).
+//!
+//! **Pure core:** [`timing_cells`] is I/O-free and deterministic (the
+//! unit tests exercise it without an egui context);
+//! [`render_telemetry_zone`] is the thin `egui` surface over it (the
+//! live render is verified in the QA phase).
 
 use ramsleuth_telemetry::amd_readout::{
-    CadBus, ClockReadout, DivMode, GearMode, RttValue, TimingSet, VoltageSet,
+    CadBus, ClockReadout, CommandRate, DivMode, GearMode, RttValue, TimingSet, VoltageSet,
 };
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
@@ -41,147 +54,242 @@ const ZONE_MAX_HEIGHT: f32 = 420.0;
 /// out-of-spec warning (AMBER).
 const SOC_MAX_VOLTS: f64 = 1.30;
 
+/// The six §3.1 section titles, in layout order: the three left-
+/// subcolumn sections interleaved with the three right-subcolumn
+/// sections (row pair i = left `2i` | right `2i + 1`).
+const CLOCK_RATIOS: &str = "Clocks & Ratios";
+const TERTIARY_TURNAROUNDS: &str = "Tertiary & Turnarounds";
+const PRIMARY_TIMINGS: &str = "Primary Timings";
+const CAD_BUS: &str = "CAD Bus Drive & Termination";
+const SECONDARY_TIMINGS: &str = "Secondary Timings";
+const ACTIVE_VOLTAGES: &str = "Active System Voltages";
+
 // ---------------------------------------------------------------------
-// The pure cell builder (testable: no I/O, no egui context).
+// The cell model (the §3.1 grouped layout).
 // ---------------------------------------------------------------------
 
-/// The zone-1 content cells, in canonical dump order: the AMD section
-/// (a header row, then clocks & ratios, the 27 subtimings, the CAD bus,
-/// the voltages), then the Intel section (one header row + field block
-/// per decoded channel, including the channel-level RTL).
+/// One labeled group of key/value rows — a single section of the §3.1
+/// 2-subcolumn matrix (e.g. `[Clocks & Ratios]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimingSection {
+    /// The section title (the bold CYAN header row of its subcolumn).
+    pub title: String,
+    /// The section's key/value rows, in canonical order.
+    pub rows: Vec<(String, String)>,
+}
+
+/// One vendor block of the §3.1 matrix: the header label (AMD / Intel
+/// ch N) and its six grouped sections, or a single whole-block N/A
+/// display when the vendor branch degraded entire.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VendorTiming {
+    /// The block header label (AMD / Intel ch N).
+    pub header: String,
+    /// The six sections, in layout order (left 1, right 1, left 2,
+    /// right 2, left 3, right 3); empty when the block is degraded.
+    pub sections: Vec<TimingSection>,
+    /// The whole-block `N/A (<reason>)` display (the degraded state);
+    /// `None` when the sections are present.
+    pub degraded: Option<String>,
+}
+
+// ---------------------------------------------------------------------
+// The pure block builder (testable: no I/O, no egui context).
+// ---------------------------------------------------------------------
+
+/// The zone-1 vendor blocks, in canonical dump order: the AMD block
+/// (a header + the six grouped sections, or one degraded N/A row),
+/// then the Intel block (one header + section block per decoded
+/// channel, including the channel-level RTL — or one degraded row for
+/// an empty / absent readout).
 ///
 /// Pure and deterministic: the same snapshot always yields the same
-/// `Vec`. Each cell's display is the formatted text of its
-/// [`Section::Value`] (two-decimal MHz, one-decimal Ω, three-decimal V,
-/// bare ticks, `1:1` / `1:2`, `1x`…`4x`, `on` / `off`, `RZQ/N (x.x Ω)`)
-/// or `N/A (<reason>)` for a [`Section::Na`] (the dump renderer's form —
-/// [`NaReason`] carries no `Display`). A section that degraded whole
-/// collapses to one `(AMD | Intel, "N/A (<reason>)")` row (and an Intel
-/// readout with no decoded channels does the same with `not
-/// applicable`), so an all-Na snapshot still renders the complete matrix
-/// and never panics. A cell with an **empty display** is a section /
-/// channel **header** row (rendered bold by [`render_telemetry_zone`]).
-pub fn timing_cells(telemetry: &SystemMemoryTelemetry) -> Vec<(String, String)> {
-    let mut cells: Vec<(String, String)> = Vec::new();
+/// `Vec`. Each row's display is the formatted text of its
+/// [`Section::Value`] (two-decimal MHz, one-decimal Ω, three-decimal
+/// V, bare ticks, `1:1` / `1:2`, `1x`…`4x`, `on` / `off`,
+/// `Gear 1` / `Disabled` + `1T` / `2T`, `RZQ/N (x.x Ω)`) or
+/// `N/A (<reason>)` for a [`Section::Na`] (the dump renderer's form —
+/// [`NaReason`] carries no `Display`). A vendor branch that degraded
+/// whole collapses to one block with empty `sections` + the N/A
+/// display (and an Intel readout with no decoded channels does the
+/// same with `not applicable`), so an all-Na snapshot still renders
+/// the complete matrix and never panics.
+pub fn timing_cells(telemetry: &SystemMemoryTelemetry) -> Vec<VendorTiming> {
+    let mut blocks: Vec<VendorTiming> = Vec::new();
 
     match &telemetry.amd {
         Section::Value(readout) => {
-            cells.push((AMD.to_owned(), String::new())); // the section header row
-            push_readout(
-                &mut cells,
-                &readout.clocks,
-                &readout.timings,
-                &readout.cad_bus,
-                &readout.voltages,
-                None,
-            );
+            blocks.push(VendorTiming {
+                header: AMD.to_owned(),
+                sections: readout_sections(
+                    &readout.clocks,
+                    &readout.timings,
+                    &readout.cad_bus,
+                    &readout.voltages,
+                    None,
+                ),
+                degraded: None,
+            });
         }
-        Section::Na(reason) => cells.push((AMD.to_owned(), na_text(reason))),
+        Section::Na(reason) => blocks.push(degraded_block(AMD, reason)),
     }
 
     match &telemetry.intel {
         Section::Value(readout) => {
             if readout.channels.is_empty() {
-                cells.push((INTEL.to_owned(), na_text(&NaReason::NotApplicable)));
+                blocks.push(degraded_block(INTEL, &NaReason::NotApplicable));
             } else {
                 for channel in &readout.channels {
-                    cells.push((format!("{INTEL} ch {}", channel.index), String::new()));
-                    push_readout(
-                        &mut cells,
-                        &channel.clocks,
-                        &channel.timings,
-                        &channel.cad_bus,
-                        &channel.voltages,
-                        Some(&channel.rtl),
-                    );
+                    blocks.push(VendorTiming {
+                        header: format!("{INTEL} ch {}", channel.index),
+                        sections: readout_sections(
+                            &channel.clocks,
+                            &channel.timings,
+                            &channel.cad_bus,
+                            &channel.voltages,
+                            Some(&channel.rtl),
+                        ),
+                        degraded: None,
+                    });
                 }
             }
         }
-        Section::Na(reason) => cells.push((INTEL.to_owned(), na_text(reason))),
+        Section::Na(reason) => blocks.push(degraded_block(INTEL, reason)),
     }
 
-    cells
+    blocks
 }
 
-/// Appends one readout's field rows (the AMD branch or one Intel
-/// channel) in canonical order: clocks & ratios, the primary /
-/// secondary / tertiary + turnaround timings, the CAD drive /
-/// termination, the voltages, and (Intel only) the channel-level RTL.
-fn push_readout(
-    cells: &mut Vec<(String, String)>,
+/// One degraded vendor block: an empty section list + the whole-block
+/// N/A display (the single crimson row the renderer draws beneath the
+/// bold header).
+fn degraded_block(header: &str, reason: &NaReason) -> VendorTiming {
+    VendorTiming {
+        header: header.to_owned(),
+        sections: Vec::new(),
+        degraded: Some(na_text(reason)),
+    }
+}
+
+/// The six §3.1 sections of one readout (the AMD block or one Intel
+/// channel), in layout order: left subcolumn `[Clocks & Ratios]`
+/// (MCLK / UCLK / FCLK / UCLK:MCLK / gear / `GDM / CR` / PDM),
+/// `[Primary Timings]`, `[Secondary Timings]`; right subcolumn
+/// `[Tertiary & Turnarounds]`, `[CAD Bus Drive & Termination]`,
+/// `[Active System Voltages]`. The `GDM / CR` row (C6-21, item 3)
+/// shows the gear down mode + the DRAM command rate (e.g.
+/// `Gear 1 / 1T`, `Disabled / 2T`); an Intel channel's not-applicable
+/// GDM + command-rate cells degrade it to a crimson N/A pair. The
+/// channel-level RTL (Intel only — the frozen `TimingSet` has no
+/// slot) is appended to `[Clocks & Ratios]`.
+fn readout_sections(
     clocks: &ClockReadout,
     timings: &TimingSet,
     cad_bus: &CadBus,
     voltages: &VoltageSet,
     rtl: Option<&Section<u16>>,
-) {
-    // Clocks & ratios (MHz).
-    push(cells, "MCLK", mhz(&clocks.mclk_mhz));
-    push(cells, "UCLK", mhz(&clocks.uclk_mhz));
-    push(cells, "FCLK", mhz(&clocks.fclk_mhz));
-    push(cells, "UCLK:MCLK", div(&clocks.div_mode));
-    push(cells, "gear", gear(&clocks.gear_mode));
-    push(cells, "GDM", flag(&clocks.gdm));
-    push(cells, "PDM", flag(&clocks.pdm));
-
-    // Primary timings (ticks).
-    push(cells, "tCL", ticks(&timings.cl));
-    push(cells, "tRCDWR", ticks(&timings.rcwdwr));
-    push(cells, "tRCDRD", ticks(&timings.rcdrd));
-    push(cells, "tRP", ticks(&timings.rp));
-
-    // Secondary timings (ticks).
-    push(cells, "tRAS", ticks(&timings.ras));
-    push(cells, "tRC", ticks(&timings.rc));
-    push(cells, "tRRDS", ticks(&timings.rrds));
-    push(cells, "tRRLD", ticks(&timings.rrld));
-    push(cells, "tFAW", ticks(&timings.faw));
-
-    // Tertiary & turnarounds (ticks).
-    push(cells, "tWTRS", ticks(&timings.wtrs));
-    push(cells, "tWTRL", ticks(&timings.wtrl));
-    push(cells, "tWR", ticks(&timings.wr));
-    push(cells, "tRFC1", ticks(&timings.rfc1));
-    push(cells, "tRFC2", ticks(&timings.rfc2));
-    push(cells, "tRFCsb", ticks(&timings.rfcsb));
-    push(cells, "tCWL", ticks(&timings.cwl));
-    push(cells, "tRTP", ticks(&timings.rtp));
-    push(cells, "tRDWR", ticks(&timings.rdwr));
-    push(cells, "tWRRD", ticks(&timings.wrrd));
-    push(cells, "tRDRD(SD)", ticks(&timings.rdrd_sd));
-    push(cells, "tRDRD(CCD)", ticks(&timings.rdrd_dd));
-    push(cells, "tRDRD(SCL)", ticks(&timings.rdrd_scl));
-    push(cells, "tRDRD(SC)", ticks(&timings.rdrd_sc));
-    push(cells, "tWRWR(SD)", ticks(&timings.wrwr_sd));
-    push(cells, "tWRWR(CCD)", ticks(&timings.wrwr_dd));
-    push(cells, "tWRWR(SCL)", ticks(&timings.wrwr_scl));
-    push(cells, "tWRWR(SC)", ticks(&timings.wrwr_sc));
-
-    // CAD bus: drive / termination (ohms).
-    push(cells, "proc ODT", ohms(&cad_bus.proc_odt));
-    push(cells, "RTT nom", rtt(&cad_bus.rtt_nom));
-    push(cells, "RTT wr", rtt(&cad_bus.rtt_wr));
-    push(cells, "RTT park", rtt(&cad_bus.rtt_park));
-    push(cells, "CLK drive", ohms(&cad_bus.clk_drv));
-    push(cells, "ADD/CMD drive", ohms(&cad_bus.addr_cmd_drv));
-    push(cells, "CS/ODT drive", ohms(&cad_bus.cs_odt_drv));
-    push(cells, "CKE drive", ohms(&cad_bus.cke_drv));
-
-    // Voltages (mV → V display).
-    push(cells, "VDDCR_SOC", volts(&voltages.vddcr_soc_mv));
-    push(cells, "VDDIO_MEM", volts(&voltages.vddio_mem_mv));
-    push(cells, "VDD_MISC", volts(&voltages.vdd_misc_mv));
-    push(cells, "VPP", volts(&voltages.vpp_mv));
-
+) -> Vec<TimingSection> {
+    // Left subcolumn.
+    let mut clocks_rows: Vec<(String, String)> = vec![
+        row("MCLK", mhz(&clocks.mclk_mhz)),
+        row("UCLK", mhz(&clocks.uclk_mhz)),
+        row("FCLK", mhz(&clocks.fclk_mhz)),
+        row("UCLK:MCLK", div(&clocks.div_mode)),
+        row("gear", gear(&clocks.gear_mode)),
+        row("GDM / CR", gdm_cr(&clocks.gdm, &clocks.command_rate)),
+        row("PDM", flag(&clocks.pdm)),
+    ];
     // Channel-level RTL (Intel only; the frozen `TimingSet` has no slot).
     if let Some(rtl) = rtl {
-        push(cells, "RTL", ticks(rtl));
+        clocks_rows.push(row("RTL", ticks(rtl)));
     }
+
+    let primary_rows: Vec<(String, String)> = vec![
+        row("tCL", ticks(&timings.cl)),
+        row("tRCDWR", ticks(&timings.rcwdwr)),
+        row("tRCDRD", ticks(&timings.rcdrd)),
+        row("tRP", ticks(&timings.rp)),
+    ];
+
+    let secondary_rows: Vec<(String, String)> = vec![
+        row("tRAS", ticks(&timings.ras)),
+        row("tRC", ticks(&timings.rc)),
+        row("tRRDS", ticks(&timings.rrds)),
+        row("tRRLD", ticks(&timings.rrld)),
+        row("tFAW", ticks(&timings.faw)),
+    ];
+
+    // Right subcolumn.
+    let tertiary_rows: Vec<(String, String)> = vec![
+        row("tWTRS", ticks(&timings.wtrs)),
+        row("tWTRL", ticks(&timings.wtrl)),
+        row("tWR", ticks(&timings.wr)),
+        row("tRFC1", ticks(&timings.rfc1)),
+        row("tRFC2", ticks(&timings.rfc2)),
+        row("tRFCsb", ticks(&timings.rfcsb)),
+        row("tCWL", ticks(&timings.cwl)),
+        row("tRTP", ticks(&timings.rtp)),
+        row("tRDWR", ticks(&timings.rdwr)),
+        row("tWRRD", ticks(&timings.wrrd)),
+        row("tRDRD(SD)", ticks(&timings.rdrd_sd)),
+        row("tRDRD(CCD)", ticks(&timings.rdrd_dd)),
+        row("tRDRD(SCL)", ticks(&timings.rdrd_scl)),
+        row("tRDRD(SC)", ticks(&timings.rdrd_sc)),
+        row("tWRWR(SD)", ticks(&timings.wrwr_sd)),
+        row("tWRWR(CCD)", ticks(&timings.wrwr_dd)),
+        row("tWRWR(SCL)", ticks(&timings.wrwr_scl)),
+        row("tWRWR(SC)", ticks(&timings.wrwr_sc)),
+    ];
+
+    let cad_rows: Vec<(String, String)> = vec![
+        row("proc ODT", ohms(&cad_bus.proc_odt)),
+        row("RTT nom", rtt(&cad_bus.rtt_nom)),
+        row("RTT wr", rtt(&cad_bus.rtt_wr)),
+        row("RTT park", rtt(&cad_bus.rtt_park)),
+        row("CLK drive", ohms(&cad_bus.clk_drv)),
+        row("ADD/CMD drive", ohms(&cad_bus.addr_cmd_drv)),
+        row("CS/ODT drive", ohms(&cad_bus.cs_odt_drv)),
+        row("CKE drive", ohms(&cad_bus.cke_drv)),
+    ];
+
+    let voltage_rows: Vec<(String, String)> = vec![
+        row("VDDCR_SOC", volts(&voltages.vddcr_soc_mv)),
+        row("VDDIO_MEM", volts(&voltages.vddio_mem_mv)),
+        row("VDD_MISC", volts(&voltages.vdd_misc_mv)),
+        row("VPP", volts(&voltages.vpp_mv)),
+    ];
+
+    vec![
+        TimingSection {
+            title: CLOCK_RATIOS.to_owned(),
+            rows: clocks_rows,
+        },
+        TimingSection {
+            title: TERTIARY_TURNAROUNDS.to_owned(),
+            rows: tertiary_rows,
+        },
+        TimingSection {
+            title: PRIMARY_TIMINGS.to_owned(),
+            rows: primary_rows,
+        },
+        TimingSection {
+            title: CAD_BUS.to_owned(),
+            rows: cad_rows,
+        },
+        TimingSection {
+            title: SECONDARY_TIMINGS.to_owned(),
+            rows: secondary_rows,
+        },
+        TimingSection {
+            title: ACTIVE_VOLTAGES.to_owned(),
+            rows: voltage_rows,
+        },
+    ]
 }
 
-/// Appends one `(label, display)` row.
-fn push(cells: &mut Vec<(String, String)>, label: &str, display: String) {
-    cells.push((label.to_owned(), display));
+/// One `(label, display)` row.
+fn row(label: &str, display: String) -> (String, String) {
+    (label.to_owned(), display)
 }
 
 // ---------------------------------------------------------------------
@@ -189,8 +297,8 @@ fn push(cells: &mut Vec<(String, String)>, label: &str, display: String) {
 // GUI matrix reads exactly like the CLI `dump`).
 // ---------------------------------------------------------------------
 
-/// The human text of an absent cell: `N/A (<reason>)` (the renderer owns
-/// this form — [`NaReason`] carries no `Display`).
+/// The human text of an absent cell: `N/A (<reason>)` (the renderer
+/// owns this form — [`NaReason`] carries no `Display`).
 fn na_text(reason: &NaReason) -> String {
     match reason {
         NaReason::UnsupportedHardware => "N/A (unsupported hardware)".to_owned(),
@@ -267,6 +375,27 @@ fn flag(section: &Section<bool>) -> String {
     }
 }
 
+/// The `GDM / CR` row (C6-21, item 3): the gear down mode + the DRAM
+/// command rate (e.g. `Gear 1 / 1T`, `Disabled / 2T`) — the §3.1
+/// mockup row `GDM / CR: Disabled / 1T` (synchronous 1:1, GDM off).
+/// GDM on → `Gear 1`, off → `Disabled`; a not-applicable / failed
+/// cell degrades its own token to `N/A (<reason>)` (the combined row
+/// colors CRIMSON when either token is absent — see [`cell_color`]).
+/// No panic on any Na combination.
+fn gdm_cr(gdm: &Section<bool>, command_rate: &Section<CommandRate>) -> String {
+    let gdm = match gdm {
+        Section::Value(true) => "Gear 1".to_owned(),
+        Section::Value(false) => "Disabled".to_owned(),
+        Section::Na(reason) => na_text(reason),
+    };
+    let rate = match command_rate {
+        Section::Value(CommandRate::OneT) => "1T".to_owned(),
+        Section::Value(CommandRate::TwoT) => "2T".to_owned(),
+        Section::Na(reason) => na_text(reason),
+    };
+    format!("{gdm} / {rate}")
+}
+
 /// A memory-rail cell in volts (the frozen mV over 1000, three
 /// decimals — the plan's mV→V display rule).
 fn volts(section: &Section<u16>) -> String {
@@ -281,9 +410,10 @@ fn volts(section: &Section<u16>) -> String {
 // in the QA phase).
 // ---------------------------------------------------------------------
 
-/// Zone 1: render the timing matrix from `data` — a titled SLATE frame
-/// with a bounded-height vertical scroll area of one `egui::Grid` (it
-/// fits the non-scrolling dashboard; the grid scrolls inside the bound).
+/// Zone 1: render the timing matrix from `data` — a titled SLATE
+/// frame with a bounded-height vertical scroll area holding the §3.1
+/// 2-subcolumn × 3-section-pair grid per vendor block (it fits the
+/// non-scrolling dashboard; the grid scrolls inside the bound).
 ///
 /// Rows: the label in default text, the value in CYAN, an absent cell
 /// (`N/A (…)`) in CRIMSON, and the two warnings in AMBER — a 1:2
@@ -300,10 +430,17 @@ pub fn render_telemetry_zone(ui: &mut egui::Ui, data: &TelemetryData) {
         ui.add_space(4.0);
         match &data.telemetry {
             Some(telemetry) => {
-                let cells = timing_cells(telemetry);
+                let blocks = timing_cells(telemetry);
                 let _ = egui::ScrollArea::vertical()
                     .max_height(ZONE_MAX_HEIGHT)
-                    .show(ui, |ui| render_cell_grid(ui, &cells));
+                    .show(ui, |ui| {
+                        for (index, block) in blocks.iter().enumerate() {
+                            if index > 0 {
+                                ui.add_space(6.0);
+                            }
+                            render_vendor_block(ui, index, block);
+                        }
+                    });
             }
             None => {
                 ui.label(egui::RichText::new("N/A (no telemetry)").color(CRIMSON));
@@ -312,41 +449,115 @@ pub fn render_telemetry_zone(ui: &mut egui::Ui, data: &TelemetryData) {
     });
 }
 
-/// The `egui::Grid` body: one row per cell — a cell with an empty
-/// display is a single bold section / channel header row, otherwise a
-/// default-text label plus its semantic-color value.
-fn render_cell_grid(ui: &mut egui::Ui, cells: &[(String, String)]) {
-    let _ = egui::Grid::new("ramsleuth_telemetry_zone")
+/// One vendor block: the bold CYAN header (AMD / Intel ch N) and
+/// either the 2-subcolumn section grid, or the single N/A row of a
+/// degraded whole branch (CRIMSON via [`cell_color`]).
+fn render_vendor_block(ui: &mut egui::Ui, index: usize, block: &VendorTiming) {
+    ui.add(egui::Label::new(
+        egui::RichText::new(block.header.as_str()).strong().color(CYAN),
+    ));
+    match &block.degraded {
+        Some(display) => {
+            ui.add(egui::Label::new(
+                egui::RichText::new(display.as_str()).color(cell_color(&block.header, display)),
+            ));
+        }
+        None => {
+            ui.add_space(2.0);
+            render_section_grid(ui, index, &block.sections);
+        }
+    }
+}
+
+/// The §3.1 2-subcolumn body: one uniform four-column `egui::Grid`
+/// (left label, left value, right label, right value) — the block's
+/// six sections laid out as three row pairs
+/// (`[Clocks & Ratios] | [Tertiary & Turnarounds]`,
+/// `[Primary Timings] | [CAD Bus Drive & Termination]`,
+/// `[Secondary Timings] | [Active System Voltages]`). Each pair's
+/// title row is bold CYAN; the pair's key/value rows run to the
+/// longer section's depth (the shorter subcolumn rests on empty
+/// cells), with a breathing row between pairs.
+fn render_section_grid(ui: &mut egui::Ui, index: usize, sections: &[TimingSection]) {
+    let _ = egui::Grid::new(format!("ramsleuth_telemetry_sections_{index}"))
         .spacing(egui::vec2(12.0, 1.0))
         .min_col_width(80.0)
         .show(ui, |ui| {
-            for (label, display) in cells {
-                if display.is_empty() {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(label.as_str()).strong().color(CYAN),
-                    ));
-                } else {
-                    ui.add(egui::Label::new(egui::RichText::new(label.as_str())));
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(display.as_str())
-                            .color(cell_color(label.as_str(), display.as_str())),
-                    ));
+            let mut i = 0;
+            while i + 1 < sections.len() {
+                let (left, right) = (&sections[i], &sections[i + 1]);
+                section_pair(ui, left, right);
+                if i + 2 < sections.len() {
+                    // The breathing row between section pairs.
+                    ui.add(egui::Label::new(egui::RichText::new(" ")));
+                    ui.end_row();
                 }
-                ui.end_row();
+                i += 2;
             }
         });
+}
+
+/// One row pair: the two section titles (bold CYAN, the other two
+/// columns empty), then the pair's key/value rows — each cell is a
+/// label and its semantic-color value, or two empty cells for the
+/// column whose section ran dry.
+fn section_pair(ui: &mut egui::Ui, left: &TimingSection, right: &TimingSection) {
+    ui.add(egui::Label::new(
+        egui::RichText::new(left.title.as_str()).strong().color(CYAN),
+    ));
+    ui.add(empty_cell());
+    ui.add(egui::Label::new(
+        egui::RichText::new(right.title.as_str()).strong().color(CYAN),
+    ));
+    ui.add(empty_cell());
+    ui.end_row();
+
+    let rows = left.rows.len().max(right.rows.len());
+    for row_index in 0..rows {
+        grid_cell(ui, left.rows.get(row_index));
+        grid_cell(ui, right.rows.get(row_index));
+        ui.end_row();
+    }
+}
+
+/// One subcolumn cell: the label + its semantic-color value, or two
+/// empty cells when that section has no such row.
+fn grid_cell(ui: &mut egui::Ui, cell: Option<&(String, String)>) {
+    match cell {
+        Some((label, display)) => {
+            ui.add(egui::Label::new(egui::RichText::new(label.as_str())));
+            ui.add(egui::Label::new(
+                egui::RichText::new(display.as_str())
+                    .color(cell_color(label.as_str(), display.as_str())),
+            ));
+        }
+        None => {
+            ui.add(empty_cell());
+            ui.add(empty_cell());
+        }
+    }
+}
+
+/// The empty grid cell (a subcolumn with no such row, or the title-
+/// row gap between the subcolumns).
+fn empty_cell() -> egui::Label {
+    egui::Label::new(egui::RichText::new(" "))
 }
 
 /// The semantic color of one grid cell: CYAN for values, CRIMSON for
 /// absent cells (`N/A (…)`), AMBER for the two warning conditions — a
 /// 1:2 UCLK:MCLK divide (gear desync) and a VDDCR_SOC reading above
-/// [`SOC_MAX_VOLTS`] (out of spec on AM5).
+/// [`SOC_MAX_VOLTS`] (out of spec on AM5). The combined `GDM / CR`
+/// row is CRIMSON when either of its tokens is absent (e.g.
+/// `Disabled / N/A (driver missing)`); a fully-absent display already
+/// hits the `starts_with("N/A")` pick above.
 fn cell_color(label: &str, display: &str) -> egui::Color32 {
     if display.starts_with("N/A") {
         return CRIMSON;
     }
     match label {
         "UCLK:MCLK" if display == "1:2" => AMBER,
+        "GDM / CR" if display.contains("N/A") => CRIMSON,
         "VDDCR_SOC" => {
             match display
                 .strip_suffix(" V")
@@ -361,9 +572,9 @@ fn cell_color(label: &str, display: &str) -> egui::Color32 {
 }
 
 // ---------------------------------------------------------------------
-// Tests (headless: `timing_cells` + `cell_color` are pure — no egui
-// context, no I/O; the render path is compile-checked and verified
-// live in the QA phase).
+// Tests (headless: `timing_cells` + `cell_color` + `gdm_cr` are pure —
+// no egui context, no I/O; the render path is compile-checked and
+// verified live in the QA phase).
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
@@ -528,54 +739,93 @@ mod tests {
         }
     }
 
-    /// The display strings of every row labelled `key` (in order).
-    fn displays(cells: &[(String, String)], key: &str) -> Vec<String> {
-        cells
+    /// Every key/value row of every section of every block, in layout
+    /// order (the flat dump order the assertions read).
+    fn all_rows(blocks: &[VendorTiming]) -> Vec<(String, String)> {
+        blocks
             .iter()
+            .flat_map(|block| block.sections.iter().flat_map(|section| section.rows.iter().cloned()))
+            .collect()
+    }
+
+    /// The display strings of every row labelled `key` (in order).
+    fn displays(rows: &[(String, String)], key: &str) -> Vec<String> {
+        rows.iter()
             .filter(|(label, _)| label == key)
             .map(|(_, display)| display.clone())
             .collect()
     }
 
-    /// (a) A representative snapshot: non-empty, with formatted values
-    /// present (not all N/A) — clocks, the 1:2 ratio, tick timings,
-    /// RZQ Ω, and volts.
-    #[test]
-    fn representative_cells_carry_formatted_values() {
-        let cells = timing_cells(&representative());
-        assert!(!cells.is_empty(), "the cells must not be empty");
-        assert!(
-            cells.iter().any(|(_, display)| !display.is_empty() && !display.contains("N/A")),
-            "at least one formatted (non-N/A) value is expected: {cells:?}"
-        );
-
-        assert_eq!(displays(&cells, "MCLK"), vec!["1600.00 MHz"]);
-        assert_eq!(displays(&cells, "FCLK"), vec!["1800.00 MHz"]);
-        assert_eq!(displays(&cells, "UCLK:MCLK"), vec!["1:2"]);
-        assert_eq!(displays(&cells, "gear"), vec!["N/A (not applicable)"]);
-        assert_eq!(displays(&cells, "GDM"), vec!["on"]);
-        assert_eq!(displays(&cells, "tCL"), vec!["16"]);
-        assert_eq!(displays(&cells, "tFAW"), vec!["16"]);
-        assert_eq!(displays(&cells, "tRFC2"), vec!["N/A (parse error: fixture)"]);
-        assert_eq!(displays(&cells, "RTT nom"), vec!["RZQ/10 (24.0 Ω)"]);
-        assert_eq!(displays(&cells, "RTT wr"), vec!["45.0 Ω"]);
-        assert_eq!(displays(&cells, "RTT park"), vec!["N/A (not applicable)"]);
-        assert_eq!(displays(&cells, "VDDCR_SOC"), vec!["1.150 V"]);
-        assert_eq!(displays(&cells, "VPP"), vec!["1.800 V"]);
+    /// The §3.1 section titles of one block, in layout order.
+    fn section_titles(block: &VendorTiming) -> Vec<String> {
+        block.sections.iter().map(|section| section.title.clone()).collect()
     }
 
-    /// (b) The fully all-Na snapshot: one row per degraded section and
-    /// every display is an `N/A (…)` — no panic.
+    /// (a) A representative snapshot: the §3.1 grouped layout — six
+    /// sections in the canonical pair order, the formatted values
+    /// (not all N/A) present — clocks, the 1:2 ratio, tick timings,
+    /// RZQ Ω, volts — and the new `GDM / CR` row.
     #[test]
-    fn all_na_cells_are_complete_and_panic_free() {
-        let cells = timing_cells(&all_na());
-        assert!(!cells.is_empty(), "all-Na must still render the complete matrix");
+    fn representative_cells_carry_formatted_values() {
+        let blocks = timing_cells(&representative());
+        let rows = all_rows(&blocks);
+        assert!(!rows.is_empty(), "the rows must not be empty");
         assert!(
-            cells.iter().all(|(_, display)| display.contains("N/A")),
-            "every all-Na cell must carry an N/A display: {cells:?}"
+            rows.iter().any(|(_, display)| !display.is_empty() && !display.contains("N/A")),
+            "at least one formatted (non-N/A) value is expected: {rows:?}"
         );
-        assert_eq!(displays(&cells, "AMD"), vec!["N/A (driver missing)"]);
-        assert_eq!(displays(&cells, "Intel"), vec!["N/A (insufficient privilege)"]);
+
+        // The §3.1 grouped layout: the six sections in pair order
+        // (left 1 | right 1, left 2 | right 2, left 3 | right 3).
+        assert_eq!(
+            section_titles(&blocks[0]),
+            vec![
+                "Clocks & Ratios",
+                "Tertiary & Turnarounds",
+                "Primary Timings",
+                "CAD Bus Drive & Termination",
+                "Secondary Timings",
+                "Active System Voltages",
+            ]
+        );
+        let row_counts: Vec<usize> =
+            blocks[0].sections.iter().map(|section| section.rows.len()).collect();
+        assert_eq!(
+            row_counts,
+            vec![7, 18, 4, 8, 5, 4],
+            "7 = clocks (+ GDM / CR), 18 = tertiary, 4 = primary, 8 = CAD, 5 = secondary, 4 = voltages"
+        );
+
+        assert_eq!(displays(&rows, "MCLK"), vec!["1600.00 MHz"]);
+        assert_eq!(displays(&rows, "FCLK"), vec!["1800.00 MHz"]);
+        assert_eq!(displays(&rows, "UCLK:MCLK"), vec!["1:2"]);
+        assert_eq!(displays(&rows, "gear"), vec!["N/A (not applicable)"]);
+        assert_eq!(displays(&rows, "GDM / CR"), vec!["Gear 1 / 1T"]);
+        assert_eq!(displays(&rows, "PDM"), vec!["off"]);
+        assert_eq!(displays(&rows, "tCL"), vec!["16"]);
+        assert_eq!(displays(&rows, "tFAW"), vec!["16"]);
+        assert_eq!(displays(&rows, "tRFC2"), vec!["N/A (parse error: fixture)"]);
+        assert_eq!(displays(&rows, "RTT nom"), vec!["RZQ/10 (24.0 Ω)"]);
+        assert_eq!(displays(&rows, "RTT wr"), vec!["45.0 Ω"]);
+        assert_eq!(displays(&rows, "RTT park"), vec!["N/A (not applicable)"]);
+        assert_eq!(displays(&rows, "VDDCR_SOC"), vec!["1.150 V"]);
+        assert_eq!(displays(&rows, "VPP"), vec!["1.800 V"]);
+    }
+
+    /// (b) The fully all-Na snapshot: one degraded block per vendor
+    /// branch (empty sections + the whole-block N/A display) — no
+    /// panic.
+    #[test]
+    fn all_na_blocks_degrade_to_single_rows_panic_free() {
+        let blocks = timing_cells(&all_na());
+        assert_eq!(blocks.len(), 2, "one block per vendor branch");
+        assert_eq!(blocks[0].header, "AMD");
+        assert!(blocks[0].sections.is_empty());
+        assert_eq!(blocks[0].degraded.as_deref(), Some("N/A (driver missing)"));
+        assert_eq!(blocks[1].header, "Intel");
+        assert!(blocks[1].sections.is_empty());
+        assert_eq!(blocks[1].degraded.as_deref(), Some("N/A (insufficient privilege)"));
+        assert!(all_rows(&blocks).is_empty(), "a degraded block carries no section rows");
     }
 
     /// (c) Deterministic: two calls on the same snapshot are equal (all
@@ -587,35 +837,42 @@ mod tests {
         }
     }
 
-    /// (d) The vendor section labels are always present: a populated
-    /// section emits its header row, a degraded one its single N/A row
+    /// (d) The vendor block headers are always present: a populated
+    /// section emits its header, a degraded one its single N/A row
     /// (all three fixture shapes).
     #[test]
-    fn section_labels_are_always_present() {
+    fn vendor_headers_are_always_present() {
         for snapshot in [representative(), intel_populated(), all_na()] {
-            let cells = timing_cells(&snapshot);
+            let blocks = timing_cells(&snapshot);
             assert!(
-                cells.iter().any(|(label, _)| label == "AMD"),
-                "the AMD section label is expected: {cells:?}"
+                blocks.iter().any(|block| block.header == "AMD"),
+                "the AMD block header is expected: {blocks:?}"
             );
             assert!(
-                cells.iter().any(|(label, _)| label == "Intel" || label.starts_with("Intel ch ")),
-                "the Intel section label is expected: {cells:?}"
+                blocks.iter().any(|block| block.header == "Intel" || block.header.starts_with("Intel ch ")),
+                "the Intel block header is expected: {blocks:?}"
             );
         }
     }
 
     /// (e) A populated Intel branch renders per channel: one `Intel ch
-    /// N` header row per channel, the decoded channel 0 with its
-    /// readings (incl. the channel-level RTL), the degraded channel 1
-    /// all-N/A.
+    /// N` block per channel, the decoded channel 0 with its readings
+    /// (incl. the channel-level RTL appended to `[Clocks & Ratios]`),
+    /// the degraded channel 1 all-N/A; the Intel `GDM / CR` row
+    /// degrades to a crimson N/A pair (D-C11 not-applicable cells).
     #[test]
-    fn intel_cells_are_per_channel() {
-        let cells = timing_cells(&intel_populated());
-        assert!(cells.iter().any(|(label, _)| label == "Intel ch 0"));
-        assert!(cells.iter().any(|(label, _)| label == "Intel ch 1"));
+    fn intel_blocks_are_per_channel() {
+        let blocks = timing_cells(&intel_populated());
+        let headers: Vec<String> = blocks.iter().map(|block| block.header.clone()).collect();
+        assert_eq!(headers, vec!["AMD", "Intel ch 0", "Intel ch 1"]);
 
-        let mclk = displays(&cells, "MCLK");
+        // Channel 0: the Intel channel-level RTL row (8 clocks rows vs
+        // the AMD 7); the rest of the six sections are unchanged.
+        let counts: Vec<usize> = blocks[1].sections.iter().map(|s| s.rows.len()).collect();
+        assert_eq!(counts, vec![8, 18, 4, 8, 5, 4]);
+
+        let rows = all_rows(&blocks);
+        let mclk = displays(&rows, "MCLK");
         // channel 0 decodes; channel 1's frequency-ratio read failed.
         assert_eq!(
             mclk,
@@ -625,19 +882,53 @@ mod tests {
             ]
         );
 
-        let gear = displays(&cells, "gear");
+        let gear = displays(&rows, "gear");
         assert_eq!(gear[0], "1x", "channel 0 decodes gear 1");
         assert!(gear[1].contains("N/A"), "channel 1 is degraded");
 
-        let rtl = displays(&cells, "RTL");
+        let rtl = displays(&rows, "RTL");
         assert_eq!(rtl.len(), 2, "one RTL row per channel");
         assert_eq!(rtl[0], "6", "channel 0's decoded RTL (ticks)");
         assert!(rtl[1].contains("N/A"), "channel 1's degraded RTL");
+
+        // The GDM / CR row across all three blocks: the AMD block
+        // (the host's Na branch — degraded, no rows), then the two
+        // Intel channels' not-applicable N/A pairs.
+        let gdm_cr = displays(&rows, "GDM / CR");
+        assert_eq!(gdm_cr.len(), 2, "one GDM / CR row per decoded channel");
+        assert_eq!(
+            gdm_cr[0],
+            "N/A (not applicable) / N/A (not applicable)",
+            "Intel channel 0's honest D-C11 not-applicable cells"
+        );
+        assert!(gdm_cr[1].contains("N/A"), "channel 1 is degraded");
     }
 
-    /// (f) The semantic color picks (the renderer's cell coloring):
+    /// (f) The `GDM / CR` combined row: gear down mode + DRAM command
+    /// rate (e.g. `Gear 1 / 1T`, `Disabled / 2T`); each absent cell
+    /// degrades its own token to `N/A (<reason>)` — no panic on any
+    /// Na combination.
+    #[test]
+    fn gdm_cr_row_formats_the_command_rate() {
+        let on = Section::Value(true);
+        let off = Section::Value(false);
+        let gdm_na: Section<bool> = Section::na(NaReason::NotApplicable);
+        let rate_na: Section<CommandRate> = Section::na(NaReason::NotApplicable);
+        let one_t = Section::Value(CommandRate::OneT);
+        let two_t = Section::Value(CommandRate::TwoT);
+
+        assert_eq!(gdm_cr(&on, &one_t), "Gear 1 / 1T");
+        assert_eq!(gdm_cr(&off, &two_t), "Disabled / 2T");
+        assert_eq!(gdm_cr(&off, &one_t), "Disabled / 1T");
+        assert!(gdm_cr(&gdm_na, &rate_na).starts_with("N/A"));
+        assert!(gdm_cr(&off, &rate_na).contains("N/A"));
+        assert!(gdm_cr(&gdm_na, &two_t).contains("N/A"));
+    }
+
+    /// (g) The semantic color picks (the renderer's cell coloring):
     /// CYAN for values, CRIMSON for N/A, AMBER for the 1:2 divide and
-    /// a VDDCR_SOC reading above 1.30 V.
+    /// a VDDCR_SOC reading above 1.30 V; the combined `GDM / CR` row
+    /// is CRIMSON when either token is absent.
     #[test]
     fn cell_color_semantics() {
         assert_eq!(cell_color("MCLK", "1600.00 MHz"), CYAN);
@@ -649,5 +940,9 @@ mod tests {
         assert_eq!(cell_color("VDDCR_SOC", "1.300 V"), CYAN);
         assert_eq!(cell_color("VDDCR_SOC", "1.450 V"), AMBER);
         assert_eq!(cell_color("VDDCR_SOC", "N/A (not applicable)"), CRIMSON);
+        assert_eq!(cell_color("GDM / CR", "Gear 1 / 1T"), CYAN);
+        assert_eq!(cell_color("GDM / CR", "Disabled / 2T"), CYAN);
+        assert_eq!(cell_color("GDM / CR", "N/A (not applicable) / N/A (not applicable)"), CRIMSON);
+        assert_eq!(cell_color("GDM / CR", "Disabled / N/A (driver missing)"), CRIMSON);
     }
 }
