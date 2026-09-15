@@ -474,8 +474,10 @@ mod tests {
     use std::thread;
 
     use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message};
+    use ramsleuth_telemetry::amd_readout::CommandRate;
     use ramsleuth_telemetry::cpuid::{AmdZen, IntelGen};
     use ramsleuth_telemetry::intel_readout::decode_channel;
+    use ramsleuth_telemetry::SystemPlatform;
 
     use super::*;
 
@@ -492,6 +494,7 @@ mod tests {
                 gear_mode: Section::na(NaReason::NotApplicable),
                 gdm: Section::Value(true),
                 pdm: Section::Value(false),
+                command_rate: Section::Value(CommandRate::OneT),
             },
             timings: TimingSet {
                 cl: Section::Value(16),
@@ -568,6 +571,9 @@ mod tests {
             index,
             is_ddr5,
             maker: Section::Value("Samsung".to_owned()),
+            die_maker: Section::Value("SK hynix".to_owned()),
+            die_type: Section::na(NaReason::NotApplicable),
+            devices: Section::Value(8),
             part: Section::Value("M391A2K40DB".to_owned()),
             serial: Section::Value("S064531ABC".to_owned()),
             rank: Section::Value(2),
@@ -596,6 +602,14 @@ mod tests {
             amd: Section::Value(fixture_amd()),
             intel: Section::na(NaReason::UnsupportedHardware),
             spd: vec![spd_module(0x52, false), spd_module(0x53, true)],
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3500.0),
+                motherboard: Section::Value("Test Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(32.0),
+            dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
         }
     }
 
@@ -613,6 +627,9 @@ mod tests {
                 index: 0x50,
                 is_ddr5: false,
                 maker: Section::na(NaReason::DriverMissing),
+                die_maker: Section::na(NaReason::NotApplicable),
+                die_type: Section::na(NaReason::NotApplicable),
+                devices: Section::na(NaReason::NotApplicable),
                 part: Section::na(NaReason::NotApplicable),
                 serial: Section::na(NaReason::NotApplicable),
                 rank: Section::na(NaReason::ParseError("fixture".to_owned())),
@@ -620,6 +637,14 @@ mod tests {
                 speed_mts: Section::na(NaReason::ParseError("fixture".to_owned())),
                 profiles: Vec::new(),
             }],
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3500.0),
+                motherboard: Section::Value("Test Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: vec![Section::na(NaReason::ParseError("fixture".to_owned()))],
         }
     }
 
@@ -633,6 +658,14 @@ mod tests {
             amd: Section::na(NaReason::DriverMissing),
             intel: Section::na(NaReason::InsufficientPrivilege),
             spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
         }
     }
 
