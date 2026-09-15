@@ -17,7 +17,8 @@
 //!   RAM summary, channel, and sync mode — plus a transient export
 //!   notice. Over the three zones: the telemetry matrix on the left,
 //!   the benchmark grid stacked over the hardware / SPD status on the
-//!   right. Each frame takes one brief read of the shared
+//!   right, and the 10-minute trend history strip (C6-24 / C6-25)
+//!   along the bottom. Each frame takes one brief read of the shared
 //!   `Arc<RwLock<TelemetryData>>` and repaints on a 16 ms cadence
 //!   (~60 FPS).
 //! - **No render-thread I/O (plan D6):** the background
@@ -65,6 +66,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ramsleuth_gui::history::render_history;
 use ramsleuth_gui::{
     build_style, export_json, render_bench_zone, render_status_zone, render_telemetry_zone,
     snapshot_png, spawn_poller, BenchCmd, GuiAction, GuiError, TelemetryData, AMBER, CRIMSON,
@@ -101,6 +103,13 @@ const MIN_RIGHT_W: f32 = 440.0;
 const COLUMN_GAP: f32 = 8.0;
 /// The header strip's stroke (a dim line over the SLATE fill).
 const HEADER_STROKE: egui::Color32 = egui::Color32::from_rgb(0x34, 0x34, 0x40);
+/// The bottom history strip's height budget: `render_history`'s auto
+/// frame (C6-24) — the inner margin (2×6 pt) + the title line (~18
+/// pt) + the three 40-pt sparkline rows + the two 2-pt row gaps +
+/// the frame stroke (2 pt) ≈ 165 pt. The columns are allocated the
+/// remaining height so the strip stays visible without a
+/// window-level scroll (the single non-scrolling dashboard).
+const HISTORY_STRIP_H: f32 = 165.0;
 
 /// Usage text printed on parse errors (exit 2) — the ramsleuth-daemon
 /// P3-17 / ramsleuth-client P3-21 / ramsleuth-tui P3-24 precedent. The
@@ -573,10 +582,12 @@ impl RamSleuthApp {
 
     /// The three zones: the telemetry matrix (zone 1) on the left; the
     /// benchmark grid + controls (zone 2) stacked over the hardware /
-    /// SPD status (zone 3) on the right — all visible, non-scrolling
-    /// at the 1400×900 size (the right column degrades to a scroll
-    /// area in a small window). Returns the [`GuiAction`] the status
-    /// zone reported this frame (`None` when no button was clicked).
+    /// SPD status (zone 3) on the right; the 10-minute trend history
+    /// strip (C6-24 / C6-25) along the bottom — all visible,
+    /// non-scrolling at the 1400×900 size (the right column degrades
+    /// to a scroll area in a small window). Returns the [`GuiAction`]
+    /// the status zone reported this frame (`None` when no button was
+    /// clicked).
     fn render_zones(&self, ctx: &egui::Context, data: &TelemetryData) -> GuiAction {
         let mut action = GuiAction::None;
         let bench_tx = &self.bench_tx;
@@ -584,6 +595,13 @@ impl RamSleuthApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(SLATE))
             .show(ctx, |ui| {
+                // The columns share the panel height minus the bottom
+                // history strip (C6-24 / C6-25): a fixed budget keeps
+                // the strip visible without a window-level scroll (the
+                // single non-scrolling dashboard). A pathological
+                // window shorter than the budget collapses the row to
+                // zero (never a negative allocation, never a panic).
+                let row_h = (ui.available_size().y - HISTORY_STRIP_H - COLUMN_GAP).max(0.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
                     let avail = ui.available_size();
@@ -596,14 +614,14 @@ impl RamSleuthApp {
                     // Left: zone 1 (the live timing matrix, its own
                     // bounded scroll area).
                     ui.allocate_ui_with_layout(
-                        egui::Vec2::new(left_w, avail.y),
+                        egui::Vec2::new(left_w, row_h),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| render_telemetry_zone(ui, data),
                     );
                     ui.add_space(COLUMN_GAP);
                     // Right: zone 2 stacked over zone 3.
                     ui.allocate_ui_with_layout(
-                        egui::Vec2::new(right_w, avail.y),
+                        egui::Vec2::new(right_w, row_h),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
                             let _ = egui::ScrollArea::vertical().show(ui, |ui| {
@@ -614,6 +632,12 @@ impl RamSleuthApp {
                         },
                     );
                 });
+                // Bottom strip: the 10-minute trend history (C6-24 /
+                // C6-25) — the three sparkline series (MCLK /
+                // VDDCR_SOC / bandwidth) below the zones; the poller
+                // is the only writer (D6).
+                ui.add_space(COLUMN_GAP);
+                render_history(ui, &data.history);
             });
         action
     }

@@ -8,7 +8,10 @@
 //!
 //! - every 2 s runs one [`poll_telemetry`] cycle (a fresh
 //!   [`Client::connect`] + `GetTelemetry` — a new connection each cycle
-//!   survives a daemon restart, the TUI P3-24 precedent);
+//!   survives a daemon restart, the TUI P3-24 precedent), appending
+//!   one trend-history sample to `state.history` per successful poll
+//!   (the Na-guarded [`record_history_sample`] — C6-25) and clearing
+//!   the series when the daemon reconnects;
 //! - serves benchmark requests from the [`BenchCmd`] channel (the app
 //!   shell's bench-zone run buttons, P3-28) with [`run_bench`]: one
 //!   `StartBenchmark` send, then the reply stream — a `BenchStarted`
@@ -39,10 +42,12 @@ use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use ramsleuth_bench::{BenchmarkGrid, StreamProgress, StreamTarget};
+use ramsleuth_bench::{BenchOp, BenchmarkGrid, StreamProgress, StreamTarget, Tier};
 use ramsleuth_client::Client;
 use ramsleuth_protocol::{BenchMode, Request, Response};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
+
+use crate::history::HistoryState;
 
 /// Telemetry poll cadence of the background loop (the plan's 2 s; a
 /// fresh connection per cycle survives daemon restarts).
@@ -75,7 +80,8 @@ pub struct BenchState {
 }
 
 /// The GUI's presentation state: the current telemetry snapshot, the
-/// bench state, and the daemon connection status.
+/// bench state, the daemon connection status, and the 10-minute
+/// trend history (C6-25).
 ///
 /// One `TelemetryData` lives behind an `Arc<RwLock<…>>` shared with the
 /// render thread (P3-30); the background poller is its only writer.
@@ -98,6 +104,14 @@ pub struct TelemetryData {
     /// `ClientError` text, or the daemon's wire `Error` message);
     /// cleared by the next success. `None` = healthy.
     pub error: Option<String>,
+    /// The 10-minute trend series (C6-24 / C6-25): MCLK (MHz),
+    /// VDDCR_SOC (mV), and the memory-read bandwidth (GB/s). The
+    /// background poller is the only writer (D6): it appends one
+    /// sample per successful poll (the Na-guarded
+    /// [`record_history_sample`]) and clears the series on a daemon
+    /// reconnect; the render thread reads it for
+    /// [`crate::history::render_history`].
+    pub history: HistoryState,
 }
 
 /// One benchmark request from the UI to the background poller (the
@@ -123,8 +137,10 @@ pub struct BenchCmd {
 /// friendly "start it with …" text, a timeout, a protocol violation, an
 /// i/o failure) is recorded in `state.error` with `daemon_status`
 /// degrading to `disconnected`; a successful `Telemetry` arm stores the
-/// snapshot, stamps `last_update`, reports `connected: <socket>`, and
-/// clears the error; a structured `Error` reply records its message.
+/// snapshot, stamps `last_update`, reports `connected: <socket>`,
+/// clears the error, and appends one trend-history sample (C6-25) —
+/// clearing the series first when the daemon reconnected; a
+/// structured `Error` reply records its message.
 /// The function always returns `Ok(())` — errors are reported through
 /// the state, not a `Result` error, so the caller's loop keeps running
 /// against a flapping daemon.
@@ -139,10 +155,20 @@ pub fn poll_telemetry(socket: &Path, state: &mut TelemetryData) -> Result<(), St
     };
     match client.request(&Request::GetTelemetry) {
         Ok(Response::Telemetry(telemetry)) => {
+            // Reconnect prime (C6-25): the previous cycle recorded a
+            // non-connected status (the first poll, or the daemon
+            // came back after an outage) — clear the stale series so
+            // the sparkline restarts cleanly instead of drawing a gap
+            // across the outage.
+            let reconnected = !state.daemon_status.starts_with("connected");
             state.telemetry = Some(telemetry);
             state.last_update = Some(Instant::now());
             state.daemon_status = format!("connected: {}", socket.display());
             state.error = None;
+            if reconnected {
+                state.history.clear();
+            }
+            record_history_sample(state);
         }
         Ok(Response::Error(message)) => {
             // The daemon was reachable but rejected the request (a
@@ -167,6 +193,64 @@ pub fn poll_telemetry(socket: &Path, state: &mut TelemetryData) -> Result<(), St
         }
     }
     Ok(())
+}
+
+/// Append one trend-history sample (C6-25) for the just-landed
+/// snapshot: MCLK (MHz) + VDDCR_SOC (mV) from the AMD clock /
+/// voltage readout, and the bandwidth (GB/s) from
+/// [`latest_memory_read_bw`].
+///
+/// The Na guard (the no-panic contract, D5): a sample is appended
+/// only when the AMD branch carries both cells as values — an Intel
+/// snapshot, a driver-missing / degraded AMD readout, or a
+/// non-finite MCLK pushes nothing (the series gains no holes; the
+/// sparkline simply holds its last shape). `vddcr_soc` is a `u16`, so
+/// a present cell is always finite.
+fn record_history_sample(state: &mut TelemetryData) {
+    let Some(readout) = state.telemetry.as_ref().and_then(|t| t.amd.value()) else {
+        return; // Intel silicon / the driver missing: no MCLK / VDDCR_SOC.
+    };
+    let Some(mclk_mhz) = readout
+        .clocks
+        .mclk_mhz
+        .value()
+        .copied()
+        .filter(|v| v.is_finite())
+    else {
+        return; // MCLK absent / non-finite: skip the whole sample.
+    };
+    let Some(vddcr_soc_mv) = readout.voltages.vddcr_soc_mv.value().copied() else {
+        return; // VDDCR_SOC absent: skip the whole sample.
+    };
+    state
+        .history
+        .push(mclk_mhz, f64::from(vddcr_soc_mv), latest_memory_read_bw(state));
+}
+
+/// The latest memory-read bandwidth figure (GB/s) for the history
+/// series: the newest streamed `Memory · Read` progress event when it
+/// carries a finite, positive value (a live run), else the terminal
+/// grid's memory-read cell (row 0 — the [`Tier::Memory`] slot, the
+/// C6-22 mapping), else `0.0` (no benchmark data yet — the row plots
+/// zero rather than a hole). Non-finite / non-positive values never
+/// count as a figure (the bench zone's live-cell rule).
+fn latest_memory_read_bw(state: &TelemetryData) -> f64 {
+    if let Some(event) = state
+        .bench
+        .progress
+        .iter()
+        .rev()
+        .find(|e| e.tier == Tier::Memory && e.op == BenchOp::Read && e.value.is_finite() && e.value > 0.0)
+    {
+        return event.value;
+    }
+    if let Some(grid) = &state.bench.grid {
+        let value = grid.read_gbps[0];
+        if value.is_finite() && value > 0.0 {
+            return value;
+        }
+    }
+    0.0
 }
 
 /// One benchmark run: connect to the daemon at `socket`, send the
@@ -337,9 +421,13 @@ mod tests {
 
     use ramsleuth_bench::{BenchOp, Tier};
     use ramsleuth_protocol::{FrameError, Message, decode_frame, encode_frame};
-    use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
+    use ramsleuth_telemetry::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
+    use ramsleuth_telemetry::amd_readout::map_amd;
+    use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::SystemPlatform;
+
+    use crate::history::HISTORY_CAPACITY;
 
     use super::*;
 
@@ -431,6 +519,26 @@ mod tests {
             Self { handle }
         }
 
+        /// A multi-connection variant: accepts up to `max_conns`
+        /// connections in order, handing each its 1-based index +
+        /// stream to `handler` (the poller opens a fresh connection
+        /// per cycle — the history accumulation test).
+        fn spawn_multi(
+            sock: &TempSocket,
+            max_conns: usize,
+            mut handler: impl FnMut(usize, UnixStream) + Send + 'static,
+        ) -> Self {
+            let listener = UnixListener::bind(sock.path()).expect("test socket must bind");
+            let handle = thread::spawn(move || {
+                for index in 1..=max_conns {
+                    if let Ok((stream, _)) = listener.accept() {
+                        handler(index, stream);
+                    }
+                }
+            });
+            Self { handle }
+        }
+
         fn join(self) {
             self.handle.join().expect("stand-in thread must not panic");
         }
@@ -493,6 +601,13 @@ mod tests {
             "the status must name the socket, got: {status}"
         );
         assert!(state.last_update.is_some(), "a successful poll must stamp last_update");
+        // The stand-in snapshot is all-Na AMD (a driver-missing
+        // host): the Na guard appends no history sample — no panic
+        // (the no-panic contract, D5).
+        assert!(
+            state.history.is_empty(),
+            "an all-Na AMD readout must append no history sample"
+        );
         stand_in.join();
     }
 
@@ -694,5 +809,351 @@ mod tests {
         assert_eq!(state.bench.run_id, Some(42), "the run id must stay recorded");
         assert!(state.error.is_none(), "a clean cancel must not record an error");
         stand_in.join();
+    }
+
+    // ------------------------------------------------------------------
+    // C6-25: the trend-history wiring — one sample per successful
+    // poll, the Na guard, the capacity wrap, the reconnect prime.
+    // ------------------------------------------------------------------
+
+    /// A snapshot with a populated AMD readout: the [`map_amd`]
+    /// output over an in-range synthetic PM-table snapshot (the
+    /// DDR4-3200-class fixture the telemetry crate's `good_snapshot`
+    /// test uses) — MCLK = `mclk_mhz` (the wrap test steps it; every
+    /// value stays inside the clock range gate) and VDDCR_SOC = 1050
+    /// mV. The host (Intel branch, platform, SPD) stays all-Na.
+    fn populated_snapshot(mclk_mhz: u16) -> SystemMemoryTelemetry {
+        let readout = map_amd(&AmdPmSnapshot {
+            version: 0x0007_0B02,
+            mclk_mhz,
+            uclk_mhz: 1600,
+            fclk_mhz: 1600,
+            div_mode: 0,
+            gdm: 1,
+            pdm: 0,
+            command_rate: 0,
+            timings: AmdPmTimings {
+                cl: 16,
+                rcwdwr: 16,
+                rcdrd: 16,
+                rp: 16,
+                ras: 32,
+                rc: 48,
+                rrds: 4,
+                rrld: 4,
+                faw: 16,
+                wtrs: 8,
+                wtrl: 8,
+                wr: 8,
+                rfc1: 160,
+                rfc2: 160,
+                rfcsb: 160,
+                cwl: 16,
+                rtp: 8,
+                rdwr: 8,
+                wrrd: 4,
+                rdrd_sd: 100,
+                rdrd_dd: 101,
+                rdrd_scl: 102,
+                rdrd_sc: 103,
+                wrwr_sd: 104,
+                wrwr_dd: 105,
+                wrwr_scl: 106,
+                wrwr_sc: 107,
+            },
+            cad_bus: AmdPmCadBus {
+                proc_odt: 5,
+                rtt_nom: 2,
+                rtt_wr: 0,
+                rtt_park: 4,
+                clk_drv: 6,
+                addr_cmd_drv: 8,
+                cs_odt_drv: 10,
+                cke_drv: 12,
+            },
+            voltages: AmdPmVoltages {
+                vddcr_soc_mv: 1050,
+                vddio_mem_mv: 1350,
+                vdd_misc_mv: 1000,
+                vpp_mv: 1800,
+            },
+        });
+        SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Amd(AmdZen::Zen3),
+                brand: "Ryzen 9 5950X".to_owned(),
+            },
+            amd: Section::Value(readout),
+            intel: Section::na(NaReason::NotApplicable),
+            spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
+        }
+    }
+
+    /// (g1) One successful poll with a populated AMD readout appends
+    /// exactly one history sample: MCLK (MHz) + VDDCR_SOC (mV) from
+    /// the readout, the bandwidth from the terminal bench grid's
+    /// memory-read cell (row 0).
+    #[test]
+    fn poll_telemetry_pushes_one_history_sample_per_success() {
+        let sock = TempSocket::new("history-once");
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetTelemetry)) => {}
+                other => panic!("stand-in expected GetTelemetry, got {other:?}"),
+            }
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(
+                populated_snapshot(1800),
+            )))
+            .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+
+        let mut state = TelemetryData::default();
+        // A terminal grid from an earlier run: the memory-read cell
+        // (row 0) feeds the bandwidth series.
+        state.bench.grid = Some(BenchmarkGrid {
+            read_gbps: [26.35, 0.0, 0.0, 0.0],
+            write_gbps: [0.0, 0.0, 0.0, 0.0],
+            copy_gbps: [0.0, 0.0, 0.0, 0.0],
+            latency_ns: [0.0, 0.0, 0.0, 0.0],
+        });
+
+        poll_telemetry(sock.path(), &mut state).expect("poll_telemetry must not error");
+        stand_in.join();
+
+        assert_eq!(state.history.len(), 1, "one successful poll appends exactly one sample");
+        assert_eq!(
+            *state.history.mclk.last().expect("the mclk series has the sample"),
+            1800.0,
+            "MCLK lands in MHz"
+        );
+        assert_eq!(
+            *state.history.vddcr_soc.last().expect("the vddcr_soc series has the sample"),
+            1050.0,
+            "VDDCR_SOC lands in mV"
+        );
+        assert_eq!(
+            *state.history
+                .bandwidth
+                .last()
+                .expect("the bandwidth series has the sample"),
+            26.35,
+            "the bandwidth is the terminal grid's memory-read cell"
+        );
+    }
+
+    /// (g2) The bandwidth source picks: the newest streamed
+    /// `Memory · Read` event (a live run) over the terminal grid, the
+    /// grid when no progress streams, `0.0` when neither carries a
+    /// value — a non-finite / non-positive event never counts.
+    #[test]
+    fn latest_memory_read_bw_source_priority() {
+        // Neither: no progress, no grid → 0.0.
+        let idle = TelemetryData::default();
+        assert_eq!(latest_memory_read_bw(&idle), 0.0, "no bench data at all → 0.0");
+
+        // Terminal grid only (row 0 = the Memory read cell).
+        let grid_only = TelemetryData {
+            bench: BenchState {
+                grid: Some(BenchmarkGrid {
+                    read_gbps: [26.35, 0.0, 0.0, 0.0],
+                    write_gbps: [0.0, 0.0, 0.0, 0.0],
+                    copy_gbps: [0.0, 0.0, 0.0, 0.0],
+                    latency_ns: [0.0, 0.0, 0.0, 0.0],
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(latest_memory_read_bw(&grid_only), 26.35, "the terminal grid cell");
+
+        // A live `Memory · Read` event beats the (older) terminal
+        // grid; a newer non-Memory / non-Read event is ignored.
+        let live = TelemetryData {
+            bench: BenchState {
+                progress: vec![
+                    StreamProgress {
+                        cell_index: 1,
+                        total_cells: 3,
+                        tier: Tier::L1,
+                        op: BenchOp::Read,
+                        value: 99.0,
+                        label: "L1 · Read (GB/s)".to_owned(),
+                    },
+                    StreamProgress {
+                        cell_index: 0,
+                        total_cells: 3,
+                        tier: Tier::Memory,
+                        op: BenchOp::Read,
+                        value: 42.0,
+                        label: "Memory · Read (GB/s)".to_owned(),
+                    },
+                ],
+                grid: Some(BenchmarkGrid {
+                    read_gbps: [26.35, 0.0, 0.0, 0.0],
+                    write_gbps: [0.0, 0.0, 0.0, 0.0],
+                    copy_gbps: [0.0, 0.0, 0.0, 0.0],
+                    latency_ns: [0.0, 0.0, 0.0, 0.0],
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            latest_memory_read_bw(&live),
+            42.0,
+            "the newest Memory · Read event wins over the grid"
+        );
+
+        // A non-finite `Memory · Read` value + a `Memory · Write`
+        // event are both ignored: the figure falls back to the grid.
+        let bad_live = TelemetryData {
+            bench: BenchState {
+                progress: vec![
+                    StreamProgress {
+                        cell_index: 0,
+                        total_cells: 3,
+                        tier: Tier::Memory,
+                        op: BenchOp::Read,
+                        value: f64::NAN,
+                        label: "Memory · Read (GB/s)".to_owned(),
+                    },
+                    StreamProgress {
+                        cell_index: 0,
+                        total_cells: 3,
+                        tier: Tier::Memory,
+                        op: BenchOp::Write,
+                        value: 42.0,
+                        label: "Memory · Write (GB/s)".to_owned(),
+                    },
+                ],
+                grid: Some(BenchmarkGrid {
+                    read_gbps: [26.35, 0.0, 0.0, 0.0],
+                    write_gbps: [0.0, 0.0, 0.0, 0.0],
+                    copy_gbps: [0.0, 0.0, 0.0, 0.0],
+                    latency_ns: [0.0, 0.0, 0.0, 0.0],
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            latest_memory_read_bw(&bad_live),
+            26.35,
+            "a NaN read event + a write event fall back to the grid"
+        );
+    }
+
+    /// (g3) N successful polls append N samples (one per poll — the
+    /// poller stays the only writer, D6), and past the 300-sample
+    /// capacity the oldest is evicted: the series caps at
+    /// [`HISTORY_CAPACITY`], the five oldest samples are gone, the
+    /// newest is last, and the order holds (a reconnect never fires —
+    /// the status stays `connected` throughout, so no clear).
+    #[test]
+    fn poll_telemetry_appends_per_poll_and_wraps_at_capacity() {
+        let total = HISTORY_CAPACITY + 5;
+        let sock = TempSocket::new("history-wrap");
+        let stand_in = DaemonStandIn::spawn_multi(&sock, total, |index, mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetTelemetry)) => {}
+                other => panic!("stand-in expected GetTelemetry, got {other:?}"),
+            }
+            // One sample per connection: MCLK = the 1-based index (so
+            // the eviction is observable); VDDCR_SOC is constant.
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(
+                populated_snapshot(index as u16),
+            )))
+            .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+
+        let mut state = TelemetryData::default();
+        for _ in 0..total {
+            poll_telemetry(sock.path(), &mut state).expect("poll_telemetry must not error");
+        }
+        stand_in.join();
+
+        assert_eq!(
+            state.history.len(),
+            HISTORY_CAPACITY,
+            "the series caps at the ring capacity"
+        );
+        let mclk = state.history.mclk.iter().copied().collect::<Vec<_>>();
+        assert_eq!(
+            mclk.first().copied(),
+            Some(6.0),
+            "the five oldest samples (MCLK 1..=5) are evicted"
+        );
+        assert_eq!(mclk.last().copied(), Some(total as f64), "the newest sample is last");
+        assert!(
+            mclk.windows(2).all(|w| w[1] > w[0]),
+            "the samples stay in poll order (oldest → newest)"
+        );
+        assert!(
+            state.history.vddcr_soc.iter().all(|v| *v == 1050.0),
+            "the constant VDDCR_SOC rail survives the wrap"
+        );
+    }
+
+    /// (g4) Reconnect prime: two continuous successful polls append
+    /// two samples (no clear — the status stays `connected`); a
+    /// daemon drop records `disconnected`, and the next successful
+    /// poll clears the stale series before appending one fresh
+    /// sample.
+    #[test]
+    fn history_clears_on_reconnect_not_on_continuous_polls() {
+        // Phase 1: two continuous successful polls (a fresh
+        // connection each) → two samples, no clear.
+        let sock = TempSocket::new("history-reconnect");
+        let stand_in = DaemonStandIn::spawn_multi(&sock, 2, |_index, mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetTelemetry)) => {}
+                other => panic!("stand-in expected GetTelemetry, got {other:?}"),
+            }
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(
+                populated_snapshot(1800),
+            )))
+            .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+        let mut state = TelemetryData::default();
+        poll_telemetry(sock.path(), &mut state).expect("first poll must not error");
+        poll_telemetry(sock.path(), &mut state).expect("second poll must not error");
+        stand_in.join();
+        assert_eq!(state.history.len(), 2, "two continuous polls append two samples");
+
+        // Phase 2: the daemon drops (a missing socket records
+        // `disconnected`), then comes back → the stale series is
+        // cleared and the reconnect poll appends exactly one fresh
+        // sample.
+        let down_sock = TempSocket::new("history-reconnect-down");
+        poll_telemetry(down_sock.path(), &mut state).expect("the down poll must not error");
+        assert_eq!(state.daemon_status, "disconnected");
+
+        let back_sock = TempSocket::new("history-reconnect-back");
+        let stand_in = DaemonStandIn::spawn(&back_sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetTelemetry)) => {}
+                other => panic!("stand-in expected GetTelemetry, got {other:?}"),
+            }
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(
+                populated_snapshot(1800),
+            )))
+            .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+        poll_telemetry(back_sock.path(), &mut state).expect("the reconnect poll must not error");
+        stand_in.join();
+        assert_eq!(state.history.len(), 1, "the reconnect clears the stale series");
+        assert_eq!(*state.history.mclk.last().expect("the fresh sample"), 1800.0);
     }
 }
