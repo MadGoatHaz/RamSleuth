@@ -3,6 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-CYCLE6.md` (Cycle 6 GUI workstream — the handover §13 primary name, alt `PLAN-PHASE7.md`; Phase 6/Cycle 5 retained as `plans/PLAN-PHASE6.md`, Phase 5 as `plans/PLAN-PHASE5.md`; Phase 1 as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
+(no active leases)
 
 @@@ CURRENT_STATE @@@
 Cycle 6 (GUI workstream) — C6-01 implemented on branch/chunk-c6-01 (pushed, awaiting review/merge); telemetry 154/154 + main 6/6 green; clippy -D warnings clean.
