@@ -699,9 +699,10 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use ramsleuth_bench::BenchOp;
-    use ramsleuth_telemetry::amd_readout::AmdReadout;
+    use ramsleuth_telemetry::amd_readout::{AmdReadout, CommandRate};
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo};
     use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
+    use ramsleuth_telemetry::SystemPlatform;
 
     /// Draw `state` into a 100×30 in-memory terminal and return the
     /// rendered buffer as text (one line per row, trailing spaces
@@ -742,6 +743,7 @@ mod tests {
                 gear_mode: Section::na(NaReason::NotApplicable),
                 gdm: Section::Value(true),
                 pdm: Section::Value(false),
+                command_rate: Section::Value(CommandRate::OneT),
             },
             timings: TimingSet {
                 cl: Section::Value(16),
@@ -797,6 +799,9 @@ mod tests {
             index: 0x52,
             is_ddr5: false,
             maker: Section::Value("Samsung".to_owned()),
+            die_maker: Section::Value("SK hynix".to_owned()),
+            die_type: Section::na(NaReason::NotApplicable),
+            devices: Section::Value(8),
             part: Section::Value("M391A2K40DB".to_owned()),
             serial: Section::na(NaReason::NotApplicable),
             rank: Section::Value(2),
@@ -826,6 +831,14 @@ mod tests {
                 amd: Section::Value(fixture_amd()),
                 intel: Section::na(NaReason::UnsupportedHardware),
                 spd: vec![fixture_module()],
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::Value(3500.0),
+                    motherboard: Section::Value("Test Board".to_owned()),
+                    bios: Section::Value("1.0".to_owned()),
+                    agesa: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::Value(16.0),
+                dimm_sizes: vec![Section::Value(16.0)],
             }),
             bench: BenchState::default(),
             daemon_status: "up · /tmp/ramsleuth.sock".to_owned(),
@@ -975,6 +988,14 @@ mod tests {
                     ],
                 }),
                 spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::Value(2400.0),
+                    motherboard: Section::na(NaReason::NotApplicable),
+                    bios: Section::na(NaReason::NotApplicable),
+                    agesa: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::na(NaReason::NotApplicable),
+                dimm_sizes: Vec::new(),
             }),
             bench: BenchState::default(),
             daemon_status: "up".to_owned(),
