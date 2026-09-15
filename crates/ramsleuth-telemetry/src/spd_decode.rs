@@ -26,7 +26,7 @@
 //! | `0x200..0x220` (DDR5)                 | Module part number (32 ASCII chars)                |
 //! | `0x91..0xA1`                           | Module serial number (16 ASCII chars)              |
 //! | `0xD0` / `0xF0` (DDR4)                 | XMP 2.0 profiles 1/2 (32-byte blocks)              |
-//! | `0x200..0x300` (DDR5)                  | XMP 3.0 / EXPO region (256 B; four 32-byte blocks at `+16+32n`) — collides with the DDR5 part number at `0x200` (C7-03 moves the base to `0x300`) |
+//! | `0x300..0x400` (DDR5)                  | XMP 3.0 / EXPO region (256 B; four 32-byte blocks at `+16+32n`, JESD79-5) — coexists with the DDR5 part number at `0x200..0x220` (C7-03 moved the base out of the part-number region) |
 //!
 //! DDR5 byte `0x13` / `0x20` / `0x80` encodings are a documented
 //! P2-04-style model (the live test host is DDR4); live reconciliation
@@ -49,7 +49,8 @@
 //!   `0x0A`, and its checksum (the sum of all 32 bytes, including the
 //!   checksum byte, is `0` mod 256); a blank / mis-revision /
 //!   bad-checksum slot is skipped, but the module is still shown.
-//! - **XMP 3.0 / EXPO** (DDR5): 256-byte region at `0x200`, gated on its
+//! - **XMP 3.0 / EXPO** (DDR5): 256-byte region at `0x300` (JESD79-5;
+//!   coexists with the DDR5 part number at `0x200`, C7-03), gated on its
 //!   `XMP` signature, revision `0x30`, and length `0x100`; four 32-byte
 //!   profile blocks at `+16 + 32n` are valid when non-blank, correctly
 //!   indexed, and carrying a non-zero data-validity mask (bit 0 timings,
@@ -533,8 +534,11 @@ const XMP2_SLOT2: usize = 0xF0;
 /// XMP 2.0 structure revision byte value (`0x0A`).
 const XMP2_REVISION: u8 = 0x0A;
 
-/// DDR5 XMP 3.0 / EXPO region base (bytes `0x200..0x300`).
-const XMP3_BASE: usize = 0x200;
+/// DDR5 XMP 3.0 / EXPO region base (bytes `0x300..0x400`, JESD79-5):
+/// the region's spec home, coexisting with the DDR5 part number at
+/// `0x200..0x220`, which the former `0x200` base collided with (C7-03
+/// moved the base here).
+const XMP3_BASE: usize = 0x300;
 /// XMP 3.0 / EXPO region size in bytes (`0x100` = 256).
 const XMP3_REGION: usize = 0x100;
 /// XMP 3.0 / EXPO revision byte value (`0x30`).
@@ -603,7 +607,9 @@ fn decode_xmp2(data: &[u8], index: u8, base: usize) -> Option<SpdProfile> {
     })
 }
 
-/// Decode the DDR5 XMP 3.0 / EXPO region (256 bytes at `0x200`).
+/// Decode the DDR5 XMP 3.0 / EXPO region (256 bytes at `0x300`,
+/// JESD79-5 — the DDR5 part number's `0x200` home is untouched; C7-03
+/// moved the base out of the part-number region).
 ///
 /// The region is gated on its revision ([`XMP3_REVISION`]) and "XMP"
 /// signature. Each profile block is 32 bytes at `+16 + 32n`; a blank or
@@ -780,11 +786,9 @@ mod tests {
         // DDR5 part at 0x200 (32-char field, JESD79-5) + serial at 0x91.
         data[0x200..0x200 + 13].copy_from_slice(b"S5H1G8719011A");
         data[0x91..0x91 + 16].copy_from_slice(b"2208ABCDEF123456");
-        // XMP 3.0 / EXPO region relocated to 0x300 (its JESD79-5 home) to
-        // make room for the part number at 0x200 (C7-02). The production
-        // XMP3_BASE is still 0x200, so the region is not decoded until
-        // C7-03 moves the base to 0x300 (the collision this fixture
-        // records).
+        // XMP 3.0 / EXPO region at 0x300 (its JESD79-5 home; C7-03 moved
+        // XMP3_BASE here), coexisting with the part number at 0x200
+        // (C7-02) — this fixture is the part/profile coexistence proof.
         data[0x300] = XMP3_REVISION; // rev 0x30 + "XMP" signature @ +2
         data[0x302..0x305].copy_from_slice(&XMP3_SIGNATURE);
         // Profile 0 @ 0x310: index 0, validity mask 1, 256 MT/s,
@@ -870,10 +874,10 @@ mod tests {
     // (b) Synthetic DDR5 decode.
     // ------------------------------------------------------------------
 
-    /// The synthetic DDR5 image decodes to full ground truth; the part now
-    /// sits at `0x200` (C7-02). The XMP 3.0 / EXPO profile block is
-    /// relocated to `0x300` in the fixture and is not decoded until C7-03
-    /// moves `XMP3_BASE` there.
+    /// The synthetic DDR5 image decodes to full ground truth: the part at
+    /// `0x200` (C7-02) and the XMP 3.0 / EXPO profile at `0x300` (C7-03
+    /// moved `XMP3_BASE` to the region's JESD79-5 home) coexist and both
+    /// decode.
     #[test]
     fn synthetic_ddr5_decodes_to_ground_truth() {
         let m = decode(&ddr5_image());
@@ -890,16 +894,18 @@ mod tests {
         assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
         assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
         assert_eq!(m.devices, Section::Value(8));
-        // C7-02 tension (C7-03 resolves it): the fixture's XMP 3.0 region
-        // sits at 0x300 to make room for the part at 0x200, but the
-        // production XMP3_BASE is still 0x200, so the profile decode reads
-        // the part region and yields no profiles until C7-03 moves the
-        // base to 0x300 (restoring this region's ground-truth
-        // assertions).
-        assert!(
-            m.profiles.is_empty(),
-            "XMP3 region is at 0x300 but XMP3_BASE is still 0x200 (C7-02 -> C7-03)"
-        );
+        // C7-03: XMP3_BASE is 0x300, so the fixture's XMP 3.0 region
+        // decodes alongside the part at 0x200 (the restored
+        // ground-truth assertions).
+        assert_eq!(m.profiles.len(), 1, "profile 0 valid, the rest blank");
+        let p = &m.profiles[0];
+        assert_eq!(p.index, 0);
+        assert_eq!(p.speed_mts, Section::Value(256));
+        assert_eq!(p.cas, Section::Value(20));
+        assert_eq!(p.trcd, Section::Value(20));
+        assert_eq!(p.trp, Section::Value(20));
+        assert_eq!(p.tras, Section::Value(40));
+        assert_eq!(p.voltage, Section::Value(1250));
     }
 
     // ------------------------------------------------------------------
@@ -1427,6 +1433,51 @@ mod tests {
         data[0x00] = 0x0A; // DDR4 signature; both part regions left blank
         let m = decode(&SpdImage { index: 0x50, data });
         assert_eq!(m.part, Section::Na(NaReason::NotApplicable));
+    }
+
+    // ------------------------------------------------------------------
+    // (j) C7-03: XMP3 base move — DDR5 part/profile coexistence.
+    // ------------------------------------------------------------------
+
+    /// C7-03 regression: a DDR5 image carrying the 32-char part number
+    /// at `0x200` (JESD79-5) and a valid XMP 3.0 / EXPO profile at
+    /// `0x300` decodes both — the part is the `0x200` string and the
+    /// profile list is non-empty. Under the former `0x200` XMP3 base the
+    /// region read would have sat inside the part-number ASCII and the
+    /// profile would have been dropped.
+    #[test]
+    fn ddr5_part_at_0x200_and_xmp3_at_0x300_coexist() {
+        let mut data = vec![0u8; 1024];
+        data[0x00] = 0x0C; // DDR5 signature
+        // Full 32-char part number at 0x200 (JESD79-5 home).
+        data[0x200..0x200 + 32].copy_from_slice(b"CTA20256D8G0111A2345678901234567");
+        // XMP 3.0 / EXPO region at 0x300 (JESD79-5 home).
+        data[0x300] = XMP3_REVISION; // rev 0x30 + "XMP" signature @ +2
+        data[0x302..0x305].copy_from_slice(&XMP3_SIGNATURE);
+        // Profile 0 @ 0x310: index 0, validity mask 1, 256 MT/s,
+        // CL/tRCD/tRP/tRAS = 20/20/20/40, 1250 mV.
+        data[0x310] = 0x00;
+        data[0x311] = 0x01;
+        data[0x312] = 0x80; // 128 MHz -> 256 MT/s
+        data[0x314] = 20;
+        data[0x315] = 20;
+        data[0x316] = 20;
+        data[0x317] = 40;
+        data[0x323] = 0xE2; // 1250 mV little-endian (block 19/20)
+        data[0x324] = 0x04;
+        let m = decode(&SpdImage {
+            index: 0x53,
+            data,
+        });
+        assert!(m.is_ddr5);
+        assert_eq!(
+            m.part,
+            Section::Value("CTA20256D8G0111A2345678901234567".to_owned())
+        );
+        assert!(!m.profiles.is_empty(), "the XMP3 profile at 0x300 must decode");
+        let p = &m.profiles[0];
+        assert_eq!(p.speed_mts, Section::Value(256));
+        assert_eq!(p.voltage, Section::Value(1250));
     }
 }
 
