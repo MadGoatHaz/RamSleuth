@@ -10,13 +10,16 @@
 //!   value is a `String` error (exit 2 — the ramsleuth-daemon P3-17 /
 //!   ramsleuth-client P3-21 / ramsleuth-tui P3-24 precedent).
 //! - **App** — a 1400×900 eframe window carrying the dark-slate
-//!   [`build_style`]: a header strip (title, CPU brand, daemon status,
-//!   and the `[F2] snapshot · [F3] export · [Q] quit` legend, plus a
-//!   transient export notice) over the three zones — the telemetry
-//!   matrix on the left, the benchmark grid stacked over the
-//!   hardware / SPD status on the right. Each frame takes one brief
-//!   read of the shared `Arc<RwLock<TelemetryData>>` and repaints on
-//!   a 16 ms cadence (~60 FPS).
+//!   [`build_style`]: the spec's 3-line header (Grand Design §3.1,
+//!   C6-20) — line 1 the `RamSleuth v2.0.0` title, the platform tag,
+//!   the daemon status, and the `[F2] snapshot · [F3] export · [Q]
+//!   quit` legend; line 2 the CPU and platform identity; line 3 the
+//!   RAM summary, channel, and sync mode — plus a transient export
+//!   notice. Over the three zones: the telemetry matrix on the left,
+//!   the benchmark grid stacked over the hardware / SPD status on the
+//!   right. Each frame takes one brief read of the shared
+//!   `Arc<RwLock<TelemetryData>>` and repaints on a 16 ms cadence
+//!   (~60 FPS).
 //! - **No render-thread I/O (plan D6):** the background
 //!   [`spawn_poller`] thread (P3-26) owns the daemon socket — the 2 s
 //!   telemetry cadence and the benchmark stream run there; the render
@@ -68,6 +71,10 @@ use ramsleuth_gui::{
     CYAN, SLATE,
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
+use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
+use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
+use ramsleuth_telemetry::error::Section;
+use ramsleuth_telemetry::SystemMemoryTelemetry;
 
 /// How long a transient header notice (an F2 / F3 export result) stays
 /// visible before it fades.
@@ -328,25 +335,196 @@ impl eframe::App for RamSleuthApp {
     }
 }
 
+// ---------------------------------------------------------------------
+// The spec's 3-line header (Grand Design §3.1, C6-20): the pure line
+// builders (unit-tested without an egui context — no display needed)
+// that `render_header` composes into the top panel.
+// ---------------------------------------------------------------------
+
+/// Line 1's platform tag (the mockup's `[AMD AM5 Platform]`): the
+/// CPU vendor + a best-effort socket family from [`CpuVendor`] — the
+/// Zen generations map to their socket family (Zen 1–3 → `AM4`,
+/// Zen 4/5 → `AM5`), Intel maps to its generic `LGA` family (a
+/// generation does not identify a socket number unambiguously —
+/// mobile and desktop share generations), and an unrecognized vendor
+/// carries no family at all (an honest bare `Platform`).
+fn platform_tag(vendor: &CpuVendor) -> String {
+    match vendor {
+        CpuVendor::Amd(AmdZen::Zen1 | AmdZen::Zen2 | AmdZen::Zen3) => "AMD AM4 Platform".to_owned(),
+        CpuVendor::Amd(AmdZen::Zen4 | AmdZen::Zen5) => "AMD AM5 Platform".to_owned(),
+        CpuVendor::Intel(_) => "Intel LGA Platform".to_owned(),
+        CpuVendor::Unknown => "Platform".to_owned(),
+    }
+}
+
+/// Line 1's daemon status (the mockup's `Daemon: Connected
+/// (IPC: /run/ramsleuth)`): a successful last poll names the
+/// configured socket, the never-polled (empty-status) state shows
+/// `Disconnected` + the socket we are trying, and any other recorded
+/// status degrades to a bare `Disconnected`.
+fn daemon_status_text(data: &TelemetryData, socket: &Path) -> String {
+    if data.daemon_status.starts_with("connected") {
+        format!("Daemon: Connected (IPC: {})", socket.display())
+    } else if data.daemon_status.is_empty() {
+        format!("Daemon: Disconnected (IPC: {})", socket.display())
+    } else {
+        "Daemon: Disconnected".to_owned()
+    }
+}
+
+/// One [`Section`] cell as display text: the contained value, or
+/// `N/A` (the header's honest-degradation rule — a missing cell
+/// renders `N/A`, never a panic).
+fn cell_text<T: std::fmt::Display>(cell: &Section<T>) -> String {
+    match cell {
+        Section::Value(v) => v.to_string(),
+        Section::Na(_) => "N/A".to_owned(),
+    }
+}
+
+/// A whole-number `f64` with no decimals (`1800.0` → `1800`), one
+/// decimal otherwise (`4.5` → `4.5`) — the unit-agnostic number
+/// formatter the header's GB / MHz segments share.
+fn trim_number(value: f64) -> String {
+    if (value - value.round()).abs() < 0.05 {
+        format!("{:.0}", value)
+    } else {
+        format!("{:.1}", value)
+    }
+}
+
+/// Line 2 (the mockup's `CPU: AMD Ryzen 9 7950X 16-Core @ 5.70 GHz |
+/// Motherboard: … (BIOS: …, AGESA …)`): the CPUID brand + the
+/// platform clock (MHz → GHz, two decimals), then the DMI
+/// motherboard / BIOS / AGESA cells — every `Na` cell degrades to
+/// its `N/A` text (never a panic).
+fn cpu_line_text(t: &SystemMemoryTelemetry) -> String {
+    let platform = &t.platform;
+    let clock = match platform.cpu_clock_mhz.value() {
+        Some(mhz) => format!("{:.2} GHz", mhz / 1000.0),
+        None => "N/A".to_owned(),
+    };
+    format!(
+        "CPU: {} @ {} | Motherboard: {} (BIOS: {}, AGESA {})",
+        t.cpu.brand,
+        clock,
+        cell_text(&platform.motherboard),
+        cell_text(&platform.bios),
+        cell_text(&platform.agesa),
+    )
+}
+
+/// The per-DIMM capacity summary (the mockup's `2x32GB`): one
+/// `<count>x<size>GB` group per distinct carried size (first-seen
+/// order, ` + `-joined); the `Na` entries contribute nothing, and an
+/// all-`Na` / empty list degrades to `N/A`.
+fn dimm_summary(sizes: &[Section<f64>]) -> String {
+    let mut groups: Vec<(f64, usize)> = Vec::new();
+    for cell in sizes {
+        if let Some(gib) = cell.value() {
+            match groups.iter_mut().find(|(value, _)| (value - gib).abs() < 0.05) {
+                Some(group) => group.1 += 1,
+                None => groups.push((*gib, 1)),
+            }
+        }
+    }
+    if groups.is_empty() {
+        "N/A".to_owned()
+    } else {
+        groups
+            .iter()
+            .map(|(gib, count)| format!("{count}x{size}GB", size = trim_number(*gib)))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+}
+
+/// The channel mode from the DIMM count (D-C8): 1 / 2 / 4 →
+/// Single- / Dual- / Quad-Channel; any other count (0, odd) degrades
+/// to `N/A`.
+fn channel_mode(dimm_count: usize) -> String {
+    match dimm_count {
+        1 => "Single-Channel".to_owned(),
+        2 => "Dual-Channel".to_owned(),
+        4 => "Quad-Channel".to_owned(),
+        _ => "N/A".to_owned(),
+    }
+}
+
+/// Line 3's non-mode part (the mockup's `RAM: 64.0 GB (2x32GB)
+/// DDR5-6000 MT/s | Dual-Channel | Mode: `): the total capacity
+/// (GiB → one-decimal GB display), the per-DIMM summary, the max SPD
+/// speed (omitted entirely when no module carries one), the channel
+/// mode, and the `Mode: ` lead-in the mode segment completes.
+fn ram_line_prefix(t: &SystemMemoryTelemetry) -> String {
+    let total = match t.total_capacity.value() {
+        Some(gib) => format!("{gib:.1} GB"),
+        None => "N/A".to_owned(),
+    };
+    let mut line = format!("RAM: {total} ({})", dimm_summary(&t.dimm_sizes));
+    if let Some(mts) = t.spd.iter().filter_map(|m| m.speed_mts.value().copied()).max() {
+        line.push_str(&format!(" {mts} MT/s"));
+    }
+    line.push_str(&format!(" | {} | Mode: ", channel_mode(t.dimm_sizes.len())));
+    line
+}
+
+/// Line 3's mode segment (D-C8): the UCLK:MCLK ratio from the AMD
+/// clock readout + its semantic color — AMBER for `Synchronous 1:1`
+/// (with the MCLK when it carries one), CRIMSON for `Asynchronous
+/// 1:2`, and `None` (the default text color) for the honest `N/A`.
+fn sync_mode_from_clocks(clocks: &ClockReadout) -> (String, Option<egui::Color32>) {
+    match clocks.div_mode.value() {
+        Some(DivMode::OneToOne) => {
+            let text = match clocks.mclk_mhz.value() {
+                Some(mhz) => {
+                    format!("Synchronous 1:1 (UCLK = MCLK = {} MHz)", trim_number(*mhz))
+                }
+                None => "Synchronous 1:1".to_owned(),
+            };
+            (text, Some(AMBER))
+        }
+        Some(DivMode::OneToTwo) => ("Asynchronous 1:2".to_owned(), Some(CRIMSON)),
+        None => ("N/A".to_owned(), None),
+    }
+}
+
+/// Line 3's mode segment over a whole snapshot: the AMD branch must
+/// carry a value whose `div_mode` is usable, else the honest `N/A` —
+/// the Intel / driver-missing / degraded states all degrade here
+/// (never a panic).
+fn sync_mode(t: &SystemMemoryTelemetry) -> (String, Option<egui::Color32>) {
+    match t.amd.value() {
+        Some(readout) => sync_mode_from_clocks(&readout.clocks),
+        None => ("N/A".to_owned(), None),
+    }
+}
+
 impl RamSleuthApp {
-    /// The header strip (the plan's top bar): the "RamSleuth" title,
-    /// the CPU brand (from the current snapshot), the daemon status,
-    /// and the `[F2] snapshot · [F3] export · [Q] quit` legend — plus
-    /// the transient notice line (the last F2 / F3 result) while one
-    /// is showing.
+    /// The header strip (Grand Design §3.1): the spec's 3-line header
+    /// — line 1 the `RamSleuth v2.0.0` title + the platform tag + the
+    /// daemon status + the `[F2] snapshot · [F3] export · [Q] quit`
+    /// legend, line 2 the CPU + platform identity, line 3 the RAM
+    /// summary + channel + sync mode — plus the transient notice line
+    /// (the last F2 / F3 result) while one is showing. No telemetry
+    /// yet (never polled) → the placeholder lines (a missing daemon
+    /// never crashes the GUI, plan D5).
     fn render_header(&self, ctx: &egui::Context, data: &TelemetryData) {
-        let cpu = data
+        // The line builders over the current snapshot — or the
+        // placeholders when no poll has landed yet (never a panic).
+        let (cpu_line, ram_prefix, ram_mode, ram_mode_color) = match &data.telemetry {
+            Some(t) => {
+                let (mode, color) = sync_mode(t);
+                (cpu_line_text(t), ram_line_prefix(t), mode, color)
+            }
+            None => ("CPU: —".to_owned(), "RAM: —".to_owned(), String::new(), None),
+        };
+        let tag = data
             .telemetry
             .as_ref()
-            .map(|t| t.cpu.brand.as_str())
-            .unwrap_or("N/A (no telemetry)");
-        // The raw status names the socket when connected; when
-        // never-polled, show which socket we are trying.
-        let status = if data.daemon_status.is_empty() {
-            format!("not connected ({})", self.socket.display())
-        } else {
-            data.daemon_status.clone()
-        };
+            .map(|t| platform_tag(&t.cpu.vendor))
+            .unwrap_or_else(|| "Platform".to_owned());
+        let status = daemon_status_text(data, &self.socket);
         egui::TopBottomPanel::top("ramsleuth_header")
             .frame(
                 egui::Frame::default()
@@ -354,11 +532,14 @@ impl RamSleuthApp {
                     .stroke(egui::Stroke::new(1.0_f32, HEADER_STROKE)),
             )
             .show(ctx, |ui| {
+                // Line 1: title + platform tag + daemon status + legend.
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
-                    ui.label(egui::RichText::new("RamSleuth").strong().color(CYAN).size(20.0));
+                    ui.label(
+                        egui::RichText::new("RamSleuth v2.0.0").strong().color(CYAN).size(20.0),
+                    );
                     ui.separator();
-                    ui.label(egui::RichText::new(cpu));
+                    ui.label(egui::RichText::new(format!("[{tag}]")));
                     ui.separator();
                     ui.label(egui::RichText::new(&status).color(header_status_color(data)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -367,6 +548,21 @@ impl RamSleuthApp {
                             egui::RichText::new("[F2] snapshot · [F3] export · [Q] quit").weak(),
                         );
                     });
+                });
+                // Line 2: the CPU + platform identity.
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(&cpu_line));
+                // Line 3: the RAM summary + channel + the mode segment
+                // (AMBER 1:1, CRIMSON 1:2, the default color for N/A).
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&ram_prefix));
+                    if !ram_mode.is_empty() {
+                        match ram_mode_color {
+                            Some(color) => ui.label(egui::RichText::new(&ram_mode).color(color)),
+                            None => ui.label(egui::RichText::new(&ram_mode)),
+                        };
+                    }
                 });
                 if let Some((text, _)) = &self.notice {
                     ui.add_space(2.0);
@@ -534,6 +730,11 @@ mod tests {
 
     use ramsleuth_bench::BenchmarkGrid;
     use ramsleuth_gui::BenchState;
+    use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
+    use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
+    use ramsleuth_telemetry::error::{NaReason, Section};
+    use ramsleuth_telemetry::spd_decode::SpdModule;
+    use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
 
     use super::*;
 
@@ -770,5 +971,265 @@ mod tests {
         let ts = unix_timestamp();
         assert!(ts > 1_577_836_800, "expected a post-2020 timestamp, got: {ts}");
         assert!(ts < 4_102_444_800, "expected a pre-2100 timestamp, got: {ts}");
+    }
+
+    // ------------------------------------------------------------------
+    // C6-20: the header's pure line builders (no egui context, no
+    // display — the live window run is the QA gate).
+    // ------------------------------------------------------------------
+
+    /// A header-test snapshot: a known AMD Zen 3 CPU + a populated
+    /// platform (one Na cell — AGESA, the common case), a
+    /// configurable capacity tail, an Na AMD / Intel branch by
+    /// default, and a configurable SPD list.
+    fn fixture_telemetry(
+        total_capacity: Section<f64>,
+        dimm_sizes: Vec<Section<f64>>,
+        spd: Vec<SpdModule>,
+    ) -> SystemMemoryTelemetry {
+        SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Amd(AmdZen::Zen3),
+                brand: "Ryzen 9 5950X".to_owned(),
+            },
+            amd: Section::na(NaReason::NotApplicable),
+            intel: Section::na(NaReason::NotApplicable),
+            spd,
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3600.0),
+                motherboard: Section::Value("ProArt X570-CREATOR".to_owned()),
+                bios: Section::Value("F60 + 09/15/2024".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity,
+            dimm_sizes,
+        }
+    }
+
+    /// A minimal SPD module fixture (every cell Na except the speed).
+    fn fixture_spd_module(speed_mts: Option<u16>) -> SpdModule {
+        SpdModule {
+            index: 0x52,
+            is_ddr5: false,
+            maker: Section::na(NaReason::NotApplicable),
+            die_maker: Section::na(NaReason::NotApplicable),
+            die_type: Section::na(NaReason::NotApplicable),
+            devices: Section::na(NaReason::NotApplicable),
+            part: Section::na(NaReason::NotApplicable),
+            serial: Section::na(NaReason::NotApplicable),
+            rank: Section::na(NaReason::NotApplicable),
+            density_mbit: Section::na(NaReason::NotApplicable),
+            speed_mts: match speed_mts {
+                Some(value) => Section::Value(value),
+                None => Section::na(NaReason::NotApplicable),
+            },
+            profiles: Vec::new(),
+        }
+    }
+
+    /// A clock-readout fixture (every cell Na except the two the mode
+    /// segment consumes).
+    fn fixture_clocks(div_mode: Option<DivMode>, mclk_mhz: Option<f64>) -> ClockReadout {
+        ClockReadout {
+            mclk_mhz: mclk_mhz
+                .map(Section::Value)
+                .unwrap_or_else(|| Section::na(NaReason::NotApplicable)),
+            uclk_mhz: Section::na(NaReason::NotApplicable),
+            fclk_mhz: Section::na(NaReason::NotApplicable),
+            div_mode: div_mode
+                .map(Section::Value)
+                .unwrap_or_else(|| Section::na(NaReason::NotApplicable)),
+            gear_mode: Section::na(NaReason::NotApplicable),
+            gdm: Section::na(NaReason::NotApplicable),
+            pdm: Section::na(NaReason::NotApplicable),
+            command_rate: Section::na(NaReason::NotApplicable),
+        }
+    }
+
+    /// (h1) `platform_tag`: the vendor → socket-family map — Zen 1–3
+    /// → AM4, Zen 4/5 → AM5, Intel → LGA, unknown → the honest bare
+    /// `Platform`.
+    #[test]
+    fn platform_tag_maps_every_vendor() {
+        assert_eq!(platform_tag(&CpuVendor::Amd(AmdZen::Zen1)), "AMD AM4 Platform");
+        assert_eq!(platform_tag(&CpuVendor::Amd(AmdZen::Zen2)), "AMD AM4 Platform");
+        assert_eq!(platform_tag(&CpuVendor::Amd(AmdZen::Zen3)), "AMD AM4 Platform");
+        assert_eq!(platform_tag(&CpuVendor::Amd(AmdZen::Zen4)), "AMD AM5 Platform");
+        assert_eq!(platform_tag(&CpuVendor::Amd(AmdZen::Zen5)), "AMD AM5 Platform");
+        assert_eq!(
+            platform_tag(&CpuVendor::Intel(IntelGen::AlderLake)),
+            "Intel LGA Platform"
+        );
+        assert_eq!(platform_tag(&CpuVendor::Unknown), "Platform");
+    }
+
+    /// (h2) `daemon_status_text`: a successful poll names the
+    /// configured socket, the never-polled (empty) state shows
+    /// `Disconnected` + the socket we are trying, and a recorded
+    /// failure is a bare `Disconnected`.
+    #[test]
+    fn daemon_status_text_arms() {
+        let socket = Path::new("/run/ramsleuth/ramsleuth.sock");
+        let connected = TelemetryData {
+            daemon_status: "connected: /run/ramsleuth/ramsleuth.sock".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            daemon_status_text(&connected, socket),
+            "Daemon: Connected (IPC: /run/ramsleuth/ramsleuth.sock)"
+        );
+
+        assert_eq!(
+            daemon_status_text(&TelemetryData::default(), socket),
+            "Daemon: Disconnected (IPC: /run/ramsleuth/ramsleuth.sock)"
+        );
+
+        let down =
+            TelemetryData { daemon_status: "disconnected".to_owned(), ..Default::default() };
+        assert_eq!(daemon_status_text(&down, socket), "Daemon: Disconnected");
+    }
+
+    /// (h3) `cpu_line_text`: the spec's line 2 — brand + the
+    /// MHz→GHz clock + motherboard / BIOS / AGESA, the Na AGESA cell
+    /// degrading to its `N/A` text; a fully Na platform degrades
+    /// every segment.
+    #[test]
+    fn cpu_line_text_populated_and_na_degraded() {
+        let t = fixture_telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            Vec::new(),
+        );
+        assert_eq!(
+            cpu_line_text(&t),
+            "CPU: Ryzen 9 5950X @ 3.60 GHz | Motherboard: ProArt X570-CREATOR (BIOS: F60 + 09/15/2024, AGESA N/A)"
+        );
+
+        let all_na = SystemMemoryTelemetry {
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            ..t
+        };
+        assert_eq!(
+            cpu_line_text(&all_na),
+            "CPU: Ryzen 9 5950X @ N/A | Motherboard: N/A (BIOS: N/A, AGESA N/A)"
+        );
+    }
+
+    /// (h4) `dimm_summary`: distinct-size grouping — 2×16 →
+    /// `2x16GB`, a mixed kit → `1x16GB + 1x32GB` (the Na entry
+    /// contributes nothing), all-Na / empty → `N/A`, a non-whole
+    /// size keeps one decimal.
+    #[test]
+    fn dimm_summary_groups_and_degrades() {
+        assert_eq!(
+            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)]),
+            "2x16GB"
+        );
+        assert_eq!(
+            dimm_summary(&[
+                Section::Value(16.0),
+                Section::na(NaReason::NotApplicable),
+                Section::Value(32.0),
+            ]),
+            "1x16GB + 1x32GB"
+        );
+        assert_eq!(dimm_summary(&[Section::na(NaReason::NotApplicable)]), "N/A");
+        assert_eq!(dimm_summary(&[]), "N/A");
+        assert_eq!(dimm_summary(&[Section::Value(4.5)]), "1x4.5GB");
+    }
+
+    /// (h5) `channel_mode`: 1 / 2 / 4 → Single / Dual / Quad, every
+    /// other count (0, odd) → `N/A` (D-C8).
+    #[test]
+    fn channel_mode_from_dimm_count() {
+        assert_eq!(channel_mode(1), "Single-Channel");
+        assert_eq!(channel_mode(2), "Dual-Channel");
+        assert_eq!(channel_mode(4), "Quad-Channel");
+        assert_eq!(channel_mode(0), "N/A");
+        assert_eq!(channel_mode(3), "N/A");
+    }
+
+    /// (h6) `ram_line_prefix`: the spec's line 3 minus the mode —
+    /// the total (one-decimal GB), the per-DIMM summary, the max SPD
+    /// speed (omitted when no module carries one), and the channel
+    /// mode; the degraded tail renders the honest N/A segments.
+    #[test]
+    fn ram_line_prefix_populated_and_degraded() {
+        let t = fixture_telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![fixture_spd_module(Some(3200))],
+        );
+        assert_eq!(
+            ram_line_prefix(&t),
+            "RAM: 32.0 GB (2x16GB) 3200 MT/s | Dual-Channel | Mode: "
+        );
+
+        let no_speed = fixture_telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![fixture_spd_module(None)],
+        );
+        assert_eq!(
+            ram_line_prefix(&no_speed),
+            "RAM: 32.0 GB (2x16GB) | Dual-Channel | Mode: "
+        );
+
+        // A single Na DIMM still counts as one bound module (the
+        // channel is the count, not the sizes): Single-Channel.
+        let degraded = fixture_telemetry(
+            Section::na(NaReason::NotApplicable),
+            vec![Section::na(NaReason::NotApplicable)],
+            Vec::new(),
+        );
+        assert_eq!(
+            ram_line_prefix(&degraded),
+            "RAM: N/A (N/A) | Single-Channel | Mode: "
+        );
+
+        // No bound modules at all: every segment degrades to N/A.
+        let empty = fixture_telemetry(
+            Section::na(NaReason::NotApplicable),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(ram_line_prefix(&empty), "RAM: N/A (N/A) | N/A | Mode: ");
+    }
+
+    /// (h7) `sync_mode_from_clocks`: D-C8's ratio segment — 1:1 with
+    /// an MCLK (AMBER), 1:1 without (AMBER, the bare text), 1:2
+    /// (CRIMSON), and a Na ratio (the honest N/A, default color).
+    #[test]
+    fn sync_mode_from_clocks_arms() {
+        assert_eq!(
+            sync_mode_from_clocks(&fixture_clocks(Some(DivMode::OneToOne), Some(1800.0))),
+            ("Synchronous 1:1 (UCLK = MCLK = 1800 MHz)".to_owned(), Some(AMBER))
+        );
+        assert_eq!(
+            sync_mode_from_clocks(&fixture_clocks(Some(DivMode::OneToOne), None)),
+            ("Synchronous 1:1".to_owned(), Some(AMBER))
+        );
+        assert_eq!(
+            sync_mode_from_clocks(&fixture_clocks(Some(DivMode::OneToTwo), Some(1800.0))),
+            ("Asynchronous 1:2".to_owned(), Some(CRIMSON))
+        );
+        assert_eq!(
+            sync_mode_from_clocks(&fixture_clocks(None, Some(1800.0))),
+            ("N/A".to_owned(), None)
+        );
+    }
+
+    /// (h8) `sync_mode`: an Na AMD branch (Intel silicon / the
+    /// driver missing) degrades the whole segment to an honest `N/A`
+    /// — never a panic.
+    #[test]
+    fn sync_mode_degrades_on_na_amd_branch() {
+        let t = fixture_telemetry(Section::Value(32.0), Vec::new(), Vec::new());
+        assert_eq!(sync_mode(&t), ("N/A".to_owned(), None));
     }
 }
