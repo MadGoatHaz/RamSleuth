@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-CYCLE6.md` (Cycle 6 GUI workstream — the handover §13 primary name, alt `PLAN-PHASE7.md`; Phase 6/Cycle 5 retained as `plans/PLAN-PHASE6.md`, Phase 5 as `plans/PLAN-PHASE5.md`; Phase 1 as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [ACTIVE] ID: C6-22 | AGENT: general (Implementation) | BRANCH: branch/chunk-c6-22 | FILES: crates/ramsleuth-gui/src/bench_zone.rs — gui live bench per-cell fill, in progress
 
 @@@ CURRENT_STATE @@@
 Cycle 6 (GUI workstream) — CROSS-CRATE FIXTURE RIPPLE C6-09…C6-19 ALL MERGED into v2-development (--no-ff; merges dcb4c8d C6-09 / dbf3838 C6-10-11-12 / d76dc1e C6-13-14 / e99370e C6-15-16 / a449887 C6-17-18-19): all 29 scheduled E0063 fixture sites closed — test-fixture-only across protocol/client/daemon/tui/gui (zero production logic, no Cargo.toml/Cargo.lock diff → MSRV 1.75 held, zero new deps); C6-17 also closed one stale style.rs export_json wire-key assert (4→7: cpu/amd/intel/spd/platform/total_capacity/dimm_sizes). HARD GATE GREEN post-C6-19: `cargo test --workspace` 399 passed / 0 failed / 0 compile errors (baseline 371 + Cycle 6 data-model tests), `cargo clippy --workspace --all-targets -- -D warnings` exit 0 clean, `cargo check --workspace` exit 0 → the test-fixture-only RED WINDOW IS CLOSED; GUI-wave chunks may now start.
