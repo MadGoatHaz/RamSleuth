@@ -204,11 +204,13 @@ pub fn poll_once(socket: &Path, state: &mut AppState) -> Result<(), String> {
             Response::BenchStarted { .. }
             | Response::BenchProgress(_)
             | Response::BenchResult { .. }
-            | Response::BenchCancelled { .. },
+            | Response::BenchCancelled { .. }
+            | Response::BurnInProgress(_),
         ) => {
-            // A benchmark frame in reply to `GetTelemetry` violates the
-            // wire contract (the daemon streams those only to the owning
-            // benchmark connection, P3-16): record a structured error.
+            // A benchmark / burn-in frame in reply to `GetTelemetry`
+            // violates the wire contract (the daemon streams those
+            // only to the owning benchmark / burn-in connection,
+            // P3-16): record a structured error.
             state.error = Some("unexpected response to GetTelemetry".to_owned());
         }
         Err(error) => {

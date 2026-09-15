@@ -15,6 +15,15 @@
 //!   [`Response::BenchResult`] / [`Response::BenchCancelled`] /
 //!   [`Response::Error`]), each blocking std-`mpsc` `recv` offloaded
 //!   via `spawn_blocking` so no runtime worker is ever parked;
+//! - [`Request::StartBurnIn { target, duration_minutes }`] → the same
+//!   single-flight slot via `start_burn_in` (`threads = 0`: auto — a
+//!   burn-in and a benchmark are mutually exclusive, D-1) → reply
+//!   [`Response::BenchStarted { run_id }] and become the run's
+//!   **owner**: every [`JobEvent`] is forwarded in order
+//!   (`BurnInTick` → [`Response::BurnInProgress`], D-2; exactly one
+//!   terminal → [`Response::BenchResult`] /
+//!   [`Response::BenchCancelled`] / [`Response::Error`]), the same
+//!   blocking-`recv`-offloaded forwarding as the benchmark arm;
 //! - [`Request::CancelBenchmark { run_id }`] →
 //!   [`BenchJobManager::cancel`] (any connection may cancel, D6) → ack
 //!   [`Response::BenchCancelled { run_id }] when the run was active,
@@ -243,6 +252,10 @@ async fn dispatch(
                         write_frame(writer, &Message::Response(Response::BenchProgress(progress)))
                             .await?;
                     }
+                    // Defensive: a benchmark run never emits a
+                    // burn-in tick (that is the `StartBurnIn` arm's
+                    // stream) — end the stream cleanly.
+                    Ok(JobEvent::BurnInTick(_)) => break,
                     Ok(JobEvent::Result(grid)) => {
                         write_frame(
                             writer,
@@ -260,6 +273,69 @@ async fn dispatch(
                         write_frame(writer, &Message::Response(Response::Error(msg))).await?;
                         break;
                     }
+                    // Defensive: the run dropped every sender without
+                    // a terminal (P3-15 sends exactly one before
+                    // closing) — end the stream cleanly.
+                    Err(_) => break,
+                }
+            }
+            Ok(())
+        }
+        Message::Request(Request::StartBurnIn { target, duration_minutes }) => {
+            // `threads = 0`: auto — one pinned worker per detected
+            // physical core (the C7-06 contract). The burn-in shares
+            // the single-flight slot with `StartBenchmark` (D-1):
+            // `JobError::Busy` arrives with its wire-ready "benchmark
+            // already running" text.
+            let handle = ctx
+                .jobs
+                .start_burn_in(*target, *duration_minutes, 0)
+                .await
+                .map_err(|e| RpcError::Job(e.to_string()))?;
+            let run_id = handle.run_id;
+            write_frame(writer, &Message::Response(Response::BenchStarted { run_id })).await?;
+
+            // Owner forwarding: the same pattern as the `StartBenchmark`
+            // arm (the run's std `mpsc` receiver blocks in `recv`, so
+            // each pull is one `spawn_blocking`; the `Mutex` keeps the
+            // receiver alive across pulls). The job guarantees every
+            // tick in order plus exactly one terminal, after which the
+            // channel closes.
+            let events = Arc::new(Mutex::new(handle.events));
+            loop {
+                let events = Arc::clone(&events);
+                let event = tokio::task::spawn_blocking(move || {
+                    let guard = events.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.recv()
+                })
+                .await
+                .map_err(|e| RpcError::Join(e.to_string()))?;
+                match event {
+                    Ok(JobEvent::BurnInTick(tick)) => {
+                        write_frame(writer, &Message::Response(Response::BurnInProgress(tick)))
+                            .await?;
+                    }
+                    Ok(JobEvent::Result(grid)) => {
+                        write_frame(
+                            writer,
+                            &Message::Response(Response::BenchResult { run_id, grid }),
+                        )
+                        .await?;
+                        break;
+                    }
+                    Ok(JobEvent::Cancelled) => {
+                        write_frame(writer, &Message::Response(Response::BenchCancelled { run_id }))
+                            .await?;
+                        break;
+                    }
+                    Ok(JobEvent::Error(msg)) => {
+                        write_frame(writer, &Message::Response(Response::Error(msg))).await?;
+                        break;
+                    }
+                    // Defensive: a burn-in run never emits a
+                    // `Progress` event (that is the benchmark arm's
+                    // stream) — end the stream cleanly.
+                    Ok(JobEvent::Progress(_)) => break,
                     // Defensive: the run dropped every sender without
                     // a terminal (P3-15 sends exactly one before
                     // closing) — end the stream cleanly.
@@ -560,6 +636,95 @@ mod tests {
         assert!(
             matches!(terminal, Response::BenchResult { .. } | Response::BenchCancelled { .. }),
             "the owner's terminal must be the run's result or cancellation: {terminal:?}"
+        );
+
+        drop(owner);
+        drop(other);
+        owner_task
+            .await
+            .expect("owner handle_connection must join")
+            .expect("clean EOF must end the owner with Ok(())");
+        other_task
+            .await
+            .expect("other handle_connection must join")
+            .expect("clean EOF must end the other connection with Ok(())");
+    }
+
+    /// (h) `StartBurnIn` (C7-07, D-1) over the wire: the reply is
+    /// `BenchStarted { run_id }`; the run (infinite — `duration_minutes
+    /// = 0`) is cancelled from a second connection, whose ack is the
+    /// run's `BenchCancelled`; the owner then receives the buffered
+    /// `BurnInProgress` tick burst (the drain-then-terminal contract —
+    /// ticks land when the run ends) followed by the run's
+    /// `BenchCancelled` terminal exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_burn_in_streams_ticks_and_cancels_from_a_second_connection() {
+        let ctx = mock_ctx();
+        let (client_owner, server_owner) = tokio::net::UnixStream::pair().expect("pair must connect");
+        let (client_other, server_other) = tokio::net::UnixStream::pair().expect("pair must connect");
+        let owner_task = tokio::spawn(handle_connection(server_owner, Arc::clone(&ctx)));
+        let other_task = tokio::spawn(handle_connection(server_other, Arc::clone(&ctx)));
+
+        let mut owner = Conn::new(client_owner);
+        owner.send(&Message::Request(Request::StartBurnIn {
+            target: StreamTarget::Tier(Tier::L1),
+            duration_minutes: 0,
+        }))
+        .await;
+        let message = owner.recv().await.expect("the started frame");
+        let Message::Response(Response::BenchStarted { run_id }) = message else {
+            panic!("the first reply must be BenchStarted: {message:?}")
+        };
+        assert!(run_id > 0, "the run id must be daemon-assigned");
+
+        // Let the run complete at least one iteration (L1 passes are
+        // fast), then cancel the (infinite) run from a second
+        // connection by its id.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let mut other = Conn::new(client_other);
+        other.send(&Message::Request(Request::CancelBenchmark { run_id })).await;
+        let message = other.recv().await.expect("the cancel reply frame");
+        let Message::Response(ack) = message else {
+            panic!("the cancel reply must be a Response: {message:?}")
+        };
+        assert!(
+            matches!(ack, Response::BenchCancelled { run_id: rid } if rid == run_id),
+            "the cancel ack must be the run's BenchCancelled: {ack:?}"
+        );
+
+        // The owner receives the buffered tick burst (a second of L1
+        // iterations emitted ticks), then the run's terminal.
+        let tick = owner
+            .recv_until(|r| matches!(r, Response::BurnInProgress(_)))
+            .await;
+        let Response::BurnInProgress(t) = tick else {
+            unreachable!("recv_until matched a BurnInProgress")
+        };
+        assert!(t.iteration >= 1, "iterations are 1-based");
+        assert_eq!(t.tier, Tier::L1, "a tier target only ticks its tier");
+        assert_eq!(
+            t.bandwidth.is_some(),
+            t.latency_ns.is_none(),
+            "exactly one of bandwidth / latency per tick"
+        );
+        assert!(
+            t.elapsed_secs.is_finite() && t.elapsed_secs >= 0.0,
+            "the elapsed must be finite and non-negative: {}",
+            t.elapsed_secs
+        );
+
+        let terminal = owner
+            .recv_until(|r| {
+                matches!(
+                    r,
+                    Response::BenchResult { .. } | Response::BenchCancelled { .. }
+                        | Response::Error(_)
+                )
+            })
+            .await;
+        assert!(
+            matches!(terminal, Response::BenchCancelled { run_id: rid } if rid == run_id),
+            "the owner's terminal must be the run's BenchCancelled: {terminal:?}"
         );
 
         drop(owner);
