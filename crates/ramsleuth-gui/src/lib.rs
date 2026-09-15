@@ -45,6 +45,7 @@
 
 pub mod bench_zone;
 pub mod history;
+pub mod settings;
 pub mod status_zone;
 pub mod style;
 pub mod telemetry_zone;
@@ -89,3 +90,15 @@ pub use bench_zone::{grid_cells, render_bench_zone};
 // I/O itself, D6), and `spd_cards` is the pure per-slot card
 // builder the tests exercise without an egui context.
 pub use status_zone::{render_status_zone, spd_cards, GuiAction};
+
+// C6-26: the in-memory settings state + the settings panel (item
+// 7a, D-C5 — in-memory only, XDG persistence deferred), re-exported
+// at the root (workspace re-export style) — the app shell (C6-30)
+// seeds `GuiSettings.socket` from the CLI `--socket` and shows
+// `render_settings_panel` in the settings area, and C6-27 moves the
+// live `poll_interval_ms` / `refresh_enabled` knobs onto the poller
+// and the `Units` formatters onto the zones.
+pub use settings::{
+    format_bw, format_capacity, format_clock, render_settings_panel, CapacityUnit, ClockUnit,
+    GuiSettings, Theme, Units, DEFAULT_POLL_INTERVAL_MS,
+};
