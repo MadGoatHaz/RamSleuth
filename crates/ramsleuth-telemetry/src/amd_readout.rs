@@ -10,7 +10,7 @@
 //! # Display types (frozen — P2-07 / P2-10 code against these)
 //!
 //! - [`ClockReadout`] — MCLK/UCLK/FCLK (MHz) + UCLK:MCLK divide mode + gear
-//!   mode + GDM/PDM flags.
+//!   mode + GDM/PDM flags + DRAM command rate.
 //! - [`TimingSet`] — the 27 DRAM subtimings, in ticks.
 //! - [`CadBus`] — CAD-bus ODT / driver strengths in ohms + the three RTT
 //!   fields as [`RttValue`].
@@ -28,7 +28,9 @@
 //!   mode maps `0`→[`DivMode::OneToOne`], `1`→[`DivMode::OneToTwo`], else
 //!   [`NaReason::ParseError`]. **Gear mode is not reported by AMD PM tables**
 //!   → [`NaReason::NotApplicable`]. GDM/PDM map `0`/`1` to `false`/`true`,
-//!   else [`NaReason::ParseError`].
+//!   else [`NaReason::ParseError`]. DRAM command rate maps `0`→
+//!   [`CommandRate::OneT`], `1`→[`CommandRate::TwoT`], else
+//!   [`NaReason::ParseError`].
 //! - **Timings** — raw tick counts pass through as `u16` (the plan's display
 //!   unit is ticks); `0` or above the plausible ceiling →
 //!   [`NaReason::ParseError`].
@@ -103,6 +105,19 @@ pub enum DivMode {
     OneToTwo,
 }
 
+/// DRAM command rate (the "1T / 2T" bus encoding shown on the dashboard).
+///
+/// Sourced from the SMN `0x50200` command-rate bit via the raw
+/// [`AmdPmSnapshot::command_rate`] slot (C6-04) and mapped by [`map_amd`];
+/// a reserved encoding degrades to [`NaReason::ParseError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CommandRate {
+    /// One transaction per clock (1T).
+    OneT,
+    /// Two transactions per clock (2T).
+    TwoT,
+}
+
 /// Memory-controller gear mode (SA:MEM clock multiplier).
 ///
 /// An Intel-side concept; AMD PM tables do not report it, so the AMD mapping
@@ -167,6 +182,8 @@ pub struct ClockReadout {
     pub gdm: Section<bool>,
     /// Power Down Mode flag.
     pub pdm: Section<bool>,
+    /// DRAM command rate (1T / 2T).
+    pub command_rate: Section<CommandRate>,
 }
 
 /// The 27 DRAM subtimings, in ticks (the plan's display unit).
@@ -315,6 +332,18 @@ fn map_div_mode(raw: u8) -> Section<DivMode> {
     }
 }
 
+/// Maps a raw DRAM command-rate byte to a sanity-gated
+/// [`Section<CommandRate>`].
+fn map_command_rate(raw: u8) -> Section<CommandRate> {
+    match raw {
+        0 => Section::Value(CommandRate::OneT),
+        1 => Section::Value(CommandRate::TwoT),
+        _ => Section::na(NaReason::ParseError(format!(
+            "DRAM command rate {raw} not 0 (1T) or 1 (2T)"
+        ))),
+    }
+}
+
 /// Maps a raw 0/1 mode byte (GDM / PDM) to a sanity-gated [`Section<bool>`].
 fn map_mode_flag(raw: u8) -> Section<bool> {
     match raw {
@@ -391,6 +420,7 @@ pub fn map_amd(snap: &AmdPmSnapshot) -> AmdReadout {
             gear_mode: Section::na(NaReason::NotApplicable),
             gdm: map_mode_flag(snap.gdm),
             pdm: map_mode_flag(snap.pdm),
+            command_rate: map_command_rate(snap.command_rate),
         },
         timings: TimingSet {
             cl: map_timing(t.cl),
@@ -519,6 +549,7 @@ mod tests {
         assert_eq!(ro.clocks.gear_mode, Section::Na(NaReason::NotApplicable));
         assert_eq!(ro.clocks.gdm, Section::Value(true));
         assert_eq!(ro.clocks.pdm, Section::Value(false));
+        assert_eq!(ro.clocks.command_rate, Section::Value(CommandRate::OneT));
 
         // timings — ticks passthrough (a sample across primary + tertiary)
         assert_eq!(ro.timings.cl, Section::Value(16));
@@ -603,6 +634,8 @@ mod tests {
         assert_eq!(ro.clocks.gdm.value(), Some(&true));
         assert!(!ro.clocks.pdm.is_na());
         assert_eq!(ro.clocks.pdm.value(), Some(&false));
+        assert!(!ro.clocks.command_rate.is_na());
+        assert_eq!(ro.clocks.command_rate.value(), Some(&CommandRate::OneT));
         // the one Na field (AMD reports no gear mode)
         assert!(ro.clocks.gear_mode.is_na());
         assert_eq!(ro.clocks.gear_mode.value(), None);
@@ -685,6 +718,7 @@ mod tests {
         assert_traits::<VoltageSet>();
         assert_traits::<AmdReadout>();
         assert_traits::<DivMode>();
+        assert_traits::<CommandRate>();
         assert_traits::<GearMode>();
         assert_traits::<RttValue>();
 
@@ -712,6 +746,35 @@ mod tests {
         assert_eq!(map_mode_flag(1), Section::Value(true));
         for raw in [2u8, 9, 255] {
             assert!(matches!(map_mode_flag(raw), Section::Na(NaReason::ParseError(_))));
+        }
+
+        assert_eq!(map_command_rate(0), Section::Value(CommandRate::OneT));
+        assert_eq!(map_command_rate(1), Section::Value(CommandRate::TwoT));
+        for raw in [2u8, 9, 255] {
+            assert!(matches!(map_command_rate(raw), Section::Na(NaReason::ParseError(_))));
+        }
+    }
+
+    /// The DRAM command rate crosses [`map_amd`]: `0` →
+    /// [`CommandRate::OneT`], `1` → [`CommandRate::TwoT`], any other raw
+    /// byte → `Na(ParseError)` (the raw slot is a single SMN bit; a
+    /// reserved value is never a mode).
+    #[test]
+    fn command_rate_maps_through_map_amd() {
+        let mut s = good_snapshot();
+        s.command_rate = 0;
+        assert_eq!(map_amd(&s).clocks.command_rate, Section::Value(CommandRate::OneT));
+
+        s.command_rate = 1;
+        assert_eq!(map_amd(&s).clocks.command_rate, Section::Value(CommandRate::TwoT));
+
+        for raw in [2u8, 7, 255] {
+            s.command_rate = raw;
+            let ro = map_amd(&s);
+            assert!(
+                matches!(ro.clocks.command_rate, Section::Na(NaReason::ParseError(_))),
+                "{raw}"
+            );
         }
     }
 
@@ -787,6 +850,7 @@ mod tests {
                 gear_mode: na_cell(),
                 gdm: na_cell(),
                 pdm: na_cell(),
+                command_rate: na_cell(),
             },
             timings: TimingSet {
                 cl: na_cell(),
@@ -893,6 +957,30 @@ mod tests {
             .expect("Section<RttValue> must serialize (no-panic contract)");
         let back: Vec<Section<RttValue>> =
             bincode::deserialize(&bytes).expect("Section<RttValue> must deserialize");
+        assert_eq!(sections, back);
+    }
+
+    /// (g′) C6-03: every [`CommandRate`] arm survives a bincode round-trip,
+    /// both bare and as the `Section` cells the clock readout uses.
+    #[test]
+    fn command_rate_arms_round_trip() {
+        let values = vec![CommandRate::OneT, CommandRate::TwoT];
+        let bytes = bincode::serialize(&values)
+            .expect("CommandRate must serialize (no-panic contract)");
+        let back: Vec<CommandRate> =
+            bincode::deserialize(&bytes).expect("CommandRate must deserialize");
+        assert_eq!(values, back);
+
+        let sections: Vec<Section<CommandRate>> = vec![
+            Section::Value(CommandRate::OneT),
+            Section::Value(CommandRate::TwoT),
+            Section::na(NaReason::NotApplicable),
+            Section::na(NaReason::ParseError("reserved encoding".to_owned())),
+        ];
+        let bytes = bincode::serialize(&sections)
+            .expect("Section<CommandRate> must serialize (no-panic contract)");
+        let back: Vec<Section<CommandRate>> =
+            bincode::deserialize(&bytes).expect("Section<CommandRate> must deserialize");
         assert_eq!(sections, back);
     }
 }
