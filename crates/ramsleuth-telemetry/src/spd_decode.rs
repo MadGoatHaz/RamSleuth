@@ -162,7 +162,9 @@ pub struct SpdProfile {
 ///
 /// Frozen (P2-09). The P2-10 facade carries `Vec<SpdModule>` into
 /// `SystemMemoryTelemetry.spd`. `index` is the I2C address from the
-/// P2-08 [`SpdImage`]; every other field is a [`Section`].
+/// P2-08 [`SpdImage`]; every other field is a [`Section`]. C6-02 adds
+/// the separately carried die maker / die type / per-rank device count
+/// (`die_maker` / `die_type` / `devices`); all degrade to `Na`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SpdModule {
     /// Module index: the I2C address of the `ee1004` device
@@ -173,6 +175,20 @@ pub struct SpdModule {
     /// Module manufacturer (JEP106, bytes `0x01`/`0x02`), falling back
     /// to the DRAM die manufacturer when no module ID is present.
     pub maker: Section<String>,
+    /// DRAM die manufacturer (JEP106 from the die-ID bytes: DDR5
+    /// `0x2E`/`0x2F`, DDR4 `0x100`/`0x101`) — the die ID [`decode_maker`]
+    /// reads as its fallback, now carried separately (C6-02); `Na` when
+    /// no die ID is present.
+    pub die_maker: Section<String>,
+    /// Human die-type label; a die variant (e.g. "A-Die") is not a
+    /// standard SPD field, so this defaults to `Na(NotApplicable)` — a
+    /// documented `die_maker` + density -> label mapping may fill it in
+    /// later (C6-02).
+    pub die_type: Section<String>,
+    /// DRAM devices per rank (byte `0x80` bits 3:0; C6-02). `Na` when
+    /// the rank config is absent or invalid (the same gating as
+    /// [`rank`]).
+    pub devices: Section<u8>,
     /// Module part number (bytes `0x81..0x91`, 16 ASCII chars).
     pub part: Section<String>,
     /// Module serial number (bytes `0x91..0xA1`, 16 ASCII chars).
@@ -201,6 +217,12 @@ pub fn decode(image: &SpdImage) -> SpdModule {
         index: image.index,
         is_ddr5,
         maker: decode_maker(data, is_ddr5),
+        die_maker: decode_die_maker(data, is_ddr5),
+        // A die variant is not a standard SPD field: the label stays
+        // Na until a documented die_maker + density mapping exists
+        // (C6-02).
+        die_type: Section::na(NaReason::NotApplicable),
+        devices: decode_devices(data),
         part: decode_ascii(data, PART_START, PART_LEN, "part number"),
         serial: decode_ascii(data, SERIAL_START, SERIAL_LEN, "serial number"),
         rank: decode_rank(data),
@@ -268,8 +290,8 @@ fn maker_string(code: u8) -> Section<String> {
 
 /// Decode the module manufacturer: JEP106 vendor + continuation at
 /// bytes `0x01`/`0x02`; when no module ID is present, falls back to the
-/// DRAM die manufacturer (DDR5 `0x2E`/`0x2F`, DDR4 `0x100`/`0x101`).
-/// All-absent -> `Na(NotApplicable)`.
+/// DRAM die manufacturer ([`decode_die_maker`]). All-absent ->
+/// `Na(NotApplicable)`.
 fn decode_maker(data: &[u8], is_ddr5: bool) -> Section<String> {
     let vendor = get(data, BYTE_MODULE_MAKER).unwrap_or(0);
     let cont = get(data, BYTE_MODULE_MAKER_CONT).unwrap_or(0);
@@ -277,6 +299,19 @@ fn decode_maker(data: &[u8], is_ddr5: bool) -> Section<String> {
     if code != 0x00 {
         return maker_string(code);
     }
+    // No module ID: the module "maker" degrades to the DRAM die
+    // manufacturer — the same source now carried separately in
+    // `SpdModule.die_maker` (C6-02).
+    decode_die_maker(data, is_ddr5)
+}
+
+/// Decode the DRAM die manufacturer: JEP106 vendor + continuation at
+/// the die-ID bytes (DDR5 `0x2E`/`0x2F`, DDR4 `0x100`/`0x101`) — the
+/// source [`decode_maker`] reads as its fallback, now carried
+/// separately in [`SpdModule.die_maker`] (C6-02). No die ID present
+/// (code 0) -> `Na(NotApplicable)`; a present-but-unknown code renders
+/// as its raw hex form (still a `Value`), never a panic.
+fn decode_die_maker(data: &[u8], is_ddr5: bool) -> Section<String> {
     let (dv, dc) = if is_ddr5 {
         (
             get(data, BYTE_DDR5_DIE_MAKER).unwrap_or(0),
@@ -337,6 +372,27 @@ fn decode_rank(data: &[u8]) -> Section<u8> {
         )));
     }
     Section::Value(total / per_rank)
+}
+
+/// Decode the DRAM devices per rank from byte `0x80` bits 3:0 (the
+/// `per_rank` half of the rank config). The invalid-config gating
+/// mirrors [`decode_rank`] exactly (the byte must be present; `total`
+/// / `per_rank` nonzero and `total % per_rank == 0`) — [`decode_rank`]
+/// computes the same `per_rank` value but discards it (it returns
+/// `total / per_rank`), so it is re-derived here (C6-02). Invalid /
+/// missing config -> `Na(ParseError)`.
+fn decode_devices(data: &[u8]) -> Section<u8> {
+    let Some(cfg) = get(data, BYTE_RANK_CONFIG) else {
+        return Section::na(oob(BYTE_RANK_CONFIG));
+    };
+    let total = cfg >> 4;
+    let per_rank = cfg & 0x0F;
+    if total == 0 || per_rank == 0 || total % per_rank != 0 {
+        return Section::na(NaReason::ParseError(format!(
+            "rank config byte 0x80 = 0x{cfg:02X} (total {total} / per-rank {per_rank}) is invalid"
+        )));
+    }
+    Section::Value(per_rank)
 }
 
 /// Decode the SDRAM density (byte `0x13`) into Mbit:
@@ -732,6 +788,11 @@ mod tests {
         assert_eq!(m.rank, Section::Value(2));
         assert_eq!(m.density_mbit, Section::Value(8192));
         assert_eq!(m.speed_mts, Section::Value(2000));
+        // C6-02: no die-ID bytes in this fixture -> absent die maker;
+        // the die-type label defaults to Na; 0x84 = 8 total / 4 per rank.
+        assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
+        assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
+        assert_eq!(m.devices, Section::Value(4));
         assert_eq!(m.profiles.len(), 1, "slot 1 valid, slot 2 blank");
         let p = &m.profiles[0];
         assert_eq!(p.index, 1);
@@ -760,6 +821,11 @@ mod tests {
         assert_eq!(m.rank, Section::Value(1));
         assert_eq!(m.density_mbit, Section::Value(16384));
         assert_eq!(m.speed_mts, Section::Value(6400));
+        // C6-02: no die-ID bytes in this fixture -> absent die maker;
+        // the die-type label defaults to Na; 0x88 = 8 total / 8 per rank.
+        assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
+        assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
+        assert_eq!(m.devices, Section::Value(8));
         assert_eq!(m.profiles.len(), 1, "profile 0 valid, the rest blank");
         let p = &m.profiles[0];
         assert_eq!(p.index, 0);
@@ -808,6 +874,11 @@ mod tests {
         assert!(matches!(&m.serial, Section::Na(NaReason::ParseError(_))));
         assert!(matches!(&m.rank, Section::Na(NaReason::ParseError(_))));
         assert!(matches!(&m.density_mbit, Section::Na(NaReason::ParseError(_))));
+        // C6-02: the die-ID bytes are past the truncation (code 0) and
+        // byte 0x80 is out of bounds.
+        assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
+        assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
+        assert!(matches!(&m.devices, Section::Na(NaReason::ParseError(_))));
         assert!(matches!(&m.speed_mts, Section::Na(NaReason::ParseError(_))));
         assert!(m.profiles.is_empty());
     }
@@ -823,6 +894,11 @@ mod tests {
         assert_eq!(m.index, 0x50);
         assert!(!m.is_ddr5);
         assert_eq!(m.maker, Section::Na(NaReason::NotApplicable));
+        // C6-02: no die ID, default die-type label, byte 0x80 out of
+        // bounds.
+        assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
+        assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
+        assert!(m.devices.is_na());
         assert!(m.part.is_na());
         assert!(m.serial.is_na());
         assert!(m.rank.is_na());
@@ -904,6 +980,9 @@ mod tests {
             data,
         });
         assert_eq!(m.maker, Section::Value("Micron".to_owned()));
+        // C6-02: the die maker is carried separately and agrees with
+        // the fallback source.
+        assert_eq!(m.die_maker, Section::Value("Micron".to_owned()));
     }
 
     // ------------------------------------------------------------------
@@ -1006,6 +1085,11 @@ mod tests {
         assert_eq!(m.maker, Section::Value("G.Skill".to_owned()));
         assert_eq!(m.density_mbit, Section::Value(16384));
         assert_eq!(m.rank, Section::Value(1));
+        // C6-02: 0x11 = 1 total / 1 per rank; the live fixture carries
+        // no die-ID bytes and the die-type label defaults to Na.
+        assert_eq!(m.devices, Section::Value(1));
+        assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
+        assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
         assert_eq!(m.speed_mts, Section::Value(3200));
         assert_eq!(m.part, Section::Value("F4-3600C18-32GVK".to_owned()));
         assert_eq!(m.serial, Section::Na(NaReason::NotApplicable));
@@ -1119,6 +1203,102 @@ mod tests {
             m.density_mbit,
             Section::Na(NaReason::ParseError(_))
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // (h) C6-02: the separately carried die maker / die type / devices.
+    // ------------------------------------------------------------------
+
+    /// The DRAM die maker is carried separately from the module maker:
+    /// with both present, `maker` stays the module ID while `die_maker`
+    /// decodes the die-ID bytes (DDR4 `0x100`/`0x101`), and the
+    /// die-type label stays its `Na(NotApplicable)` default.
+    #[test]
+    fn die_maker_carried_separately_from_module_maker() {
+        let mut data = ddr4_image().data; // module maker: Micron
+        data[0x100] = 0x09; // SK hynix 0x89 (vendor 0x09, continuation 0x08)
+        data[0x101] = 0x08;
+        let m = decode(&SpdImage { index: 0x52, data });
+        assert_eq!(m.maker, Section::Value("Micron".to_owned()));
+        assert_eq!(m.die_maker, Section::Value("SK hynix".to_owned()));
+        assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
+    }
+
+    /// The DDR5 die-ID bytes (`0x2E`/`0x2F`) decode the separately
+    /// carried die maker on a DDR5 module.
+    #[test]
+    fn die_maker_decodes_ddr5_die_id_bytes() {
+        let mut data = ddr5_image().data; // module maker: Samsung
+        data[0x2E] = 0x02; // Micron 0xC2 (vendor 0x02, continuation 0x0C)
+        data[0x2F] = 0x0C;
+        let m = decode(&SpdImage { index: 0x53, data });
+        assert_eq!(m.maker, Section::Value("Samsung".to_owned()));
+        assert_eq!(m.die_maker, Section::Value("Micron".to_owned()));
+    }
+
+    /// A die-ID code absent from the [`JEP106`] table renders as its
+    /// raw hex form in the separately carried die maker (still a
+    /// `Value`); with no module ID the module maker falls back to the
+    /// same die source, so the two agree.
+    #[test]
+    fn die_maker_unknown_code_renders_raw_hex_and_matches_fallback() {
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A;
+        data[0x100] = 0x0B; // vendor nibble
+        data[0x101] = 0x0A; // continuation nibble -> 0xAB (unknown)
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert_eq!(m.maker, Section::Value("0xAB".to_owned())); // fallback = die
+        assert_eq!(m.die_maker, Section::Value("0xAB".to_owned()));
+    }
+
+    /// `devices` re-derives byte `0x80` bits 3:0 (the `per_rank` half
+    /// [`decode_rank`] computes but discards): 0x84 -> 4 (2 ranks),
+    /// 0x88 -> 8 (1 rank), 0x11 -> 1 (1 rank), 0x42 -> 2 (2 ranks).
+    #[test]
+    fn devices_rederived_from_rank_config() {
+        for (cfg, devices, ranks) in [
+            (0x84u8, 4u8, 2u8),
+            (0x88, 8, 1),
+            (0x11, 1, 1),
+            (0x42, 2, 2),
+        ] {
+            let mut data = vec![0u8; 512];
+            data[0x00] = 0x0A;
+            data[0x80] = cfg;
+            let m = decode(&SpdImage { index: 0x50, data });
+            assert_eq!(m.devices, Section::Value(devices), "cfg 0x{cfg:02X}");
+            assert_eq!(m.rank, Section::Value(ranks), "cfg 0x{cfg:02X}");
+        }
+    }
+
+    /// Invalid rank configs gate `devices` to `Na(ParseError)` exactly
+    /// like `rank` does (nonzero, divisible): 0x00, 0x0F (zero total),
+    /// 0x83 (8 total / 3 per rank not divisible), 0x80 (zero per-rank)
+    /// — and a truncated image with byte `0x80` out of bounds.
+    #[test]
+    fn devices_invalid_config_gates_like_rank() {
+        for cfg in [0x00u8, 0x0F, 0x83, 0x80] {
+            let mut data = vec![0u8; 512];
+            data[0x00] = 0x0A;
+            data[0x80] = cfg;
+            let m = decode(&SpdImage { index: 0x50, data });
+            assert!(
+                matches!(m.devices, Section::Na(NaReason::ParseError(_))),
+                "cfg 0x{cfg:02X}: devices must be Na(ParseError), got {:?}",
+                m.devices
+            );
+            assert!(
+                matches!(m.rank, Section::Na(NaReason::ParseError(_))),
+                "cfg 0x{cfg:02X}: rank must be Na(ParseError) (same gating)"
+            );
+        }
+        // Byte 0x80 out of bounds (truncated image): both cells Na.
+        let m = decode(&SpdImage {
+            index: 0x50,
+            data: vec![0x0A, 0x02, 0x0C],
+        });
+        assert!(matches!(m.devices, Section::Na(NaReason::ParseError(_))));
+        assert!(matches!(m.rank, Section::Na(NaReason::ParseError(_))));
     }
 }
 
