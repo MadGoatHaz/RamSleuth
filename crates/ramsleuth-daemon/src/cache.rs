@@ -93,11 +93,14 @@ mod tests {
 
     use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
+    use ramsleuth_telemetry::SystemPlatform;
 
     use super::*;
 
-    /// All-`Na` mock snapshot built via the telemetry crate's public
-    /// API (host-independent — no hardware, no real `collect()`).
+    /// Mock snapshot built via the telemetry crate's public API
+    /// (host-independent — no hardware, no real `collect()`): vendor
+    /// branches all-`Na` + empty SPD, representative platform /
+    /// capacity values (C6-13/14).
     fn mock_snapshot() -> SystemMemoryTelemetry {
         SystemMemoryTelemetry {
             cpu: CpuInfo {
@@ -107,6 +110,14 @@ mod tests {
             amd: Section::na(NaReason::NotApplicable),
             intel: Section::na(NaReason::NotApplicable),
             spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3500.0),
+                motherboard: Section::Value("Test Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(32.0),
+            dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
         }
     }
 
@@ -196,7 +207,8 @@ mod tests {
         let snap = cache.get();
 
         // Field-level equality against the mock (SystemMemoryTelemetry
-        // derives PartialEq; the mock is all-Na + empty SPD).
+        // derives PartialEq; the mock's vendor branches are all-Na +
+        // empty SPD).
         assert_eq!(
             snap.cpu,
             CpuInfo {
