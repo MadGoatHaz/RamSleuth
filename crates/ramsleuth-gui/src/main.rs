@@ -195,7 +195,8 @@ fn unix_timestamp() -> u64 {
 /// Perform one user action against the current state (P3-30).
 ///
 /// The status zone's returned [`GuiAction`] becomes its side effect:
-/// `SnapshotPng` writes the current benchmark grid to
+/// `SnapshotPng` writes the current benchmark grid — with the CPU /
+/// RAM header lines over it (C6-28) — to
 /// `ramsleuth-snapshot-<unix-ts>.png` (via [`snapshot_png`]) and
 /// `ExportJson` writes the current telemetry snapshot to
 /// `ramsleuth-export-<unix-ts>.json` (via [`export_json`]) — both into
@@ -218,7 +219,7 @@ pub fn perform_export(
         GuiAction::SnapshotPng => match &data.bench.grid {
             Some(grid) => {
                 let path = out_dir.join(format!("ramsleuth-snapshot-{ts}.png"));
-                snapshot_png(grid, &path)?;
+                snapshot_png(grid, data.telemetry.as_ref(), &path)?;
                 Ok(Some(path))
             }
             None => Ok(None),
