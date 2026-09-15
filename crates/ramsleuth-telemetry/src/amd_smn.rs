@@ -20,7 +20,7 @@
 //!
 //! | SMN reg | fields (bits) | snapshot slot(s) |
 //! |---|---|---|
-//! | `0x50200` | MCLK set-point `(v & 0x7F) / 3 × 100` MHz (6:0); **GDM** (11); command rate 1T/2T (10) | `gdm` (set-point/CR: decoded, not stored) |
+//! | `0x50200` | MCLK set-point `(v & 0x7F) / 3 × 100` MHz (6:0); **GDM** (11); command rate 1T/2T (10) | `gdm` + `command_rate` (set-point: decoded, not stored) |
 //! | `0x50204` | tCL (5:0); tRAS (14:8); tRCDRD (20:16); tRCDWR (28:24) | `cl` / `ras` / `rcdrd` / `rcwdwr` |
 //! | `0x50208` | tRC (7:0); tRP (21:16) | `rc` / `rp` |
 //! | `0x5020C` | tRRDS (4:0); tRRDL (12:8); tRTP (28:24) | `rrds` / `rrld` / `rtp` |
@@ -190,10 +190,7 @@ pub(crate) fn gdm_flag(reg: u32) -> u8 {
     ((reg >> 11) & 1) as u8
 }
 
-/// Command rate: bit 10 of `0x50200` (`0` = 1T, `1` = 2T) — decoded,
-/// documented, not stored (no frozen slot; see [`mclk_setpoint_mhz`] for
-/// the `#[allow(dead_code)]` rationale).
-#[allow(dead_code)]
+/// Command rate: bit 10 of `0x50200` (`0` = 1T, `1` = 2T).
 pub(crate) fn command_rate(reg: u32) -> u8 {
     ((reg >> 10) & 1) as u8
 }
@@ -322,14 +319,17 @@ pub(crate) fn trfc4(reg: u32) -> u16 {
 
 /// The confirmed SMN fields decoded from the register set.
 ///
-/// Carries GDM + the 27 DRAM subtimings. PDM and the eight CAD-bus codes
-/// are deliberately **absent**: their bitfields are unconfirmed (plan D3,
-/// confirm-or-Na), so the snapshot's `pdm` / `cad_bus` stay zeroed by
-/// P2-04 and render as honest `Disabled` / `Na` under the P2-05 gates.
+/// Carries GDM + command rate + the 27 DRAM subtimings. PDM and the eight
+/// CAD-bus codes are deliberately **absent**: their bitfields are
+/// unconfirmed (plan D3, confirm-or-Na), so the snapshot's `pdm` /
+/// `cad_bus` stay zeroed by P2-04 and render as honest `Disabled` / `Na`
+/// under the P2-05 gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SmnFields {
     /// Gear Down Mode (`0x50200` bit 11): `0` = off, `1` = on.
     pub gdm: u8,
+    /// DRAM command rate (`0x50200` bit 10): `0` = 1T, `1` = 2T.
+    pub command_rate: u8,
     /// The 27 DRAM subtimings in ticks (the verified reference table).
     pub timings: AmdPmTimings,
 }
@@ -372,6 +372,7 @@ pub fn decode_smn(regs: &[(u32, Option<u32>)]) -> SmnFields {
 
     SmnFields {
         gdm: gdm_flag(word_at(regs, SMN_MCLK)),
+        command_rate: command_rate(word_at(regs, SMN_MCLK)),
         timings: AmdPmTimings {
             cl: tcl(word_at(regs, SMN_CMD0)),
             rcwdwr: trcdwr(word_at(regs, SMN_CMD0)),
@@ -579,10 +580,10 @@ impl Drop for FdGuard {
 /// - **Any other per-register failure** (privilege, I/O, short read) →
 ///   that register's fields stay zeroed (honest `Disabled` / `Na` under
 ///   the P2-05 gates); the other registers proceed independently.
-/// - **Written fields**: `gdm` (`0x50200` bit 11) + the 27 `timings` — and
-///   only those. PM-table fields (version, clocks, div mode, voltages) are
-///   never touched; `pdm` / `cad_bus` stay zeroed (unconfirmed bitfields,
-///   plan D3).
+/// - **Written fields**: `gdm` (`0x50200` bit 11) + `command_rate`
+///   (`0x50200` bit 10) + the 27 `timings` — and only those. PM-table
+///   fields (version, clocks, div mode, voltages) are never touched;
+///   `pdm` / `cad_bus` stay zeroed (unconfirmed bitfields, plan D3).
 pub fn apply_smn(snap: &mut AmdPmSnapshot) {
     if vendor_gate(&CpuInfo::detect()).is_err() {
         return;
@@ -606,13 +607,13 @@ fn read_word(res: TelemetryResult<u32>) -> Option<u32> {
 ///
 /// Register flow (module docs): probe `0x50200` (offset rule) → read the
 /// remaining 12 at the resolved base → [`decode_smn`] → write `gdm` +
-/// `timings` only. `DriverMissing` on the probe is a whole-overlay no-op;
-/// any other probe failure — including the driver's `0xFFFF_FFFF`
-/// failed-read sentinel (P6-10) — degrades to per-register containment (a
-/// failed read contributes `None` → its fields decode to `0`). The offset
-/// rule is decided by the first read only (monitor_cpu semantics): a
-/// sentinel on the relocated re-read keeps the relocated base with no
-/// set-point.
+/// `command_rate` + `timings` only. `DriverMissing` on the probe is a
+/// whole-overlay no-op; any other probe failure — including the driver's
+/// `0xFFFF_FFFF` failed-read sentinel (P6-10) — degrades to per-register
+/// containment (a failed read contributes `None` → its fields decode to
+/// `0`). The offset rule is decided by the first read only (monitor_cpu
+/// semantics): a sentinel on the relocated re-read keeps the relocated
+/// base with no set-point.
 fn apply_smn_with<R: FnMut(u32) -> TelemetryResult<u32>>(
     mut reader: R,
     snap: &mut AmdPmSnapshot,
@@ -654,10 +655,12 @@ fn apply_smn_with<R: FnMut(u32) -> TelemetryResult<u32>>(
     // are deliberately untouched: their bitfields are unconfirmed (plan
     // D3 confirm-or-Na) and they render as honest `Disabled` / `Na` under
     // the P2-05 gates. A failed-read word (`None` or the sentinel) decodes
-    // to `0` — exactly the PM-table parse value for `gdm` / `timings`
-    // (P2-04 zeroes them), so the write preserves the parse output: on a
-    // sentinel probe the snapshot's `gdm` keeps the parse value (P6-10).
+    // to `0` — exactly the PM-table parse value for `gdm` /
+    // `command_rate` / `timings` (P2-04 zeroes them), so the write
+    // preserves the parse output: on a sentinel probe the snapshot's
+    // `gdm` keeps the parse value (P6-10).
     snap.gdm = fields.gdm;
+    snap.command_rate = fields.command_rate;
     snap.timings = fields.timings;
 }
 
@@ -833,6 +836,7 @@ mod tests {
             SMN_REGISTER_SET.iter().map(|a| (*a, Some(max_mask_word(*a)))).collect();
         let f = decode_smn(&regs);
         assert_eq!(f.gdm, 1);
+        assert_eq!(f.command_rate, 1); // bit 10 set in the max mask word
         let t = f.timings;
         assert_eq!(t.cl, 63);
         assert_eq!(t.ras, 127);
@@ -866,12 +870,14 @@ mod tests {
         assert_eq!(tcke(max_mask_word(SMN_CKE)), 31);
     }
 
-    /// (b) `decode_smn` maps the fixture words onto all 27 timings + GDM
-    /// exactly (the `0x50264` mirror is ignored without the sentinel).
+    /// (b) `decode_smn` maps the fixture words onto all 27 timings + GDM +
+    /// command rate exactly (the `0x50264` mirror is ignored without the
+    /// sentinel).
     #[test]
-    fn decode_smn_fixture_words_all_27_timings_and_gdm() {
+    fn decode_smn_fixture_words_all_27_timings_gdm_command_rate() {
         let f = decode_smn(&fixture_regs());
         assert_eq!(f.gdm, 0);
+        assert_eq!(f.command_rate, 1); // the fixture's 0x50200 = 0x1539 (bit 10 set: 2T)
         assert_eq!(
             f.timings,
             AmdPmTimings {
@@ -893,6 +899,17 @@ mod tests {
         assert_eq!(decode_smn(&[(SMN_MCLK, Some(0x0000_0800u32))]).gdm, 1);
         assert_eq!(decode_smn(&[(SMN_MCLK, Some(0x0000_07FFu32))]).gdm, 0);
         assert_eq!(decode_smn(&[(SMN_MCLK, Some(SMN_READ_FAILURE_SENTINEL))]).gdm, 0);
+    }
+
+    /// (b) Command rate is exactly bit 10 of `0x50200` (all other bits
+    /// irrelevant); the driver's `0xFFFF_FFFF` failed-read sentinel never
+    /// decodes — bit 10 of the all-ones word (which happens to be set) is
+    /// a read failure, not `2T` (P6-10).
+    #[test]
+    fn command_rate_is_bit_10_of_50200() {
+        assert_eq!(decode_smn(&[(SMN_MCLK, Some(0x0000_0400u32))]).command_rate, 1);
+        assert_eq!(decode_smn(&[(SMN_MCLK, Some(0x0000_0BFFu32))]).command_rate, 0);
+        assert_eq!(decode_smn(&[(SMN_MCLK, Some(SMN_READ_FAILURE_SENTINEL))]).command_rate, 0);
     }
 
     /// (c) The `0x50264` mirror/sentinel rule (reference lines 275–277):
@@ -945,6 +962,7 @@ mod tests {
     fn decode_smn_robust_inputs() {
         let zero = SmnFields {
             gdm: 0,
+            command_rate: 0,
             timings: AmdPmTimings {
                 cl: 0, rcwdwr: 0, rcdrd: 0, rp: 0, ras: 0, rc: 0, rrds: 0, rrld: 0,
                 faw: 0, wtrs: 0, wtrl: 0, wr: 0, rfc1: 0, rfc2: 0, rfcsb: 0,
@@ -969,6 +987,7 @@ mod tests {
         let f = decode_smn(&unknown);
         assert_eq!(f.timings.cl, 16);
         assert_eq!(f.gdm, 0);
+        assert_eq!(f.command_rate, 0); // absent word -> 0
     }
 
     // ---- accessor (hermetic) ----------------------------------------------
@@ -1136,6 +1155,7 @@ mod tests {
             &mut snap,
         );
         assert_eq!(snap.gdm, 0);
+        assert_eq!(snap.command_rate, 0); // all reads failed -> parse value
         assert_eq!(snap.timings, base_snapshot().timings); // all zero
         assert_eq!(snap.cad_bus, base_snapshot().cad_bus); // unconfirmed: untouched
         assert_eq!(snap.pdm, 0); // unconfirmed: untouched
@@ -1148,8 +1168,9 @@ mod tests {
     }
 
     /// (d) A synthetic register feed populates exactly the SMN fields (GDM +
-    /// the 27 timings) and leaves clocks / voltages / `pdm` / `cad_bus`
-    /// untouched — the overlay's write surface is precisely D2's.
+    /// command rate + the 27 timings) and leaves clocks / voltages / `pdm`
+    /// / `cad_bus` untouched — the overlay's write surface is precisely
+    /// the extended one (D-C2).
     #[test]
     fn apply_smn_with_synthetic_feed_writes_smn_fields_only() {
         let mut snap = base_snapshot();
@@ -1164,6 +1185,7 @@ mod tests {
             &mut snap,
         );
         assert_eq!(snap.gdm, 0); // the fixture's 0x50200 = 0x1539
+        assert_eq!(snap.command_rate, 1); // bit 10 set in the fixture's 0x1539
         let t = snap.timings;
         assert_eq!(t.cl, 16);
         assert_eq!(t.ras, 36);
@@ -1272,6 +1294,7 @@ mod tests {
             assert!(*a < SMN_HIGH_BASE, "relocated address on a sentinel probe: {a:#x}");
         }
         assert_eq!(snap.gdm, 0); // sentinel -> no set-point -> parse value
+        assert_eq!(snap.command_rate, 0); // sentinel -> no set-point -> parse value
         // The bare-address words still decode (per-register containment).
         assert_eq!(snap.timings.cl, 16);
         assert_eq!(snap.timings.rfc1, 160);
@@ -1383,6 +1406,7 @@ mod tests {
         );
         assert_eq!(pm_before, pm_after, "PM-table fields must never be touched");
         assert!(snap.gdm <= 1, "gdm decodes from a single bit");
+        assert!(snap.command_rate <= 1, "command rate decodes from a single bit");
         assert_eq!(snap.pdm, 0); // unconfirmed: never written
         assert_eq!(snap.cad_bus, base_snapshot().cad_bus); // unconfirmed: never written
         // Every timing is within its reference mask width (0 or decoded).
