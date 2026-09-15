@@ -201,7 +201,9 @@ fn section_from<T>(result: TelemetryResult<T>) -> Section<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::amd_readout::{CadBus, ClockReadout, DivMode, RttValue, TimingSet, VoltageSet};
+    use crate::amd_readout::{
+        CadBus, ClockReadout, CommandRate, DivMode, RttValue, TimingSet, VoltageSet,
+    };
     use crate::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
     use crate::cpuid::{AmdZen, IntelGen};
 
@@ -378,6 +380,7 @@ mod tests {
                 gear_mode: Section::na(NaReason::NotApplicable),
                 gdm: Section::Value(false),
                 pdm: Section::Value(true),
+                command_rate: Section::Value(CommandRate::TwoT),
             },
             timings: TimingSet {
                 cl: Section::Value(16),

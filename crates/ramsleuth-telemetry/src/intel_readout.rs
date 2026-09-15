@@ -47,6 +47,9 @@
 //! - `div_mode` ← command rate (1N → `DivMode::OneToOne`, 2N →
 //!   `DivMode::OneToTwo`); a reserved encoding or failed read →
 //!   `Na(ParseError)`.
+//! - `command_rate` → `Na(NotApplicable)` — the IMC command rate (1N/2N)
+//!   is already surfaced as `div_mode` above (P2-07); a separate slot
+//!   would redundantly re-expose the same bits (D-C11).
 //! - `gear_mode` ← gear (1/2/4 → `GearMode::One`/`Two`/`Four`); a reserved
 //!   encoding or failed read → `Na(ParseError)`.
 //! - tCL/tRCD/tRP/tRAS/RTL/tCCD_S/tCCD_L/tRDRD/tRDWR/tWRWR/tWRRD map into
@@ -293,6 +296,10 @@ pub fn decode_channel(index: u8, mclk_reg: Option<u32>, regs: [Option<u32>; 4]) 
         gear_mode,
         gdm: Section::na(NaReason::NotApplicable),
         pdm: Section::na(NaReason::NotApplicable),
+        // D-C11: the IMC command rate (1N/2N) is already surfaced as
+        // `div_mode`; a separate slot would redundantly re-expose the
+        // same bits → honest not-applicable.
+        command_rate: Section::na(NaReason::NotApplicable),
     };
 
     // --- timings (ticks) ----------------------------------------------------
@@ -737,6 +744,7 @@ mod tests {
         assert_eq!(ch.clocks.fclk_mhz, Section::na(NaReason::NotApplicable));
         assert_eq!(ch.clocks.gdm, Section::na(NaReason::NotApplicable));
         assert_eq!(ch.clocks.pdm, Section::na(NaReason::NotApplicable));
+        assert_eq!(ch.clocks.command_rate, Section::na(NaReason::NotApplicable));
 
         // RTL (channel-level field).
         assert_eq!(ch.rtl, Section::Value(6));
@@ -869,6 +877,7 @@ mod tests {
         is_na(&ch.clocks.gear_mode);
         is_na(&ch.clocks.gdm);
         is_na(&ch.clocks.pdm);
+        is_na(&ch.clocks.command_rate);
         let timing_secs: [&Section<u16>; 27] = [
             &ch.timings.cl,
             &ch.timings.rcwdwr,
