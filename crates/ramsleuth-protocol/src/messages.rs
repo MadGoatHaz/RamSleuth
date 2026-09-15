@@ -7,15 +7,15 @@
 //! **Payloads are reused, never duplicated (plan D2):** [`Request`] /
 //! [`Response`] embed the telemetry crate's `SystemMemoryTelemetry` and
 //! the bench crate's `StreamTarget` / `StreamProgress` /
-//! `BenchmarkGrid` verbatim — the single source of truth for each is its
-//! owning crate. This module owns only the four wire enums and the
-//! socket-path constant.
+//! `BenchmarkGrid` / `BurnInTick` verbatim — the single source of truth
+//! for each is its owning crate. This module owns only the four wire
+//! enums and the socket-path constant.
 //!
 //! **No-panic contract:** every arm is bincode-serializable (plan D3);
 //! failures cross the wire as structured payloads — [`Response::Error`]
 //! and the `Na(reason)` sections inside a snapshot — never as panics.
 
-use ramsleuth_bench::{BenchmarkGrid, StreamProgress, StreamTarget};
+use ramsleuth_bench::{BenchmarkGrid, BurnInTick, StreamProgress, StreamTarget};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 
 /// The default daemon Unix-socket path: the single socket-path source
@@ -50,6 +50,17 @@ pub enum Request {
     /// Cancel the active run `run_id`: the in-flight pass finishes, the
     /// run stops at the next gate (clean cancel, plan D6).
     CancelBenchmark { run_id: u64 },
+    /// Start a burn-in run (D-1): `target` selects the cells every pass
+    /// runs, `duration_minutes` the duration — `0` means *infinite*
+    /// (stop only via [`Request::CancelBenchmark`]), `n > 0` stops once
+    /// a pass has completed and the run elapsed is `n × 60` seconds. A
+    /// burn-in is a distinct run class (a multi-pass duration run, not
+    /// the single-pass [`Request::StartBenchmark`]), so it gets its own
+    /// arm: `StartBenchmark` / `BenchMode` stay byte-frozen.
+    /// Single-flight with `StartBenchmark` (a second start while any
+    /// run is active gets [`Response::Error`], plan D6); its progress
+    /// streams on [`Response::BurnInProgress`].
+    StartBurnIn { target: StreamTarget, duration_minutes: u32 },
 }
 
 /// A daemon → client RPC response.
@@ -78,6 +89,12 @@ pub enum Response {
     /// A structured error reply — the wire-safe arm of the no-panic
     /// contract.
     Error(String),
+    /// One streamed burn-in tick for the owning `StartBurnIn`
+    /// connection (D-2): the bench crate's [`BurnInTick`] verbatim —
+    /// one per completed bandwidth cell and per completed per-tier
+    /// latency pass of each burn-in iteration. The normal-bench
+    /// [`Response::BenchProgress`] arm stays byte-identical.
+    BurnInProgress(BurnInTick),
 }
 
 /// The top-level wire frame payload: one request or one response per
@@ -157,6 +174,29 @@ mod tests {
         assert_eq!(back, req);
     }
 
+    /// (a1b) `Request::StartBurnIn` round-trips through bincode (D-1:
+    /// the appended wire arm — both the infinite (`0`) and a finite
+    /// duration, over the full target range).
+    #[test]
+    fn start_burn_in_request_bincode_round_trip() {
+        for target in [
+            StreamTarget::Full,
+            StreamTarget::Tier(Tier::L2),
+            StreamTarget::Cell(Tier::Memory, BenchOp::Write),
+        ] {
+            for duration_minutes in [0u32, 1, 60, u32::MAX] {
+                let req = Request::StartBurnIn {
+                    target,
+                    duration_minutes,
+                };
+                let bytes = bincode::serialize(&req).expect("Request must serialize");
+                let back: Request =
+                    bincode::deserialize(&bytes).expect("Request must deserialize");
+                assert_eq!(back, req);
+            }
+        }
+    }
+
     /// (a2) `Response::Telemetry` round-trips with a representative
     /// snapshot (the P3-06 payload root crosses the wire verbatim).
     #[test]
@@ -185,6 +225,14 @@ mod tests {
                 mode: BenchMode::MemoryOnly,
             },
             Request::CancelBenchmark { run_id: 42 },
+            Request::StartBurnIn {
+                target: StreamTarget::Full,
+                duration_minutes: 0,
+            },
+            Request::StartBurnIn {
+                target: StreamTarget::Tier(Tier::L3),
+                duration_minutes: 30,
+            },
         ];
         let bytes = bincode::serialize(&requests).expect("requests must serialize");
         let back: Vec<Request> = bincode::deserialize(&bytes).expect("requests must deserialize");
@@ -209,6 +257,20 @@ mod tests {
             Response::BenchResult { run_id: 1, grid },
             Response::BenchCancelled { run_id: 1 },
             Response::Error("benchmark already running".to_owned()),
+            Response::BurnInProgress(BurnInTick {
+                iteration: 3,
+                elapsed_secs: 42.5,
+                tier: Tier::Memory,
+                bandwidth: Some((BenchOp::Read, 512.0)),
+                latency_ns: None,
+            }),
+            Response::BurnInProgress(BurnInTick {
+                iteration: 3,
+                elapsed_secs: 42.9,
+                tier: Tier::L1,
+                bandwidth: None,
+                latency_ns: Some(1.1),
+            }),
         ];
         let bytes = bincode::serialize(&responses).expect("responses must serialize");
         let back: Vec<Response> = bincode::deserialize(&bytes).expect("responses must deserialize");

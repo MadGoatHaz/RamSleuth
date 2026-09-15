@@ -213,11 +213,13 @@ pub fn poll_telemetry(socket: &Path, state: &mut TelemetryData) -> Result<(), St
             Response::BenchStarted { .. }
             | Response::BenchProgress(_)
             | Response::BenchResult { .. }
-            | Response::BenchCancelled { .. },
+            | Response::BenchCancelled { .. }
+            | Response::BurnInProgress(_),
         ) => {
-            // A benchmark frame in reply to `GetTelemetry` violates the
-            // wire contract (the daemon streams those only to the owning
-            // benchmark connection, P3-16): record a structured error.
+            // A benchmark / burn-in frame in reply to `GetTelemetry`
+            // violates the wire contract (the daemon streams those
+            // only to the owning benchmark / burn-in connection,
+            // P3-16): record a structured error.
             state.error = Some("unexpected response to GetTelemetry".to_owned());
         }
         Err(error) => {
@@ -296,8 +298,9 @@ fn latest_memory_read_bw(state: &TelemetryData) -> f64 {
 /// events never mix into a new one); the terminal frame (`BenchResult`
 /// → the grid, `BenchCancelled`, or the daemon's `Error`) sets
 /// `running = false`; a transport failure (a closed stream, a timeout,
-/// …) or a contract-violating frame records `state.error` and the
-/// same. Always returns `Ok(())` (the no-panic contract, as in
+/// …) or a contract-violating frame (a `Telemetry` or `BurnInProgress`
+/// frame in this stream) records `state.error` and the same. Always
+/// returns `Ok(())` (the no-panic contract, as in
 /// [`poll_telemetry`]) — the poller loop must survive every failure.
 ///
 /// **Cancel (P3-28):** `cancel` is the flag the bench zone's Cancel
@@ -375,6 +378,18 @@ pub fn run_bench(
                 // wire contract (`GetTelemetry` is served on its own
                 // connection, P3-16): stop the run and record it.
                 state.error = Some("unexpected response during benchmark".to_owned());
+                state.bench.running = false;
+                break;
+            }
+            Ok(Response::BurnInProgress(_)) => {
+                // A burn-in frame in a normal-bench stream violates
+                // the wire contract (burn-in ticks stream only on the
+                // owning `StartBurnIn` connection, D-1/D-2): stop the
+                // run and record it. The interim guard C7-07 lands so
+                // the workspace compiles; C7-16 replaces it with the
+                // real burn-in consumption.
+                state.error =
+                    Some("unexpected burn-in frame during benchmark".to_owned());
                 state.bench.running = false;
                 break;
             }

@@ -1,18 +1,25 @@
 //! Single-flight benchmark job manager (P3-15, plan D6): at most one
-//! benchmark runs at a time — a bandwidth run monopolizes every
-//! pinned core, so a concurrent run is meaningless. A second
-//! [`BenchJobManager::start`] while a run is active fails with
-//! [`JobError::Busy`], which the daemon maps onto the wire's
+//! run of either class (a single-pass benchmark or a multi-pass
+//! burn-in, C7-07/D-1) is active at a time — a bandwidth run
+//! monopolizes every pinned core, so a concurrent run is meaningless.
+//! A second [`BenchJobManager::start`] / [`BenchJobManager::start_burn_in`]
+//! while a run is active fails with [`JobError::Busy`], which the
+//! daemon maps onto the wire's
 //! `Response::Error("benchmark already running")` (P3-16).
 //!
-//! Each run executes the frozen P3-09 contract [`run_streamed`] on a
-//! blocking-pool thread ([`tokio::task::spawn_blocking`] — the run is
-//! CPU-bound and must not occupy a runtime worker) and streams its
-//! events on the [`JobHandle`] channel: one [`JobEvent::Progress`] per
-//! completed bandwidth cell (the P3-09 [`StreamProgress`] verbatim)
-//! and exactly one terminal event — [`JobEvent::Result`] (the measured
-//! [`BenchmarkGrid`]), [`JobEvent::Cancelled`] (the run's cancel flag
-//! was set at a P3-09 gate), or [`JobEvent::Error`] (a
+//! Each benchmark run executes the frozen P3-09 contract
+//! [`run_streamed`] and each burn-in run the C7-06 contract
+//! [`run_burn_in`], both on a blocking-pool thread
+//! ([`tokio::task::spawn_blocking`] — the run is CPU-bound and must
+//! not occupy a runtime worker) and both stream their events on the
+//! [`JobHandle`] channel: one [`JobEvent::Progress`] (the P3-09
+//! [`StreamProgress`] verbatim) per completed bandwidth cell of a
+//! benchmark run, one [`JobEvent::BurnInTick`] (the C7-06
+//! [`BurnInTick`] verbatim) per completed cell / per-tier latency pass
+//! of each burn-in iteration, and exactly one terminal event —
+//! [`JobEvent::Result`] (the measured [`BenchmarkGrid`] — for a
+//! burn-in, its last completed pass), [`JobEvent::Cancelled`] (the
+//! run's cancel flag was set at a gate), or [`JobEvent::Error`] (a
 //! [`StreamError`]'s `Display` text, or the blocking task's join
 //! failure — no-panic contract, plan D5: a failed run ends with a
 //! structured event, never a panic). After the terminal event the job
@@ -51,7 +58,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ramsleuth_bench::{
-    run_streamed, BenchmarkGrid, StreamError, StreamOptions, StreamProgress, StreamTarget, Tier,
+    run_burn_in, run_streamed, BenchmarkGrid, BurnInOptions, BurnInTick, StreamError,
+    StreamOptions, StreamProgress, StreamTarget, Tier,
 };
 use ramsleuth_protocol::BenchMode;
 
@@ -70,8 +78,14 @@ pub enum JobEvent {
     /// One completed bandwidth cell (the P3-09 [`StreamProgress`]
     /// verbatim — the protocol wraps it with the `run_id`).
     Progress(StreamProgress),
+    /// One burn-in tick (the C7-06 [`BurnInTick`] verbatim — the
+    /// protocol wraps it in its `BurnInProgress` arm, D-2): one per
+    /// completed bandwidth cell and per completed per-tier latency
+    /// pass of each burn-in iteration.
+    BurnInTick(BurnInTick),
     /// Terminal: the run completed; `grid` holds the measured cells
-    /// (unrequested cells stay `0.0`, P3-09 contract).
+    /// (unrequested cells stay `0.0`, P3-09 contract; for a burn-in,
+    /// the grid of its last completed pass).
     Result(BenchmarkGrid),
     /// Terminal: the run's cancel flag was set at a P3-09 gate; the
     /// in-flight pass finished and the partial grid was discarded.
@@ -92,7 +106,8 @@ pub enum JobEvent {
 pub struct JobHandle {
     /// This run's daemon-assigned id (monotonic, first run is 1).
     pub run_id: u64,
-    /// The run's event stream (see the type docs).
+    /// The run's event stream (see the type docs: progress or
+    /// burn-in ticks, in order, plus exactly one terminal).
     pub events: mpsc::Receiver<JobEvent>,
 }
 
@@ -183,18 +198,7 @@ impl BenchJobManager {
         mode: BenchMode,
         threads: usize,
     ) -> Result<JobHandle, JobError> {
-        // Single-flight claim: `swap` reports the previous state, so
-        // exactly one concurrent `start` wins; the rejection path
-        // changes no state, and nothing after this point can fail, so
-        // no rollback is needed.
-        if self.busy.swap(true, Ordering::AcqRel) {
-            return Err(JobError::Busy);
-        }
-
-        let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
-        let cancel = Arc::new(AtomicBool::new(false));
-        *lock(&self.active) = Some((run_id, Arc::clone(&cancel)));
-
+        let (run_id, cancel) = self.claim_slot()?;
         let options = StreamOptions {
             target: mapped_target(target, mode),
             threads,
@@ -246,9 +250,112 @@ impl BenchJobManager {
         })
     }
 
+    /// Start a burn-in run (single-flight, D-1): the same slot
+    /// claim, `run_id` allocation, cancel-flag registration, and slot
+    /// self-release as [`start`] — a burn-in and a normal benchmark
+    /// are mutually exclusive.
+    ///
+    /// The job runs [`run_burn_in`] (C7-06) on a blocking-pool
+    /// thread, streaming one [`JobEvent::BurnInTick`] per completed
+    /// bandwidth cell and per completed per-tier latency pass of each
+    /// iteration plus exactly one terminal: [`JobEvent::Result`] (the
+    /// grid of the last completed pass) on the duration deadline,
+    /// [`JobEvent::Cancelled`] when the run's cancel flag is set at a
+    /// gate, or [`JobEvent::Error`] (no-panic contract, plan D5).
+    /// Returns the owner's [`JobHandle`].
+    ///
+    /// `target` selects the cells every pass runs (the protocol's
+    /// `StartBurnIn` arm carries it verbatim — no `BenchMode` fold: a
+    /// burn-in is always a full-scope duration run, D-1). `threads`
+    /// bounds the pinned workers (C7-06: `0` = auto, one per detected
+    /// physical core). `duration_minutes` = `0` means infinite
+    /// (stop only via [`BenchJobManager::cancel`]).
+    ///
+    /// # Errors
+    ///
+    /// [`JobError::Busy`] when a run is already active;
+    /// [`JobError::Spawn`] if the run task could not be spawned
+    /// (defensive — see the arm docs).
+    pub async fn start_burn_in(
+        &self,
+        target: StreamTarget,
+        duration_minutes: u32,
+        threads: usize,
+    ) -> Result<JobHandle, JobError> {
+        let (run_id, cancel) = self.claim_slot()?;
+        let options = BurnInOptions {
+            target,
+            duration_minutes,
+            threads,
+            cancel: Arc::clone(&cancel),
+        };
+
+        // Two channels, one owner (the same drain-then-terminal
+        // pattern as `start`): the C7-06 tick channel carries
+        // `BurnInTick` into `run_burn_in`; the job pumps it into the
+        // owner's `JobEvent` channel (in order) and then sends the
+        // single terminal, so the terminal is always last.
+        let (tx, rx) = mpsc::channel::<JobEvent>();
+        let (tick_tx, tick_rx) = mpsc::channel::<BurnInTick>();
+
+        let active = Arc::clone(&self.active);
+        let busy = Arc::clone(&self.busy);
+
+        tokio::spawn(async move {
+            let outcome =
+                tokio::task::spawn_blocking(move || run_burn_in(&options, Some(tick_tx)))
+                    .await;
+            // `run_burn_in` has returned, so its tick sender is
+            // dropped: drain every buffered tick (FIFO order) into the
+            // owner channel before the terminal.
+            while let Ok(tick) = tick_rx.recv() {
+                let _ = tx.send(JobEvent::BurnInTick(tick));
+            }
+            let terminal = match outcome {
+                Ok(Ok(grid)) => JobEvent::Result(grid),
+                Ok(Err(StreamError::Cancelled)) => JobEvent::Cancelled,
+                Ok(Err(err)) => JobEvent::Error(err.to_string()),
+                // The blocking task panicked: caught here as a
+                // structured event (no-panic contract, plan D5) —
+                // `run_burn_in` is no-panic by design, so this is
+                // defensive.
+                Err(join) => JobEvent::Error(format!("burn-in job task failed: {join}")),
+            };
+            // The receiver may already be gone (owner disconnected) —
+            // the send is best-effort; dropping `tx` below closes the
+            // channel either way.
+            let _ = tx.send(terminal);
+            release(&active, run_id, &busy);
+        });
+
+        Ok(JobHandle {
+            run_id,
+            events: rx,
+        })
+    }
+
+    /// Claim the single-flight slot for a new run (the shared claim of
+    /// [`start`] + [`start_burn_in`], D-1): `swap` reports the
+    /// previous state, so exactly one concurrent claim wins; the
+    /// rejection path changes no state, and nothing after this point
+    /// can fail, so no rollback is needed. On success, registers the
+    /// new run's id + cancel flag in `active` and returns them.
+    fn claim_slot(&self) -> Result<(u64, Arc<AtomicBool>), JobError> {
+        if self.busy.swap(true, Ordering::AcqRel) {
+            return Err(JobError::Busy);
+        }
+        let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        *lock(&self.active) = Some((run_id, Arc::clone(&cancel)));
+        Ok((run_id, cancel))
+    }
+
     /// Cancel the active run `run_id`: set its cancel flag (relaxed)
-    /// so the run stops at its next P3-09 gate (the in-flight pass
-    /// finishes first — clean stop, plan D6).
+    /// so the run stops at its next gate (the in-flight pass finishes
+    /// first — clean stop, plan D6).
+    ///
+    /// Serves both run classes (a benchmark and a burn-in share the
+    /// one slot, D-1).
     ///
     /// Returns `true` when the run was active and the flag was set;
     /// `false` for an unknown id or a run that already terminated and
@@ -456,6 +563,165 @@ mod tests {
         assert!(
             !mgr.cancel(run_id),
             "after the terminal the slot is released: cancel must be false"
+        );
+    }
+
+    /// (g) A burn-in (C7-07/D-1) streams its ticks and ends with the
+    /// `Cancelled` terminal when cancelled: `duration_minutes = 0` is
+    /// infinite (cancel-only stop). The drain-then-terminal contract
+    /// buffers every tick until the run ends, so the test cancels the
+    /// run itself (a short async sleep — no worker is blocked) and
+    /// then collects the whole stream: the buffered ticks (≥ one
+    /// completed iteration on any sane host) in order, then the
+    /// `Cancelled` terminal, then the released slot. The
+    /// `Result`-terminal mapping is the shared code exercised by (a);
+    /// a burn-in duration terminal needs ≥ 1 minute of wall time at
+    /// the wire's minute granularity, so it is not unit-tested here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_burn_in_streams_ticks_then_cancelled() {
+        let mgr = BenchJobManager::new();
+        let handle = mgr
+            .start_burn_in(StreamTarget::Tier(Tier::L1), 0, 1)
+            .await
+            .expect("first burn-in on a fresh manager must succeed");
+        let run_id = handle.run_id;
+
+        // Let the run complete at least one iteration (L1 passes are
+        // fast), then cancel it: the infinite run is still active, so
+        // the cancel must land.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(mgr.cancel(run_id), "the active burn-in must be cancellable");
+
+        let events = collect(handle).await;
+        assert!(
+            matches!(events.last(), Some(JobEvent::Cancelled)),
+            "the cancelled burn-in must end with the Cancelled terminal: {events:?}"
+        );
+        let ticks: Vec<&BurnInTick> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                JobEvent::BurnInTick(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !ticks.is_empty(),
+            "a second of L1 iterations must stream ticks: {events:?}"
+        );
+        assert_eq!(ticks[0].iteration, 1, "the first tick must be iteration 1");
+        for t in &ticks {
+            assert_eq!(t.tier, Tier::L1, "a tier target only ticks its tier");
+            assert_eq!(
+                t.bandwidth.is_some(),
+                t.latency_ns.is_none(),
+                "exactly one of bandwidth / latency per tick"
+            );
+            assert!(t.iteration >= 1, "iterations are 1-based");
+            assert!(
+                t.elapsed_secs.is_finite() && t.elapsed_secs >= 0.0,
+                "elapsed must be finite and non-negative: {}",
+                t.elapsed_secs
+            );
+        }
+        for w in ticks.windows(2) {
+            assert!(w[1].iteration >= w[0].iteration, "iterations must not decrease");
+            assert!(
+                w[1].elapsed_secs + 0.001 >= w[0].elapsed_secs,
+                "elapsed must not decrease"
+            );
+        }
+        // After the terminal the slot is released: cancel is false.
+        assert!(
+            !mgr.cancel(run_id),
+            "after the terminal the slot is released: cancel must be false"
+        );
+    }
+
+    /// (h) A burn-in and a normal benchmark share the one
+    /// single-flight slot (D-1): each refuses the other while active
+    /// with `Busy`, and each still terminates cleanly with
+    /// `Cancelled` when stopped (both are long Memory-tier runs on
+    /// one worker, so the immediately-issued cancel wins its race).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn burn_in_and_bench_share_the_single_flight_slot() {
+        let mgr = BenchJobManager::new();
+
+        // Phase 1: a normal bench is active → a concurrent burn-in is
+        // refused; the bench still ends with the Cancelled terminal.
+        let bench = mgr
+            .start(StreamTarget::Tier(Tier::Memory), BenchMode::Full, 1)
+            .await
+            .expect("the bench start must succeed");
+        let bench_id = bench.run_id;
+        let refused = mgr.start_burn_in(StreamTarget::Full, 0, 1).await;
+        assert!(
+            matches!(refused, Err(JobError::Busy)),
+            "a concurrent burn-in must be refused single-flight"
+        );
+        assert!(mgr.cancel(bench_id), "the active bench must be cancellable");
+        let events = collect(bench).await;
+        assert!(
+            matches!(events.last(), Some(JobEvent::Cancelled)),
+            "the bench must end with the Cancelled terminal: {events:?}"
+        );
+
+        // Phase 2: a burn-in is active → a concurrent bench is
+        // refused; the (infinite) burn-in ends with Cancelled.
+        let burn = mgr
+            .start_burn_in(StreamTarget::Tier(Tier::Memory), 0, 1)
+            .await
+            .expect("the burn-in must start after the bench released the slot");
+        let burn_id = burn.run_id;
+        let refused = mgr
+            .start(StreamTarget::Cell(Tier::L1, BenchOp::Read), BenchMode::Full, 1)
+            .await;
+        assert!(
+            matches!(refused, Err(JobError::Busy)),
+            "a concurrent bench must be refused single-flight"
+        );
+        assert!(mgr.cancel(burn_id), "the active burn-in must be cancellable");
+        let events = collect(burn).await;
+        assert!(
+            matches!(events.last(), Some(JobEvent::Cancelled)),
+            "the burn-in must end with the Cancelled terminal: {events:?}"
+        );
+    }
+
+    /// (i) Run ids advance monotonically across run classes (D-1): a
+    /// burn-in started after a normal bench's terminal gets the next
+    /// id; the refused claims of (h) consumed none in between.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_ids_advance_across_run_classes() {
+        let mgr = BenchJobManager::new();
+        let first = mgr
+            .start(StreamTarget::Cell(Tier::L1, BenchOp::Read), BenchMode::Full, 1)
+            .await
+            .expect("first start must succeed");
+        let first_id = first.run_id;
+        let events = collect(first).await;
+        assert!(
+            matches!(events.last(), Some(JobEvent::Result(_))),
+            "the bench must complete with a Result: {events:?}"
+        );
+
+        let burn = mgr
+            .start_burn_in(StreamTarget::Tier(Tier::Memory), 0, 1)
+            .await
+            .expect("the burn-in must start after the bench's terminal");
+        assert_eq!(
+            burn.run_id,
+            first_id + 1,
+            "run ids must advance across run classes"
+        );
+        // Stop the infinite run (best-effort: the slot is still held).
+        let _ = mgr.cancel(burn.run_id);
+        let events = collect(burn).await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(JobEvent::Cancelled) | Some(JobEvent::Result(_))
+            ),
+            "the burn-in must reach a terminal: {events:?}"
         );
     }
 

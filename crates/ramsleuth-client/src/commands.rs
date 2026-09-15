@@ -153,6 +153,9 @@ pub fn render_grid(grid: &BenchmarkGrid) -> String {
 /// - `BenchResult { grid }` → [`render_grid`] of the terminal grid;
 /// - `BenchCancelled { run_id }` → `benchmark cancelled (run {run_id})`;
 /// - `Error(msg)` → [`ClientError::Protocol`] with the daemon's text;
+/// - `BurnInProgress` → [`ClientError::Protocol`] (a burn-in frame in
+///   a normal-bench stream is a contract violation — burn-in ticks
+///   stream only on the owning `StartBurnIn` connection, D-1/D-2);
 /// - any other response → [`ClientError::Protocol`] (a protocol
 ///   violation for this request).
 ///
@@ -197,6 +200,17 @@ pub fn bench(
             Response::Telemetry(_) => {
                 return Err(ClientError::Protocol(
                     "unexpected response during benchmark".to_owned(),
+                ))
+            }
+            Response::BurnInProgress(_) => {
+                // A burn-in frame in a normal-bench stream violates the
+                // wire contract (burn-in ticks stream only on the
+                // owning `StartBurnIn` connection, D-1/D-2). The CLI
+                // gains no burn-in subcommand this cycle (a documented
+                // follow-up) — this subcommand only ever starts a
+                // `StartBenchmark`.
+                return Err(ClientError::Protocol(
+                    "unexpected burn-in frame during benchmark".to_owned(),
                 ))
             }
         }
@@ -566,6 +580,41 @@ mod tests {
         assert_eq!(
             err,
             ClientError::Protocol("benchmark already running".to_owned())
+        );
+    }
+
+    /// (c2) `bench` on a contract-violating `BurnInProgress` frame in
+    /// the stream (burn-in ticks belong to the owning `StartBurnIn`
+    /// connection, D-1/D-2) maps onto `ClientError::Protocol` with the
+    /// guard's text.
+    #[test]
+    fn bench_burn_in_progress_frame_is_protocol() {
+        let sock = TempSocket::new("bench-burnin");
+        let handle = spawn_standin(
+            &sock,
+            Request::StartBenchmark {
+                target: StreamTarget::Full,
+                mode: BenchMode::Full,
+            },
+            vec![
+                Response::BenchStarted { run_id: 1 },
+                Response::BurnInProgress(ramsleuth_bench::BurnInTick {
+                    iteration: 1,
+                    elapsed_secs: 0.5,
+                    tier: Tier::Memory,
+                    bandwidth: Some((BenchOp::Read, 512.0)),
+                    latency_ns: None,
+                }),
+            ],
+        );
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let err = bench(&mut client, StreamTarget::Full, BenchMode::Full)
+            .expect_err("a BurnInProgress frame must fail bench");
+        handle.join().expect("stand-in thread must not panic");
+
+        assert_eq!(
+            err,
+            ClientError::Protocol("unexpected burn-in frame during benchmark".to_owned())
         );
     }
 
