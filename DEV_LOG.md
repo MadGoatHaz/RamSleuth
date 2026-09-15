@@ -3,6 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-CYCLE6.md` (Cycle 6 GUI workstream — the handover §13 primary name, alt `PLAN-PHASE7.md`; Phase 6/Cycle 5 retained as `plans/PLAN-PHASE6.md`, Phase 5 as `plans/PLAN-PHASE5.md`; Phase 1 as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
+(no active leases)
 
 @@@ CURRENT_STATE @@@
 Cycle 6 (GUI workstream) — C6-03 implemented on branch/chunk-c6-03 (pushed, awaiting review/merge); CommandRate enum + ClockReadout.command_rate + map_command_rate (D-C2) with the D-C10 same-crate ripples co-landed (intel_readout::decode_channel honest Na(NotApplicable) per D-C11, facade::fixture_amd); telemetry 157/157 lib + 6/6 main green (workspace 388/388 once merged), clippy -D warnings clean; next = C6-05 (amd_smn.rs SmnFields.command_rate + apply_smn write surface — in flight in a parallel worktree) then C6-06 (facade.rs SystemMemoryTelemetry wire-shape hub).
