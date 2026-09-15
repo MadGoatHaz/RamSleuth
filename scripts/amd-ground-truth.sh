@@ -8,11 +8,13 @@
 # driver's `smn_result` is one shared global, so never run `monitor_cpu`
 # concurrently with the daemon's SMN reads (plan D3):
 #
-#   (a) monitor_cpu -f     — one PM-table frame (timeout 2; -f is required —
+#   (a) monitor_cpu -f     — PM-table frame(s) (timeout 2; -f is required —
 #                            without it an unsupported PM table version (this
 #                            host: 0x380805 vs supported 0x240903) makes
 #                            monitor_cpu print a notice to stderr and exit
-#                            with ZERO stdout frames)
+#                            with ZERO stdout frames); with -f it loops
+#                            forever printing ~1 frame/sec, so the timeout
+#                            kill (rc=124) is the normal capture path
 #   (b) ramsleuth-client   — dump (dashboard, root daemon)
 #   (c) monitor_cpu -m     — one-shot SMN memory timings (the reference)
 #
@@ -97,8 +99,12 @@ first_number() { printf '%s\n' "$1" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n 1 |
 trim() { local x="$1"; x="${x#"${x%%[![:space:]]*}"}"; x="${x%"${x##*[![:space:]]}"}"; printf '%s' "$x"; }
 # 0 if |$1 - $2| <= $3; 2 if either side is not a plain number (no-verdict).
 fcmp_within() { awk -v a="$1" -v b="$2" -v t="$3" 'BEGIN{if(a!~/^[0-9.]+$/||b!~/^[0-9.]+$/)exit 2; d=a-b; if(d<0)d=-d; exit (d<=t+1e-6)?0:1}'; }
-# A monitor_cpu frame value by exact label (last occurrence = most recent
-# frame), from $WORK/pm.txt (ANSI/box-drawing stripped; rows are `| <label> | <value> |`).
+# A monitor_cpu frame value by exact label, from $WORK/pm.txt (ANSI/
+# box-drawing stripped; rows are `| <label> | <value> |`). The 2s timeout
+# can capture 1-2 frames: repeated rows across frames resolve to the LAST
+# occurrence (the most recent frame) — the intended behavior, since values
+# are consistent within the settle window (a kill that truncates the newest
+# frame simply falls back to the prior frame for the rows it never reached).
 pm_field() { awk -F'|' -v l="$1" '{x=$2; gsub(/^[ \t]+|[ \t]+$/,"",x); if(x==l){v=$3; gsub(/^[ \t]+|[ \t]+$/,"",v); last=v}} END{if(last!="")print last}' "$WORK/pm.txt"; }
 # One ramsleuth-dump AMD-section row: prints `VAL<TAB><rest>` or
 # `NA<TAB><reason>`, or nothing when the key is absent. Dump rows are
@@ -145,19 +151,32 @@ log "daemon probe: $(grep -m 1 '^AMD:' "$WORK/probe.txt" || echo 'AMD: ok')"
 # --- Matched-condition capture (sequential, short idle settle) ---------------
 log "settling ${SETTLE}s (idle), then capturing sequentially (monitor_cpu -> dump -> monitor_cpu -m)..."
 sleep "$SETTLE"
-# (a) one monitor_cpu PM-table frame: `timeout 2` sends SIGTERM; the
-# monitor's handler exits cleanly 0. -f is REQUIRED — without it, an
+# (a) monitor_cpu PM-table frame(s): `timeout 2` sends SIGTERM. With -f,
+# monitor_cpu enters an INFINITE frame loop (~1 frame/sec, each starting
+# with an ANSI screen-clear) and NEVER exits on its own — so the timeout
+# kill (rc=124) IS the normal capture path (1-2 frames are captured before
+# the kill) and is accepted; the captured stdout is parsed below. An early
+# clean exit (rc=0, e.g. the PM-table version gate when -f is absent) is
+# also tolerated but degrades to no-verdict if it produced no frame rows.
+# Any OTHER non-zero rc (126/127 exec failure, monitor_cpu's own non-zero
+# exit) and a timeout-kill with ZERO captured frame rows (monitor_cpu
+# produced nothing) are capture failures. -f is REQUIRED — without it, an
 # unsupported PM table version (0x380805 on this host vs 0x240903) makes
 # monitor_cpu print a notice to stderr and exit with ZERO stdout frames
 # (start_pm_monitor(); the Cycle-5 live run's empty-frame no-verdicts).
-# Label values use the LAST occurrence (the most recent frame).
 mon_rc=0; timeout 2 "$MONITOR" -f >"$WORK/mon.raw" 2>"$WORK/mon.err" || mon_rc=$?
-[[ "$mon_rc" -eq 0 ]] || die2 "monitor_cpu PM-frame capture failed (rc=${mon_rc}: $(head -n 1 "$WORK/mon.err" 2>/dev/null || true))"
+case "$mon_rc" in
+  0 | 124) ;;  # 124 = the timeout's SIGTERM kill: expected with -f (infinite frame loop)
+  *) die2 "monitor_cpu PM-frame capture failed (rc=${mon_rc}: $(head -n 1 "$WORK/mon.err" 2>/dev/null || true))" ;;
+esac
 # Strip ANSI escapes; map box char U+2502 (E2 94 82) to '|'; drop remaining
 # non-ASCII (corners) — the frame rows become `| <label> | <value> |`
 # (print_line: "│ %46s │ %47s │"; LC_ALL=C pins byte semantics in both stages).
 LC_ALL=C sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\xe2\x94\x82/|/g' <"$WORK/mon.raw" | LC_ALL=C tr -d '\200-\377' >"$WORK/pm.txt"
 if ! grep -q '^|' "$WORK/pm.txt"; then
+  if [[ "$mon_rc" -eq 124 ]]; then
+    die2 "monitor_cpu PM-frame capture failed (rc=124: timeout-kill but zero frame rows captured — monitor_cpu produced nothing: $(head -n 1 "$WORK/mon.err" 2>/dev/null || true))"
+  fi
   log "NOTE: no PM-table frame rows parsed from the monitor_cpu -f capture ($(wc -l <"$WORK/pm.txt") lines; stderr: $(head -n 1 "$WORK/mon.err" 2>/dev/null || true)) — the PM clock/voltage gates will be no-verdict"
 fi
 # (b) the ramsleuth dashboard from the root daemon.
