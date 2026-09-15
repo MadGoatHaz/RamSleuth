@@ -498,6 +498,7 @@ mod tests {
             div_mode: 1,
             gdm: 0,
             pdm: 0,
+            command_rate: 0,
             timings: AmdPmTimings {
                 cl: 0, rcwdwr: 0, rcdrd: 0, rp: 0, ras: 0, rc: 0, rrds: 0, rrld: 0,
                 faw: 0, wtrs: 0, wtrl: 0, wr: 0, rfc1: 0, rfc2: 0, rfcsb: 0,
