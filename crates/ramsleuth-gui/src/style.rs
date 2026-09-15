@@ -7,8 +7,10 @@
 //!
 //! - [`export_json`] — a [`SystemMemoryTelemetry`] snapshot as pretty
 //!   JSON (F3).
-//! - [`snapshot_png`] — a [`BenchmarkGrid`] as a small
-//!   data-visualization PNG (F2): the 4×4 Tier×metric layout, each cell
+//! - [`snapshot_png`] — the F2 validation card: a 640×420 PNG with a
+//!   title row (`RamSleuth v2.0.0` + the UTC wall clock), a CPU line
+//!   (brand + clock) and a RAM line (capacity + channel, honest `N/A`
+//!   for absent cells) over the 4×4 [`BenchmarkGrid`], each cell
 //!   colored by its value magnitude along the CYAN → AMBER → CRIMSON
 //!   ramp on a SLATE background.
 //!
@@ -148,32 +150,62 @@ pub fn export_json(telemetry: &SystemMemoryTelemetry, path: &Path) -> Result<(),
 // F2: PNG snapshot of the benchmark grid.
 // ---------------------------------------------------------------------
 
-/// One snapshot cell, in pixels.
-const CELL: usize = 64;
-/// Gutter between cells and margin around the grid, in pixels.
-const GUTTER: usize = 8;
+// The F2 validation card (C6-28): a 640×420 PNG — the title row
+// (`RamSleuth v2.0.0` + the UTC wall clock), the CPU line (brand +
+// clock), and the RAM line (capacity + channel), each the 5×7 font at
+// 2× scale, a dim separator, then the 4×4 [`BenchmarkGrid`] pinned to
+// the bottom margin (4 × 64 + 3 × 16 = 304 tall, 4 × 140 + 3 × 16 =
+// 608 wide = 640 − 2 × 16), leaving the 16…100 band for the header.
+const CARD_W: usize = 640;
+const CARD_H: usize = 420;
 const MARGIN: usize = 16;
-/// Grid extent: the AIDA64 layout is 4 tiers × 4 metrics, square.
-const DIM: usize = MARGIN * 2 + 4 * CELL + 3 * GUTTER; // 312
+/// One grid cell (the AIDA64 layout is 4 tiers × 4 metrics).
+const CELL_W: usize = 140;
+const CELL_H: usize = 64;
+/// Gutter between cells; the outer margin is shared with the header.
+const GUTTER: usize = 16;
+/// The 5×7 font's 2×-scaled line height.
+const LINE_H: usize = 14;
+/// The header block's lines: title / CPU / RAM.
+const TITLE_Y0: usize = MARGIN; // 16
+const CPU_Y0: usize = MARGIN + LINE_H + 8; // 38
+const RAM_Y0: usize = MARGIN + 2 * (LINE_H + 8); // 60
+/// The 4×4 grid's top, pinned to the bottom margin (420 − 16 − 304).
+const GRID_Y0: usize = CARD_H - MARGIN - (4 * CELL_H + 3 * GUTTER); // 100
+/// A dim 1px separator halfway between the RAM line and the grid.
+const SEPARATOR_Y: usize = (RAM_Y0 + LINE_H + GRID_Y0) / 2; // 87
+/// The header lines' text color (the same light gray as
+/// `build_style`'s text).
+const TEXT: egui::Color32 = egui::Color32::from_rgb(0xE6, 0xE6, 0xEC);
 /// `ln` value at which the color ramp saturates (≈ 999 → 6.9).
 const RAMP_FULL: f64 = 6.9;
 /// Unmeasured cell (0.0 on the wire): dim slate, distinct from the
 /// background.
 const DIM_CELL: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x3A, 0x44);
 
-/// F2: encode `grid` as a data-visualization PNG and write it to `path`.
+/// F2: encode the validation card — the [`BenchmarkGrid`] plus the
+/// header block (title + UTC wall clock, the CPU line, the RAM line) —
+/// as a 640×420 data-visualization PNG and write it to `path`.
 ///
-/// A 4×4 block of cells — one per [`Tier`] row × [`Metric`] column, the
-/// AIDA64 layout — each colored by its value magnitude along the
-/// CYAN → AMBER → CRIMSON ramp on a SLATE background (an unmeasured
-/// 0.0 cell, the wire's `N/A`, renders dim). Produces a valid RGB8 PNG
-/// by design — a small data grid, not a screen capture (the app shell
-/// is the only place window pixels come from). An encoder failure maps
-/// to [`GuiError::Png`], a file write to [`GuiError::Io`].
-pub fn snapshot_png(grid: &BenchmarkGrid, path: &Path) -> Result<(), GuiError> {
-    let tiers = [Tier::Memory, Tier::L1, Tier::L2, Tier::L3];
-    let metrics = [Metric::Read, Metric::Write, Metric::Copy, Metric::Latency];
-    let mut pixels = vec![0u8; DIM * DIM * 3];
+/// The card (C6-28): a SLATE background, the 5×7-font title row
+/// `RamSleuth v2.0.0 <YYYY-MM-DD HH:MM:SS>`, the CPU line (brand +
+/// platform clock), the RAM line (total capacity + channel mode from
+/// the bound-DIMM count), a dim separator, then the 4×4 block of
+/// cells — one per [`Tier`] row × [`Metric`] column, the AIDA64
+/// layout — each colored by its value magnitude along the CYAN →
+/// AMBER → CRIMSON ramp (an unmeasured 0.0 cell, the wire's `N/A`,
+/// renders dim). Absent telemetry or cells degrade to the honest `N/A`
+/// text — never a panic. A line longer than the card is clipped at the
+/// right margin (no wrap). Produces a valid RGB8 PNG by design — a
+/// small data card, not a screen capture (the app shell is the only
+/// place window pixels come from). An encoder failure maps to
+/// [`GuiError::Png`], a file write to [`GuiError::Io`].
+pub fn snapshot_png(
+    grid: &BenchmarkGrid,
+    telemetry: Option<&SystemMemoryTelemetry>,
+    path: &Path,
+) -> Result<(), GuiError> {
+    let mut pixels = vec![0u8; CARD_W * CARD_H * 3];
 
     // SLATE background.
     for p in pixels.chunks_exact_mut(3) {
@@ -181,15 +213,34 @@ pub fn snapshot_png(grid: &BenchmarkGrid, path: &Path) -> Result<(), GuiError> {
         p[1] = SLATE.g();
         p[2] = SLATE.b();
     }
-    // One colored cell per Tier × metric.
+    // The header block: title + wall clock, the CPU line, the RAM
+    // line — absent telemetry / cells degrade to the honest `N/A`
+    // text (never a panic).
+    let stamp = wall_clock_string(now_epoch_secs());
+    let title = format!("RamSleuth v2.0.0  {stamp}");
+    let cpu = telemetry.map(snapshot_cpu_line).unwrap_or_else(|| "CPU: N/A".to_owned());
+    let ram = telemetry.map(snapshot_ram_line).unwrap_or_else(|| "RAM: N/A".to_owned());
+    draw_text(&mut pixels, MARGIN, TITLE_Y0, &title, CYAN);
+    draw_text(&mut pixels, MARGIN, CPU_Y0, &cpu, TEXT);
+    draw_text(&mut pixels, MARGIN, RAM_Y0, &ram, TEXT);
+    // A dim 1px separator between the header block and the grid.
+    for x in MARGIN..CARD_W - MARGIN {
+        let idx = (SEPARATOR_Y * CARD_W + x) * 3;
+        pixels[idx] = DIM_CELL.r();
+        pixels[idx + 1] = DIM_CELL.g();
+        pixels[idx + 2] = DIM_CELL.b();
+    }
+    // The 4×4 benchmark grid (repositioned + scaled under the header).
+    let tiers = [Tier::Memory, Tier::L1, Tier::L2, Tier::L3];
+    let metrics = [Metric::Read, Metric::Write, Metric::Copy, Metric::Latency];
     for (row, tier) in tiers.iter().enumerate() {
         for (col, metric) in metrics.iter().enumerate() {
             let c = cell_color(grid.cell(*tier, *metric));
-            let x0 = MARGIN + col * (CELL + GUTTER);
-            let y0 = MARGIN + row * (CELL + GUTTER);
-            for y in y0..y0 + CELL {
-                for x in x0..x0 + CELL {
-                    let idx = (y * DIM + x) * 3;
+            let x0 = MARGIN + col * (CELL_W + GUTTER);
+            let y0 = GRID_Y0 + row * (CELL_H + GUTTER);
+            for y in y0..y0 + CELL_H {
+                for x in x0..x0 + CELL_W {
+                    let idx = (y * CARD_W + x) * 3;
                     pixels[idx] = c.r();
                     pixels[idx + 1] = c.g();
                     pixels[idx + 2] = c.b();
@@ -200,7 +251,7 @@ pub fn snapshot_png(grid: &BenchmarkGrid, path: &Path) -> Result<(), GuiError> {
 
     let mut out: Vec<u8> = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut out, DIM as u32, DIM as u32);
+        let mut encoder = png::Encoder::new(&mut out, CARD_W as u32, CARD_H as u32);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().map_err(|err| GuiError::Png(err.to_string()))?;
@@ -233,11 +284,242 @@ fn lerp(a: egui::Color32, b: egui::Color32, t: f64) -> egui::Color32 {
 }
 
 // ---------------------------------------------------------------------
+// The card's header block (C6-28): the 5×7 bitmap font + the pure
+// line / wall-clock builders (unit-tested below, no display needed).
+// ---------------------------------------------------------------------
+
+/// The 5×7 bitmap font for printable ASCII (0x20…0x7E): one byte per
+/// row, bit 0 = the leftmost pixel — a public-domain dot-matrix
+/// pattern set.
+const FONT_5X7: [[u8; 7]; 95] = [
+    [0, 0, 0, 0, 0, 0, 0], // ' '
+    [4, 4, 4, 4, 4, 0, 4], // !
+    [10, 10, 10, 0, 0, 0, 0], // "
+    [10, 27, 10, 10, 27, 10, 10], // #
+    [14, 9, 10, 6, 21, 9, 14], // $
+    [19, 19, 2, 4, 1, 25, 25], // %
+    [6, 9, 9, 6, 10, 9, 14], // &
+    [4, 4, 0, 0, 0, 0, 0], // '
+    [6, 2, 1, 1, 1, 2, 6], // (
+    [12, 8, 16, 16, 16, 8, 12], // )
+    [0, 10, 14, 31, 14, 10, 0], // *
+    [0, 4, 4, 31, 4, 4, 0], // +
+    [0, 0, 0, 0, 4, 4, 2], // ,
+    [0, 0, 0, 31, 0, 0, 0], // -
+    [0, 0, 0, 0, 0, 4, 4], // .
+    [16, 8, 8, 4, 2, 2, 1], // /
+    [14, 17, 25, 21, 19, 17, 14], // 0
+    [4, 2, 4, 4, 4, 4, 14], // 1
+    [14, 17, 16, 12, 2, 1, 31], // 2
+    [14, 17, 16, 12, 16, 17, 14], // 3
+    [8, 12, 10, 9, 31, 16, 16], // 4
+    [31, 1, 1, 14, 16, 17, 14], // 5
+    [14, 1, 1, 31, 17, 17, 14], // 6
+    [31, 16, 8, 4, 2, 2, 2], // 7
+    [14, 17, 17, 14, 17, 17, 14], // 8
+    [14, 17, 17, 30, 16, 16, 14], // 9
+    [0, 4, 4, 0, 4, 4, 0], // :
+    [0, 4, 4, 0, 4, 2, 0], // ;
+    [16, 8, 4, 2, 4, 8, 16], // <
+    [0, 0, 31, 0, 31, 0, 0], // =
+    [1, 2, 4, 8, 4, 2, 1], // >
+    [14, 17, 16, 12, 0, 0, 4], // ?
+    [14, 17, 21, 13, 1, 1, 14], // @
+    [14, 17, 17, 31, 17, 17, 17], // A
+    [30, 17, 17, 30, 17, 17, 30], // B
+    [14, 17, 1, 1, 1, 17, 14], // C
+    [30, 17, 17, 17, 17, 17, 30], // D
+    [31, 1, 1, 30, 1, 1, 31], // E
+    [31, 1, 1, 30, 1, 1, 1], // F
+    [14, 17, 1, 21, 17, 17, 14], // G
+    [17, 17, 17, 31, 17, 17, 17], // H
+    [14, 4, 4, 4, 4, 4, 14], // I
+    [28, 16, 16, 16, 16, 17, 6], // J
+    [17, 9, 5, 3, 5, 9, 17], // K
+    [1, 1, 1, 1, 1, 1, 31], // L
+    [17, 27, 21, 21, 17, 17, 17], // M
+    [17, 19, 21, 25, 17, 17, 17], // N
+    [14, 17, 17, 17, 17, 17, 14], // O
+    [30, 17, 17, 30, 1, 1, 1], // P
+    [14, 17, 17, 17, 21, 9, 22], // Q
+    [30, 17, 17, 30, 5, 9, 17], // R
+    [14, 17, 1, 14, 16, 17, 14], // S
+    [31, 4, 4, 4, 4, 4, 4], // T
+    [17, 17, 17, 17, 17, 17, 14], // U
+    [17, 17, 17, 17, 17, 10, 4], // V
+    [17, 17, 17, 21, 21, 27, 17], // W
+    [17, 17, 10, 4, 10, 17, 17], // X
+    [17, 17, 10, 4, 4, 4, 4], // Y
+    [31, 16, 8, 4, 2, 1, 31], // Z
+    [30, 2, 2, 2, 2, 2, 30], // [
+    [1, 2, 2, 4, 8, 16, 16], // \
+    [30, 8, 8, 8, 8, 8, 30], // ]
+    [4, 10, 17, 0, 0, 0, 0], // ^
+    [0, 0, 0, 0, 0, 0, 31], // _
+    [4, 2, 1, 0, 0, 0, 0], // `
+    [0, 0, 14, 16, 30, 17, 30], // a
+    [1, 1, 30, 17, 17, 17, 30], // b
+    [0, 0, 14, 1, 1, 17, 14], // c
+    [16, 16, 30, 17, 17, 17, 30], // d
+    [0, 0, 14, 17, 31, 1, 14], // e
+    [12, 2, 30, 2, 2, 2, 2], // f
+    [0, 30, 17, 17, 30, 16, 14], // g
+    [1, 1, 30, 17, 17, 17, 17], // h
+    [4, 0, 6, 4, 4, 4, 14], // i
+    [16, 0, 12, 16, 16, 17, 6], // j
+    [1, 1, 9, 5, 3, 5, 9], // k
+    [6, 4, 4, 4, 4, 4, 14], // l
+    [0, 0, 11, 21, 21, 21, 21], // m
+    [0, 0, 30, 17, 17, 17, 17], // n
+    [0, 0, 14, 17, 17, 17, 14], // o
+    [0, 30, 17, 17, 30, 1, 1], // p
+    [0, 30, 17, 17, 30, 16, 16], // q
+    [0, 0, 21, 19, 1, 1, 1], // r
+    [0, 0, 30, 1, 14, 16, 30], // s
+    [2, 2, 30, 2, 2, 2, 12], // t
+    [0, 0, 17, 17, 17, 17, 30], // u
+    [0, 0, 17, 17, 17, 10, 4], // v
+    [0, 0, 17, 17, 21, 21, 10], // w
+    [0, 0, 17, 10, 4, 10, 17], // x
+    [0, 17, 17, 17, 30, 16, 14], // y
+    [0, 0, 31, 8, 4, 2, 31], // z
+    [8, 4, 4, 2, 4, 4, 8], // {
+    [4, 4, 4, 4, 4, 4, 4], // |
+    [2, 4, 4, 8, 4, 4, 2], // }
+    [0, 0, 18, 9, 0, 0, 0], // ~
+];
+
+/// Draw `text` at `(x0, y0)` in the 2×-scaled [`FONT_5X7`] font: one
+/// color square per lit font pixel, clipped to the card (a line
+/// longer than the card is cut at the right margin — no wrap, no
+/// panic). A character outside printable ASCII renders a 3×7 block
+/// marker.
+fn draw_text(pixels: &mut [u8], x0: usize, y0: usize, text: &str, color: egui::Color32) {
+    const SCALE: usize = 2;
+    for (i, ch) in text.chars().enumerate() {
+        let glyph: [u8; 7] = match ch {
+            ' '..='~' => FONT_5X7[(ch as u8 - 0x20) as usize],
+            _ => [7u8; 7],
+        };
+        let gx0 = x0 + i * (6 * SCALE); // 5 font columns + 1 spacing
+        if gx0 >= CARD_W {
+            break;
+        }
+        for (row, bits) in glyph.iter().enumerate() {
+            let gy0 = y0 + row * SCALE;
+            if gy0 >= CARD_H {
+                break;
+            }
+            for col in 0..5 {
+                if *bits & (1 << col) == 0 {
+                    continue;
+                }
+                let px0 = gx0 + col * SCALE;
+                if px0 >= CARD_W {
+                    break;
+                }
+                for sy in 0..SCALE {
+                    let gy = gy0 + sy;
+                    if gy >= CARD_H {
+                        break;
+                    }
+                    for sx in 0..SCALE {
+                        let px = px0 + sx;
+                        if px >= CARD_W {
+                            break;
+                        }
+                        let idx = (gy * CARD_W + px) * 3;
+                        pixels[idx] = color.r();
+                        pixels[idx + 1] = color.g();
+                        pixels[idx + 2] = color.b();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The wall clock as `YYYY-MM-DD HH:MM:SS` in UTC (the card carries
+/// no local-time dependency — any host reads the same instant).
+/// Total over `i64`: a pre-epoch count degrades through `div_euclid`
+/// to the honest 1969 rendering — never a panic.
+fn wall_clock_string(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400) as u32;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
+}
+
+/// Howard Hinnant's `civil_from_days` (days since 1970-01-01 →
+/// calendar year / month / day) — the public-domain algorithm, total
+/// over `i64` (the era division handles pre-epoch day counts).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146_096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (y + i64::from(m <= 2), m as u32, d)
+}
+
+/// The current wall clock in epoch seconds; a pre-epoch clock
+/// (impossible on Linux) degrades to 0 — never a panic (the app
+/// shell's `unix_timestamp` precedent).
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The card's CPU line: the CPUID brand + the platform clock (MHz →
+/// GHz, two decimals); an absent clock renders the honest `N/A`
+/// (never a panic).
+fn snapshot_cpu_line(t: &SystemMemoryTelemetry) -> String {
+    let clock = match t.platform.cpu_clock_mhz.value() {
+        Some(mhz) => format!("{:.2} GHz", mhz / 1000.0),
+        None => "N/A".to_owned(),
+    };
+    format!("CPU: {} @ {}", t.cpu.brand, clock)
+}
+
+/// The card's RAM line: the total capacity (GiB → one-decimal GB) +
+/// the channel mode from the bound-DIMM count; both degrade to `N/A`.
+fn snapshot_ram_line(t: &SystemMemoryTelemetry) -> String {
+    let total = match t.total_capacity.value() {
+        Some(gib) => format!("{gib:.1} GB"),
+        None => "N/A".to_owned(),
+    };
+    format!("RAM: {} | {}", total, channel_name(t.dimm_sizes.len()))
+}
+
+/// Channel mode from the bound-DIMM count (the C6-20 header rule):
+/// 1 / 2 / 4 → Single- / Dual- / Quad-Channel; any other count (0,
+/// odd) degrades to `N/A`.
+fn channel_name(dimm_count: usize) -> String {
+    match dimm_count {
+        1 => "Single-Channel".to_owned(),
+        2 => "Dual-Channel".to_owned(),
+        4 => "Quad-Channel".to_owned(),
+        _ => "N/A".to_owned(),
+    }
+}
+
+// ---------------------------------------------------------------------
 // Tests (headless: no window, no display).
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
+    use ramsleuth_telemetry::error::{NaReason, Section};
+    use ramsleuth_telemetry::SystemPlatform;
+
     use super::*;
 
     /// Unique temp path per test (pid-scoped — the client's
@@ -318,12 +600,12 @@ mod tests {
     }
 
     /// (c) `snapshot_png` on a small grid writes a VALID PNG: the
-    /// 8-byte signature, non-empty, and a 312×312 RGB8 image per the
-    /// layout.
+    /// 8-byte signature, non-empty, and a 640×420 RGB8 card per the
+    /// layout (no telemetry — the header lines render the honest N/A).
     #[test]
     fn snapshot_png_writes_valid_png() {
         let path = temp_path("snapshot.png");
-        snapshot_png(&fixture_grid(), &path)
+        snapshot_png(&fixture_grid(), None, &path)
             .expect("snapshot_png must not fail for a writable temp path");
 
         let bytes = std::fs::read(&path).expect("the snapshot file must exist");
@@ -334,7 +616,7 @@ mod tests {
             .read_info()
             .expect("a valid PNG has a header");
         let info = reader.info();
-        assert_eq!((info.width, info.height), (DIM as u32, DIM as u32));
+        assert_eq!((info.width, info.height), (CARD_W as u32, CARD_H as u32));
         assert_eq!(info.color_type, png::ColorType::Rgb);
 
         let _ = std::fs::remove_file(&path);
@@ -351,7 +633,7 @@ mod tests {
             latency_ns: [86.0, 1.1, 4.0, 13.9],
         };
         let path = temp_path("snapshot-na.png");
-        snapshot_png(&grid, &path).expect("a mixed grid must encode");
+        snapshot_png(&grid, None, &path).expect("a mixed grid must encode");
         let bytes = std::fs::read(&path).expect("the snapshot file must exist");
         assert!(!bytes.is_empty());
         assert_eq!(&bytes[..8], &PNG_SIG);
@@ -401,5 +683,143 @@ mod tests {
         assert_eq!(GuiError::Json("bad json".into()).to_string(), "JSON serialize error: bad json");
         assert!(std::error::Error::source(&a).is_some(), "the Io arm must expose its source");
         assert!(std::error::Error::source(&GuiError::Png("x".into())).is_none());
+    }
+
+    /// A header-line snapshot fixture (the C6-20 style: one populated
+    /// AMD CPU; the clock / capacity / DIMM cells are test-configured,
+    /// the remaining platform cells Na by default).
+    fn fixture_telemetry(
+        clock: Section<f64>,
+        total: Section<f64>,
+        dimms: Vec<Section<f64>>,
+    ) -> SystemMemoryTelemetry {
+        SystemMemoryTelemetry {
+            cpu: CpuInfo { vendor: CpuVendor::Amd(AmdZen::Zen3), brand: "Ryzen 9 5950X".to_owned() },
+            amd: Section::na(NaReason::NotApplicable),
+            intel: Section::na(NaReason::NotApplicable),
+            spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: clock,
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: total,
+            dimm_sizes: dimms,
+        }
+    }
+
+    /// (c2) The card's header lines (C6-28): the CPU line is brand +
+    /// clock (MHz → GHz, two decimals), the RAM line is total capacity
+    /// (one-decimal GB) + the channel mode from the bound-DIMM count.
+    #[test]
+    fn snapshot_lines_populated() {
+        let t = fixture_telemetry(
+            Section::Value(3600.0),
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+        );
+        assert_eq!(snapshot_cpu_line(&t), "CPU: Ryzen 9 5950X @ 3.60 GHz");
+        assert_eq!(snapshot_ram_line(&t), "RAM: 32.0 GB | Dual-Channel");
+    }
+
+    /// (c2) Absent cells degrade to the honest `N/A` text (no-panic
+    /// contract): an Na clock, an Na capacity, zero bound DIMMs.
+    #[test]
+    fn snapshot_lines_degrade_to_na() {
+        let t =
+            fixture_telemetry(Section::na(NaReason::NotApplicable), Section::na(NaReason::NotApplicable), Vec::new());
+        assert_eq!(snapshot_cpu_line(&t), "CPU: Ryzen 9 5950X @ N/A");
+        assert_eq!(snapshot_ram_line(&t), "RAM: N/A | N/A");
+    }
+
+    /// (c2) The channel-mode map (the C6-20 rule): 1 / 2 / 4 →
+    /// Single- / Dual- / Quad-Channel, any other count → `N/A`.
+    #[test]
+    fn channel_name_maps_dimm_counts() {
+        assert_eq!(channel_name(1), "Single-Channel");
+        assert_eq!(channel_name(2), "Dual-Channel");
+        assert_eq!(channel_name(4), "Quad-Channel");
+        assert_eq!(channel_name(0), "N/A");
+        assert_eq!(channel_name(3), "N/A");
+    }
+
+    /// (c2) The wall clock: known epoch seconds format to their UTC
+    /// `YYYY-MM-DD HH:MM:SS` — including the pre-epoch count (the
+    /// honest 1969 rendering), never a panic.
+    #[test]
+    fn wall_clock_string_formats_utc() {
+        assert_eq!(wall_clock_string(0), "1970-01-01 00:00:00");
+        assert_eq!(wall_clock_string(-1), "1969-12-31 23:59:59");
+        assert_eq!(wall_clock_string(946_684_800), "2000-01-01 00:00:00");
+        assert_eq!(wall_clock_string(1_789_439_400), "2026-09-15 02:30:00");
+    }
+
+    /// (c2) The live wall clock is a plausible post-2020 / pre-2100
+    /// second count (the app shell's `unix_timestamp` test precedent).
+    #[test]
+    fn now_epoch_secs_is_plausible() {
+        let secs = now_epoch_secs();
+        assert!(secs > 1_577_836_800, "expected a post-2020 count, got: {secs}");
+        assert!(secs < 4_102_444_800, "expected a pre-2100 count, got: {secs}");
+    }
+
+    /// (c2) The card layout (C6-28): a 640×420 RGB8 card with the
+    /// CYAN title glyph at the top-left margin, the SLATE gap between
+    /// the separator and the grid, the DIM_CELL separator line, and a
+    /// measured grid cell painted over the background.
+    #[test]
+    fn snapshot_card_layout_header_and_grid() {
+        let t = fixture_telemetry(
+            Section::Value(3600.0),
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+        );
+        let path = temp_path("snapshot-card.png");
+        snapshot_png(&fixture_grid(), Some(&t), &path)
+            .expect("the card must not fail for a writable temp path");
+        let bytes = std::fs::read(&path).expect("the card file must exist");
+        assert_eq!(&bytes[..8], &PNG_SIG);
+
+        let mut reader =
+            png::Decoder::new(&bytes[..]).read_info().expect("a valid PNG has a header");
+        let info = reader.info();
+        assert_eq!((info.width, info.height), (CARD_W as u32, CARD_H as u32));
+        assert_eq!(info.color_type, png::ColorType::Rgb);
+        let mut img = vec![0u8; reader.output_buffer_size()];
+        reader.next_frame(&mut img).expect("the card payload must decode");
+
+        let slate = (SLATE.r(), SLATE.g(), SLATE.b());
+        // The title's first glyph (the `R` of `RamSleuth`) sits at the
+        // top-left margin (the 2×-scaled 5×7 font): its top row leaves
+        // the corner pixel inkless, but row 1 column 0 and the top
+        // row's column 1 are lit CYAN.
+        assert_eq!(pixel(&img, 16, 16), slate, "the glyph corner is inkless");
+        assert_eq!(
+            pixel(&img, 16, 18),
+            (CYAN.r(), CYAN.g(), CYAN.b()),
+            "the title glyph must be CYAN"
+        );
+        assert_eq!(
+            pixel(&img, 18, 16),
+            (CYAN.r(), CYAN.g(), CYAN.b()),
+            "the title glyph must be CYAN"
+        );
+        // The gap between the separator and the grid stays SLATE...
+        assert_eq!(pixel(&img, 320, 95), slate, "the header/grid gap must be SLATE");
+        // ...the separator line renders DIM_CELL...
+        assert_eq!(
+            pixel(&img, 320, SEPARATOR_Y),
+            (DIM_CELL.r(), DIM_CELL.g(), DIM_CELL.b())
+        );
+        // ...and a measured grid cell is painted (not the background).
+        assert_ne!(pixel(&img, 86, 132), slate, "a measured cell must be painted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// One decoded card pixel (RGB8) as a channel triple.
+    fn pixel(img: &[u8], x: usize, y: usize) -> (u8, u8, u8) {
+        let i = (y * CARD_W + x) * 3;
+        (img[i], img[i + 1], img[i + 2])
     }
 }
