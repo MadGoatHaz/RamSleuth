@@ -67,5 +67,10 @@ pub use orchestrator::{BenchmarkGrid, Metric, OrchestratorError, Tier, run_all};
 // (`StreamTarget`/`StreamOptions`/`StreamProgress`/`StreamError` +
 // `run_streamed`) behind the daemon's single-flight benchmark job
 // (P3-15); reuses the P3-08-widened passes.
+// C7-06 adds the burn-in engine on the same pass core
+// (`run_burn_in` + `BurnInOptions` / `BurnInTick`).
 mod streamed;
-pub use streamed::{StreamError, StreamOptions, StreamProgress, StreamTarget, run_streamed};
+pub use streamed::{
+    BurnInOptions, BurnInTick, StreamError, StreamOptions, StreamProgress, StreamTarget,
+    run_burn_in, run_streamed,
+};
