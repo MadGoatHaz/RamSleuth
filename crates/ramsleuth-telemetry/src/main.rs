@@ -159,6 +159,7 @@ mod tests {
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::NaReason;
     use ramsleuth_telemetry::spd_decode::SpdModule;
+    use ramsleuth_telemetry::SystemPlatform;
 
     /// A synthetic all-Na snapshot (pure — never calls `collect()`).
     fn all_na() -> SystemMemoryTelemetry {
@@ -170,6 +171,17 @@ mod tests {
             amd: Section::Na(NaReason::DriverMissing),
             intel: Section::Na(NaReason::UnsupportedHardware),
             spd: Vec::new(),
+            // The C6-06 fields: a fully-degraded platform, no total
+            // (the synthetic host carries no meminfo source), and no
+            // DIMM sizes (parallel to the empty SPD list).
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
         }
     }
 

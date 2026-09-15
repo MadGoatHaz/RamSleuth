@@ -2,10 +2,14 @@
 //!
 //! [`collect()`] aggregates every Phase 2 provider into one
 //! [`SystemMemoryTelemetry`] with **per-branch error containment**: the
-//! AMD branch (P2-03/04/05), the Intel branch (P2-06/07), and the
-//! vendor-independent SPD branch (P2-08/09) each degrade independently
-//! to a structured `Section::Na(reason)` (or an empty SPD list), so a
-//! failure in one branch can never affect the others (plan D5).
+//! AMD branch (P2-03/04/05), the Intel branch (P2-06/07), the
+//! vendor-independent SPD branch (P2-08/09), and the vendor-independent
+//! platform branch (C6-01) each degrade independently to a structured
+//! `Section::Na(reason)` (or an empty SPD list), so a failure in one
+//! branch can never affect the others (plan D5). The per-DIMM
+//! capacities (`dimm_sizes`) derive from the SPD modules, and the total
+//! capacity falls back to `/proc/meminfo` when no DIMM carries a value
+//! (D-C3/D-C9).
 //!
 //! **No-panic contract:** [`collect()`] never returns `Err` and never
 //! panics — unavailable data always degrades to `Section::Na(reason)`.
@@ -15,16 +19,21 @@
 //! I/O of its own):
 //!
 //! ```text
-//! CpuInfo::detect() ──┬─ AMD:   amd_smu::acquire() → amd_pm::parse() → amd_smn::apply_smn (overlay) → amd_readout::map_amd()
-//!                     ├─ Intel: intel_mchbar::acquire() → intel_readout::read_intel()
-//!                     └─ SPD:   spd_eeprom::acquire() → spd_decode::decode() (per image)
+//! CpuInfo::detect() ──┬─ AMD:      amd_smu::acquire() → amd_pm::parse() → amd_smn::apply_smn (overlay) → amd_readout::map_amd()
+//!                     ├─ Intel:    intel_mchbar::acquire() → intel_readout::read_intel()
+//!                     ├─ SPD:      spd_eeprom::acquire() → spd_decode::decode() (per image)
+//!                     └─ Platform: platform::collect_platform() (C6-01) → dimm_sizes + total_capacity (D-C3)
 //! ```
 //!
 //! A vendor branch runs only on matching silicon: the AMD branch gates
 //! on `CpuVendor::Amd(_)` and the Intel branch on `CpuVendor::Intel(_)`
 //! *before* any provider call, so a non-matching vendor yields
 //! `Section::Na(UnsupportedHardware)` with zero I/O in that branch. The
-//! SPD branch runs on every vendor (unprivileged sysfs reads).
+//! SPD and platform branches run on every vendor (unprivileged sysfs /
+//! DMI + `/proc` reads); the per-DIMM capacities derive from the SPD
+//! modules (`density_mbit × devices / 8192`, D-C3) and the total
+//! capacity falls back to the meminfo total when no DIMM carries a
+//! value (D-C9).
 
 use crate::amd_pm;
 use crate::amd_readout::{self, AmdReadout};
@@ -34,11 +43,13 @@ use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_mchbar;
 use crate::intel_readout::{self, IntelReadout};
+use crate::platform::{self, SystemPlatform};
 use crate::spd_decode::{self, SpdModule};
 use crate::spd_eeprom;
 
 /// The full system memory telemetry snapshot — the Phase 2 exit-criteria
-/// struct (v2 §2.2.1).
+/// struct (v2 §2.2.1), extended in Cycle 6 with the platform branch
+/// (C6-01) and the derived capacities (D-C3/D-C9).
 ///
 /// - `cpu`: the detected CPU whose vendor dispatched the branches.
 /// - `amd`: the AMD SMU readout; `Na` when not on AMD silicon or when
@@ -48,6 +59,16 @@ use crate::spd_eeprom;
 ///   or when the MCHBAR map is unavailable.
 /// - `spd`: the decoded SPD modules, one per bound `ee1004` device;
 ///   empty when the driver is absent or no device is bound.
+/// - `platform`: the vendor-neutral platform identity (C6-01, D-C1);
+///   each of its four fields degrades independently to
+///   `Na(NotApplicable)`.
+/// - `total_capacity`: total installed memory in GiB (D-C3): the sum of
+///   the [`dimm_sizes`](Self::dimm_sizes) entries that carry a value,
+///   else the `/proc/meminfo` `MemTotal` fallback, else `Na`.
+/// - `dimm_sizes`: per-DIMM capacity in GiB (D-C3/D-C9), parallel to
+///   [`spd`](Self::spd) — entry `i` is `density_mbit × devices / 8192`
+///   for module `i`; `Na` when that module's density or devices is `Na`
+///   (carrying the offending source's reason).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SystemMemoryTelemetry {
     /// The detected CPU (vendor + brand).
@@ -61,6 +82,20 @@ pub struct SystemMemoryTelemetry {
     /// SPD branch outcome: one decoded module per bound device (empty
     /// when unavailable).
     pub spd: Vec<SpdModule>,
+    /// Platform branch outcome (C6-01): the vendor-neutral identity
+    /// snapshot; every field degrades to `Na(NotApplicable)`
+    /// independently.
+    pub platform: SystemPlatform,
+    /// Total installed capacity in GiB (D-C3): the sum of the
+    /// `Value` [`dimm_sizes`](Self::dimm_sizes) entries when at least
+    /// one carries a value, else the `/proc/meminfo` `MemTotal`
+    /// fallback, else `Na`.
+    pub total_capacity: Section<f64>,
+    /// Per-DIMM capacity in GiB (D-C3/D-C9), parallel to
+    /// [`spd`](Self::spd): entry `i` is `density_mbit × devices /
+    /// 8192` for module `i`, `Na` when that module's density or
+    /// devices is `Na`.
+    pub dimm_sizes: Vec<Section<f64>>,
 }
 
 /// Collect the full [`SystemMemoryTelemetry`] snapshot.
@@ -83,6 +118,14 @@ pub struct SystemMemoryTelemetry {
 ///    `intel_readout::read_intel()`.
 /// 4. SPD branch (all vendors, unprivileged): `spd_eeprom::acquire()` →
 ///    `spd_decode::decode()` per image.
+/// 5. Platform branch (all vendors, C6-01): `platform::collect_platform()`
+///    — every field degrades independently and it never fails the
+///    process.
+/// 6. Per-DIMM capacities (D-C3/D-C9): `density_mbit × devices / 8192`
+///    per SPD module (parallel to the SPD list; `Na` when that module's
+///    density or devices is `Na`).
+/// 7. Total capacity (D-C3): the sum of the DIMM capacities when at
+///    least one carries a value, else the `/proc/meminfo` fallback.
 pub fn collect() -> SystemMemoryTelemetry {
     // 1. Detect the CPU once; every vendor branch dispatches on it.
     let cpu = CpuInfo::detect();
@@ -93,8 +136,16 @@ pub fn collect() -> SystemMemoryTelemetry {
     // 4. SPD branch (vendor-independent; per-device containment lives
     //    inside the provider).
     let spd = spd_branch();
-    // 5. Assemble with per-branch containment (pure).
-    assemble(cpu, amd, intel, spd)
+    // 5. Platform branch (vendor-independent, C6-01; never fails the
+    //    process — every field degrades independently).
+    let platform = platform_branch();
+    // 6. Per-DIMM capacities (D-C3/D-C9): parallel to the SPD modules.
+    let dimm_sizes = dimm_sizes(&spd);
+    // 7. Total capacity (D-C3): the sum of the DIMM capacities when at
+    //    least one carries a value, else the meminfo fallback.
+    let total_capacity = total_capacity(&dimm_sizes);
+    // 8. Assemble with per-branch containment (pure).
+    assemble(cpu, amd, intel, spd, platform, total_capacity, dimm_sizes)
 }
 
 /// Map a frozen [`TelemetryError`] to its display [`NaReason`] tag.
@@ -169,22 +220,85 @@ fn spd_branch() -> Vec<SpdModule> {
     }
 }
 
+/// Platform branch (C6-01): `platform::collect_platform()`.
+///
+/// Vendor-independent, like the SPD branch: it runs on every vendor and
+/// every field degrades independently to `Na(NotApplicable)` — a
+/// failure in this branch never affects the others and never fails the
+/// process (the entry point never returns `Err`).
+fn platform_branch() -> SystemPlatform {
+    platform::collect_platform()
+}
+
+/// Per-DIMM capacities in GiB (D-C3/D-C9): one entry per SPD module,
+/// parallel to `spd`.
+///
+/// Pure: entry `i` is `density_mbit × devices / 8192` for module `i`
+/// (16384 Mbit × 8 devices / 8192 = 16 GiB). An entry degrades to `Na`
+/// — carrying the offending source's reason (density's when both are
+/// `Na`) — when that module's `density_mbit` or `devices` is `Na`.
+/// Never a panic, never an invented value.
+fn dimm_sizes(spd: &[SpdModule]) -> Vec<Section<f64>> {
+    spd
+        .iter()
+        .map(|module| match (&module.density_mbit, &module.devices) {
+            (Section::Na(reason), _) => Section::na(reason.clone()),
+            (Section::Value(_), Section::Na(reason)) => Section::na(reason.clone()),
+            (Section::Value(density_mbit), Section::Value(devices)) => {
+                Section::Value((*density_mbit as f64) * (*devices as f64) / 8192.0)
+            }
+        })
+        .collect()
+}
+
+/// Total installed capacity in GiB (D-C3): the sum of the per-DIMM
+/// capacities that carry a value, when at least one does; otherwise the
+/// `/proc/meminfo` `MemTotal` fallback (C6-01), which itself degrades
+/// to `Na(NotApplicable)` when the meminfo source is absent or
+/// unreadable — the chain ends in an honest `Na`, never a panic and
+/// never an invented value.
+fn total_capacity(dimm_sizes: &[Section<f64>]) -> Section<f64> {
+    let mut total = 0.0;
+    let mut any_value = false;
+    for cell in dimm_sizes {
+        if let Section::Value(gib) = cell {
+            total += gib;
+            any_value = true;
+        }
+    }
+    if any_value {
+        Section::Value(total)
+    } else {
+        platform::mem_total_gib()
+    }
+}
+
 /// Assemble the snapshot from the branch results (pure — no I/O).
 ///
 /// This is the unit of per-branch containment: each `Err` degrades only
 /// its own `Section` (via [`reason_from`]) while the other branches'
-/// data is carried through untouched.
+/// data is carried through untouched. The platform branch (already a
+/// fully degraded-or-populated [`SystemPlatform`]) and the derived
+/// capacities (`dimm_sizes` / `total_capacity`, computed in
+/// [`collect()`] from the SPD modules — D-C3/D-C9) are carried through
+/// as-is.
 fn assemble(
     cpu: CpuInfo,
     amd: TelemetryResult<AmdReadout>,
     intel: TelemetryResult<IntelReadout>,
     spd: Vec<SpdModule>,
+    platform: SystemPlatform,
+    total_capacity: Section<f64>,
+    dimm_sizes: Vec<Section<f64>>,
 ) -> SystemMemoryTelemetry {
     SystemMemoryTelemetry {
         cpu,
         amd: section_from(amd),
         intel: section_from(intel),
         spd,
+        platform,
+        total_capacity,
+        dimm_sizes,
     }
 }
 
@@ -282,6 +396,34 @@ mod tests {
         for module in &t.spd {
             assert!(module.index > 0, "SPD module index must be nonzero");
         }
+
+        // platform (C6-01): runs on every vendor; each field is a
+        // `Value` or the frozen `Na(NotApplicable)` — never any other
+        // reason.
+        assert_value_or_na("cpu_clock_mhz", &t.platform.cpu_clock_mhz);
+        assert_value_or_na("motherboard", &t.platform.motherboard);
+        assert_value_or_na("bios", &t.platform.bios);
+        assert_value_or_na("agesa", &t.platform.agesa);
+
+        // dimm_sizes (D-C9): parallel to the SPD list, positionally.
+        assert_eq!(
+            t.dimm_sizes.len(),
+            t.spd.len(),
+            "dimm_sizes must be parallel to spd"
+        );
+
+        // total_capacity (D-C3): an in-band positive `Value` (the DIMM
+        // sum or the meminfo fallback) or the fallback's own
+        // `Na(NotApplicable)` — never any other reason.
+        match &t.total_capacity {
+            Section::Value(gib) => {
+                assert!(gib.is_finite() && *gib > 0.0, "total_capacity must be positive, got {gib}")
+            }
+            Section::Na(reason) => assert!(
+                matches!(reason, NaReason::NotApplicable),
+                "total_capacity Na must be NotApplicable, got {reason:?}"
+            ),
+        }
     }
 
     /// (c) Per-branch containment: an `Err` in the AMD branch degrades
@@ -299,8 +441,23 @@ mod tests {
             vendor: "AMD (Intel IMC decode requires an Intel CPU)".to_owned(),
         });
         let spd = vec![fixture_module(0x52), fixture_module(0x53)];
+        // The C6-06 fields carry through independently of the vendor
+        // branches: a synthetic all-Na platform, the pure per-DIMM
+        // capacities (the fixture modules carry Na density/devices),
+        // and the derived total.
+        let platform = fixture_platform();
+        let dimm_sizes = dimm_sizes(&spd);
+        let total_capacity = total_capacity(&dimm_sizes);
 
-        let t = assemble(cpu, amd, intel, spd.clone());
+        let t = assemble(
+            cpu,
+            amd,
+            intel,
+            spd.clone(),
+            platform.clone(),
+            total_capacity.clone(),
+            dimm_sizes.clone(),
+        );
 
         // AMD: its own Err → Na(DriverMissing).
         assert_eq!(t.amd, Section::Na(NaReason::DriverMissing));
@@ -309,6 +466,10 @@ mod tests {
         // SPD: the modules survive the AMD failure verbatim.
         assert_eq!(t.spd, spd);
         assert_eq!(t.spd.len(), 2);
+        // Platform / capacities: carried through verbatim.
+        assert_eq!(t.platform, platform);
+        assert_eq!(t.dimm_sizes, dimm_sizes);
+        assert_eq!(t.total_capacity, total_capacity);
     }
 
     /// (c′) Symmetric containment: an Intel-branch `Err` degrades only
@@ -326,8 +487,21 @@ mod tests {
         let intel: TelemetryResult<IntelReadout> =
             Err(TelemetryError::InsufficientPrivilege { hint: "run as root" });
         let spd = vec![fixture_module(0x50)];
+        // The C6-06 fields carry through independently of the vendor
+        // branches (same shape as the AMD-failure arm above).
+        let platform = fixture_platform();
+        let dimm_sizes = dimm_sizes(&spd);
+        let total_capacity = total_capacity(&dimm_sizes);
 
-        let t = assemble(cpu, amd, intel, spd.clone());
+        let t = assemble(
+            cpu,
+            amd,
+            intel,
+            spd.clone(),
+            platform.clone(),
+            total_capacity.clone(),
+            dimm_sizes.clone(),
+        );
 
         // AMD: independently Na(UnsupportedHardware).
         assert_eq!(t.amd, Section::Na(NaReason::UnsupportedHardware));
@@ -335,6 +509,10 @@ mod tests {
         assert_eq!(t.intel, Section::Na(NaReason::InsufficientPrivilege));
         // SPD: carried through verbatim.
         assert_eq!(t.spd, spd);
+        // Platform / capacities: carried through verbatim.
+        assert_eq!(t.platform, platform);
+        assert_eq!(t.dimm_sizes, dimm_sizes);
+        assert_eq!(t.total_capacity, total_capacity);
     }
 
     /// `section_from` is the single containment rule for both vendor
@@ -365,6 +543,17 @@ mod tests {
             density_mbit: Section::na(NaReason::ParseError("fixture".to_owned())),
             speed_mts: Section::Value(3200),
             profiles: Vec::new(),
+        }
+    }
+
+    /// A fully-degraded [`SystemPlatform`] fixture (host-independent;
+    /// every field the frozen `Na(NotApplicable)`).
+    fn fixture_platform() -> SystemPlatform {
+        SystemPlatform {
+            cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+            motherboard: Section::na(NaReason::NotApplicable),
+            bios: Section::na(NaReason::NotApplicable),
+            agesa: Section::na(NaReason::NotApplicable),
         }
     }
     // ------------------------------------------------------------------
@@ -435,13 +624,15 @@ mod tests {
 
     /// The full snapshot root is wire-safe: a representative
     /// [`SystemMemoryTelemetry`] (a `Value` AMD readout with mixed
-    /// `Value`/`Na` cells, a `Na` Intel branch, two SPD modules) and a
-    /// fully-degraded all-`Na` snapshot each round-trip through bincode
-    /// and compare equal — every field of the Phase 2 exit-criteria
-    /// struct crosses the wire.
+    /// `Value`/`Na` cells, a `Na` Intel branch, two SPD modules, a
+    /// mixed platform, and mixed per-DIMM capacities) and a
+    /// fully-degraded all-`Na` snapshot each round-trip through
+    /// bincode and compare equal — every field of the snapshot struct
+    /// crosses the wire.
     #[test]
     fn system_memory_telemetry_bincode_round_trip() {
-        // representative: Value + Na sections across CPU / AMD / Intel / SPD
+        // representative: Value + Na sections across CPU / AMD / Intel /
+        // SPD / platform / capacities
         let t = SystemMemoryTelemetry {
             cpu: CpuInfo {
                 vendor: CpuVendor::Amd(AmdZen::Zen3),
@@ -450,6 +641,20 @@ mod tests {
             amd: Section::Value(fixture_amd()),
             intel: Section::Na(NaReason::UnsupportedHardware),
             spd: vec![fixture_module(0x52), fixture_module(0x53)],
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3600.0),
+                motherboard: Section::Value("ProArt X570-CREATOR".to_owned()),
+                bios: Section::Value("F60 + 09/15/2024".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            // A mixed `dimm_sizes` (one `Value`, one `Na`) plus a
+            // `Value` total exercises both arms of the new cells on the
+            // wire.
+            total_capacity: Section::Value(16.0),
+            dimm_sizes: vec![
+                Section::Value(16.0),
+                Section::na(NaReason::NotApplicable),
+            ],
         };
 
         let bytes = bincode::serialize(&t)
@@ -458,7 +663,8 @@ mod tests {
             bincode::deserialize(&bytes).expect("SystemMemoryTelemetry must deserialize");
         assert_eq!(t, back);
 
-        // fully degraded: every branch `Na`, no SPD modules
+        // fully degraded: every branch `Na`, no SPD modules, no
+        // platform data, no capacities
         let all_na = SystemMemoryTelemetry {
             cpu: CpuInfo {
                 vendor: CpuVendor::Unknown,
@@ -467,6 +673,9 @@ mod tests {
             amd: Section::Na(NaReason::DriverMissing),
             intel: Section::Na(NaReason::InsufficientPrivilege),
             spd: Vec::new(),
+            platform: fixture_platform(),
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
         };
         let bytes = bincode::serialize(&all_na)
             .expect("SystemMemoryTelemetry must serialize (no-panic contract)");
@@ -766,5 +975,138 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // (f) C6-06: per-DIMM capacities + total capacity (D-C3/D-C9).
+    // ------------------------------------------------------------------
+
+    /// A [`SpdModule`] with `Value` density + devices (the capacity
+    /// arithmetic fixture; everything else as in [`fixture_module`]).
+    fn capacity_module(index: u8, density_mbit: u16, devices: u8) -> SpdModule {
+        let mut module = fixture_module(index);
+        module.density_mbit = Section::Value(density_mbit);
+        module.devices = Section::Value(devices);
+        module
+    }
+
+    /// (f1) `dimm_sizes` is parallel to `spd` and computes
+    /// `density_mbit × devices / 8192` GiB per module: the plan's
+    /// verification case (16384 Mbit × 8 devices = 16 GiB) plus smaller
+    /// and non-power-of-two products (exact in binary: every factor
+    /// divides 8192 cleanly).
+    #[test]
+    fn dimm_sizes_is_parallel_and_computes_capacity() {
+        let spd = vec![
+            capacity_module(0x52, 16384, 8), // 16 GiB
+            capacity_module(0x53, 8192, 4),  // 4 GiB
+            capacity_module(0x54, 12288, 8), // 12 GiB (non-power-of-two)
+        ];
+
+        let sizes = dimm_sizes(&spd);
+
+        assert_eq!(sizes.len(), 3, "one entry per module, in order");
+        assert_eq!(sizes[0], Section::Value(16.0));
+        assert_eq!(sizes[1], Section::Value(4.0));
+        assert_eq!(sizes[2], Section::Value(12.0));
+
+        // An empty SPD list yields an empty (still parallel) list.
+        assert_eq!(dimm_sizes(&[]), Vec::new());
+    }
+
+    /// (f2) Na propagation is per-module: a capacity entry degrades to
+    /// `Na` carrying the offending source's reason (density's when both
+    /// are `Na`), while the other modules are unaffected.
+    #[test]
+    fn dimm_sizes_propagates_na_per_module() {
+        // Both density and devices Na → the density's reason wins.
+        let density_na = fixture_module(0x50);
+        // A clean module computes its capacity verbatim.
+        let ok = capacity_module(0x51, 16384, 8);
+        // Devices Na while the density is a value → the devices'
+        // reason.
+        let mut devices_na = capacity_module(0x52, 16384, 8);
+        devices_na.devices = Section::na(NaReason::ParseError("invalid rank config".to_owned()));
+
+        let sizes = dimm_sizes(&[density_na, ok, devices_na]);
+
+        assert_eq!(sizes[0], Section::na(NaReason::ParseError("fixture".to_owned())));
+        assert_eq!(sizes[1], Section::Value(16.0));
+        assert_eq!(sizes[2], Section::na(NaReason::ParseError("invalid rank config".to_owned())));
+    }
+
+    /// (f3) `total_capacity` is the sum of the DIMM capacities that
+    /// carry a value (an `Na` entry contributes nothing) when at least
+    /// one does.
+    #[test]
+    fn total_capacity_sums_the_dimm_sizes() {
+        let sizes = vec![
+            Section::Value(8.0),
+            Section::na(NaReason::NotApplicable),
+            Section::Value(16.0),
+        ];
+        assert_eq!(total_capacity(&sizes), Section::Value(24.0));
+
+        // A single value module sums to itself.
+        assert_eq!(total_capacity(&[Section::Value(16.0)]), Section::Value(16.0));
+
+        // The host shape (two 16 GiB DIMMs) through the full
+        // spd → dimm_sizes → total_capacity chain.
+        let spd = vec![capacity_module(0x52, 16384, 8), capacity_module(0x53, 16384, 8)];
+        assert_eq!(total_capacity(&dimm_sizes(&spd)), Section::Value(32.0));
+    }
+
+    /// (f4) `total_capacity` falls back to the `/proc/meminfo` total
+    /// when no DIMM carries a value (including the empty-SPD case).
+    /// `MemTotal` is boot-constant, so the fallback is deterministic —
+    /// its own degradation (`Na(NotApplicable)` without a meminfo
+    /// source) is the chain's honest end.
+    #[test]
+    fn total_capacity_falls_back_to_meminfo() {
+        // No DIMM values (the fixture modules carry Na density/devices)
+        // → the meminfo fallback, whatever this host reports.
+        let sizes = dimm_sizes(&[fixture_module(0x52), fixture_module(0x53)]);
+        assert!(
+            sizes.iter().all(Section::is_na),
+            "fixture modules carry no capacity value"
+        );
+        assert_eq!(total_capacity(&sizes), platform::mem_total_gib());
+
+        // An empty SPD list → the same fallback.
+        assert_eq!(total_capacity(&[]), platform::mem_total_gib());
+
+        // The fallback is in-band: a positive finite GiB or the
+        // honest `Na(NotApplicable)`.
+        match platform::mem_total_gib() {
+            Section::Value(gib) => {
+                assert!(gib.is_finite() && gib > 0.0, "meminfo total must be positive: {gib}")
+            }
+            Section::Na(reason) => assert!(
+                matches!(reason, NaReason::NotApplicable),
+                "meminfo Na must be NotApplicable: {reason:?}"
+            ),
+        }
+    }
+
+    /// (f5) `platform_branch` runs on every vendor and never fails the
+    /// process: on this host every field is a `Value` or the frozen
+    /// `Na(NotApplicable)` (the C6-01 fallback column).
+    /// A [`SystemPlatform`] cell must be a `Value` or the frozen
+    /// `Na(NotApplicable)` — the only two states the platform branch
+    /// produces (the C6-01 fallback column).
+    fn assert_value_or_na<T: std::fmt::Debug>(name: &str, cell: &Section<T>) {
+        assert!(
+            matches!(cell, Section::Value(_) | Section::Na(NaReason::NotApplicable)),
+            "platform.{name} must be Value or Na(NotApplicable), got {cell:?}"
+        );
+    }
+
+    #[test]
+    fn platform_branch_is_vendor_independent_and_graceful() {
+        let p = platform_branch();
+        assert_value_or_na("cpu_clock_mhz", &p.cpu_clock_mhz);
+        assert_value_or_na("motherboard", &p.motherboard);
+        assert_value_or_na("bios", &p.bios);
+        assert_value_or_na("agesa", &p.agesa);
     }
 }
