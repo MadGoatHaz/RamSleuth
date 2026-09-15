@@ -369,12 +369,13 @@ fn cell_color(label: &str, display: &str) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use ramsleuth_telemetry::amd_readout::{
-        AmdReadout, CadBus, ClockReadout, DivMode, RttValue, TimingSet, VoltageSet,
+        AmdReadout, CadBus, ClockReadout, CommandRate, DivMode, RttValue, TimingSet, VoltageSet,
     };
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
     use ramsleuth_telemetry::SystemMemoryTelemetry;
+    use ramsleuth_telemetry::SystemPlatform;
 
     use super::*;
 
@@ -392,6 +393,7 @@ mod tests {
                 gear_mode: Section::na(NaReason::NotApplicable),
                 gdm: Section::Value(true),
                 pdm: Section::Value(false),
+                command_rate: Section::Value(CommandRate::OneT),
             },
             timings: TimingSet {
                 cl: Section::Value(16),
@@ -472,6 +474,14 @@ mod tests {
             amd: Section::Value(fixture_amd()),
             intel: Section::na(NaReason::UnsupportedHardware),
             spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3500.0),
+                motherboard: Section::Value("Test Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(32.0),
+            dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
         }
     }
 
@@ -486,6 +496,14 @@ mod tests {
             amd: Section::na(NaReason::UnsupportedHardware),
             intel: Section::Value(fixture_intel()),
             spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3500.0),
+                motherboard: Section::Value("Test Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(32.0),
+            dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
         }
     }
 
@@ -499,6 +517,14 @@ mod tests {
             amd: Section::na(NaReason::DriverMissing),
             intel: Section::na(NaReason::InsufficientPrivilege),
             spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
         }
     }
 
