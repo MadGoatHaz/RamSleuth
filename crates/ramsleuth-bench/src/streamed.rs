@@ -171,12 +171,16 @@ impl std::error::Error for StreamError {
 /// cells that ran (unrequested cells stay `0.0`).
 ///
 /// Topology detection, tier sizing, kernel-family selection, and thread
-/// pinning are resolved from the host (see the module docs); one
-/// [`StreamProgress`] is sent per completed bandwidth cell through
-/// `progress_tx` when provided (a dropped receiver is ignored). The
-/// cancel gate is checked before the run starts and between cells: a
-/// set flag stops the run cleanly with [`StreamError::Cancelled`] — no
-/// panic, no leaked threads.
+/// pinning are resolved from the host once (see the module docs), and
+/// the run is one whole pass over the target's cells via
+/// [`run_cell_pass`], wired here to the [`StreamProgress`] emitter: one
+/// event per completed bandwidth cell through `progress_tx` when
+/// provided (a dropped receiver is ignored), and no event for the
+/// per-tier latency pass (it lands in the grid with no progress cell of
+/// its own — the `StreamProgress::op` tag stays truthful). The cancel
+/// gate is checked before the run starts and between cells: a set flag
+/// stops the run cleanly with [`StreamError::Cancelled`] — no panic, no
+/// leaked threads.
 ///
 /// # Errors
 ///
@@ -197,12 +201,125 @@ pub fn run_streamed(
 
     let cells = cells_for_target(&options.target);
     let total_cells = cells.len() as u32;
+    let setup = PassSetup {
+        target: options.target,
+        cells,
+        total_cells,
+        effective,
+        use_avx512,
+        plan,
+    };
     let mut grid = zero_grid();
-    let mut cell_index = 0u32;
+    let ctx = PassContext { cell_index: 0 };
 
+    // One whole pass over the target's cells. The cell-completed emit
+    // forwards to the progress channel (a no-op when none is provided;
+    // a dropped receiver is ignored — the `.ok()` contract); the
+    // latency emit is a no-op: the latency pass is a per-tier
+    // measurement, never a progress cell.
+    let mut emit_cell = |tier: Tier,
+                        op: BenchOp,
+                        value: f64,
+                        cell_index: u32,
+                        total_cells: u32| {
+        if let Some(ref tx) = progress_tx {
+            let label = format!("{} · {} (GB/s)", tier_name(tier), op_name(op));
+            let _ = tx
+                .send(StreamProgress {
+                    cell_index,
+                    total_cells,
+                    tier,
+                    op,
+                    value,
+                    label,
+                })
+                .ok(); // dropped receiver: ignored, per contract
+        }
+    };
+    let mut emit_latency = |_tier: Tier, _ns: f64| {};
+    run_cell_pass(
+        &mut grid,
+        &setup,
+        &options.cancel,
+        &ctx,
+        &mut emit_cell,
+        &mut emit_latency,
+    )?;
+    Ok(grid)
+}
+
+/// Everything one pass needs that does not change between passes: the
+/// target and its cell list (tier-major, op-ordered), the target's
+/// bandwidth cell count, the thread-bounded topology the worker
+/// dispatch sees, the kernel-family flag, and the per-tier sizing
+/// plan. `run_streamed` resolves it from the host once per run; the
+/// burn-in loop (C7-06) reuses the same setup for every iteration.
+struct PassSetup {
+    /// Which cells the pass runs (see the [`StreamTarget`] docs).
+    target: StreamTarget,
+    /// The target's cell list, tier-major, op-ordered.
+    cells: Vec<(Tier, BenchOp)>,
+    /// The target's bandwidth cell count (emitted with every completed
+    /// cell).
+    total_cells: u32,
+    /// The topology the worker dispatch sees (`threads`-bounded).
+    effective: CpuTopology,
+    /// The runtime kernel-family flag (AVX-512).
+    use_avx512: bool,
+    /// The per-tier sizing plan.
+    plan: BufferPlan,
+}
+
+/// The per-pass bookkeeping for [`run_cell_pass`]: where the pass's
+/// cell cursor starts. A pass always walks the target's cell list from
+/// the beginning (`0` for a fresh pass — every pass is one), and the
+/// cursor grows by one per completed bandwidth cell, so a fresh pass
+/// emits indices `0 .. total_cells` (the emitted index is the
+/// pre-increment value).
+struct PassContext {
+    /// The pass's starting cell cursor (`0` for a fresh pass).
+    cell_index: u32,
+}
+
+/// Run one whole pass over the target's cells, writing the measured
+/// cells into `grid`.
+///
+/// For every tier the target touches, in [`TIER_ORDER`]: the tier's
+/// cells in global order run against one shared aligned src/dst window
+/// pair (one allocation, one fill — mirroring `run_all_sized`), the
+/// cancel gate checked before every bandwidth pass; each completed cell
+/// is written to the grid and forwarded to `emit_cell` (the cell's
+/// tier, op, value, index within the target's list, and the list's
+/// total); both windows are released before the chase buffer so the
+/// per-tier peak stays at ~1× the tier size. When the target covers the
+/// whole tier, the per-tier latency pass runs behind its own gate
+/// (between the last bandwidth cell and the chase): a per-tier
+/// measurement, not a cell — it lands in the grid and is forwarded to
+/// `emit_latency` (tier, ns) with no index bookkeeping.
+///
+/// `run_streamed` is this helper wired to its [`StreamProgress`]
+/// emitter (one pass from a zero cursor); the burn-in loop (C7-06)
+/// runs the same helper repeatedly, one pass per iteration.
+///
+/// # Errors
+///
+/// - [`StreamError::Cancelled`] when the cancel flag is set at any gate
+///   (the in-flight pass completes first; the grid is left as written —
+///   the caller discards it);
+/// - [`StreamError::Worker`] when a bandwidth pass fails.
+fn run_cell_pass(
+    grid: &mut BenchmarkGrid,
+    setup: &PassSetup,
+    cancel: &AtomicBool,
+    ctx: &PassContext,
+    emit_cell: &mut impl FnMut(Tier, BenchOp, f64, u32, u32),
+    emit_latency: &mut impl FnMut(Tier, f64),
+) -> Result<(), StreamError> {
+    let mut cell_index = ctx.cell_index;
     for &tier in &TIER_ORDER {
         // This tier's cells in global order (the list is tier-major).
-        let tier_ops: Vec<BenchOp> = cells
+        let tier_ops: Vec<BenchOp> = setup
+            .cells
             .iter()
             .filter_map(|(t, op)| (*t == tier).then_some(*op))
             .collect();
@@ -210,7 +327,7 @@ pub fn run_streamed(
             continue; // the target never touches this tier
         }
         let slot = tier as usize;
-        let size = normalize_size(tier_size(&plan, tier));
+        let size = normalize_size(tier_size(&setup.plan, tier));
 
         // Bandwidth cells: one shared aligned src/dst window pair per
         // tier (mirroring `run_all_sized`: one allocation, one fill).
@@ -219,24 +336,18 @@ pub fn run_streamed(
         fill_pattern(src.as_mut_slice());
         for &op in &tier_ops {
             // Gate: between cells.
-            ensure_not_cancelled(&options.cancel)?;
+            ensure_not_cancelled(cancel)?;
             let value =
-                bench_bandwidth(&effective, op, src.as_slice(), dst.as_mut_slice(), use_avx512)
-                    .map_err(map_orchestrator_error)?;
-            set_bandwidth_cell(&mut grid, slot, op, value);
-            if let Some(ref tx) = progress_tx {
-                let label = format!("{} · {} (GB/s)", tier_name(tier), op_name(op));
-                let _ = tx
-                    .send(StreamProgress {
-                        cell_index,
-                        total_cells,
-                        tier,
-                        op,
-                        value,
-                        label,
-                    })
-                    .ok(); // dropped receiver: ignored, per contract
-            }
+                bench_bandwidth(
+                    &setup.effective,
+                    op,
+                    src.as_slice(),
+                    dst.as_mut_slice(),
+                    setup.use_avx512,
+                )
+                .map_err(map_orchestrator_error)?;
+            set_bandwidth_cell(grid, slot, op, value);
+            emit_cell(tier, op, value, cell_index, setup.total_cells);
             cell_index += 1;
         }
         // Release both windows before the chase buffer so the per-tier
@@ -246,13 +357,15 @@ pub fn run_streamed(
 
         // Latency: a per-tier measurement (not a cell) that runs only
         // when the target covers the whole tier.
-        if covers_full_tier(&options.target, tier) {
+        if covers_full_tier(&setup.target, tier) {
             // Gate: between the last bandwidth cell and the latency pass.
-            ensure_not_cancelled(&options.cancel)?;
-            grid.latency_ns[slot] = bench_latency(size, tier as u64 + 1);
+            ensure_not_cancelled(cancel)?;
+            let ns = bench_latency(size, tier as u64 + 1);
+            grid.latency_ns[slot] = ns;
+            emit_latency(tier, ns);
         }
     }
-    Ok(grid)
+    Ok(())
 }
 
 /// The zero grid: every cell `0.0` (unrequested cells stay zero).
