@@ -414,7 +414,7 @@ mod tests {
             die_type: Section::na(NaReason::NotApplicable),
             devices: Section::na(NaReason::NotApplicable),
             part: Section::na(NaReason::ParseError(
-                "part number: byte 0x81 outside image bounds".to_owned(),
+                "part number: byte 0x149 outside image bounds".to_owned(),
             )),
             serial: Section::na(NaReason::NotApplicable),
             rank: Section::na(NaReason::InsufficientPrivilege),
@@ -571,7 +571,7 @@ mod tests {
         );
         assert_eq!(
             cards[0][4].1,
-            "N/A (parse error: part number: byte 0x81 outside image bounds)"
+            "N/A (parse error: part number: byte 0x149 outside image bounds)"
         );
         // The all-Na EXPO profile line: every field degrades.
         assert_eq!(cards[0][8].0, "EXPO 0");
