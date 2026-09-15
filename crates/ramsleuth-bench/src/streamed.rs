@@ -52,11 +52,28 @@
 //! through the caller's channel when one is provided; a dropped
 //! receiver is ignored (the `.ok()` contract). `cell_index` /
 //! `total_cells` count within the target's cell list.
+//!
+//! # Burn-in
+//!
+//! [`run_burn_in`] loops whole passes — one [`run_cell_pass`] per
+//! iteration, a fresh zero grid and a zeroed cursor each time — until
+//! (a) the cancel gate trips (the in-flight pass completes first; its
+//! partial grid is discarded — the [`StreamError::Cancelled`] contract)
+//! or (b) for a finite `duration_minutes`, the first completed pass
+//! whose run-elapsed time reaches `duration_minutes × 60` seconds (the
+//! grid of that last completed pass is returned). `duration_minutes ==
+//! 0` runs until cancelled. Each completed bandwidth cell and each
+//! completed per-tier latency pass emits one [`BurnInTick`] — the
+//! 1-based iteration, the run-elapsed seconds at the emit, and exactly
+//! one of the bandwidth `(op, GB/s)` or the latency `ns` value —
+//! through the channel the caller provided when one is; a dropped
+//! receiver is ignored (the `.ok()` contract).
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::buffers::{BufferPlan, plan};
 use crate::features::CpuFeatures;
@@ -167,6 +184,56 @@ impl std::error::Error for StreamError {
     }
 }
 
+/// One burn-in tick: a completed bandwidth cell or a completed per-tier
+/// latency pass of one [`run_burn_in`] iteration.
+///
+/// Crosses the wire to the owning client connection (bincode, plan
+/// D-2); the protocol wraps it verbatim in its `BurnInProgress`
+/// response arm (C7-07). A wire payload, so it is serde-derived — the
+/// [`StreamProgress`] precedent. Exactly one of
+/// [`bandwidth`](Self::bandwidth) / [`latency_ns`](Self::latency_ns)
+/// is `Some` per tick; `iteration` is 1-based and `elapsed_secs` is
+/// the run elapsed at the emit, stamped from the run start.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BurnInTick {
+    /// The 1-based burn-in iteration this tick belongs to.
+    pub iteration: u32,
+    /// The run elapsed, in seconds, at the moment the tick was emitted.
+    pub elapsed_secs: f64,
+    /// The tick tier.
+    pub tier: Tier,
+    /// The completed bandwidth cell: its op and the measured GB/s.
+    /// `Some` for a cell tick, `None` for a latency tick.
+    pub bandwidth: Option<(BenchOp, f64)>,
+    /// The completed per-tier latency pass: the measured ns. `Some`
+    /// for a latency tick, `None` for a cell tick.
+    pub latency_ns: Option<f64>,
+}
+
+/// Configuration for one burn-in run.
+///
+/// A local type, like [`StreamOptions`]: it holds the cancel [`Arc`]
+/// and never crosses the wire itself — only its [`BurnInTick`]
+/// payloads do (the protocol `StartBurnIn` request arm carries just
+/// the `target` and `duration_minutes`, C7-07).
+#[derive(Debug, Clone)]
+pub struct BurnInOptions {
+    /// Which cells every pass runs (see the [`StreamTarget`] docs).
+    pub target: StreamTarget,
+    /// The run duration in minutes: `0` = infinite (stop only via
+    /// cancel); `n > 0` = stop once a pass has completed and the run
+    /// elapsed is at least `n × 60` seconds.
+    pub duration_minutes: u32,
+    /// Pinned worker count: same semantics as
+    /// [`StreamOptions::threads`] (`0` = auto).
+    pub threads: usize,
+    /// The cancel token: relaxed-loaded at the gates (before the run
+    /// starts, between iterations, and inside every pass); set → the
+    /// in-flight pass completes first, its partial grid is discarded,
+    /// and the run returns [`StreamError::Cancelled`].
+    pub cancel: Arc<AtomicBool>,
+}
+
 /// Run the benchmark for `options.target` and return the grid for the
 /// cells that ran (unrequested cells stay `0.0`).
 ///
@@ -246,6 +313,150 @@ pub fn run_streamed(
         &mut emit_latency,
     )?;
     Ok(grid)
+}
+
+/// Run a burn-in: loop whole passes (one [`run_cell_pass`] per
+/// iteration) until the cancel gate trips or, for a finite
+/// `duration_minutes`, the deadline is reached after a completed pass.
+///
+/// Same detection / sizing preamble as [`run_streamed`] (shared via the
+/// existing helpers), then the pass loop: each iteration runs one full
+/// pass over the target cells with a fresh zero grid and a zeroed
+/// [`PassContext`], emitting one [`BurnInTick`] per completed bandwidth
+/// cell and per completed per-tier latency pass through `tx` when
+/// provided (a dropped receiver is ignored — the `.ok()` contract).
+/// Each tick carries the 1-based iteration, the run elapsed at the emit
+/// (stamped from the run start), and exactly one of the bandwidth or
+/// the latency value.
+///
+/// Stop conditions: (a) the cancel gate trips — the in-flight pass
+/// completes first and its partial grid is discarded, the run returns
+/// [`StreamError::Cancelled`] (the [`run_streamed`] cancel contract);
+/// (b) `duration_minutes > 0` and a pass has completed with the run
+/// elapsed at least `duration_minutes × 60` — the run returns `Ok`
+/// with the grid of that last completed pass. `duration_minutes == 0`
+/// is infinite: the loop runs until cancelled.
+///
+/// # Errors
+///
+/// - [`StreamError::Cancelled`] when the cancel flag is set at any gate;
+/// - [`StreamError::Worker`] when a bandwidth pass fails;
+/// - [`StreamError::Other`] when topology detection fails.
+pub fn run_burn_in(
+    options: &BurnInOptions,
+    tx: Option<mpsc::Sender<BurnInTick>>,
+) -> Result<BenchmarkGrid, StreamError> {
+    burn_in(options, tx, duration_deadline(options.duration_minutes))
+}
+
+/// The burn-in stop deadline: `0` minutes = no deadline (infinite —
+/// cancel-only stop); `n > 0` = `n × 60` seconds from the run start.
+fn duration_deadline(duration_minutes: u32) -> Option<Duration> {
+    if duration_minutes == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(duration_minutes as u64 * 60))
+    }
+}
+
+/// The burn-in pass loop: the detection / sizing preamble runs once,
+/// then every iteration runs one whole pass (fresh zero grid, zeroed
+/// cursor) until a stop condition fires.
+///
+/// # Errors
+///
+/// - [`StreamError::Cancelled`] at any cancel gate (the in-flight pass
+///   completes first; its partial grid is discarded);
+/// - [`StreamError::Worker`] when a bandwidth pass fails;
+/// - [`StreamError::Other`] when topology detection fails.
+fn burn_in(
+    options: &BurnInOptions,
+    tx: Option<mpsc::Sender<BurnInTick>>,
+    deadline: Option<Duration>,
+) -> Result<BenchmarkGrid, StreamError> {
+    // Gate 0: before any work (detection, allocation, passes).
+    ensure_not_cancelled(&options.cancel)?;
+
+    let topo = detect().map_err(|e| StreamError::Other(e.to_string()))?;
+    let use_avx512 = CpuFeatures::detect().avx512f;
+    let effective = effective_topology(&topo, options.threads);
+    let plan = plan(&topo);
+
+    let cells = cells_for_target(&options.target);
+    let total_cells = cells.len() as u32;
+    let setup = PassSetup {
+        target: options.target,
+        cells,
+        total_cells,
+        effective,
+        use_avx512,
+        plan,
+    };
+
+    let start = Instant::now();
+    let mut iteration: u32 = 0;
+    loop {
+        iteration += 1;
+        // Gate: between iterations (a pass also gates internally,
+        // before every bandwidth and latency pass).
+        ensure_not_cancelled(&options.cancel)?;
+
+        let mut grid = zero_grid();
+        let ctx = PassContext { cell_index: 0 };
+
+        // One tick per completed bandwidth cell: the iteration, the
+        // run elapsed at the emit, and exactly the bandwidth value.
+        let mut emit_cell = |tier: Tier,
+                            op: BenchOp,
+                            value: f64,
+                            _cell_index: u32,
+                            _total_cells: u32| {
+            if let Some(sender) = tx.as_ref() {
+                let _ = sender
+                    .send(BurnInTick {
+                        iteration,
+                        elapsed_secs: start.elapsed().as_secs_f64(),
+                        tier,
+                        bandwidth: Some((op, value)),
+                        latency_ns: None,
+                    })
+                    .ok(); // dropped receiver: ignored, per contract
+            }
+        };
+        // One tick per completed per-tier latency pass: exactly the
+        // latency value.
+        let mut emit_latency = |tier: Tier, ns: f64| {
+            if let Some(sender) = tx.as_ref() {
+                let _ = sender
+                    .send(BurnInTick {
+                        iteration,
+                        elapsed_secs: start.elapsed().as_secs_f64(),
+                        tier,
+                        bandwidth: None,
+                        latency_ns: Some(ns),
+                    })
+                    .ok(); // dropped receiver: ignored, per contract
+            }
+        };
+        // The in-flight pass completes first; on a cancel gate hit the
+        // partial grid is discarded (the run_streamed contract), and a
+        // worker failure propagates as-is.
+        run_cell_pass(
+            &mut grid,
+            &setup,
+            &options.cancel,
+            &ctx,
+            &mut emit_cell,
+            &mut emit_latency,
+        )?;
+        // Deadline reached after a completed pass: return that pass grid.
+        if let Some(limit) = deadline {
+            if start.elapsed() >= limit {
+                return Ok(grid);
+            }
+        }
+        // No deadline (infinite) or not yet reached: next iteration.
+    }
 }
 
 /// Everything one pass needs that does not change between passes: the
@@ -605,5 +816,248 @@ mod tests {
         assert!(std::error::Error::source(&err).is_some());
         assert!(std::error::Error::source(&StreamError::Cancelled).is_none());
         assert!(std::error::Error::source(&StreamError::Other("x".into())).is_none());
+    }
+
+    /// (g) Burn-in ticks: a whole-tier target emits one tick per
+    /// completed bandwidth cell and one per completed latency pass,
+    /// per iteration — iterations ascending from 1, elapsed
+    /// non-decreasing, exactly one of bandwidth / latency per tick,
+    /// the ops in grid-column order. The finite duration (1 minute,
+    /// the minimum) far exceeds the test window, so the run is
+    /// stopped via cancel once two full iterations have been observed.
+    #[test]
+    fn burn_in_emits_ascending_ticks_per_iteration() {
+        let (tx, rx) = mpsc::channel();
+        let opts = BurnInOptions {
+            target: StreamTarget::Tier(Tier::L1),
+            duration_minutes: 1,
+            threads: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let cancel = opts.cancel.clone();
+        let run = std::thread::spawn(move || run_burn_in(&opts, Some(tx)));
+        let mut ticks = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(15)) {
+                Ok(t) => {
+                    ticks.push(t);
+                    // The 8th tick is the latency pass of iteration 2:
+                    // two full iterations observed.
+                    if let Some(last) = ticks.last() {
+                        if last.iteration >= 2 && last.latency_ns.is_some() {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => panic!("no burn-in ticks within the wait window"),
+            }
+        }
+        cancel.store(true, Ordering::Relaxed);
+        let err = run
+            .join()
+            .expect("the run thread must finish")
+            .expect_err("a cancelled burn-in must return an error");
+        assert!(matches!(err, StreamError::Cancelled), "got {err:?}");
+        // Two full tier iterations = 2 x (3 cells + 1 latency) = 8 ticks.
+        assert_eq!(ticks.len(), 8, "two full tier iterations = 8 ticks");
+        // Iterations are 1-based and non-decreasing.
+        assert_eq!(ticks[0].iteration, 1, "the first tick must be iteration 1");
+        for w in ticks.windows(2) {
+            assert!(w[1].iteration >= w[0].iteration, "iterations must not decrease");
+        }
+        // Elapsed: finite, non-negative, non-decreasing.
+        for t in &ticks {
+            assert!(
+                t.elapsed_secs.is_finite() && t.elapsed_secs >= 0.0,
+                "elapsed = {}",
+                t.elapsed_secs
+            );
+        }
+        for w in ticks.windows(2) {
+            assert!(
+                w[1].elapsed_secs + 0.001 >= w[0].elapsed_secs,
+                "elapsed must not decrease"
+            );
+        }
+        // Every tick is the tier tier and carries exactly one of
+        // bandwidth / latency.
+        for t in &ticks {
+            assert_eq!(t.tier, Tier::L1, "a tier target only ticks its tier");
+            assert_eq!(
+                t.bandwidth.is_some(),
+                t.latency_ns.is_none(),
+                "exactly one of bandwidth / latency per tick"
+            );
+        }
+        // Per-iteration pattern: Read, Write, Copy, then the latency pass.
+        for iter in 1..=2u32 {
+            let iter_ticks: Vec<&BurnInTick> = ticks
+                .iter()
+                .filter(|t| t.iteration == iter)
+                .collect();
+            assert_eq!(iter_ticks.len(), 4, "iteration {iter} = 3 cells + 1 latency pass");
+            let ops: Vec<BenchOp> = iter_ticks
+                .iter()
+                .filter_map(|t| t.bandwidth.map(|(op, _)| op))
+                .collect();
+            assert_eq!(
+                ops,
+                vec![BenchOp::Read, BenchOp::Write, BenchOp::Copy],
+                "ops in grid-column order"
+            );
+            let ns = iter_ticks
+                .iter()
+                .filter_map(|t| t.latency_ns)
+                .next()
+                .expect("one latency tick per iteration");
+            assert!(ns > 0.0 && ns.is_finite(), "the latency value must be positive, got {ns}");
+        }
+    }
+
+    /// (h) Deadline stop: a finite duration stops the loop once a pass
+    /// has completed with the run elapsed at the deadline — the public
+    /// entry derives `duration_minutes × 60` seconds; the loop seam is
+    /// driven with a sub-second deadline so the test does not wait a
+    /// full minute. The returned grid is the last completed pass:
+    /// exactly the target cell measured, everything else 0.0.
+    #[test]
+    fn burn_in_deadline_stops_after_a_completed_pass() {
+        let (tx, rx) = mpsc::channel();
+        let opts = BurnInOptions {
+            target: StreamTarget::Cell(Tier::L1, BenchOp::Read),
+            duration_minutes: 1,
+            threads: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let grid = burn_in(&opts, Some(tx), Some(Duration::from_millis(50)))
+            .expect("a deadline burn-in must complete Ok");
+        let ticks: Vec<BurnInTick> = rx.iter().collect();
+        assert!(!ticks.is_empty(), "at least one completed pass emits a tick");
+        for t in &ticks {
+            assert!(t.iteration >= 1, "iterations are 1-based");
+            assert!(t.elapsed_secs.is_finite() && t.elapsed_secs >= 0.0);
+            assert_eq!(t.bandwidth.is_some(), t.latency_ns.is_none(), "exactly one Some per tick");
+        }
+        // The terminal grid: the target cell measured, everything else 0.0.
+        for &tier in &TIER_ORDER {
+            for &metric in &[Metric::Read, Metric::Write, Metric::Copy, Metric::Latency] {
+                let cell = grid.cell(tier, metric);
+                assert!(cell.is_finite(), "{tier:?}/{metric:?} = {cell} not finite");
+                if (tier, metric) == (Tier::L1, Metric::Read) {
+                    assert!(cell > 0.0, "the requested cell must be positive, got {cell}");
+                } else {
+                    assert_eq!(cell, 0.0, "unrequested {tier:?}/{metric:?} must stay 0.0");
+                }
+            }
+        }
+    }
+
+    /// (h2) The minutes → deadline derivation: `0` = no deadline
+    /// (infinite), `n > 0` = `n × 60` seconds.
+    #[test]
+    fn burn_in_duration_deadline_derivation() {
+        assert_eq!(duration_deadline(0), None);
+        assert_eq!(duration_deadline(1), Some(Duration::from_secs(60)));
+        assert_eq!(duration_deadline(2), Some(Duration::from_secs(120)));
+        assert_eq!(duration_deadline(1440), Some(Duration::from_secs(86_400)));
+    }
+
+    /// (i) Cancel pre-set before the call: the burn-in halts at gate
+    /// 0 — `Err(StreamError::Cancelled)` with no panic and zero ticks
+    /// (nothing ran).
+    #[test]
+    fn burn_in_pre_set_cancel_halts_before_any_work() {
+        let (tx, rx) = mpsc::channel();
+        let opts = BurnInOptions {
+            target: StreamTarget::Tier(Tier::L1),
+            duration_minutes: 0,
+            threads: 0,
+            cancel: Arc::new(AtomicBool::new(true)),
+        };
+        let err = run_burn_in(&opts, Some(tx)).expect_err("a pre-set cancel must fail the run");
+        assert!(matches!(err, StreamError::Cancelled), "got {err:?}");
+        assert_eq!(rx.try_iter().count(), 0, "no ticks before the first gate");
+    }
+
+    /// (j) Infinite duration (`0` minutes): the loop never stops on the
+    /// clock — it runs until the cancel gate trips, returning
+    /// `Cancelled` with the partial pass grid discarded. A single-cell
+    /// target keeps the loop cheap (one tick per completed pass).
+    #[test]
+    fn burn_in_zero_duration_runs_until_cancelled() {
+        let (tx, rx) = mpsc::channel();
+        let opts = BurnInOptions {
+            target: StreamTarget::Cell(Tier::L1, BenchOp::Read),
+            duration_minutes: 0,
+            threads: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let cancel = opts.cancel.clone();
+        let run = std::thread::spawn(move || run_burn_in(&opts, Some(tx)));
+        let mut ticks = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(15)) {
+                Ok(t) => {
+                    ticks.push(t);
+                    if ticks.len() >= 3 {
+                        break;
+                    }
+                }
+                Err(_) => panic!("no burn-in ticks within the wait window"),
+            }
+        }
+        cancel.store(true, Ordering::Relaxed);
+        let res = run.join().expect("the run thread must finish");
+        assert!(matches!(res, Err(StreamError::Cancelled)), "got {res:?}");
+        // Three ticks from a single-cell target = three full passes:
+        // the loop ran past the clock until the cancel gate stopped it.
+        assert_eq!(ticks.len(), 3, "one tick per completed single-cell pass");
+        for (i, t) in ticks.iter().enumerate() {
+            assert_eq!(t.iteration, (i + 1) as u32, "consecutive iterations");
+        }
+    }
+
+    /// (k) A dropped burn-in tick receiver is ignored (the `.ok()`
+    /// contract): the run still completes — here via a tiny deadline —
+    /// with the measured cell.
+    #[test]
+    fn burn_in_dropped_receiver_does_not_fail_the_run() {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        let opts = BurnInOptions {
+            target: StreamTarget::Cell(Tier::L1, BenchOp::Copy),
+            duration_minutes: 1,
+            threads: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let grid = burn_in(&opts, Some(tx), Some(Duration::from_millis(50)))
+            .expect("a dropped receiver must not fail the run");
+        assert!(grid.cell(Tier::L1, Metric::Copy) > 0.0);
+    }
+
+    /// (l) `BurnInTick` round-trips through bincode (the wire codec,
+    /// plan D-2) — both tick kinds: a bandwidth cell and a latency pass.
+    #[test]
+    fn burn_in_tick_bincode_round_trip() {
+        let ticks = vec![
+            BurnInTick {
+                iteration: 3,
+                elapsed_secs: 42.5,
+                tier: Tier::L2,
+                bandwidth: Some((BenchOp::Write, 18.75)),
+                latency_ns: None,
+            },
+            BurnInTick {
+                iteration: 4,
+                elapsed_secs: 61.25,
+                tier: Tier::Memory,
+                bandwidth: None,
+                latency_ns: Some(142.0),
+            },
+        ];
+        let bytes = bincode::serialize(&ticks).expect("BurnInTick must serialize");
+        let back: Vec<BurnInTick> =
+            bincode::deserialize(&bytes).expect("BurnInTick must deserialize");
+        assert_eq!(back, ticks);
     }
 }
