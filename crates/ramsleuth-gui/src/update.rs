@@ -8,14 +8,17 @@
 //!
 //! - at the live settings cadence (default 2 s — the
 //!   `settings.poll_interval_ms` knob, C6-27) runs one
-//!   [`poll_telemetry`] cycle (a fresh [`Client::connect`] +
-//!   `GetTelemetry` — a new connection each cycle survives a daemon
-//!   restart, the TUI P3-24 precedent), appending one trend-history
-//!   sample to `state.history` per successful poll (the Na-guarded
-//!   [`record_history_sample`] — C6-25) and clearing the series when
-//!   the daemon reconnects;
+//!   [`poll_telemetry`] cycle against the live settings socket
+//!   (`settings.socket` — seeded from the CLI `--socket` by the app
+//!   shell; a panel edit retargets the next cycle, C6-30): a fresh
+//!   [`Client::connect`] + `GetTelemetry` — a new connection each
+//!   cycle survives a daemon restart, the TUI P3-24 precedent —
+//!   appending one trend-history sample to `state.history` per
+//!   successful poll (the Na-guarded [`record_history_sample`] —
+//!   C6-25) and clearing the series when the daemon reconnects;
 //! - serves benchmark requests from the [`BenchCmd`] channel (the app
-//!   shell's bench-zone run buttons, P3-28) with [`run_bench`]: one
+//!   shell's bench-zone run buttons, P3-28) with [`run_bench`]
+//!   against the same live settings socket (C6-30): one
 //!   `StartBenchmark` send, then the reply stream — a `BenchStarted`
 //!   ack, the `BenchProgress` events, and exactly one terminal — into
 //!   `state.bench`;
@@ -24,9 +27,9 @@
 //!   frame — once set, the run is stopped daemon-side with a
 //!   best-effort `CancelBenchmark` and ends with `running = false`;
 //! - re-reads the live settings knobs (`poll_interval_ms` +
-//!   `refresh_enabled`) every tick (C6-27) — a changed interval or
-//!   the refresh gate takes effect without a poller restart; a
-//!   disabled refresh idles the loop (no polling);
+//!   `refresh_enabled` every tick — C6-27, the `socket` per poll /
+//!   bench cycle — C6-30) — a changed knob takes effect without a
+//!   poller restart; a disabled refresh idles the loop (no polling);
 //! - ticks every 200 ms so an in-flight run's progress frames stay
 //!   responsive, and stops on the shared `AtomicBool` (or when the
 //!   channel disconnects).
@@ -42,9 +45,9 @@
 //! written from that one background thread only; the one
 //! render-thread write is the settings panel mutating
 //! `state.settings` (no I/O, D6 — C6-27), which the poller re-reads
-//! every tick.
+//! every tick (including the socket knob, C6-30).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, RwLock};
@@ -131,14 +134,15 @@ pub struct TelemetryData {
     /// reconnect; the render thread reads it for
     /// [`crate::history::render_history`].
     pub history: HistoryState,
-    /// The in-memory settings knobs (C6-26): the poll cadence
-    /// (`poll_interval_ms`, default 2 s) + the refresh gate
+    /// The in-memory settings knobs (C6-26 / C6-30): the poll
+    /// cadence (`poll_interval_ms`, default 2 s) + the refresh gate
     /// (`refresh_enabled`) the poller re-reads every tick (C6-27),
-    /// and the units / theme knobs the zones consume (the settings
-    /// panel wiring lands in C6-30). The render thread's one
-    /// permitted write is the settings panel mutating these knobs
-    /// (no I/O, D6); the poller is the only writer of every other
-    /// field.
+    /// the daemon socket (`socket` — seeded from the CLI `--socket`
+    /// by the app shell; the poller re-reads it live per poll /
+    /// bench cycle, C6-30), and the units / theme knobs the settings
+    /// panel edits. The render thread's one permitted write is the
+    /// settings panel mutating these knobs (no I/O, D6); the poller
+    /// is the only writer of every other field.
     pub settings: GuiSettings,
 }
 
@@ -405,21 +409,21 @@ fn clamp_poll_interval(ms: u64) -> Duration {
 ///
 /// The loop: check `stop`; service at most one [`BenchCmd`] from
 /// `bench_rx` (a run streams to its terminal before the next tick —
-/// runs are single-flight daemon-side anyway, P3-15) handing the
-/// shared `cancel` flag to [`run_bench`] (the bench zone's Cancel
-/// button sets it, P3-28; `run_bench` resets it per run); otherwise
-/// re-read the live settings knobs (C6-27) — the clamped
-/// `poll_interval_ms` + the `refresh_enabled` gate — and poll
-/// telemetry when the last poll is ≥ the clamped interval old (a
-/// thread-local stamp, so a flapping daemon polls on the configured
-/// cadence instead of every tick; a disabled refresh idles the loop,
-/// and a changed knob takes effect on the next tick — no restart);
-/// tick [`POLLER_TICK`] (200 ms, so bench progress stays responsive);
-/// exit when `stop` is set or the channel disconnects. The `RwLock`'s
-/// data fields are written from this thread only, so the `unwrap` is
-/// the workspace's one-writer precedent (TUI P3-24).
+/// runs are single-flight daemon-side anyway, P3-15) against the
+/// live settings socket (C6-30), handing the shared `cancel` flag to
+/// [`run_bench`] (the bench zone's Cancel button sets it, P3-28;
+/// `run_bench` resets it per run); otherwise re-read the live
+/// settings knobs (C6-27 / C6-30) — the clamped `poll_interval_ms` +
+/// the `refresh_enabled` gate + the `socket` — and poll telemetry
+/// when the last poll is ≥ the clamped interval old (a thread-local
+/// stamp, so a flapping daemon polls on the configured cadence
+/// instead of every tick; a disabled refresh idles the loop, and a
+/// changed knob takes effect on the next tick — no restart); tick
+/// [`POLLER_TICK`] (200 ms, so bench progress stays responsive); exit
+/// when `stop` is set or the channel disconnects. The `RwLock`'s data
+/// fields are written from this thread only, so the `unwrap` is the
+/// workspace's one-writer precedent (TUI P3-24).
 pub fn spawn_poller(
-    socket: PathBuf,
     state: Arc<RwLock<TelemetryData>>,
     bench_rx: Receiver<BenchCmd>,
     stop: Arc<AtomicBool>,
@@ -437,22 +441,28 @@ pub fn spawn_poller(
             }
             match bench_rx.try_recv() {
                 Ok(cmd) => {
-                    let _ = run_bench(&socket, cmd, &mut state.write().unwrap(), &cancel);
+                    // The live settings socket (C6-30): a panel edit
+                    // retargets the next run (the fresh connection
+                    // per cycle rides the change — D6).
+                    let socket = state.read().unwrap().settings.socket.clone();
+                    let _ = run_bench(Path::new(&socket), cmd, &mut state.write().unwrap(), &cancel);
                 }
                 Err(TryRecvError::Empty) => {
-                    // The live settings knobs (C6-27): re-read every
-                    // tick — a changed interval (clamped) or the
-                    // refresh gate takes effect without a restart.
-                    let (interval, refresh_enabled) = {
+                    // The live settings knobs (C6-27 / C6-30): re-read
+                    // every tick — a changed interval (clamped), the
+                    // refresh gate, or the socket takes effect
+                    // without a restart.
+                    let (interval, refresh_enabled, socket) = {
                         let settings = state.read().unwrap();
                         (
                             clamp_poll_interval(settings.settings.poll_interval_ms),
                             settings.settings.refresh_enabled,
+                            settings.settings.socket.clone(),
                         )
                     };
                     if refresh_enabled && last_poll.elapsed() >= interval {
                         last_poll = Instant::now();
-                        let _ = poll_telemetry(&socket, &mut state.write().unwrap());
+                        let _ = poll_telemetry(Path::new(&socket), &mut state.write().unwrap());
                     }
                 }
                 Err(TryRecvError::Disconnected) => break,
@@ -472,6 +482,7 @@ pub fn spawn_poller(
 mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
     use std::process;
     use std::sync::mpsc;
 
@@ -776,22 +787,17 @@ mod tests {
     /// (e) `spawn_poller` smoke: it returns a `JoinHandle` whose thread
     /// stops cleanly on the `stop` flag and leaves the lock usable (the
     /// heavy logic is covered by the `poll_telemetry` / `run_bench`
-    /// tests above — no extensive real-thread assertions).
+    /// tests above — no extensive real-thread assertions). The poller
+    /// reads its socket from `state.settings` (C6-30): the default
+    /// (unbound) socket just records a friendly error per cycle.
     #[test]
     fn spawn_poller_returns_a_handle_that_stops_cleanly() {
-        let sock = TempSocket::new("poller");
         let state = Arc::new(RwLock::new(TelemetryData::default()));
         let (_tx, rx) = mpsc::channel::<BenchCmd>();
         let stop = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
 
-        let handle = spawn_poller(
-            sock.path().to_path_buf(),
-            state.clone(),
-            rx,
-            stop.clone(),
-            cancel.clone(),
-        );
+        let handle = spawn_poller(state.clone(), rx, stop.clone(), cancel.clone());
         stop.store(true, Ordering::Relaxed);
         handle.join().expect("the poller thread must not panic");
 
@@ -1281,11 +1287,13 @@ mod tests {
             })
         };
 
-        // The shared state starts with a short (clamp-floor)
-        // interval + refresh on — the poller reads these live, per
+        // The shared state starts with the live socket (the
+        // stand-in's path — C6-30) + a short (clamp-floor) interval
+        // + refresh on — the poller reads all of these live, per
         // tick (the settings panel's one render-thread write, D6).
         let state = Arc::new(RwLock::new(TelemetryData {
             settings: GuiSettings {
+                socket: sock.path().to_string_lossy().into_owned(),
                 poll_interval_ms: MIN_POLL_INTERVAL_MS,
                 ..Default::default()
             },
@@ -1293,13 +1301,7 @@ mod tests {
         }));
         let (bench_tx, bench_rx) = mpsc::channel::<BenchCmd>();
         let cancel = Arc::new(AtomicBool::new(false));
-        let poller = spawn_poller(
-            sock.path().to_path_buf(),
-            state.clone(),
-            bench_rx,
-            stop.clone(),
-            cancel,
-        );
+        let poller = spawn_poller(state.clone(), bench_rx, stop.clone(), cancel);
 
         // Phase A: the short interval — several samples over the
         // window (one per poll; a 100 ms knob polls nearly every
@@ -1367,5 +1369,124 @@ mod tests {
             state.history.mclk.iter().all(|v| *v == 1800.0),
             "every sample is the stand-in's MCLK"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // C6-30: the dynamic socket — the poller reads the live
+    // `settings.socket` (a panel edit retargets the next cycle, no
+    // poller restart).
+    // ------------------------------------------------------------------
+
+    /// Wait until `daemon_status` contains `needle` (bounded by a 10 s
+    /// deadline: the test fails with the current status instead of
+    /// hanging).
+    fn wait_for_status(state: &Arc<RwLock<TelemetryData>>, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = state
+                .read()
+                .expect("the poller must not poison the lock")
+                .daemon_status
+                .clone();
+            if status.contains(needle) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a status containing {needle:?}, got: {status}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// (i3) The poller follows the **live** settings socket (no
+    /// restart): it starts against socket A (the stand-in), a panel
+    /// edit of `settings.socket` to a missing path B retargets the
+    /// next cycle (the friendly `disconnected`), and a second edit
+    /// back to A reconnects the same running poller (the fresh
+    /// connection per cycle rides each change — C6-30).
+    #[test]
+    fn spawn_poller_follows_the_live_settings_socket() {
+        let sock_a = TempSocket::new("socket-live-a");
+        let sock_b = TempSocket::new("socket-live-b"); // never bound: missing
+        let stop = Arc::new(AtomicBool::new(false));
+        // The stand-in on A: accept until `stop`, serve one mock
+        // snapshot per fresh connection (one per poll cycle); the
+        // final accept is unblocked by the waker (an EOF before a
+        // frame ends it — no panic).
+        let listener = UnixListener::bind(sock_a.path()).expect("test socket must bind");
+        let stand_in = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    if stop.load(Ordering::Relaxed) {
+                        break; // the waker (stop was set first)
+                    }
+                    match read_one_message(&mut stream) {
+                        Some(Message::Request(Request::GetTelemetry)) => {}
+                        Some(other) => {
+                            panic!("stand-in expected GetTelemetry, got {other:?}")
+                        }
+                        None => break, // the waker (an EOF before a frame)
+                    }
+                    let bytes =
+                        encode_frame(&Message::Response(Response::Telemetry(
+                            mock_snapshot(),
+                        )))
+                        .expect("must encode");
+                    stream.write_all(&bytes).expect("stand-in write must not fail");
+                }
+            })
+        };
+
+        // The shared state: the socket starts at A, the short
+        // (clamp-floor) interval polls nearly every tick.
+        let state = Arc::new(RwLock::new(TelemetryData {
+            settings: GuiSettings {
+                socket: sock_a.path().to_string_lossy().into_owned(),
+                poll_interval_ms: MIN_POLL_INTERVAL_MS,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let (bench_tx, bench_rx) = mpsc::channel::<BenchCmd>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let poller = spawn_poller(state.clone(), bench_rx, stop.clone(), cancel);
+
+        // Phase A: connected to A (the CLI-seeded / current socket).
+        wait_for_status(&state, &format!("connected: {}", sock_a.path().display()));
+
+        // Phase B: the panel edits the socket to the missing B → the
+        // next cycle retargets (the friendly disconnect).
+        state
+            .write()
+            .expect("the panel write must not fail")
+            .settings
+            .socket = sock_b.path().to_string_lossy().into_owned();
+        wait_for_status(&state, "disconnected");
+
+        // Phase C: the panel edits the socket back to A → the same
+        // running poller reconnects (no restart).
+        state
+            .write()
+            .expect("the panel write must not fail")
+            .settings
+            .socket = sock_a.path().to_string_lossy().into_owned();
+        wait_for_status(&state, &format!("connected: {}", sock_a.path().display()));
+
+        // Stop: set the shared flag and wake the stand-in's final
+        // accept with a throwaway connect (immediate EOF; a failed
+        // connect means the stand-in is already out).
+        drop(bench_tx);
+        stop.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(sock_a.path());
+        stand_in.join().expect("the stand-in must not panic");
+        poller.join().expect("the poller thread must not panic");
     }
 }

@@ -12,42 +12,57 @@
 //! - **App** — a 1400×900 eframe window carrying the dark-slate
 //!   [`build_style`]: the spec's 3-line header (Grand Design §3.1,
 //!   C6-20) — line 1 the `RamSleuth v2.0.0` title, the platform tag,
-//!   the daemon status, and the `[F2] snapshot · [F3] export · [Q]
-//!   quit` legend; line 2 the CPU and platform identity; line 3 the
-//!   RAM summary, channel, and sync mode — plus a transient export
-//!   notice. Over the three zones: the telemetry matrix on the left,
-//!   the benchmark grid stacked over the hardware / SPD status on the
-//!   right, and the 10-minute trend history strip (C6-24 / C6-25)
-//!   along the bottom. Each frame takes one brief read of the shared
+//!   the daemon status (naming the live settings socket — C6-30),
+//!   the `Settings` toggle, and the `[F2] snapshot · [F3] export ·
+//!   [Q] quit` legend; line 2 the CPU and platform identity; line 3
+//!   the RAM summary, channel, and sync mode — plus a transient
+//!   export notice. The `Settings` toggle opens the C6-26 settings
+//!   panel as its own top strip below the header (C6-30). Over the
+//!   three zones: the telemetry matrix on the left, the benchmark
+//!   grid stacked over the hardware / SPD status on the right, and
+//!   the 10-minute trend history strip (C6-24 / C6-25) along the
+//!   bottom. Each frame takes one brief read of the shared
 //!   `Arc<RwLock<TelemetryData>>` and repaints on a 16 ms cadence
 //!   (~60 FPS).
+//! - **Keyboard (C6-30):** the spec's key legend is live — a fresh
+//!   key-down of F2 / F3 / Q (egui marks OS key-repeats
+//!   `repeat: true`, so a held key fires exactly once) routes through
+//!   the same [`GuiAction`] dispatch as the status zone's buttons
+//!   (D-C7: keys and buttons are behaviorally identical).
 //! - **No render-thread I/O (plan D6):** the background
 //!   [`spawn_poller`] thread (P3-26) owns the daemon socket — the
-//!   telemetry cadence (the live settings knob, default 2 s — C6-27)
-//!   and the benchmark stream run there; the render loop only reads
-//!   the state (the settings panel's knob write — C6-30 — is the one
-//!   permitted render-thread mutation: no I/O). The status zone's
-//!   [`GuiAction`] is the one side effect the render loop performs:
-//!   F2 / F3 run [`perform_export`] (a one-shot file write) and Q
-//!   sets the stop flag + closes the viewport.
+//!   telemetry cadence (the live settings knob, default 2 s — C6-27),
+//!   the socket itself (the live settings knob, seeded from the CLI
+//!   `--socket` — C6-30), and the benchmark stream all run there; the
+//!   render loop only reads the state (the settings panel's knob
+//!   write — C6-30 — is the one permitted render-thread mutation:
+//!   no I/O). The status zone's [`GuiAction`] is the one side effect
+//!   the render loop performs: F2 / F3 run [`perform_export`] (a
+//!   one-shot file write) and Q sets the stop flag + closes the
+//!   viewport.
 //!
 //! **No-panic contract (plan D5):** a missing daemon never crashes the
 //! GUI — the poller records the friendly error in the state (the
 //! header + the status zone show it) and a failed export is a
-//! structured [`GuiError`] in the notice line. On window close (Q, the
-//! OS close button, or an eframe failure) the app's `Drop` stops the
-//! poller and joins it (bounded) so the process always exits cleanly.
+//! structured [`GuiError`] in the notice line. On window close (the
+//! Q key or button, the OS close button, or an eframe failure) the
+//! app's `Drop` stops the poller and joins it (bounded) so the
+//! process always exits cleanly.
 //!
 //! Manual verification (a live display, the QA phase): with the dev
 //! daemon running (`cargo run -p ramsleuth-daemon -- --socket
 //! /tmp/ramsleuth.sock`), `cargo run -p ramsleuth-gui -- --socket
 //! /tmp/ramsleuth.sock` opens the 1400×900 window with all three zones
 //! live (values update at the configured poll interval, default
-//! ~2 s); F2 writes
-//! `ramsleuth-snapshot-<unix-ts>.png`, F3 writes
+//! ~2 s); the F2 / F3 keys and their status-zone buttons both write
+//! `ramsleuth-snapshot-<unix-ts>.png` /
 //! `ramsleuth-export-<unix-ts>.json` to `$HOME` (the transient notice
-//! carries the path); Q (or the window close button) exits cleanly.
-//! With no daemon the dashboard stays responsive, showing
+//! carries the path); Q (key or button, or the window close button)
+//! exits cleanly. The header's `Settings` toggle opens the settings
+//! panel: its `Socket` field shows the CLI-seeded socket (C6-30), and
+//! editing it retargets the poller live (a fresh connection per
+//! cycle); the poll interval / refresh knobs behave per C6-27. With
+//! no daemon the dashboard stays responsive, showing
 //! `disconnected` + the start hint — no crash.
 //!
 //! ```text
@@ -71,9 +86,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ramsleuth_gui::history::render_history;
 use ramsleuth_gui::{
-    build_style, export_json, render_bench_zone, render_status_zone, render_telemetry_zone,
-    snapshot_png, spawn_poller, BenchCmd, GuiAction, GuiError, TelemetryData, AMBER, CRIMSON,
-    CYAN, SLATE,
+    build_style, export_json, render_bench_zone, render_settings_panel, render_status_zone,
+    render_telemetry_zone, snapshot_png, spawn_poller, BenchCmd, GuiAction, GuiError,
+    GuiSettings, TelemetryData, AMBER, CRIMSON, CYAN, SLATE,
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
@@ -241,6 +256,36 @@ pub fn perform_export(
     }
 }
 
+/// The key → [`GuiAction`] map of the spec's key legend (Grand
+/// Design §3.1, `[F2] snapshot · [F3] export · [Q] quit`): F2
+/// snapshots the PNG, F3 exports the JSON, Q quits; any other key
+/// yields `None` (no action this frame). Pure + headless-testable —
+/// the app shell feeds it the fresh (non-repeat) key-down events, and
+/// the mapped action dispatches through the same [`handle_action`]
+/// path as the status zone's buttons (D-C7: keys and buttons are
+/// behaviorally identical).
+fn key_action(key: egui::Key) -> Option<GuiAction> {
+    match key {
+        egui::Key::F2 => Some(GuiAction::SnapshotPng),
+        egui::Key::F3 => Some(GuiAction::ExportJson),
+        egui::Key::Q => Some(GuiAction::Quit),
+        _ => None,
+    }
+}
+
+/// The shared settings state seeded from the CLI (C6-30): the
+/// `--socket` argument becomes `settings.socket` (the settings panel
+/// shows the active socket, and the poller reads it live — a panel
+/// edit retargets the next cycle), every other knob at its
+/// [`GuiSettings::default`] value (2 s poll, refresh on, the default
+/// units + theme).
+fn seed_settings(args: &GuiArgs) -> GuiSettings {
+    GuiSettings {
+        socket: args.socket.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+}
+
 /// The header's daemon-status color: CYAN when connected and healthy
 /// (no recorded error), CRIMSON otherwise — the status zone's
 /// `daemon_status_color` rule (that helper is private to the zone, so
@@ -270,16 +315,17 @@ fn notice_color(text: &str) -> egui::Color32 {
 }
 
 /// The eframe app (P3-30): the shared state, the poller's command
-/// channel, the stop / cancel flags, the export dir, the poller
-/// thread, and the transient header notice.
+/// channel, the stop / cancel flags, the settings-panel visibility,
+/// the export dir, the poller thread, and the transient header
+/// notice.
 struct RamSleuthApp {
     /// The shared presentation state — includes the in-memory
-    /// `GuiSettings` knobs (C6-26 / C6-27: the poll cadence + refresh
-    /// gate live here; the poller re-reads them every tick, and the
-    /// settings panel — C6-30 — is the render thread's one permitted
-    /// write: no I/O, D6). The background poller is the only writer
-    /// of the data fields; the render loop only ever takes a brief
-    /// read.
+    /// `GuiSettings` knobs (C6-26 / C6-27 / C6-30: the poll cadence +
+    /// refresh gate + the daemon socket live here; the poller
+    /// re-reads them every tick, and the settings panel is the render
+    /// thread's one permitted write: no I/O, D6). The background
+    /// poller is the only writer of the data fields; the render loop
+    /// only ever takes a brief read.
     state: Arc<RwLock<TelemetryData>>,
     /// The poller's benchmark channel (the bench zone's run buttons
     /// send into it; the poller owns the socket).
@@ -289,9 +335,11 @@ struct RamSleuthApp {
     /// The shared benchmark cancel flag (the bench zone's Cancel button
     /// sets it; the poller's run checks it between frames).
     cancel: Arc<AtomicBool>,
-    /// The daemon socket the poller connects to (kept for the app's
-    /// context; the render loop never touches it — D6).
-    socket: PathBuf,
+    /// Whether the settings panel (the header's `Settings` toggle,
+    /// C6-30) is open: while open it renders as its own top strip
+    /// below the header and mutates `state.settings` (the render
+    /// thread's one permitted write — no I/O, D6).
+    settings_open: bool,
     /// The export destination dir (F2 / F3 write here — `$HOME`).
     out_dir: PathBuf,
     /// The background poller thread (joined — bounded — on drop so the
@@ -342,12 +390,47 @@ impl eframe::App for RamSleuthApp {
         if expired {
             self.notice = None;
         }
-        let action = {
+        // The keyboard (C6-30, the spec's key legend): a fresh
+        // key-down — egui marks OS key-repeats `repeat: true`, so a
+        // held key fires exactly once, the button's click semantics —
+        // routes through the same [`GuiAction`] dispatch as the
+        // status zone's buttons (D-C7: keys and buttons are
+        // behaviorally identical).
+        let keyed_action = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::Key { key, pressed: true, repeat: false, .. } => {
+                        key_action(*key)
+                    }
+                    _ => None,
+                })
+                .next()
+        });
+        // The top strips allocate in a fixed per-frame order (header,
+        // settings while open, then the central panel): each takes
+        // its own brief lock (the render thread does no I/O, D6 —
+        // the settings strip is its one permitted write).
+        {
             let data = self.state.read().unwrap();
-            self.render_header(ctx, &data);
+            Self::render_header(ctx, &data, &mut self.settings_open, &self.notice);
+        }
+        if self.settings_open {
+            self.render_settings_area(ctx);
+        }
+        let button_action = {
+            let data = self.state.read().unwrap();
             self.render_zones(ctx, &data)
         };
-        self.handle_action(ctx, action);
+        // One dispatch path for both sources: the button (the
+        // explicit affordance) runs first, then a distinct key
+        // action; a duplicate (button + key, same action) fires once.
+        self.handle_action(ctx, button_action);
+        if let Some(keyed_action) = keyed_action {
+            if keyed_action != button_action {
+                self.handle_action(ctx, keyed_action);
+            }
+        }
 
         // ~60 FPS: eframe's vsync drives the present; this only asks
         // for the next frame on the 16 ms cadence.
@@ -523,13 +606,26 @@ fn sync_mode(t: &SystemMemoryTelemetry) -> (String, Option<egui::Color32>) {
 impl RamSleuthApp {
     /// The header strip (Grand Design §3.1): the spec's 3-line header
     /// — line 1 the `RamSleuth v2.0.0` title + the platform tag + the
-    /// daemon status + the `[F2] snapshot · [F3] export · [Q] quit`
-    /// legend, line 2 the CPU + platform identity, line 3 the RAM
-    /// summary + channel + sync mode — plus the transient notice line
-    /// (the last F2 / F3 result) while one is showing. No telemetry
-    /// yet (never polled) → the placeholder lines (a missing daemon
-    /// never crashes the GUI, plan D5).
-    fn render_header(&self, ctx: &egui::Context, data: &TelemetryData) {
+    /// daemon status (naming the live settings socket — C6-30) + the
+    /// `Settings` toggle + the `[F2] snapshot · [F3] export · [Q]
+    /// quit` legend, line 2 the CPU + platform identity, line 3 the
+    /// RAM summary + channel + sync mode — plus the transient notice
+    /// line (the last F2 / F3 result) while one is showing. No
+    /// telemetry yet (never polled) → the placeholder lines (a
+    /// missing daemon never crashes the GUI, plan D5).
+    ///
+    /// An associated function (no `self`): it needs only the
+    /// snapshot + the `settings_open` toggle (the `Settings` button
+    /// flips it, C6-30) + the transient notice (the last F2 / F3
+    /// result line) — so the call site can hold the state's read
+    /// guard and the `settings_open` / `notice` field borrows at once
+    /// (the field split the borrow checker enforces).
+    fn render_header(
+        ctx: &egui::Context,
+        data: &TelemetryData,
+        settings_open: &mut bool,
+        notice: &Option<(String, Instant)>,
+    ) {
         // The line builders over the current snapshot — or the
         // placeholders when no poll has landed yet (never a panic).
         let (cpu_line, ram_prefix, ram_mode, ram_mode_color) = match &data.telemetry {
@@ -544,7 +640,10 @@ impl RamSleuthApp {
             .as_ref()
             .map(|t| platform_tag(&t.cpu.vendor))
             .unwrap_or_else(|| "Platform".to_owned());
-        let status = daemon_status_text(data, &self.socket);
+        // The live settings socket (C6-30): the panel's `Socket`
+        // field is the single source (seeded from the CLI `--socket`
+        // at startup; the poller reads it live).
+        let status = daemon_status_text(data, Path::new(&data.settings.socket));
         egui::TopBottomPanel::top("ramsleuth_header")
             .frame(
                 egui::Frame::default()
@@ -564,6 +663,18 @@ impl RamSleuthApp {
                     ui.label(egui::RichText::new(&status).color(header_status_color(data)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(10.0);
+                        // The settings toggle (C6-30): opens the
+                        // settings panel strip below the header.
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("Settings"))
+                                    .selected(*settings_open),
+                            )
+                            .clicked()
+                        {
+                            *settings_open = !*settings_open;
+                        }
+                        ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("[F2] snapshot · [F3] export · [Q] quit").weak(),
                         );
@@ -584,7 +695,7 @@ impl RamSleuthApp {
                         };
                     }
                 });
-                if let Some((text, _)) = &self.notice {
+                if let Some((text, _)) = notice {
                     ui.add_space(2.0);
                     ui.label(egui::RichText::new(text).color(notice_color(text)));
                 }
@@ -653,6 +764,30 @@ impl RamSleuthApp {
         action
     }
 
+    /// The settings strip (C6-30): shown below the header while
+    /// `settings_open` — its own top panel (the per-frame allocation
+    /// order: header, settings, central). The grid mutates
+    /// `TelemetryData.settings` under the write lock — the render
+    /// thread's one permitted write (no I/O, D6); the poller re-reads
+    /// the knobs live every tick (C6-27), including the socket
+    /// (C6-30), so a panel change takes effect without a restart.
+    fn render_settings_area(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("ramsleuth_settings")
+            .frame(
+                egui::Frame::default()
+                    .fill(SLATE)
+                    .stroke(egui::Stroke::new(1.0_f32, HEADER_STROKE)),
+            )
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Settings").strong().color(CYAN));
+                ui.add_space(2.0);
+                // The one permitted render-thread write (D6): no I/O.
+                let mut guard = self.state.write().unwrap();
+                render_settings_panel(ui, &mut guard.settings);
+            });
+    }
+
     /// Execute the status zone's [`GuiAction`] — the one side effect
     /// the render loop performs: F2 / F3 run [`perform_export`] (a
     /// one-shot file write into `out_dir`) and flash the result as the
@@ -691,9 +826,15 @@ fn main() -> ExitCode {
 
     // 2. The shared state + the two flags (the poller is the state's
     //    data fields' only writer — the settings knobs' one
-    //    render-thread write is the exception, C6-27; the bench zone
-    //    + the poller share the flags).
-    let state = Arc::new(RwLock::new(TelemetryData::default()));
+    //    render-thread write is the exception, C6-27 / C6-30; the
+    //    bench zone + the poller share the flags). The settings are
+    //    seeded from the CLI: `--socket` becomes `settings.socket`
+    //    (the panel shows the active socket, the poller reads it
+    //    live — C6-30).
+    let state = Arc::new(RwLock::new(TelemetryData {
+        settings: seed_settings(&args),
+        ..Default::default()
+    }));
     let (bench_tx, bench_rx) = std::sync::mpsc::channel::<BenchCmd>();
     let stop = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -704,14 +845,9 @@ fn main() -> ExitCode {
 
     // 3. The background poller: the GUI's only daemon connection (D6)
     //    — the telemetry cadence (the live settings knob, default 2 s
-    //    — C6-27) + the benchmark stream.
-    let poller = spawn_poller(
-        args.socket.clone(),
-        state.clone(),
-        bench_rx,
-        stop.clone(),
-        cancel.clone(),
-    );
+    //    — C6-27) + the live settings socket (C6-30) + the
+    //    benchmark stream.
+    let poller = spawn_poller(state.clone(), bench_rx, stop.clone(), cancel.clone());
 
     // 4. The eframe window: 1400×900 initial, the dark-slate style set
     //    once at creation (eframe 0.27 `AppCreator`: a plain
@@ -734,7 +870,7 @@ fn main() -> ExitCode {
                 bench_tx,
                 stop,
                 cancel,
-                socket: args.socket,
+                settings_open: false,
                 out_dir,
                 poller: Some(poller),
                 notice: None,
@@ -767,7 +903,7 @@ mod tests {
     use std::fs;
 
     use ramsleuth_bench::BenchmarkGrid;
-    use ramsleuth_gui::BenchState;
+    use ramsleuth_gui::{BenchState, DEFAULT_POLL_INTERVAL_MS};
     use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
@@ -1276,5 +1412,81 @@ mod tests {
     fn sync_mode_degrades_on_na_amd_branch() {
         let t = fixture_telemetry(Section::Value(32.0), Vec::new(), Vec::new());
         assert_eq!(sync_mode(&t), ("N/A".to_owned(), None));
+    }
+
+    // ------------------------------------------------------------------
+    // C6-30: the keyboard key map, the CLI socket seed, the settings
+    // panel render.
+    // ------------------------------------------------------------------
+
+    /// (k1) `key_action`: the legend's three keys map to their
+    /// actions; every other key (other function keys, letters,
+    /// modifiers, navigation) yields `None` (no action this frame).
+    #[test]
+    fn key_action_maps_only_the_legend_keys() {
+        assert_eq!(key_action(egui::Key::F2), Some(GuiAction::SnapshotPng));
+        assert_eq!(key_action(egui::Key::F3), Some(GuiAction::ExportJson));
+        assert_eq!(key_action(egui::Key::Q), Some(GuiAction::Quit));
+
+        for key in [
+            egui::Key::F1,
+            egui::Key::F4,
+            egui::Key::F12,
+            egui::Key::A,
+            egui::Key::Escape,
+            egui::Key::Enter,
+            egui::Key::Space,
+            egui::Key::Num0,
+            egui::Key::ArrowUp,
+        ] {
+            assert_eq!(key_action(key), None, "{key:?} must not fire an action");
+        }
+    }
+
+    /// (k2) `seed_settings`: the CLI `--socket` becomes
+    /// `settings.socket` (the panel shows the active socket, the
+    /// poller reads it live), every other knob stays at its default
+    /// (2 s poll, refresh on); the no-flag default seeds the
+    /// protocol's default socket.
+    #[test]
+    fn seed_settings_from_the_cli_socket() {
+        let args = GuiArgs { socket: PathBuf::from("/tmp/ramsleuth-dev.sock") };
+        let settings = seed_settings(&args);
+        assert_eq!(settings.socket, "/tmp/ramsleuth-dev.sock");
+        assert_eq!(settings.poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
+        assert!(settings.refresh_enabled);
+        assert_eq!(
+            settings,
+            GuiSettings {
+                socket: "/tmp/ramsleuth-dev.sock".to_owned(),
+                ..Default::default()
+            }
+        );
+
+        let settings = seed_settings(&GuiArgs::default());
+        assert_eq!(settings.socket, DEFAULT_SOCKET_PATH);
+    }
+
+    /// (k3) The settings panel renders headless without panicking
+    /// (the `begin_frame` idiom, the history test precedent): the
+    /// default settings + a mutated one (every widget — the socket
+    /// edit, the drag, the combos, the checkbox — executes).
+    #[test]
+    fn settings_panel_renders_headless_without_panicking() {
+        for settings in [
+            GuiSettings::default(),
+            GuiSettings {
+                socket: "/tmp/x".to_owned(),
+                poll_interval_ms: 5_000,
+                ..Default::default()
+            },
+        ] {
+            let mut settings = settings;
+            let ctx = egui::Context::default();
+            ctx.begin_frame(egui::RawInput::default());
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                render_settings_panel(ui, &mut settings);
+            });
+        }
     }
 }
