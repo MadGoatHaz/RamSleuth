@@ -3,7 +3,7 @@
 Base branch: `v2-development`. Plan: `plans/PLAN-CYCLE6.md` (Cycle 6 GUI workstream — the handover §13 primary name, alt `PLAN-PHASE7.md`; Phase 6/Cycle 5 retained as `plans/PLAN-PHASE6.md`, Phase 5 as `plans/PLAN-PHASE5.md`; Phase 1 as `plans/PLAN.md`, Phase 2 as `plans/PLAN-PHASE2.md`, Phase 3 as `plans/PLAN-PHASE3.md`). Sign in/out under `@@@ ACTIVE_WORKERS @@@` per the lease protocol. Durable cycle history lives in `MASTER_LOG.md`.
 
 @@@ ACTIVE_WORKERS @@@
-(no active leases)
+- [ACTIVE] ID: C6-24 | AGENT: general (Implementation) | BRANCH: branch/chunk-c6-24 | FILES: crates/ramsleuth-gui/src/history.rs, crates/ramsleuth-gui/src/lib.rs
 
 @@@ CURRENT_STATE @@@
 Cycle 6 (GUI workstream) — GUI WAVE ITEMS 1–5 (C6-20…C6-23) ALL MERGED into v2-development (--no-ff; merges 482f12d C6-20 / 84990dd C6-21 / 6614e87 C6-22 / 4b08acd C6-23): single-file GUI display work (main.rs 3-line header; telemetry_zone.rs §3.1 grouped 2-sub-column × 3-section-pair layout + GDM/CR row; bench_zone.rs per-cell live bench fill; status_zone.rs SPD card product/die/rank-label rows) — zero production-logic regressions, no Cargo.toml/Cargo.lock diff → MSRV 1.75 held, zero new deps. HARD GATES GREEN post-GUI-wave: `cargo test --workspace` 413 passed / 0 failed / 0 compile errors (baseline 399 + 14 new GUI tests), `cargo clippy --workspace --all-targets -- -D warnings` exit 0 clean, `cargo check --workspace` exit 0. v2-development is operator-gated (NOT pushed); remaining GUI-wave chunks fork from the post-merge tip.

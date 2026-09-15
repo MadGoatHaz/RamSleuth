@@ -34,10 +34,17 @@
 //!   row — [`spd_cards`] (the pure per-slot card builder) and
 //!   [`render_status_zone`] (the titled-frame renderer reporting
 //!   the clicked action as a [`GuiAction`] for the app shell).
+//! - `history` — C6-24 — the 10-minute trend window: the
+//!   fixed-capacity [`history::RingBuffer`] (300 samples at the 2 s
+//!   poll), the three in-lockstep [`history::HistoryState`] series
+//!   (MCLK / VDDCR_SOC / bandwidth), and the hand-rolled
+//!   immediate-mode [`history::render_history`] sparkline plot (no
+//!   chart crate, D-C4). The poller wiring is C6-25.
 //!
 //! (The eframe app shell in `main.rs` lands in P3-30.)
 
 pub mod bench_zone;
+pub mod history;
 pub mod status_zone;
 pub mod style;
 pub mod telemetry_zone;
