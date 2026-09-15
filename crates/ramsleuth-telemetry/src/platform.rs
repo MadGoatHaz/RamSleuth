@@ -266,10 +266,11 @@ fn agesa_from_sources(bios_version: Option<&str>, smu_version: Option<&str>) -> 
 ///
 /// - an `AGESA` keyword (case-insensitive) immediately followed by a
 ///   version-shaped token (e.g. `AGESA 12.0.6557.0`);
-/// - a bare version-shaped token: `d{1,2}.d{1,2}.d{2,6}` with an optional
+/// - a bare version-shaped token: `d{1,2}.d{1,2}.d{1,6}` with an optional
 ///   fourth group `d{1,6}` (e.g. `12.0.6557.0`), optionally prefixed by
 ///   one letter in `P`/`C` (the documented project-code prefixes, e.g.
-///   `P3.20.0017`).
+///   `P3.20.0017`). The third group's 1-digit floor (D-6) admits the
+///   `ryzen_smu` `version` attribute's `56.78.0` shape.
 ///
 /// The match is deliberately conservative: a token that does not fully
 /// validate is skipped, and a string with no valid token yields `None` →
@@ -305,9 +306,12 @@ fn is_agesa_version(token: &str) -> bool {
         Some(digits) => digits,
         None => groups[0],
     };
+    // Third group (the build number): 1–6 digits (D-6 — the `ryzen_smu`
+    // `version` attribute reports a one-digit build group, e.g. `56.78.0`;
+    // the shape check stays, so the attribute is never accepted verbatim).
     is_version_group(g0, 1, 2)
         && is_version_group(groups[1], 1, 2)
-        && is_version_group(groups[2], 2, 6)
+        && is_version_group(groups[2], 1, 6)
         && groups.get(3).map_or(true, |g| is_version_group(g, 1, 6))
 }
 
@@ -427,6 +431,9 @@ mod tests {
         assert_eq!(parse_agesa("C2.61.1000"), Some("C2.61.1000".to_owned()));
         // Case-insensitive keyword.
         assert_eq!(parse_agesa("agesa 12.0.6557.0"), Some("12.0.6557.0".to_owned()));
+        // The host's `ryzen_smu` `version` attribute (D-6): a one-digit
+        // third group now validates.
+        assert_eq!(parse_agesa("56.78.0"), Some("56.78.0".to_owned()));
     }
 
     /// (b2) Non-AGESA strings degrade to `None` (never a fabricated
@@ -441,6 +448,11 @@ mod tests {
         assert_eq!(parse_agesa(""), None);
         // `AGESA` keyword with no valid token after it.
         assert_eq!(parse_agesa("AGESA F60"), None);
+        // The host's DMI `bios_version`: a bare 4-digit string, no dots →
+        // not a token (the AGESA value rides the smu attribute instead).
+        assert_eq!(parse_agesa("5601"), None);
+        // Vendor prose with no version-shaped token.
+        assert_eq!(parse_agesa("American Megatrends Inc."), None);
     }
 
     /// (b3) Documented heuristic boundary: a bare 3-group dot-numeric
@@ -452,13 +464,27 @@ mod tests {
         assert_eq!(parse_agesa("09.15.2024"), Some("09.15.2024".to_owned()));
     }
 
-    /// (b4) The source chain prefers the BIOS string; the `ryzen_smu`
-    /// `version` attribute is consulted only when the BIOS string carries
-    /// no token; neither → `Na(NotApplicable)`.
+    /// (b4) D-6: the relaxed third-group boundary — 1 and 6 digits
+    /// validate; 0 digits (a trailing dot) and 7 digits do not. The shape
+    /// check stays: an smu attribute is accepted by shape, never verbatim.
+    #[test]
+    fn parse_agesa_third_group_relaxed_boundary() {
+        // 1 digit (the host case) and 6 digits validate.
+        assert_eq!(parse_agesa("56.78.0"), Some("56.78.0".to_owned()));
+        assert_eq!(parse_agesa("03.00.123456"), Some("03.00.123456".to_owned()));
+        // 0 digits and 7 digits do not.
+        assert_eq!(parse_agesa("56.78."), None);
+        assert_eq!(parse_agesa("56.78.1234567"), None);
+    }
+
+    /// (b5) The source chain prefers the BIOS string (the DMI-bios scan
+    /// stays primary); the `ryzen_smu` `version` attribute is consulted
+    /// only when the BIOS string carries no token; neither →
+    /// `Na(NotApplicable)`.
     #[test]
     fn agesa_source_chain() {
         assert_eq!(
-            agesa_from_sources(Some("AGESA 12.0.6557.0"), Some("ryzen_smu 1.0.0")),
+            agesa_from_sources(Some("AGESA 12.0.6557.0"), Some("ryzen_smu 1.0")),
             Section::Value("12.0.6557.0".to_owned())
         );
         // BIOS string has no token → the smu attribute's token wins.
@@ -466,9 +492,18 @@ mod tests {
             agesa_from_sources(Some("F60"), Some("SMU 12.0.6557.0")),
             Section::Value("12.0.6557.0".to_owned())
         );
-        // Neither carries one → honest N/A.
+        // The live host case (D-6): DMI `bios_version` "5601" carries no
+        // token (the DMI-bios scan stays primary but yields nothing), so
+        // the `ryzen_smu` `version` attribute "56.78.0" resolves by the
+        // relaxed shape.
         assert_eq!(
-            agesa_from_sources(Some("F60"), Some("ryzen_smu 1.0.0")),
+            agesa_from_sources(Some("5601"), Some("56.78.0")),
+            Section::Value("56.78.0".to_owned())
+        );
+        // Neither carries one (the 2-group driver version fails the
+        // shape) → honest N/A.
+        assert_eq!(
+            agesa_from_sources(Some("F60"), Some("ryzen_smu 1.0")),
             Section::na(NaReason::NotApplicable)
         );
         assert_eq!(
