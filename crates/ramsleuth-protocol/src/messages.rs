@@ -104,9 +104,11 @@ mod tests {
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::spd_decode::SpdModule;
+    use ramsleuth_telemetry::SystemPlatform;
 
     /// A representative snapshot: a `Value` CPU branch, structured-`Na`
-    /// vendor branches, one SPD module with mixed `Value`/`Na` cells
+    /// vendor branches, one SPD module with mixed `Value`/`Na` cells, a
+    /// mixed `Value`/`Na` platform, and per-DIMM capacity parallel to `spd`
     /// (host-independent).
     fn fixture_snapshot() -> SystemMemoryTelemetry {
         SystemMemoryTelemetry {
@@ -120,6 +122,9 @@ mod tests {
                 index: 0x52,
                 is_ddr5: false,
                 maker: Section::Value("0xC1".to_owned()),
+                die_maker: Section::Value("SK hynix".to_owned()),
+                die_type: Section::na(NaReason::NotApplicable),
+                devices: Section::Value(8),
                 part: Section::na(NaReason::NotApplicable),
                 serial: Section::na(NaReason::NotApplicable),
                 rank: Section::Value(1),
@@ -127,6 +132,16 @@ mod tests {
                 speed_mts: Section::Value(3_200),
                 profiles: Vec::new(),
             }],
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3500.0),
+                motherboard: Section::Value("Test Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            // 16_384 Mbit x 8 devices / 8192 = 16 GiB per DIMM, parallel
+            // to `spd`; total = the sum of the `Value` entries.
+            total_capacity: Section::Value(16.0),
+            dimm_sizes: vec![Section::Value(16.0)],
         }
     }
 
