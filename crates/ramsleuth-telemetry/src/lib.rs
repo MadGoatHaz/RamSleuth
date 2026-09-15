@@ -27,3 +27,5 @@ pub mod platform; // C6-01 — SystemPlatform: DMI + /proc sourced vendor-neutra
 
 // P2-10: the crate's public snapshot API, re-exported at the root.
 pub use facade::{collect, SystemMemoryTelemetry};
+// C6-07: the C6-01 platform types, re-exported at the root.
+pub use platform::{SystemPlatform, mem_total_gib};
