@@ -1,8 +1,8 @@
 # RamSleuth v2 — Full Scope vs. Completed
 
 > **Authoritative "full project scope vs. what is done" reference.** Self-contained: a new reader should understand the entire project from this document alone.
-> **Branch:** `v2-development` — local tip = `2409947` (Cycle 4 final compaction) + this docs refresh; **2 commits ahead of `origin/v2-development` @ `b908f7b`**, both local-only, unpushed; prune + optional tag await operator go-ahead (HANDOVER §8). **Status date:** 2026-09-13 (Cycle 4 close-out — Phase 5 complete, ready for Cycle 5).
-> **Grounded in:** `Docs/HANDOVER.md` (the standing handover — read it first), `Docs/Grand Design & Architecture Specification.md`, `Docs/RamSleuth-v2.md`, `MASTER_LOG.md` (Cycles 1–4), `plans/PLAN-PHASE5.md`, workspace `Cargo.toml` (7 members).
+> **Branch:** `v2-development` — local tip = **`51f4c4f`** (the P6-11 merge); **19 commits ahead of `origin/v2-development` @ `b908f7b`** (the P5-15 review/merge — everything up to `b908f7b` is on origin), all local-only, unpushed; the push (ff + prune + optional tag) awaits operator go-ahead (HANDOVER §8). **Status date:** 2026-09-15 (Cycle 5 close — Phase 6 complete: the AMD ground truth CLOSED with **VERDICT PASS** (31 active gates); ready for Cycle 6 — the **GUI workstream is primary** per the operator).
+> **Grounded in:** `Docs/HANDOVER.md` (the standing handover — read it first), `Docs/Grand Design & Architecture Specification.md`, `Docs/RamSleuth-v2.md`, `MASTER_LOG.md` (Cycles 1–5), `plans/PLAN-PHASE6.md`, workspace `Cargo.toml` (7 members).
 
 ---
 
@@ -21,14 +21,15 @@ The workspace root `Cargo.toml` defines exactly these **7 member crates** (Editi
 | Crate | Role | Phase | Status |
 |---|---|---|---|
 | `ramsleuth-bench` | Native benchmark engine: runtime AVX2/AVX-512F feature detect, /sys topology (SMT-filtered, per-CCD L3), pure 64-byte-aligned buffer plan (L1 16 KiB / L2 256 KiB / L3 50% of CCD slice / DRAM max(256 MiB, 3×L3) / 128 MiB latency ring), AVX2 + AVX-512F streaming read / NT write / copy kernels with scalar fallback, pinned barrier-synced per-core worker dispatch, 64-byte-stride pointer-chase latency (`__rdtscp`), 4×4 grid orchestrator, verification CLI (deps: `libc` only) | 1 | ✅ COMPLETE |
-| `ramsleuth-telemetry` | Live memory-controller telemetry: CPUID vendor + frozen generation map (5950X → `Amd(Zen3)`), no-panic `Section<T> { Value, Na(reason) }` contract, privilege-guarded AMD SMU access (sysfs-first — canonical `/sys/kernel/ryzen_smu_drv/pm_table` + sibling `pm_table_version`/`pm_table_size`, legacy `/sys/kernel/ryzen_smu/` fallback → char-dev `/dev/ryzen_smu` ioctl), **live-verified f32 AMD PM parse (Vermeer `TableVersionId` sets — reconciled in Phase 5, P5-15)**, Intel MCHBAR `/dev/mem` read-only mmap guard + per-channel IMC decode (offsets still skeleton), unprivileged `ee1004` SPD acquire + decode (JEP106, rank, XMP/EXPO), `SystemMemoryTelemetry` facade + `collect()`, verification CLI (deps: `nix` 0.29 only) | 2 | ✅ COMPLETE |
+| `ramsleuth-telemetry` | Live memory-controller telemetry: CPUID vendor + frozen generation map (5950X → `Amd(Zen3)`), no-panic `Section<T> { Value, Na(reason) }` contract, privilege-guarded AMD SMU access (sysfs-first — canonical `/sys/kernel/ryzen_smu_drv/pm_table` + sibling `pm_table_version`/`pm_table_size`, legacy `/sys/kernel/ryzen_smu/` fallback → char-dev `/dev/ryzen_smu` ioctl), **live-verified f32 AMD PM parse (Vermeer `TableVersionId` sets — reconciled in Phase 5, P5-15) + the live SMN path (13-register bitfield table 0x50200–0x50264 — 27 DRAM timings + GDM live on the 5950X, sentinel-safe — P6-02/03/10, Cycle 5)**, Intel MCHBAR `/dev/mem` read-only mmap guard + per-channel IMC decode (offsets still skeleton), unprivileged `ee1004` SPD acquire + decode (JEP106, rank, XMP/EXPO — live `0x0D`/`0xC1` reconciled, P6-04), `SystemMemoryTelemetry` facade + `collect()` (`acquire → parse → apply_smn → map`), verification CLI (deps: `nix` 0.29 only) | 2 | ✅ COMPLETE |
 | `ramsleuth-protocol` | The wire contract: `Request` / `Response` / `BenchMode` / `Message` serde enums (payload types reused verbatim from telemetry + bench), `DEFAULT_SOCKET_PATH` (`/run/ramsleuth/ramsleuth.sock`), length-prefixed Bincode 1.3 frame codec with a 16 MiB `MAX_FRAME_SIZE` guard (zero `unsafe`, tokio-free) | 3 | ✅ COMPLETE |
 | `ramsleuth-daemon` | The privileged daemon (the ONLY process touching hardware): SOFT capability probe (geteuid + `CapEff` bit 21 — never panics/exits), socket listener (mode 0660, stale-file probe → rebind, best-effort `chown`), TTL `TelemetryCache` (injectable collector), single-flight `BenchJobManager` (clean cancel + per-cell progress), per-connection async RPC (tokio is the daemon-only dependency), bin (`--socket` / `--max-age`, SIGTERM/SIGINT graceful stop) + `systemd/ramsleuth.service` (CAP_SYS_RAWIO-clamped, sandboxed unit) | 3 | ✅ COMPLETE |
 | `ramsleuth-client` | The unprivileged CLI + shared IPC library: synchronous `UnixStream` transport (read/write timeouts, 3-retry backoff, friendly `DaemonDown` diagnostics), pure `dump` dashboard renderer (full hardware timings, every N/A cell with its reason — **the Phase 3 exit criterion**), `bench` / `status` commands, CLI (`dump` / `bench` / `status` + `--socket` / `--tier` / `--mode`, exit codes 0/1/2) | 3 | ✅ COMPLETE |
 | `ramsleuth-tui` | Terminal dashboard: ratatui 0.29 + crossterm 0.28 (MSRV ≤ 1.75 via two lockfile pins), pure `key_to_action` (R / S / Q), 3-zone non-scrolling layout (timing matrix / bench grid + progress / SPD + daemon status), terminal loop with a background 2 s updater | 4 | ✅ COMPLETE |
-| `ramsleuth-gui` | Desktop dashboard: egui / eframe / egui_extras 0.27.2 (newest 1.75-compatible line), semantic palette (cyan / amber / slate / crimson), F2 PNG snapshot / F3 JSON export to `$HOME`, `TelemetryData` behind `Arc<RwLock>` with a background poller (bench command channel + cancel), 3 zones, 1400×900 @ ~60 FPS eframe app | 4 | ✅ COMPLETE |
+| `ramsleuth-gui` | Desktop dashboard — **initial 3-zone shell only (Cycle 3, P3-25…P3-30)**: egui / eframe / egui_extras 0.27.2 (newest 1.75-compatible line), semantic palette (cyan / amber / slate / crimson), F2 PNG snapshot / F3 JSON export to `$HOME`, `TelemetryData` behind `Arc<RwLock>` with a background poller (bench command channel + cancel), 3 zones (flat timing matrix / 4×4 bench grid + Run Full / Memory Only / Cancel + progress / SPD cards + daemon status + actions), 1400×900 @ ~60 FPS eframe app | 4 | ⏳ **INITIAL ONLY — the primary outstanding workstream** (Grand Design §3.1 gap list = §"GUI Gap" below; per the operator, 2026-09-15, "we have not even gotten near the GUI yet") |
 
 **Phase 5 deliverable (not a crate — packaging/distribution):** `packaging/ramsleuth-git/` (AUR `PKGBUILD` + `.install` hooks creating the `ramsleuth` group + systemd `preset`), `packaging/ryzen-smu-dkms/` (optional DKMS extra: `PKGBUILD` + `dkms.conf`), `scripts/install-ryzen-smu-dkms.sh` (idempotent operator install helper — fully working DKMS path), `.github/workflows/ci.yml` (1.75/stable matrix: test debug+release, clippy `-D warnings`, 6-binary artifact), `packaging/README.md` (operator/end-user guide), `systemd/ramsleuth.service` (frozen, shipped). ✅ COMPLETE.
+**Phase 6 deliverable (not a crate — live verification + reconciliation, Cycle 5):** `scripts/amd-ground-truth.sh` (the matched-condition cross-check — **VERDICT PASS, 31 active gates in tolerance**), the `amd_smn` telemetry module (the SMN 27 timings + GDM live; the `0xffffffff` sentinel never decoded), the SPD `0x0D`/`0xC1` reconciliation, the bench L1/L2 inner-loop iterations, and the 3 retroactive script/daemon fixes (`monitor_cpu -f` capture, sentinel handling, rc=124 timeout-kill acceptance). 8 chunks (`--no-ff`), QA 371/371. ✅ COMPLETE (the Intel decode + MSRV + push items remain operator/hardware-gated — §4).
 
 **Architecture in one line:** hardware I/O (SMU / MCHBAR `/dev/mem` / `ee1004`) lives exclusively in the `ramsleuth-daemon` process; the `protocol` crate is the single source of truth for the wire contract; `client` (std-only, no tokio) is the transport shared by the CLI and by `tui`/`gui`, which are pure renderers.
 
@@ -46,21 +47,21 @@ Status legend: ✅ COMPLETE · ⏳ PENDING / OPEN (carried forward, not a defect
 - L1/L2/L3/DRAM partitioning (pure `plan(&CpuTopology) -> BufferPlan`, all 64-byte aligned, safe sysfs fallbacks) ✅
 - 4×4 AIDA64-style grid (Read/Write/Copy/Latency × Memory/L3/L2/L1; best-of-3 bandwidth, median latency; DRAM latency chases a materialized buffer beyond L3) ✅
 - Verification CLI (`cargo run -p ramsleuth-bench [--avx512] [--json]`; serde-free JSON, unknown flag → exit 2) ✅
-- ⏳ OPEN: L1/L2 small-tier bandwidth overhead refinement — the 32 KiB / 1 MiB working sets split across 16 pinned workers are dominated by thread/barrier/timing overhead per pass; **fix: add inner-loop iterations to amortize that overhead** (cells currently informational, not comparable across tiers)
+- **L1/L2 small-tier bandwidth overhead refinement — DONE (P6-05, Cycle 5):** the sub-4 MiB tiers run inner-loop iterations (`small_tier_iters = clamp(32 MiB/total, 1..=65536)`: L1 32 KiB → 1024, L2 1 MiB → 32; work per pass ≤ 32 MiB) so the cells are data-dominated and comparable across tiers; large tiers (`total ≥ 4 MiB`) byte-identical; checksum conventions frozen; `run_pinned` signature + wire shapes unchanged
 
 ### Phase 2 — Live Memory Controller Telemetry (`ramsleuth-telemetry`) — ✅ COMPLETE (Cycle 2, 11 chunks P2-01…P2-11, QA 8/8 gates PASS)
 
 - CPUID detection (vendor + frozen family→generation map; 5950X reports family `0x19` → `Amd(Zen3)`) ✅
 - No-panic `Section<T> { Value(T), Na(TelemetryError) }` contract (every cell renders a value or `N/A (<reason>)`; exit 0 even when all sections are `Na`; no `panic!`, no `unwrap`/`expect` on hardware data) ✅
 - Privilege-guarded AMD SMU access — sysfs-first (canonical `/sys/kernel/ryzen_smu_drv/pm_table` + sibling `pm_table_version`/`pm_table_size`, legacy `/sys/kernel/ryzen_smu/` fallback) + char-dev `/dev/ryzen_smu` fallback; `nix` 0.29 is the only dependency (the `ryzen_smu` Rust crate is deliberately NOT used) ✅
-- **AMD PM parse — LIVE-VERIFIED for Vermeer (reconciled in Phase 5, P5-15):** version = `TableVersionId` from the sibling `pm_table_version` attr (exact Vermeer 10-id + Matisse 8-id sets), headerless `f32` layout (FCLK 0x0C0 / UCLK 0x0C8 / MCLK 0x0CC MHz, VDDCR_SOC 0x0B0, MIN_LEN 0x518); on the 5950X the live decode reports MCLK/UCLK/FCLK ≈ 1792 MHz OneToOne + VDDCR_SOC ≈ 1.128 V (matches `monitor_cpu` within ±10 mV) ✅
+- **AMD PM parse — LIVE-VERIFIED for Vermeer (reconciled in Phase 5, P5-15):** version = `TableVersionId` from the sibling `pm_table_version` attr (exact Vermeer 10-id + Matisse 8-id sets), headerless `f32` layout (FCLK 0x0C0 / UCLK 0x0C8 / MCLK 0x0CC MHz, VDDCR_SOC 0x0B0, MIN_LEN 0x518); on the 5950X the live decode reports MCLK/UCLK/FCLK = 1800 MHz OneToOne + VDDCR_SOC = 1.1375 V (Cycle 5: within ±1 MHz / ±10 mV of `monitor_cpu` — VERDICT PASS) ✅
 - Intel MCHBAR `/dev/mem` guard (Intel-gated before any file/mmap; read-only mmap, bounds-checked reads, `munmap` in `Drop`; STRICT_DEVMEM EIO/ENODATA → `InsufficientPrivilege`) + per-channel IMC decode ✅ (register offsets still SKELETON — live validation pending, open item 3c)
 - SPD EEPROM acquire (world-readable `ee1004` sysfs, 512 B DDR4 / 1024 B DDR5) + decode (JEP106 module/die makers with continued-ID, rank bits, part/serial, JEDEC speed, XMP 2.0/3.0 + EXPO summaries) ✅
 - `SystemMemoryTelemetry` facade + `collect()` (per-branch error containment) ✅
 - Verification CLI (`cargo run -p ramsleuth-telemetry [--json]`) ✅
-- ⏳ OPEN: AMD tick-identical ground truth — **NOW UNBLOCKED** (the `ryzen_smu` module is installed + loaded on the 5950X host, §5): compare vs the `monitor_cpu` ground truth under matched conditions — clocks ±1 MHz, voltages ±10 mV, CAD per code table (CAD still `Na` until the SMN-attr path, open item 3a); investigate the 1792-vs-1800 MHz delta under matched conditions
-- ⏳ OPEN: Intel live MCHBAR decode verification — on the LGA-1151 i5-6600 (Skylake, dual-channel = `channel_count(Skylake) = 2`); confirm per-channel timings + command-rate/gear decode against known-good values
-- ⏳ OPEN: Model reconciliation — **partially done** (the Vermeer AMD PM table was reconciled in P5-15): remaining = CAD/timings/GDM/PDM via the driver's `smn` sysfs attr (SMN regs 0x50200–0x50264 — the sanctioned channel, not raw MMIO), Intel IMC register offsets (skeleton), and SPD maker `0xC1` (rendered raw-hex) + density `0x0D` (→ `Na`) observed on the 5950X host (outside the frozen decode tables)
+- ✅ CLOSED (Cycle 5): AMD tick-identical ground truth — the matched-condition cross-check (`scripts/amd-ground-truth.sh`, operator live run) returned **VERDICT PASS — 31 active gates in tolerance**: MCLK/UCLK/FCLK = 1800 MHz vs dump 1800.00 MHz (±1 MHz), VDDCR_SOC = 1.1375 V vs 1.138 V (±10 mV), **27/27 DRAM timings tick-identical** to `monitor_cpu -m` (±1 tick, 0 deferred), the 0x50200 set-point read = 1800 MHz (raw `0x00001936`, two-stage +0x100000 path), GDM triple-confirmed (smn / `monitor_cpu -m` / dump); CAD = honest N/A (informational, non-fatal — bitfields unconfirmed in the driver source). The earlier "1792 vs 1800" delta was root-caused as **transient retraining, not a scaling bug** (the host's kit is DDR4-3600 — §5)
+- ⏳ OPEN: Intel live MCHBAR decode verification — on the LGA-1151 i5-6600 (Skylake, dual-channel = `channel_count(Skylake) = 2`); confirm per-channel timings + command-rate/gear decode against known-good values. **Hardware-gated: the i5-6600 is not yet attached** (P6-06 parked; the IMC offsets are still SKELETON — the first live pass reconciles them, plan D6)
+- **Model reconciliation — DONE except two gated items (Cycles 4–5):** the Vermeer AMD PM table (P5-15) + **the SMN 27 DRAM timings + GDM are now live from silicon (P6-02/03/10 — tick-identical to the `monitor_cpu` reference)** + **SPD density `0x0D` → 16 Gb (vendor/legacy encoding) + maker `0xC1` → G.Skill (JEP106) (P6-04)** are all reconciled. Remaining: **(a)** the CAD/RTT/drive + PDM bitfields are **unconfirmed in the ryzen_smu driver source → honest `N/A`** (confirm-or-Na — driver-side confirmation pending); **(b)** Intel IMC register offsets (still SKELETON — hardware-gated on the i5-6600)
 
 ### Phase 3 — Privilege-Separated Architecture (daemon + socket + clients) — ✅ COMPLETE (Cycle 3, 30 chunks P3-01…P3-30 + 2 doc-drift fixes)
 
@@ -75,7 +76,8 @@ Status legend: ✅ COMPLETE · ⏳ PENDING / OPEN (carried forward, not a defect
 
 - `ramsleuth-tui` (ratatui 0.29 + crossterm 0.28): pure key→action mapping (R / S / Q), 3-zone non-scrolling dashboard (timing matrix / bench grid + live progress / SPD + status), terminal event loop with a background 2 s updater, degrades to "daemon not connected" without crashing ✅
 - `ramsleuth-gui` (egui / eframe / egui_extras 0.27.2): semantic palette, F2 PNG snapshot / F3 JSON export to `$HOME`, `TelemetryData` + background poller with a bench command channel + cancel, 3 zones, 1400×900 @ ~60 FPS app with no UI-thread blocking ✅
-- Grand Design §3 three-zone layout — **LIVE MEMORY CONTROLLER & SUBTIMINGS / AIDA-STYLE BENCHMARK ENGINE / HARDWARE & SPD TELEMETRY** — implemented in both frontends ✅
+- Grand Design §3 three-zone layout — **LIVE MEMORY CONTROLLER & SUBTIMINGS / AIDA-STYLE BENCHMARK ENGINE / HARDWARE & SPD TELEMETRY** — implemented in both frontends as their initial 3-zone shells ✅ (TUI complete; the GUI is initial-only per the operator note below)
+- **GUI caveat (operator, 2026-09-15):** "we have not even gotten near the GUI yet" — the Phase 4 delivery is the **initial** 3-zone dashboard shell (the live data plumbing, the three zones, the F2/F3 exports), not the Grand Design §3.1 spec. The GUI is the **primary outstanding workstream** — the concrete gap list is the "GUI Gap" section below.
 
 ### Phase 5 — Packaging & Distribution — ✅ COMPLETE (Cycle 4, 15 chunks P5-01…P5-15; QA PASS; compacted to MASTER_LOG)
 
@@ -84,29 +86,43 @@ Status legend: ✅ COMPLETE · ⏳ PENDING / OPEN (carried forward, not a defect
 - **P5-11/12/13/14 — ryzen_smu install-path fixes** ✅ (root-caused from three live operator runs): stage the source into `/usr/src/ryzen_smu-$PKGVER` before `dkms add` (the script cloned but never staged); the repo `dkms.conf` `MAKE`/`CLEAN` aligned to the authoritative upstream amkillam pattern (the `M=` path missing `/build` broke `dkms build`); `dkms build`/`install` now pass `${MODULE}/${PKGVER}` (DKMS 3.4.3 does not resolve a bare name); the "already installed" skip-check uses `dkms status` install-state (a build-dir existence test wrongly skipped `dkms install` after a build). The install path is fully working — `dkms status` = `ryzen_smu/1.d298366, 7.2.3-1-cachyos-custom, x86_64: installed` on the dev host
 - **P5-15 — AMD PM-table model reconciliation (open item 3, Vermeer)** ✅: the first Rust-source change of the cycle (`amd_smu.rs` + `amd_pm.rs` only) — the version is sourced from the sibling `pm_table_version` file (`TableVersionId`; the blob is a headerless `f32` array — its first word is a PPT-limit float the old skeleton misread as the version), the layout is live-verified (FCLK 0x0C0 / UCLK 0x0C8 / MCLK 0x0CC MHz, VDDCR_SOC 0x0B0, MIN_LEN 0x518), and the accepted versions are the exact Vermeer 10-id set (operator's live `0x380805` in-set) + Matisse 8-id set. 328→337 tests
 - **QA (Cycle 4 close):** 337/337 tests green (debug AND release, whole workspace), zero clippy warnings, MSRV 1.75 held (lockfile-pinned), release build OK, 9/9 packaging/CI/systemd files valid (`bash -n` ×4, shellcheck zero findings, YAML valid); zero `.rs`/`Cargo.*` changes in P5-01…P5-07 (P5-15 touched exactly two telemetry files); live end-to-end on the host — the AMD section populates (clocks + VDDCR_SOC; CAD/timings honest `Na`); **zero panics / segfaults** ✅
-- ⏳ OPEN (operator gate, not a deliverable): push to GitHub — fast-forward `origin/v2-development` (1 commit behind local) + prune the 17 fully-merged remote `branch/chunk-p5-*` branches + optional tag (e.g. `v2.0.0`) — **only on explicit go-ahead; never force-push; no remote branch deleted until then**
+- ⏳ OPEN (operator gate, not a deliverable): push to GitHub — fast-forward `origin/v2-development` (now **19 commits behind** local @ `51f4c4f`) + prune the 17 fully-merged remote `branch/chunk-p5-*` branches + optional tag (e.g. `v2.0.0`) — **only on explicit go-ahead; never force-push; no remote branch deleted until then**
 
 ---
 
-## 4. Cross-Cutting Open Items (carried into Cycle 5)
+## GUI Gap — Grand Design §3.1/§3.2 spec vs. the current `ramsleuth-gui` (the Cycle 6 primary workstream)
 
-1. **AMD tick-identical ground truth — NOW UNBLOCKED** (the `ryzen_smu` module is installed + loaded on the 5950X host — §5). Cross-check under matched conditions: `sudo monitor_cpu` vs `ramsleuth-client -- dump` (root daemon) — clocks ±1 MHz, voltages ±10 mV, CAD per the code table. CAD is currently `Na` (waits on item 3a's SMN-attr path). **Investigate the 1792-vs-1800 MHz delta** — system-state variation vs a scaling issue — under matched conditions.
-2. **Intel live MCHBAR decode** — run on the i5-6600 (Skylake, LGA-1151, dual-channel) test machine; first live pass also validates the decode pipeline + reconciles the still-skeleton IMC register offsets (item 3c).
-3. **Model reconciliation — partially done** (the Vermeer AMD PM table was reconciled in P5-15). Remaining: **(a)** CAD/timings/GDM/PDM via the driver's `smn` sysfs attr (SMN regs `0x50200`–`0x50264` bitfields — the sanctioned channel, **not** raw MMIO; the attr is confirmed present on the dev host); **(b)** SPD density `0x0D` + maker `0xC1` (outside the frozen decode tables; observed on the 5950X host); **(c)** Intel IMC register offsets (still SKELETON — needs the i5-6600).
-4. **Phase 1 L1/L2 bandwidth overhead refinement** — add inner-loop iterations for the small-tier working sets so the cells become comparable across tiers.
-5. **MSRV 1.75 vs 1.89 decision — operator call** (deferred): keep 1.75 (lockfile-pinned for the ratatui/egui transitive deps; the AVX-512F intrinsics are cfg-gated and never exercised on Zen 3; the CI `1.75` leg proves it on a clean runner) vs bump to 1.89 (requires re-verifying the lockfile pins + the CI matrix).
-6. **Push to GitHub — on operator go-ahead** (see HANDOVER §8): fast-forward `origin/v2-development` to the local tip (≥ `2409947`) (NEVER force-push), prune the 17 fully-merged remote `branch/chunk-p5-*` branches, optional `v2.0.0` tag — a deliberate, reviewed event. Until go-ahead: 100% local, no remote branch deleted.
+> The operator (2026-09-15): "we have not even gotten near the GUI yet." The `ramsleuth-gui` crate (egui + eframe, 7 modules, 3543 lines) was delivered in Cycle 3 (Phase 4, P3-25…P3-30) as the **initial** 3-zone dashboard. This section lists, honestly, what the spec requires that the crate does not yet implement — grounded in a full skim of `crates/ramsleuth-gui/src/` (2026-09-15).
+
+**What exists today (initial shell):** the eframe app shell (1400×900, ~60 FPS, no render-thread I/O — the background poller is the state's only writer); the semantic palette (cyan / amber / slate / crimson) + dark-slate style; the `TelemetryData` shared state + 2 s background poller (fresh connection per cycle — survives daemon restarts) + bench command channel + cancel; **zone 1** "MEMORY CONTROLLER & SUBTIMINGS" = a **flat** `egui::Grid` label/value matrix (AMD / Intel vendor rows + clocks & ratios + the 27 timings + the 8 CAD fields + the 4 voltages; N/A cells in crimson; AMBER warnings for a 1:2 divide and VDDCR_SOC > 1.30 V); **zone 2** "BENCHMARK ENGINE" = the `egui_extras::TableBuilder` 4×4 grid (**the terminal result only**) + one progress bar + Run Full / Memory Only / Cancel; **zone 3** "HARDWARE & SPD" = per-slot SPD cards (maker / part / rank / density / speed + XMP/EXPO rows; "driver missing" placeholder) + the daemon status line + the F2/F3/Q actions row; exports: F2 = a bench-grid mini-heatmap PNG, F3 = the telemetry JSON (both to `$HOME`); a headless no-panic test suite.
+
+**The gap list (spec → current), in recommended implementation order:**
+
+1. **The header + its data-model gaps (land first).** The spec's 3-line header: title + a platform tag ("[AMD AM5 Platform]"); a CPU line with the clock + **motherboard + BIOS + AGESA**; a RAM line with **total capacity + per-DIMM size + channel mode + the sync-mode summary** ("Synchronous 1:1 (UCLK = MCLK = 3000 MHz)"). Current: title + CPU brand + daemon status + the key legend only. **The wire model (`CpuInfo` / `SystemMemoryTelemetry`) carries none of motherboard / BIOS / AGESA / total-capacity / per-DIMM-size / command-rate — these telemetry data-model + wire extensions must land before the header can be populated** (a frozen-shape change = a plan edit + rebase; the serde derives + bincode round-trip tests extend with them; all three frontends consume the payload).
+2. **The grouped timing layout.** The spec's left panel is 2 sub-columns × 3 section pairs — [Clocks & Ratios] | [Tertiary & Turnarounds], [Primary Timings] | [CAD Bus Drive & Termination], [Secondary Timings] | [Active System Voltages]. Current: one flat single-column grid (the section grouping is lost; the rows are just in dump order).
+3. **The GDM / CR row.** The spec shows "GDM / CR: Disabled / 1T". Current: the GDM cell only — the command rate is decoded in the SMN path (0x50200 bit 10) but **not stored** (no frozen slot); needs a snapshot slot + a cell (a shape extension per item 1).
+4. **Per-cell live bench updates.** The spec's grid is live during a run. Current: only the terminal result grid populates (the in-flight `BenchProgress` stream drives the single progress bar; no per-cell progressive fill).
+5. **SPD card content.** The spec shows the module product line ("G.Skill Trident Z5 RGB (F5-6000J3038F16GX2)"), **DRAM die maker + die type** ("SK Hynix (A-Die, 16Gb)"), a human rank label ("Single-Rank"). Current: maker / part / rank-number / density / speed + profile rows; **the wire `SpdModule` has no die-maker/die-type field** (the decode reads the die ID — the model must carry it; a shape extension per item 1).
+6. **History / charting.** None: no time series, no sparklines, no history buffer anywhere in `TelemetryData` (a 2 s poll with no memory of the last N samples). The spec-level "live dashboard" implies it — a design decision + a ring buffer + a chart widget (egui has no built-in chart; a hand-rolled immediate-mode plot in the workspace's no-new-deps spirit, or a deliberately chosen pure-Rust chart crate — a plan decision).
+7. **Settings / configuration.** The socket is CLI-only (`--socket`); the poll interval is fixed at 2 s; no units / theme / refresh controls. Needs a settings panel + state extensions (persisted or not — a plan decision).
+8. **Export parity + keyboard actions.** The spec's F2 = "a clean .png validation card" of the dashboard (current F2 is a bench-grid-only mini-heatmap; F3 is telemetry-only, no bench grid). The spec's key legend [F2] / [F3] / [Q] — current: buttons only (no keyboard handling in the eframe loop).
+
+**Effort / gating:** items 1/3/5 are data-model + wire work (telemetry + protocol + all three frontends consume the payload — the bincode round-trip + no-panic gates apply); items 2/4/6/7/8 are GUI-local. **Nothing here is hardware-gated — the whole list is implementable on the 5950X host today.** A multi-cycle workstream: recommended Cycle 6 scope = items 1–3 first (header + grouped sections + the CR slot), then 4–5, then 6–8 (HANDOVER §13).
 
 ---
 
+## 4. Cross-Cutting Open Items (post-Cycle-5 — carried into Cycle 6)
+
+1. **GUI — the primary next workstream** (operator: "we have not even gotten near the GUI yet"). The initial 3-zone dashboard (Cycle 3, Phase 4) exists; the gap against the Grand Design §3.1/§3.2 spec = the "GUI Gap" section below (the header + its data-model gaps — motherboard/BIOS/AGESA, total RAM, the command-rate slot, the die maker; the grouped timing sections; per-cell live bench updates; the SPD card content; history/charting; settings; export parity; keyboard actions). Multi-cycle; **not hardware-gated** — the whole list is implementable on the 5950X host today.
+2. **O2 — Intel live MCHBAR decode (hardware-gated).** The i5-6600 (Skylake, LGA-1151, dual-channel) is **not yet attached**. When it is: the live decode + per-channel tCL/tRCD/tRP/tRAS + command-rate/gear vs. known-good; the IMC register offsets are still SKELETON (the first pass reconciles them — plan D6: verify-first, reconcile-if-divergent; the wire shapes never change); Intel voltages/CAD = `Na(NotApplicable)`. P6-06 is parked for exactly this.
+3. **O5 — MSRV 1.75 vs. 1.89 (operator call).** Keep 1.75 (all 441 lockfile packages MSRV ≤ 1.75; the AVX-512F bodies compile green on the CI `1.75` leg and are runtime-gated — never exercised on this AVX2-only host; the CI 1.75 leg is the continuous proof) vs. bump to 1.89 (the `rust-version` edit + CI matrix `["1.89","stable"]` + the pin re-verification — a follow-up micro-chunk after the decision). The plan's P6-07 docs-only record was parked, not authored.
+4. **O6 — push to GitHub (operator go-ahead).** Fast-forward `origin/v2-development` (`b908f7b`) to **`51f4c4f`** (19 behind; **NEVER force-push**), prune the **17** fully-merged remote `branch/chunk-p5-*` branches, optional `v2.0.0` tag (decide at push time, with explicit sign-off). The plan's P6-08 runbook was parked, not authored; the runbook content = HANDOVER §8. Until go-ahead: 100% local.
+5. **CAD/RTT/drive + PDM SMN bitfields (honest N/A — driver-side confirmation pending).** Unconfirmed in the ryzen_smu driver source (the amkillam v0.1.7 audit, P6-02); the confirm-or-Na position is held (no field displayed with an unverified mapping); needs an AMD-published UMC register map or an upstream bitfield publication. Non-fatal: the O1 PASS treats the CAD gate as informational.
 ## 5. Verification Environment
 
-- **AMD dev host (primary):** Ryzen 9 5950X (Zen 3, Vermeer), 16C/32T, 64 MiB L3, DDR4-3200 (2× modules, rank-1), AVX2 (**no AVX-512** — the `--avx512` path falls back to AVX2 at runtime), CachyOS, kernel `7.2.3-1-cachyos-custom`. **`ryzen_smu` is NOW INSTALLED + LOADED** (amkillam/ryzen_smu v0.1.7 via DKMS — `dkms status` = `ryzen_smu/1.d298366, 7.2.3-1-cachyos-custom, x86_64: installed`); sysfs at `/sys/kernel/ryzen_smu_drv/` (`pm_table` 2288 B, `pm_table_version` = 0x380805, `pm_table_size`, `smn` — the CAD/timings follow-up channel, `codename`/`drv_version`/`version` + command attrs). **Live AMD subtimings work:** MCLK/UCLK/FCLK ≈ 1792 MHz (OneToOne) + VDDCR_SOC ≈ 1.128 V (matches the `monitor_cpu` ground truth, at `/usr/bin/monitor_cpu` (mode 700 root), within ±10 mV); CAD/timings/other rails = honest `Na` (open item 3a). Install/re-run via `scripts/install-ryzen-smu-dkms.sh` (idempotent; DKMS `AUTOINSTALL=yes` rebuilds on kernel updates); without the module the app degrades gracefully (`N/A (DriverMissing)`, exit 0, no panic).
-- **Intel test machine:** LGA-1151 i5-6600 (Skylake, 6th-gen), **dual-channel (2 DIMM channels)** — matches `channel_count(Skylake) = 2` in the Intel decode model; this is where the live MCHBAR decode verification (item 4.2) runs. Intel voltages/CAD sections are out of Phase 2 scope by design → `Na(NotApplicable)` on Intel.
+- **AMD dev host (primary):** Ryzen 9 5950X (Zen 3, Vermeer), 16C/32T, 64 MiB L3, **DDR4-3600 — a G.Skill F4-3600C18-32GVK kit (2× 16 GiB rank-1 DIMMs, 16 Gb dies; the SPD's 3200 MT/s *base* speed was the source of the earlier "DDR4-3200" misnomer)**, AVX2 (**no AVX-512** — the `--avx512` path falls back to AVX2 at runtime), CachyOS, kernel `7.2.3-1-cachyos-custom`. **`ryzen_smu` is INSTALLED + LOADED** (amkillam/ryzen_smu v0.1.7 via DKMS — `dkms status` = `ryzen_smu/1.d298366, 7.2.3-1-cachyos-custom, x86_64: installed`); sysfs at `/sys/kernel/ryzen_smu_drv/` (`pm_table` 2288 B, `pm_table_version` = 0x380805, `pm_table_size`, `smn` — the live SMN channel, `codename`/`drv_version`/`version` + command attrs). **Live AMD telemetry is fully working (Cycle 5):** PM MCLK/UCLK/FCLK = 1800 MHz (OneToOne) + VDDCR_SOC = 1.1375 V + **the 27 DRAM timings + GDM live from the SMN registers** (CAD/RTT/drive = honest `N/A`, driver-side confirmation pending); the ground-truth cross-check returned **VERDICT PASS — 31 active gates in tolerance** (clocks ±1 MHz, voltages ±10 mV, 27/27 timings tick-identical to `monitor_cpu -m`, the 0x50200 set-point 1800 MHz, GDM triple-confirmed). Ground truth: `/usr/bin/monitor_cpu` (mode 700 root — **its PM-frame path requires `-f` on this 0x380805 table**; `-m` = the SMN one-shot); the cross-check: `scripts/amd-ground-truth.sh` (needs the daemon up). Install/re-run via `scripts/install-ryzen-smu-dkms.sh` (idempotent; DKMS `AUTOINSTALL=yes` rebuilds on kernel updates); without the module the app degrades gracefully (`N/A (DriverMissing)`, exit 0, no panic).
+- **Intel test machine:** LGA-1151 i5-6600 (Skylake, 6th-gen), **dual-channel (2 DIMM channels)** — matches `channel_count(Skylake) = 2` in the Intel decode model; **not yet attached to the dev environment (the O2 hardware gate)** — this is where the live MCHBAR decode verification runs (the IMC offsets are still SKELETON — the first pass reconciles them). Intel voltages/CAD sections are out of Phase 2 scope by design → `Na(NotApplicable)` on Intel.
 - **Deferred target:** the AIDA64 parity gate (DRAM bandwidth ±5%, latency in the 60–75 ns DDR5-6000 AM5 band) is deferred to a **DDR5-6000 AM5 host** — the 5950X host is DDR4 (measured DRAM latency ~81.5 ns is out of that band as expected; reported, not failed).
-
----
-
 ## 6. Scope Map
 
 ```mermaid
@@ -116,26 +132,27 @@ flowchart TD
     ROOT --> P1["Phase 1 — Benchmark Engine ✅"]
     ROOT --> P2["Phase 2 — Live Telemetry ✅"]
     ROOT --> P3["Phase 3 — Privilege Separation ✅"]
-    ROOT --> P4["Phase 4 — TUI + GUI Dashboards ✅"]
+    ROOT --> P4["Phase 4 — TUI + GUI Dashboards (TUI ✅ / GUI initial ⏳)"]
     ROOT --> P5["Phase 5 — Packaging & Distribution ✅"]
+    ROOT --> P6["Phase 6 — Live Verification & Reconciliation ✅ (Cycle 5)"]
 
     P1 --> BENCH["ramsleuth-bench ✅"]
     BENCH --> B1["AVX2 + AVX-512 kernels ✅"]
     BENCH --> B2["Pinned worker dispatch ✅"]
     BENCH --> B3["4×4 AIDA64 grid ✅"]
     BENCH --> B4["Verification CLI + JSON ✅"]
-    BENCH --> B5["L1/L2 overhead refinement ⏳"]
+    BENCH --> B5["L1/L2 inner-loop iterations ✅ (P6-05)"]
 
     P2 --> TELE["ramsleuth-telemetry ✅"]
     TELE --> T1["CPUID + no-panic Section contract ✅"]
-    TELE --> T2["AMD SMU access + PM parse ✅"]
-    TELE --> T2a["AMD PM model reconciled — Vermeer f32 layout + TableVersionId sets ✅"]
-    TELE --> T3["Intel MCHBAR guard + IMC decode ✅ (offsets ⏳ skeleton)"]
-    TELE --> T4["SPD EEPROM acquire + decode ✅"]
-    TELE --> T5["Facade + collect + CLI ✅"]
-    TELE --> T6["AMD ground truth vs monitor_cpu ⏳ (UNBLOCKED)"]
-    TELE --> T7["Intel live decode on i5-6600 ⏳"]
-    TELE --> T8["Model reconciliation ⏳ (partially done — Vermeer AMD ✅)"]
+    TELE --> T2["AMD SMU access + PM parse ✅ (Vermeer live-verified, P5-15)"]
+    TELE --> T2a["SMN 27 timings + GDM live ✅ (P6-02/03/10; sentinel-safe)"]
+    TELE --> T3["Intel MCHBAR guard + IMC decode ✅ (offsets ⏳ SKELETON)"]
+    TELE --> T4["SPD acquire + decode ✅ (0x0D/0xC1 reconciled, P6-04)"]
+    TELE --> T5["Facade + collect + CLI ✅ (acquire → parse → apply_smn → map)"]
+    TELE --> T6["AMD ground truth vs monitor_cpu ✅ CLOSED (VERDICT PASS — 31 active gates)"]
+    TELE --> T7["Intel live decode on i5-6600 ⏳ (hardware-gated — machine not attached)"]
+    TELE --> T8["CAD/RTT/drive + PDM ⏳ (driver-side confirm; honest N/A)"]
 
     P3 --> PROTO["ramsleuth-protocol ✅"]
     P3 --> DAEMON["ramsleuth-daemon ✅"]
@@ -148,9 +165,10 @@ flowchart TD
     CLIENT --> W6["CORE GATE PASSED ✅"]
 
     P4 --> TUI["ramsleuth-tui — ratatui + crossterm ✅"]
-    P4 --> GUI["ramsleuth-gui — egui + eframe ✅"]
+    P4 --> GUI["ramsleuth-gui — initial 3-zone shell (Cycle 3) ⏳"]
     TUI --> X1["3 zones + R/S/Q + 2s updater ✅"]
-    GUI --> X2["3 zones + F2/F3 export + 60 FPS ✅"]
+    GUI --> X2["3 zones + F2/F3 export + 60 FPS ✅ (initial only)"]
+    GUI --> X3["GUI Gap vs Grand Design §3.1/§3.2 ⏳ (header/data-model, grouped sections, CR slot, live bench cells, SPD card content, charting, settings, export parity — the Cycle 6 primary workstream)"]
 
     P5 --> Y0["15 chunks P5-01…P5-15 ✅ (QA 337/337)"]
     P5 --> Y1["AUR ramsleuth-git: PKGBUILD + .install group hooks + preset ✅"]
@@ -159,19 +177,23 @@ flowchart TD
     P5 --> Y4["GitHub Actions CI: 1.75/stable matrix + 6-binary artifact ✅"]
     P5 --> Y5["ryzen_smu uAPI reconciliation: ryzen_smu_drv paths + amkillam upstream ✅"]
     P5 --> Y6["AMD PM-table model reconciliation: Vermeer f32 + TableVersionId sets ✅"]
-    P5 --> Y7["Push to GitHub — ff + prune 17 branches + optional tag ⏳ (operator go-ahead)"]
+    P5 --> Y7["Push to GitHub ⏳ (operator go-ahead: ff to 51f4c4f + prune 17 + optional tag)"]
 
-    ROOT -. "carried to Cycle 5" .-> OPEN["Cross-cutting open items"]
-    OPEN --> O1["AMD ground truth cross-check ⏳ (UNBLOCKED — 1792 vs 1800 delta)"]
-    OPEN --> O2["Intel MCHBAR live decode ⏳ (i5-6600)"]
-    OPEN --> O3["Model reconciliation ⏳ (SMN-attr CAD/timings, SPD 0xC1/0x0D, Intel IMC offsets)"]
-    OPEN --> O4["P1 L1/L2 overhead refinement ⏳ (inner-loop iterations)"]
+    P6 --> Z0["8 chunks merged ✅ (P6-01…P6-05 + P6-09/10/11; QA 371/371)"]
+    P6 --> Z1["Ground-truth script: VERDICT PASS, 31 active gates ✅ (amd-ground-truth.sh)"]
+    P6 --> Z2["amd_smn accessor + 13-register bitfield table + overlay ✅"]
+    P6 --> Z3["SPD 0x0D/0xC1 reconciled ✅"]
+    P6 --> Z4["L1/L2 inner-loop iterations ✅"]
+    P6 --> Z5["monitor_cpu -f + 0xffffffff sentinel + rc=124 fixes ✅ (P6-09/10/11)"]
+    P6 --> Z6["Intel live decode ⏳ (P6-06 parked — hardware-gated)"]
+
+    ROOT -. "carried to Cycle 6" .-> OPEN["Cross-cutting open items"]
+    OPEN --> O1["GUI — the primary workstream ⏳ (the 'GUI Gap' list above)"]
+    OPEN --> O2["Intel MCHBAR live decode ⏳ (i5-6600 not yet attached)"]
     OPEN --> O5["MSRV 1.75 vs 1.89 ⏳ (operator decision)"]
-    OPEN --> O6["GitHub push + prune + tag ⏳ (operator go-ahead, ff-only)"]
+    OPEN --> O6["GitHub push ⏳ (operator go-ahead: ff to 51f4c4f + prune 17 + optional tag)"]
+    OPEN --> OC["CAD/RTT/drive + PDM bitfields ⏳ (driver-side confirm; honest N/A)"]
 ```
-
----
-
 ## 7. How to Run (quick reference, release)
 
 The QA-verified flow: one privileged daemon; all frontends unprivileged over the socket.
@@ -197,8 +219,9 @@ target/release/ramsleuth-client --socket /tmp/ramsleuth.sock -- dump
 target/release/ramsleuth-tui
 target/release/ramsleuth-gui
 
-# Ground truth (AMD open item 1 comparison target; installed by the ryzen_smu install helper)
-sudo monitor_cpu
+# Ground truth + the Cycle 5 cross-check (VERDICT PASS; the cross-check needs the daemon up + root)
+sudo scripts/amd-ground-truth.sh      # monitor_cpu -f vs ramsleuth-client -- dump vs one-shot monitor_cpu -m
+sudo monitor_cpu                      # raw reference — PM frame: -f (REQUIRED on this 0x380805 table) / SMN one-shot: -m
 
 # Direct verification CLIs (no daemon; from the Cycle 1/2 QA lineage)
 cargo run -p ramsleuth-bench --release            # [--avx512] [--json]
@@ -218,7 +241,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ramsleuth
 
 ## 8. Git / Push State
 
-- **Dev branch:** `v2-development`, tree clean, single local branch — **2 commits ahead of `origin/v2-development` @ `b908f7b`** (the P5-15 review/merge commit; everything up to `b908f7b` is on origin, fast-forwarded during the cycle, no force-push): **`2409947`** (the Cycle 4 final compaction commit) + this docs refresh — both local-only, unpushed. `origin/master` is divergent legacy — the operator confirmed `v2-development` is the canonical line; treat `master` as a read-only reference (never merge into or force onto it; no need to preserve/branch from it). All 15 Cycle 4 chunk branches + the 2 earlier fixes were merged `--no-ff` and their **17 remote `branch/chunk-p5-*` branches remain on origin — all fully merged, prune candidates on go-ahead** (p5-01, p5-02, p5-02-fix, p5-03, p5-04, p5-04-fix, p5-05, p5-06, p5-07, p5-08-sysfs, p5-09-script, p5-10-readme, p5-11-dkms, p5-12-dkmsconf, p5-13-dkmsver, p5-14-dkmsinstall, p5-15-pmtable). All earlier Cycle 1–3 chunk branches were pruned at their close-outs.
-- **Push policy (confirmed 2026-09-12, carried):** stay 100% local until explicit operator go-ahead — the **confirmed, tested, working** end-result app condition has been **met since Cycle 3** (and Phase 5 packaging is now done too). On go-ahead: **fast-forward** `origin/v2-development` to the local tip (≥ `2409947`) (NEVER force-push), **prune the 17 remote chunk branches** (all verified fully merged), **optional `v2.0.0` tag** (decide at push time, with explicit sign-off). Until then: no push, no remote branch deleted.
+- **Dev branch:** `v2-development` @ **`51f4c4f`**, tree clean — **19 commits ahead of `origin/v2-development` @ `b908f7b`** (the P5-15 review/merge commit; everything up to `b908f7b` is on origin, fast-forwarded during Cycle 4, no force-push): the 2 Cycle-4 close-out commits (`2409947`, `b890ecf`) + the Phase 6 plan (`1ad1afe`) + the 8 P6 chunks (16 implementation + merge commits) — all local-only, unpushed. `origin/master` is divergent legacy — the operator confirmed `v2-development` is the canonical line; treat `master` as a read-only reference (never merge into or force onto it; no need to preserve/branch from it). All 8 Cycle 5 `branch/chunk-p6-*` branches are fully merged (their local branches/worktrees retained until the next compaction — the uncommitted stub harness lives in one of them); the **17 remote `branch/chunk-p5-*` branches remain on origin — all fully merged, prune candidates on go-ahead** (p5-01, p5-02, p5-02-fix, p5-03, p5-04, p5-04-fix, p5-05, p5-06, p5-07, p5-08-sysfs, p5-09-script, p5-10-readme, p5-11-dkms, p5-12-dkmsconf, p5-13-dkmsver, p5-14-dkmsinstall, p5-15-pmtable). All earlier Cycle 1–3 chunk branches were pruned at their close-outs.
+- **Push policy (confirmed 2026-09-12, carried):** stay 100% local until explicit operator go-ahead — the **confirmed, tested, working** end-result app condition has been **met since Cycle 3** (Phase 5 packaging done in Cycle 4; the live AMD verification closed in Cycle 5 with VERDICT PASS). On go-ahead: **fast-forward** `origin/v2-development` to **`51f4c4f`** (NEVER force-push; if the origin is not a strict ancestor, stop and report), **prune the 17 remote chunk branches** (all verified fully merged), **optional `v2.0.0` tag** (decide at push time, with explicit sign-off). Until then: no push, no remote branch deleted.
 
-**This document: `FULLSCOPEvsCOMPLETED.md` — refreshed at Cycle 4 close-out (2026-09-13) for the Cycle 5 handover: Phase 5 marked COMPLETE (15 chunks), the Vermeer AMD PM-table model marked reconciled, open items + scope map + git state updated.**
+**This document: `FULLSCOPEvsCOMPLETED.md` — refreshed at Cycle 5 close-out (2026-09-15) for the Cycle 6 handover: Phase 6 marked COMPLETE (8 chunks; the AMD ground truth CLOSED with VERDICT PASS — 31 active gates), the GUI Gap section added (the primary outstanding workstream per the operator), the post-Cycle-5 open items (GUI, O2/O5/O6, CAD driver-side) + scope map + git state updated.**
