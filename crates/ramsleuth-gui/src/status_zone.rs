@@ -3,7 +3,8 @@
 //!
 //! Grand Design §3.1 bottom-right panel: one small framed "card" per
 //! bound SPD slot (a `slot 0xNN (DDR4|DDR5)` header over the
-//! [`spd_cards`] rows — maker / part / rank / density / speed, each
+//! [`spd_cards`] rows — a product line, a DRAM-die line, a human rank
+//! label, the raw maker / part / rank / density / speed cells, each
 //! its [`Section`] value in CYAN or `N/A (<reason>)` in CRIMSON, plus
 //! one row per XMP / EXPO profile (or a `profiles: none` placeholder)),
 //! the daemon status line (`daemon: <status>` + the last-update stamp
@@ -56,12 +57,16 @@ pub enum GuiAction {
 // ---------------------------------------------------------------------
 
 /// The per-slot SPD module cards: one `Vec` of `(label, display)` pairs
-/// per bound [`SpdModule`] (maker / part / rank / density / speed, then
-/// one row per XMP / EXPO profile — or a `profiles: none` placeholder
-/// when the module carries none).
+/// per bound [`SpdModule`] (a product line, a DRAM-die line, a human
+/// rank label, the raw maker / part / rank / density / speed cells,
+/// then one row per XMP / EXPO profile — or a `profiles: none`
+/// placeholder when the module carries none).
 ///
 /// Pure and deterministic: the same snapshot always yields the same
-/// `Vec`. Each display is the formatted [`Section::Value`] (bare rank,
+/// `Vec`. Each display is the formatted [`Section::Value`] (the
+/// `<maker> (<part>)` product line, the `<die_maker> (<die_type>,
+/// <density>Gb)` die line with each absent part dropped, the
+/// `Single-Rank` / `Dual-Rank` / `<n>-Rank` rank label, bare rank,
 /// `… Mbit` density, `… MT/s` speed, the profile line
 /// `<speed> <cl>-<trcd>-<trp>-<tras> @ <volts>`) or `N/A (<reason>)`
 /// for a [`Section::Na`] (the dump renderer's form — [`NaReason`]
@@ -72,10 +77,15 @@ pub fn spd_cards(telemetry: &SystemMemoryTelemetry) -> Vec<Vec<(String, String)>
     telemetry.spd.iter().map(card_rows).collect()
 }
 
-/// The `(label, display)` rows of one SPD module card: maker / part /
-/// rank / density / speed, then the profile rows.
+/// The `(label, display)` rows of one SPD module card: the product
+/// line, the DRAM-die line, the human rank label, the raw
+/// maker / part / rank / density / speed cells, then the profile
+/// rows.
 fn card_rows(module: &SpdModule) -> Vec<(String, String)> {
     let mut rows = vec![
+        ("product".to_owned(), product_line(&module.maker, &module.part)),
+        ("dram die".to_owned(), dram_die_line(module)),
+        ("rank label".to_owned(), rank_label(&module.rank)),
         ("maker".to_owned(), display(&module.maker, |value: &String| value.clone())),
         ("part".to_owned(), display(&module.part, |value: &String| value.clone())),
         ("rank".to_owned(), display(&module.rank, |value: &u8| value.to_string())),
@@ -96,6 +106,71 @@ fn card_rows(module: &SpdModule) -> Vec<(String, String)> {
         }
     }
     rows
+}
+
+/// The product-line row: `<maker> (<part>)` (the spec's "G.Skill …
+/// (F5-…)" form). One `Na` partner renders the other bare (no empty
+/// parens); both `Na` degrades the whole row to the maker's reason
+/// text. Never a panic.
+fn product_line(maker: &Section<String>, part: &Section<String>) -> String {
+    match (maker, part) {
+        (Section::Value(maker), Section::Value(part)) => format!("{maker} ({part})"),
+        (Section::Value(maker), Section::Na(_)) => maker.clone(),
+        (Section::Na(_), Section::Value(part)) => part.clone(),
+        (Section::Na(reason), _) => na_text(reason),
+    }
+}
+
+/// The DRAM-die row: `<die_maker> (<die_type>, <density>Gb)` with
+/// each parenthetical part dropped when absent — a `Na` die type
+/// yields `<die_maker> (<density>Gb)`, a `Na` density omits the
+/// density, and both absent shows the die maker bare. A `Na` die
+/// maker degrades the whole row to its reason text. Never a panic.
+fn dram_die_line(module: &SpdModule) -> String {
+    match &module.die_maker {
+        Section::Na(reason) => na_text(reason),
+        Section::Value(die_maker) => {
+            let mut parts = Vec::new();
+            if let Section::Value(die_type) = &module.die_type {
+                parts.push(die_type.clone());
+            }
+            if let Section::Value(mbit) = &module.density_mbit {
+                parts.push(density_gib(*mbit));
+            }
+            if parts.is_empty() {
+                die_maker.clone()
+            } else {
+                format!("{die_maker} ({})", parts.join(", "))
+            }
+        }
+    }
+}
+
+/// The density cell in Gb: `Mbit ÷ 1024` (16384 → `16Gb`); a
+/// non-integer conversion (not a real-world density) keeps the raw
+/// `Mbit` form — deterministic, never a panic.
+fn density_gib(mbit: u16) -> String {
+    if mbit % 1024 == 0 {
+        format!("{}Gb", mbit / 1024)
+    } else {
+        format!("{mbit} Mbit")
+    }
+}
+
+/// The human rank label: `1` → `Single-Rank`, `2` →
+/// `Dual-Rank`, other positive counts → `<n>-Rank` (e.g.
+/// `4-Rank`); a `Na` rank (or a degenerate `0` value) degrades to the
+/// `N/A` reason text. The raw rank number stays on its own row.
+fn rank_label(rank: &Section<u8>) -> String {
+    match rank {
+        Section::Na(reason) => na_text(reason),
+        Section::Value(value) => match value {
+            0 => na_text(&NaReason::NotApplicable),
+            1 => "Single-Rank".to_owned(),
+            2 => "Dual-Rank".to_owned(),
+            other => format!("{other}-Rank"),
+        },
+    }
 }
 
 /// One profile row: the label is the scheme + slot (`XMP <n>` on
@@ -426,7 +501,8 @@ mod tests {
     }
 
     /// (a) A representative snapshot: one card per module, with the
-    /// populated module's formatted values (maker / part / rank /
+    /// populated module's formatted values (the product line, the
+    /// DRAM-die line, the human rank label, maker / part / rank /
     /// density / speed + the XMP profile line) and at least one
     /// non-`N/A` value.
     #[test]
@@ -434,15 +510,23 @@ mod tests {
         let cards = spd_cards(&representative());
         assert_eq!(cards.len(), 2, "one card per SPD slot");
 
-        // The populated DDR4 module: every field decoded.
+        // The populated DDR4 module: every field decoded. The
+        // fixture's die type is Na(NotApplicable), so the die line
+        // drops it (16384 Mbit -> 16Gb); rank 2 -> Dual-Rank.
         let card = &cards[0];
-        assert_eq!(card[0], ("maker".to_owned(), "Samsung".to_owned()));
-        assert_eq!(card[1], ("part".to_owned(), "M391A2K40DB".to_owned()));
-        assert_eq!(card[2], ("rank".to_owned(), "2".to_owned()));
-        assert_eq!(card[3], ("density".to_owned(), "16384 Mbit".to_owned()));
-        assert_eq!(card[4], ("speed".to_owned(), "3200 MT/s".to_owned()));
-        assert_eq!(card[5].0, "XMP 1");
-        assert_eq!(card[5].1, "3600 MT/s 18-18-18-36 @ 1.350 V");
+        assert_eq!(
+            card[0],
+            ("product".to_owned(), "Samsung (M391A2K40DB)".to_owned())
+        );
+        assert_eq!(card[1], ("dram die".to_owned(), "SK hynix (16Gb)".to_owned()));
+        assert_eq!(card[2], ("rank label".to_owned(), "Dual-Rank".to_owned()));
+        assert_eq!(card[3], ("maker".to_owned(), "Samsung".to_owned()));
+        assert_eq!(card[4], ("part".to_owned(), "M391A2K40DB".to_owned()));
+        assert_eq!(card[5], ("rank".to_owned(), "2".to_owned()));
+        assert_eq!(card[6], ("density".to_owned(), "16384 Mbit".to_owned()));
+        assert_eq!(card[7], ("speed".to_owned(), "3200 MT/s".to_owned()));
+        assert_eq!(card[8].0, "XMP 1");
+        assert_eq!(card[8].1, "3600 MT/s 18-18-18-36 @ 1.350 V");
 
         // At least one formatted (non-N/A) value overall.
         assert!(
@@ -454,8 +538,9 @@ mod tests {
     }
 
     /// (b) No SPD modules → an empty `Vec` (no cards, no panic); the
-    /// all-`Na` module → one card whose every row (fields and the
-    /// all-`Na` EXPO profile line) is `N/A (…)`, no panic.
+    /// all-`Na` module → one card whose every row (the product line,
+    /// the die line, the rank label, the fields, and the all-`Na`
+    /// EXPO profile line) is `N/A (…)`, no panic.
     #[test]
     fn spd_cards_handles_no_spd_and_all_na_without_panic() {
         assert!(spd_cards(&no_spd()).is_empty(), "no SPD modules -> no cards");
@@ -470,18 +555,117 @@ mod tests {
         );
         assert_eq!(
             cards[0][0],
+            ("product".to_owned(), "N/A (driver missing)".to_owned())
+        );
+        assert_eq!(
+            cards[0][1],
+            ("dram die".to_owned(), "N/A (not applicable)".to_owned())
+        );
+        assert_eq!(
+            cards[0][2],
+            ("rank label".to_owned(), "N/A (insufficient privilege)".to_owned())
+        );
+        assert_eq!(
+            cards[0][3],
             ("maker".to_owned(), "N/A (driver missing)".to_owned())
         );
         assert_eq!(
-            cards[0][1].1,
+            cards[0][4].1,
             "N/A (parse error: part number: byte 0x81 outside image bounds)"
         );
         // The all-Na EXPO profile line: every field degrades.
-        assert_eq!(cards[0][5].0, "EXPO 0");
+        assert_eq!(cards[0][8].0, "EXPO 0");
         assert_eq!(
-            cards[0][5].1,
+            cards[0][8].1,
             "N/A (not applicable) N/A (not applicable)-N/A (not applicable)-N/A (not applicable)-N/A (not applicable) @ N/A (not applicable)"
         );
+    }
+
+    /// (b′) The new card rows in isolation: the rank label maps
+    /// 1 / 2 / n to `Single-Rank` / `Dual-Rank` / `<n>-Rank` (a
+    /// degenerate `0` and an absent rank degrade to `N/A`), the
+    /// product line renders `<maker> (<part>)` with one `Na` partner
+    /// bare and both `Na` on the maker's reason, and the die line
+    /// drops each absent part (`(type, density)` → `(density)` →
+    /// `(type)` → bare maker → the maker's reason).
+    #[test]
+    fn card_row_formatters_no_panic_on_na() {
+        // The human rank label.
+        assert_eq!(rank_label(&Section::Value(1)), "Single-Rank");
+        assert_eq!(rank_label(&Section::Value(2)), "Dual-Rank");
+        assert_eq!(rank_label(&Section::Value(4)), "4-Rank");
+        assert_eq!(rank_label(&Section::Value(0)), "N/A (not applicable)");
+        assert_eq!(
+            rank_label(&Section::na(NaReason::DriverMissing)),
+            "N/A (driver missing)"
+        );
+
+        // The product line (the spec's "G.Skill … (F5-…)" form).
+        assert_eq!(
+            product_line(
+                &Section::Value("G.Skill Trident Z5 RGB".to_owned()),
+                &Section::Value("F5-6000J3038F16GX2".to_owned())
+            ),
+            "G.Skill Trident Z5 RGB (F5-6000J3038F16GX2)"
+        );
+        assert_eq!(
+            product_line(
+                &Section::Value("Samsung".to_owned()),
+                &Section::na(NaReason::NotApplicable)
+            ),
+            "Samsung"
+        );
+        assert_eq!(
+            product_line(
+                &Section::na(NaReason::NotApplicable),
+                &Section::Value("M391A2K40DB".to_owned())
+            ),
+            "M391A2K40DB"
+        );
+        assert_eq!(
+            product_line(
+                &Section::na(NaReason::DriverMissing),
+                &Section::na(NaReason::NotApplicable)
+            ),
+            "N/A (driver missing)"
+        );
+
+        // The DRAM-die line: each absent part is dropped (the
+        // fixture already carries a Na die type + 16384 Mbit).
+        let full = SpdModule {
+            die_type: Section::Value("A-Die".to_owned()),
+            ..fixture_module()
+        };
+        assert_eq!(dram_die_line(&full), "SK hynix (A-Die, 16Gb)");
+        assert_eq!(dram_die_line(&fixture_module()), "SK hynix (16Gb)");
+        assert_eq!(
+            dram_die_line(&SpdModule {
+                die_type: Section::Value("A-Die".to_owned()),
+                density_mbit: Section::na(NaReason::NotApplicable),
+                ..fixture_module()
+            }),
+            "SK hynix (A-Die)"
+        );
+        assert_eq!(
+            dram_die_line(&SpdModule {
+                density_mbit: Section::na(NaReason::NotApplicable),
+                ..fixture_module()
+            }),
+            "SK hynix"
+        );
+        assert_eq!(
+            dram_die_line(&SpdModule {
+                die_maker: Section::na(NaReason::DriverMissing),
+                ..fixture_module()
+            }),
+            "N/A (driver missing)"
+        );
+
+        // The density conversion: Mbit -> Gb (a non-integer
+        // conversion keeps the raw Mbit form).
+        assert_eq!(density_gib(16_384), "16Gb");
+        assert_eq!(density_gib(8_192), "8Gb");
+        assert_eq!(density_gib(2_000), "2000 Mbit");
     }
 
     /// (c) Deterministic: two calls on the same snapshot are equal
