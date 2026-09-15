@@ -352,7 +352,7 @@ mod tests {
     use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message, Request, Response};
     use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
-    use ramsleuth_telemetry::SystemMemoryTelemetry;
+    use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
 
     use super::*;
 
@@ -395,6 +395,14 @@ mod tests {
             amd: Section::na(NaReason::NotApplicable),
             intel: Section::na(NaReason::NotApplicable),
             spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
         }
     }
 

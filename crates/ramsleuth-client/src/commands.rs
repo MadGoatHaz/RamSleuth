@@ -295,7 +295,7 @@ mod tests {
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
     use ramsleuth_telemetry::spd_decode::SpdModule;
-    use ramsleuth_telemetry::SystemMemoryTelemetry;
+    use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
 
     use super::*;
 
@@ -426,6 +426,9 @@ mod tests {
                 index: 0x50,
                 is_ddr5: false,
                 maker: Section::Value("0xC1".to_owned()),
+                die_maker: Section::Value("SK hynix".to_owned()),
+                die_type: Section::na(NaReason::NotApplicable),
+                devices: Section::Value(8),
                 part: Section::Value("M391A2K40DB".to_owned()),
                 serial: Section::Value("S064531ABC".to_owned()),
                 rank: Section::Value(1),
@@ -433,6 +436,14 @@ mod tests {
                 speed_mts: Section::Value(3_200),
                 profiles: Vec::new(),
             }],
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3500.0),
+                motherboard: Section::Value("Test Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(16.0),
+            dimm_sizes: vec![Section::Value(16.0)],
         }
     }
 
@@ -447,6 +458,14 @@ mod tests {
             amd: Section::na(NaReason::DriverMissing),
             intel: Section::na(NaReason::InsufficientPrivilege),
             spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
         }
     }
 
