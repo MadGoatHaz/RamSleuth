@@ -5,8 +5,12 @@
 //! [`build_style`], and the two file exports the app shell (P3-30)
 //! triggers on F2 / F3:
 //!
-//! - [`export_json`] — a [`SystemMemoryTelemetry`] snapshot as pretty
-//!   JSON (F3).
+//! - [`export_json`] — the F3 snapshot: the
+//!   [`SystemMemoryTelemetry`] wire root + the terminal
+//!   [`BenchmarkGrid`], as pretty JSON — the seven telemetry wire
+//!   keys at the top level (byte-compatible with the pre-C6-29
+//!   file) + a `bench` key (the grid object, or `null` before the
+//!   first completed run).
 //! - [`snapshot_png`] — the F2 validation card: a 640×420 PNG with a
 //!   title row (`RamSleuth v2.0.0` + the UTC wall clock), a CPU line
 //!   (brand + clock) and a RAM line (capacity + channel, honest `N/A`
@@ -134,13 +138,37 @@ impl std::error::Error for GuiError {
 // F3: JSON export.
 // ---------------------------------------------------------------------
 
-/// F3: write one telemetry snapshot to `path` as pretty JSON.
+/// The F3 wire snapshot (C6-29): the frozen [`SystemMemoryTelemetry`]
+/// root flattened into the top level (its seven wire keys, unchanged
+/// — no type duplication, D2) plus the `bench` key.
+#[derive(serde::Serialize)]
+struct ExportSnapshot<'a> {
+    #[serde(flatten)]
+    telemetry: &'a SystemMemoryTelemetry,
+    /// The terminal 4×4 benchmark grid (the wire's unmeasured `N/A`
+    /// cells are the honest `0.0`); `null` before the first completed
+    /// run.
+    bench: Option<&'a BenchmarkGrid>,
+}
+
+/// F3: write one telemetry + benchmark snapshot to `path` as pretty
+/// JSON.
 ///
-/// Serializes the reused wire root (`SystemMemoryTelemetry` is
-/// serde-derived since P3-06 — no type duplication, D2). A JSON
-/// failure maps to [`GuiError::Json`], a file write to [`GuiError::Io`].
-pub fn export_json(telemetry: &SystemMemoryTelemetry, path: &Path) -> Result<(), GuiError> {
-    let json = serde_json::to_string_pretty(telemetry)
+/// The wire root (`SystemMemoryTelemetry`, serde-derived since P3-06)
+/// serializes under its own seven wire keys, and the terminal
+/// [`BenchmarkGrid`] rides alongside it under the `bench` key (C6-29,
+/// item 8b): the grid object when a run has completed, the JSON
+/// `null` before the first run. Both absent-grid shapes — no run yet
+/// (`None`) and the all-`0.0`/`N/A` grid — export as-is, never a
+/// panic (D5). A JSON failure maps to [`GuiError::Json`], a file
+/// write to [`GuiError::Io`].
+pub fn export_json(
+    telemetry: &SystemMemoryTelemetry,
+    bench: Option<&BenchmarkGrid>,
+    path: &Path,
+) -> Result<(), GuiError> {
+    let snapshot = ExportSnapshot { telemetry, bench };
+    let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|err| GuiError::Json(err.to_string()))?;
     std::fs::write(path, json).map_err(GuiError::Io)?;
     Ok(())
@@ -564,15 +592,21 @@ mod tests {
         assert_ne!(style.visuals.panel_fill, egui::Visuals::dark().panel_fill);
     }
 
-    /// (b) `export_json` on a live snapshot writes a file that parses
-    /// back as a JSON object with the snapshot's seven wire keys (the Cycle 6
-    /// shape: cpu / amd / intel / spd / platform / total_capacity /
-    /// dimm_sizes), and round-trips into an equal `SystemMemoryTelemetry`.
+    /// (b) `export_json` on a live snapshot + terminal grid writes a
+    /// file that parses back as a JSON object with the snapshot's
+    /// eight wire keys (the seven Cycle 6 telemetry keys: cpu / amd /
+    /// intel / spd / platform / total_capacity / dimm_sizes — plus
+    /// the C6-29 `bench` key), with the telemetry sub-object
+    /// byte-compatible with the pre-C6-29 file and the `bench` key
+    /// round-tripping into an equal `BenchmarkGrid`; the whole file
+    /// still re-parses into an equal `SystemMemoryTelemetry` (the
+    /// wire root ignores the extra `bench` key).
     #[test]
     fn export_json_writes_parseable_snapshot() {
         let telemetry = ramsleuth_telemetry::collect();
+        let grid = fixture_grid();
         let path = temp_path("export.json");
-        export_json(&telemetry, &path)
+        export_json(&telemetry, Some(&grid), &path)
             .expect("export_json must not fail for a writable temp path");
 
         let text = std::fs::read_to_string(&path).expect("the exported file must exist");
@@ -584,14 +618,28 @@ mod tests {
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        let expected: std::collections::BTreeSet<String> =
-            ["amd", "cpu", "intel", "spd", "platform", "total_capacity", "dimm_sizes"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect();
+        let expected: std::collections::BTreeSet<String> = [
+            "amd", "bench", "cpu", "intel", "spd", "platform", "total_capacity", "dimm_sizes",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         assert_eq!(keys, expected);
 
-        // The wire root is serde round-trip safe (P3-06).
+        // The C6-29 `bench` key carries the grid verbatim.
+        let back_grid: BenchmarkGrid =
+            serde_json::from_value(value["bench"].clone()).expect("bench must re-parse into the grid");
+        assert_eq!(back_grid, grid);
+
+        // The telemetry sub-object is byte-compatible: every one of
+        // the seven wire keys matches the pre-C6-29 serialization.
+        let base = serde_json::to_value(&telemetry).expect("the wire root must serialize");
+        for key in ["cpu", "amd", "intel", "spd", "platform", "total_capacity", "dimm_sizes"] {
+            assert_eq!(value[key], base[key], "the {key} key must stay byte-compatible");
+        }
+
+        // The wire root is serde round-trip safe (P3-06); the extra
+        // `bench` key is ignored on the way back.
         let back: SystemMemoryTelemetry =
             serde_json::from_str(&text).expect("the file must re-parse into the wire root");
         assert_eq!(back, telemetry);
@@ -662,8 +710,60 @@ mod tests {
     fn export_json_maps_write_failure_to_io() {
         let telemetry = ramsleuth_telemetry::collect();
         let path = temp_path("no-such-dir.json");
-        let err = export_json(&telemetry, &path.join("missing-dir")).expect_err("a missing parent dir must fail");
+        let err = export_json(&telemetry, None, &path.join("missing-dir")).expect_err("a missing parent dir must fail");
         assert!(matches!(err, GuiError::Io(_)), "a missing parent dir must map to Io, got {err:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (b2) `bench` is `None` (no run has completed yet) → the
+    /// `bench` key is the JSON `null`: the snapshot shape stays stable
+    /// and parseable, the telemetry sub-object is untouched, never a
+    /// panic.
+    #[test]
+    fn export_json_bench_none_is_null() {
+        let telemetry = ramsleuth_telemetry::collect();
+        let path = temp_path("export-nobench.json");
+        export_json(&telemetry, None, &path)
+            .expect("export_json must not fail for a writable temp path");
+
+        let text = std::fs::read_to_string(&path).expect("the exported file must exist");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("export must be valid JSON");
+        assert!(value.is_object(), "a snapshot must serialize to a JSON object");
+        assert!(
+            value["bench"].is_null(),
+            "no run yet must export `bench: null`, got: {}",
+            value["bench"]
+        );
+
+        let back: SystemMemoryTelemetry =
+            serde_json::from_str(&text).expect("the file must re-parse into the wire root");
+        assert_eq!(back, telemetry);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (b3) The all-`N/A` grid (every cell `0.0` — the wire's
+    /// unmeasured marker) exports as-is: the `bench` object
+    /// round-trips into the same zero grid, never a panic.
+    #[test]
+    fn export_json_all_na_grid_exports_as_is() {
+        let telemetry = ramsleuth_telemetry::collect();
+        let grid = BenchmarkGrid {
+            read_gbps: [0.0; 4],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [0.0; 4],
+        };
+        let path = temp_path("export-nagrid.json");
+        export_json(&telemetry, Some(&grid), &path)
+            .expect("export_json must not fail for a writable temp path");
+
+        let text = std::fs::read_to_string(&path).expect("the exported file must exist");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("export must be valid JSON");
+        let back_grid: BenchmarkGrid =
+            serde_json::from_value(value["bench"].clone()).expect("bench must re-parse into the grid");
+        assert_eq!(back_grid, grid, "the all-N/A grid must export as-is");
+
         let _ = std::fs::remove_file(&path);
     }
 

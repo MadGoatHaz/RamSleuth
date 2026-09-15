@@ -198,8 +198,10 @@ fn unix_timestamp() -> u64 {
 /// `SnapshotPng` writes the current benchmark grid — with the CPU /
 /// RAM header lines over it (C6-28) — to
 /// `ramsleuth-snapshot-<unix-ts>.png` (via [`snapshot_png`]) and
-/// `ExportJson` writes the current telemetry snapshot to
-/// `ramsleuth-export-<unix-ts>.json` (via [`export_json`]) — both into
+/// `ExportJson` writes the current telemetry snapshot + the terminal
+/// benchmark grid (the `bench` key — the JSON `null` before the
+/// first completed run, C6-29) to `ramsleuth-export-<unix-ts>.json`
+/// (via [`export_json`]) — both into
 /// `out_dir` (the app uses `$HOME`), returning the written path. An
 /// action with nothing to export (no grid yet / no telemetry yet), or
 /// `Quit` / `None`, returns `Ok(None)` (no file).
@@ -227,7 +229,7 @@ pub fn perform_export(
         GuiAction::ExportJson => match &data.telemetry {
             Some(telemetry) => {
                 let path = out_dir.join(format!("ramsleuth-export-{ts}.json"));
-                export_json(telemetry, &path)?;
+                export_json(telemetry, data.bench.grid.as_ref(), &path)?;
                 Ok(Some(path))
             }
             None => Ok(None),
@@ -823,12 +825,14 @@ mod tests {
 
     /// (b) `ExportJson` with telemetry set → a JSON file is written to
     /// the out dir, `Ok(Some(path))`, the file exists + parses as a
-    /// JSON object.
+    /// JSON object carrying the terminal grid under the `bench` key
+    /// (C6-29 — the grid is exported alongside the telemetry).
     #[test]
     fn perform_export_json_writes_and_parses() {
         let dir = temp_out_dir("export");
         let data = TelemetryData {
             telemetry: Some(ramsleuth_telemetry::collect()),
+            bench: BenchState { grid: Some(fixture_grid()), ..Default::default() },
             ..Default::default()
         };
 
@@ -844,6 +848,11 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&text).expect("the export must be valid JSON");
         assert!(value.is_object(), "a snapshot must serialize to a JSON object");
+        assert!(
+            value["bench"].is_object(),
+            "a completed run must export the bench grid object, got: {}",
+            value["bench"]
+        );
 
         fs::remove_dir_all(&dir).expect("cleanup");
     }
