@@ -22,12 +22,14 @@
 //!   `Arc<RwLock<TelemetryData>>` and repaints on a 16 ms cadence
 //!   (~60 FPS).
 //! - **No render-thread I/O (plan D6):** the background
-//!   [`spawn_poller`] thread (P3-26) owns the daemon socket — the 2 s
-//!   telemetry cadence and the benchmark stream run there; the render
-//!   loop only reads the state. The status zone's [`GuiAction`] is the
-//!   one side effect the render loop performs: F2 / F3 run
-//!   [`perform_export`] (a one-shot file write) and Q sets the stop
-//!   flag + closes the viewport.
+//!   [`spawn_poller`] thread (P3-26) owns the daemon socket — the
+//!   telemetry cadence (the live settings knob, default 2 s — C6-27)
+//!   and the benchmark stream run there; the render loop only reads
+//!   the state (the settings panel's knob write — C6-30 — is the one
+//!   permitted render-thread mutation: no I/O). The status zone's
+//!   [`GuiAction`] is the one side effect the render loop performs:
+//!   F2 / F3 run [`perform_export`] (a one-shot file write) and Q
+//!   sets the stop flag + closes the viewport.
 //!
 //! **No-panic contract (plan D5):** a missing daemon never crashes the
 //! GUI — the poller records the friendly error in the state (the
@@ -40,7 +42,8 @@
 //! daemon running (`cargo run -p ramsleuth-daemon -- --socket
 //! /tmp/ramsleuth.sock`), `cargo run -p ramsleuth-gui -- --socket
 //! /tmp/ramsleuth.sock` opens the 1400×900 window with all three zones
-//! live (values update every ~2 s); F2 writes
+//! live (values update at the configured poll interval, default
+//! ~2 s); F2 writes
 //! `ramsleuth-snapshot-<unix-ts>.png`, F3 writes
 //! `ramsleuth-export-<unix-ts>.json` to `$HOME` (the transient notice
 //! carries the path); Q (or the window close button) exits cleanly.
@@ -268,8 +271,13 @@ fn notice_color(text: &str) -> egui::Color32 {
 /// channel, the stop / cancel flags, the export dir, the poller
 /// thread, and the transient header notice.
 struct RamSleuthApp {
-    /// The shared presentation state — the background poller is its
-    /// only writer; the render loop only ever takes a brief read (D6).
+    /// The shared presentation state — includes the in-memory
+    /// `GuiSettings` knobs (C6-26 / C6-27: the poll cadence + refresh
+    /// gate live here; the poller re-reads them every tick, and the
+    /// settings panel — C6-30 — is the render thread's one permitted
+    /// write: no I/O, D6). The background poller is the only writer
+    /// of the data fields; the render loop only ever takes a brief
+    /// read.
     state: Arc<RwLock<TelemetryData>>,
     /// The poller's benchmark channel (the bench zone's run buttons
     /// send into it; the poller owns the socket).
@@ -680,7 +688,9 @@ fn main() -> ExitCode {
     };
 
     // 2. The shared state + the two flags (the poller is the state's
-    //    only writer; the bench zone + the poller share the flags).
+    //    data fields' only writer — the settings knobs' one
+    //    render-thread write is the exception, C6-27; the bench zone
+    //    + the poller share the flags).
     let state = Arc::new(RwLock::new(TelemetryData::default()));
     let (bench_tx, bench_rx) = std::sync::mpsc::channel::<BenchCmd>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -691,7 +701,8 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| PathBuf::from("."));
 
     // 3. The background poller: the GUI's only daemon connection (D6)
-    //    — the 2 s telemetry cadence + the benchmark stream.
+    //    — the telemetry cadence (the live settings knob, default 2 s
+    //    — C6-27) + the benchmark stream.
     let poller = spawn_poller(
         args.socket.clone(),
         state.clone(),
