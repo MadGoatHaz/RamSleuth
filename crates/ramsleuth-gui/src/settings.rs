@@ -13,13 +13,14 @@
 //! (`Default` covers the no-flag case with the protocol's
 //! [`DEFAULT_SOCKET_PATH`]).
 //!
-//! **Not yet wired (C6-27 / C6-30):** the poller still runs the fixed
-//! `update`-crate `TELEMETRY_INTERVAL` and the layout does not show
-//! this panel yet — those chunks consume this state (`TelemetryData`
-//! gains the settings, the poller reads the live
-//! `poll_interval_ms` / `refresh_enabled` per tick, the zones use the
-//! unit formatters, the app shell shows [`render_settings_panel`] in
-//! the settings area and seeds `socket` from the CLI).
+//! **Wired (C6-27 / C6-30):** `TelemetryData` carries this state
+//! (`settings`), the poller re-reads the live `poll_interval_ms` /
+//! `refresh_enabled` knobs per tick (C6-27), and the app shell
+//! (C6-30) shows [`render_settings_panel`] in the header's settings
+//! strip, seeds `socket` from the CLI `--socket`, and re-reads the
+//! `socket` knob live per poll / bench cycle. The zones' `Units` /
+//! `Theme` formatters remain a follow-up (the knobs are editable,
+//! not yet consumed by the zone renderers).
 //!
 //! **No-panic contract (D5):** the pure helpers here (the unit
 //! formatters) degrade non-finite inputs to the honest `N/A` text —
@@ -28,9 +29,10 @@
 
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 
-/// The default telemetry poll cadence in milliseconds — the current
-/// fixed `TELEMETRY_INTERVAL` (2 s) as the [`GuiSettings::default`]
-/// knob value (C6-27 reads the live knob per tick).
+/// The default telemetry poll cadence in milliseconds — the
+/// pre-C6-27 fixed `TELEMETRY_INTERVAL` (2 s, since removed) as the
+/// [`GuiSettings::default`] knob value (the poller reads the live
+/// knob per tick, C6-27).
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 2000;
 
 /// The binary → decimal capacity conversion factor (1 GiB =
@@ -101,11 +103,13 @@ pub enum Theme {
 /// case with the protocol's [`DEFAULT_SOCKET_PATH`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GuiSettings {
-    /// The daemon Unix socket to connect to (the CLI `--socket`).
+    /// The daemon Unix socket to connect to (seeded from the CLI
+    /// `--socket`; the poller reads it live per poll / bench cycle —
+    /// C6-30, the settings panel edits it).
     pub socket: String,
-    /// The telemetry poll cadence in milliseconds (the fixed
-    /// `TELEMETRY_INTERVAL` knob-ized — C6-27 reads the live value
-    /// per tick).
+    /// The telemetry poll cadence in milliseconds (the pre-C6-27
+    /// fixed `TELEMETRY_INTERVAL` knob-ized — the poller reads the
+    /// live value per tick, C6-27).
     pub poll_interval_ms: u64,
     /// The display units (capacity GiB/GB, clock MHz/GHz).
     pub units: Units,
