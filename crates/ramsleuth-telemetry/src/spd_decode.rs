@@ -21,10 +21,12 @@
 //! | `0x13`                                 | SDRAM density (code -> Gb)                         |
 //! | `0x20`                                 | Minimum data rate, in 100 MT/s units               |
 //! | `0x80`                                 | Rank config: bits 7:4 total DRAM devices, bits 3:0 per rank |
-//! | `0x81..0x91`                           | Module part number (16 ASCII chars)                |
+//! | `0x81..0x91` (DDR2/DDR3)               | Module part number (16 ASCII chars)                |
+//! | `0x149..0x15D` (DDR4)                 | Module part number (20 ASCII chars; falls back to `0x81..0x91` when present-but-blank) |
+//! | `0x200..0x220` (DDR5)                 | Module part number (32 ASCII chars)                |
 //! | `0x91..0xA1`                           | Module serial number (16 ASCII chars)              |
 //! | `0xD0` / `0xF0` (DDR4)                 | XMP 2.0 profiles 1/2 (32-byte blocks)              |
-//! | `0x200..0x300` (DDR5)                  | XMP 3.0 / EXPO region (256 B; four 32-byte blocks at `+16+32n`) |
+//! | `0x200..0x300` (DDR5)                  | XMP 3.0 / EXPO region (256 B; four 32-byte blocks at `+16+32n`) — collides with the DDR5 part number at `0x200` (C7-03 moves the base to `0x300`) |
 //!
 //! DDR5 byte `0x13` / `0x20` / `0x80` encodings are a documented
 //! P2-04-style model (the live test host is DDR4); live reconciliation
@@ -93,10 +95,20 @@ const BYTE_BASE_SPEED: usize = 0x20;
 /// Byte `0x80`: rank config (bits 7:4 total devices / bits 3:0 per rank).
 const BYTE_RANK_CONFIG: usize = 0x80;
 
-/// `0x81..=0x90`: module part number (16 ASCII chars).
+/// `0x81..=0x90`: module part number (16 ASCII chars) — the DDR2/DDR3
+/// location, and the DDR4 fallback when the DDR4 primary (`0x149`) is
+/// present-but-blank.
 const PART_START: usize = 0x81;
-/// Part-number field length in bytes.
+/// Part-number field length in bytes at `PART_START` (16).
 const PART_LEN: usize = 16;
+/// `0x149..=0x15C`: DDR4 module part number (20 ASCII chars, JESD79-4).
+const DDR4_PART_START: usize = 0x149;
+/// DDR4 part-number field length in bytes (20).
+const DDR4_PART_LEN: usize = 20;
+/// `0x200..=0x21F`: DDR5 module part number (32 ASCII chars, JESD79-5).
+const DDR5_PART_START: usize = 0x200;
+/// DDR5 part-number field length in bytes (32).
+const DDR5_PART_LEN: usize = 32;
 /// `0x91..=0xA0`: module serial number (16 ASCII chars).
 const SERIAL_START: usize = 0x91;
 /// Serial-number field length in bytes.
@@ -189,7 +201,10 @@ pub struct SpdModule {
     /// the rank config is absent or invalid (the same gating as
     /// [`rank`]).
     pub devices: Section<u8>,
-    /// Module part number (bytes `0x81..0x91`, 16 ASCII chars).
+    /// Module part number, generation-scoped (C7-02): DDR2/DDR3
+    /// `0x81..0x91` (16 ASCII chars); DDR4 `0x149..0x15D` (20 chars,
+    /// falling back to `0x81..0x91` when present-but-blank); DDR5
+    /// `0x200..0x220` (32 chars).
     pub part: Section<String>,
     /// Module serial number (bytes `0x91..0xA1`, 16 ASCII chars).
     pub serial: Section<String>,
@@ -223,7 +238,7 @@ pub fn decode(image: &SpdImage) -> SpdModule {
         // (C6-02).
         die_type: Section::na(NaReason::NotApplicable),
         devices: decode_devices(data),
-        part: decode_ascii(data, PART_START, PART_LEN, "part number"),
+        part: decode_part(data, is_ddr5),
         serial: decode_ascii(data, SERIAL_START, SERIAL_LEN, "serial number"),
         rank: decode_rank(data),
         density_mbit: decode_density(data, is_ddr5),
@@ -354,6 +369,47 @@ fn decode_ascii(data: &[u8], start: usize, len: usize, what: &str) -> Section<St
         Section::na(NaReason::NotApplicable)
     } else {
         Section::Value(s)
+    }
+}
+
+/// The memory-type code (byte `0x00`, bits 4:0), or `None` when the byte
+/// is outside the image bounds.
+fn memory_type(data: &[u8]) -> Option<u8> {
+    get(data, BYTE_MEMORY_TYPE).map(|b| b & 0x1F)
+}
+
+/// `true` when the module's memory-type byte is DDR4 (`0x0A`); `false`
+/// for DDR2/DDR3 codes, unrecognized codes, or an out-of-bounds header
+/// (those classify to the legacy `0x81` part location on the not-DDR5
+/// path).
+fn is_ddr4(data: &[u8]) -> bool {
+    memory_type(data) == Some(MEM_TYPE_DDR4)
+}
+
+/// Decode the module part number, generation-scoped (C7-02):
+/// - DDR5 (JESD79-5): the 32-char field at `0x200..0x220`;
+/// - DDR4 (JESD79-4): the 20-char field at `0x149..0x15D`, falling back
+///   to the 16-char field at `0x81..0x91` when the `0x149` region is
+///   present-but-blank; a truncated image (the `0x149` region out of
+///   bounds) keeps its own `Na(ParseError)` rather than the fallback's;
+/// - DDR2/DDR3 (everything else the classifier does not call DDR5): the
+///   16-char field at `0x81..0x91`, unchanged.
+///
+/// Reuses [`decode_ascii`]; never panics.
+fn decode_part(data: &[u8], is_ddr5: bool) -> Section<String> {
+    if is_ddr5 {
+        decode_ascii(data, DDR5_PART_START, DDR5_PART_LEN, "part number")
+    } else if is_ddr4(data) {
+        let primary = decode_ascii(data, DDR4_PART_START, DDR4_PART_LEN, "part number");
+        if matches!(&primary, Section::Na(NaReason::NotApplicable)) {
+            // The 0x149 region is present but blank: the part is recorded
+            // at the legacy 0x81 location instead.
+            decode_ascii(data, PART_START, PART_LEN, "part number")
+        } else {
+            primary
+        }
+    } else {
+        decode_ascii(data, PART_START, PART_LEN, "part number")
     }
 }
 
@@ -680,8 +736,9 @@ mod tests {
         data[0x20] = 0x14;
         // Rank config: 8 total devices, 4 per rank -> 2 ranks.
         data[0x80] = 0x84;
-        // 16-char ASCII part/serial (null-terminated fields).
-        data[0x81..0x81 + 15].copy_from_slice(b"MPK24168BC320G6");
+        // DDR4 part at 0x149 (20-char field, JESD79-4) + serial at 0x91
+        // (null-terminated fields).
+        data[0x149..0x149 + 15].copy_from_slice(b"MPK24168BC320G6");
         data[0x91..0x91 + 15].copy_from_slice(b"0ABCD123456789X");
         // XMP 2.0 slot 1 @ 0xD0: rev 0x0A, 200 MT/s, CL/tRCD/tRP/tRAS =
         // 16/16/16/34, 1350 mV, valid structure checksum.
@@ -720,22 +777,27 @@ mod tests {
         data[0x20] = 0x40;
         // Rank config: 8 total devices, 8 per rank -> 1 rank.
         data[0x80] = 0x88;
-        data[0x81..0x81 + 13].copy_from_slice(b"S5H1G8719011A");
+        // DDR5 part at 0x200 (32-char field, JESD79-5) + serial at 0x91.
+        data[0x200..0x200 + 13].copy_from_slice(b"S5H1G8719011A");
         data[0x91..0x91 + 16].copy_from_slice(b"2208ABCDEF123456");
-        // XMP 3.0 / EXPO region @ 0x200: rev 0x30 + "XMP" signature @ +2.
-        data[0x200] = XMP3_REVISION;
-        data[0x202..0x205].copy_from_slice(&XMP3_SIGNATURE);
-        // Profile 0 @ 0x210: index 0, validity mask 1, 256 MT/s,
+        // XMP 3.0 / EXPO region relocated to 0x300 (its JESD79-5 home) to
+        // make room for the part number at 0x200 (C7-02). The production
+        // XMP3_BASE is still 0x200, so the region is not decoded until
+        // C7-03 moves the base to 0x300 (the collision this fixture
+        // records).
+        data[0x300] = XMP3_REVISION; // rev 0x30 + "XMP" signature @ +2
+        data[0x302..0x305].copy_from_slice(&XMP3_SIGNATURE);
+        // Profile 0 @ 0x310: index 0, validity mask 1, 256 MT/s,
         // CL/tRCD/tRP/tRAS = 20/20/20/40, 1250 mV.
-        data[0x210] = 0x00;
-        data[0x211] = 0x01;
-        data[0x212] = 0x80; // 128 MHz -> 256 MT/s
-        data[0x214] = 20;
-        data[0x215] = 20;
-        data[0x216] = 20;
-        data[0x217] = 40;
-        data[0x223] = 0xE2; // 1250 mV little-endian (block 19/20)
-        data[0x224] = 0x04;
+        data[0x310] = 0x00;
+        data[0x311] = 0x01;
+        data[0x312] = 0x80; // 128 MHz -> 256 MT/s
+        data[0x314] = 20;
+        data[0x315] = 20;
+        data[0x316] = 20;
+        data[0x317] = 40;
+        data[0x323] = 0xE2; // 1250 mV little-endian (block 19/20)
+        data[0x324] = 0x04;
         SpdImage {
             index: 0x53,
             data,
@@ -760,9 +822,9 @@ mod tests {
         data[0x20] = 0x20;
         // Rank config: 1 total device, 1 per rank -> 1 rank.
         data[0x80] = 0x11;
-        // The live part number: 16 ASCII chars, filling the whole
-        // 16-byte field (the live image NUL-pads it at the field end).
-        data[0x81..0x81 + 16].copy_from_slice(b"F4-3600C18-32GVK");
+        // The live part number: 16 ASCII chars in the DDR4 20-char field
+        // at 0x149 (JESD79-4; the live image NUL-pads the field end).
+        data[0x149..0x149 + 16].copy_from_slice(b"F4-3600C18-32GVK");
         // Serial is blank on the live module -> Na(NotApplicable).
         SpdImage {
             index: 0x52,
@@ -808,8 +870,10 @@ mod tests {
     // (b) Synthetic DDR5 decode.
     // ------------------------------------------------------------------
 
-    /// The synthetic DDR5 image decodes to full ground truth, including the
-    /// XMP 3.0 / EXPO profile block.
+    /// The synthetic DDR5 image decodes to full ground truth; the part now
+    /// sits at `0x200` (C7-02). The XMP 3.0 / EXPO profile block is
+    /// relocated to `0x300` in the fixture and is not decoded until C7-03
+    /// moves `XMP3_BASE` there.
     #[test]
     fn synthetic_ddr5_decodes_to_ground_truth() {
         let m = decode(&ddr5_image());
@@ -826,15 +890,16 @@ mod tests {
         assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
         assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
         assert_eq!(m.devices, Section::Value(8));
-        assert_eq!(m.profiles.len(), 1, "profile 0 valid, the rest blank");
-        let p = &m.profiles[0];
-        assert_eq!(p.index, 0);
-        assert_eq!(p.speed_mts, Section::Value(256));
-        assert_eq!(p.cas, Section::Value(20));
-        assert_eq!(p.trcd, Section::Value(20));
-        assert_eq!(p.trp, Section::Value(20));
-        assert_eq!(p.tras, Section::Value(40));
-        assert_eq!(p.voltage, Section::Value(1250));
+        // C7-02 tension (C7-03 resolves it): the fixture's XMP 3.0 region
+        // sits at 0x300 to make room for the part at 0x200, but the
+        // production XMP3_BASE is still 0x200, so the profile decode reads
+        // the part region and yields no profiles until C7-03 moves the
+        // base to 0x300 (restoring this region's ground-truth
+        // assertions).
+        assert!(
+            m.profiles.is_empty(),
+            "XMP3 region is at 0x300 but XMP3_BASE is still 0x200 (C7-02 -> C7-03)"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1299,6 +1364,69 @@ mod tests {
         });
         assert!(matches!(m.devices, Section::Na(NaReason::ParseError(_))));
         assert!(matches!(m.rank, Section::Na(NaReason::ParseError(_))));
+    }
+
+    // ------------------------------------------------------------------
+    // (i) C7-02: per-generation part-number decode.
+    // ------------------------------------------------------------------
+
+    /// DDR4: the 20-char part at `0x149` (JESD79-4) decodes in full.
+    #[test]
+    fn ddr4_part_20_chars_at_0x149_decodes() {
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A; // DDR4 signature
+        data[0x149..0x149 + 20].copy_from_slice(b"ABCDEFGHIJKLMNOPQRST");
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert!(!m.is_ddr5);
+        assert_eq!(m.part, Section::Value("ABCDEFGHIJKLMNOPQRST".to_owned()));
+    }
+
+    /// DDR4 fallback: when the `0x149` region is present-but-blank, the
+    /// decoder falls back to the legacy `0x81` location.
+    #[test]
+    fn ddr4_part_falls_back_to_0x81_when_0x149_blank() {
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A; // DDR4 signature; 0x149..0x15D left blank
+        data[0x81..0x81 + 12].copy_from_slice(b"FALLBACK0123");
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert_eq!(m.part, Section::Value("FALLBACK0123".to_owned()));
+    }
+
+    /// DDR5: the 32-char part at `0x200` (JESD79-5) decodes in full.
+    #[test]
+    fn ddr5_part_32_chars_at_0x200_decodes() {
+        let mut data = vec![0u8; 1024];
+        data[0x00] = 0x0C; // DDR5 signature
+        data[0x200..0x200 + 32].copy_from_slice(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345");
+        let m = decode(&SpdImage { index: 0x51, data });
+        assert!(m.is_ddr5);
+        assert_eq!(
+            m.part,
+            Section::Value("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345".to_owned())
+        );
+    }
+
+    /// DDR3 (memory type `0x02`): the part stays at the unchanged
+    /// 16-char `0x81` location.
+    #[test]
+    fn ddr3_part_16_chars_at_0x81_unchanged() {
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x02; // DDR3 memory type (not DDR4 0x0A / DDR5 0x0C)
+        data[0x81..0x81 + 16].copy_from_slice(b"DDR3PART12345678");
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert!(!m.is_ddr5);
+        assert_eq!(m.part, Section::Value("DDR3PART12345678".to_owned()));
+    }
+
+    /// A DDR4 module whose `0x149` primary is present-but-blank and whose
+    /// `0x81` fallback is also blank degrades to `Na(NotApplicable)`
+    /// (never a panic).
+    #[test]
+    fn ddr4_part_blank_primary_and_fallback_is_not_applicable() {
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A; // DDR4 signature; both part regions left blank
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert_eq!(m.part, Section::Na(NaReason::NotApplicable));
     }
 }
 
