@@ -455,6 +455,7 @@ mod tests {
             div_mode: 0,
             gdm: 1,
             pdm: 0,
+            command_rate: 0,
             timings: AmdPmTimings {
                 cl: 16,
                 rcwdwr: 16,

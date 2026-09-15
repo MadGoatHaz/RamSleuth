@@ -7,14 +7,14 @@
 //!   (derived: `UCLK == MCLK` → 1:1 coupled, otherwise 1:2);
 //! - **Voltage** — VDDCR_SOC (mV, converted from the table's volt unit).
 //!
-//! The remaining fields of the frozen snapshot shape (GDM / PDM mode
-//! flags, the 27 DRAM subtimings, the 8 CAD-bus codes, VDDIO_MEM /
-//! VDD_MISC / VPP) are **not present in this table** on the verified
-//! driver model (P5-15): [`parse`] sets them to `0`, which degrades to an
-//! honest `Disabled` / `N/A` under P2-05's sanity gates (code `0` →
-//! `Disabled`/`NotApplicable`, `0` ticks/mV → out-of-band Na). Display
-//! mapping (code→Ω, mV→V, ratio computation, sanity ranges) belongs to
-//! P2-05 (`amd_readout.rs`).
+//! The remaining fields of the frozen snapshot shape (GDM / PDM /
+//! command-rate mode flags, the 27 DRAM subtimings, the 8 CAD-bus codes,
+//! VDDIO_MEM / VDD_MISC / VPP) are **not present in this table** on the
+//! verified driver model (P5-15): [`parse`] sets them to `0`, which
+//! degrades to an honest `Disabled` / `N/A` under P2-05's sanity gates
+//! (code `0` → `Disabled`/`NotApplicable`, `0` ticks/mV → out-of-band
+//! Na). Display mapping (code→Ω, mV→V, ratio computation, sanity
+//! ranges) belongs to P2-05 (`amd_readout.rs`).
 //!
 //! # Version guard (P5-15 reconciliation)
 //!
@@ -249,6 +249,8 @@ pub struct AmdPmSnapshot {
     pub gdm: u8,
     /// Power Down Mode: `0` = off, `1` = on.
     pub pdm: u8,
+    /// DRAM command rate: `0` = 1T, `1` = 2T.
+    pub command_rate: u8,
     /// DRAM subtimings in ticks (19 primary + 8 tertiary).
     pub timings: AmdPmTimings,
     /// CAD-bus raw RZQ/driver codes.
@@ -311,9 +313,9 @@ fn to_u16(v: f32) -> u16 {
 /// Fields: FCLK / UCLK / MCLK (MHz, f32 at [`FCLK_OFF`] / [`UCLK_OFF`] /
 /// [`MCLK_OFF`], rounded to integer MHz) and VDDCR_SOC (volts, f32 at
 /// [`VDDCR_SOC_OFF`], ×1000 → mV). The divide mode is derived (`UCLK ==
-/// MCLK` → 1:1, else 1:2). GDM / PDM, the 27 timings, the 8 CAD codes,
-/// and the other three voltages are not present in this table → `0`
-/// (honest Na / Disabled under the P2-05 gates).
+/// MCLK` → 1:1, else 1:2). GDM / PDM / command rate, the 27 timings,
+/// the 8 CAD codes, and the other three voltages are not present in
+/// this table → `0` (honest Na / Disabled under the P2-05 gates).
 ///
 /// Pure: no I/O, no `unsafe`, no panic on any input (non-finite floats
 /// and negative values degrade to `0`).
@@ -346,10 +348,12 @@ pub fn parse(ctx: &SmuContext) -> TelemetryResult<AmdPmSnapshot> {
         // DivMode is derived, not stored: coupled (1:1) when UCLK ==
         // MCLK, 1:2 otherwise.
         div_mode: u8::from(uclk != mclk),
-        // GDM / PDM are not present in this table: `0` degrades to an
-        // honest "Disabled" under the P2-05 mode-flag gate.
+        // GDM / PDM / command rate are not present in this table (SMN
+        // overlay slots, like `gdm`): `0` degrades to an honest
+        // "Disabled" / 1T under the P2-05 gates.
         gdm: 0,
         pdm: 0,
+        command_rate: 0,
         // The 27 DRAM subtimings are not present in this table: `0`
         // ticks degrade to an honest Na under the P2-05 timing gate.
         timings: AmdPmTimings {
@@ -447,6 +451,7 @@ mod tests {
             div_mode,
             gdm: 0,
             pdm: 0,
+            command_rate: 0,
             timings: AmdPmTimings {
                 cl: 0,
                 rcwdwr: 0,
@@ -585,6 +590,21 @@ mod tests {
             parse(&ctx),
             Ok(known_snapshot(V_MATISSE, 1200, 1200, 1200, 0, 900))
         );
+    }
+
+    /// (d) The `command_rate` raw slot (mirroring the `gdm` / `pdm`
+    /// pattern): `parse` leaves it `0` — it is an SMN field (`0x50200`
+    /// bit 10), not a PM-table field — and the snapshot carries it.
+    #[test]
+    fn parse_zeroes_command_rate_like_gdm_and_pdm() {
+        let ctx = SmuContext {
+            version: V_VERMEER,
+            pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05),
+        };
+        let snap = parse(&ctx).expect("synthetic blob must parse");
+        assert_eq!(snap.command_rate, 0);
+        assert_eq!(snap.gdm, 0);
+        assert_eq!(snap.pdm, 0);
     }
 
     /// (e) Non-finite floats (NaN / ±inf) at any field offset degrade to
