@@ -297,6 +297,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
+    use ramsleuth_telemetry::SystemPlatform;
 
     use super::*;
 
@@ -307,6 +308,9 @@ mod tests {
             index: 0x52,
             is_ddr5: false,
             maker: Section::Value("Samsung".to_owned()),
+            die_maker: Section::Value("SK hynix".to_owned()),
+            die_type: Section::na(NaReason::NotApplicable),
+            devices: Section::Value(8),
             part: Section::Value("M391A2K40DB".to_owned()),
             serial: Section::na(NaReason::NotApplicable),
             rank: Section::Value(2),
@@ -331,6 +335,9 @@ mod tests {
             index: 0x53,
             is_ddr5: true,
             maker: Section::na(NaReason::DriverMissing),
+            die_maker: Section::na(NaReason::NotApplicable),
+            die_type: Section::na(NaReason::NotApplicable),
+            devices: Section::na(NaReason::NotApplicable),
             part: Section::na(NaReason::ParseError(
                 "part number: byte 0x81 outside image bounds".to_owned(),
             )),
@@ -363,6 +370,16 @@ mod tests {
             amd: Section::na(NaReason::NotApplicable),
             intel: Section::na(NaReason::NotApplicable),
             spd: vec![fixture_module(), all_na_module()],
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3500.0),
+                motherboard: Section::Value("Test Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            // Parallel to spd (C6-06): module 0 is 16384 Mbit x 8 devices = 16 GiB;
+            // module 1 density is Na, so its entry carries the offending source reason.
+            total_capacity: Section::Value(16.0),
+            dimm_sizes: vec![Section::Value(16.0), Section::na(NaReason::UnknownPmTableVersion)],
         }
     }
 
@@ -376,6 +393,14 @@ mod tests {
             amd: Section::na(NaReason::DriverMissing),
             intel: Section::na(NaReason::DriverMissing),
             spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
         }
     }
 
@@ -389,6 +414,14 @@ mod tests {
             amd: Section::na(NaReason::DriverMissing),
             intel: Section::na(NaReason::DriverMissing),
             spd: vec![all_na_module()],
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: vec![Section::na(NaReason::UnknownPmTableVersion)],
         }
     }
 

@@ -283,8 +283,9 @@ mod tests {
     }
 
     /// (b) `export_json` on a live snapshot writes a file that parses
-    /// back as a JSON object with the snapshot's four wire keys, and
-    /// round-trips into an equal `SystemMemoryTelemetry`.
+    /// back as a JSON object with the snapshot's seven wire keys (the Cycle 6
+    /// shape: cpu / amd / intel / spd / platform / total_capacity /
+    /// dimm_sizes), and round-trips into an equal `SystemMemoryTelemetry`.
     #[test]
     fn export_json_writes_parseable_snapshot() {
         let telemetry = ramsleuth_telemetry::collect();
@@ -302,7 +303,10 @@ mod tests {
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
         let expected: std::collections::BTreeSet<String> =
-            ["amd", "cpu", "intel", "spd"].into_iter().map(str::to_owned).collect();
+            ["amd", "cpu", "intel", "spd", "platform", "total_capacity", "dimm_sizes"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
         assert_eq!(keys, expected);
 
         // The wire root is serde round-trip safe (P3-06).
