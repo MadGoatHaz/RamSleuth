@@ -2,6 +2,57 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Cycle 6 (Phase 7: GUI Workstream) — 2026-09-15 — COMPLETE
+
+### What was delivered
+The GUI workstream is COMPLETE: **all 29 chunks merged into `v2-development`** — the data-model wave C6-01…C6-19 (C6-08 retired, no branch/worktree) + the GUI wave C6-20…C6-30 — closing **all 8 GUI Gap items** against Grand Design §3.1/§3.2 (`FULLSCOPEvsCOMPLETED.md` §"GUI Gap").
+
+**Data-model / wire (interface freeze):**
+- New `SystemPlatform` (cpu_clock_mhz / motherboard / bios / agesa; DMI+ and `/proc`-sourced; N/A-safe) + `mem_total_gib`.
+- `SystemMemoryTelemetry` += `platform` / `total_capacity` / `dimm_sizes` (per-DIMM = density × devices / 8192; total = Σ dimm_sizes, else `/proc/meminfo`).
+- `SpdModule` += `die_maker` / `die_type` / `devices`.
+- `CommandRate` enum + `ClockReadout.command_rate` (raw 0 → 1T, 1 → 2T, else `Na`; Intel honest `Na`).
+- `AmdPmSnapshot.command_rate` raw slot; `SmnFields.command_rate` (0x50200 bit 10) with `apply_smn` now surfacing gdm + timings + command_rate.
+- Cross-crate test-fixture ripple (C6-09…C6-19) closed the red window introduced by the wire-shape changes; hard workspace gate post-C6-19.
+
+**GUI (egui/eframe, items 1–8):**
+1. 3-line header (platform tag; CPU + motherboard/BIOS/AGESA; RAM total + per-DIMM + channel + sync-mode).
+2. Zone 1 regrouped: 2 sub-columns × 3 section-pairs.
+3. GDM / command-rate row.
+4. Zone 2 per-cell live bench fill.
+5. Zone 3 SPD cards (product line, DRAM die, rank label).
+6. History: 300-sample `RingBuffer` + hand-rolled sparklines (no new dep).
+7. Settings: `GuiSettings` + dynamic clamped poll interval + refresh gate.
+8. Export parity: F2 640×420 validation-card PNG, F3 JSON + bench key, keyboard F2/F3/Q, dynamic socket.
+
+### Key plan decisions
+- **D-C10 (red window):** production-compile-clean per merge; test-fixture red window allowed during the wire freeze, closed by the C6-09…C6-19 ripple, hard workspace gate post-C6-19.
+- **D-C11:** Intel `command_rate` honest `Na` (no hardware slot) — no speculative mapping.
+- Refined circuit-breaker (recorded in `plans/PLAN.md`).
+
+### Quality
+- **452/452 tests green (debug AND release, whole workspace)** — up from 371 at the Cycle 5 close; **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); **MSRV 1.75** held; **6 release binaries** build.
+- **QA verdict: PASS-WITH-MANUAL-LIVE-VERIFY** — all 8 GUI Gap items closed; the operator live run (`plans/CYCLE6-LIVE-CHECKLIST.md`) is the remaining manual gate.
+
+### Push state (operator gate)
+Local `v2-development` tip = **`33dd08b`** — **95 commits ahead of `origin/v2-development` @ `b908f7b`** (the 19 Cycle-5 commits + 76 C6 implementation/merge commits, range `51f4c4f..33dd08b`; Rust delta: 26 `.rs` files, +5850/−508). All **local-only, unpushed** (this compaction performs no push). No remote `branch/chunk-c6-*` branches exist; the **31 merged c6/p6 chunk branches + 29 c6/p6 worktrees were pruned (deleted) at compaction** (all fully merged into `v2-development` — the 23 c6 + 8 p6 branches, 21 c6 + 8 p6 worktrees; the `v2-development` tip `33dd08b` is untouched). On the operator's go-ahead: **fast-forward to `33dd08b` (NEVER force-push) → prune the remote chunk branches → optional `v2.0.0` tag**.
+
+### Follow-ups (non-blocking, deferred)
+1. "q"-focus Quit guard (key-handling edge).
+2. `die_type` label mapping.
+3. Settings XDG persistence.
+4. Zones Units/Theme formatters.
+
+### Open items carried to Cycle 7
+1. **Operator live-run sign-off** — `plans/CYCLE6-LIVE-CHECKLIST.md` (untracked in the working tree): the PASS-WITH-MANUAL-LIVE-VERIFY verdict closes on this manual run.
+2. **Push to GitHub** — operator go-ahead (ff to `33dd08b`, prune the remote chunk branches, optional `v2.0.0` tag; strictly no force-push, no pre-go-ahead remote mutation).
+3. **Intel MCHBAR decode** — hardware-gated (the i5-6600 not yet attached; IMC offsets still SKELETON, P6-06 parked).
+4. **MSRV 1.75 vs 1.89** — operator call (441 lockfile packages all MSRV ≤ 1.75; the CI 1.75 leg is the continuous proof).
+5. **CAD/RTT/drive + PDM SMN bitfields** — unconfirmed in the ryzen_smu driver source → honest N/A; pending driver-side confirmation.
+6. **AIDA64 parity gate** — still deferred to the DDR5-6000 AM5 host (this host is Zen 3 / DDR4).
+
+Cycle 6 close-out (2026-09-15): this compaction recorded the Cycle 6 section in `MASTER_LOG.md` (with the reset `DEV_LOG.md`, the refreshed `Docs/HANDOVER.md`, and the live-run checklist `plans/CYCLE6-LIVE-CHECKLIST.md`; one local commit, no push). The 31 merged c6/p6 chunk branches + 29 c6/p6 worktrees were pruned at compaction (`v2-development` tip `33dd08b` untouched). Per the "newest cycle first" header convention, the section was relocated from the end to the top of the file by this compaction (reordering closed).
+
 ## Dev-Cycle Decisions & Hardware Context — 2026-09-12
 
 Confirmed by director/user 2026-09-12; captured in `Docs/RamSleuth-v2.md`, `Docs/Grand Design & Architecture Specification.md`, and `Docs/HANDOVER.md`.
