@@ -20,7 +20,8 @@
 //! (two-decimal GB/s for a bandwidth metric, ns for latency) or `N/A`
 //! for an unmeasured cell (0.0 on the wire), in an
 //! `egui_extras::TableBuilder` table (bandwidth values CYAN, latency
-//! cells AMBER — the palette's low-latency accent — `N/A` CRIMSON); a
+//! cells AMBER — the palette's low-latency accent — `N/A` NA_GRAY,
+//! the muted unavailable gray (D-5: unmeasured, not a fault)); a
 //! flat status line (C7-17 — the progress bar's pill retired):
 //! `Status: Idle` dim at rest, `Status: Running… <m:ss>` CYAN while a
 //! normal bench is in flight (elapsed from the zone's local start
@@ -66,7 +67,7 @@ use ramsleuth_bench::{BenchOp, BenchmarkGrid, Metric, StreamProgress, StreamTarg
 use ramsleuth_protocol::BenchMode;
 
 use crate::update::{BenchCmd, BenchState, BurnInState, TelemetryData};
-use crate::{AMBER, CRIMSON, CYAN, SLATE};
+use crate::{AMBER, CYAN, NA_GRAY, SLATE};
 
 /// The zone title (Grand Design §3.1, right panel).
 const ZONE_TITLE: &str = "2 · BENCHMARK ENGINE";
@@ -251,12 +252,12 @@ fn status_color(state: StatusState, idle_color: egui::Color32) -> egui::Color32 
     }
 }
 
-/// One grid cell's semantic color: CRIMSON for an unmeasured cell
-/// (`N/A`), AMBER for a latency cell (the palette's low-latency
-/// accent), CYAN for the bandwidth values.
+/// One grid cell's semantic color: NA_GRAY for an unmeasured cell
+/// (`N/A` — unavailable, not a fault, D-5), AMBER for a latency cell
+/// (the palette's low-latency accent), CYAN for the bandwidth values.
 fn cell_color(metric: Metric, display: &str) -> egui::Color32 {
     if display.starts_with("N/A") {
-        return CRIMSON;
+        return NA_GRAY;
     }
     match metric {
         Metric::Latency => AMBER,
@@ -357,14 +358,15 @@ fn phase_cell_text(
 }
 
 /// One cell's color for its render [`CellPhase`]: the terminal
-/// semantics (the existing [`cell_color`]: CYAN / AMBER / CRIMSON),
+/// semantics (the existing [`cell_color`]: CYAN / AMBER / NA_GRAY),
 /// the live fill (dimmed CYAN — visually distinct from the final
-/// value's full CYAN), or the not-started placeholder (CRIMSON).
+/// value's full CYAN), or the not-started placeholder (NA_GRAY — a
+/// not-started / unmeasured cell is unavailable, not a fault, D-5).
 fn phase_cell_color(phase: CellPhase, metric: Metric, text: &str) -> egui::Color32 {
     match phase {
         CellPhase::Terminal => cell_color(metric, text),
         CellPhase::Live => CYAN.gamma_multiply(0.6),
-        CellPhase::NotStarted => CRIMSON,
+        CellPhase::NotStarted => NA_GRAY,
     }
 }
 
@@ -481,7 +483,7 @@ pub fn render_bench_zone(
 /// `StreamProgress` accumulation, or a burn-in's `latest`, C7-18) and
 /// the rest keep the `N/A` placeholder; once the run is not in flight,
 /// the cells show the terminal result grid's values (CYAN / AMBER /
-/// CRIMSON). No terminal grid yet renders the all-`N/A` placeholder
+/// NA_GRAY). No terminal grid yet renders the all-`N/A` placeholder
 /// (the layout never shifts when the result lands).
 fn render_grid_table(ui: &mut egui::Ui, data: &TelemetryData) {
     // The terminal result grid of the last completed run, or the
@@ -945,12 +947,13 @@ mod tests {
     }
 
     /// (h) The semantic cell color: CYAN for the bandwidth values,
-    /// AMBER for a latency cell, CRIMSON for an unmeasured cell.
+    /// AMBER for a latency cell, NA_GRAY for an unmeasured cell (D-5:
+    /// unavailable, not a fault).
     #[test]
     fn cell_color_semantics() {
         assert_eq!(cell_color(Metric::Read, "26.35 GB/s"), CYAN);
         assert_eq!(cell_color(Metric::Latency, "86.84 ns"), AMBER);
-        assert_eq!(cell_color(Metric::Copy, "N/A"), CRIMSON);
+        assert_eq!(cell_color(Metric::Copy, "N/A"), NA_GRAY);
     }
 
     /// One synthetic streamed progress event (the label is unused by
@@ -1058,7 +1061,7 @@ mod tests {
     /// the final value's full CYAN) — a bandwidth cell in `GB/s`, a
     /// latency cell in `ns` (a burn-in's `latest` carries latency
     /// ticks, C7-16); not-started cells keep the `N/A` placeholder in
-    /// CRIMSON.
+    /// NA_GRAY (D-5: unavailable, not a fault).
     #[test]
     fn phase_text_and_color_render_live_and_terminal_cells() {
         let grid = fixture_grid();
@@ -1074,7 +1077,7 @@ mod tests {
         assert_eq!(phase_cell_color(CellPhase::Terminal, Metric::Latency, &text), AMBER);
         let text = phase_cell_text(CellPhase::Terminal, &grid, &live, Tier::L2, Metric::Write);
         assert_eq!(text, "N/A");
-        assert_eq!(phase_cell_color(CellPhase::Terminal, Metric::Write, &text), CRIMSON);
+        assert_eq!(phase_cell_color(CellPhase::Terminal, Metric::Write, &text), NA_GRAY);
 
         // Live: the in-flight value + the `…` suffix, dimmed.
         let text = phase_cell_text(CellPhase::Live, &grid, &live, Tier::Memory, Metric::Read);
@@ -1101,7 +1104,7 @@ mod tests {
             phase_cell_text(CellPhase::NotStarted, &grid, &live, Tier::L3, Metric::Read),
             "N/A"
         );
-        assert_eq!(phase_cell_color(CellPhase::NotStarted, Metric::Read, "N/A"), CRIMSON);
+        assert_eq!(phase_cell_color(CellPhase::NotStarted, Metric::Read, "N/A"), NA_GRAY);
     }
 
     /// (m) `burn_in_cmd`: the `Run Burn-In` trigger's [`BenchCmd`] —
