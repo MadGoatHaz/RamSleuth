@@ -86,9 +86,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ramsleuth_gui::history::render_history;
 use ramsleuth_gui::{
-    build_style, export_json, render_bench_zone, render_settings_panel, render_status_zone,
-    render_telemetry_zone, snapshot_png, spawn_poller, BenchCmd, GuiAction, GuiError,
-    GuiSettings, TelemetryData, AMBER, CRIMSON, CYAN, SLATE,
+    build_style, export_json, format_capacity, format_clock, render_bench_zone,
+    render_settings_panel, render_status_zone, render_telemetry_zone, snapshot_png, spawn_poller,
+    BenchCmd, GuiAction, GuiError, GuiSettings, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
@@ -442,7 +442,8 @@ impl eframe::App for RamSleuthApp {
 // ---------------------------------------------------------------------
 // The spec's 3-line header (Grand Design §3.1, C6-20): the pure line
 // builders (unit-tested without an egui context — no display needed)
-// that `render_header` composes into the top panel.
+// that `render_header` composes into the top panel; the capacity +
+// clock segments honor the live `units` knob (C7-11).
 // ---------------------------------------------------------------------
 
 /// Line 1's platform tag (the mockup's `[AMD AM5 Platform]`): the
@@ -486,26 +487,16 @@ fn cell_text<T: std::fmt::Display>(cell: &Section<T>) -> String {
     }
 }
 
-/// A whole-number `f64` with no decimals (`1800.0` → `1800`), one
-/// decimal otherwise (`4.5` → `4.5`) — the unit-agnostic number
-/// formatter the header's GB / MHz segments share.
-fn trim_number(value: f64) -> String {
-    if (value - value.round()).abs() < 0.05 {
-        format!("{:.0}", value)
-    } else {
-        format!("{:.1}", value)
-    }
-}
-
 /// Line 2 (the mockup's `CPU: AMD Ryzen 9 7950X 16-Core @ 5.70 GHz |
 /// Motherboard: … (BIOS: …, AGESA …)`): the CPUID brand + the
-/// platform clock (MHz → GHz, two decimals), then the DMI
-/// motherboard / BIOS / AGESA cells — every `Na` cell degrades to
-/// its `N/A` text (never a panic).
-fn cpu_line_text(t: &SystemMemoryTelemetry) -> String {
+/// platform clock in the selected clock unit (C7-11: `format_clock`
+/// — the default MHz keeps the carried wire value, the GHz arm
+/// ÷1000), then the DMI motherboard / BIOS / AGESA cells — every
+/// `Na` cell degrades to its `N/A` text (never a panic).
+fn cpu_line_text(t: &SystemMemoryTelemetry, units: &Units) -> String {
     let platform = &t.platform;
     let clock = match platform.cpu_clock_mhz.value() {
-        Some(mhz) => format!("{:.2} GHz", mhz / 1000.0),
+        Some(mhz) => format_clock(*mhz, units),
         None => "N/A".to_owned(),
     };
     format!(
@@ -519,10 +510,12 @@ fn cpu_line_text(t: &SystemMemoryTelemetry) -> String {
 }
 
 /// The per-DIMM capacity summary (the mockup's `2x32GB`): one
-/// `<count>x<size>GB` group per distinct carried size (first-seen
-/// order, ` + `-joined); the `Na` entries contribute nothing, and an
-/// all-`Na` / empty list degrades to `N/A`.
-fn dimm_summary(sizes: &[Section<f64>]) -> String {
+/// `<count>x<size>` group per distinct carried size (first-seen
+/// order, ` + `-joined) with the size rendered in the selected
+/// capacity unit (C7-11: `format_capacity` — the `x`-group prefix is
+/// kept); the `Na` entries contribute nothing, and an all-`Na` /
+/// empty list degrades to `N/A`.
+fn dimm_summary(sizes: &[Section<f64>], units: &Units) -> String {
     let mut groups: Vec<(f64, usize)> = Vec::new();
     for cell in sizes {
         if let Some(gib) = cell.value() {
@@ -537,7 +530,7 @@ fn dimm_summary(sizes: &[Section<f64>]) -> String {
     } else {
         groups
             .iter()
-            .map(|(gib, count)| format!("{count}x{size}GB", size = trim_number(*gib)))
+            .map(|(gib, count)| format!("{count}x{}", format_capacity(*gib, units)))
             .collect::<Vec<_>>()
             .join(" + ")
     }
@@ -556,16 +549,18 @@ fn channel_mode(dimm_count: usize) -> String {
 }
 
 /// Line 3's non-mode part (the mockup's `RAM: 64.0 GB (2x32GB)
-/// DDR5-6000 MT/s | Dual-Channel | Mode: `): the total capacity
-/// (GiB → one-decimal GB display), the per-DIMM summary, the max SPD
-/// speed (omitted entirely when no module carries one), the channel
-/// mode, and the `Mode: ` lead-in the mode segment completes.
-fn ram_line_prefix(t: &SystemMemoryTelemetry) -> String {
+/// DDR5-6000 MT/s | Dual-Channel | Mode: `): the total capacity in
+/// the selected capacity unit (C7-11: `format_capacity` — the
+/// default GiB keeps the carried wire value, the GB arm converts
+/// × 1.073741824), the per-DIMM summary, the max SPD speed (omitted
+/// entirely when no module carries one), the channel mode, and the
+/// `Mode: ` lead-in the mode segment completes.
+fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
     let total = match t.total_capacity.value() {
-        Some(gib) => format!("{gib:.1} GB"),
+        Some(gib) => format_capacity(*gib, units),
         None => "N/A".to_owned(),
     };
-    let mut line = format!("RAM: {total} ({})", dimm_summary(&t.dimm_sizes));
+    let mut line = format!("RAM: {total} ({})", dimm_summary(&t.dimm_sizes, units));
     if let Some(mts) = t.spd.iter().filter_map(|m| m.speed_mts.value().copied()).max() {
         line.push_str(&format!(" {mts} MT/s"));
     }
@@ -575,14 +570,15 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry) -> String {
 
 /// Line 3's mode segment (D-C8): the UCLK:MCLK ratio from the AMD
 /// clock readout + its semantic color — AMBER for `Synchronous 1:1`
-/// (with the MCLK when it carries one), CRIMSON for `Asynchronous
-/// 1:2`, and `None` (the default text color) for the honest `N/A`.
-fn sync_mode_from_clocks(clocks: &ClockReadout) -> (String, Option<egui::Color32>) {
+/// (with the MCLK in the selected clock unit when it carries one —
+/// C7-11: `format_clock`), CRIMSON for `Asynchronous 1:2`, and
+/// `None` (the default text color) for the honest `N/A`.
+fn sync_mode_from_clocks(clocks: &ClockReadout, units: &Units) -> (String, Option<egui::Color32>) {
     match clocks.div_mode.value() {
         Some(DivMode::OneToOne) => {
             let text = match clocks.mclk_mhz.value() {
                 Some(mhz) => {
-                    format!("Synchronous 1:1 (UCLK = MCLK = {} MHz)", trim_number(*mhz))
+                    format!("Synchronous 1:1 (UCLK = MCLK = {})", format_clock(*mhz, units))
                 }
                 None => "Synchronous 1:1".to_owned(),
             };
@@ -597,9 +593,9 @@ fn sync_mode_from_clocks(clocks: &ClockReadout) -> (String, Option<egui::Color32
 /// carry a value whose `div_mode` is usable, else the honest `N/A` —
 /// the Intel / driver-missing / degraded states all degrade here
 /// (never a panic).
-fn sync_mode(t: &SystemMemoryTelemetry) -> (String, Option<egui::Color32>) {
+fn sync_mode(t: &SystemMemoryTelemetry, units: &Units) -> (String, Option<egui::Color32>) {
     match t.amd.value() {
-        Some(readout) => sync_mode_from_clocks(&readout.clocks),
+        Some(readout) => sync_mode_from_clocks(&readout.clocks, units),
         None => ("N/A".to_owned(), None),
     }
 }
@@ -610,8 +606,10 @@ impl RamSleuthApp {
     /// daemon status (naming the live settings socket — C6-30) + the
     /// `Settings` toggle + the `[F2] snapshot · [F3] export · [Q]
     /// quit` legend, line 2 the CPU + platform identity, line 3 the
-    /// RAM summary + channel + sync mode — plus the transient notice
-    /// line (the last F2 / F3 result) while one is showing. No
+    /// RAM summary + channel + sync mode (the capacity + clock
+    /// segments render in the live `units` knob's units — C7-11) —
+    /// plus the transient notice line (the last F2 / F3 result)
+    /// while one is showing. No
     /// telemetry yet (never polled) → the placeholder lines (a
     /// missing daemon never crashes the GUI, plan D5).
     ///
@@ -627,12 +625,14 @@ impl RamSleuthApp {
         settings_open: &mut bool,
         notice: &Option<(String, Instant)>,
     ) {
-        // The line builders over the current snapshot — or the
-        // placeholders when no poll has landed yet (never a panic).
+        // The line builders over the current snapshot (the capacity +
+        // clock segments honor the live `units` knob — C7-11) — or
+        // the placeholders when no poll has landed yet (never a panic).
         let (cpu_line, ram_prefix, ram_mode, ram_mode_color) = match &data.telemetry {
             Some(t) => {
-                let (mode, color) = sync_mode(t);
-                (cpu_line_text(t), ram_line_prefix(t), mode, color)
+                let units = &data.settings.units;
+                let (mode, color) = sync_mode(t, units);
+                (cpu_line_text(t, units), ram_line_prefix(t, units), mode, color)
             }
             None => ("CPU: —".to_owned(), "RAM: —".to_owned(), String::new(), None),
         };
@@ -904,7 +904,7 @@ mod tests {
     use std::fs;
 
     use ramsleuth_bench::BenchmarkGrid;
-    use ramsleuth_gui::{BenchState, DEFAULT_POLL_INTERVAL_MS};
+    use ramsleuth_gui::{BenchState, CapacityUnit, ClockUnit, DEFAULT_POLL_INTERVAL_MS};
     use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
@@ -1271,10 +1271,11 @@ mod tests {
         assert_eq!(daemon_status_text(&down, socket), "Daemon: Disconnected");
     }
 
-    /// (h3) `cpu_line_text`: the spec's line 2 — brand + the
-    /// MHz→GHz clock + motherboard / BIOS / AGESA, the Na AGESA cell
-    /// degrading to its `N/A` text; a fully Na platform degrades
-    /// every segment.
+    /// (h3) `cpu_line_text`: the spec's line 2 — brand + the clock in
+    /// the selected clock unit (C7-11: `format_clock` — the default
+    /// MHz keeps the carried wire value, the GHz arm ÷1000) +
+    /// motherboard / BIOS / AGESA, the Na AGESA cell degrading to its
+    /// `N/A` text; a fully Na platform degrades every segment.
     #[test]
     fn cpu_line_text_populated_and_na_degraded() {
         let t = fixture_telemetry(
@@ -1283,8 +1284,16 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(
-            cpu_line_text(&t),
-            "CPU: Ryzen 9 5950X @ 3.60 GHz | Motherboard: ProArt X570-CREATOR (BIOS: F60 + 09/15/2024, AGESA N/A)"
+            cpu_line_text(&t, &Units::default()),
+            "CPU: Ryzen 9 5950X @ 3600 MHz | Motherboard: ProArt X570-CREATOR (BIOS: F60 + 09/15/2024, AGESA N/A)"
+        );
+
+        // The GHz knob (C7-11): the same carried clock renders ÷1000
+        // (3600 MHz → 3.6 GHz).
+        let ghz = Units { clock: ClockUnit::GHz, ..Units::default() };
+        assert_eq!(
+            cpu_line_text(&t, &ghz),
+            "CPU: Ryzen 9 5950X @ 3.6 GHz | Motherboard: ProArt X570-CREATOR (BIOS: F60 + 09/15/2024, AGESA N/A)"
         );
 
         let all_na = SystemMemoryTelemetry {
@@ -1297,32 +1306,47 @@ mod tests {
             ..t
         };
         assert_eq!(
-            cpu_line_text(&all_na),
+            cpu_line_text(&all_na, &Units::default()),
             "CPU: Ryzen 9 5950X @ N/A | Motherboard: N/A (BIOS: N/A, AGESA N/A)"
         );
     }
 
-    /// (h4) `dimm_summary`: distinct-size grouping — 2×16 →
-    /// `2x16GB`, a mixed kit → `1x16GB + 1x32GB` (the Na entry
-    /// contributes nothing), all-Na / empty → `N/A`, a non-whole
-    /// size keeps one decimal.
+    /// (h4) `dimm_summary`: distinct-size grouping in the selected
+    /// capacity unit (C7-11: `format_capacity` — default GiB, the GB
+    /// knob converts × 1.073741824) — 2×16 → `2x16 GiB`, a mixed kit
+    /// → `1x16 GiB + 1x32 GiB` (the Na entry contributes nothing),
+    /// all-Na / empty → `N/A`, a non-whole size keeps one decimal.
     #[test]
     fn dimm_summary_groups_and_degrades() {
+        let default_units = Units::default();
         assert_eq!(
-            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)]),
-            "2x16GB"
+            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &default_units),
+            "2x16 GiB"
         );
         assert_eq!(
-            dimm_summary(&[
-                Section::Value(16.0),
-                Section::na(NaReason::NotApplicable),
-                Section::Value(32.0),
-            ]),
-            "1x16GB + 1x32GB"
+            dimm_summary(
+                &[
+                    Section::Value(16.0),
+                    Section::na(NaReason::NotApplicable),
+                    Section::Value(32.0),
+                ],
+                &default_units,
+            ),
+            "1x16 GiB + 1x32 GiB"
         );
-        assert_eq!(dimm_summary(&[Section::na(NaReason::NotApplicable)]), "N/A");
-        assert_eq!(dimm_summary(&[]), "N/A");
-        assert_eq!(dimm_summary(&[Section::Value(4.5)]), "1x4.5GB");
+        assert_eq!(
+            dimm_summary(&[Section::na(NaReason::NotApplicable)], &default_units),
+            "N/A"
+        );
+        assert_eq!(dimm_summary(&[], &default_units), "N/A");
+        assert_eq!(dimm_summary(&[Section::Value(4.5)], &default_units), "1x4.5 GiB");
+
+        // The GB knob (C7-11): 16 GiB → 17.2 GB per group.
+        let gb = Units { capacity: CapacityUnit::GB, ..Units::default() };
+        assert_eq!(
+            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &gb),
+            "2x17.2 GB"
+        );
     }
 
     /// (h5) `channel_mode`: 1 / 2 / 4 → Single / Dual / Quad, every
@@ -1337,9 +1361,11 @@ mod tests {
     }
 
     /// (h6) `ram_line_prefix`: the spec's line 3 minus the mode —
-    /// the total (one-decimal GB), the per-DIMM summary, the max SPD
-    /// speed (omitted when no module carries one), and the channel
-    /// mode; the degraded tail renders the honest N/A segments.
+    /// the total in the selected capacity unit (C7-11:
+    /// `format_capacity` — default GiB, the GB knob converts
+    /// × 1.073741824), the per-DIMM summary, the max SPD speed
+    /// (omitted when no module carries one), and the channel mode;
+    /// the degraded tail renders the honest N/A segments.
     #[test]
     fn ram_line_prefix_populated_and_degraded() {
         let t = fixture_telemetry(
@@ -1348,8 +1374,8 @@ mod tests {
             vec![fixture_spd_module(Some(3200))],
         );
         assert_eq!(
-            ram_line_prefix(&t),
-            "RAM: 32.0 GB (2x16GB) 3200 MT/s | Dual-Channel | Mode: "
+            ram_line_prefix(&t, &Units::default()),
+            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | Mode: "
         );
 
         let no_speed = fixture_telemetry(
@@ -1358,8 +1384,8 @@ mod tests {
             vec![fixture_spd_module(None)],
         );
         assert_eq!(
-            ram_line_prefix(&no_speed),
-            "RAM: 32.0 GB (2x16GB) | Dual-Channel | Mode: "
+            ram_line_prefix(&no_speed, &Units::default()),
+            "RAM: 32 GiB (2x16 GiB) | Dual-Channel | Mode: "
         );
 
         // A single Na DIMM still counts as one bound module (the
@@ -1370,7 +1396,7 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(
-            ram_line_prefix(&degraded),
+            ram_line_prefix(&degraded, &Units::default()),
             "RAM: N/A (N/A) | Single-Channel | Mode: "
         );
 
@@ -1380,39 +1406,69 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        assert_eq!(ram_line_prefix(&empty), "RAM: N/A (N/A) | N/A | Mode: ");
+        assert_eq!(
+            ram_line_prefix(&empty, &Units::default()),
+            "RAM: N/A (N/A) | N/A | Mode: "
+        );
+
+        // The GB knob (C7-11): 32 GiB → 34.4 GB total, 16 GiB →
+        // 17.2 GB per group.
+        let gb = Units { capacity: CapacityUnit::GB, ..Units::default() };
+        assert_eq!(
+            ram_line_prefix(&t, &gb),
+            "RAM: 34.4 GB (2x17.2 GB) 3200 MT/s | Dual-Channel | Mode: "
+        );
     }
 
     /// (h7) `sync_mode_from_clocks`: D-C8's ratio segment — 1:1 with
-    /// an MCLK (AMBER), 1:1 without (AMBER, the bare text), 1:2
-    /// (CRIMSON), and a Na ratio (the honest N/A, default color).
+    /// an MCLK (AMBER; C7-11: the MCLK in the selected clock unit —
+    /// default MHz, the GHz knob ÷1000), 1:1 without (AMBER, the bare
+    /// text), 1:2 (CRIMSON), and a Na ratio (the honest N/A, default
+    /// color).
     #[test]
     fn sync_mode_from_clocks_arms() {
+        let default_units = Units::default();
         assert_eq!(
-            sync_mode_from_clocks(&fixture_clocks(Some(DivMode::OneToOne), Some(1800.0))),
+            sync_mode_from_clocks(
+                &fixture_clocks(Some(DivMode::OneToOne), Some(1800.0)),
+                &default_units,
+            ),
             ("Synchronous 1:1 (UCLK = MCLK = 1800 MHz)".to_owned(), Some(AMBER))
         );
         assert_eq!(
-            sync_mode_from_clocks(&fixture_clocks(Some(DivMode::OneToOne), None)),
+            sync_mode_from_clocks(&fixture_clocks(Some(DivMode::OneToOne), None), &default_units),
             ("Synchronous 1:1".to_owned(), Some(AMBER))
         );
         assert_eq!(
-            sync_mode_from_clocks(&fixture_clocks(Some(DivMode::OneToTwo), Some(1800.0))),
+            sync_mode_from_clocks(
+                &fixture_clocks(Some(DivMode::OneToTwo), Some(1800.0)),
+                &default_units,
+            ),
             ("Asynchronous 1:2".to_owned(), Some(CRIMSON))
         );
         assert_eq!(
-            sync_mode_from_clocks(&fixture_clocks(None, Some(1800.0))),
+            sync_mode_from_clocks(&fixture_clocks(None, Some(1800.0)), &default_units),
             ("N/A".to_owned(), None)
+        );
+
+        // The GHz knob (C7-11): 1800 MHz → 1.8 GHz.
+        let ghz = Units { clock: ClockUnit::GHz, ..Units::default() };
+        assert_eq!(
+            sync_mode_from_clocks(&fixture_clocks(Some(DivMode::OneToOne), Some(1800.0)), &ghz),
+            ("Synchronous 1:1 (UCLK = MCLK = 1.8 GHz)".to_owned(), Some(AMBER))
         );
     }
 
     /// (h8) `sync_mode`: an Na AMD branch (Intel silicon / the
     /// driver missing) degrades the whole segment to an honest `N/A`
-    /// — never a panic.
+    /// — never a panic (independent of the clock unit — the Na
+    /// branch renders no clock at all).
     #[test]
     fn sync_mode_degrades_on_na_amd_branch() {
         let t = fixture_telemetry(Section::Value(32.0), Vec::new(), Vec::new());
-        assert_eq!(sync_mode(&t), ("N/A".to_owned(), None));
+        assert_eq!(sync_mode(&t, &Units::default()), ("N/A".to_owned(), None));
+        let ghz = Units { clock: ClockUnit::GHz, ..Units::default() };
+        assert_eq!(sync_mode(&t, &ghz), ("N/A".to_owned(), None));
     }
 
     // ------------------------------------------------------------------
