@@ -1,15 +1,19 @@
 //! The Graphs window: the five-series graph state + the hand-rolled
-//! static render (C7-20, plan D-3 / D-4 / D-5).
+//! render (C7-20) + the interactive layer (C7-22: the hover
+//! crosshair, the horizontal pan, the 1/5/15/60-min window — plan
+//! D-3 / D-4 / D-5).
 //!
 //! The dedicated monitoring window (C7-21 spawns it as the eframe
 //! 0.27.2 deferred child viewport, C7-22 makes it interactive)
-//! renders five series over the newest five minutes:
+//! renders five series over a selectable time window (default: the
+//! newest five minutes):
 //!
 //! - `CPU FREQ (MHz)` — the live core frequency
 //!   (`SystemPlatform.cpu_clock_mhz`).
 //! - `VDDCR_CPU` — no source anywhere (the unprivileged SMU surface
-//!   carries no VDDCR_CPU cell): a permanent label-only row with the
-//!   `N/A (no source)` note, no fake geometry (D-4).
+//!   carries no VDDCR_CPU cell): a permanent label-only row whose
+//!   label carries the `N/A (no source)` note, no fake geometry
+//!   (D-4).
 //! - `VDDCR_SOC (mV)` — the AMD SOC rail
 //!   (`AmdReadout.voltages.vddcr_soc_mv`).
 //! - `CPU TEMP (°C)` — the runtime unprivileged thermal-zone scan
@@ -24,41 +28,70 @@
 //!
 //! - [`GraphSample`] / [`GraphState`] — one timestamped five-field
 //!   sample per successful poll (an absent value = `f64::NAN`, the
-//!   plot's non-finite-skip rule) in the [`GRAPH_CAPACITY`]-deep
-//!   ring (1800 = 60 min at the 2 s poll cadence — the
-//!   `history.rs` [`RingBuffer`] reused, generic, bounded). The
-//!   background poller is the only writer (D6 — the Na-guarded
-//!   [`record_graph_sample`] hook appends one sample per successful
-//!   poll); the render thread + the child window are pure readers.
-//! - [`read_cpu_temp_c`] — the direct unprivileged thermal-zone scan
-//!   (D-4's runtime source): every failure class (no dir, no
-//!   matching zone, an unreadable / non-numeric `temp`) degrades to
-//!   `f64::NAN`; nothing panics (std `fs` only — poller-thread I/O,
-//!   D6: it runs in the poller, never the render thread).
-//! - [`render_graphs_window`] — the basic render: a `CentralPanel`
-//!   (SLATE fill, the zone idiom) with the title + a dim subtitle
-//!   and the five series rows in fixed order — each a hand-rolled
-//!   time-windowed plot (the pure [`window_points`] helper over the
-//!   newest five minutes: non-finite samples skipped, a flat window
-//!   on the midline, every division guarded — the D5 no-panic
-//!   plot contract); a series whose window holds no finite sample
-//!   draws a label + the `N/A (no source)` note and no geometry
-//!   (D-4 — a flat 0 line would be a lie, 0 ≠ N/A).
+//!   non-finite-skip rule of the plot) in the
+//!   [`GRAPH_CAPACITY`]-deep ring (1800 = 60 min at the 2 s poll
+//!   cadence — the `history.rs` [`RingBuffer`] reused, generic,
+//!   bounded). The background poller is the only writer (D6 — the
+//!   Na-guarded [`record_graph_sample`] hook appends one sample per
+//!   successful poll); the render thread + the child window are
+//!   pure readers.
+//! - [`read_cpu_temp_c`] — the direct unprivileged thermal-zone
+//!   scan (the runtime source of D-4): every failure class (no
+//!   dir, no matching zone, an unreadable / non-numeric `temp`)
+//!   degrades to `f64::NAN`; nothing panics (std `fs` only —
+//!   poller-thread I/O, D6: it runs in the poller, never the
+//!   render thread).
+//! - [`render_graphs_window`] — the interactive render: a
+//!   `CentralPanel` (SLATE fill, the zone idiom) with the title + a
+//!   dim subtitle (the live window + the sample count), the
+//!   window-resolution row (four selectable `1 / 5 / 15 / 60 min`
+//!   buttons — the default 5 min is the static view of C7-20;
+//!   selecting one resets the pan), and the five series rows in
+//!   fixed order — each a hand-rolled time-windowed plot (the pure
+//!   [`window_points`] helper over the view window: non-finite
+//!   samples skipped, a flat window on the midline, every division
+//!   guarded — the no-panic plot contract of D5). The interactive
+//!   layer of C7-22 over the same rows: (a) a horizontal drag on
+//!   any row pans the window (`pan_offset_s += dx ×
+//!   seconds_per_px`, clamped to the data by [`clamp_pan`] — never
+//!   a negative allocation, panning past the data clamps) + the dim
+//!   `« pan »` hint; (b) on hover over any row, a full-height (all
+//!   rows) vertical crosshair at the hovered x + a floating
+//!   tooltip with the exact value of every series at the hovered
+//!   timestamp (the t of the nearest sample — the pure
+//!   [`hover_timestamp`] + [`tooltip_lines`] helpers —
+//!   `1800 MHz · 1150 mV · 47.3 °C · 26.35 GB/s`-style, missing
+//!   fields as `N/A`) + the `HH:MM:SS` timestamp; no hover → no
+//!   crosshair. A series whose window holds no finite sample draws
+//!   a label + the `N/A (no source)` note and no geometry (D-4 — a
+//!   flat 0 line would be a lie, 0 ≠ N/A): the `VDDCR_CPU` note
+//!   lives in the label (permanent), the `CPU TEMP` / `MEM
+//!   BANDWIDTH` notes self-clear when data appears.
+//!
+//! - The render-local view state (`GraphView` — the window length +
+//!   the pan offset) lives in the IdTypeMap of the child context
+//!   (the D-3 mechanism: `ctx.data_mut` +
+//!   `get_temp_mut_or_insert_with` — per-context, session-local,
+//!   child-only, never in `TelemetryData` — the poller stays the
+//!   only writer, D6), read-modify-write per frame (no context
+//!   borrow held across the layout — the C7-18 idiom).
 //!
 //! **No new dependency (D-3):** the plot is a few dozen
-//! `egui::Painter` calls (the `history.rs` idiom) — no chart crate,
-//! the MSRV-1.75 lockfile stays untouched.
+//! `egui::Painter` calls (the `history.rs` idiom) — no chart
+//! crate, the MSRV-1.75 lockfile stays untouched.
 //!
-//! **Pure core:** [`window_points`] / [`finite_min_max`] are I/O-free
-//! and deterministic (the unit tests exercise them without an egui
+//! **Pure core:** [`window_points`] / [`finite_min_max`] /
+//! [`window_seconds_for`] / [`clamp_pan`] / [`nearest_sample`] /
+//! [`hover_timestamp`] / [`tooltip_lines`] are I/O-free and
+//! deterministic (the unit tests exercise them without an egui
 //! context); [`render_graphs_window`] is the thin `egui` surface
-//! over them (the live render is C7-21's gate).
+//! over them (the live render is gated by C7-21).
 
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+use egui::{Align2, Area, Color32, FontId, Id, Order, PointerButton, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 
 use crate::history::RingBuffer;
@@ -69,9 +102,21 @@ use crate::{AMBER, CYAN, SLATE};
 /// precedent: the `history.rs` `RingBuffer` reused, generic).
 pub const GRAPH_CAPACITY: usize = 1800;
 
-/// The static render's time window: the newest five minutes (C7-22
-/// makes it interactive: 1 / 5 / 15 / 60 min + pan).
-const WINDOW_SECONDS: f64 = 300.0;
+
+/// The supported time-window lengths (minutes) in the resolution
+/// row (C7-22 item 7f): 1 / 5 / 15 / 60 min.
+const WINDOW_MINUTES: [u32; 4] = [1, 5, 15, 60];
+
+/// The default window length (minutes): the static five-minute view
+/// of C7-20.
+const DEFAULT_WINDOW_MINUTES: u32 = 5;
+
+/// The dim pan hint on the resolution row (C7-22 item 7f): a drag
+/// on any row pans the window.
+const PAN_HINT: &str = "« pan »";
+
+/// The tooltip background (a step lighter than the row background).
+const TOOLTIP_BG: Color32 = Color32::from_rgb(0x24, 0x24, 0x2E);
 
 /// One series row's height (points) (the `PLOT_ROW_HEIGHT` idiom).
 const ROW_HEIGHT: f32 = 40.0;
@@ -280,6 +325,60 @@ fn read_zone_temp_c(zone_dir: &Path) -> f64 {
         _ => f64::NAN, // a non-numeric reading: not data.
     }
 }
+// ---------------------------------------------------------------------
+// The render-local view state (C7-22 — the D-3 IdTypeMap mechanism).
+// ---------------------------------------------------------------------
+
+/// The interactive view state of the graphs window (C7-22 — the §3
+/// GUI-internal shape): the time-window length + the pan offset.
+///
+/// Render-local (the D-3 mechanism): it lives in the IdTypeMap of
+/// the child context (session-local, per-context —
+/// `get_temp_mut_or_insert_with` is not cleared between frames, so
+/// the view survives across the child repaints) and is touched only
+/// by the child callback ([`render_graphs_window`]) — never in
+/// [`GraphState`] / `TelemetryData` (the poller stays the only
+/// writer, D6). Read-modify-write per frame: no context borrow is
+/// held across the layout (the C7-18 idiom).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GraphView {
+    /// The time-window length in minutes (one of [`WINDOW_MINUTES`];
+    /// the default [`DEFAULT_WINDOW_MINUTES`] is the static view of
+    /// C7-20).
+    window_minutes: u32,
+    /// The pan offset in seconds back from the newest sample
+    /// (0 = anchored at the newest sample — the static view).
+    /// Always clamped into the data by [`clamp_pan`] (never
+    /// negative, never past the oldest sample).
+    pan_offset_s: f64,
+}
+
+impl Default for GraphView {
+    fn default() -> Self {
+        Self {
+            window_minutes: DEFAULT_WINDOW_MINUTES,
+            pan_offset_s: 0.0,
+        }
+    }
+}
+
+/// The view-state id in the IdTypeMap of the child context (a
+/// function, not a `const` — `egui::Id::new` is not const in
+/// pinned 0.27.2 — the C7-21 idiom).
+fn view_id() -> Id {
+    Id::new("ramsleuth_graph_view")
+}
+
+/// Read the view state (inserting the default on first use).
+fn view_state(ctx: &egui::Context) -> GraphView {
+    ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(view_id(), GraphView::default))
+}
+
+/// Persist the view state (the store half of the read-modify-write;
+/// it runs once per frame, after the interaction).
+fn store_view(ctx: &egui::Context, view: GraphView) {
+    ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(view_id(), GraphView::default) = view);
+}
 
 // ---------------------------------------------------------------------
 // The pure plot geometry (testable: no egui context, no I/O).
@@ -359,6 +458,142 @@ fn window_points(
         .collect()
 }
 
+/// Map a selected window length (minutes) to seconds (C7-22 item
+/// 7f): only the four supported resolutions (1 / 5 / 15 / 60 min)
+/// are accepted; anything else (a corrupted value read back from
+/// the view state) falls back to the default (5 min = 300 s — the
+/// static window of C7-20).
+fn window_seconds_for(minutes: u32) -> f64 {
+    match minutes {
+        1 => 60.0,
+        5 => 300.0,
+        15 => 900.0,
+        60 => 3600.0,
+        _ => f64::from(DEFAULT_WINDOW_MINUTES) * 60.0,
+    }
+}
+
+/// Clamp a pan offset (seconds back from the newest sample) into
+/// the recorded data (C7-22 item 7f): the window may not reach
+/// before the oldest sample (max pan = newest − oldest −
+/// `window_secs`) and it may never be negative (never a negative
+/// allocation). Returns 0.0 when there is nothing to pan (no
+/// samples, one sample, a degenerate span, or the whole history
+/// fits inside the window); a non-finite pan degrades to 0.0 (the
+/// no-panic contract of D5).
+fn clamp_pan(pan: f64, samples: &[GraphSample], window_secs: f64) -> f64 {
+    if !pan.is_finite() {
+        return 0.0;
+    }
+    let (Some(oldest), Some(newest)) = (samples.first(), samples.last()) else {
+        return 0.0;
+    };
+    let span = newest.t - oldest.t;
+    if !span.is_finite() || span <= 0.0 || !window_secs.is_finite() || span <= window_secs {
+        // The data fits the window (or is degenerate): no pan.
+        return 0.0;
+    }
+    pan.clamp(0.0, span - window_secs)
+}
+
+/// The sample nearest in time to `t` (ties resolve to the earlier
+/// sample), or `None` for an empty slice or a non-finite `t` (the
+/// no-panic contract of D5).
+fn nearest_sample(samples: &[GraphSample], t: f64) -> Option<&GraphSample> {
+    if !t.is_finite() {
+        return None;
+    }
+    let mut best: Option<&GraphSample> = None;
+    let mut best_dist = f64::INFINITY;
+    for s in samples {
+        let d = (s.t - t).abs();
+        if d.is_finite() && d < best_dist {
+            best_dist = d;
+            best = Some(s);
+        }
+    }
+    best
+}
+
+/// The timestamp of the sample nearest to a hovered x (C7-22 item
+/// 7e): the inverse of the [`window_points`] normalization (x → t
+/// over the panned window) + the nearest-sample lookup (the
+/// crosshair snaps to a real sample, not the raw mapped time).
+///
+/// - `window` = the base time window `(t_start, t_end)`, anchored
+///   at the newest sample (the static view); `pan` (seconds,
+///   already clamped by [`clamp_pan`]) shifts it back: the
+///   effective window is `(t_start − pan, t_end − pan)`.
+/// - `x` / `width` = the hovered x in pixels relative to the left
+///   edge of the row, and the width of the row. `x` is clamped to
+///   `[0, width]` (a hover just outside the row snaps to the
+///   window edge — no panic).
+///
+/// Returns `None` for no samples, a collapsed / non-finite window,
+/// or a zero-width row (the crosshair never shows then).
+fn hover_timestamp(
+    samples: &[GraphSample],
+    window: (f64, f64),
+    pan: f64,
+    x: f32,
+    width: f32,
+) -> Option<f64> {
+    let (t_start, t_end) = window;
+    if samples.is_empty()
+        || !t_start.is_finite()
+        || !t_end.is_finite()
+        || !width.is_finite()
+        || width <= 0.0
+    {
+        return None;
+    }
+    let eff_start = t_start - pan;
+    let eff_end = t_end - pan;
+    if eff_end <= eff_start {
+        return None; // a collapsed (panned-away) window.
+    }
+    let frac = (f64::from(x) / f64::from(width)).clamp(0.0, 1.0);
+    let t = eff_start + frac * (eff_end - eff_start);
+    nearest_sample(samples, t).map(|s| s.t)
+}
+
+/// One tooltip value token (C7-22 item 7e): `prec` decimals
+/// (`1800`, `1150`, `47.3`, `26.35`-style), or `N/A` when the
+/// value is non-finite (D-4 — a missing field is an honest note,
+/// never a fake 0).
+fn value_token(value: f64, prec: usize) -> String {
+    if value.is_finite() {
+        format!("{:.*}", prec, value)
+    } else {
+        "N/A".to_owned()
+    }
+}
+
+/// The crosshair tooltip lines for the timestamp `t` (C7-22 item
+/// 7e): line 1 = the wall-clock time of the nearest sample
+/// (`HH:MM:SS` from that unix `t` — the sample the values come
+/// from), line 2 = the value of every series at that sample in
+/// `1800 MHz · 1150 mV · 47.3 °C · 26.35 GB/s`-style (a
+/// non-finite field degrades to `N/A` — D-4). Empty (no lines, no
+/// panic) for no samples or a non-finite `t`.
+fn tooltip_lines(samples: &[GraphSample], t: f64) -> Vec<String> {
+    let Some(sample) = nearest_sample(samples, t) else {
+        return Vec::new();
+    };
+    let secs = sample.t.floor().max(0.0) as u64;
+    let (h, m, s) = (secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    vec![
+        format!("{h:02}:{m:02}:{s:02}"),
+        format!(
+            "{} MHz · {} mV · {} °C · {} GB/s",
+            value_token(sample.cpu_freq_mhz, 0),
+            value_token(sample.vddcr_soc_mv, 0),
+            value_token(sample.cpu_temp_c, 1),
+            value_token(sample.bandwidth_gbps, 2),
+        ),
+    ]
+}
+
 // ---------------------------------------------------------------------
 // The egui surface (the hand-rolled immediate-mode plot, D-3).
 // ---------------------------------------------------------------------
@@ -368,26 +603,34 @@ fn window_points(
 /// either (a) the time-windowed geometry from [`window_points`] (a
 /// filled dot for a single in-window sample, a polyline for more,
 /// a dim newest-value readout top-right) or (b) when the window
-/// holds no finite sample, the `N/A (no source)` note (D-4) —
+/// holds no finite sample, the `N/A (no source)` note (D-4 — it
+/// self-clears when data appears; the permanent `VDDCR_CPU` row
+/// carries the note in its label instead — `note_in_label`) —
 /// never fake geometry, never a panic.
+///
+/// The row senses drags (`Sense::drag()` — C7-22): the caller reads
+/// the returned [`egui::Response`] for the pan (`dragged_by` +
+/// `drag_delta`) and for the crosshair (`hover_pos`) — every row is
+/// a pan target, and any row raises the crosshair.
 fn graph_row(
     ui: &mut egui::Ui,
     samples: &[GraphSample],
     field: impl Fn(&GraphSample) -> f64,
     label: &str,
     color: Color32,
-    t_start: f64,
-    t_end: f64,
+    window: (f64, f64),
+    note_in_label: bool,
 ) -> egui::Response {
+    let (t_start, t_end) = window;
     let row_width = ui.available_width().max(1.0);
     let desired = Rect::from_min_size(ui.cursor().min, Vec2::new(row_width, ROW_HEIGHT));
     let rect = desired.intersect(ui.available_rect_before_wrap());
-    let response = ui.allocate_rect(rect, Sense::hover());
+    let response = ui.allocate_rect(rect, Sense::drag());
     let dim = ui.visuals().weak_text_color();
     let painter = ui.painter();
 
-    // The row background (always, so a no-source row still shows its
-    // label + the plot area's extent).
+    // The row background (always, so a no-source row still shows
+    // its label + the extent of the plot area).
     painter.rect_filled(rect, 3.0, ROW_BG);
     // The series label (always, over the plot).
     painter.text(
@@ -401,14 +644,18 @@ fn graph_row(
         let points = window_points(samples, &field, t_start, t_end, rect);
         if points.is_empty() {
             // No finite sample in the window: the no-source note
-            // (D-4) — no geometry, no fake 0 line.
-            painter.text(
-                rect.right_top() + Vec2::new(-TEXT_MARGIN, TEXT_MARGIN),
-                Align2::RIGHT_TOP,
-                NO_SOURCE_NOTE,
-                FontId::monospace(11.0),
-                dim,
-            );
+            // (D-4) — no geometry, no fake 0 line. The permanent
+            // `VDDCR_CPU` row carries the note in its label instead
+            // (no double note).
+            if !note_in_label {
+                painter.text(
+                    rect.right_top() + Vec2::new(-TEXT_MARGIN, TEXT_MARGIN),
+                    Align2::RIGHT_TOP,
+                    NO_SOURCE_NOTE,
+                    FontId::monospace(11.0),
+                    dim,
+                );
+            }
         } else {
             match points.len() {
                 1 => {
@@ -444,23 +691,42 @@ fn graph_row(
     response
 }
 
-/// The dedicated graphs window's basic render (C7-20; C7-21 spawns
-/// this as the deferred child viewport's body, C7-22 layers the
-/// interactivity on): a `CentralPanel` (SLATE fill, the zone idiom)
-/// with the title + a dim subtitle and the five series rows in
-/// fixed order over the newest five minutes (the static default
-/// view):
+/// The interactive render of the dedicated graphs window (C7-22
+/// over the basic render of C7-20; C7-21 spawns this as the body
+/// of the deferred child viewport): a `CentralPanel` (SLATE fill,
+/// the zone idiom) with the title + a dim subtitle (the live
+/// window + the sample count), the window-resolution row, and the
+/// five series rows in fixed order over the view window:
 ///
 /// 1. `CPU FREQ (MHz)` — the live core frequency.
-/// 2. `VDDCR_CPU` — the permanent no-source row (D-4: the series
-///    has no source anywhere — the label + the `N/A (no source)`
-///    note, no geometry; it self-populates if a source appears, no
-///    layout change — the row is data-driven).
+/// 2. `VDDCR_CPU` — the permanent no-source row (D-4: the label
+///    carries `— N/A (no source)` — the series has no source
+///    anywhere; no geometry, it self-populates if one ever
+///    appears, no layout change — the row is data-driven).
 /// 3. `VDDCR_SOC (mV)` — the AMD SOC rail.
 /// 4. `CPU TEMP (°C)` — the thermal-zone scan; a no-source row
-///    while the window holds no finite temp (D-4).
+///    while the window holds no finite temp (D-4, self-clearing).
 /// 5. `MEM BANDWIDTH (GB/s)` — the bench / burn-in step series
 ///    (D-5); a no-source row until the first sample.
+///
+/// The interactive layer (C7-22), driven by the render-local
+/// [`GraphView`] in the IdTypeMap of the child context (the D-3
+/// mechanism — per-context, session-local, child-only, never in
+/// `TelemetryData`):
+///
+/// - the window-resolution row: four selectable `1 / 5 / 15 / 60
+///   min` buttons (the default 5 min is the static view of C7-20;
+///   selecting one resets the pan to 0);
+/// - horizontal pan: a drag on any row pans the window
+///   (`pan_offset_s += dx × seconds_per_px`, clamped to the data
+///   by [`clamp_pan`]) + the dim `« pan »` hint;
+/// - the interactive vertical crosshair: on hover over any row, a
+///   full-height (all rows) vertical line at the hovered x + a
+///   floating tooltip with the exact value of every series at the
+///   hovered timestamp (the t of the nearest sample —
+///   [`hover_timestamp`] + [`tooltip_lines`]; missing fields as
+///   `N/A`, D-4) + the `HH:MM:SS` timestamp; no hover → no
+///   crosshair.
 ///
 /// Pure read over [`GraphState`] (no I/O, D6 — the poller is the
 /// only writer): an empty state renders the five no-source rows
@@ -470,48 +736,170 @@ pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState) {
     egui::CentralPanel::default()
         .frame(egui::Frame::default().fill(SLATE))
         .show(ctx, |ui| {
-            ui.add_space(8.0);
-            ui.label(RichText::new(WINDOW_TITLE).strong().color(CYAN));
-            // The dim subtitle: the static window + the sample count.
-            ui.label(
-                RichText::new(format!("last 5 minutes · {} samples", graph.samples.len()))
-                    .color(ui.visuals().weak_text_color()),
-            );
-            ui.add_space(8.0);
+            let dim = ui.visuals().weak_text_color();
+            // The render-local view state (C7-22, the D-3
+            // IdTypeMap mechanism): read-modify-write — no context
+            // borrow is held across the layout (the C7-18 idiom).
+            let mut view = view_state(ctx);
             // One pass over the ring (the transient `Vec` is a
             // render-only copy — the `render_history` idiom; the
             // ring itself never grows, D-C4).
             let samples: Vec<GraphSample> = graph.samples.iter().copied().collect();
-            // The shared static window: anchored at the newest
-            // sample (C7-22's `pan_offset_s = 0` default) and
-            // reaching five minutes back — collapsed (0..0) while
-            // the state is empty, so every row degrades to its
-            // no-source note.
-            let t_end = samples.last().map(|s| s.t).unwrap_or(0.0);
-            let t_start = t_end - WINDOW_SECONDS;
-            // Palette semantics (style.rs): clocks + voltages
-            // AMBER, bandwidth + temperature CYAN.
-            graph_row(ui, &samples, |s| s.cpu_freq_mhz, "CPU FREQ (MHz)", AMBER, t_start, t_end);
-            ui.add_space(2.0);
-            // The permanent no-source row (D-4): the series has no
-            // source anywhere — an empty slice keeps it data-driven
-            // (it self-populates if one ever appears, no layout
-            // change).
-            graph_row(ui, &[], |_s| f64::NAN, "VDDCR_CPU", AMBER, t_start, t_end);
-            ui.add_space(2.0);
-            graph_row(ui, &samples, |s| s.vddcr_soc_mv, "VDDCR_SOC (mV)", AMBER, t_start, t_end);
-            ui.add_space(2.0);
-            graph_row(ui, &samples, |s| s.cpu_temp_c, "CPU TEMP (°C)", CYAN, t_start, t_end);
-            ui.add_space(2.0);
-            graph_row(
-                ui,
-                &samples,
-                |s| s.bandwidth_gbps,
-                "MEM BANDWIDTH (GB/s)",
-                CYAN,
-                t_start,
-                t_end,
+            // The view window: the selected resolution (default 5
+            // min = the static view of C7-20), the base
+            // [newest − W, newest] shifted back by the (clamped)
+            // pan. An empty state collapses to [−W, 0] — every row
+            // degrades to its no-source note, as in C7-20.
+            let window_secs = window_seconds_for(view.window_minutes);
+            let pan = clamp_pan(view.pan_offset_s, &samples, window_secs);
+            view.pan_offset_s = pan;
+            let t_end_base = samples.last().map(|s| s.t).unwrap_or(0.0);
+            let t_start_base = t_end_base - window_secs;
+            let (t_start, t_end) = (t_start_base - pan, t_end_base - pan);
+
+            ui.add_space(8.0);
+            ui.label(RichText::new(WINDOW_TITLE).strong().color(CYAN));
+            // The dim subtitle: the live window + the sample count
+            // (the pan offset when it is non-zero).
+            let mut subtitle = format!(
+                "last {} min · {} samples",
+                view.window_minutes,
+                samples.len()
             );
+            if pan > 0.0 {
+                subtitle.push_str(&format!(" · −{pan:.0} s"));
+            }
+            ui.label(RichText::new(subtitle).color(dim));
+            ui.add_space(8.0);
+            // The window-resolution row (C7-22 item 7f): four
+            // selectable buttons (selecting one resets the pan to
+            // 0) + the dim pan hint, right-aligned.
+            ui.horizontal(|ui| {
+                for minutes in WINDOW_MINUTES {
+                    if ui
+                        .add(
+                            egui::Button::new(format!("{minutes} min"))
+                                .selected(view.window_minutes == minutes),
+                        )
+                        .clicked()
+                    {
+                        view.window_minutes = minutes;
+                        view.pan_offset_s = 0.0;
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(PAN_HINT).color(dim));
+                });
+            });
+            ui.add_space(8.0);
+
+            // The five series rows in fixed order (C7-20) + the
+            // interaction (C7-22): a drag on any row pans the
+            // window, a hover over any row raises the crosshair.
+            let mut row_rects: Vec<Rect> = Vec::new();
+            let mut hover_pos: Option<Pos2> = None;
+            let mut add_row = |ui: &mut egui::Ui,
+                               field: &dyn Fn(&GraphSample) -> f64,
+                               label: &str,
+                               color: Color32,
+                               data: &[GraphSample],
+                               note_in_label: bool,
+                               window: (f64, f64)| {
+                let resp = graph_row(ui, data, field, label, color, window, note_in_label);
+                row_rects.push(resp.rect);
+                if let Some(pos) = resp.hover_pos() {
+                    hover_pos = Some(pos);
+                }
+                if resp.dragged_by(PointerButton::Primary) {
+                    let width = resp.rect.width().max(1.0);
+                    view.pan_offset_s += f64::from(resp.drag_delta().x) * (window_secs / f64::from(width));
+                }
+            };
+            add_row(ui, &|s| s.cpu_freq_mhz, "CPU FREQ (MHz)", AMBER, &samples, false, (t_start, t_end));
+            ui.add_space(2.0);
+            // The permanent no-source row (D-4): the label carries
+            // the `N/A (no source)` note (item 7d); the empty slice
+            // keeps it data-driven (it self-populates if a source
+            // ever appears, no layout change).
+            add_row(ui, &|_s| f64::NAN, "VDDCR_CPU — N/A (no source)", AMBER, &[], true, (t_start, t_end));
+            ui.add_space(2.0);
+            add_row(ui, &|s| s.vddcr_soc_mv, "VDDCR_SOC (mV)", AMBER, &samples, false, (t_start, t_end));
+            ui.add_space(2.0);
+            add_row(ui, &|s| s.cpu_temp_c, "CPU TEMP (°C)", CYAN, &samples, false, (t_start, t_end));
+            ui.add_space(2.0);
+            add_row(ui, &|s| s.bandwidth_gbps, "MEM BANDWIDTH (GB/s)", CYAN, &samples, false, (t_start, t_end));
+            // Clamp the accumulated pan back into the data (never a
+            // negative or past-the-data allocation), then persist
+            // the (possibly dragged / re-resolved) view.
+            view.pan_offset_s = clamp_pan(view.pan_offset_s, &samples, window_secs);
+            store_view(ctx, view);
+
+            // The interactive crosshair (C7-22 item 7e): on hover
+            // over any row, a full-height (all rows) vertical line
+            // at the hovered x + a floating tooltip with the exact
+            // value of every series at the hovered timestamp (the
+            // t of the nearest sample). No hover → no crosshair.
+            let (Some(pos), Some(row)) = (hover_pos, row_rects.first()) else {
+                return;
+            };
+            let Some(t) = hover_timestamp(
+                &samples,
+                (t_start_base, t_end_base),
+                pan,
+                pos.x - row.left(),
+                row.width(),
+            ) else {
+                return;
+            };
+            let top = row_rects.iter().map(|r| r.top()).fold(f32::INFINITY, f32::min);
+            let bottom = row_rects.iter().map(|r| r.bottom()).fold(f32::NEG_INFINITY, f32::max);
+            if bottom > top {
+                ui.painter().line_segment(
+                    [Pos2::new(pos.x, top), Pos2::new(pos.x, bottom)],
+                    Stroke::new(1.0_f32, ui.visuals().strong_text_color()),
+                );
+            }
+            let lines = tooltip_lines(&samples, t);
+            if !lines.is_empty() {
+                // The floating tooltip (the `egui::Area` idiom):
+                // offset from the pointer, flipped / clamped into
+                // the screen, above everything (Foreground).
+                let screen = ctx.screen_rect();
+                let est_w = lines
+                    .iter()
+                    .map(|l| l.chars().count() as f32)
+                    .fold(0.0, f32::max)
+                    * 7.5
+                    + 16.0;
+                let est_h = lines.len() as f32 * 18.0 + 12.0;
+                let mut x = pos.x + 12.0;
+                if x + est_w > screen.right() {
+                    x = (pos.x - 12.0 - est_w).max(screen.left());
+                }
+                let y = (pos.y + 12.0).min(screen.bottom() - est_h).max(screen.top());
+                Area::new(Id::new("ramsleuth_graph_tooltip"))
+                    .order(Order::Foreground)
+                    .fixed_pos(Pos2::new(x, y))
+                    .show(ctx, |ui| {
+                        let frame = egui::Frame::default()
+                            .fill(TOOLTIP_BG)
+                            .inner_margin(egui::Margin::same(6.0))
+                            .rounding(3.0);
+                        frame.show(ui, |ui| {
+                            for (i, line) in lines.iter().enumerate() {
+                                if i > 0 {
+                                    ui.add_space(2.0);
+                                }
+                                let color = if i == 0 {
+                                    dim
+                                } else {
+                                    ui.visuals().strong_text_color()
+                                };
+                                ui.label(RichText::new(line).monospace().size(12.0).color(color));
+                            }
+                        });
+                    });
+            }
         });
 }
 
@@ -912,5 +1300,435 @@ mod tests {
         run_headless_frame(|ctx| {
             render_graphs_window(ctx, &one);
         });
+    }
+
+    // ------------------------------------------------------------------
+    // C7-22 — window_seconds_for (the window-length selection).
+    // ------------------------------------------------------------------
+
+    /// (k) The four supported resolutions map to their seconds; an
+    /// unsupported value falls back to the default (5 min = 300 s).
+    #[test]
+    fn window_seconds_for_selects_the_supported_resolutions() {
+        assert_eq!(window_seconds_for(1), 60.0);
+        assert_eq!(window_seconds_for(5), 300.0);
+        assert_eq!(window_seconds_for(15), 900.0);
+        assert_eq!(window_seconds_for(60), 3600.0);
+        assert_eq!(window_seconds_for(7), 300.0, "an unsupported value falls back to the default");
+        assert_eq!(window_seconds_for(0), 300.0);
+        assert_eq!(window_seconds_for(u32::MAX), 300.0);
+    }
+
+    // ------------------------------------------------------------------
+    // C7-22 — clamp_pan (the pan clamping).
+    // ------------------------------------------------------------------
+
+    /// (l) The pan stays inside the data: a negative pan clamps to
+    /// 0, an in-range pan is kept, a past-the-data pan clamps to
+    /// span − window, and there is nothing to pan when the data
+    /// fits the window (or is empty / degenerate / non-finite).
+    #[test]
+    fn clamp_pan_stays_inside_the_data() {
+        // A 10-min span (600 s) against a 5-min window: max pan 300.
+        let ten = vec![sample(1000.0, 1.0, 1.0, 1.0, 1.0), sample(1600.0, 2.0, 2.0, 2.0, 2.0)];
+        assert_eq!(clamp_pan(-50.0, &ten, 300.0), 0.0, "a negative pan clamps to 0");
+        assert_eq!(clamp_pan(100.0, &ten, 300.0), 100.0, "an in-range pan is kept");
+        assert_eq!(
+            clamp_pan(9999.0, &ten, 300.0),
+            300.0,
+            "a past-the-data pan clamps to span − window"
+        );
+        // The span fits the window: nothing to pan.
+        let two = vec![sample(1000.0, 1.0, 1.0, 1.0, 1.0), sample(1240.0, 2.0, 2.0, 2.0, 2.0)];
+        assert_eq!(clamp_pan(999.0, &two, 300.0), 0.0, "a span that fits the window never pans");
+        // No data / one sample: no pan.
+        assert_eq!(clamp_pan(50.0, &[], 300.0), 0.0, "no samples never pan");
+        assert_eq!(
+            clamp_pan(50.0, &[sample(1000.0, 1.0, 1.0, 1.0, 1.0)], 300.0),
+            0.0,
+            "one sample never pans"
+        );
+        // A non-finite pan degrades to 0 (no panic).
+        assert_eq!(clamp_pan(f64::NAN, &ten, 300.0), 0.0, "a NaN pan degrades to 0");
+        assert_eq!(clamp_pan(f64::INFINITY, &ten, 300.0), 0.0, "an infinite pan degrades to 0");
+    }
+
+    // ------------------------------------------------------------------
+    // C7-22 — hover_timestamp (the crosshair nearest-sample lookup).
+    // ------------------------------------------------------------------
+
+    /// (m) The hovered x maps across the (panned) window and snaps
+    /// to the t of the nearest sample: the window edges, an exact
+    /// hit, the clamped out-of-row x, the pan shift, and the
+    /// degenerate inputs (no samples → None, zero width → None,
+    /// collapsed window → None, NaN pan → None).
+    #[test]
+    fn hover_timestamp_maps_the_window_and_snaps_to_the_nearest_sample() {
+        let samples = vec![
+            sample(1010.0, 1.0, 1.0, 1.0, 1.0),
+            sample(1050.0, 2.0, 2.0, 2.0, 2.0),
+            sample(1090.0, 3.0, 3.0, 3.0, 3.0),
+        ];
+        let w = (1000.0, 1100.0);
+        assert_eq!(
+            hover_timestamp(&samples, w, 0.0, 0.0, 100.0),
+            Some(1010.0),
+            "the left edge maps to t = 1000 → the nearest sample"
+        );
+        assert_eq!(
+            hover_timestamp(&samples, w, 0.0, 50.0, 100.0),
+            Some(1050.0),
+            "the mid maps exactly to the 1050 sample"
+        );
+        assert_eq!(
+            hover_timestamp(&samples, w, 0.0, 90.0, 100.0),
+            Some(1090.0),
+            "t = 1090 → the 1090 sample"
+        );
+        assert_eq!(
+            hover_timestamp(&samples, w, 0.0, 100.0, 100.0),
+            Some(1090.0),
+            "the right edge maps to t = 1100 → the nearest sample"
+        );
+        // The clamped x: a hover outside the row snaps to the edge.
+        assert_eq!(
+            hover_timestamp(&samples, w, 0.0, -25.0, 100.0),
+            Some(1010.0),
+            "x < 0 clamps to the left edge"
+        );
+        assert_eq!(
+            hover_timestamp(&samples, w, 0.0, 250.0, 100.0),
+            Some(1090.0),
+            "x > width clamps to the right edge"
+        );
+        // The pan shifts the window back: the same x maps earlier.
+        // [1000, 1100] − 100 → [900, 1000]: x = 100 → t = 1000 → 1010.
+        assert_eq!(
+            hover_timestamp(&samples, w, 100.0, 100.0, 100.0),
+            Some(1010.0),
+            "the panned window shifts the mapping back"
+        );
+        // Degenerate inputs: no panic, None.
+        assert_eq!(hover_timestamp(&[], w, 0.0, 50.0, 100.0), None, "no samples → no crosshair");
+        assert_eq!(
+            hover_timestamp(&samples, w, 0.0, 50.0, 0.0),
+            None,
+            "a zero-width row → no crosshair"
+        );
+        assert_eq!(
+            hover_timestamp(&samples, (1000.0, 1000.0), 0.0, 50.0, 100.0),
+            None,
+            "a collapsed window → no crosshair"
+        );
+        assert_eq!(
+            hover_timestamp(&samples, w, f64::NAN, 50.0, 100.0),
+            None,
+            "a NaN pan → no crosshair (no panic)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // C7-22 — tooltip_lines (the crosshair exact values).
+    // ------------------------------------------------------------------
+
+    /// (n) The tooltip lists the value of every series at the hover
+    /// timestamp in the plan style
+    /// (`1800 MHz · 1150 mV · 47.3 °C · 26.35 GB/s`) + the
+    /// `HH:MM:SS` timestamp: a fully populated sample, a partial
+    /// sample (missing fields as `N/A` — D-4), and the degenerate
+    /// inputs (no samples / a NaN t → no lines, no panic).
+    #[test]
+    fn tooltip_lines_list_every_series_at_the_hover_timestamp() {
+        let samples = vec![
+            sample(1_700_000_000.0, 3600.0, 1150.0, 47.3, 26.35),
+            sample(1_700_000_060.0, 3700.0, 1160.0, 48.0, 26.4),
+        ];
+        // The first sample (t = 1_700_000_000 → 22:13:20).
+        let lines = tooltip_lines(&samples, 1_700_000_000.0);
+        assert_eq!(lines.len(), 2, "the timestamp line + the values line");
+        assert_eq!(lines[0], "22:13:20");
+        assert_eq!(lines[1], "3600 MHz · 1150 mV · 47.3 °C · 26.35 GB/s");
+        // The nearest sample wins (t + 31 → the second, 29 s away).
+        let lines = tooltip_lines(&samples, 1_700_000_031.0);
+        assert_eq!(lines[0], "22:14:20");
+        assert_eq!(lines[1], "3700 MHz · 1160 mV · 48.0 °C · 26.40 GB/s");
+        // A partial sample: the missing fields degrade to N/A (D-4),
+        // the present one keeps its value.
+        let partial = vec![sample(1_700_000_000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN)];
+        let lines = tooltip_lines(&partial, 1_700_000_000.0);
+        assert_eq!(lines[1], "3600 MHz · N/A mV · N/A °C · N/A GB/s");
+        // Degenerate inputs: no lines, no panic.
+        assert!(tooltip_lines(&[], 1.0).is_empty());
+        assert!(tooltip_lines(&samples, f64::NAN).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // C7-22 — the interactive headless render (the synthetic pointer
+    // injection — the `render_history` headless pattern extended).
+    // ------------------------------------------------------------------
+
+    /// One `RawInput` carrying the given events (+ an optional
+    /// screen rect — `None` keeps the default 10000×10000).
+    fn pointer_input(events: Vec<egui::Event>, screen: Option<Rect>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: screen,
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// A `PointerButton` press / release event at `pos`.
+    fn button_event(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// The rect of the first series row, from the painted row
+    /// backgrounds (`ROW_BG` fills — the rows are the only shapes
+    /// painted with that color).
+    fn first_row_rect(out: &egui::FullOutput) -> Option<Rect> {
+        out.shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Rect(r) if r.fill == ROW_BG => Some(r.rect),
+                _ => None,
+            })
+    }
+
+    /// Whether the output carries the full-height crosshair line at
+    /// x: a vertical line segment (both points at x, a span well
+    /// above the single-row height — the line crosses all five
+    /// rows).
+    fn has_crosshair_line(out: &egui::FullOutput, x: f32) -> bool {
+        out.shapes.iter().any(|cs| match &cs.shape {
+            egui::Shape::LineSegment {
+                points: [p0, p1], ..
+            } => {
+                (p0.x - x).abs() < 0.5 && (p1.x - x).abs() < 0.5 && (p1.y - p0.y).abs() > 100.0
+            }
+            _ => false,
+        })
+    }
+
+    /// The painted text lines (the tooltip assertion surface).
+    fn painted_texts(out: &egui::FullOutput) -> Vec<&str> {
+        out.shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) => Some(t.galley.text()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// (o) The interactive render with a synthetic hover: a hover
+    /// over a row raises the full-height crosshair line at the
+    /// pointer x + the floating tooltip (the `HH:MM:SS` + the values
+    /// lines — egui areas paint from the frame after they first
+    /// appear, so the tooltip is asserted on the second hover
+    /// frame); the empty / partial states never panic, and the
+    /// crosshair drops again on a pointer-gone frame.
+    #[test]
+    fn render_graphs_window_hover_raises_the_crosshair_without_panicking() {
+        // 20 samples, 10 s apart (t = 1000..1190): all inside the
+        // default 5-min window [890, 1190].
+        let mut full = GraphState::default();
+        for i in 0..20 {
+            full.samples.push(sample(
+                1000.0 + 10.0 * f64::from(i),
+                3600.0 + 10.0 * f64::from(i),
+                1150.0 + f64::from(i),
+                45.0 + 0.1 * f64::from(i),
+                26.35,
+            ));
+        }
+
+        let ctx = egui::Context::default();
+        // Frame 1: no pointer — lay out the window + the row rect.
+        ctx.begin_frame(egui::RawInput::default());
+        render_graphs_window(&ctx, &GraphState::default());
+        let out = ctx.end_frame();
+        let row = first_row_rect(&out).expect("the first row background was painted");
+        let hover = Pos2::new(row.center().x, row.center().y);
+
+        // The empty state + hover: no panic, no crosshair (no
+        // samples to snap to).
+        ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(hover)], None));
+        render_graphs_window(&ctx, &GraphState::default());
+        let out = ctx.end_frame();
+        assert!(!has_crosshair_line(&out, hover.x), "no samples → no crosshair");
+
+        // The full state + hover: the crosshair at the pointer x.
+        // The tooltip area is new this frame — not painted yet.
+        ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(hover)], None));
+        render_graphs_window(&ctx, &full);
+        let out = ctx.end_frame();
+        assert!(has_crosshair_line(&out, hover.x), "the crosshair line paints at the hover x");
+
+        // The pointer stays: the tooltip now paints (the mid-row
+        // hover maps to t = 1040 = the exact 5th sample: 3640 MHz ·
+        // 1154 mV · 45.4 °C · 26.35 GB/s @ 00:17:20).
+        ctx.begin_frame(egui::RawInput::default());
+        render_graphs_window(&ctx, &full);
+        let out = ctx.end_frame();
+        assert!(has_crosshair_line(&out, hover.x), "the crosshair persists while hovering");
+        let texts = painted_texts(&out);
+        assert!(
+            texts.contains(&"00:17:20"),
+            "the tooltip shows the HH:MM:SS timestamp, got {texts:?}"
+        );
+        assert!(
+            texts.contains(&"3640 MHz · 1154 mV · 45.4 °C · 26.35 GB/s"),
+            "the tooltip lists every series at that timestamp, got {texts:?}"
+        );
+
+        // The pointer goes: the crosshair drops again.
+        ctx.begin_frame(pointer_input(vec![egui::Event::PointerGone], None));
+        render_graphs_window(&ctx, &full);
+        let out = ctx.end_frame();
+        assert!(!has_crosshair_line(&out, hover.x), "no hover → no crosshair");
+
+        // The partial state (one sample with only a finite clock):
+        // the crosshair + the tooltip with the N/A fields (D-4) —
+        // the tooltip area reappears fresh, so two hover frames
+        // again.
+        let mut partial = GraphState::default();
+        partial.samples.push(sample(1000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN));
+        ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(hover)], None));
+        render_graphs_window(&ctx, &partial);
+        let _out = ctx.end_frame();
+        ctx.begin_frame(egui::RawInput::default());
+        render_graphs_window(&ctx, &partial);
+        let out = ctx.end_frame();
+        assert!(has_crosshair_line(&out, hover.x), "a partial sample still raises the crosshair");
+        let texts = painted_texts(&out);
+        assert!(
+            texts.contains(&"3600 MHz · N/A mV · N/A °C · N/A GB/s"),
+            "the tooltip degrades the missing fields to N/A, got {texts:?}"
+        );
+    }
+
+    /// (p) The horizontal pan with a synthetic drag: a press on a
+    /// row + a rightward drag pans the window back (the view state
+    /// in the IdTypeMap of the child context), clamped to the data
+    /// (span − window); the pan persists across the release + the
+    /// following pointer-less frames.
+    #[test]
+    fn render_graphs_window_drag_pans_the_window_and_clamps_to_the_data() {
+        // 36 samples, 10 s apart (t = 1000..1350): span 350 s >
+        // the default 300 s window → max pan = 50 s.
+        let mut history = GraphState::default();
+        for i in 0..36 {
+            history.samples.push(sample(
+                1000.0 + 10.0 * f64::from(i),
+                3600.0 + f64::from(i),
+                1150.0,
+                45.0,
+                26.35,
+            ));
+        }
+        // A 400×300 screen (a manageable row width for the drag).
+        let screen = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0)));
+
+        let ctx = egui::Context::default();
+        ctx.begin_frame(pointer_input(vec![], screen));
+        render_graphs_window(&ctx, &history);
+        let out = ctx.end_frame();
+        let row = first_row_rect(&out).expect("the first row background was painted");
+
+        // Press the primary button on the left edge of the row …
+        let press = Pos2::new(row.left() + 1.0, row.center().y);
+        ctx.begin_frame(pointer_input(vec![button_event(press, true)], screen));
+        render_graphs_window(&ctx, &history);
+        let _out = ctx.end_frame();
+        // … then drag the pointer to the center of the row.
+        let drag_to = Pos2::new(row.center().x, row.center().y);
+        ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(drag_to)], screen));
+        render_graphs_window(&ctx, &history);
+        let _out = ctx.end_frame();
+        // The pan = the drag × (window / width): far beyond the max
+        // (50 s) → clamped to exactly span − window.
+        let view = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(view_id(), GraphView::default));
+        assert_eq!(view.pan_offset_s, 50.0, "the pan clamps to span − window, got {view:?}");
+        assert_eq!(view.window_minutes, 5, "the window resolution is untouched by the pan");
+
+        // Release + a pointer-less frame: the pan persists.
+        ctx.begin_frame(pointer_input(vec![button_event(drag_to, false)], screen));
+        render_graphs_window(&ctx, &history);
+        let _out = ctx.end_frame();
+        ctx.begin_frame(pointer_input(vec![], screen));
+        render_graphs_window(&ctx, &history);
+        let _out = ctx.end_frame();
+        let view = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(view_id(), GraphView::default));
+        assert_eq!(view.pan_offset_s, 50.0, "the pan persists after the release, got {view:?}");
+    }
+
+    /// (q) The window-resolution buttons: clicking `60 min`
+    /// re-selects the window and resets the pan to 0 (the plan
+    /// selection rule) — over the view state in the IdTypeMap of
+    /// the child context (a pre-set in-range pan is cleared by the
+    /// click).
+    #[test]
+    fn render_graphs_window_button_reselects_the_window_and_resets_the_pan() {
+        // 36 samples, 10 s apart (t = 1000..1350): span 350 s → an
+        // in-range pan of 37 s against the 5-min window.
+        let mut history = GraphState::default();
+        for i in 0..36 {
+            history.samples.push(sample(
+                1000.0 + 10.0 * f64::from(i),
+                3600.0 + f64::from(i),
+                1150.0,
+                45.0,
+                26.35,
+            ));
+        }
+        let ctx = egui::Context::default();
+        // Pre-set the view: 5 min + an in-range pan of 37 s.
+        ctx.data_mut(|d| {
+            *d.get_temp_mut_or_insert_with(view_id(), GraphView::default) = GraphView {
+                window_minutes: 5,
+                pan_offset_s: 37.0,
+            }
+        });
+
+        ctx.begin_frame(egui::RawInput::default());
+        render_graphs_window(&ctx, &history);
+        let out = ctx.end_frame();
+        // Find the `60 min` button by its label (the only thing
+        // painted with that exact text) and click its center.
+        let click = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text() == "60 min" => Some(Pos2::new(
+                    t.pos.x + t.galley.size().x / 2.0,
+                    t.pos.y + t.galley.size().y / 2.0,
+                )),
+                _ => None,
+            })
+            .expect("the `60 min` button label was painted");
+
+        // Press …
+        ctx.begin_frame(pointer_input(vec![button_event(click, true)], None));
+        render_graphs_window(&ctx, &history);
+        let _out = ctx.end_frame();
+        // … then release on the button: clicked → re-select +
+        // reset the pan.
+        ctx.begin_frame(pointer_input(vec![button_event(click, false)], None));
+        render_graphs_window(&ctx, &history);
+        let _out = ctx.end_frame();
+        let view = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(view_id(), GraphView::default));
+        assert_eq!(
+            view,
+            GraphView {
+                window_minutes: 60,
+                pan_offset_s: 0.0
+            },
+            "selecting the window re-selects it and resets the pan"
+        );
     }
 }
