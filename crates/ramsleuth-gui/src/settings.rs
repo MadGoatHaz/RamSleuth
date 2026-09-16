@@ -127,7 +127,7 @@ impl Default for GuiSettings {
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             units: Units::default(),
             theme: Theme::default(),
-            refresh_enabled: true,
+            refresh_enabled: false,
         }
     }
 }
@@ -289,7 +289,10 @@ mod tests {
     /// (a) The defaults match the brief (D-C5): the protocol's
     /// default socket, the current 2 s poll cadence, the binary
     /// capacity + MHz clock units, the single dark-slate theme, and
-    /// refresh on.
+    /// refresh off by default (one baseline fetch on connect; enable
+    /// in Settings to poll — the brief's item 1: auto-polling OFF by
+    /// default, the C7-08 baseline-once mechanism performs the
+    /// startup fetch).
     #[test]
     fn default_settings_match_the_brief() {
         let settings = GuiSettings::default();
@@ -301,7 +304,7 @@ mod tests {
             Units { capacity: CapacityUnit::GiB, clock: ClockUnit::MHz }
         );
         assert_eq!(settings.theme, Theme::DarkSlate);
-        assert!(settings.refresh_enabled, "refresh must default on");
+        assert!(!settings.refresh_enabled, "refresh must default off");
     }
 
     /// (b) The serde round-trip: a fully-mutated settings struct

@@ -277,8 +277,9 @@ fn key_action(key: egui::Key) -> Option<GuiAction> {
 /// `--socket` argument becomes `settings.socket` (the settings panel
 /// shows the active socket, and the poller reads it live — a panel
 /// edit retargets the next cycle), every other knob at its
-/// [`GuiSettings::default`] value (2 s poll, refresh on, the default
-/// units + theme).
+/// [`GuiSettings::default`] value (2 s poll, refresh off by default
+/// — one baseline fetch on connect; enable in Settings to poll; the
+/// default units + theme).
 fn seed_settings(args: &GuiArgs) -> GuiSettings {
     GuiSettings {
         socket: args.socket.to_string_lossy().into_owned(),
@@ -1446,15 +1447,16 @@ mod tests {
     /// (k2) `seed_settings`: the CLI `--socket` becomes
     /// `settings.socket` (the panel shows the active socket, the
     /// poller reads it live), every other knob stays at its default
-    /// (2 s poll, refresh on); the no-flag default seeds the
-    /// protocol's default socket.
+    /// (2 s poll, refresh off by default — one baseline fetch on
+    /// connect; enable in Settings to poll); the no-flag default
+    /// seeds the protocol's default socket.
     #[test]
     fn seed_settings_from_the_cli_socket() {
         let args = GuiArgs { socket: PathBuf::from("/tmp/ramsleuth-dev.sock") };
         let settings = seed_settings(&args);
         assert_eq!(settings.socket, "/tmp/ramsleuth-dev.sock");
         assert_eq!(settings.poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
-        assert!(settings.refresh_enabled);
+        assert!(!settings.refresh_enabled, "refresh must default off");
         assert_eq!(
             settings,
             GuiSettings {
