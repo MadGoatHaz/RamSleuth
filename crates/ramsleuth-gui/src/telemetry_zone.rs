@@ -11,7 +11,10 @@
 //! each [`Section::Value`] printed in CYAN, each [`Section::Na`]
 //! printed `N/A (<reason>)` in CRIMSON, and the two semantic warnings
 //! in AMBER (a 1:2 UCLK:MCLK divide = gear desync; a SOC rail above
-//! 1.30 V = out of spec on AM5).
+//! 1.30 V = out of spec on AM5). The MCLK / UCLK / FCLK rows follow
+//! the settings panel's clock-unit knob (C7-15): the default `MHz`
+//! keeps the two-decimal form, the `GHz` knob re-renders them
+//! through [`format_clock`]'s GHz form (÷1000, trimmed).
 //!
 //! **Grouped layout (C6-21, items 2+3; C7-12 3×2):** the flat
 //! single-column grid is now the §3.1 3-column × 2-row matrix —
@@ -51,7 +54,7 @@ use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 
 use crate::update::TelemetryData;
-use crate::{AMBER, CRIMSON, CYAN, SLATE};
+use crate::{format_clock, ClockUnit, Units, AMBER, CRIMSON, CYAN, SLATE};
 
 /// The zone title (Grand Design §3.1, left panel).
 const ZONE_TITLE: &str = "1 · MEMORY CONTROLLER & SUBTIMINGS";
@@ -136,9 +139,11 @@ pub struct VendorTiming {
 /// both blocks (the vendor-claim-free behavior — each branch
 /// degrades to its own single N/A row).
 ///
-/// Pure and deterministic: the same snapshot always yields the same
-/// `Vec`. Each row's display is the formatted text of its
-/// [`Section::Value`] (two-decimal MHz, one-decimal Ω, three-decimal
+/// Pure and deterministic: the same snapshot + clock unit always
+/// yields the same `Vec`. Each row's display is the formatted text
+/// of its [`Section::Value`] (the clock unit's form — the `MHz`
+/// default keeps its two-decimal, the `GHz` knob is
+/// [`format_clock`]'s ÷1000-trimmed — one-decimal Ω, three-decimal
 /// V, bare ticks, `1:1` / `1:2`, `1x`…`4x`, `on` / `off`,
 /// `GEAR_DOWN: Enabled` / `GEAR_DOWN: Disabled` + `CR: 1T` / `CR: 2T`,
 /// `RZQ/N (x.x Ω)`) or
@@ -148,7 +153,7 @@ pub struct VendorTiming {
 /// N/A display (and an Intel readout with no decoded channels does
 /// the same with `not applicable`), so an all-Na snapshot still
 /// renders the complete matrix and never panics.
-pub fn timing_cells(telemetry: &SystemMemoryTelemetry) -> Vec<VendorTiming> {
+pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<VendorTiming> {
     // The platform-conditional visibility (C7-14, item 3b): each
     // block renders on its own vendor — the off-vendor branch is
     // omitted even in its degraded `N/A (unsupported hardware)` form
@@ -169,6 +174,7 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry) -> Vec<VendorTiming> {
                         &readout.cad_bus,
                         &readout.voltages,
                         None,
+                        units,
                     ),
                     degraded: None,
                 });
@@ -192,6 +198,7 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry) -> Vec<VendorTiming> {
                                 &channel.cad_bus,
                                 &channel.voltages,
                                 Some(&channel.rtl),
+                                units,
                             ),
                             degraded: None,
                         });
@@ -237,12 +244,13 @@ fn readout_sections(
     cad_bus: &CadBus,
     voltages: &VoltageSet,
     rtl: Option<&Section<u16>>,
+    units: &Units,
 ) -> Vec<TimingSection> {
     // The first three stored sections.
     let mut clocks_rows: Vec<(String, String)> = vec![
-        row("MCLK", mhz(&clocks.mclk_mhz)),
-        row("UCLK", mhz(&clocks.uclk_mhz)),
-        row("FCLK", mhz(&clocks.fclk_mhz)),
+        row("MCLK", mhz(&clocks.mclk_mhz, units)),
+        row("UCLK", mhz(&clocks.uclk_mhz, units)),
+        row("FCLK", mhz(&clocks.fclk_mhz, units)),
         row("UCLK:MCLK", div(&clocks.div_mode)),
         row("gear", gear(&clocks.gear_mode)),
         row("GDM / CR", gdm_cr(&clocks.gdm, &clocks.command_rate)),
@@ -359,10 +367,16 @@ fn na_text(reason: &NaReason) -> String {
     }
 }
 
-/// A memory-clock cell in megahertz (two decimals).
-fn mhz(section: &Section<f64>) -> String {
+/// A memory-clock cell in the selected clock unit (C7-15): the
+/// default `MHz` arm keeps the current two-decimal form, the `GHz`
+/// arm is [`format_clock`]'s GHz form (the carried MHz ÷ 1000,
+/// trimmed — a non-finite value degrades to the honest `N/A`).
+fn mhz(section: &Section<f64>, units: &Units) -> String {
     match section {
-        Section::Value(value) => format!("{value:.2} MHz"),
+        Section::Value(value) => match units.clock {
+            ClockUnit::MHz => format!("{value:.2} MHz"),
+            ClockUnit::GHz => format_clock(*value, units),
+        },
         Section::Na(reason) => na_text(reason),
     }
 }
@@ -473,8 +487,9 @@ fn volts(section: &Section<u16>) -> String {
 /// Rows: the label in default text, the value in CYAN, an absent cell
 /// (`N/A (…)`) in CRIMSON, and the two warnings in AMBER — a 1:2
 /// UCLK:MCLK divide (gear desync) and a VDDCR_SOC reading above 1.30 V
-/// (out of spec on AM5). No telemetry renders one crimson placeholder
-/// line — never a panic (plan D5).
+/// (out of spec on AM5); the MCLK / UCLK / FCLK rows follow the
+/// settings panel's clock-unit knob (C7-15). No telemetry renders one
+/// crimson placeholder line — never a panic (plan D5).
 pub fn render_telemetry_zone(ui: &mut egui::Ui, data: &TelemetryData) {
     let frame = egui::Frame::default()
         .fill(SLATE)
@@ -485,7 +500,7 @@ pub fn render_telemetry_zone(ui: &mut egui::Ui, data: &TelemetryData) {
         ui.add_space(4.0);
         match &data.telemetry {
             Some(telemetry) => {
-                let blocks = timing_cells(telemetry);
+                let blocks = timing_cells(telemetry, &data.settings.units);
                 for (index, block) in blocks.iter().enumerate() {
                     if index > 0 {
                         ui.add_space(6.0);
@@ -803,7 +818,7 @@ mod tests {
     /// row.
     #[test]
     fn representative_cells_carry_formatted_values() {
-        let blocks = timing_cells(&representative());
+        let blocks = timing_cells(&representative(), &Units::default());
         assert_eq!(
             blocks.len(),
             1,
@@ -859,7 +874,7 @@ mod tests {
     /// both blocks (C7-14) — no panic.
     #[test]
     fn all_na_blocks_degrade_to_single_rows_panic_free() {
-        let blocks = timing_cells(&all_na());
+        let blocks = timing_cells(&all_na(), &Units::default());
         assert_eq!(
             blocks.len(),
             2,
@@ -879,7 +894,10 @@ mod tests {
     #[test]
     fn cells_are_deterministic() {
         for snapshot in [representative(), intel_populated(), all_na()] {
-            assert_eq!(timing_cells(&snapshot), timing_cells(&snapshot));
+            assert_eq!(
+            timing_cells(&snapshot, &Units::default()),
+            timing_cells(&snapshot, &Units::default())
+        );
         }
     }
 
@@ -894,7 +912,7 @@ mod tests {
         // AMD host (a populated AMD branch): the AMD header renders,
         // the off-vendor Intel block — even its degraded N/A form —
         // is omitted.
-        let blocks = timing_cells(&representative());
+        let blocks = timing_cells(&representative(), &Units::default());
         assert!(
             blocks.iter().any(|block| block.header == "AMD"),
             "the AMD block header is expected: {blocks:?}"
@@ -909,7 +927,7 @@ mod tests {
         // Intel host (a populated two-channel Intel branch): the
         // Intel channel headers render, the off-vendor AMD block is
         // omitted.
-        let blocks = timing_cells(&intel_populated());
+        let blocks = timing_cells(&intel_populated(), &Units::default());
         assert!(
             blocks.iter().any(|block| block.header.starts_with("Intel ch ")),
             "the Intel channel block headers are expected: {blocks:?}"
@@ -921,7 +939,7 @@ mod tests {
 
         // Unknown vendor (both branches degraded): both blocks
         // render — the current vendor-claim-free behavior.
-        let blocks = timing_cells(&all_na());
+        let blocks = timing_cells(&all_na(), &Units::default());
         assert!(
             blocks.iter().any(|block| block.header == "AMD"),
             "the AMD block header is expected: {blocks:?}"
@@ -940,7 +958,7 @@ mod tests {
     /// to a crimson N/A pair (D-C11 not-applicable cells).
     #[test]
     fn intel_blocks_are_per_channel() {
-        let blocks = timing_cells(&intel_populated());
+        let blocks = timing_cells(&intel_populated(), &Units::default());
         let headers: Vec<String> = blocks.iter().map(|block| block.header.clone()).collect();
         assert_eq!(
             headers,
@@ -1096,7 +1114,7 @@ mod tests {
     fn worst_column_depth_fits_the_default_size() {
         const ROW_PITCH: f32 = 18.0;
         for snapshot in [representative(), intel_populated(), all_na()] {
-            for block in &timing_cells(&snapshot) {
+            for block in &timing_cells(&snapshot, &Units::default()) {
                 let depth = if block.sections.is_empty() {
                     1 // a degraded block renders one N/A row
                 } else {
@@ -1140,7 +1158,7 @@ mod tests {
             Some(all_na()),
             None,
         ] {
-            let blocks = telemetry.as_ref().map(timing_cells);
+            let blocks = telemetry.as_ref().map(|t| timing_cells(t, &Units::default()));
             let data = TelemetryData { telemetry, ..Default::default() };
             run_headless_frame(|ui| {
                 ui.allocate_ui_with_layout(
@@ -1171,5 +1189,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// (j) The clock-unit knob (C7-15, item 2c): the MCLK / UCLK /
+    /// FCLK rows render in the selected clock unit — the default
+    /// `MHz` keeps the current two-decimal form (the `representative`
+    /// assertions cover it), the `GHz` knob re-renders the same rows
+    /// through [`format_clock`]'s GHz form (the carried MHz ÷ 1000,
+    /// trimmed); every other row is unit-agnostic and unchanged under
+    /// the knob.
+    #[test]
+    fn clock_rows_follow_the_units_knob() {
+        // The default unit (MHz) keeps the current two-decimal form.
+        let blocks = timing_cells(&representative(), &Units::default());
+        let rows = all_rows(&blocks);
+        assert_eq!(displays(&rows, "MCLK"), vec!["1600.00 MHz"]);
+        assert_eq!(displays(&rows, "UCLK"), vec!["1600.00 MHz"]);
+        assert_eq!(displays(&rows, "FCLK"), vec!["1800.00 MHz"]);
+
+        // The GHz knob re-renders the clock rows in GHz: 1600 MHz →
+        // `1.6 GHz`, 1800 MHz → `1.8 GHz` (format_clock's trim: a
+        // whole number drops its decimals, else one decimal).
+        let ghz = Units {
+            clock: ClockUnit::GHz,
+            ..Units::default()
+        };
+        let blocks = timing_cells(&representative(), &ghz);
+        let rows = all_rows(&blocks);
+        assert_eq!(displays(&rows, "MCLK"), vec!["1.6 GHz"]);
+        assert_eq!(displays(&rows, "UCLK"), vec!["1.6 GHz"]);
+        assert_eq!(displays(&rows, "FCLK"), vec!["1.8 GHz"]);
+
+        // The unit-agnostic rows are unchanged under the knob.
+        assert_eq!(displays(&rows, "UCLK:MCLK"), vec!["1:2"]);
+        assert_eq!(displays(&rows, "gear"), vec!["N/A (not applicable)"]);
+        assert_eq!(displays(&rows, "GDM / CR"), vec!["GEAR_DOWN: Enabled · CR: 1T"]);
+        assert_eq!(displays(&rows, "PDM"), vec!["off"]);
+        assert_eq!(displays(&rows, "tCL"), vec!["16"]);
+        assert_eq!(displays(&rows, "VDDCR_SOC"), vec!["1.150 V"]);
     }
 }
