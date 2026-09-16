@@ -12,7 +12,7 @@
 //!   (`SystemPlatform.cpu_clock_mhz`).
 //! - `VDDCR_CPU` — no source anywhere (the unprivileged SMU surface
 //!   carries no VDDCR_CPU cell): a permanent label-only row whose
-//!   label carries the `N/A (no source)` note, no fake geometry
+//!   label carries the bare `N/A` note, no fake geometry
 //!   (D-4).
 //! - `VDDCR_SOC (mV)` — the AMD SOC rail
 //!   (`AmdReadout.voltages.vddcr_soc_mv`).
@@ -63,7 +63,7 @@
 //!   `1800 MHz · 1150 mV · 47.3 °C · 26.35 GB/s`-style, missing
 //!   fields as `N/A`) + the `HH:MM:SS` timestamp; no hover → no
 //!   crosshair. A series whose window holds no finite sample draws
-//!   a label + the `N/A (no source)` note and no geometry (D-4 — a
+//!   a label + the bare `N/A` note and no geometry (D-4 — a
 //!   flat 0 line would be a lie, 0 ≠ N/A): the `VDDCR_CPU` note
 //!   lives in the label (permanent), the `CPU TEMP` / `MEM
 //!   BANDWIDTH` notes self-clear when data appears.
@@ -130,9 +130,10 @@ const TEXT_MARGIN: f32 = 3.0;
 const ROW_BG: Color32 = Color32::from_rgb(0x16, 0x16, 0x1C);
 /// The window title (the dedicated graphs window, C7-20/21).
 const WINDOW_TITLE: &str = "RAM & SYSTEM GRAPHS";
-/// The no-source note (D-4): a source-less series never fakes a
-/// 0 line (0 ≠ N/A) — the label + this note, no geometry.
-const NO_SOURCE_NOTE: &str = "N/A (no source)";
+/// The no-source note (D-4): the bare `N/A` — a source-less
+/// series never fakes a 0 line (0 ≠ N/A) — the label + this
+/// note, no geometry.
+const NO_SOURCE_NOTE: &str = "N/A";
 
 // ---------------------------------------------------------------------
 // The state (the §3 frozen shapes: one ring of timestamped samples).
@@ -603,7 +604,7 @@ fn tooltip_lines(samples: &[GraphSample], t: f64) -> Vec<String> {
 /// either (a) the time-windowed geometry from [`window_points`] (a
 /// filled dot for a single in-window sample, a polyline for more,
 /// a dim newest-value readout top-right) or (b) when the window
-/// holds no finite sample, the `N/A (no source)` note (D-4 — it
+/// holds no finite sample, the bare `N/A` note (D-4 — it
 /// self-clears when data appears; the permanent `VDDCR_CPU` row
 /// carries the note in its label instead — `note_in_label`) —
 /// never fake geometry, never a panic.
@@ -700,7 +701,7 @@ fn graph_row(
 ///
 /// 1. `CPU FREQ (MHz)` — the live core frequency.
 /// 2. `VDDCR_CPU` — the permanent no-source row (D-4: the label
-///    carries `— N/A (no source)` — the series has no source
+///    carries `— N/A` — the series has no source
 ///    anywhere; no geometry, it self-populates if one ever
 ///    appears, no layout change — the row is data-driven).
 /// 3. `VDDCR_SOC (mV)` — the AMD SOC rail.
@@ -818,10 +819,10 @@ pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState) {
             add_row(ui, &|s| s.cpu_freq_mhz, "CPU FREQ (MHz)", AMBER, &samples, false, (t_start, t_end));
             ui.add_space(2.0);
             // The permanent no-source row (D-4): the label carries
-            // the `N/A (no source)` note (item 7d); the empty slice
+            // the bare `N/A` note (item 7d); the empty slice
             // keeps it data-driven (it self-populates if a source
             // ever appears, no layout change).
-            add_row(ui, &|_s| f64::NAN, "VDDCR_CPU — N/A (no source)", AMBER, &[], true, (t_start, t_end));
+            add_row(ui, &|_s| f64::NAN, "VDDCR_CPU — N/A", AMBER, &[], true, (t_start, t_end));
             ui.add_space(2.0);
             add_row(ui, &|s| s.vddcr_soc_mv, "VDDCR_SOC (mV)", AMBER, &samples, false, (t_start, t_end));
             ui.add_space(2.0);
@@ -1301,6 +1302,66 @@ mod tests {
         run_headless_frame(|ctx| {
             render_graphs_window(ctx, &one);
         });
+    }
+
+    /// (r) The no-source note renders bare `N/A` (D-4 — the
+    /// parenthetical is stripped): the permanent `VDDCR_CPU` row
+    /// label reads `VDDCR_CPU — N/A`, each source-less data row
+    /// paints the bare note top-right, and no painted text carries
+    /// a `no source` parenthetical — in the empty state (all four
+    /// data rows no-source) and the populated state (the permanent
+    /// label + the self-cleared notes).
+    #[test]
+    fn render_graphs_window_no_source_note_renders_bare_na() {
+        // The empty state: every data row its bare note + the
+        // permanent VDDCR_CPU label (the note lives in the label).
+        let ctx = egui::Context::default();
+        ctx.begin_frame(egui::RawInput::default());
+        render_graphs_window(&ctx, &GraphState::default());
+        let out = ctx.end_frame();
+        let texts = painted_texts(&out);
+        assert!(
+            texts.contains(&"VDDCR_CPU — N/A"),
+            "the permanent row label is bare N/A, got {texts:?}"
+        );
+        assert!(
+            texts.iter().filter(|t| **t == "N/A").count() == 4,
+            "each source-less data row shows the bare note, got {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|t| !t.contains("no source")),
+            "no painted text carries the parenthetical, got {texts:?}"
+        );
+
+        // The populated state: the four data rows their newest-value
+        // readouts (the notes self-cleared) + the permanent label.
+        let mut full = GraphState::default();
+        for i in 0..20 {
+            full.samples.push(sample(
+                1000.0 + 10.0 * f64::from(i),
+                3600.0 + 10.0 * f64::from(i),
+                1150.0 + f64::from(i),
+                45.0 + 0.1 * f64::from(i),
+                26.35,
+            ));
+        }
+        let ctx = egui::Context::default();
+        ctx.begin_frame(egui::RawInput::default());
+        render_graphs_window(&ctx, &full);
+        let out = ctx.end_frame();
+        let texts = painted_texts(&out);
+        assert!(
+            texts.contains(&"VDDCR_CPU — N/A"),
+            "the permanent row label stays bare N/A, got {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"N/A"),
+            "no note left once data appears (self-cleared), got {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|t| !t.contains("no source")),
+            "no painted text carries the parenthetical, got {texts:?}"
+        );
     }
 
     // ------------------------------------------------------------------
