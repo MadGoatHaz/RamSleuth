@@ -19,10 +19,11 @@
 //! Voltages]` (the six sections, related content vertically adjacent)
 //! — each section a bold CYAN title row over its own 2-column
 //! `egui::Grid` (label/value, the compact 8.0 / 60.0 spacing so the
-//! three columns fit the zone width), and the new `GDM / CR` row in
+//! three columns fit the zone width), and the `GDM / CR` row in
 //! `[Clocks & Ratios]` (gear down mode + DRAM command rate — e.g.
-//! `Gear 1 / 1T` or `Disabled / 2T`; an Intel channel's
-//! not-applicable cells degrade it to a crimson N/A pair). The zone
+//! `GEAR_DOWN: Enabled · CR: 1T` or `GEAR_DOWN: Disabled · CR: 2T`;
+//! an Intel channel's not-applicable cells degrade their own tokens
+//! to a crimson N/A). The zone
 //! lays out at its natural height — no scroll area: at the default
 //! 1400×900 window the 3×2 grid (worst column ≈ 25 rows) fits the
 //! left column without vertical scrolling (C7-12); a whole `Na`
@@ -126,7 +127,8 @@ pub struct VendorTiming {
 /// `Vec`. Each row's display is the formatted text of its
 /// [`Section::Value`] (two-decimal MHz, one-decimal Ω, three-decimal
 /// V, bare ticks, `1:1` / `1:2`, `1x`…`4x`, `on` / `off`,
-/// `Gear 1` / `Disabled` + `1T` / `2T`, `RZQ/N (x.x Ω)`) or
+/// `GEAR_DOWN: Enabled` / `GEAR_DOWN: Disabled` + `CR: 1T` / `CR: 2T`,
+/// `RZQ/N (x.x Ω)`) or
 /// `N/A (<reason>)` for a [`Section::Na`] (the dump renderer's form —
 /// [`NaReason`] carries no `Display`). A vendor branch that degraded
 /// whole collapses to one block with empty `sections` + the N/A
@@ -197,10 +199,12 @@ fn degraded_block(header: &str, reason: &NaReason) -> VendorTiming {
 /// `[CAD Bus Drive & Termination]`, `[Secondary Timings]`, `[Active
 /// System Voltages]` — the 3×2 layout (C7-12) reads them as columns
 /// of two stacked sections ([`COLUMN_SECTIONS`]). The `GDM / CR` row
-/// (C6-21, item 3)
-/// shows the gear down mode + the DRAM command rate (e.g.
-/// `Gear 1 / 1T`, `Disabled / 2T`); an Intel channel's not-applicable
-/// GDM + command-rate cells degrade it to a crimson N/A pair. The
+/// (C6-21, item 3; D-7 format C7-13)
+/// shows the gear down mode + the DRAM command rate, each token
+/// carrying its own name (e.g. `GEAR_DOWN: Enabled · CR: 1T`,
+/// `GEAR_DOWN: Disabled · CR: 2T`); an Intel channel's not-applicable
+/// GDM / command-rate cells degrade their own tokens to a crimson
+/// N/A. The
 /// channel-level RTL (Intel only — the frozen `TimingSet` has no
 /// slot) is appended to `[Clocks & Ratios]`.
 fn readout_sections(
@@ -396,25 +400,30 @@ fn flag(section: &Section<bool>) -> String {
     }
 }
 
-/// The `GDM / CR` row (C6-21, item 3): the gear down mode + the DRAM
-/// command rate (e.g. `Gear 1 / 1T`, `Disabled / 2T`) — the §3.1
-/// mockup row `GDM / CR: Disabled / 1T` (synchronous 1:1, GDM off).
-/// GDM on → `Gear 1`, off → `Disabled`; a not-applicable / failed
-/// cell degrades its own token to `N/A (<reason>)` (the combined row
-/// colors CRIMSON when either token is absent — see [`cell_color`]).
-/// No panic on any Na combination.
+/// The `GDM / CR` row (C6-21, item 3; D-7 format C7-13): the gear
+/// down mode + the DRAM command rate, each token carrying its own
+/// name — `GEAR_DOWN: Enabled` / `GEAR_DOWN: Disabled` (gdm
+/// `true` / `false`) + `CR: 1T` / `CR: 2T`, joined with `" · "` →
+/// the exact displays `GEAR_DOWN: Enabled · CR: 1T`,
+/// `GEAR_DOWN: Enabled · CR: 2T`, `GEAR_DOWN: Disabled · CR: 1T`,
+/// `GEAR_DOWN: Disabled · CR: 2T` (the previous wording is dropped —
+/// it collided with Intel gear-mode semantics). A not-applicable /
+/// failed cell degrades its own token to `N/A (<reason>)` (per token,
+/// not the whole row; the combined row colors CRIMSON when either
+/// token is absent — see [`cell_color`]). No panic on any Na
+/// combination.
 fn gdm_cr(gdm: &Section<bool>, command_rate: &Section<CommandRate>) -> String {
     let gdm = match gdm {
-        Section::Value(true) => "Gear 1".to_owned(),
-        Section::Value(false) => "Disabled".to_owned(),
+        Section::Value(true) => "GEAR_DOWN: Enabled".to_owned(),
+        Section::Value(false) => "GEAR_DOWN: Disabled".to_owned(),
         Section::Na(reason) => na_text(reason),
     };
     let rate = match command_rate {
-        Section::Value(CommandRate::OneT) => "1T".to_owned(),
-        Section::Value(CommandRate::TwoT) => "2T".to_owned(),
+        Section::Value(CommandRate::OneT) => "CR: 1T".to_owned(),
+        Section::Value(CommandRate::TwoT) => "CR: 2T".to_owned(),
         Section::Na(reason) => na_text(reason),
     };
-    format!("{gdm} / {rate}")
+    format!("{gdm} · {rate}")
 }
 
 /// A memory-rail cell in volts (the frozen mV over 1000, three
@@ -547,8 +556,9 @@ fn render_section(
 /// 1:2 UCLK:MCLK divide (gear desync) and a VDDCR_SOC reading above
 /// [`SOC_MAX_VOLTS`] (out of spec on AM5). The combined `GDM / CR`
 /// row is CRIMSON when either of its tokens is absent (e.g.
-/// `Disabled / N/A (driver missing)`); a fully-absent display already
-/// hits the `starts_with("N/A")` pick above.
+/// `GEAR_DOWN: Enabled · N/A (driver missing)` or
+/// `N/A (not applicable) · CR: 1T`); a display whose gear-down token
+/// is absent already hits the `starts_with("N/A")` pick above.
 fn cell_color(label: &str, display: &str) -> egui::Color32 {
     if display.starts_with("N/A") {
         return CRIMSON;
@@ -799,7 +809,7 @@ mod tests {
         assert_eq!(displays(&rows, "FCLK"), vec!["1800.00 MHz"]);
         assert_eq!(displays(&rows, "UCLK:MCLK"), vec!["1:2"]);
         assert_eq!(displays(&rows, "gear"), vec!["N/A (not applicable)"]);
-        assert_eq!(displays(&rows, "GDM / CR"), vec!["Gear 1 / 1T"]);
+        assert_eq!(displays(&rows, "GDM / CR"), vec!["GEAR_DOWN: Enabled · CR: 1T"]);
         assert_eq!(displays(&rows, "PDM"), vec!["off"]);
         assert_eq!(displays(&rows, "tCL"), vec!["16"]);
         assert_eq!(displays(&rows, "tFAW"), vec!["16"]);
@@ -892,21 +902,22 @@ mod tests {
 
         // The GDM / CR row across all three blocks: the AMD block
         // (the host's Na branch — degraded, no rows), then the two
-        // Intel channels' not-applicable N/A pairs.
+        // Intel channels' not-applicable N/A token pairs.
         let gdm_cr = displays(&rows, "GDM / CR");
         assert_eq!(gdm_cr.len(), 2, "one GDM / CR row per decoded channel");
         assert_eq!(
             gdm_cr[0],
-            "N/A (not applicable) / N/A (not applicable)",
+            "N/A (not applicable) · N/A (not applicable)",
             "Intel channel 0's honest D-C11 not-applicable cells"
         );
         assert!(gdm_cr[1].contains("N/A"), "channel 1 is degraded");
     }
 
-    /// (f) The `GDM / CR` combined row: gear down mode + DRAM command
-    /// rate (e.g. `Gear 1 / 1T`, `Disabled / 2T`); each absent cell
-    /// degrades its own token to `N/A (<reason>)` — no panic on any
-    /// Na combination.
+    /// (f) The `GDM / CR` combined row (D-7 format): each token
+    /// carries its own name — the four value combinations
+    /// `GEAR_DOWN: <Enabled|Disabled> · CR: <1T|2T>` — and each
+    /// absent cell degrades its own token to `N/A (<reason>)` (per
+    /// token, not the whole row); no panic on any Na combination.
     #[test]
     fn gdm_cr_row_formats_the_command_rate() {
         let on = Section::Value(true);
@@ -916,11 +927,28 @@ mod tests {
         let one_t = Section::Value(CommandRate::OneT);
         let two_t = Section::Value(CommandRate::TwoT);
 
-        assert_eq!(gdm_cr(&on, &one_t), "Gear 1 / 1T");
-        assert_eq!(gdm_cr(&off, &two_t), "Disabled / 2T");
-        assert_eq!(gdm_cr(&off, &one_t), "Disabled / 1T");
-        assert!(gdm_cr(&gdm_na, &rate_na).starts_with("N/A"));
-        assert!(gdm_cr(&off, &rate_na).contains("N/A"));
+        // The four value combinations (D-7's exact strings).
+        assert_eq!(gdm_cr(&on, &one_t), "GEAR_DOWN: Enabled · CR: 1T");
+        assert_eq!(gdm_cr(&on, &two_t), "GEAR_DOWN: Enabled · CR: 2T");
+        assert_eq!(gdm_cr(&off, &one_t), "GEAR_DOWN: Disabled · CR: 1T");
+        assert_eq!(gdm_cr(&off, &two_t), "GEAR_DOWN: Disabled · CR: 2T");
+
+        // Per-token N/A degradation: the absent token renders
+        // `N/A (<reason>)`, the present token keeps its own form.
+        assert_eq!(
+            gdm_cr(&gdm_na, &one_t),
+            "N/A (not applicable) · CR: 1T",
+            "the gear-down token degrades on its own"
+        );
+        assert_eq!(
+            gdm_cr(&off, &rate_na),
+            "GEAR_DOWN: Disabled · N/A (not applicable)",
+            "the command-rate token degrades on its own"
+        );
+        assert!(
+            gdm_cr(&gdm_na, &rate_na).starts_with("N/A"),
+            "both tokens absent"
+        );
         assert!(gdm_cr(&gdm_na, &two_t).contains("N/A"));
     }
 
@@ -939,10 +967,31 @@ mod tests {
         assert_eq!(cell_color("VDDCR_SOC", "1.300 V"), CYAN);
         assert_eq!(cell_color("VDDCR_SOC", "1.450 V"), AMBER);
         assert_eq!(cell_color("VDDCR_SOC", "N/A (not applicable)"), CRIMSON);
-        assert_eq!(cell_color("GDM / CR", "Gear 1 / 1T"), CYAN);
-        assert_eq!(cell_color("GDM / CR", "Disabled / 2T"), CYAN);
-        assert_eq!(cell_color("GDM / CR", "N/A (not applicable) / N/A (not applicable)"), CRIMSON);
-        assert_eq!(cell_color("GDM / CR", "Disabled / N/A (driver missing)"), CRIMSON);
+        assert_eq!(
+            cell_color("GDM / CR", "GEAR_DOWN: Enabled · CR: 1T"),
+            CYAN,
+            "both tokens present"
+        );
+        assert_eq!(
+            cell_color("GDM / CR", "GEAR_DOWN: Disabled · CR: 2T"),
+            CYAN,
+            "both tokens present"
+        );
+        assert_eq!(
+            cell_color("GDM / CR", "N/A (not applicable) · N/A (not applicable)"),
+            CRIMSON,
+            "both tokens absent"
+        );
+        assert_eq!(
+            cell_color("GDM / CR", "GEAR_DOWN: Enabled · N/A (driver missing)"),
+            CRIMSON,
+            "the command-rate token alone absent"
+        );
+        assert_eq!(
+            cell_color("GDM / CR", "N/A (not applicable) · CR: 1T"),
+            CRIMSON,
+            "the gear-down token alone absent"
+        );
     }
 
     /// The zone's content budget at the default 1400×900 size
