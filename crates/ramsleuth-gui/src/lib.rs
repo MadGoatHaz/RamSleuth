@@ -66,7 +66,7 @@ pub mod update;
 // (workspace re-export style) — P3-26…P3-30 consume the palette,
 // `build_style`, and the F2/F3 export helpers from here. `GuiError`
 // rides along (the `ClientError` precedent) for the app shell's toasts.
-pub use style::{build_style, export_json, snapshot_png, GuiError, AMBER, CRIMSON, CYAN, SLATE};
+pub use style::{build_style, export_json, snapshot_png, GuiError, AMBER, CRIMSON, CYAN, NA_GRAY, SLATE};
 
 // P3-26: the shared update state + the background poller, re-exported
 // at the root (workspace re-export style) — the app shell (P3-30)

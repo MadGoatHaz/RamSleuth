@@ -1,7 +1,8 @@
 //! GUI semantic style + export helpers (P3-25, Grand Design §3.2).
 //!
 //! The visual contract of the desktop GUI: the four semantic palette
-//! colors (cyan / amber / slate / crimson), the dark-slate
+//! colors (cyan / amber / slate / crimson) + the muted N/A gray
+//! ([`NA_GRAY`], C8-05 — unavailable, not critical), the dark-slate
 //! [`build_style`], and the two file exports the app shell (P3-30)
 //! triggers on F2 / F3:
 //!
@@ -40,10 +41,17 @@ pub const AMBER: egui::Color32 = egui::Color32::from_rgb(0xFF, 0xB3, 0x00);
 pub const SLATE: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x1E, 0x24);
 /// Alert: 1:2 desync, out-of-spec voltages, errors.
 pub const CRIMSON: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x3B, 0x30);
+/// Muted / dimmed gray: N/A / unavailable sensors (C8-05, D-5) — the
+/// "absent, not critical" semantic; readable on the SLATE panel,
+/// distinct from `DIM_CELL` (the F2 card fill for unmeasured cells)
+/// and from the 0xE6E6EC body text.
+pub const NA_GRAY: egui::Color32 = egui::Color32::from_rgb(0x8A, 0x8A, 0x94);
 
 /// Build the dark-slate app style: SLATE window/panel fills, light
 /// text, CYAN accents (hover/active strokes, hyperlinks, text cursor,
-/// selection). AMBER/CRIMSON are consumed by the zones that render the
+/// selection). AMBER/CRIMSON and the muted [`NA_GRAY`] (C8-05: the
+/// fifth *text* color for N/A / unavailable cells, the zone-local
+/// `STATUS_DONE` precedent) are consumed by the zones that render the
 /// semantic values (P3-27/28), not by the base style.
 pub fn build_style() -> egui::Style {
     let text = egui::Color32::from_rgb(0xE6, 0xE6, 0xEC);
@@ -578,6 +586,14 @@ mod tests {
         assert_eq!((AMBER.r(), AMBER.g(), AMBER.b()), (0xFF, 0xB3, 0x00));
         assert_eq!((SLATE.r(), SLATE.g(), SLATE.b()), (0x1E, 0x1E, 0x24));
         assert_eq!((CRIMSON.r(), CRIMSON.g(), CRIMSON.b()), (0xFF, 0x3B, 0x30));
+    }
+
+    /// (d2) C8-05: the N/A gray decodes to the exact muted RGB and is
+    /// distinct from the fault-red CRIMSON (unavailable, not critical).
+    #[test]
+    fn na_gray_is_muted_and_distinct_from_crimson() {
+        assert_eq!(NA_GRAY, egui::Color32::from_rgb(0x8A, 0x8A, 0x94));
+        assert_ne!(NA_GRAY, CRIMSON);
     }
 
     /// (a) `build_style` returns the dark-slate Style: SLATE panel and
