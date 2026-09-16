@@ -6,8 +6,15 @@
 //! place the GUI talks to the daemon (plan D6: no render-thread blocking
 //! — 60 FPS stays feasible). That thread:
 //!
+//! - performs exactly one **baseline** [`poll_telemetry`] fetch per
+//!   distinct `settings.socket` value (D-8 — the one-shot startup
+//!   snapshot, independent of the `refresh_enabled` gate; a socket
+//!   edit re-triggers exactly one fetch for the new socket, and a
+//!   failed baseline never retries on its own — the next re-trigger
+//!   is a socket change or the refresh cadence);
 //! - at the live settings cadence (default 2 s — the
-//!   `settings.poll_interval_ms` knob, C6-27) runs one
+//!   `settings.poll_interval_ms` knob, C6-27, while
+//!   `refresh_enabled` is on) runs one
 //!   [`poll_telemetry`] cycle against the live settings socket
 //!   (`settings.socket` — seeded from the CLI `--socket` by the app
 //!   shell; a panel edit retargets the next cycle, C6-30): a fresh
@@ -29,7 +36,8 @@
 //! - re-reads the live settings knobs (`poll_interval_ms` +
 //!   `refresh_enabled` every tick — C6-27, the `socket` per poll /
 //!   bench cycle — C6-30) — a changed knob takes effect without a
-//!   poller restart; a disabled refresh idles the loop (no polling);
+//!   poller restart; a disabled refresh idles the loop after the
+//!   one-shot baseline per distinct socket (no continuous polling);
 //! - ticks every 200 ms so an in-flight run's progress frames stay
 //!   responsive, and stops on the shared `AtomicBool` (or when the
 //!   channel disconnects).
@@ -429,15 +437,25 @@ fn clamp_poll_interval(ms: u64) -> Duration {
 /// [`run_bench`] (the bench zone's Cancel button sets it, P3-28;
 /// `run_bench` resets it per run); otherwise re-read the live
 /// settings knobs (C6-27 / C6-30) — the clamped `poll_interval_ms` +
-/// the `refresh_enabled` gate + the `socket` — and poll telemetry
-/// when the last poll is ≥ the clamped interval old (a thread-local
-/// stamp, so a flapping daemon polls on the configured cadence
-/// instead of every tick; a disabled refresh idles the loop, and a
-/// changed knob takes effect on the next tick — no restart); tick
-/// [`POLLER_TICK`] (200 ms, so bench progress stays responsive); exit
-/// when `stop` is set or the channel disconnects. The `RwLock`'s data
-/// fields are written from this thread only, so the `unwrap` is the
-/// workspace's one-writer precedent (TUI P3-24).
+/// the `refresh_enabled` gate + the `socket` — and: (a) run exactly
+/// one **baseline** [`poll_telemetry`] fetch for a `socket` value the
+/// thread-local `baseline_for` stamp has not seen yet (D-8 —
+/// regardless of `refresh_enabled`, the one-shot startup snapshot; a
+/// socket edit re-triggers exactly one fetch for the new socket, and
+/// a failed baseline never retries on its own — no retry storm: the
+/// stamp is set after the fetch, which cannot panic (D5), so the
+/// next re-trigger is a socket change or the refresh cadence); it
+/// stamps the due clock, so the (b) cadence starts a full interval
+/// after it; (b) else, when the `refresh_enabled` gate is on and the
+/// last poll is ≥ the clamped interval old (the thread-local
+/// `last_poll` stamp, so a flapping daemon polls on the configured
+/// cadence instead of every tick; a disabled refresh idles the loop,
+/// and a changed knob takes effect on the next tick — no restart),
+/// poll telemetry; tick [`POLLER_TICK`] (200 ms, so bench progress
+/// stays responsive); exit when `stop` is set or the channel
+/// disconnects. The `RwLock`'s data fields are written from this
+/// thread only, so the `unwrap` is the workspace's one-writer
+/// precedent (TUI P3-24).
 pub fn spawn_poller(
     state: Arc<RwLock<TelemetryData>>,
     bench_rx: Receiver<BenchCmd>,
@@ -445,11 +463,23 @@ pub fn spawn_poller(
     cancel: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        // Primed due at the default cadence: the first telemetry
-        // poll runs at once (the live knob read below governs every
-        // subsequent due-check — C6-27).
+        // Primed due at the default cadence: with the refresh gate
+        // on, the first continuous poll runs at once (the live knob
+        // read below governs every subsequent due-check — C6-27);
+        // with it off the stamp only matters after a later
+        // refresh-enable (the baseline fetch is due-gate-independent
+        // — D-8).
         let mut last_poll =
             Instant::now() - Duration::from_millis(DEFAULT_POLL_INTERVAL_MS);
+        // Baseline-once (D-8): the last `settings.socket` value a
+        // one-shot baseline fetch ran against (`None` before the
+        // first tick). A distinct value triggers exactly one
+        // [`poll_telemetry`] regardless of `refresh_enabled`; the
+        // stamp is set after the fetch (which cannot panic, D5), so
+        // a failed baseline never retries on its own (no retry storm
+        // — the next re-trigger is a socket change or the refresh
+        // cadence).
+        let mut baseline_for: Option<String> = None;
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -475,7 +505,20 @@ pub fn spawn_poller(
                             settings.settings.socket.clone(),
                         )
                     };
-                    if refresh_enabled && last_poll.elapsed() >= interval {
+                    if baseline_for.as_deref() != Some(socket.as_str()) {
+                        // The one-shot baseline fetch for this socket
+                        // value (D-8): exactly one per distinct
+                        // socket, regardless of `refresh_enabled` —
+                        // the startup snapshot. Stamping `baseline_for`
+                        // + the due clock after the fetch (which cannot
+                        // panic, D5) — no retry storm: a failed
+                        // baseline is not re-attempted on its own — so
+                        // the (b) cadence starts a full interval after
+                        // it.
+                        let _ = poll_telemetry(Path::new(&socket), &mut state.write().unwrap());
+                        baseline_for = Some(socket);
+                        last_poll = Instant::now();
+                    } else if refresh_enabled && last_poll.elapsed() >= interval {
                         last_poll = Instant::now();
                         let _ = poll_telemetry(Path::new(&socket), &mut state.write().unwrap());
                     }
@@ -499,6 +542,7 @@ mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::process;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
 
     use ramsleuth_bench::{BenchOp, Tier};
@@ -804,7 +848,8 @@ mod tests {
     /// heavy logic is covered by the `poll_telemetry` / `run_bench`
     /// tests above — no extensive real-thread assertions). The poller
     /// reads its socket from `state.settings` (C6-30): the default
-    /// (unbound) socket just records a friendly error per cycle.
+    /// (unbound) socket records a friendly error on the one-shot
+    /// baseline fetch (D-8) before the immediate stop.
     #[test]
     fn spawn_poller_returns_a_handle_that_stops_cleanly() {
         let state = Arc::new(RwLock::new(TelemetryData::default()));
@@ -1310,6 +1355,9 @@ mod tests {
             settings: GuiSettings {
                 socket: sock.path().to_string_lossy().into_owned(),
                 poll_interval_ms: MIN_POLL_INTERVAL_MS,
+                // Explicit (C7-08): the pre-C7-09 default is `true`;
+                // the test's semantics are unchanged.
+                refresh_enabled: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -1466,6 +1514,9 @@ mod tests {
             settings: GuiSettings {
                 socket: sock_a.path().to_string_lossy().into_owned(),
                 poll_interval_ms: MIN_POLL_INTERVAL_MS,
+                // Explicit (C7-08): the pre-C7-09 default is `true`;
+                // the test's semantics are unchanged.
+                refresh_enabled: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -1501,6 +1552,336 @@ mod tests {
         drop(bench_tx);
         stop.store(true, Ordering::Relaxed);
         let _ = UnixStream::connect(sock_a.path());
+        stand_in.join().expect("the stand-in must not panic");
+        poller.join().expect("the poller thread must not panic");
+    }
+
+    // ------------------------------------------------------------------
+    // C7-08 (D-8): the baseline-once mechanism — exactly one
+    // `poll_telemetry` fetch per distinct `settings.socket` value,
+    // independent of `refresh_enabled`; a socket edit re-triggers one
+    // fetch; a failed baseline never retries on its own.
+    // ------------------------------------------------------------------
+
+    /// A counting stand-in: accepts connections until `stop`, serves
+    /// one mock snapshot per connection, and increments `count` per
+    /// served connection. The stop-waker's throwaway connect is never
+    /// counted (it is only sent after `stop` is set, and both stop
+    /// checks pass before a served connection is counted).
+    fn counting_stand_in(
+        sock: &TempSocket,
+        stop: &Arc<AtomicBool>,
+        count: &Arc<AtomicUsize>,
+    ) -> JoinHandle<()> {
+        let listener = UnixListener::bind(sock.path()).expect("test socket must bind");
+        let stop = Arc::clone(stop);
+        let count = Arc::clone(count);
+        thread::spawn(move || {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                if stop.load(Ordering::Relaxed) {
+                    break; // the waker (stop was set first)
+                }
+                count.fetch_add(1, Ordering::Relaxed);
+                match read_one_message(&mut stream) {
+                    Some(Message::Request(Request::GetTelemetry)) => {}
+                    Some(other) => {
+                        panic!("stand-in expected GetTelemetry, got {other:?}")
+                    }
+                    None => break, // an unexpected EOF before a frame
+                }
+                let bytes = encode_frame(&Message::Response(Response::Telemetry(
+                    mock_snapshot(),
+                )))
+                .expect("must encode");
+                stream.write_all(&bytes).expect("stand-in write must not fail");
+            }
+        })
+    }
+
+    /// A flapping-daemon stand-in: accepts until `stop`, drops each
+    /// connection immediately (immediate EOF — the client's request
+    /// fails on the read), and increments `count` per accepted
+    /// connection (the stop-waker's connect is never counted, as
+    /// above).
+    fn dropping_stand_in(
+        sock: &TempSocket,
+        stop: &Arc<AtomicBool>,
+        count: &Arc<AtomicUsize>,
+    ) -> JoinHandle<()> {
+        let listener = UnixListener::bind(sock.path()).expect("test socket must bind");
+        let stop = Arc::clone(stop);
+        let count = Arc::clone(count);
+        thread::spawn(move || {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                if stop.load(Ordering::Relaxed) {
+                    break; // the waker (stop was set first)
+                }
+                count.fetch_add(1, Ordering::Relaxed);
+                drop(stream); // immediate EOF: the client's request fails
+            }
+        })
+    }
+
+    /// (j1) Baseline-once (D-8): with `refresh_enabled` off, the
+    /// poller performs **exactly one** fetch per distinct
+    /// `settings.socket` value — the startup baseline against A (one
+    /// connection), a socket edit to B fires exactly one more (one
+    /// connection for B), and a second edit back to A fires exactly
+    /// one more for A — no continuous polling (the gate is off) and
+    /// no retry (an unchanged socket is never re-fetched).
+    #[test]
+    fn baseline_fires_exactly_once_per_distinct_socket_with_refresh_off() {
+        let sock_a = TempSocket::new("baseline-a");
+        let sock_b = TempSocket::new("baseline-b");
+        let stop = Arc::new(AtomicBool::new(false));
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+        let stand_in_a = counting_stand_in(&sock_a, &stop, &count_a);
+        let stand_in_b = counting_stand_in(&sock_b, &stop, &count_b);
+
+        // Refresh explicitly off (the pre-C7-09 default is still on —
+        // C7-09 flips it): the baseline must not depend on the
+        // default; it is the only thing that may fetch.
+        let state = Arc::new(RwLock::new(TelemetryData {
+            settings: GuiSettings {
+                socket: sock_a.path().to_string_lossy().into_owned(),
+                poll_interval_ms: MIN_POLL_INTERVAL_MS,
+                refresh_enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let (bench_tx, bench_rx) = mpsc::channel::<BenchCmd>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let poller = spawn_poller(state.clone(), bench_rx, stop.clone(), cancel);
+
+        // Phase A: the startup baseline fetch against A — exactly one
+        // connection, then nothing (the gate is off, the socket is
+        // unchanged — several ticks pass).
+        wait_for_status(&state, &format!("connected: {}", sock_a.path().display()));
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            count_a.load(Ordering::Relaxed),
+            1,
+            "exactly one baseline fetch for the startup socket A"
+        );
+
+        // Phase B: a socket edit to B re-triggers exactly one
+        // baseline fetch for the new socket.
+        state
+            .write()
+            .expect("the panel write must not fail")
+            .settings
+            .socket = sock_b.path().to_string_lossy().into_owned();
+        wait_for_status(&state, &format!("connected: {}", sock_b.path().display()));
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            count_b.load(Ordering::Relaxed),
+            1,
+            "exactly one baseline fetch for the edited socket B"
+        );
+        assert_eq!(
+            count_a.load(Ordering::Relaxed),
+            1,
+            "A is never re-fetched without another socket change"
+        );
+
+        // Phase C: a second socket edit (back to A) fires exactly one
+        // more baseline fetch for A.
+        state
+            .write()
+            .expect("the panel write must not fail")
+            .settings
+            .socket = sock_a.path().to_string_lossy().into_owned();
+        wait_for_status(&state, &format!("connected: {}", sock_a.path().display()));
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            count_a.load(Ordering::Relaxed),
+            2,
+            "the edit back to A re-triggers exactly one more baseline"
+        );
+        assert_eq!(
+            count_b.load(Ordering::Relaxed),
+            1,
+            "B stays at its one baseline fetch"
+        );
+
+        // Stop: set the shared flag and wake both stand-ins' final
+        // accepts with throwaway connects (immediate EOF; a failed
+        // connect means the stand-in is already out).
+        drop(bench_tx);
+        stop.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(sock_a.path());
+        let _ = UnixStream::connect(sock_b.path());
+        stand_in_a.join().expect("the stand-in must not panic");
+        stand_in_b.join().expect("the stand-in must not panic");
+        poller.join().expect("the poller thread must not panic");
+    }
+
+    /// (j2) A **failed** baseline (the daemon drops the connection on
+    /// the fetch) records the friendly `disconnected` state + a
+    /// structured error exactly once and never retries on its own
+    /// (no retry storm — several ticks pass with the gate off): the
+    /// next re-trigger is either the refresh gate (the cadence then
+    /// polls on the configured interval) or a socket edit to a live
+    /// daemon (one baseline fetch for it).
+    #[test]
+    fn failed_baseline_records_disconnected_without_retrying() {
+        let dead = TempSocket::new("baseline-dead");
+        let live = TempSocket::new("baseline-live");
+        let stop = Arc::new(AtomicBool::new(false));
+        let dead_count = Arc::new(AtomicUsize::new(0));
+        let live_count = Arc::new(AtomicUsize::new(0));
+        let stand_in_dead = dropping_stand_in(&dead, &stop, &dead_count);
+        let stand_in_live = counting_stand_in(&live, &stop, &live_count);
+
+        let state = Arc::new(RwLock::new(TelemetryData {
+            settings: GuiSettings {
+                socket: dead.path().to_string_lossy().into_owned(),
+                poll_interval_ms: MIN_POLL_INTERVAL_MS,
+                refresh_enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let (bench_tx, bench_rx) = mpsc::channel::<BenchCmd>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let poller = spawn_poller(state.clone(), bench_rx, stop.clone(), cancel);
+
+        // Phase A: the one-shot baseline fetch against the flapping
+        // daemon fails — the friendly `disconnected` state + a
+        // structured error.
+        wait_for_status(&state, "disconnected");
+        {
+            let s = state.read().expect("the poller must not poison the lock");
+            assert!(s.error.is_some(), "the failed baseline must record a structured error");
+        }
+        // No retry storm: several ticks pass with the gate off — the
+        // failed baseline is never re-attempted on its own.
+        thread::sleep(Duration::from_millis(800));
+        assert_eq!(
+            dead_count.load(Ordering::Relaxed),
+            1,
+            "a failed baseline must not retry on its own (no retry storm)"
+        );
+
+        // Phase B: enabling the refresh gate re-triggers the cadence
+        // (the due clock polls the still-dead socket on the
+        // configured interval).
+        state
+            .write()
+            .expect("the panel write must not fail")
+            .settings
+            .refresh_enabled = true;
+        thread::sleep(Duration::from_millis(600));
+        assert!(
+            dead_count.load(Ordering::Relaxed) > 1,
+            "an enabled refresh must resume the (failing) cadence"
+        );
+
+        // Phase C: the gate is frozen again, and a socket edit to a
+        // live daemon re-triggers exactly one baseline fetch for the
+        // new socket (the settings panel is never a dead end).
+        state
+            .write()
+            .expect("the panel write must not fail")
+            .settings
+            .refresh_enabled = false;
+        state
+            .write()
+            .expect("the panel write must not fail")
+            .settings
+            .socket = live.path().to_string_lossy().into_owned();
+        wait_for_status(&state, &format!("connected: {}", live.path().display()));
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            live_count.load(Ordering::Relaxed),
+            1,
+            "exactly one baseline fetch for the new live socket"
+        );
+
+        // Stop: set the shared flag and wake both stand-ins' final
+        // accepts with throwaway connects (immediate EOF; a failed
+        // connect means the stand-in is already out).
+        drop(bench_tx);
+        stop.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(dead.path());
+        let _ = UnixStream::connect(live.path());
+        stand_in_dead.join().expect("the stand-in must not panic");
+        stand_in_live.join().expect("the stand-in must not panic");
+        poller.join().expect("the poller thread must not panic");
+    }
+
+    /// (j3) With the refresh gate off, the one-shot baseline is the
+    /// only fetch (one connection, frozen afterward — several ticks
+    /// pass); **enabling the refresh gate** resumes the continuous
+    /// cadence one interval after the baseline's stamp — the
+    /// connections grow again against the same socket.
+    #[test]
+    fn enabling_refresh_after_baseline_resumes_the_cadence() {
+        let sock = TempSocket::new("baseline-resume");
+        let stop = Arc::new(AtomicBool::new(false));
+        let count = Arc::new(AtomicUsize::new(0));
+        let stand_in = counting_stand_in(&sock, &stop, &count);
+
+        let state = Arc::new(RwLock::new(TelemetryData {
+            settings: GuiSettings {
+                socket: sock.path().to_string_lossy().into_owned(),
+                poll_interval_ms: MIN_POLL_INTERVAL_MS,
+                refresh_enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let (bench_tx, bench_rx) = mpsc::channel::<BenchCmd>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let poller = spawn_poller(state.clone(), bench_rx, stop.clone(), cancel);
+
+        // Phase A: the startup baseline fetch (one connection); with
+        // the gate off the cadence never starts — the count freezes
+        // over several ticks.
+        wait_for_status(&state, &format!("connected: {}", sock.path().display()));
+        thread::sleep(Duration::from_millis(800));
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "with refresh off, only the one-shot baseline fetch happens"
+        );
+
+        // Phase B: the panel enables the refresh gate (the short
+        // clamp-floor interval): the baseline's due stamp is now well
+        // past the interval, so the cadence resumes on the next tick
+        // — the connections grow again.
+        state
+            .write()
+            .expect("the panel write must not fail")
+            .settings
+            .refresh_enabled = true;
+        thread::sleep(Duration::from_millis(1_200));
+        assert!(
+            count.load(Ordering::Relaxed) >= 3,
+            "enabling refresh must resume the continuous cadence (got {} connections)",
+            count.load(Ordering::Relaxed)
+        );
+
+        // Stop: set the shared flag and wake the stand-in's final
+        // accept with a throwaway connect (immediate EOF; a failed
+        // connect means the stand-in is already out).
+        drop(bench_tx);
+        stop.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(sock.path());
         stand_in.join().expect("the stand-in must not panic");
         poller.join().expect("the poller thread must not panic");
     }
