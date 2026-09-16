@@ -22,7 +22,10 @@
 //!   cycle survives a daemon restart, the TUI P3-24 precedent —
 //!   appending one trend-history sample to `state.history` per
 //!   successful poll (the Na-guarded [`record_history_sample`] —
-//!   C6-25) and clearing the series when the daemon reconnects;
+//!   C6-25) + one graphs-window sample to `state.graph` (the
+//!   Na-guarded [`graph::record_graph_sample`] — C7-20, the D-4 /
+//!   D-5 sources) and clearing the series when the daemon
+//!   reconnects;
 //! - serves benchmark requests from the [`BenchCmd`] channel (the app
 //!   shell's bench-zone run buttons, P3-28) against the same live
 //!   settings socket (C6-30), dispatching on the cmd's
@@ -74,6 +77,7 @@ use ramsleuth_client::Client;
 use ramsleuth_protocol::{BenchMode, Request, Response};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 
+use crate::graph::GraphState;
 use crate::history::HistoryState;
 use crate::settings::{DEFAULT_POLL_INTERVAL_MS, GuiSettings};
 
@@ -174,8 +178,8 @@ impl Default for BurnInState {
 
 /// The GUI's presentation state: the current telemetry snapshot, the
 /// bench state, the daemon connection status, the 10-minute
-/// trend history (C6-25), and the in-memory settings knobs
-/// (C6-26 / C6-27).
+/// trend history (C6-25), the Graphs-window series (C7-20), and the
+/// in-memory settings knobs (C6-26 / C6-27).
 ///
 /// One `TelemetryData` lives behind an `Arc<RwLock<…>>` shared with the
 /// render thread (P3-30); the background poller is the only writer
@@ -209,6 +213,17 @@ pub struct TelemetryData {
     /// reconnect; the render thread reads it for
     /// [`crate::history::render_history`].
     pub history: HistoryState,
+    /// The Graphs-window series (C7-20, the D-3 / D-4 / D-5
+    /// sources): one timestamped sample per successful poll — CPU
+    /// core frequency (MHz, `platform.cpu_clock_mhz`), VDDCR_SOC
+    /// (mV, the AMD readout), the CPU temperature (°C — the runtime
+    /// [`graph::read_cpu_temp_c`] thermal-zone scan), and the
+    /// memory-read bandwidth (GB/s — the D-5 bench / burn-in step
+    /// series) — in the 1800-deep ring (60 min at the 2 s poll).
+    /// The background poller is the only writer (D6): it appends the
+    /// Na-guarded [`graph::record_graph_sample`] per poll; the
+    /// render thread + the Graphs window (C7-21) read it.
+    pub graph: GraphState,
     /// The in-memory settings knobs (C6-26 / C6-30): the poll
     /// cadence (`poll_interval_ms`, default 2 s) + the refresh gate
     /// (`refresh_enabled`) the poller re-reads every tick (C6-27),
@@ -284,6 +299,7 @@ pub fn poll_telemetry(socket: &Path, state: &mut TelemetryData) -> Result<(), St
                 state.history.clear();
             }
             record_history_sample(state);
+            record_graph_sample(state);
         }
         Ok(Response::Error(message)) => {
             // The daemon was reachable but rejected the request (a
@@ -342,6 +358,37 @@ fn record_history_sample(state: &mut TelemetryData) {
     state
         .history
         .push(mclk_mhz, f64::from(vddcr_soc_mv), latest_memory_read_bw(state));
+}
+
+/// Append one graphs-window sample (C7-20) for the just-landed
+/// snapshot — the D-4 / D-5 source map:
+///
+/// - the CPU core frequency (MHz) from `platform.cpu_clock_mhz` and
+///   the VDDCR_SOC (mV) from the AMD readout ride inside
+///   [`graph::record_graph_sample`]'s Na guard (an absent /
+///   non-finite source degrades its own field to NaN);
+/// - the CPU temperature (°C) comes from the runtime thermal-zone
+///   scan ([`graph::read_cpu_temp_c`] — poller-thread I/O only,
+///   D6: never the render thread);
+/// - the memory-read bandwidth (GB/s) comes from
+///   [`latest_memory_read_bw`] (D-5: the newest streamed / burn-in
+///   `Memory · Read` event, else the terminal grid's cell) — its
+///   0.0 no-figure sentinel maps to NaN, so the row stays its
+///   no-source note until the first bench / burn-in sample (D-4: a
+///   flat 0 line would be a lie, 0 ≠ N/A).
+///
+/// The Na guard itself (the no-panic contract, D5): a sample lands
+/// only when ≥ 1 field is finite — an all-NaN poll appends
+/// nothing (the `record_history_sample` precedent).
+fn record_graph_sample(state: &mut TelemetryData) {
+    let bandwidth = latest_memory_read_bw(state);
+    let bandwidth_gbps = if bandwidth > 0.0 { bandwidth } else { f64::NAN };
+    crate::graph::record_graph_sample(
+        &mut state.graph,
+        &state.telemetry,
+        crate::graph::read_cpu_temp_c(),
+        bandwidth_gbps,
+    );
 }
 
 /// The latest memory-read bandwidth figure (GB/s) for the history
@@ -980,6 +1027,7 @@ mod tests {
         assert!(state.daemon_status.is_empty());
         assert!(state.last_update.is_none());
         assert!(state.error.is_none());
+        assert!(state.graph.is_empty(), "a fresh state has no graph samples");
     }
 
     /// (a) `poll_telemetry` against a live stand-in (a `GetTelemetry`
@@ -1582,6 +1630,58 @@ mod tests {
         stand_in.join();
         assert_eq!(state.history.len(), 1, "the reconnect clears the stale series");
         assert_eq!(*state.history.mclk.last().expect("the fresh sample"), 1800.0);
+    }
+
+    /// (g5) C7-20: five successful polls append five graphs-window
+    /// samples (one per poll — the poller stays the only writer,
+    /// D6): the VDDCR_SOC (mV) + the terminal grid's memory-read
+    /// bandwidth (GB/s, D-5) land finite on every sample, and the
+    /// no-source series (the CPU freq — this fixture's platform is
+    /// all-Na) stays NaN (D-4: it self-populates if a source
+    /// appears — the row is data-driven, no layout change).
+    #[test]
+    fn poll_telemetry_appends_one_graph_sample_per_success() {
+        let sock = TempSocket::new("graph-once");
+        let stand_in = DaemonStandIn::spawn_multi(&sock, 5, |index, mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetTelemetry)) => {}
+                other => panic!("stand-in expected GetTelemetry, got {other:?}"),
+            }
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(
+                populated_snapshot(index as u16),
+            )))
+            .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+
+        let mut state = TelemetryData::default();
+        // A terminal grid from an earlier run: the memory-read cell
+        // (row 0) feeds the bandwidth series (D-5).
+        state.bench.grid = Some(BenchmarkGrid {
+            read_gbps: [26.35, 0.0, 0.0, 0.0],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [0.0; 4],
+        });
+
+        for _ in 0..5 {
+            poll_telemetry(sock.path(), &mut state).expect("poll_telemetry must not error");
+        }
+        stand_in.join();
+
+        assert_eq!(state.graph.len(), 5, "five successful polls append five graph samples");
+        for sample in state.graph.samples.iter() {
+            assert!(sample.t.is_finite() && sample.t > 0.0, "the sample is stamped with unix seconds");
+            assert_eq!(sample.vddcr_soc_mv, 1050.0, "VDDCR_SOC lands in mV");
+            assert_eq!(
+                sample.bandwidth_gbps, 26.35,
+                "the bandwidth is the terminal grid's memory-read cell (D-5)"
+            );
+            assert!(
+                sample.cpu_freq_mhz.is_nan(),
+                "the all-Na platform keeps the freq series no-source (D-4)"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
