@@ -18,10 +18,13 @@
 //! | `0x00`                                 | SPD bytes used; bits 4:0 also carry the legacy memory-type check (`0x0A` DDR4 / `0x0C` DDR5) — the documented fallback when `0x02` is unrecognized (C8-02) |
 //! | `0x01` / `0x02`                        | Module manufacturer JEP106 vendor / continuation nibble (byte `0x02` doubles as the basic-info memory type) |
 //! | `0x02`                                 | Basic-info memory type (JESD79-4/5): `0x0C` = DDR4 (512 B image) / DDR5 (1024 B image — the generations share the code), `0x0B` = DDR3 — the primary classification (C8-02) |
+//! | `0x0C`                                 | DDR4 module organization (JESD79-4): package ranks per DIMM - 1 (bit 1) + SDRAM device width (bits 2:0: `0 = x4 / 1 = x8 / 2 = x16`) — the DDR4 rank + width primary (C8-03) |
+//! | `0x0D`                                 | DDR4 SDRAM bus-width extension (bit 4) — the consistency rule's bus = 64 + extension (C8-03) |
 //! | `0x2E` / `0x2F` (DDR5), `0x100` / `0x101` (DDR4) | DRAM die manufacturer JEP106 |
 //! | `0x13`                                 | SDRAM density (code -> Gb)                         |
 //! | `0x20`                                 | Minimum data rate, in 100 MT/s units               |
-//! | `0x80`                                 | Rank config: bits 7:4 total DRAM devices, bits 3:0 per rank |
+//! | `0x80`                                 | Rank config (C8-03): per-rank device count (bits 3:0); bits 7:4 also carry the rank in the DDR5 hub model + the DDR4 rank fallback when `0x0C` is blank/absent |
+//! | `0x81`                                 | SDRAM device width (bits 2:0: `0 = x4 / 1 = x8 / 2 = x16`) — the DDR5 width primary + the DDR4 width fallback (C8-03; the byte also opens the DDR2/DDR3 part region) |
 //! | `0x81..0x91` (DDR2/DDR3)               | Module part number (16 ASCII chars)                |
 //! | `0x149..0x15D` (DDR4)                 | Module part number (20 ASCII chars; falls back to `0x81..0x91` when present-but-blank) |
 //! | `0x200..0x220` (DDR5)                 | Module part number (32 ASCII chars)                |
@@ -109,8 +112,23 @@ const BYTE_DDR4_DIE_MAKER_CONT: usize = 0x101;
 const BYTE_DENSITY: usize = 0x13;
 /// Byte `0x20`: minimum data rate, in 100 MT/s units.
 const BYTE_BASE_SPEED: usize = 0x20;
-/// Byte `0x80`: rank config (bits 7:4 total devices / bits 3:0 per rank).
+/// Byte `0x80`: rank config (C8-03): per-rank device count (bits 3:0);
+/// bits 7:4 also carry the rank in the DDR5 hub model (and the DDR4
+/// rank fallback when byte `0x0C` is blank/absent).
 const BYTE_RANK_CONFIG: usize = 0x80;
+/// Byte `0x0C`: DDR4 module organization (JESD79-4, C8-03): bit 1 =
+/// package ranks per DIMM - 1 (rank = bit + 1), bits 2:0 = SDRAM device
+/// width code (`0 = x4 / 1 = x8 / 2 = x16`, else unrecognized).
+const BYTE_RANK_WIDTH: usize = 0x0C;
+/// Byte `0x0D`: DDR4 SDRAM bus-width extension (JESD79-4, C8-03): bit 4
+/// extends the 64-bit desktop bus (the consistency rule's bus = 64 or
+/// 128).
+const BYTE_BUS_WIDTH: usize = 0x0D;
+/// Byte `0x81`: SDRAM device width (bits 2:0, C8-03): the DDR5 width
+/// primary and the DDR4 fallback when byte `0x0C`'s width bits are
+/// missing or unrecognized (the same `0/1/2` code). The byte also
+/// opens the DDR2/DDR3 part-number region (a documented-model sharing).
+const BYTE_DEVICE_WIDTH: usize = 0x81;
 
 /// `0x81..=0x90`: module part number (16 ASCII chars) — the DDR2/DDR3
 /// location, and the DDR4 fallback when the DDR4 primary (`0x149`) is
@@ -214,8 +232,16 @@ pub struct SpdModule {
     /// documented `die_maker` + density -> label mapping may fill it in
     /// later (C6-02).
     pub die_type: Section<String>,
-    /// DRAM devices per rank (byte `0x80` bits 3:0; C6-02). `Na` when
-    /// the rank config is absent or invalid (the same gating as
+    /// Total DRAM devices (rank × per-rank, JESD79-4/5, C8-03): the
+    /// per-rank count is byte `0x80` bits 3:0 when consistent with the
+    /// bus width (`per_rank × width == bus`, the 64-bit desktop bus
+    /// plus the `0x0D` bit-4 extension), else derived as
+    /// `bus / width` (the non-compliant vendor hub is worked around,
+    /// never trusted, D-2); the rank is generation-scoped (DDR4 byte
+    /// `0x0C` bit 3 + 1, DDR5 byte `0x80` bits 7:4). The per-DIMM
+    /// capacity is `density_mbit × devices / 8192` GiB (the facade's
+    /// D-C3 arithmetic consumes the total). `Na` when the module
+    /// organization is absent or invalid (the same gating as
     /// [`rank`]).
     pub devices: Section<u8>,
     /// Module part number, generation-scoped (C7-02): DDR2/DDR3
@@ -225,7 +251,10 @@ pub struct SpdModule {
     pub part: Section<String>,
     /// Module serial number (bytes `0x91..0xA1`, 16 ASCII chars).
     pub serial: Section<String>,
-    /// Number of ranks (derived from the byte `0x80` rank config).
+    /// Number of ranks (C8-03, generation-scoped): DDR4 byte `0x0C`
+    /// bit 1 + 1 (the JESD79-4 package-ranks-per-DIMM - 1 code; the
+    /// byte `0x80` bits 7:4 hub nibble when `0x0C` is blank/absent),
+    /// DDR5 byte `0x80` bits 7:4 (the documented hub model).
     pub rank: Section<u8>,
     /// Per-DRAM density in Mbit.
     pub density_mbit: Section<u16>,
@@ -254,10 +283,10 @@ pub fn decode(image: &SpdImage) -> SpdModule {
         // Na until a documented die_maker + density mapping exists
         // (C6-02).
         die_type: Section::na(NaReason::NotApplicable),
-        devices: decode_devices(data),
+        devices: decode_devices(data, is_ddr5),
         part: decode_part(data, is_ddr5),
         serial: decode_ascii(data, SERIAL_START, SERIAL_LEN, "serial number"),
-        rank: decode_rank(data),
+        rank: decode_rank(data, is_ddr5),
         density_mbit: decode_density(data, is_ddr5),
         speed_mts: decode_base_speed(data),
         profiles: decode_profiles(data, is_ddr5),
@@ -444,42 +473,150 @@ fn decode_part(data: &[u8], is_ddr5: bool) -> Section<String> {
     }
 }
 
-/// Decode the rank count from byte `0x80`: bits 7:4 = total DRAM
-/// devices, bits 3:0 = devices per rank; ranks = total / per-rank.
-/// Zero / non-divisible config -> `Na(ParseError)`.
-fn decode_rank(data: &[u8]) -> Section<u8> {
-    let Some(cfg) = get(data, BYTE_RANK_CONFIG) else {
-        return Section::na(oob(BYTE_RANK_CONFIG));
-    };
-    let total = cfg >> 4;
-    let per_rank = cfg & 0x0F;
-    if total == 0 || per_rank == 0 || total % per_rank != 0 {
-        return Section::na(NaReason::ParseError(format!(
-            "rank config byte 0x80 = 0x{cfg:02X} (total {total} / per-rank {per_rank}) is invalid"
-        )));
+/// The SDRAM device width in bits from a width-code byte (C8-03, D-2):
+/// `0 = x4 / 1 = x8 / 2 = x16` (the JESD79-4/5 device-width code, read
+/// at bits 2:0); any other code is unrecognized in this documented
+/// model -> `None`.
+fn width_from_code(code: u8) -> Option<u8> {
+    match code & 0x07 {
+        0 => Some(4),
+        1 => Some(8),
+        2 => Some(16),
+        _ => None,
     }
-    Section::Value(total / per_rank)
 }
 
-/// Decode the DRAM devices per rank from byte `0x80` bits 3:0 (the
-/// `per_rank` half of the rank config). The invalid-config gating
-/// mirrors [`decode_rank`] exactly (the byte must be present; `total`
-/// / `per_rank` nonzero and `total % per_rank == 0`) — [`decode_rank`]
-/// computes the same `per_rank` value but discards it (it returns
-/// `total / per_rank`), so it is re-derived here (C6-02). Invalid /
-/// missing config -> `Na(ParseError)`.
-fn decode_devices(data: &[u8]) -> Section<u8> {
-    let Some(cfg) = get(data, BYTE_RANK_CONFIG) else {
-        return Section::na(oob(BYTE_RANK_CONFIG));
-    };
-    let total = cfg >> 4;
-    let per_rank = cfg & 0x0F;
-    if total == 0 || per_rank == 0 || total % per_rank != 0 {
-        return Section::na(NaReason::ParseError(format!(
-            "rank config byte 0x80 = 0x{cfg:02X} (total {total} / per-rank {per_rank}) is invalid"
+/// The module's SDRAM device width in bits (C8-03, D-2),
+/// generation-scoped: DDR5 reads byte `0x81` bits 2:0 (the documented
+/// hub model); DDR4 reads byte `0x0C` bits 2:0 (the JESD79-4
+/// primary), falling back to byte `0x81` bits 2:0 (the same code) when
+/// the primary is absent or carries an unrecognized code. Missing /
+/// unrecognized width -> `NaReason` naming the byte; never a panic.
+fn device_width(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
+    if !is_ddr5 {
+        if let Some(rw) = get(data, BYTE_RANK_WIDTH) {
+            if let Some(bits) = width_from_code(rw) {
+                return Ok(bits);
+            }
+        }
+    }
+    let w = get(data, BYTE_DEVICE_WIDTH).ok_or_else(|| oob(BYTE_DEVICE_WIDTH))?;
+    width_from_code(w).ok_or_else(|| {
+        NaReason::ParseError(format!(
+            "device width byte 0x81 = 0x{w:02X} (code {}) is not recognized",
+            w & 0x07
+        ))
+    })
+}
+
+/// The module's rank count (C8-03, D-2), generation-scoped: DDR4 =
+/// byte `0x0C` bit 1 + 1 (the JESD79-4 package-ranks-per-DIMM - 1
+/// code), falling back to the byte `0x80` bits 7:4 hub nibble when
+/// `0x0C` is blank / absent; DDR5 = byte `0x80` bits 7:4 (the
+/// documented hub model). A zero rank from either source -> `NaReason`
+/// naming the byte; never a panic.
+fn rank_count(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
+    if is_ddr5 {
+        let hub = get(data, BYTE_RANK_CONFIG).ok_or_else(|| oob(BYTE_RANK_CONFIG))?;
+        return rank_from_nibble(hub, BYTE_RANK_CONFIG);
+    }
+    match get(data, BYTE_RANK_WIDTH) {
+        Some(rw) if rw != 0 => Ok(((rw >> 1) & 1) + 1),
+        // `0x0C` blank / absent: the byte `0x80` hub nibble stands in
+        // for the rank.
+        _ => {
+            let hub = get(data, BYTE_RANK_CONFIG).ok_or_else(|| oob(BYTE_RANK_CONFIG))?;
+            rank_from_nibble(hub, BYTE_RANK_CONFIG)
+        }
+    }
+}
+
+/// The rank from a hub nibble (byte `0x80` bits 7:4): zero ->
+/// `NaReason` naming the byte.
+fn rank_from_nibble(hub: u8, byte: usize) -> Result<u8, NaReason> {
+    let rank = hub >> 4;
+    if rank == 0 {
+        return Err(NaReason::ParseError(format!(
+            "rank byte 0x{byte:02X} = 0x{hub:02X} carries rank 0 (invalid)"
         )));
     }
-    Section::Value(per_rank)
+    Ok(rank)
+}
+
+/// The per-rank device count (C8-03, D-2): the byte `0x80` bits 3:0
+/// hub nibble, trusted only when it is consistent with the bus
+/// (`per_rank x width == bus`, the 64-bit desktop bus plus the `0x0D`
+/// bit-4 extension); otherwise it is derived as `bus / width` (the
+/// non-compliant vendor hub - e.g. the live `0x80 = 0x11` per-rank 1
+/// on the 64-bit bus with x8 devices - is worked around, never
+/// trusted). Per-rank `0` or a non-dividing bus -> `NaReason` naming
+/// the byte; never a panic.
+fn per_rank_count(data: &[u8], width: u8, bus: u8) -> Result<u8, NaReason> {
+    let hub = get(data, BYTE_RANK_CONFIG).ok_or_else(|| oob(BYTE_RANK_CONFIG))?;
+    let per_rank = hub & 0x0F;
+    if per_rank == 0 {
+        return Err(NaReason::ParseError(format!(
+            "rank config byte 0x80 = 0x{hub:02X} carries per-rank 0 (invalid)"
+        )));
+    }
+    if (per_rank as u16) * (width as u16) == bus as u16 {
+        return Ok(per_rank);
+    }
+    if bus % width != 0 {
+        return Err(NaReason::ParseError(format!(
+            "bus width {bus} bits (byte 0x0D extension) is not divisible by the {width}-bit device width (bytes 0x0C/0x81)"
+        )));
+    }
+    Ok(bus / width)
+}
+
+/// The bus width in bits for the per-rank consistency rule (C8-03,
+/// D-2): the 64-bit desktop bus, extended by 64 when the byte `0x0D`
+/// bit 4 is set (the JESD79-4 bus-width extension); a missing `0x0D`
+/// keeps the base 64.
+fn bus_width(data: &[u8]) -> u8 {
+    match get(data, BYTE_BUS_WIDTH) {
+        Some(b) if b & 0x10 != 0 => 128,
+        _ => 64,
+    }
+}
+
+/// The total device count (C8-03, D-2) = rank x per-rank, where the
+/// rank is generation-scoped ([`rank_count`]) and the per-rank count
+/// follows the bus-width consistency rule ([`per_rank_count`]). Any
+/// organization failure -> `NaReason` naming the byte; never a panic.
+fn total_devices(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
+    let rank = rank_count(data, is_ddr5)?;
+    let width = device_width(data, is_ddr5)?;
+    let per_rank = per_rank_count(data, width, bus_width(data))?;
+    rank.checked_mul(per_rank).ok_or_else(|| {
+        NaReason::ParseError(format!(
+            "device total (rank {rank} x per-rank {per_rank}) exceeds the u8 cell"
+        ))
+    })
+}
+
+/// Decode the rank count (C8-03, D-2): the generation-scoped
+/// [`rank_count`]; every failure degrades to `Na(ParseError)` naming
+/// the offending byte (the same gating as [`decode_devices`]).
+fn decode_rank(data: &[u8], is_ddr5: bool) -> Section<u8> {
+    match rank_count(data, is_ddr5) {
+        Ok(rank) => Section::Value(rank),
+        Err(reason) => Section::na(reason),
+    }
+}
+
+/// Decode the total DRAM device count (C8-03, D-2): rank x per-rank
+/// with the per-rank derived from the bus width when the byte `0x80`
+/// hub nibble fails the consistency rule (the vendor non-compliance
+/// worked around, never trusted). Any failure degrades to
+/// `Na(ParseError)` naming the offending byte (the same gating as
+/// [`decode_rank`]).
+fn decode_devices(data: &[u8], is_ddr5: bool) -> Section<u8> {
+    match total_devices(data, is_ddr5) {
+        Ok(total) => Section::Value(total),
+        Err(reason) => Section::na(reason),
+    }
 }
 
 /// Decode the SDRAM density (byte `0x13`) into Mbit:
@@ -759,7 +896,8 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// A full synthetic DDR4 image (512 B): Micron module, 8 Gb, 2000 MT/s
-    /// minimum, 2 ranks, one valid XMP 2.0 profile (slot 1), blank slot 2.
+    /// minimum, 2 ranks x 4 devices per rank (8 total -> 8 GiB), one
+    /// valid XMP 2.0 profile (slot 1), blank slot 2.
     fn ddr4_image() -> SpdImage {
         let mut data = vec![0u8; 512];
         data[0x00] = 0x0A; // legacy memory-type check: DDR4 (agrees with 0x02, C8-02)
@@ -770,8 +908,13 @@ mod tests {
         data[0x13] = 0x13;
         // Minimum data rate 2000 MT/s (20 x 100).
         data[0x20] = 0x14;
-        // Rank config: 8 total devices, 4 per rank -> 2 ranks.
-        data[0x80] = 0x84;
+        // Module organization (C8-03): 2 ranks (0x0C bit 1 + 1); x16
+        // width (0x0C bits 2:0 code 3 unrecognized -> the 0x81
+        // fallback, code 2); 4 devices per rank (0x80 bits 3:0).
+        // 4 x 16 = the 64-bit bus -> consistent -> 2 x 4 = 8 total.
+        data[0x0C] = 0x0B;
+        data[0x81] = 0x02;
+        data[0x80] = 0x24;
         // DDR4 part at 0x149 (20-char field, JESD79-4) + serial at 0x91
         // (null-terminated fields).
         data[0x149..0x149 + 15].copy_from_slice(b"MPK24168BC320G6");
@@ -802,8 +945,8 @@ mod tests {
     /// A full synthetic DDR5 image (1024 B): Micron module (the C8-02
     /// re-anchor — byte `0x02` = `0x0C` is both the DDR5 type key and
     /// the JEP106 continuation, so the maker is `0xC2`, not the former
-    /// Samsung `0x92`), 16 Gb, 6400 MT/s minimum, 1 rank, one valid
-    /// XMP 3.0 / EXPO block, blank rest.
+    /// Samsung `0x92`), 16 Gb, 6400 MT/s minimum, 1 rank x 8 devices
+    /// (8 total -> 16 GiB), one valid XMP 3.0 / EXPO block, blank rest.
     fn ddr5_image() -> SpdImage {
         let mut data = vec![0u8; 1024];
         data[0x00] = 0x0C; // legacy memory-type check: DDR5 (agrees with 0x02, C8-02)
@@ -814,8 +957,12 @@ mod tests {
         data[0x13] = 0x15;
         // Minimum data rate 6400 MT/s (64 x 100).
         data[0x20] = 0x40;
-        // Rank config: 8 total devices, 8 per rank -> 1 rank.
-        data[0x80] = 0x88;
+        // Module organization (C8-03 hub model): 1 rank (0x80 bits
+        // 7:4), 8 devices per rank (0x80 bits 3:0), x8 width (0x81
+        // bits 2:0, code 1). 8 x 8 = the 64-bit bus -> consistent ->
+        // 1 x 8 = 8 total.
+        data[0x81] = 0x01;
+        data[0x80] = 0x18;
         // DDR5 part at 0x200 (32-char field, JESD79-5) + serial at 0x91.
         data[0x200..0x200 + 13].copy_from_slice(b"S5H1G8719011A");
         data[0x91..0x91 + 16].copy_from_slice(b"2208ABCDEF123456");
@@ -843,7 +990,9 @@ mod tests {
 
     /// A synthetic reconstruction of the live 5950X host module
     /// (P6-04): G.Skill `F4-3600C18-32GVK` - a 32 GiB kit (2x16 GiB),
-    /// rank 1, 3200 MT/s minimum. The module-maker field carries
+    /// rank 1 x 8 devices (C8-03: the vendor hub's per-rank 1 fails
+    /// the consistency rule -> the per-rank is derived as 64 / 8),
+    /// 3200 MT/s minimum. The module-maker field carries
     /// `0xC1` and the density byte carries `0x0D` (the two codes
     /// P6-04 reconciles); the serial is blank and no XMP profiles
     /// are present, as observed live.
@@ -857,7 +1006,14 @@ mod tests {
         data[0x13] = 0x0D;
         // Minimum data rate 3200 MT/s (32 x 100).
         data[0x20] = 0x20;
-        // Rank config: 1 total device, 1 per rank -> 1 rank.
+        // Module organization (C8-03): 1 rank (0x0C bit 1 + 1), x8
+        // width (0x0C bits 2:0 code 1; the live 0x81 = 0x11 lower
+        // nibble agrees); the vendor hub (0x80 = 0x11) carries
+        // per-rank 1, which fails the consistency rule (1 x 8 != 64)
+        // -> the per-rank is derived as 64 / 8 = 8 -> 8 total devices
+        // (16 Gb x 8 / 8192 = 16 GiB per slot).
+        data[0x0C] = 0x09;
+        data[0x81] = 0x11;
         data[0x80] = 0x11;
         // The live part number: 16 ASCII chars in the DDR4 20-char field
         // at 0x149 (JESD79-4; the live image NUL-pads the field end).
@@ -887,11 +1043,13 @@ mod tests {
         assert_eq!(m.rank, Section::Value(2));
         assert_eq!(m.density_mbit, Section::Value(8192));
         assert_eq!(m.speed_mts, Section::Value(2000));
-        // C6-02: no die-ID bytes in this fixture -> absent die maker;
-        // the die-type label defaults to Na; 0x84 = 8 total / 4 per rank.
+        // C8-03: no die-ID bytes in this fixture -> absent die maker;
+        // the die-type label defaults to Na; the organization (0x0C =
+        // 0x0B: 2 ranks; 0x81 = 0x02: x16; 0x80 = 0x24: 4 per rank,
+        // consistent with the 64-bit bus) -> 2 x 4 = 8 total devices.
         assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
         assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
-        assert_eq!(m.devices, Section::Value(4));
+        assert_eq!(m.devices, Section::Value(8));
         assert_eq!(m.profiles.len(), 1, "slot 1 valid, slot 2 blank");
         let p = &m.profiles[0];
         assert_eq!(p.index, 1);
@@ -924,8 +1082,10 @@ mod tests {
         assert_eq!(m.rank, Section::Value(1));
         assert_eq!(m.density_mbit, Section::Value(16384));
         assert_eq!(m.speed_mts, Section::Value(6400));
-        // C6-02: no die-ID bytes in this fixture -> absent die maker;
-        // the die-type label defaults to Na; 0x88 = 8 total / 8 per rank.
+        // C8-03: no die-ID bytes in this fixture -> absent die maker;
+        // the die-type label defaults to Na; the hub model (0x80 =
+        // 0x18: 1 rank / 8 per rank; 0x81 = 0x01: x8, consistent with
+        // the 64-bit bus) -> 1 x 8 = 8 total devices.
         assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
         assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
         assert_eq!(m.devices, Section::Value(8));
@@ -1191,15 +1351,46 @@ mod tests {
         assert_eq!(m.maker, Section::Value("G.Skill".to_owned()));
         assert_eq!(m.density_mbit, Section::Value(16384));
         assert_eq!(m.rank, Section::Value(1));
-        // C6-02: 0x11 = 1 total / 1 per rank; the live fixture carries
-        // no die-ID bytes and the die-type label defaults to Na.
-        assert_eq!(m.devices, Section::Value(1));
+        // C8-03: the vendor hub (0x80 = 0x11, per-rank 1) fails the
+        // consistency rule (1 x 8 != the 64-bit bus) -> the per-rank
+        // is derived as 64 / 8 = 8 -> 8 total devices (16 Gb x 8 /
+        // 8192 = 16 GiB per slot); the live fixture carries no
+        // die-ID bytes and the die-type label defaults to Na.
+        assert_eq!(m.devices, Section::Value(8));
         assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
         assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
         assert_eq!(m.speed_mts, Section::Value(3200));
         assert_eq!(m.part, Section::Value("F4-3600C18-32GVK".to_owned()));
         assert_eq!(m.serial, Section::Na(NaReason::NotApplicable));
         assert!(m.profiles.is_empty(), "the live module carries no XMP");
+    }
+
+    /// The operator's live shape (C8-03, D-2; the reported `2 GiB`
+    /// defect pinned as a regression): 16 Gb dies (`0x13 = 0x0D`),
+    /// 1 rank (`0x0C = 0x09` bit 1 + 1), x8 width (`0x0C` bits 2:0;
+    /// the `0x81 = 0x11` lower nibble agrees), and the vendor's
+    /// non-compliant hub (`0x80 = 0x11`: per-rank 1 fails
+    /// `1 x 8 != 64` -> the per-rank is derived as `64 / 8 = 8`) ->
+    /// **8 total devices** -> the per-slot capacity `16384 x 8 /
+    /// 8192 = 16 GiB` (not the 2 GiB the old per-rank nibble
+    /// produced).
+    #[test]
+    fn live_shape_total_devices() {
+        let m = decode(&live_5950x_image());
+        assert!(!m.is_ddr5);
+        assert_eq!(m.rank, Section::Value(1), "0x0C = 0x09 bit 1 -> rank 1");
+        assert_eq!(m.devices, Section::Value(8), "8 total devices (derived per-rank)");
+        assert_eq!(m.density_mbit, Section::Value(16384), "16 Gb per die (0x13 = 0x0D)");
+        // The facade's per-slot arithmetic (density_mbit x devices /
+        // 8192) fed by the corrected decode: 16 GiB per slot.
+        let (Some(density), Some(devices)) = (m.density_mbit.value(), m.devices.value()) else {
+            panic!("the live shape must decode density + devices");
+        };
+        assert_eq!(
+            *density as f64 * *devices as f64 / 8192.0,
+            16.0,
+            "16384 x 8 / 8192 = 16 GiB per slot"
+        );
     }
 
     /// Regression: every entry of the frozen [`JEP106`] table (all
@@ -1431,54 +1622,156 @@ mod tests {
         assert_eq!(m.die_maker, Section::Value("0xAB".to_owned()));
     }
 
-    /// `devices` re-derives byte `0x80` bits 3:0 (the `per_rank` half
-    /// [`decode_rank`] computes but discards): 0x84 -> 4 (2 ranks),
-    /// 0x88 -> 8 (1 rank), 0x11 -> 1 (1 rank), 0x42 -> 2 (2 ranks).
+    /// The rank is the DDR4 `0x0C` bit 1 + 1 primary (C8-03, D-2):
+    /// `0x09` -> 1, `0x0A` / `0x0B` / `0x1B` -> 2 (bit 1 is the rank
+    /// code; bits 2:0 carry the width code, sharing the bit); the byte `0x80` hub nibble
+    /// (bits 7:4) is the fallback when `0x0C` is blank / absent
+    /// (`0x80 = 0x84` -> 8); the DDR5 hub model reads the `0x80`
+    /// bits 7:4 (`0x38` -> 3); a zero rank nibble ->
+    /// `Na(ParseError)` naming `0x80`.
     #[test]
-    fn devices_rederived_from_rank_config() {
-        for (cfg, devices, ranks) in [
-            (0x84u8, 4u8, 2u8),
-            (0x88, 8, 1),
-            (0x11, 1, 1),
-            (0x42, 2, 2),
-        ] {
+    fn rank_from_0x0c_primary_with_0x80_fallback() {
+        for (org, ranks) in [(0x09u8, 1u8), (0x0A, 2), (0x0B, 2), (0x1B, 2)] {
             let mut data = vec![0u8; 512];
             data[0x00] = 0x0A;
-            data[0x80] = cfg;
+            data[0x0C] = org;
+            data[0x81] = 0x01; // x8 (the 0x09 width bits are code 1; the
+            //                 // others fall back to this same x8 code)
+            data[0x80] = 0x18; // per-rank 8; 8 x 8 = 64 -> consistent
             let m = decode(&SpdImage { index: 0x50, data });
-            assert_eq!(m.devices, Section::Value(devices), "cfg 0x{cfg:02X}");
-            assert_eq!(m.rank, Section::Value(ranks), "cfg 0x{cfg:02X}");
+            assert_eq!(m.rank, Section::Value(ranks), "0x0C = 0x{org:02X}");
         }
+        // Blank 0x0C + the 0x80 hub nibble fallback: rank 8 (per-rank
+        // 4, width x4 from the blank 0x0C code 0: 4 x 4 != 64 -> the
+        // derived per-rank 16; the rank is the point here).
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A;
+        data[0x80] = 0x84;
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert_eq!(m.rank, Section::Value(8), "0x0C blank -> the 0x80 nibble");
+        // DDR5 hub model: 0x80 = 0x38 -> rank 3.
+        let mut data = vec![0u8; 1024];
+        data[0x00] = 0x0C;
+        data[0x80] = 0x38;
+        data[0x81] = 0x01;
+        let m = decode(&SpdImage { index: 0x51, data });
+        assert_eq!(m.rank, Section::Value(3), "DDR5 0x80 = 0x38");
+        // A zero rank nibble -> Na naming 0x80 (both cells degrade).
+        let mut data = vec![0u8; 1024];
+        data[0x00] = 0x0C;
+        data[0x80] = 0x08;
+        let m = decode(&SpdImage { index: 0x51, data });
+        assert!(
+            matches!(&m.rank, Section::Na(NaReason::ParseError(d)) if d.contains("0x80")),
+            "rank 0 must name byte 0x80: {:?}",
+            m.rank
+        );
     }
 
-    /// Invalid rank configs gate `devices` to `Na(ParseError)` exactly
-    /// like `rank` does (nonzero, divisible): 0x00, 0x0F (zero total),
-    /// 0x83 (8 total / 3 per rank not divisible), 0x80 (zero per-rank)
-    /// — and a truncated image with byte `0x80` out of bounds.
+    /// The total device count is generation-scoped (C8-03, D-2): the
+    /// per-rank hub nibble is trusted when it is consistent with the
+    /// bus (`per_rank x width == 64`), else derived (`bus / width`);
+    /// the rank is the DDR4 `0x0C` bit 1 + 1 (or the DDR5 `0x80`
+    /// hub nibble). Re-derived expected values: `0x80 = 0x24` +
+    /// `0x0C = 0x0B` (width via the `0x81` fallback) -> total 8 /
+    /// rank 2; `0x80 = 0x18` + `0x81 = 0x01` (DDR5) -> total 8 /
+    /// rank 1; the live-shape derivation (`0x80 = 0x11` per-rank 1
+    /// fails 1 x 8 != 64) -> total 8 / rank 1.
     #[test]
-    fn devices_invalid_config_gates_like_rank() {
-        for cfg in [0x00u8, 0x0F, 0x83, 0x80] {
-            let mut data = vec![0u8; 512];
-            data[0x00] = 0x0A;
-            data[0x80] = cfg;
-            let m = decode(&SpdImage { index: 0x50, data });
-            assert!(
-                matches!(m.devices, Section::Na(NaReason::ParseError(_))),
-                "cfg 0x{cfg:02X}: devices must be Na(ParseError), got {:?}",
-                m.devices
-            );
-            assert!(
-                matches!(m.rank, Section::Na(NaReason::ParseError(_))),
-                "cfg 0x{cfg:02X}: rank must be Na(ParseError) (same gating)"
-            );
-        }
-        // Byte 0x80 out of bounds (truncated image): both cells Na.
+    fn devices_total_generation_scoped() {
+        // DDR4: 0x0C = 0x0B (rank 2; width code 3 unrecognized) +
+        // 0x81 = 0x02 (the x16 fallback) + 0x80 = 0x24 (per-rank 4;
+        // 4 x 16 = 64, consistent) -> 2 x 4 = 8 total.
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A;
+        data[0x0C] = 0x0B;
+        data[0x81] = 0x02;
+        data[0x80] = 0x24;
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert_eq!(m.devices, Section::Value(8), "0x24 + 0x0B/0x02");
+        assert_eq!(m.rank, Section::Value(2), "0x24 + 0x0B/0x02");
+
+        // DDR5 hub model: 0x80 = 0x18 (rank 1 / per-rank 8) +
+        // 0x81 = 0x01 (x8; 8 x 8 = 64, consistent) -> 1 x 8 = 8 total.
+        let mut data = vec![0u8; 1024];
+        data[0x00] = 0x0C;
+        data[0x80] = 0x18;
+        data[0x81] = 0x01;
+        let m = decode(&SpdImage { index: 0x51, data });
+        assert_eq!(m.devices, Section::Value(8), "0x18 + 0x01");
+        assert_eq!(m.rank, Section::Value(1), "0x18 + 0x01");
+
+        // The live-shape derivation: 0x0C = 0x09 (rank 1, x8) +
+        // 0x80 = 0x11 (per-rank 1; 1 x 8 != 64 -> derived 64 / 8 =
+        // 8) -> 1 x 8 = 8 total (the vendor hub worked around, D-2).
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A;
+        data[0x0C] = 0x09;
+        data[0x80] = 0x11;
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert_eq!(m.devices, Section::Value(8), "derived per-rank");
+        assert_eq!(m.rank, Section::Value(1), "derived per-rank");
+    }
+
+    /// Invalid module-organization configs gate `devices` to
+    /// `Na(ParseError)` naming the offending byte (C8-03): per-rank
+    /// 0 (the `0x80` lower nibble) and an unrecognized width (both
+    /// the `0x0C` bits 2:0 and the `0x81` fallback outside the
+    /// 0/1/2 code); the rank degrades only when its own source
+    /// fails (a zero hub nibble, or `0x80` out of bounds). (The
+    /// non-dividing-bus arm of the consistency rule is unreachable
+    /// with the documented width codes 4/8/16 against a 64/128-bit
+    /// bus - a defensive gate, exercised structurally by
+    /// `bus_width`'s single extension bit.)
+    #[test]
+    fn devices_invalid_org_gates_naming_the_byte() {
+        // Per-rank 0: 0x0C = 0x09 (rank 1, x8) + 0x80 = 0x80
+        // (per-rank 0) -> devices Na naming 0x80; the rank source
+        // (0x0C) is well-formed -> rank 1.
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A;
+        data[0x0C] = 0x09;
+        data[0x80] = 0x80;
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert!(
+            matches!(&m.devices, Section::Na(NaReason::ParseError(d)) if d.contains("0x80")),
+            "per-rank 0 must name byte 0x80: {:?}",
+            m.devices
+        );
+        assert_eq!(m.rank, Section::Value(1), "the 0x0C rank source is well-formed");
+
+        // Unrecognized width: 0x0C = 0x0F (rank 2; width code 7) +
+        // 0x81 = 0x0F (fallback code 7) + 0x80 = 0x18 -> devices Na
+        // naming 0x81; the rank (0x0C bit 1 + 1) is 2.
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A;
+        data[0x0C] = 0x0F;
+        data[0x81] = 0x0F;
+        data[0x80] = 0x18;
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert!(
+            matches!(&m.devices, Section::Na(NaReason::ParseError(d)) if d.contains("0x81")),
+            "unknown width must name byte 0x81: {:?}",
+            m.devices
+        );
+        assert_eq!(m.rank, Section::Value(2), "the 0x0C rank source is well-formed");
+
+        // Byte 0x80 out of bounds (truncated image): both cells Na,
+        // naming the byte.
         let m = decode(&SpdImage {
             index: 0x50,
             data: vec![0x0A, 0x02, 0x0C],
         });
-        assert!(matches!(m.devices, Section::Na(NaReason::ParseError(_))));
-        assert!(matches!(m.rank, Section::Na(NaReason::ParseError(_))));
+        assert!(
+            matches!(&m.devices, Section::Na(NaReason::ParseError(d)) if d.contains("0x80")),
+            "OOB 0x80 must name the byte: {:?}",
+            m.devices
+        );
+        assert!(
+            matches!(&m.rank, Section::Na(NaReason::ParseError(d)) if d.contains("0x80")),
+            "OOB 0x80 must name the byte: {:?}",
+            m.rank
+        );
     }
 
     // ------------------------------------------------------------------
