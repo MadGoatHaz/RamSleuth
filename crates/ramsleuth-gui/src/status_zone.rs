@@ -5,7 +5,7 @@
 //! bound SPD slot (a `slot 0xNN (DDR4|DDR5)` header over the
 //! [`spd_cards`] rows — a product line, a DRAM-die line, a human rank
 //! label, the raw maker / part / rank / density / speed cells, each
-//! its [`Section`] value in CYAN or `N/A (<reason>)` in CRIMSON, plus
+//! its [`Section`] value in CYAN or a bare `N/A` in muted `NA_GRAY`, plus
 //! one row per XMP / EXPO profile (or a `profiles: none` placeholder)),
 //! the daemon status line (`daemon: <status>` + the last-update stamp
 //! `· <N.N>s ago`, or `· never` when no poll has landed; CYAN when
@@ -16,9 +16,9 @@
 //! execute (the render thread itself does no I/O, D6).
 //!
 //! **No-panic contract (D5):** the zone reads only a `&TelemetryData`
-//! snapshot: no telemetry renders one crimson placeholder, an empty
-//! SPD list renders a crimson `driver missing` placeholder, an all-`Na`
-//! module renders every row `N/A (<reason>)` — never a panic.
+//! snapshot: no telemetry renders one gray placeholder, an empty
+//! SPD list renders a gray `driver missing` placeholder, an all-`Na`
+//! module renders every row a bare `N/A` in muted `NA_GRAY` — never a panic.
 //!
 //! **Pure core:** [`spd_cards`] (+ the daemon-status line/color and
 //! the card value-color pickers) is I/O-free and deterministic (the
@@ -31,7 +31,7 @@ use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 
 use crate::update::TelemetryData;
-use crate::{CRIMSON, CYAN, SLATE};
+use crate::{CRIMSON, CYAN, NA_GRAY, SLATE};
 
 /// The zone title (Grand Design §3.1, bottom-right panel).
 const ZONE_TITLE: &str = "3 · HARDWARE & SPD";
@@ -68,11 +68,12 @@ pub enum GuiAction {
 /// <density>Gb)` die line with each absent part dropped, the
 /// `Single-Rank` / `Dual-Rank` / `<n>-Rank` rank label, bare rank,
 /// `… Mbit` density, `… MT/s` speed, the profile line
-/// `<speed> <cl>-<trcd>-<trp>-<tras> @ <volts>`) or `N/A (<reason>)`
-/// for a [`Section::Na`] (the dump renderer's form — [`NaReason`]
-/// carries no `Display`); an all-`Na` module renders every row `N/A`
-/// and never panics. Returns an empty `Vec` when the snapshot carries
-/// no SPD modules (the renderer draws its own placeholder).
+/// `<speed> <cl>-<trcd>-<trp>-<tras> @ <volts>`) or a bare `N/A`
+/// for a [`Section::Na`] (the reason stays on the wire as [`NaReason`]
+/// — the GUI drops the parenthetical, D-4); an all-`Na` module
+/// renders every row a bare `N/A` in muted `NA_GRAY` and never
+/// panics. Returns an empty `Vec` when the snapshot carries no SPD
+/// modules (the renderer draws its own placeholder).
 pub fn spd_cards(telemetry: &SystemMemoryTelemetry) -> Vec<Vec<(String, String)>> {
     telemetry.spd.iter().map(card_rows).collect()
 }
@@ -195,8 +196,8 @@ fn profile_row(is_ddr5: bool, profile: &SpdProfile) -> (String, String) {
     )
 }
 
-/// One [`Section`] cell's display: the formatted value, or
-/// `N/A (<reason>)` for an absent one.
+/// One [`Section`] cell's display: the formatted value, or a bare
+/// `N/A` for an absent one (D-4 — the reason stays on the wire).
 fn display<T>(section: &Section<T>, fmt: impl Fn(&T) -> String) -> String {
     match section {
         Section::Value(value) => fmt(value),
@@ -204,18 +205,11 @@ fn display<T>(section: &Section<T>, fmt: impl Fn(&T) -> String) -> String {
     }
 }
 
-/// The human text of an absent cell: `N/A (<reason>)` (the renderer
-/// owns this form — [`NaReason`] carries no `Display`; the zone 1 /
-/// TUI precedent).
-fn na_text(reason: &NaReason) -> String {
-    match reason {
-        NaReason::UnsupportedHardware => "N/A (unsupported hardware)".to_owned(),
-        NaReason::DriverMissing => "N/A (driver missing)".to_owned(),
-        NaReason::InsufficientPrivilege => "N/A (insufficient privilege)".to_owned(),
-        NaReason::UnknownPmTableVersion => "N/A (unknown PM table version)".to_owned(),
-        NaReason::NotApplicable => "N/A (not applicable)".to_owned(),
-        NaReason::ParseError(detail) => format!("N/A (parse error: {detail})"),
-    }
+/// The human text of an absent cell: bare `N/A` (D-4 — the reason
+/// stays on the wire as [`NaReason`]; the GUI drops the parenthetical
+/// as verbose — the zone 1 / TUI precedent).
+fn na_text(_reason: &NaReason) -> String {
+    "N/A".to_owned()
 }
 
 /// The daemon status line: `daemon: <status>` (an empty status reads
@@ -250,11 +244,11 @@ fn daemon_status_color(data: &TelemetryData) -> egui::Color32 {
 }
 
 /// The semantic color of one card row's display: CYAN for a decoded
-/// value, CRIMSON for an absent one (an `N/A (…)`, including a
-/// degraded profile field).
+/// value, muted `NA_GRAY` for an absent one (a bare `N/A`, including
+/// a degraded profile field — D-5: unavailable, not a fault).
 fn card_value_color(display: &str) -> egui::Color32 {
     if display.contains("N/A") {
-        CRIMSON
+        NA_GRAY
     } else {
         CYAN
     }
@@ -293,14 +287,14 @@ pub fn render_status_zone(ui: &mut egui::Ui, data: &TelemetryData) -> GuiAction 
 
 /// The per-slot SPD module cards: one framed card per bound module
 /// (the `slot 0xNN (DDR4|DDR5)` header + the [`spd_cards`] rows); an
-/// empty SPD list renders a crimson `driver missing` placeholder, and
-/// no telemetry at all renders one crimson placeholder — never a
+/// empty SPD list renders a gray `driver missing` placeholder, and
+/// no telemetry at all renders one gray placeholder — never a
 /// panic (plan D5).
 fn render_spd_cards(ui: &mut egui::Ui, data: &TelemetryData) {
     match &data.telemetry {
         Some(telemetry) => {
             if telemetry.spd.is_empty() {
-                ui.label(egui::RichText::new("SPD: N/A (driver missing)").color(CRIMSON));
+                ui.label(egui::RichText::new("SPD: N/A").color(NA_GRAY));
                 return;
             }
             for (module, card) in telemetry.spd.iter().zip(spd_cards(telemetry)) {
@@ -309,7 +303,7 @@ fn render_spd_cards(ui: &mut egui::Ui, data: &TelemetryData) {
             }
         }
         None => {
-            ui.label(egui::RichText::new("N/A (no telemetry)").color(CRIMSON));
+            ui.label(egui::RichText::new("N/A").color(NA_GRAY));
         }
     }
 }
@@ -543,7 +537,7 @@ mod tests {
     /// (b) No SPD modules → an empty `Vec` (no cards, no panic); the
     /// all-`Na` module → one card whose every row (the product line,
     /// the die line, the rank label, the fields, and the all-`Na`
-    /// EXPO profile line) is `N/A (…)`, no panic.
+    /// EXPO profile line) is a bare `N/A` in muted gray, no panic.
     #[test]
     fn spd_cards_handles_no_spd_and_all_na_without_panic() {
         assert!(spd_cards(&no_spd()).is_empty(), "no SPD modules -> no cards");
@@ -558,50 +552,47 @@ mod tests {
         );
         assert_eq!(
             cards[0][0],
-            ("product".to_owned(), "N/A (driver missing)".to_owned())
+            ("product".to_owned(), "N/A".to_owned())
         );
         assert_eq!(
             cards[0][1],
-            ("dram die".to_owned(), "N/A (not applicable)".to_owned())
+            ("dram die".to_owned(), "N/A".to_owned())
         );
         assert_eq!(
             cards[0][2],
-            ("rank label".to_owned(), "N/A (insufficient privilege)".to_owned())
+            ("rank label".to_owned(), "N/A".to_owned())
         );
         assert_eq!(
             cards[0][3],
-            ("maker".to_owned(), "N/A (driver missing)".to_owned())
+            ("maker".to_owned(), "N/A".to_owned())
         );
         assert_eq!(
             cards[0][4].1,
-            "N/A (parse error: part number: byte 0x149 outside image bounds)"
+            "N/A"
         );
-        // The all-Na EXPO profile line: every field degrades.
+        // The all-Na EXPO profile line: every field degrades to bare N/A.
         assert_eq!(cards[0][8].0, "EXPO 0");
         assert_eq!(
             cards[0][8].1,
-            "N/A (not applicable) N/A (not applicable)-N/A (not applicable)-N/A (not applicable)-N/A (not applicable) @ N/A (not applicable)"
+            "N/A N/A-N/A-N/A-N/A @ N/A"
         );
     }
 
     /// (b′) The new card rows in isolation: the rank label maps
     /// 1 / 2 / n to `Single-Rank` / `Dual-Rank` / `<n>-Rank` (a
-    /// degenerate `0` and an absent rank degrade to `N/A`), the
-    /// product line renders `<maker> (<part>)` with one `Na` partner
-    /// bare and both `Na` on the maker's reason, and the die line
+    /// degenerate `0` and an absent rank degrade to a bare `N/A`),
+    /// the product line renders `<maker> (<part>)` with one `Na`
+    /// partner bare and both `Na` a bare `N/A`, and the die line
     /// drops each absent part (`(type, density)` → `(density)` →
-    /// `(type)` → bare maker → the maker's reason).
+    /// `(type)` → bare maker → a bare `N/A`).
     #[test]
     fn card_row_formatters_no_panic_on_na() {
         // The human rank label.
         assert_eq!(rank_label(&Section::Value(1)), "Single-Rank");
         assert_eq!(rank_label(&Section::Value(2)), "Dual-Rank");
         assert_eq!(rank_label(&Section::Value(4)), "4-Rank");
-        assert_eq!(rank_label(&Section::Value(0)), "N/A (not applicable)");
-        assert_eq!(
-            rank_label(&Section::na(NaReason::DriverMissing)),
-            "N/A (driver missing)"
-        );
+        assert_eq!(rank_label(&Section::Value(0)), "N/A");
+        assert_eq!(rank_label(&Section::na(NaReason::DriverMissing)), "N/A");
 
         // The product line (the spec's "G.Skill … (F5-…)" form).
         assert_eq!(
@@ -630,7 +621,7 @@ mod tests {
                 &Section::na(NaReason::DriverMissing),
                 &Section::na(NaReason::NotApplicable)
             ),
-            "N/A (driver missing)"
+            "N/A"
         );
 
         // The DRAM-die line: each absent part is dropped (the
@@ -661,7 +652,7 @@ mod tests {
                 die_maker: Section::na(NaReason::DriverMissing),
                 ..fixture_module()
             }),
-            "N/A (driver missing)"
+            "N/A"
         );
 
         // The density conversion: Mbit -> Gb (a non-integer
@@ -741,20 +732,16 @@ mod tests {
         assert_eq!(daemon_status_color(&errored), CRIMSON);
     }
 
-    /// (f) The card value color: CYAN for a decoded display, CRIMSON
-    /// for an `N/A` one (a full cell or a degraded profile field).
+    /// (f) The card value color: CYAN for a decoded display, muted
+    /// `NA_GRAY` for a bare `N/A` one (a full cell or a degraded
+    /// profile field — D-5: unavailable, not a fault).
     #[test]
     fn card_value_color_semantics() {
         assert_eq!(card_value_color("Samsung"), CYAN);
         assert_eq!(card_value_color("3200 MT/s"), CYAN);
         assert_eq!(card_value_color("16384 Mbit"), CYAN);
         assert_eq!(card_value_color("none"), CYAN);
-        assert_eq!(card_value_color("N/A (driver missing)"), CRIMSON);
-        assert_eq!(
-            card_value_color(
-                "N/A (parse error: x) N/A (not applicable) @ N/A (not applicable)"
-            ),
-            CRIMSON
-        );
+        assert_eq!(card_value_color("N/A"), NA_GRAY);
+        assert_eq!(card_value_color("N/A N/A-N/A-N/A-N/A @ N/A"), NA_GRAY);
     }
 }
