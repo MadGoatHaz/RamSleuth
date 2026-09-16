@@ -2,6 +2,74 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Cycle 7 (v2.0.0 Polish: UI Refactor, Telemetry Lifecycle, Burn-In, Graphs Window) — 2026-09-16 — COMPLETE
+
+### What was delivered
+The v2.0.0 polish cycle is COMPLETE: **all 22 chunks merged into `v2-development` (C7-01…C7-22)** — the UI refactor, telemetry polling lifecycle, burn-in, and the native graphs window:
+
+**Polling lifecycle:**
+- Baseline-once fetch per socket regardless of refresh (D-8, C7-08).
+- Auto-refresh default OFF (C7-09, incl. the main.rs test/doc ripple).
+
+**Settings:**
+- Unique combo widget ids fix the dropdown desync (C7-10).
+- Socket field 240 pt min width (no truncation); capacity/clock units wired into the header (C7-11) + Zone 1 clock rows (C7-15).
+
+**Platform:**
+- AGESA validator group2 relaxed to 1–6 digits (D-6, C7-01) — the host's ryzen_smu version "56.78.0" now resolves.
+- Vendor-conditional timing blocks omit the unsupported vendor's N/A block (C7-14).
+
+**Panel 1:**
+- 3-column × 2-row compact layout, no vertical scroll at 1400×900 (C7-12).
+- GDM/CR explicit labels "GEAR_DOWN: Enabled/Disabled · CR: 1T/2T" (D-7, C7-13).
+
+**Panel 2 + burn-in:**
+- Flat "Status: Idle/Running…/Done" label replaces the button-like progress pill (C7-17).
+- Burn-in mode: `run_cell_pass` extraction (C7-05); engine with duration deadline + per-iteration emit (C7-06); wire freeze StartBurnIn/BurnInProgress (D-1/D-2, C7-07, single commit); GUI path with 120 s stream timeout (C7-16); controls — minutes input 0=∞, Run Burn-In, live per-iteration cells (C7-18).
+
+**SPD:**
+- Per-generation module part decode — DDR4 0x149 (20 chars, 0x81 fallback) / DDR5 0x200 (32 chars) / DDR3-2 0x81 (C7-02).
+- XMP3_BASE 0x200→0x300 (JESD79-5) part/profile coexistence (C7-03); GUI fixture ripple (C7-04).
+
+**Graphs window:**
+- Embedded TREND HISTORY strip removed, columns reclaim full height (C7-19).
+- Graph state — 1800-sample ring, Na-guarded 5-series recording, thermal-zone temp scan, basic render (C7-20).
+- Native eframe 0.27 multi-viewport spawn via `show_viewport_deferred` (D-3, C7-21; live Wayland second-window gate deferred to operator).
+- Interactivity — hover crosshair with all-series tooltip, horizontal pan, 1/5/15/60-min window selector (C7-22).
+
+### Key plan decisions
+- **D-1:** new `StartBurnIn` arm (existing bench wire byte-frozen).
+- **D-2:** bench-owned `BurnInTick`.
+- **D-3:** eframe 0.27.2 native multi-viewport (spike-verified; the D-3b thread fallback unused).
+- **D-4:** no-source series render label + "N/A (no source)" (VDDCR_CPU always; CPU temp when no AMD thermal zone).
+- **D-5:** bandwidth = step series from the latest bench/burn-in Memory·Read (no continuous sampler).
+- **D-6:** AGESA validator relaxation (group2 1–6 digits).
+- **D-7:** GDM/CR explicit labels.
+- **D-8:** baseline-once fetch per socket.
+
+### Quality
+- **515/515 tests green (debug AND release, whole workspace)** — up from 452 at the Cycle 6 close; **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); **MSRV 1.75** held; **6 release binaries** build.
+- **QA verdict: PASS-WITH-MANUAL-LIVE-VERIFY** — all 22 chunks merged; the 5 operator live checks are the remaining manual gate (Wayland second window, burn-in live updates, AGESA in header, SPD part on live host, Panel 1 no-scroll).
+
+### Push state (operator gate)
+Local `v2-development` tip = **`a2577c0`** — **unpushed, operator-gated** (this compaction performs no push). The **22 merged `branch/chunk-c7-*` chunk branches were pruned (deleted) at compaction** (all fully merged into `v2-development`; the tip `a2577c0` untouched). On the operator's go-ahead: **fast-forward to `a2577c0` (NEVER force-push) → prune the remote chunk branches → optional `v2.0.0` tag**.
+
+### Follow-ups (non-blocking, carried)
+1. "q"-focus Quit guard (key-handling edge).
+2. `SpdModule.die_type` label mapping.
+3. Settings XDG persistence.
+4. VDDCR_CPU + CPU temp have no source on this host (honest N/A by design).
+
+### Open items carried forward
+1. **Operator live-run sign-off** — the 5 deferred live checks (Wayland second window, burn-in live updates, AGESA in header, SPD part on live host, Panel 1 no-scroll) close the PASS-WITH-MANUAL-LIVE-VERIFY verdict.
+2. **Push to GitHub** — operator go-ahead (fast-forward to `a2577c0`, prune the remote chunk branches, optional `v2.0.0` tag; strictly no force-push, no pre-go-ahead remote mutation).
+3. **Intel MCHBAR decode** — hardware-gated (the i5-6600 not yet attached; IMC offsets still SKELETON).
+4. **MSRV 1.75 vs newer** — operator call (workspace deliberately kept at 1.75; the CI 1.75 leg is the continuous proof).
+5. **CAD/RTT/drive SMN bitfields** — unconfirmed in the ryzen_smu driver source → honest N/A; pending driver-side confirmation.
+6. **AIDA64 parity gate** — deferred to the DDR5-6000 AM5 host (this host is Zen 3 / DDR4).
+
+Cycle 7 close-out (2026-09-16): this compaction recorded the Cycle 7 section in `MASTER_LOG.md` (the MASTER_LOG-only compaction — `DEV_LOG.md` and `Docs/HANDOVER.md` untouched; no commit, no push). The 22 merged `branch/chunk-c7-*` chunk branches were pruned at compaction (`v2-development` tip `a2577c0` untouched).
+
 ## Cycle 6 (Phase 7: GUI Workstream) — 2026-09-15 — COMPLETE
 
 ### What was delivered
