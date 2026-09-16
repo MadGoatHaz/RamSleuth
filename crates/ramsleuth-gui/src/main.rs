@@ -13,8 +13,9 @@
 //!   [`build_style`]: the spec's 3-line header (Grand Design §3.1,
 //!   C6-20) — line 1 the `RamSleuth v2.0.0` title, the platform tag,
 //!   the daemon status (naming the live settings socket — C6-30),
-//!   the `Settings` toggle, and the `[F2] snapshot · [F3] export ·
-//!   [Q] quit` legend; line 2 the CPU and platform identity; line 3
+//!   the `Settings` toggle, the `Graphs` window toggle (C7-21,
+//!   D-3), and the `[F2] snapshot · [F3] export · [Q] quit`
+//!   legend; line 2 the CPU and platform identity; line 3
 //!   the RAM summary, channel, and sync mode — plus a transient
 //!   export notice. The `Settings` toggle opens the C6-26 settings
 //!   panel as its own top strip below the header (C6-30). Over the
@@ -26,6 +27,18 @@
 //!   read of the shared
 //!   `Arc<RwLock<TelemetryData>>` and repaints on a 16 ms cadence
 //!   (~60 FPS).
+//! - **Graphs window (C7-21, D-3):** the header's `Graphs` toggle
+//!   spawns a dedicated second OS window as an eframe 0.27 deferred
+//!   child viewport (one shared context + event loop — no second
+//!   eframe lifecycle, Wayland-safe): while open the root re-
+//!   registers it every frame (the keep-alive — egui GCs a child
+//!   the first frame the root stops registering it, which is the
+//!   close); the child's body renders the C7-20
+//!   `render_graphs_window` over the shared state (a pure reader —
+//!   the poller stays the only writer, D6) on its own ~60 FPS
+//!   cadence; the child's WM close button clears the same flag the
+//!   header button toggles (D-C7: the two close paths are
+//!   behaviorally identical).
 //! - **Keyboard (C6-30):** the spec's key legend is live — a fresh
 //!   key-down of F2 / F3 / Q (egui marks OS key-repeats
 //!   `repeat: true`, so a held key fires exactly once) routes through
@@ -88,8 +101,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ramsleuth_gui::{
     build_style, export_json, format_capacity, format_clock, render_bench_zone,
-    render_settings_panel, render_status_zone, render_telemetry_zone, snapshot_png, spawn_poller,
-    BenchCmd, GuiAction, GuiError, GuiSettings, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
+    render_graphs_window, render_settings_panel, render_status_zone,
+    render_telemetry_zone, snapshot_png, spawn_poller, BenchCmd, GuiAction, GuiError,
+    GuiSettings, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
@@ -110,6 +124,13 @@ const POLLER_JOIN_DEADLINE: Duration = Duration::from_secs(10);
 const JOIN_POLL: Duration = Duration::from_millis(50);
 /// The window's initial inner size (the plan's 1400×900 dashboard).
 const WINDOW_SIZE: [f32; 2] = [1400.0, 900.0];
+/// The Graphs window's initial inner size (C7-21, D-3 — the deferred
+/// child viewport; the plan's default, a bit narrower + shorter
+/// than the main dashboard).
+const GRAPHS_WINDOW_SIZE: [f32; 2] = [900.0, 520.0];
+/// The Graphs window's minimum inner size (the title + the five
+/// series rows must stay legible).
+const GRAPHS_WINDOW_MIN_SIZE: [f32; 2] = [640.0, 420.0];
 /// The repaint cadence: ~60 FPS (16 ms — eframe's vsync drives the
 /// actual present; this only asks for the next frame).
 const REPAINT: Duration = Duration::from_millis(16);
@@ -335,6 +356,15 @@ struct RamSleuthApp {
     /// below the header and mutates `state.settings` (the render
     /// thread's one permitted write — no I/O, D6).
     settings_open: bool,
+    /// Whether the Graphs window (C7-21, D-3 — the eframe deferred
+    /// child viewport) is open: while set, `update` re-registers
+    /// the viewport every frame (the keep-alive — egui GCs a child
+    /// the first frame the root stops registering it, which is the
+    /// close). The header's `Graphs` button (a render-thread click
+    /// — no I/O, D6) and the child's own WM close button both
+    /// write this shared flag (D-C7: the two close paths are
+    /// behaviorally identical).
+    graphs_open: Arc<AtomicBool>,
     /// The export destination dir (F2 / F3 write here — `$HOME`).
     out_dir: PathBuf,
     /// The background poller thread (joined — bounded — on drop so the
@@ -408,7 +438,13 @@ impl eframe::App for RamSleuthApp {
         // the settings strip is its one permitted write).
         {
             let data = self.state.read().unwrap();
-            Self::render_header(ctx, &data, &mut self.settings_open, &self.notice);
+            Self::render_header(
+                ctx,
+                &data,
+                &mut self.settings_open,
+                &self.graphs_open,
+                &self.notice,
+            );
         }
         if self.settings_open {
             self.render_settings_area(ctx);
@@ -425,6 +461,15 @@ impl eframe::App for RamSleuthApp {
             if keyed_action != button_action {
                 self.handle_action(ctx, keyed_action);
             }
+        }
+
+        // The Graphs window (C7-21, D-3): while open, re-register
+        // the deferred child viewport every frame — the keep-alive
+        // (egui GCs the child the first frame the root stops
+        // registering it, which is how both close paths destroy the
+        // OS window).
+        if self.graphs_open.load(Ordering::Relaxed) {
+            show_graphs_viewport(ctx, &self.state, &self.graphs_open);
         }
 
         // ~60 FPS: eframe's vsync drives the present; this only asks
@@ -595,28 +640,32 @@ fn sync_mode(t: &SystemMemoryTelemetry, units: &Units) -> (String, Option<egui::
 }
 
 impl RamSleuthApp {
-    /// The header strip (Grand Design §3.1): the spec's 3-line header
-    /// — line 1 the `RamSleuth v2.0.0` title + the platform tag + the
-    /// daemon status (naming the live settings socket — C6-30) + the
-    /// `Settings` toggle + the `[F2] snapshot · [F3] export · [Q]
-    /// quit` legend, line 2 the CPU + platform identity, line 3 the
-    /// RAM summary + channel + sync mode (the capacity + clock
-    /// segments render in the live `units` knob's units — C7-11) —
-    /// plus the transient notice line (the last F2 / F3 result)
-    /// while one is showing. No
+    /// The header strip (Grand Design §3.1): the spec's 3-line
+    /// header — line 1 the `RamSleuth v2.0.0` title, the platform
+    /// tag, the daemon status (naming the live settings socket —
+    /// C6-30), the `Settings` toggle, the `Graphs` window toggle
+    /// (C7-21, D-3), and the `[F2] snapshot · [F3] export · [Q]
+    /// quit` legend; line 2 the CPU + platform identity; line 3
+    /// the RAM summary, channel, and sync mode (the capacity +
+    /// clock segments render in the live `units` knob's units —
+    /// C7-11) — plus the transient notice line (the last F2 / F3
+    /// result) while one is showing. No
     /// telemetry yet (never polled) → the placeholder lines (a
     /// missing daemon never crashes the GUI, plan D5).
     ///
     /// An associated function (no `self`): it needs only the
     /// snapshot + the `settings_open` toggle (the `Settings` button
-    /// flips it, C6-30) + the transient notice (the last F2 / F3
-    /// result line) — so the call site can hold the state's read
-    /// guard and the `settings_open` / `notice` field borrows at once
-    /// (the field split the borrow checker enforces).
+    /// flips it, C6-30) + the shared `graphs_open` flag (the
+    /// `Graphs` button toggles it, C7-21) + the transient notice
+    /// (the last F2 / F3 result line) — so the call site can hold
+    /// the state's read guard and the `settings_open` /
+    /// `graphs_open` / `notice` field borrows at once (the field
+    /// split the borrow checker enforces).
     fn render_header(
         ctx: &egui::Context,
         data: &TelemetryData,
         settings_open: &mut bool,
+        graphs_open: &Arc<AtomicBool>,
         notice: &Option<(String, Instant)>,
     ) {
         // The line builders over the current snapshot (the capacity +
@@ -658,6 +707,13 @@ impl RamSleuthApp {
                     ui.label(egui::RichText::new(&status).color(header_status_color(data)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(10.0);
+                        // The Graphs window (C7-21, D-3): the
+                        // dedicated second OS window — rightmost,
+                        // next to Settings; selected while open, a
+                        // click toggles the shared open flag (spawn
+                        // or close, D-C7).
+                        graphs_button(ui, graphs_open);
+                        ui.add_space(8.0);
                         // The settings toggle (C6-30): opens the
                         // settings panel strip below the header.
                         if ui
@@ -803,6 +859,93 @@ impl RamSleuthApp {
     }
 }
 
+// ---------------------------------------------------------------------
+// The Graphs window (C7-21, D-3): the eframe 0.27.2 native
+// multi-viewport spawn — one deferred child OS window sharing the
+// app's egui context + event loop (no second eframe lifecycle,
+// Wayland-safe), re-registered by the root every frame while open
+// (the keep-alive; egui GCs a child the first frame the root stops
+// registering it, which is the close).
+// ---------------------------------------------------------------------
+
+/// The Graphs child viewport's stable id (C7-21, D-3): the same id
+/// on every re-registration, so `show_viewport_deferred` patches
+/// the existing registration in place (no duplicate window, no
+/// title-bar reshuffle) and the keep-alive / GC mechanics key off
+/// one identity. A function, not a `const` — `egui::Id::new` is
+/// not const in the pinned egui 0.27.2.
+fn graphs_viewport_id() -> egui::ViewportId {
+    egui::ViewportId(egui::Id::new("ramsleuth_graphs_window"))
+}
+
+/// The header's `Graphs` button (C7-21, D-3): `selected` while the
+/// window is open (the shared flag read live each frame), and a
+/// click toggles the flag — `false` → the window spawns on the next
+/// frame, `true` → the root stops re-registering the viewport, so
+/// egui GCs the child and the OS window closes (D-C7: the button's
+/// close and the WM's close button are behaviorally identical).
+fn graphs_button(ui: &mut egui::Ui, graphs_open: &Arc<AtomicBool>) -> egui::Response {
+    let open = graphs_open.load(Ordering::Relaxed);
+    let response = ui.add(egui::Button::new(egui::RichText::new("Graphs")).selected(open));
+    if response.clicked() {
+        graphs_open.store(!open, Ordering::Relaxed);
+    }
+    response
+}
+
+/// Register (or re-register) the Graphs deferred child viewport
+/// (C7-21, D-3) — the keep-alive: the app calls this every frame
+/// while `graphs_open` is set; the same builder + id each time
+/// patches the existing registration in place (idempotent), and a
+/// frame without a call lets egui GC the child (the close). The
+/// child's body ([`run_graphs_child_frame`]) runs on its own native
+/// window's frame with its own viewport input over this one shared
+/// context — no second eframe lifecycle, no second event loop (the
+/// Wayland-safe design, D-3).
+fn show_graphs_viewport(
+    ctx: &egui::Context,
+    state: &Arc<RwLock<TelemetryData>>,
+    graphs_open: &Arc<AtomicBool>,
+) {
+    let shared = Arc::clone(state);
+    let flag = Arc::clone(graphs_open);
+    ctx.show_viewport_deferred(
+        graphs_viewport_id(),
+        egui::ViewportBuilder::default()
+            .with_title("RamSleuth — Graphs")
+            .with_inner_size(GRAPHS_WINDOW_SIZE)
+            .with_min_inner_size(GRAPHS_WINDOW_MIN_SIZE),
+        move |child_ctx, _class| {
+            run_graphs_child_frame(child_ctx, &shared, &flag);
+        },
+    );
+}
+
+/// The Graphs child viewport's frame body (C7-21, D-3): one
+/// idempotent style set over the shared context (the main window's
+/// `AppCreator` already set it — this keeps a fresh context correct
+/// too), one brief read of the shared state (the child is a pure
+/// reader — the poller stays the only writer, D6), the window's
+/// render, the child's own ~60 FPS cadence, and the WM close path —
+/// a `close_requested()` clears the shared flag so the root stops
+/// re-registering and egui GCs the window (the button's close is
+/// the same path, D-C7).
+fn run_graphs_child_frame(
+    ctx: &egui::Context,
+    state: &Arc<RwLock<TelemetryData>>,
+    graphs_open: &Arc<AtomicBool>,
+) {
+    ctx.set_style(build_style());
+    {
+        let data = state.read().unwrap();
+        render_graphs_window(ctx, &data.graph);
+    }
+    ctx.request_repaint_after(REPAINT);
+    if ctx.input(|i| i.viewport().close_requested()) {
+        graphs_open.store(false, Ordering::Relaxed);
+    }
+}
+
 fn main() -> ExitCode {
     // 1. Parse the command line (usage error → exit 2).
     let args = match parse_args(std::env::args().skip(1)) {
@@ -814,13 +957,15 @@ fn main() -> ExitCode {
         }
     };
 
-    // 2. The shared state + the two flags (the poller is the state's
+    // 2. The shared state + the flags (the poller is the state's
     //    data fields' only writer — the settings knobs' one
     //    render-thread write is the exception, C6-27 / C6-30; the
-    //    bench zone + the poller share the flags). The settings are
-    //    seeded from the CLI: `--socket` becomes `settings.socket`
-    //    (the panel shows the active socket, the poller reads it
-    //    live — C6-30).
+    //    bench zone + the poller share the bench flags; the Graphs
+    //    window open flag is shared between the header button and
+    //    the child's WM close button — C7-21, D-C7). The settings
+    //    are seeded from the CLI: `--socket` becomes
+    //    `settings.socket` (the panel shows the active socket, the
+    //    poller reads it live — C6-30).
     let state = Arc::new(RwLock::new(TelemetryData {
         settings: seed_settings(&args),
         ..Default::default()
@@ -828,6 +973,11 @@ fn main() -> ExitCode {
     let (bench_tx, bench_rx) = std::sync::mpsc::channel::<BenchCmd>();
     let stop = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
+    // The Graphs window open flag (C7-21, D-3): shared between the
+    // header's `Graphs` button and the child viewport's WM close
+    // button — both write it, the root's per-frame re-registration
+    // reads it (the keep-alive).
+    let graphs_open = Arc::new(AtomicBool::new(false));
     // Exports land in $HOME (fall back to the CWD if it is unset).
     let out_dir = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -861,6 +1011,7 @@ fn main() -> ExitCode {
                 stop,
                 cancel,
                 settings_open: false,
+                graphs_open,
                 out_dir,
                 poller: Some(poller),
                 notice: None,
@@ -1535,5 +1686,208 @@ mod tests {
                 render_settings_panel(ui, &mut settings);
             });
         }
+    }
+
+    // ------------------------------------------------------------------
+    // C7-21 (D-3): the Graphs button + the deferred child viewport
+    // (headless: no display, no daemon — the eframe spawn is
+    // compile-checked; the live Wayland window is this chunk's gate).
+    // ------------------------------------------------------------------
+
+    /// A synthesized primary-button click at `pos` (press + release
+    /// in one frame — egui's interaction resolution confirms a
+    /// `Released { click: Some(..) }` over the widget's previous-
+    /// frame rect).
+    fn click_events(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// (g1) The button's click-toggle semantics over the shared
+    /// `Arc<AtomicBool>`: no click leaves the flag closed, a click
+    /// on the button opens the window, and a click while open
+    /// closes it (both toggle directions, headless — the eframe
+    /// spawn itself is the live gate).
+    #[test]
+    fn graphs_button_click_toggles_the_shared_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1200.0, 300.0));
+
+        let frame = |events: Vec<egui::Event>| -> egui::Rect {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            ctx.begin_frame(input);
+            let mut rect = egui::Rect::NOTHING;
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                ui.horizontal(|ui| {
+                    rect = graphs_button(ui, &flag).rect;
+                });
+            });
+            let _ = ctx.end_frame();
+            rect
+        };
+
+        // No click: stays closed; the button is laid out.
+        let rect = frame(Vec::new());
+        assert!(!flag.load(Ordering::Relaxed), "no click must not open the window");
+        assert!(rect.area() > 0.0, "the button must be laid out, got {rect:?}");
+
+        // A click at the button's center: opens.
+        frame(click_events(rect.center()));
+        assert!(flag.load(Ordering::Relaxed), "a click on the button must open the window");
+
+        // A click while open: closes.
+        let rect = frame(Vec::new());
+        frame(click_events(rect.center()));
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a click while open must close the window"
+        );
+    }
+
+    /// (g2) The full header renders the Graphs button headless
+    /// without panicking in both open states (the k3 headless
+    /// idiom — the button's `selected`-while-open rendering is
+    /// compile-checked + live-gated), and a render never toggles
+    /// the flag (only a click does).
+    #[test]
+    fn render_header_renders_the_graphs_button_headless_without_panicking() {
+        for open in [false, true] {
+            let flag = Arc::new(AtomicBool::new(open));
+            let ctx = egui::Context::default();
+            ctx.begin_frame(egui::RawInput::default());
+            let mut settings_open = false;
+            RamSleuthApp::render_header(
+                &ctx,
+                &TelemetryData::default(),
+                &mut settings_open,
+                &flag,
+                &None,
+            );
+            let _ = ctx.end_frame();
+            assert_eq!(flag.load(Ordering::Relaxed), open, "a render must not toggle the flag");
+        }
+    }
+
+    /// (g3) The spawn / keep-alive / GC path over the real egui
+    /// context (the D-3 mechanism, headless): a root frame with the
+    /// flag open registers the deferred child (`ViewportClass::
+    /// Deferred` in the frame's viewport output), a child frame
+    /// renders the graph window over the shared state without
+    /// closing it, the next root frame's re-registration keeps the
+    /// child alive, and the first root frame without a re-
+    /// registration GCs it (that IS the close).
+    #[test]
+    fn graphs_viewport_spawn_keep_alive_and_gc_headless() {
+        let state = Arc::new(RwLock::new(TelemetryData::default()));
+        let flag = Arc::new(AtomicBool::new(true));
+        // The eframe desktop runtime disables embed mode (a bare
+        // `Context::default()` leaves it on — the no-integration
+        // fallback) so the deferred viewport is registered, not run
+        // inline.
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let child = graphs_viewport_id();
+
+        // Root frame 1: the spawn — the deferred child is registered.
+        ctx.begin_frame(egui::RawInput::default());
+        show_graphs_viewport(&ctx, &state, &flag);
+        let out = ctx.end_frame();
+        let registered = out.viewport_output.get(&child).cloned();
+        assert!(registered.is_some(), "the deferred child must be registered on spawn");
+        assert!(
+            registered.expect("registered").class == egui::ViewportClass::Deferred,
+            "the child must be a deferred (independent-window) viewport"
+        );
+
+        // The child's own frame: renders the window over the shared
+        // state (a pure reader, D6) on its own cadence, without
+        // closing it.
+        let mut child_input = egui::RawInput { viewport_id: child, ..Default::default() };
+        child_input.viewports.insert(
+            child,
+            egui::ViewportInfo {
+                parent: Some(egui::ViewportId::ROOT),
+                ..Default::default()
+            },
+        );
+        ctx.begin_frame(child_input);
+        run_graphs_child_frame(&ctx, &state, &flag);
+        let child_out = ctx.end_frame();
+        assert!(!child_out.shapes.is_empty(), "the child frame must paint the graph window");
+        assert!(flag.load(Ordering::Relaxed), "a plain child frame must not close the window");
+
+        // Root frame 2 (flag still open): the re-registration keeps
+        // the child alive (the keep-alive).
+        ctx.begin_frame(egui::RawInput::default());
+        show_graphs_viewport(&ctx, &state, &flag);
+        let out = ctx.end_frame();
+        assert!(
+            out.viewport_output.contains_key(&child),
+            "the keep-alive re-registration must retain the child"
+        );
+
+        // Root frame 3 (flag closed): no re-registration — the
+        // child is GC'd (the D-3 close).
+        flag.store(false, Ordering::Relaxed);
+        ctx.begin_frame(egui::RawInput::default());
+        let out = ctx.end_frame();
+        assert!(
+            !out.viewport_output.contains_key(&child),
+            "a child the root stops registering must be GC'd (the close)"
+        );
+    }
+
+    /// (g4) The WM close path (the D-3 close via the window's own
+    /// close button): a child frame carrying `ViewportEvent::Close`
+    /// sees `close_requested()` and clears the shared open flag —
+    /// the next root frame stops re-registering and the window is
+    /// GC'd (behaviorally identical to the header button's close,
+    /// D-C7).
+    #[test]
+    fn graphs_viewport_close_requested_clears_the_flag_headless() {
+        let state = Arc::new(RwLock::new(TelemetryData::default()));
+        let flag = Arc::new(AtomicBool::new(true));
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let child = graphs_viewport_id();
+
+        // Register the child once (the context learns its parent).
+        ctx.begin_frame(egui::RawInput::default());
+        show_graphs_viewport(&ctx, &state, &flag);
+        let _ = ctx.end_frame();
+
+        // The WM close: the child's frame carries `ViewportEvent::
+        // Close` (eframe's glow runtime pushes it on the window's
+        // CloseRequested event).
+        let mut info =
+            egui::ViewportInfo { parent: Some(egui::ViewportId::ROOT), ..Default::default() };
+        info.events.push(egui::ViewportEvent::Close);
+        let mut child_input = egui::RawInput { viewport_id: child, ..Default::default() };
+        child_input.viewports.insert(child, info);
+        ctx.begin_frame(child_input);
+        run_graphs_child_frame(&ctx, &state, &flag);
+        let _ = ctx.end_frame();
+
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "close_requested must clear the open flag (the D-3 close)"
+        );
     }
 }
