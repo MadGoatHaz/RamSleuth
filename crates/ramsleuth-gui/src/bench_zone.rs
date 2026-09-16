@@ -388,12 +388,14 @@ fn render_controls(
             let _ = bench_tx.send(BenchCmd {
                 target: StreamTarget::Full,
                 mode: BenchMode::Full,
+                duration_minutes: None,
             });
         }
         if ui.button("Memory Only").clicked() {
             let _ = bench_tx.send(BenchCmd {
                 target: StreamTarget::Full,
                 mode: BenchMode::MemoryOnly,
+                duration_minutes: None,
             });
         }
         if data.bench.running && ui.button("Cancel").clicked() {
