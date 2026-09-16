@@ -450,6 +450,7 @@ mod tests {
                 motherboard: Section::Value("Test Board".to_owned()),
                 bios: Section::Value("1.0".to_owned()),
                 agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
             },
             // Parallel to spd (C6-06): module 0 is 16384 Mbit x 8 devices = 16 GiB;
             // module 1 density is Na, so its entry carries the offending source reason.
@@ -473,6 +474,7 @@ mod tests {
                 motherboard: Section::na(NaReason::NotApplicable),
                 bios: Section::na(NaReason::NotApplicable),
                 agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
@@ -494,6 +496,7 @@ mod tests {
                 motherboard: Section::na(NaReason::NotApplicable),
                 bios: Section::na(NaReason::NotApplicable),
                 agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: vec![Section::na(NaReason::UnknownPmTableVersion)],

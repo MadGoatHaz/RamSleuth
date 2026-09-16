@@ -21,12 +21,13 @@
 //! | `cpu_clock_mhz` | `/proc/cpuinfo` `cpu MHz` (first core) | `Na(NotApplicable)` |
 //! | `motherboard` | DMI `board_name` → `board_vendor` → `product_name` | `Na(NotApplicable)` (VM/container) |
 //! | `bios` | DMI `bios_version` (` + <bios_date>` when present) | `Na(NotApplicable)` |
-//! | `agesa` | best-effort AGESA token from the BIOS string, else the `ryzen_smu` `version` attribute | `Na(NotApplicable)` (common — no clean unprivileged AGESA) |
+//! | `agesa` | true AGESA token from the DMI BIOS string only (the real AGESA string is root-gated, so commonly absent, D-1); the SMU firmware version rides `smu_version` | `Na(NotApplicable)` |
+//! | `smu_version` | the `ryzen_smu` driver `version` attribute, shape-checked (never verbatim, D-1) | `Na(NotApplicable)` (driver absent, or the payload fails the shape) |
 //!
 //! The `ryzen_smu` `version` attribute is a plain text file (not an SMN
 //! register read), so the `0xFFFFFFFF` sentinel rule of the SMN overlay
 //! does not apply here: an absent or unreadable attribute simply yields
-//! no AGESA source (honest N/A). All sources are unprivileged `std::fs`
+//! no SMU source (honest N/A). All sources are unprivileged `std::fs`
 //! reads; on non-Linux targets every read fails and the fields degrade
 //! to N/A (the module still compiles).
 
@@ -36,8 +37,9 @@ use crate::error::{NaReason, Section};
 const DMI_ID_DIR: &str = "/sys/class/dmi/id";
 
 /// The `ryzen_smu` driver `version` attribute, tried in order (the
-/// verified kobject name first, then the legacy directory). Consulted as
-/// a best-effort AGESA source only when the BIOS string carries no token.
+/// verified kobject name first, then the legacy directory): the source
+/// of [`SystemPlatform::smu_version`], shape-checked, never verbatim
+/// (D-1).
 const SMU_VERSION_CANDIDATES: [&str; 2] = [
     "/sys/kernel/ryzen_smu_drv/version",
     "/sys/kernel/ryzen_smu/version",
@@ -59,9 +61,16 @@ pub struct SystemPlatform {
     /// BIOS version (DMI `bios_version`, with ` + <bios_date>` appended
     /// when the date attribute is present).
     pub bios: Section<String>,
-    /// Best-effort AMD AGESA version token (from the BIOS string or the
-    /// `ryzen_smu` `version` attribute); commonly N/A.
+    /// True AMD AGESA version token, from the DMI BIOS string only (the
+    /// real AGESA string lives in the root-gated SMBIOS Type 11 / raw
+    /// DMI table, so commonly N/A — D-1); the SMU firmware version
+    /// rides [`smu_version`] under its own label.
     pub agesa: Section<String>,
+    /// SMU firmware version from the `ryzen_smu` driver `version`
+    /// attribute, shape-checked (the dotted-numeric guarantee, never
+    /// verbatim — C7 D-6); N/A when the driver publishes none or the
+    /// payload fails the shape (D-1).
+    pub smu_version: Section<String>,
 }
 
 /// Collect the [`SystemPlatform`] snapshot (the frozen C6-01 entry point).
@@ -77,6 +86,7 @@ pub fn collect_platform() -> SystemPlatform {
         motherboard: read_motherboard(),
         bios: read_bios(),
         agesa: read_agesa(),
+        smu_version: read_smu_version_section(),
     }
 }
 
@@ -163,12 +173,22 @@ fn read_bios() -> Section<String> {
     }
 }
 
-/// `agesa` source: a best-effort AGESA token from the BIOS version string,
-/// else from the `ryzen_smu` `version` attribute when it carries one.
+/// `agesa` source: the true AGESA token from the DMI `bios_version`
+/// string only (the unchanged best-effort scan); `Na(NotApplicable)`
+/// when the string carries no token (common — the real AGESA string is
+/// root-gated, D-1). The SMU firmware version that previously served as
+/// a fallback now rides [`SystemPlatform::smu_version`].
 fn read_agesa() -> Section<String> {
     let bios = read_dmi("bios_version");
-    let smu = read_smu_version();
-    agesa_from_sources(bios.as_deref(), smu.as_deref())
+    agesa_from_sources(bios.as_deref())
+}
+
+/// `smu_version` source: the `ryzen_smu` driver `version` attribute,
+/// shape-checked (the dotted-numeric guarantee — never verbatim, C7
+/// D-6); `Na(NotApplicable)` when the driver publishes none or the
+/// payload fails the shape (D-1).
+fn read_smu_version_section() -> Section<String> {
+    smu_version_from(read_smu_version().as_deref())
 }
 
 // ---------------------------------------------------------------------------
@@ -244,18 +264,29 @@ fn bios_from_sources(version: Option<&str>, date: Option<&str>) -> Option<String
     })
 }
 
-/// The AGESA source chain (frozen): a best-effort token from the BIOS
-/// version string first, then from the `ryzen_smu` `version` attribute;
-/// `Na(NotApplicable)` when neither carries one (common — there is no
-/// clean unprivileged AGESA source on most hosts).
-fn agesa_from_sources(bios_version: Option<&str>, smu_version: Option<&str>) -> Section<String> {
-    if let Some(token) = bios_version.and_then(parse_agesa) {
-        return Section::Value(token);
+/// The AGESA source (frozen, D-1): the true AGESA token from the DMI
+/// `bios_version` string only — the real AGESA string (SMBIOS Type 11 /
+/// the raw DMI table) is root-gated and unobtainable unprivileged, so
+/// this commonly degrades to `Na(NotApplicable)`. The SMU firmware
+/// version is no longer a fallback here; it rides
+/// [`SystemPlatform::smu_version`] under its own label.
+fn agesa_from_sources(bios_version: Option<&str>) -> Section<String> {
+    match bios_version.and_then(parse_agesa) {
+        Some(token) => Section::Value(token),
+        None => Section::na(NaReason::NotApplicable),
     }
-    if let Some(token) = smu_version.and_then(parse_agesa) {
-        return Section::Value(token);
+}
+
+/// The SMU firmware source (frozen, D-1): the `ryzen_smu` driver
+/// `version` payload, carried only when the whole payload passes the
+/// dotted-numeric shape check (never verbatim — C7 D-6); otherwise
+/// `Na(NotApplicable)` (the driver publishes nothing, or its payload
+/// fails the shape).
+fn smu_version_from(smu_version: Option<&str>) -> Section<String> {
+    match smu_version {
+        Some(version) if is_agesa_version(version) => Section::Value(version.to_owned()),
+        _ => Section::na(NaReason::NotApplicable),
     }
-    Section::na(NaReason::NotApplicable)
 }
 
 /// Best-effort AGESA token extraction from a BIOS (or driver) version
@@ -477,39 +508,53 @@ mod tests {
         assert_eq!(parse_agesa("56.78.1234567"), None);
     }
 
-    /// (b5) The source chain prefers the BIOS string (the DMI-bios scan
-    /// stays primary); the `ryzen_smu` `version` attribute is consulted
-    /// only when the BIOS string carries no token; neither →
-    /// `Na(NotApplicable)`.
+    /// (b5) D-1: the AGESA source is the DMI BIOS string scan only —
+    /// the real AGESA string is root-gated, so a host whose BIOS string
+    /// carries no token (the common case, e.g. the live host's "5601")
+    /// degrades to `Na(NotApplicable)`; the `ryzen_smu` `version`
+    /// attribute is no longer a fallback (it rides `smu_version`).
     #[test]
     fn agesa_source_chain() {
+        // The BIOS string carries a token → it resolves.
         assert_eq!(
-            agesa_from_sources(Some("AGESA 12.0.6557.0"), Some("ryzen_smu 1.0")),
+            agesa_from_sources(Some("AGESA 12.0.6557.0")),
             Section::Value("12.0.6557.0".to_owned())
         );
-        // BIOS string has no token → the smu attribute's token wins.
+        // The live host case (D-1): DMI `bios_version` "5601" carries
+        // no token → `Na(NotApplicable)` (the SMU version "56.78.0" is
+        // no longer folded under the AGESA label — it rides
+        // `smu_version`).
         assert_eq!(
-            agesa_from_sources(Some("F60"), Some("SMU 12.0.6557.0")),
-            Section::Value("12.0.6557.0".to_owned())
+            agesa_from_sources(Some("5601")),
+            Section::na(NaReason::NotApplicable)
         );
-        // The live host case (D-6): DMI `bios_version` "5601" carries no
-        // token (the DMI-bios scan stays primary but yields nothing), so
-        // the `ryzen_smu` `version` attribute "56.78.0" resolves by the
-        // relaxed shape.
+        // An ordinary vendor BIOS code → honest N/A.
         assert_eq!(
-            agesa_from_sources(Some("5601"), Some("56.78.0")),
+            agesa_from_sources(Some("F60")),
+            Section::na(NaReason::NotApplicable)
+        );
+        // No BIOS string at all → honest N/A.
+        assert_eq!(agesa_from_sources(None), Section::na(NaReason::NotApplicable));
+    }
+
+    /// (b6) D-1: the SMU firmware section — the driver payload is
+    /// carried only by shape (the dotted-numeric guarantee, never
+    /// verbatim): `"56.78.0"` → `Value`; a 2-group driver string and an
+    /// absent driver both → `Na(NotApplicable)`.
+    #[test]
+    fn smu_version_from_shape_checked_only() {
+        // The live host shape: the `ryzen_smu` `version` attribute.
+        assert_eq!(
+            smu_version_from(Some("56.78.0")),
             Section::Value("56.78.0".to_owned())
         );
-        // Neither carries one (the 2-group driver version fails the
-        // shape) → honest N/A.
+        // A 2-group driver string fails the shape → honest N/A.
         assert_eq!(
-            agesa_from_sources(Some("F60"), Some("ryzen_smu 1.0")),
+            smu_version_from(Some("ryzen_smu 1.0")),
             Section::na(NaReason::NotApplicable)
         );
-        assert_eq!(
-            agesa_from_sources(None, None),
-            Section::na(NaReason::NotApplicable)
-        );
+        // The driver publishes nothing → honest N/A.
+        assert_eq!(smu_version_from(None), Section::na(NaReason::NotApplicable));
     }
 
     // ------------------------------------------------------------------
@@ -549,6 +594,11 @@ mod tests {
             "agesa must be Value or Na(NotApplicable): {:?}",
             p.agesa
         );
+        assert!(
+            is_value_or_na(&p.smu_version),
+            "smu_version must be Value or Na(NotApplicable): {:?}",
+            p.smu_version
+        );
 
         // A carried clock is in-band (never garbage, never a sentinel).
         if let Section::Value(mhz) = &p.cpu_clock_mhz {
@@ -583,7 +633,10 @@ mod tests {
             cpu_clock_mhz: Section::Value(3800.0),
             motherboard: Section::Value("ProArt X570-CREATOR".to_owned()),
             bios: Section::Value("F60 + 09/15/2024".to_owned()),
+            // The live host shape (D-1): the BIOS string carries no
+            // AGESA token, the SMU firmware version resolves by shape.
             agesa: Section::na(NaReason::NotApplicable),
+            smu_version: Section::Value("56.78.0".to_owned()),
         };
         let bytes = bincode::serialize(&p)
             .expect("SystemPlatform must serialize (no-panic contract)");
@@ -596,6 +649,7 @@ mod tests {
             motherboard: Section::na(NaReason::NotApplicable),
             bios: Section::na(NaReason::NotApplicable),
             agesa: Section::na(NaReason::NotApplicable),
+            smu_version: Section::na(NaReason::NotApplicable),
         };
         let bytes = bincode::serialize(&all_na)
             .expect("SystemPlatform must serialize (no-panic contract)");

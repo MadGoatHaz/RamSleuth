@@ -1322,6 +1322,7 @@ mod tests {
                 motherboard: Section::Value("ProArt X570-CREATOR".to_owned()),
                 bios: Section::Value("F60 + 09/15/2024".to_owned()),
                 agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
             },
             total_capacity,
             dimm_sizes,
@@ -1442,6 +1443,7 @@ mod tests {
                 motherboard: Section::na(NaReason::NotApplicable),
                 bios: Section::na(NaReason::NotApplicable),
                 agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
             },
             ..t
         };

@@ -404,6 +404,7 @@ mod tests {
         assert_value_or_na("motherboard", &t.platform.motherboard);
         assert_value_or_na("bios", &t.platform.bios);
         assert_value_or_na("agesa", &t.platform.agesa);
+        assert_value_or_na("smu_version", &t.platform.smu_version);
 
         // dimm_sizes (D-C9): parallel to the SPD list, positionally.
         assert_eq!(
@@ -554,6 +555,7 @@ mod tests {
             motherboard: Section::na(NaReason::NotApplicable),
             bios: Section::na(NaReason::NotApplicable),
             agesa: Section::na(NaReason::NotApplicable),
+            smu_version: Section::na(NaReason::NotApplicable),
         }
     }
     // ------------------------------------------------------------------
@@ -646,6 +648,7 @@ mod tests {
                 motherboard: Section::Value("ProArt X570-CREATOR".to_owned()),
                 bios: Section::Value("F60 + 09/15/2024".to_owned()),
                 agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
             },
             // A mixed `dimm_sizes` (one `Value`, one `Na`) plus a
             // `Value` total exercises both arms of the new cells on the
@@ -1108,5 +1111,6 @@ mod tests {
         assert_value_or_na("motherboard", &p.motherboard);
         assert_value_or_na("bios", &p.bios);
         assert_value_or_na("agesa", &p.agesa);
+        assert_value_or_na("smu_version", &p.smu_version);
     }
 }

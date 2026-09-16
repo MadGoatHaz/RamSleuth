@@ -154,6 +154,7 @@ mod tests {
                 motherboard: Section::Value("Test Board".to_owned()),
                 bios: Section::Value("1.0".to_owned()),
                 agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
             },
             // 16_384 Mbit x 8 devices / 8192 = 16 GiB per DIMM, parallel
             // to `spd`; total = the sum of the `Value` entries.

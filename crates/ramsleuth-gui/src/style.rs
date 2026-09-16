@@ -803,6 +803,7 @@ mod tests {
                 motherboard: Section::na(NaReason::NotApplicable),
                 bios: Section::na(NaReason::NotApplicable),
                 agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
             },
             total_capacity: total,
             dimm_sizes: dimms,
