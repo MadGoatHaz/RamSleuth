@@ -24,15 +24,21 @@
 //!   successful poll (the Na-guarded [`record_history_sample`] —
 //!   C6-25) and clearing the series when the daemon reconnects;
 //! - serves benchmark requests from the [`BenchCmd`] channel (the app
-//!   shell's bench-zone run buttons, P3-28) with [`run_bench`]
-//!   against the same live settings socket (C6-30): one
-//!   `StartBenchmark` send, then the reply stream — a `BenchStarted`
-//!   ack, the `BenchProgress` events, and exactly one terminal — into
-//!   `state.bench`;
+//!   shell's bench-zone run buttons, P3-28) against the same live
+//!   settings socket (C6-30), dispatching on the cmd's
+//!   `duration_minutes` discriminator (C7-16): a normal run (`None`)
+//!   goes to [`run_bench`] — one `StartBenchmark` send, then the
+//!   reply stream (a `BenchStarted` ack, the `BenchProgress` events,
+//!   and exactly one terminal) into `state.bench`; a burn-in run
+//!   (`Some`) goes to [`run_burn_in`] — one `StartBurnIn` send, then
+//!   the reply stream (a `BenchStarted` ack, the `BurnInProgress`
+//!   ticks, and exactly one terminal) into `state.bench` (the
+//!   `burn_in` state + the terminal grid);
 //! - watches the shared `AtomicBool` cancel flag (the bench zone's
-//!   Cancel button, P3-28): [`run_bench`] checks it before each
-//!   frame — once set, the run is stopped daemon-side with a
-//!   best-effort `CancelBenchmark` and ends with `running = false`;
+//!   Cancel button, P3-28): [`run_bench`] / [`run_burn_in`] check it
+//!   before each frame — once set, the run is stopped daemon-side
+//!   with a best-effort `CancelBenchmark` and ends with
+//!   `running` / `burn_in.running = false`;
 //! - re-reads the live settings knobs (`poll_interval_ms` +
 //!   `refresh_enabled` every tick — C6-27, the `socket` per poll /
 //!   bench cycle — C6-30) — a changed knob takes effect without a
@@ -42,9 +48,10 @@
 //!   responsive, and stops on the shared `AtomicBool` (or when the
 //!   channel disconnects).
 //!
-//! **No-panic contract (plan D5):** [`poll_telemetry`] and [`run_bench`]
-//! take `&mut TelemetryData` (no thread, no lock — testable in
-//! isolation) and **always return `Ok(())`**: every failure class
+//! **No-panic contract (plan D5):** [`poll_telemetry`], [`run_bench`],
+//! and [`run_burn_in`] take `&mut TelemetryData` (no thread, no lock
+//! — testable in isolation) and **always return `Ok(())`**: every
+//! failure class
 //! (a missing / refused socket → the `ClientError::DaemonDown`
 //! "start it with …" text, a read timeout, a protocol violation, a
 //! closed stream) is recorded in the state (`error` +
@@ -62,7 +69,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use ramsleuth_bench::{BenchOp, BenchmarkGrid, StreamProgress, StreamTarget, Tier};
+use ramsleuth_bench::{BenchOp, BenchmarkGrid, BurnInTick, StreamProgress, StreamTarget, Tier};
 use ramsleuth_client::Client;
 use ramsleuth_protocol::{BenchMode, Request, Response};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
@@ -81,13 +88,22 @@ const MIN_POLL_INTERVAL_MS: u64 = 100;
 /// DragValue range ceiling (60 s), re-clamped defensively by the
 /// poller (an absurd stored knob can never stall the loop, D5).
 const MAX_POLL_INTERVAL_MS: u64 = 60_000;
+/// Read timeout for the bench / burn-in streams (C7-16): 120 s
+/// *between frames* — a run streams its progress (the
+/// `BenchProgress` events or the `BurnInProgress` ticks) over
+/// minutes, so a legitimate gap between frames can far exceed the
+/// client's 5 s transport default (the CLI precedent,
+/// `client/src/main.rs`'s `BENCH_READ_TIMEOUT`); the deadline only
+/// bounds a silently wedged daemon.
+const BENCH_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------------
 // Shared state (the render thread reads only; one writer: the poller).
 // ---------------------------------------------------------------------
 
 /// The live benchmark state: a run in flight, its streamed progress
-/// events, and the terminal result grid.
+/// events, the terminal result grid, and the live burn-in state
+/// (C7-16).
 #[derive(Debug, Clone, Default)]
 pub struct BenchState {
     /// A benchmark run is in flight (the status zone + the bench
@@ -101,8 +117,59 @@ pub struct BenchState {
     /// (cleared when a new run starts).
     pub progress: Vec<StreamProgress>,
     /// The terminal result grid of the last completed run (`None`
-    /// until the first `BenchResult`).
+    /// until the first `BenchResult` — a burn-in's terminal lands
+    /// here too: its last completed pass, C7-16).
     pub grid: Option<BenchmarkGrid>,
+    /// The live burn-in state (C7-16): a burn-in in flight, the
+    /// newest tick's iteration / elapsed, and the newest per-cell
+    /// values seen this burn-in (`latest`).
+    pub burn_in: BurnInState,
+}
+
+/// The live burn-in state (C7-16): a burn-in run in flight, the
+/// newest tick's iteration / elapsed, and the newest per-cell values
+/// seen this burn-in.
+///
+/// `latest` accumulates each streamed `BurnInProgress` tick the same
+/// way the bench zone's `live_grid` accumulates `StreamProgress`
+/// events (the newest value per cell wins, a non-finite / non-positive
+/// reading never renders as data), except a burn-in also streams
+/// per-tier latency ticks (written into the `latency_ns` column). The
+/// 4×4 table keeps showing the *terminal* grid
+/// ([`BenchState::grid`]) during a run; the burn-in row shows
+/// `latest` (C7-18).
+#[derive(Debug, Clone)]
+pub struct BurnInState {
+    /// A burn-in run is in flight (the status / controls key off this
+    /// alongside [`BenchState::running`]).
+    pub running: bool,
+    /// The 1-based iteration of the newest tick seen this run (0
+    /// before the first tick).
+    pub iteration: u32,
+    /// The run elapsed, in seconds, from the newest tick (0.0 before
+    /// the first tick).
+    pub elapsed_secs: f64,
+    /// The newest per-cell values seen this burn-in (the `live_grid`
+    /// rule over the ticks: the newest value per cell wins).
+    pub latest: BenchmarkGrid,
+}
+
+impl Default for BurnInState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            iteration: 0,
+            elapsed_secs: 0.0,
+            // A zero grid: unmeasured cells stay 0.0 (the `live_grid`
+            // form — the bench zone renders them `N/A`).
+            latest: BenchmarkGrid {
+                read_gbps: [0.0; 4],
+                write_gbps: [0.0; 4],
+                copy_gbps: [0.0; 4],
+                latency_ns: [0.0; 4],
+            },
+        }
+    }
 }
 
 /// The GUI's presentation state: the current telemetry snapshot, the
@@ -155,13 +222,20 @@ pub struct TelemetryData {
 }
 
 /// One benchmark request from the UI to the background poller (the
-/// bench zone's run buttons, P3-28): the cell target + the scope.
+/// bench zone's run buttons, P3-28): the cell target + the scope +
+/// the run-class discriminator (C7-16).
 #[derive(Debug, Clone, Copy)]
 pub struct BenchCmd {
     /// Which cells run (`Full` / one `Tier` / one `Cell`).
     pub target: StreamTarget,
     /// The run scope (the daemon clamps it onto the target, P3-15).
     pub mode: BenchMode,
+    /// The run-class discriminator (C7-16): `None` = a normal
+    /// single-pass benchmark ([`run_bench`]); `Some(n)` = a burn-in
+    /// ([`run_burn_in`]) with a duration of `n` minutes (`n = 0`
+    /// infinite — stop only via the Cancel flag /
+    /// [`Request::CancelBenchmark`]).
+    pub duration_minutes: Option<u32>,
 }
 
 // ---------------------------------------------------------------------
@@ -337,6 +411,14 @@ pub fn run_bench(
             return Ok(());
         }
     };
+    // The stream read timeout (C7-16): the client's 5 s default would
+    // kill a long run's frame gap mid-stream (the 120 s CLI
+    // precedent).
+    if let Err(error) = client.set_read_timeout(BENCH_READ_TIMEOUT) {
+        state.bench.running = false;
+        state.error = Some(error.to_string());
+        return Ok(());
+    }
     state.bench.running = true;
     state.bench.progress.clear();
     // The new run's id arrives with the `BenchStarted` ack.
@@ -393,9 +475,9 @@ pub fn run_bench(
                 // A burn-in frame in a normal-bench stream violates
                 // the wire contract (burn-in ticks stream only on the
                 // owning `StartBurnIn` connection, D-1/D-2): stop the
-                // run and record it. The interim guard C7-07 lands so
-                // the workspace compiles; C7-16 replaces it with the
-                // real burn-in consumption.
+                // run and record it — the permanent mirror of
+                // `run_burn_in`'s `BenchProgress` contract guard
+                // (C7-16 landed the real burn-in consumption).
                 state.error =
                     Some("unexpected burn-in frame during benchmark".to_owned());
                 state.bench.running = false;
@@ -404,6 +486,198 @@ pub fn run_bench(
             Err(error) => {
                 state.error = Some(error.to_string());
                 state.bench.running = false;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One burn-in run (C7-16): connect to the daemon at `socket`, send
+/// the `StartBurnIn` for `cmd`, and drain the reply stream — a
+/// `BenchStarted` ack, the `BurnInProgress` ticks, and exactly one
+/// terminal — into `state.bench` (the `burn_in` state + the terminal
+/// grid).
+///
+/// Testable, no thread. The run starts with `burn_in.running = true`,
+/// a fresh zero `latest` grid + zeroed iteration / elapsed (a stale
+/// run's values never mix into a new one), and a stale `run_id`
+/// dropped (the new run's id arrives with the `BenchStarted` ack);
+/// each tick updates the newest iteration / elapsed and writes its
+/// cell / latency into `latest` (the newest value per cell wins — the
+/// bench zone's `live_grid` rule); the terminal frame (`BenchResult`
+/// → the grid, `BenchCancelled`, or the daemon's `Error`) sets
+/// `burn_in.running = false`. The run never touches
+/// `BenchState::running` / `progress` (those are the normal-bench
+/// state; the two run classes share only the `run_id` + the cancel
+/// flag).
+///
+/// **Cancel (P3-28, the brief's "stop via existing Cancel"):** the
+/// shared `cancel` flag is reset to `false` at the start of every run
+/// (a stale cancel never kills a new one) and checked before each
+/// `recv()`: once set, the run is stopped daemon-side with a
+/// best-effort `CancelBenchmark` for the current `run_id` (only once
+/// the `BenchStarted` ack has landed — the daemon's reply is never
+/// read) and the loop breaks with `burn_in.running = false` (the
+/// clean stop, plan D6: the in-flight pass finishes, the run ends at
+/// the next gate).
+///
+/// A contract-violating frame (a `BenchProgress` or `Telemetry` frame
+/// in this stream) or a transport failure (a closed stream, a
+/// timeout, …) records `state.error` and ends the run the same way.
+/// Always returns `Ok(())` (the no-panic contract, as in
+/// [`poll_telemetry`]) — the poller loop must survive every failure.
+pub fn run_burn_in(
+    socket: &Path,
+    cmd: BenchCmd,
+    state: &mut TelemetryData,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    // The shared cancel flag is reset per run: a stale `true` from a
+    // cancelled run must not abort this one before its first frame.
+    cancel.store(false, Ordering::Relaxed);
+    let mut client = match Client::connect(socket) {
+        Ok(client) => client,
+        Err(error) => {
+            state.bench.burn_in.running = false;
+            state.error = Some(error.to_string());
+            return Ok(());
+        }
+    };
+    // The stream read timeout (C7-16): the client's 5 s default would
+    // kill a long burn-in's frame gap mid-stream (the 120 s CLI
+    // precedent).
+    if let Err(error) = client.set_read_timeout(BENCH_READ_TIMEOUT) {
+        state.bench.burn_in.running = false;
+        state.error = Some(error.to_string());
+        return Ok(());
+    }
+    // A fresh run starts from the idle burn-in state: a stale run's
+    // tick bookkeeping (iteration / elapsed / `latest`) never mixes
+    // into a new one.
+    state.bench.burn_in = BurnInState::default();
+    state.bench.burn_in.running = true;
+    // The new run's id arrives with the `BenchStarted` ack.
+    state.bench.run_id = None;
+    // The poller dispatches `duration_minutes.is_some()` to this
+    // path; a `None` cmd reaching it is a dispatch contract violation
+    // (never a normal-bench run): record it and stop — no panic (D5).
+    let Some(duration_minutes) = cmd.duration_minutes else {
+        state.bench.burn_in.running = false;
+        state.error =
+            Some("burn-in command without a duration_minutes discriminator".to_owned());
+        return Ok(());
+    };
+    if let Err(error) = client.send(&Request::StartBurnIn {
+        target: cmd.target,
+        duration_minutes,
+    }) {
+        state.bench.burn_in.running = false;
+        state.error = Some(error.to_string());
+        return Ok(());
+    }
+    loop {
+        // The Cancel button set the shared flag: ask the daemon for a
+        // clean stop (best-effort — the reply is never read) and break
+        // before the next frame.
+        if cancel.load(Ordering::Relaxed) {
+            if let Some(run_id) = state.bench.run_id {
+                let _ = client.send(&Request::CancelBenchmark { run_id });
+            }
+            state.bench.burn_in.running = false;
+            break;
+        }
+        match client.recv() {
+            Ok(Response::BenchStarted { run_id }) => {
+                state.bench.run_id = Some(run_id);
+            }
+            Ok(Response::BurnInProgress(tick)) => {
+                // The tick's bookkeeping lands in the burn-in state:
+                // the newest iteration / elapsed, and its cell /
+                // latency written into `latest` (the newest value per
+                // cell wins — the `live_grid` rule; a non-finite /
+                // non-positive reading never renders as data).
+                let BurnInTick {
+                    iteration,
+                    elapsed_secs,
+                    tier,
+                    bandwidth,
+                    latency_ns,
+                } = tick;
+                state.bench.burn_in.iteration = iteration;
+                state.bench.burn_in.elapsed_secs = elapsed_secs;
+                let slot = tier as usize;
+                match (bandwidth, latency_ns) {
+                    (Some((op, value)), _) => {
+                        if value.is_finite() && value > 0.0 {
+                            match op {
+                                BenchOp::Read => {
+                                    state.bench.burn_in.latest.read_gbps[slot] = value;
+                                }
+                                BenchOp::Write => {
+                                    state.bench.burn_in.latest.write_gbps[slot] = value;
+                                }
+                                BenchOp::Copy => {
+                                    state.bench.burn_in.latest.copy_gbps[slot] = value;
+                                }
+                            }
+                        }
+                    }
+                    (None, Some(ns)) => {
+                        if ns.is_finite() && ns > 0.0 {
+                            state.bench.burn_in.latest.latency_ns[slot] = ns;
+                        }
+                    }
+                    (None, None) => {
+                        // A tick with neither a cell nor a latency is
+                        // off-contract (exactly one of the two is
+                        // `Some`, the `BurnInTick` contract): stop
+                        // the run and record it.
+                        state.error =
+                            Some("burn-in tick carried neither a cell nor a latency".to_owned());
+                        state.bench.burn_in.running = false;
+                        break;
+                    }
+                }
+            }
+            Ok(Response::BenchProgress(_)) => {
+                // A normal-bench progress frame in a burn-in stream
+                // violates the wire contract (`BenchProgress` streams
+                // only on the owning `StartBenchmark` connection,
+                // D-1/D-2): record the structured error and stop the
+                // run — the permanent mirror of `run_bench`'s
+                // `BurnInProgress` contract guard.
+                state.error = Some("unexpected benchmark frame during burn-in".to_owned());
+                state.bench.burn_in.running = false;
+                break;
+            }
+            Ok(Response::BenchResult { grid, .. }) => {
+                // The terminal grid is the last completed pass: the
+                // 4×4 table + the F2/F3 exports pick it up for free.
+                state.bench.grid = Some(grid);
+                state.bench.burn_in.running = false;
+                break;
+            }
+            Ok(Response::BenchCancelled { .. }) => {
+                state.bench.burn_in.running = false;
+                break;
+            }
+            Ok(Response::Error(message)) => {
+                state.error = Some(message);
+                state.bench.burn_in.running = false;
+                break;
+            }
+            Ok(Response::Telemetry(_)) => {
+                // A telemetry frame in the burn-in stream violates the
+                // wire contract (`GetTelemetry` is served on its own
+                // connection, P3-16): stop the run and record it.
+                state.error = Some("unexpected response during burn-in".to_owned());
+                state.bench.burn_in.running = false;
+                break;
+            }
+            Err(error) => {
+                state.error = Some(error.to_string());
+                state.bench.burn_in.running = false;
                 break;
             }
         }
@@ -433,9 +707,11 @@ fn clamp_poll_interval(ms: u64) -> Duration {
 /// The loop: check `stop`; service at most one [`BenchCmd`] from
 /// `bench_rx` (a run streams to its terminal before the next tick —
 /// runs are single-flight daemon-side anyway, P3-15) against the
-/// live settings socket (C6-30), handing the shared `cancel` flag to
-/// [`run_bench`] (the bench zone's Cancel button sets it, P3-28;
-/// `run_bench` resets it per run); otherwise re-read the live
+/// live settings socket (C6-30), dispatching on the cmd's
+/// `duration_minutes` discriminator to [`run_bench`] (a normal run)
+/// or [`run_burn_in`] (a burn-in, C7-16), and handing the shared
+/// `cancel` flag to it (the bench zone's Cancel button sets it,
+/// P3-28; each run resets it per run); otherwise re-read the live
 /// settings knobs (C6-27 / C6-30) — the clamped `poll_interval_ms` +
 /// the `refresh_enabled` gate + the `socket` — and: (a) run exactly
 /// one **baseline** [`poll_telemetry`] fetch for a `socket` value the
@@ -490,7 +766,28 @@ pub fn spawn_poller(
                     // retargets the next run (the fresh connection
                     // per cycle rides the change — D6).
                     let socket = state.read().unwrap().settings.socket.clone();
-                    let _ = run_bench(Path::new(&socket), cmd, &mut state.write().unwrap(), &cancel);
+                    // The run-class dispatch (C7-16): the cmd's
+                    // `duration_minutes` is the discriminator —
+                    // `None` routes to `run_bench` (a normal run),
+                    // `Some` to `run_burn_in` (a burn-in); both share
+                    // the same socket read, the same cancel-flag
+                    // hand-off, and the same `Ok(())`-always
+                    // contract.
+                    if cmd.duration_minutes.is_some() {
+                        let _ = run_burn_in(
+                            Path::new(&socket),
+                            cmd,
+                            &mut state.write().unwrap(),
+                            &cancel,
+                        );
+                    } else {
+                        let _ = run_bench(
+                            Path::new(&socket),
+                            cmd,
+                            &mut state.write().unwrap(),
+                            &cancel,
+                        );
+                    }
                 }
                 Err(TryRecvError::Empty) => {
                     // The live settings knobs (C6-27 / C6-30): re-read
@@ -804,7 +1101,11 @@ mod tests {
             }
         });
 
-        let cmd = BenchCmd { target: StreamTarget::Tier(Tier::Memory), mode: BenchMode::Full };
+        let cmd = BenchCmd {
+            target: StreamTarget::Tier(Tier::Memory),
+            mode: BenchMode::Full,
+            duration_minutes: None,
+        };
         // A false cancel flag: this run is never cancelled (it is
         // reset per run anyway).
         let cancel = Arc::new(AtomicBool::new(false));
@@ -904,7 +1205,11 @@ mod tests {
             let state = Arc::clone(&state);
             let cancel = Arc::clone(&cancel);
             thread::spawn(move || {
-                let cmd = BenchCmd { target: StreamTarget::Full, mode: BenchMode::Full };
+                let cmd = BenchCmd {
+                    target: StreamTarget::Full,
+                    mode: BenchMode::Full,
+                    duration_minutes: None,
+                };
                 run_bench(&socket, cmd, &mut state.write().unwrap(), &cancel)
                     .expect("run_bench must not error");
             })
@@ -1884,5 +2189,417 @@ mod tests {
         let _ = UnixStream::connect(sock.path());
         stand_in.join().expect("the stand-in must not panic");
         poller.join().expect("the poller thread must not panic");
+    }
+
+    // ------------------------------------------------------------------
+    // C7-16: the burn-in path — `run_burn_in` consumption, the
+    // `BenchCmd` dispatch, the raised stream read timeout.
+    // ------------------------------------------------------------------
+
+    /// (k0) The bench / burn-in stream read timeout is the raised
+    /// 120 s value (the CLI precedent): a long frame gap can no
+    /// longer trip the client's 5 s default mid-stream.
+    #[test]
+    fn bench_stream_read_timeout_is_the_raised_cli_value() {
+        assert_eq!(
+            BENCH_READ_TIMEOUT,
+            Duration::from_secs(120),
+            "the stream read timeout must be the 120 s CLI precedent"
+        );
+    }
+
+    /// (k1) `run_burn_in` against a stand-in (a `StartBurnIn`
+    /// answered with `BenchStarted` + `BurnInProgress` ticks — one
+    /// bandwidth kind and one latency kind — + the terminal
+    /// `BenchResult`) consumes the stream into `state.bench`: the
+    /// request rides the wire with the cmd's target / duration, the
+    /// `BenchStarted` ack's `run_id` is recorded, each tick updates
+    /// `burn_in` (the newest `iteration` / `elapsed_secs`, and the
+    /// `latest` grid — the newest value per cell wins, the
+    /// `live_grid` rule), and the terminal lands its grid in
+    /// `state.bench.grid` + clears `burn_in.running` — with no
+    /// transport error and the normal-bench `running` flag untouched.
+    #[test]
+    fn run_burn_in_streams_ticks_and_the_terminal_grid() {
+        let sock = TempSocket::new("burnin");
+        let grid = BenchmarkGrid {
+            read_gbps: [51.2, 901.4, 612.7, 240.3],
+            write_gbps: [47.8, 870.2, 590.1, 221.9],
+            copy_gbps: [28.4, 455.6, 310.8, 130.4],
+            latency_ns: [91.2, 1.3, 3.9, 14.1],
+        };
+        let expected_grid = grid.clone();
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
+                    assert_eq!(
+                        target,
+                        StreamTarget::Full,
+                        "the cmd's target must ride the wire"
+                    );
+                    assert_eq!(duration_minutes, 5, "the cmd's duration must ride the wire");
+                }
+                other => panic!("stand-in expected StartBurnIn, got {other:?}"),
+            }
+            for response in [
+                Response::BenchStarted { run_id: 9 },
+                Response::BurnInProgress(BurnInTick {
+                    iteration: 1,
+                    elapsed_secs: 1.5,
+                    tier: Tier::Memory,
+                    bandwidth: Some((BenchOp::Read, 50.0)),
+                    latency_ns: None,
+                }),
+                Response::BurnInProgress(BurnInTick {
+                    iteration: 1,
+                    elapsed_secs: 2.0,
+                    tier: Tier::L1,
+                    bandwidth: None,
+                    latency_ns: Some(1.2),
+                }),
+                // A later tick over the same cell: the newest value
+                // wins in `latest` (the `live_grid` rule).
+                Response::BurnInProgress(BurnInTick {
+                    iteration: 2,
+                    elapsed_secs: 3.5,
+                    tier: Tier::Memory,
+                    bandwidth: Some((BenchOp::Read, 52.5)),
+                    latency_ns: None,
+                }),
+                Response::BenchResult { run_id: 9, grid },
+            ] {
+                let bytes = encode_frame(&Message::Response(response)).expect("must encode");
+                stream.write_all(&bytes).expect("stand-in write must not fail");
+            }
+        });
+
+        let cmd = BenchCmd {
+            target: StreamTarget::Full,
+            mode: BenchMode::Full,
+            duration_minutes: Some(5),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut state = TelemetryData::default();
+        // A stale pre-run burn-in state must be reset at run start
+        // (iteration / elapsed / `latest`).
+        state.bench.burn_in.running = true;
+        state.bench.burn_in.iteration = 7;
+        state.bench.burn_in.elapsed_secs = 99.0;
+        state.bench.burn_in.latest.read_gbps[0] = 7.0;
+        // A stale pre-run id must be dropped at run start.
+        state.bench.run_id = Some(99);
+        run_burn_in(sock.path(), cmd, &mut state, &cancel).expect("run_burn_in must not error");
+
+        assert!(!state.bench.burn_in.running, "the terminal must clear burn_in.running");
+        assert!(
+            !state.bench.running,
+            "a burn-in run must not touch the normal-bench running flag"
+        );
+        assert_eq!(state.bench.run_id, Some(9), "the ack's run_id must be recorded");
+        assert_eq!(state.bench.burn_in.iteration, 2, "the newest tick's iteration");
+        assert_eq!(state.bench.burn_in.elapsed_secs, 3.5, "the newest tick's elapsed");
+        assert_eq!(
+            state.bench.burn_in.latest.read_gbps[0],
+            52.5,
+            "the newest value per cell wins (the stale 7.0 is reset)"
+        );
+        assert_eq!(
+            state.bench.burn_in.latest.latency_ns[1],
+            1.2,
+            "the latency tick lands in the tier's latency cell (L1 = slot 1)"
+        );
+        assert_eq!(state.bench.burn_in.latest.write_gbps, [0.0; 4], "an unticked column stays zero");
+        assert_eq!(state.bench.burn_in.latest.copy_gbps, [0.0; 4], "an unticked column stays zero");
+        assert_eq!(
+            state.bench.grid,
+            Some(expected_grid),
+            "the terminal grid must land in the state"
+        );
+        assert!(state.error.is_none(), "a clean run must not record an error");
+        stand_in.join();
+    }
+
+    /// (k2) CANCEL (P3-28, the brief's "stop via existing Cancel"):
+    /// after the burn-in's `BenchStarted` ack lands in the state, the
+    /// shared `cancel` flag is set — `run_burn_in` ends the run with
+    /// `burn_in.running = false` (sending the daemon a best-effort
+    /// `CancelBenchmark` for the recorded run id) — no hang (the
+    /// stand-in ends the run within a beat either way), no panic, no
+    /// error recorded.
+    #[test]
+    fn run_burn_in_cancel_flag_stops_the_run() {
+        let sock = TempSocket::new("burnin-cancel");
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
+                    assert_eq!(target, StreamTarget::Full, "the cmd's target must ride the wire");
+                    assert_eq!(
+                        duration_minutes,
+                        0,
+                        "the infinite (0) duration must ride the wire"
+                    );
+                }
+                other => panic!("stand-in expected StartBurnIn, got {other:?}"),
+            }
+            let started =
+                encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
+                    .expect("must encode");
+            stream.write_all(&started).expect("stand-in write must not fail");
+            // Mimic the daemon: end the run after a beat — the worker
+            // either sees the cancel flag before the terminal frame
+            // (sends a `CancelBenchmark` and breaks) or receives the
+            // terminal `BenchCancelled` while blocked in `recv`.
+            thread::sleep(Duration::from_millis(200));
+            let _ = stream.write_all(
+                &encode_frame(&Message::Response(Response::BenchCancelled { run_id: 42 }))
+                    .expect("must encode"),
+            );
+            let _ = read_one_message(&mut stream); // drain the cancel (best-effort)
+        });
+
+        let socket = sock.path().to_path_buf();
+        let state = Arc::new(RwLock::new(TelemetryData::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let state = Arc::clone(&state);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                let cmd = BenchCmd {
+                    target: StreamTarget::Full,
+                    mode: BenchMode::Full,
+                    duration_minutes: Some(0),
+                };
+                run_burn_in(&socket, cmd, &mut state.write().unwrap(), &cancel)
+                    .expect("run_burn_in must not error");
+            })
+        };
+
+        // Wait for the run to start (the ack's run_id lands in the
+        // state), then set the shared cancel flag.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if state.read().expect("the poller must not poison the lock").bench.run_id.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the run never started (no BenchStarted within 5 s)"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        cancel.store(true, Ordering::Relaxed);
+        worker.join().expect("run_burn_in must return on cancel (no hang)");
+
+        let state = state.read().expect("the poller must not poison the lock");
+        assert!(!state.bench.burn_in.running, "the cancel must clear burn_in.running");
+        assert_eq!(state.bench.run_id, Some(42), "the run id must stay recorded");
+        assert!(state.error.is_none(), "a clean cancel must not record an error");
+        stand_in.join();
+    }
+
+    /// (k3) A `BenchProgress` frame in a burn-in stream violates the
+    /// wire contract (normal-bench progress streams only on the
+    /// owning `StartBenchmark` connection, D-1/D-2): `run_burn_in`
+    /// records the structured error and ends the run with
+    /// `burn_in.running = false` — the permanent mirror of
+    /// `run_bench`'s `BurnInProgress` guard.
+    #[test]
+    fn run_burn_in_rejects_a_bench_progress_frame() {
+        let sock = TempSocket::new("burnin-contract");
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::StartBurnIn { .. })) => {}
+                other => panic!("stand-in expected StartBurnIn, got {other:?}"),
+            }
+            let started =
+                encode_frame(&Message::Response(Response::BenchStarted { run_id: 3 }))
+                    .expect("must encode");
+            stream.write_all(&started).expect("stand-in write must not fail");
+            let progress = encode_frame(&Message::Response(Response::BenchProgress(
+                StreamProgress {
+                    cell_index: 0,
+                    total_cells: 3,
+                    tier: Tier::Memory,
+                    op: BenchOp::Read,
+                    value: 26.35,
+                    label: "Memory · Read (GB/s)".to_owned(),
+                },
+            )))
+            .expect("must encode");
+            stream.write_all(&progress).expect("stand-in write must not fail");
+        });
+
+        let cmd = BenchCmd {
+            target: StreamTarget::Full,
+            mode: BenchMode::Full,
+            duration_minutes: Some(2),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut state = TelemetryData::default();
+        run_burn_in(sock.path(), cmd, &mut state, &cancel).expect("run_burn_in must not error");
+
+        assert!(!state.bench.burn_in.running, "the violation must clear burn_in.running");
+        let error = state.error.expect("the violation must record a structured error");
+        assert!(
+            error.contains("unexpected benchmark frame during burn-in"),
+            "the error must name the violation, got: {error}"
+        );
+        stand_in.join();
+    }
+
+    /// (k4) The poller dispatches on the cmd's `duration_minutes`
+    /// discriminator (C7-16): a default (`None`) cmd routes to
+    /// `run_bench` (a `StartBenchmark` on the wire) and a burn-in
+    /// (`Some(7)`) cmd routes to `run_burn_in` (a `StartBurnIn` on
+    /// the wire) — same live settings socket, both runs stream to
+    /// their terminal cleanly (the baseline poll may interleave; the
+    /// stand-in serves every request arm it sees).
+    #[test]
+    fn poller_dispatches_bench_cmds_by_the_duration_discriminator() {
+        let sock = TempSocket::new("burnin-dispatch");
+        let stop = Arc::new(AtomicBool::new(false));
+        // Bit 0 = a `StartBenchmark` observed, bit 1 = a
+        // `StartBurnIn` observed.
+        let seen = Arc::new(AtomicUsize::new(0));
+        let listener = UnixListener::bind(sock.path()).expect("test socket must bind");
+        let stand_in = {
+            let stop = Arc::clone(&stop);
+            let seen = Arc::clone(&seen);
+            thread::spawn(move || {
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    if stop.load(Ordering::Relaxed) {
+                        break; // the waker (stop was set first)
+                    }
+                    match read_one_message(&mut stream) {
+                        Some(Message::Request(Request::StartBenchmark { .. })) => {
+                            seen.fetch_or(1, Ordering::Relaxed);
+                            let started =
+                                encode_frame(&Message::Response(Response::BenchStarted { run_id: 1 }))
+                                    .expect("must encode");
+                            stream.write_all(&started).expect("stand-in write must not fail");
+                            let result = encode_frame(&Message::Response(Response::BenchResult {
+                                run_id: 1,
+                                grid: BenchmarkGrid {
+                                    read_gbps: [1.0, 0.0, 0.0, 0.0],
+                                    write_gbps: [0.0; 4],
+                                    copy_gbps: [0.0; 4],
+                                    latency_ns: [0.0; 4],
+                                },
+                            }))
+                            .expect("must encode");
+                            stream.write_all(&result).expect("stand-in write must not fail");
+                        }
+                        Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
+                            assert_eq!(
+                                target,
+                                StreamTarget::Full,
+                                "the burn-in cmd's target must ride the wire"
+                            );
+                            assert_eq!(
+                                duration_minutes,
+                                7,
+                                "the burn-in cmd's duration must ride the wire"
+                            );
+                            seen.fetch_or(2, Ordering::Relaxed);
+                            let started =
+                                encode_frame(&Message::Response(Response::BenchStarted { run_id: 2 }))
+                                    .expect("must encode");
+                            stream.write_all(&started).expect("stand-in write must not fail");
+                            let cancelled =
+                                encode_frame(&Message::Response(Response::BenchCancelled { run_id: 2 }))
+                                    .expect("must encode");
+                            stream.write_all(&cancelled).expect("stand-in write must not fail");
+                        }
+                        Some(Message::Request(Request::GetTelemetry)) => {
+                            let bytes = encode_frame(&Message::Response(Response::Telemetry(
+                                mock_snapshot(),
+                            )))
+                            .expect("must encode");
+                            stream.write_all(&bytes).expect("stand-in write must not fail");
+                        }
+                        Some(other) => {
+                            panic!("stand-in saw an unexpected frame: {other:?}")
+                        }
+                        None => break, // the waker (an EOF before a frame)
+                    }
+                }
+            })
+        };
+
+        // Refresh explicitly off (the pre-C7-09 default is still on —
+        // C7-09 flips it): only the dispatched runs + the one-shot
+        // baseline may fetch.
+        let state = Arc::new(RwLock::new(TelemetryData {
+            settings: GuiSettings {
+                socket: sock.path().to_string_lossy().into_owned(),
+                refresh_enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let (bench_tx, bench_rx) = mpsc::channel::<BenchCmd>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let poller = spawn_poller(state.clone(), bench_rx, stop.clone(), cancel);
+
+        // Phase A: the default (`duration_minutes = None`) cmd — the
+        // dispatch must route it to `run_bench` (a `StartBenchmark`
+        // on the wire).
+        bench_tx
+            .send(BenchCmd {
+                target: StreamTarget::Full,
+                mode: BenchMode::Full,
+                duration_minutes: None,
+            })
+            .expect("the channel must accept the cmd");
+        // Phase B: the burn-in (`duration_minutes = Some(7)`) cmd —
+        // the dispatch must route it to `run_burn_in` (a
+        // `StartBurnIn` on the wire).
+        bench_tx
+            .send(BenchCmd {
+                target: StreamTarget::Full,
+                mode: BenchMode::Full,
+                duration_minutes: Some(7),
+            })
+            .expect("the channel must accept the cmd");
+
+        // Wait until both request arms were observed (bounded by a 10
+        // s deadline: the test fails with the current bits instead of
+        // hanging).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let bits = seen.load(Ordering::Relaxed);
+            if bits == 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the dispatch never served both arms, saw {bits:#b}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(seen.load(Ordering::Relaxed), 3, "exactly one StartBenchmark + one StartBurnIn");
+
+        // Stop: drop the bench sender (the poller's channel
+        // disconnects), set the shared flag, and wake the stand-in's
+        // final accept with a throwaway connect (immediate EOF; a
+        // failed connect means the stand-in is already out).
+        drop(bench_tx);
+        stop.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(sock.path());
+        stand_in.join().expect("the stand-in must not panic");
+        poller.join().expect("the poller thread must not panic");
+
+        // Both runs ended cleanly: nothing left in flight (either
+        // class), no error recorded.
+        let state = state.read().expect("the poller must not poison the lock");
+        assert!(!state.bench.running, "the normal run must end at its terminal");
+        assert!(!state.bench.burn_in.running, "the burn-in must end at its terminal");
+        assert!(state.error.is_none(), "clean runs must not record an error");
     }
 }
