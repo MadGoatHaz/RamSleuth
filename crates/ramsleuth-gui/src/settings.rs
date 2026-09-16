@@ -218,7 +218,11 @@ fn theme_label(theme: Theme) -> &'static str {
 /// the [`GuiSettings`] knobs — the daemon socket (a singleline text
 /// edit), the poll interval (a clamped drag value in ms,
 /// 100 ms – 60 s), the capacity + clock unit combos, the theme combo,
-/// and the refresh checkbox. The widgets mutate `settings` directly
+/// and the refresh checkbox. The three combos carry unique id
+/// sources (`ramsleuth_combo_*` — the shared empty `from_label("")`
+/// id desynced their dropdowns, C7-10), and the socket field keeps
+/// a 240 pt minimum width so the full default path never truncates
+/// (C7-10). The widgets mutate `settings` directly
 /// (the render-thread-only write the app shell permits, D6: no
 /// I/O, no socket); nothing here is wired to the poller or the layout
 /// yet (C6-27 / C6-30).
@@ -227,7 +231,15 @@ pub fn render_settings_panel(ui: &mut egui::Ui, settings: &mut GuiSettings) {
         .spacing([12.0, 4.0])
         .show(ui, |ui| {
             ui.label("Socket");
-            ui.add(egui::TextEdit::singleline(&mut settings.socket).desired_width(280.0));
+            // The desired width keeps the full default path
+            // (`/run/ramsleuth/ramsleuth.sock`) visible at the default
+            // window size; the minimum width stops the field
+            // truncating the path when the window narrows (C7-10).
+            ui.add(
+                egui::TextEdit::singleline(&mut settings.socket)
+                    .desired_width(360.0)
+                    .min_size(egui::vec2(240.0, 0.0)),
+            );
             ui.end_row();
 
             ui.label("Poll interval");
@@ -239,7 +251,10 @@ pub fn render_settings_panel(ui: &mut egui::Ui, settings: &mut GuiSettings) {
             ui.end_row();
 
             ui.label("Capacity units");
-            let _ = egui::ComboBox::from_label("")
+            // A unique id source per combo (C7-10): the shared empty
+            // `from_label("")` id made all three dropdowns share one
+            // egui memory and desync each other.
+            let _ = egui::ComboBox::from_id_source("ramsleuth_combo_capacity")
                 .selected_text(capacity_unit_label(settings.units.capacity))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
@@ -256,7 +271,7 @@ pub fn render_settings_panel(ui: &mut egui::Ui, settings: &mut GuiSettings) {
             ui.end_row();
 
             ui.label("Clock units");
-            let _ = egui::ComboBox::from_label("")
+            let _ = egui::ComboBox::from_id_source("ramsleuth_combo_clock")
                 .selected_text(clock_unit_label(settings.units.clock))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut settings.units.clock, ClockUnit::MHz, "MHz");
@@ -265,7 +280,7 @@ pub fn render_settings_panel(ui: &mut egui::Ui, settings: &mut GuiSettings) {
             ui.end_row();
 
             ui.label("Theme");
-            let _ = egui::ComboBox::from_label("")
+            let _ = egui::ComboBox::from_id_source("ramsleuth_combo_theme")
                 .selected_text(theme_label(settings.theme))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut settings.theme, Theme::DarkSlate, "Dark Slate");
@@ -392,5 +407,142 @@ mod tests {
         assert_eq!(format_bw(12.0, &gib), "12 GiB/s");
         assert_eq!(format_bw(12.0, &gb), "12.9 GB/s");
         assert_eq!(format_bw(f64::NEG_INFINITY, &gb), "N/A");
+    }
+
+    /// The settings panel in a fresh context (the `begin_frame`
+    /// precedent, the `history` module's `run_headless_frame`), shown
+    /// in a central panel over `screen_size` via `ctx.run` (the eframe
+    /// frame driver — fonts load in `begin_frame`; `end_frame` yields
+    /// the frame's shapes). Two frames run: `Grid::show` records the
+    /// grid's layout state on the first render while suppressing
+    /// visibility until that state exists (first-frame jitter
+    /// avoidance), so the panel's shapes only paint on the second.
+    /// Returns the context (for `read_response`), the second frame's
+    /// shapes, and the panel ui's id (the combos' id-derivation root).
+    fn render_settings_frame(
+        screen_size: egui::Vec2,
+    ) -> (egui::Context, Vec<egui::epaint::ClippedShape>, egui::Id) {
+        fn show_panel(ctx: &egui::Context, settings: &mut GuiSettings, panel_id: &mut egui::Id) {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                *panel_id = ui.id();
+                render_settings_panel(ui, settings);
+            });
+        }
+        let ctx = egui::Context::default();
+        let mut settings = GuiSettings::default();
+        let mut panel_id = egui::Id::NULL;
+        let frame_input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                screen_size,
+            )),
+            ..Default::default()
+        };
+        // Warm-up frame: the grid records its state, so the second
+        // frame renders (and paints) the content.
+        let _ = ctx.run(frame_input(), |ctx| show_panel(ctx, &mut settings, &mut panel_id));
+        let out = ctx.run(frame_input(), |ctx| show_panel(ctx, &mut settings, &mut panel_id));
+        (ctx, out.shapes, panel_id)
+    }
+
+    /// (h) The three unit / theme combos have distinct widget ids
+    /// (C7-10): they were all `ComboBox::from_label("")` — the same
+    /// empty id source, one shared egui dropdown memory, the knobs
+    /// desyncing each other (the operator-reported bug). Render the
+    /// panel headless and read each combo's button response back:
+    /// three distinct registered widgets, each at its own grid row.
+    #[test]
+    fn the_three_combos_have_distinct_widget_ids() {
+        let (ctx, _shapes, panel_id) = render_settings_frame(egui::vec2(1400.0, 900.0));
+
+        // The grid's content ui sits two child levels below the
+        // panel ui (`Grid::show` allocates a rect child, then a
+        // horizontal child), and each combo's button id is its id
+        // source composed into that ui.
+        let grid_ui = panel_id.with("child").with("child");
+
+        let capacity_btn = grid_ui.with(egui::Id::new("ramsleuth_combo_capacity"));
+        let clock_btn = grid_ui.with(egui::Id::new("ramsleuth_combo_clock"));
+        let theme_btn = grid_ui.with(egui::Id::new("ramsleuth_combo_theme"));
+
+        // Distinct id sources → distinct widget ids ...
+        assert_ne!(capacity_btn, clock_btn);
+        assert_ne!(capacity_btn, theme_btn);
+        assert_ne!(clock_btn, theme_btn);
+
+        // ... and each combo registered itself as its own widget
+        // with its own rect (a shared id would desync the three
+        // dropdown memories).
+        let capacity = ctx
+            .read_response(capacity_btn)
+            .expect("capacity combo must be registered");
+        let clock = ctx
+            .read_response(clock_btn)
+            .expect("clock combo must be registered");
+        let theme = ctx
+            .read_response(theme_btn)
+            .expect("theme combo must be registered");
+        assert_ne!(capacity.rect, clock.rect);
+        assert_ne!(capacity.rect, theme.rect);
+        assert_ne!(clock.rect, theme.rect);
+    }
+
+    /// (i) The socket field never truncates the default path
+    /// (C7-10): the field's 240 pt minimum width holds in both the
+    /// default 1400×900 window and a narrowed one, and 240 pt is
+    /// wider than the rendered default path (`/run/ramsleuth/
+    /// ramsleuth.sock`), so the full path stays visible. The pre-fix
+    /// field (desired 280, no minimum) settled at the grid's
+    /// prev-frame value-column width (≈ 100 pt, driven by the
+    /// combos) and clipped the path. The socket TextEdit's frame is
+    /// the topmost filled rect inside the panel (the panel background
+    /// starts at y = 0; the socket row is the grid's first).
+    #[test]
+    fn the_socket_field_keeps_its_width() {
+        fn socket_frame_width(shapes: &[egui::epaint::ClippedShape]) -> f32 {
+            shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Rect(r) if r.rect.min.y > 0.0 => Some(r.rect),
+                    _ => None,
+                })
+                .min_by(|a, b| a.min.y.total_cmp(&b.min.y))
+                .expect("the socket field's frame rect must be drawn")
+                .width()
+        }
+
+        // The default 1400×900 window (the live gate's size): the
+        // field keeps its 240 pt minimum width — and that is wider
+        // than the rendered default path, so the full
+        // `/run/ramsleuth/ramsleuth.sock` is visible, untruncated.
+        let (ctx, wide_shapes, _panel_id) = render_settings_frame(egui::vec2(1400.0, 900.0));
+        let wide_width = socket_frame_width(&wide_shapes);
+        assert!(
+            wide_width >= 240.0,
+            "at the default size the socket field must keep its 240 pt minimum width (got {wide_width})"
+        );
+        let font_id = egui::TextStyle::Body.resolve(&ctx.style());
+        let path_width = ctx.fonts(|f| {
+            f.layout_job(egui::text::LayoutJob::simple_singleline(
+                DEFAULT_SOCKET_PATH.to_owned(),
+                font_id.clone(),
+                egui::Color32::WHITE,
+            ))
+            .size()
+            .x
+        });
+        assert!(
+            wide_width >= path_width + 8.0,
+            "at the default size the field ({wide_width} pt) must fit the full path ({path_width} pt, +8 pt margin)"
+        );
+
+        // A narrowed window: the field keeps its 240 pt minimum
+        // width — it overflows the window rather than truncating the
+        // path (the pre-fix behavior).
+        let (_ctx, narrow_shapes, _panel_id) = render_settings_frame(egui::vec2(200.0, 900.0));
+        assert!(
+            socket_frame_width(&narrow_shapes) >= 240.0,
+            "in a narrowed window the socket field must keep its 240 pt minimum width"
+        );
     }
 }
