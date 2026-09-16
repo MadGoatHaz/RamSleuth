@@ -109,7 +109,7 @@ use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
 use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::Section;
-use ramsleuth_telemetry::SystemMemoryTelemetry;
+use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
 
 /// How long a transient header notice (an F2 / F3 export result) stays
 /// visible before it fades.
@@ -530,8 +530,11 @@ fn cell_text<T: std::fmt::Display>(cell: &Section<T>) -> String {
 /// Motherboard: … (BIOS: …, AGESA …)`): the CPUID brand + the
 /// platform clock in the selected clock unit (C7-11: `format_clock`
 /// — the default MHz keeps the carried wire value, the GHz arm
-/// ÷1000), then the DMI motherboard / BIOS / AGESA cells — every
-/// `Na` cell degrades to its `N/A` text (never a panic).
+/// ÷1000), then the DMI motherboard / BIOS cells + the AGESA/SMU
+/// provenance fragment ([`age_fragment`] — `AGESA <v>` for a true
+/// AGESA, `SMU <v>` for the ryzen_smu firmware version, `AGESA N/A`
+/// otherwise — C8-11, D-1) — every `Na` cell degrades to its `N/A`
+/// text (never a panic).
 fn cpu_line_text(t: &SystemMemoryTelemetry, units: &Units) -> String {
     let platform = &t.platform;
     let clock = match platform.cpu_clock_mhz.value() {
@@ -539,13 +542,31 @@ fn cpu_line_text(t: &SystemMemoryTelemetry, units: &Units) -> String {
         None => "N/A".to_owned(),
     };
     format!(
-        "CPU: {} @ {} | Motherboard: {} (BIOS: {}, AGESA {})",
+        "CPU: {} @ {} | Motherboard: {} (BIOS: {}, {})",
         t.cpu.brand,
         clock,
         cell_text(&platform.motherboard),
         cell_text(&platform.bios),
-        cell_text(&platform.agesa),
+        age_fragment(platform),
     )
+}
+
+/// Line 2's AGESA/SMU provenance fragment (C8-11, D-1): the header
+/// labels the value by where it came from — a true AGESA token (the
+/// DMI BIOS string scan, e.g. `ComboAm4v2 PI 1.2.0.12`) renders
+/// `AGESA <v>`; when no true AGESA is available (common — the real
+/// AGESA string is root-gated in the raw DMI table) but the
+/// `ryzen_smu` driver publishes a shape-checked firmware version, it
+/// renders `SMU <v>` under its own label (never the reported
+/// `AGESA <smu value>` mislabel); when neither is available the
+/// honest `AGESA N/A`. One value, one true label: no hybrid, no
+/// fabricated string.
+fn age_fragment(platform: &SystemPlatform) -> String {
+    match (&platform.agesa, &platform.smu_version) {
+        (Section::Value(v), _) => format!("AGESA {v}"),
+        (Section::Na(_), Section::Value(v)) => format!("SMU {v}"),
+        (Section::Na(_), Section::Na(_)) => "AGESA N/A".to_owned(),
+    }
 }
 
 /// The per-DIMM capacity summary (the mockup's `2x32GB`): one
@@ -1415,8 +1436,9 @@ mod tests {
     /// (h3) `cpu_line_text`: the spec's line 2 — brand + the clock in
     /// the selected clock unit (C7-11: `format_clock` — the default
     /// MHz keeps the carried wire value, the GHz arm ÷1000) +
-    /// motherboard / BIOS / AGESA, the Na AGESA cell degrading to its
-    /// `N/A` text; a fully Na platform degrades every segment.
+    /// motherboard / BIOS + the provenance fragment (C8-11, D-1) —
+    /// with both cells Na it degrades to `AGESA N/A`; a fully Na
+    /// platform degrades every segment.
     #[test]
     fn cpu_line_text_populated_and_na_degraded() {
         let t = fixture_telemetry(
@@ -1450,6 +1472,72 @@ mod tests {
         assert_eq!(
             cpu_line_text(&all_na, &Units::default()),
             "CPU: Ryzen 9 5950X @ N/A | Motherboard: N/A (BIOS: N/A, AGESA N/A)"
+        );
+    }
+
+    /// (h3′) `age_fragment` (C8-11, D-1): the provenance arms — a
+    /// true AGESA (the BIOS-string scan) wins and suppresses the SMU
+    /// version (D-1's precedence); else the shape-checked `ryzen_smu`
+    /// firmware version renders under its own `SMU` label; else the
+    /// honest `AGESA N/A`. No `AGESA <smu value>` hybrid, never
+    /// fabricated.
+    #[test]
+    fn age_fragment_by_provenance() {
+        let base = SystemPlatform {
+            cpu_clock_mhz: Section::Value(3600.0),
+            motherboard: Section::Value("ProArt X570-CREATOR".to_owned()),
+            bios: Section::Value("5601".to_owned()),
+            agesa: Section::na(NaReason::NotApplicable),
+            smu_version: Section::na(NaReason::NotApplicable),
+        };
+        assert_eq!(age_fragment(&base), "AGESA N/A");
+
+        let smu = SystemPlatform {
+            smu_version: Section::Value("56.78.0".to_owned()),
+            ..base.clone()
+        };
+        assert_eq!(age_fragment(&smu), "SMU 56.78.0");
+
+        let agesa = SystemPlatform {
+            agesa: Section::Value("ComboAm4v2 PI 1.2.0.12".to_owned()),
+            ..base.clone()
+        };
+        assert_eq!(age_fragment(&agesa), "AGESA ComboAm4v2 PI 1.2.0.12");
+
+        // The precedence (D-1): a true AGESA suppresses the SMU value.
+        let both = SystemPlatform {
+            agesa: Section::Value("ComboAm4v2 PI 1.2.0.12".to_owned()),
+            smu_version: Section::Value("56.78.0".to_owned()),
+            ..base.clone()
+        };
+        assert_eq!(age_fragment(&both), "AGESA ComboAm4v2 PI 1.2.0.12");
+    }
+
+    /// (h3″) `cpu_line_text`'s provenance fragment in the header
+    /// (C8-11, D-1): the live host shape — `bios = 5601` (a bare OEM
+    /// build code, no AGESA token), no true AGESA (the real string is
+    /// root-gated), the `ryzen_smu` firmware `56.78.0` → `… (BIOS:
+    /// 5601, SMU 56.78.0)` — the reported `AGESA 56.78.0` mislabel
+    /// pinned as a regression; a true AGESA renders `AGESA <v>` with
+    /// the SMU value suppressed (D-1's precedence).
+    #[test]
+    fn cpu_line_text_provenance_fragment() {
+        // The live host shape: the SMU firmware under its true label.
+        let mut t = fixture_telemetry(Section::Value(32.0), Vec::new(), Vec::new());
+        t.platform.bios = Section::Value("5601".to_owned());
+        t.platform.smu_version = Section::Value("56.78.0".to_owned());
+        assert_eq!(
+            cpu_line_text(&t, &Units::default()),
+            "CPU: Ryzen 9 5950X @ 3600 MHz | Motherboard: ProArt X570-CREATOR (BIOS: 5601, SMU 56.78.0)"
+        );
+
+        // A true AGESA (the BIOS-string scan) wins over the SMU value.
+        let mut t = fixture_telemetry(Section::Value(32.0), Vec::new(), Vec::new());
+        t.platform.agesa = Section::Value("ComboAm4v2 PI 1.2.0.12".to_owned());
+        t.platform.smu_version = Section::Value("56.78.0".to_owned());
+        assert_eq!(
+            cpu_line_text(&t, &Units::default()),
+            "CPU: Ryzen 9 5950X @ 3600 MHz | Motherboard: ProArt X570-CREATOR (BIOS: F60 + 09/15/2024, AGESA ComboAm4v2 PI 1.2.0.12)"
         );
     }
 
