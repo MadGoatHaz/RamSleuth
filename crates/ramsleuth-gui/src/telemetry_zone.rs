@@ -9,9 +9,10 @@
 //! subtimings (primary / secondary / tertiary + turnarounds, ticks),
 //! the CAD bus (drive / termination, ohms), the voltages (mV→V) —
 //! each [`Section::Value`] printed in CYAN, each [`Section::Na`]
-//! printed `N/A (<reason>)` in CRIMSON, and the two semantic warnings
-//! in AMBER (a 1:2 UCLK:MCLK divide = gear desync; a SOC rail above
-//! 1.30 V = out of spec on AM5). The MCLK / UCLK / FCLK rows follow
+//! printed as bare `N/A` in muted gray (NA_GRAY — the reason stays on
+//! the wire, D-4), and the two semantic warnings in AMBER (a 1:2
+//! UCLK:MCLK divide = gear desync; a SOC rail above 1.30 V = out of
+//! spec on AM5). The MCLK / UCLK / FCLK rows follow
 //! the settings panel's clock-unit knob (C7-15): the default `MHz`
 //! keeps the two-decimal form, the `GHz` knob re-renders them
 //! through [`format_clock`]'s GHz form (÷1000, trimmed).
@@ -28,18 +29,17 @@
 //! `[Clocks & Ratios]` (gear down mode + DRAM command rate — e.g.
 //! `GEAR_DOWN: Enabled · CR: 1T` or `GEAR_DOWN: Disabled · CR: 2T`;
 //! an Intel channel's not-applicable cells degrade their own tokens
-//! to a crimson N/A). The zone
+//! to a bare gray N/A). The zone
 //! lays out at its natural height — no scroll area: at the default
 //! 1400×900 window the 3×2 grid (worst column ≈ 25 rows) fits the
 //! left column without vertical scrolling (C7-12). The vendor
 //! blocks are conditional on the detected CPU (C7-14): an `Amd` host
 //! renders only the AMD block, an `Intel` host only the Intel
-//! per-channel blocks — the off-vendor `N/A (unsupported hardware)`
-//! row is omitted entirely — and an `Unknown` vendor keeps both; a
-//! rendered whole-`Na` branch collapses to a single row (`AMD` /
-//! `Intel` + the reason), and no telemetry at all renders one
-//! crimson placeholder — never a panic (the no-panic contract, plan
-//! D5).
+//! per-channel blocks — the off-vendor bare-`N/A` row is omitted
+//! entirely — and an `Unknown` vendor keeps both; a rendered
+//! whole-`Na` branch collapses to a single bare-`N/A` row, and no
+//! telemetry at all renders one gray placeholder — never a panic
+//! (the no-panic contract, plan D5).
 //!
 //! **Pure core:** [`timing_cells`] is I/O-free and deterministic (the
 //! unit tests exercise it without an egui context);
@@ -54,7 +54,7 @@ use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 
 use crate::update::TelemetryData;
-use crate::{format_clock, ClockUnit, Units, AMBER, CRIMSON, CYAN, SLATE};
+use crate::{format_clock, ClockUnit, Units, AMBER, CYAN, NA_GRAY, SLATE};
 
 /// The zone title (Grand Design §3.1, left panel).
 const ZONE_TITLE: &str = "1 · MEMORY CONTROLLER & SUBTIMINGS";
@@ -119,8 +119,9 @@ pub struct VendorTiming {
     /// Voltages — the 3×2 layout reads them by column,
     /// [`COLUMN_SECTIONS`]); empty when the block is degraded.
     pub sections: Vec<TimingSection>,
-    /// The whole-block `N/A (<reason>)` display (the degraded state);
-    /// `None` when the sections are present.
+    /// The whole-block bare `N/A` display (the degraded state — the
+    /// reason stays on the wire, D-4); `None` when the sections are
+    /// present.
     pub degraded: Option<String>,
 }
 
@@ -130,8 +131,8 @@ pub struct VendorTiming {
 
 /// The zone-1 vendor blocks, filtered by the detected CPU vendor
 /// (C7-14): `CpuVendor::Amd(…)` renders only the AMD block (a
-/// header + the six grouped sections, or one degraded `N/A
-/// (<reason>)` row — an AMD host with a missing driver still shows
+/// header + the six grouped sections, or one degraded bare-`N/A`
+/// row — an AMD host with a missing driver still shows
 /// its own block, never an Intel one); `CpuVendor::Intel(…)` only
 /// the Intel per-channel blocks (one header + section block per
 /// decoded channel, including the channel-level RTL — or one
@@ -147,8 +148,9 @@ pub struct VendorTiming {
 /// V, bare ticks, `1:1` / `1:2`, `1x`…`4x`, `on` / `off`,
 /// `GEAR_DOWN: Enabled` / `GEAR_DOWN: Disabled` + `CR: 1T` / `CR: 2T`,
 /// `RZQ/N (x.x Ω)`) or
-/// `N/A (<reason>)` for a [`Section::Na`] (the dump renderer's form —
-/// [`NaReason`] carries no `Display`). A rendered vendor branch that
+/// bare `N/A` for a [`Section::Na`] (the reason stays on the wire;
+/// [`NaReason`] carries no `Display`, and the GUI drops the
+/// `(<reason>)` parenthetical — D-4). A rendered vendor branch that
 /// degraded whole collapses to one block with empty `sections` + the
 /// N/A display (and an Intel readout with no decoded channels does
 /// the same with `not applicable`), so an all-Na snapshot still
@@ -156,7 +158,7 @@ pub struct VendorTiming {
 pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<VendorTiming> {
     // The platform-conditional visibility (C7-14, item 3b): each
     // block renders on its own vendor — the off-vendor branch is
-    // omitted even in its degraded `N/A (unsupported hardware)` form
+    // omitted even in its degraded bare-`N/A` form
     // — while an `Unknown` vendor (no honest vendor claim) keeps
     // both.
     let show_amd = !matches!(telemetry.cpu.vendor, CpuVendor::Intel(_));
@@ -213,8 +215,8 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<Ven
 }
 
 /// One degraded vendor block: an empty section list + the whole-block
-/// N/A display (the single crimson row the renderer draws beneath the
-/// bold header).
+/// bare N/A display (the single gray row the renderer draws beneath
+/// the bold header, D-5).
 fn degraded_block(header: &str, reason: &NaReason) -> VendorTiming {
     VendorTiming {
         header: header.to_owned(),
@@ -234,8 +236,8 @@ fn degraded_block(header: &str, reason: &NaReason) -> VendorTiming {
 /// shows the gear down mode + the DRAM command rate, each token
 /// carrying its own name (e.g. `GEAR_DOWN: Enabled · CR: 1T`,
 /// `GEAR_DOWN: Disabled · CR: 2T`); an Intel channel's not-applicable
-/// GDM / command-rate cells degrade their own tokens to a crimson
-/// N/A. The
+/// GDM / command-rate cells degrade their own tokens to a bare gray
+/// N/A (D-5). The
 /// channel-level RTL (Intel only — the frozen `TimingSet` has no
 /// slot) is appended to `[Clocks & Ratios]`.
 fn readout_sections(
@@ -354,17 +356,11 @@ fn row(label: &str, display: String) -> (String, String) {
 // GUI matrix reads exactly like the CLI `dump`).
 // ---------------------------------------------------------------------
 
-/// The human text of an absent cell: `N/A (<reason>)` (the renderer
-/// owns this form — [`NaReason`] carries no `Display`).
-fn na_text(reason: &NaReason) -> String {
-    match reason {
-        NaReason::UnsupportedHardware => "N/A (unsupported hardware)".to_owned(),
-        NaReason::DriverMissing => "N/A (driver missing)".to_owned(),
-        NaReason::InsufficientPrivilege => "N/A (insufficient privilege)".to_owned(),
-        NaReason::UnknownPmTableVersion => "N/A (unknown PM table version)".to_owned(),
-        NaReason::NotApplicable => "N/A (not applicable)".to_owned(),
-        NaReason::ParseError(detail) => format!("N/A (parse error: {detail})"),
-    }
+/// The human text of an absent cell: bare `N/A` (D-4 — the reason
+/// stays on the wire; [`NaReason`] carries no `Display`, and the GUI
+/// drops the verbose `(<reason>)` parenthetical).
+fn na_text(_reason: &NaReason) -> String {
+    "N/A".to_owned()
 }
 
 /// A memory-clock cell in the selected clock unit (C7-15): the
@@ -446,10 +442,9 @@ fn flag(section: &Section<bool>) -> String {
 /// `GEAR_DOWN: Enabled · CR: 2T`, `GEAR_DOWN: Disabled · CR: 1T`,
 /// `GEAR_DOWN: Disabled · CR: 2T` (the previous wording is dropped —
 /// it collided with Intel gear-mode semantics). A not-applicable /
-/// failed cell degrades its own token to `N/A (<reason>)` (per token,
-/// not the whole row; the combined row colors CRIMSON when either
-/// token is absent — see [`cell_color`]). No panic on any Na
-/// combination.
+/// failed cell degrades its own token to bare `N/A` (per token, not
+/// the whole row; the combined row colors gray when either token is
+/// absent — see [`cell_color`]). No panic on any Na combination.
 fn gdm_cr(gdm: &Section<bool>, command_rate: &Section<CommandRate>) -> String {
     let gdm = match gdm {
         Section::Value(true) => "GEAR_DOWN: Enabled".to_owned(),
@@ -485,11 +480,12 @@ fn volts(section: &Section<u16>) -> String {
 /// column ≈ 25 rows) fits the left column without vertical scrolling.
 ///
 /// Rows: the label in default text, the value in CYAN, an absent cell
-/// (`N/A (…)`) in CRIMSON, and the two warnings in AMBER — a 1:2
-/// UCLK:MCLK divide (gear desync) and a VDDCR_SOC reading above 1.30 V
-/// (out of spec on AM5); the MCLK / UCLK / FCLK rows follow the
+/// (bare `N/A`) in muted gray (NA_GRAY — D-5), and the two warnings
+/// in AMBER — a 1:2 UCLK:MCLK divide (gear desync) and a VDDCR_SOC
+/// reading above 1.30 V (out of spec on AM5); the MCLK / UCLK / FCLK
+/// rows follow the
 /// settings panel's clock-unit knob (C7-15). No telemetry renders one
-/// crimson placeholder line — never a panic (plan D5).
+/// gray placeholder line — never a panic (plan D5).
 pub fn render_telemetry_zone(ui: &mut egui::Ui, data: &TelemetryData) {
     let frame = egui::Frame::default()
         .fill(SLATE)
@@ -509,7 +505,7 @@ pub fn render_telemetry_zone(ui: &mut egui::Ui, data: &TelemetryData) {
                 }
             }
             None => {
-                ui.label(egui::RichText::new("N/A (no telemetry)").color(CRIMSON));
+                ui.label(egui::RichText::new("N/A").color(NA_GRAY));
             }
         }
     });
@@ -517,7 +513,7 @@ pub fn render_telemetry_zone(ui: &mut egui::Ui, data: &TelemetryData) {
 
 /// One vendor block: the bold CYAN header (AMD / Intel ch N) and
 /// either the 3-column × 2-row section grid, or the single N/A row
-/// of a degraded whole branch (CRIMSON via [`cell_color`]).
+/// of a degraded whole branch (NA_GRAY via [`cell_color`], D-5).
 fn render_vendor_block(ui: &mut egui::Ui, index: usize, block: &VendorTiming) {
     ui.add(egui::Label::new(
         egui::RichText::new(block.header.as_str()).strong().color(CYAN),
@@ -590,21 +586,22 @@ fn render_section(
         });
 }
 
-/// The semantic color of one grid cell: CYAN for values, CRIMSON for
-/// absent cells (`N/A (…)`), AMBER for the two warning conditions — a
-/// 1:2 UCLK:MCLK divide (gear desync) and a VDDCR_SOC reading above
+/// The semantic color of one grid cell: CYAN for values, muted gray
+/// (NA_GRAY) for absent cells (bare `N/A` — D-5: unavailable, not a
+/// critical fault), AMBER for the two warning conditions — a 1:2
+/// UCLK:MCLK divide (gear desync) and a VDDCR_SOC reading above
 /// [`SOC_MAX_VOLTS`] (out of spec on AM5). The combined `GDM / CR`
-/// row is CRIMSON when either of its tokens is absent (e.g.
-/// `GEAR_DOWN: Enabled · N/A (driver missing)` or
-/// `N/A (not applicable) · CR: 1T`); a display whose gear-down token
-/// is absent already hits the `starts_with("N/A")` pick above.
+/// row is gray when either of its tokens is absent (e.g.
+/// `GEAR_DOWN: Enabled · N/A` or `N/A · CR: 1T`); a display whose
+/// gear-down token is absent already hits the `starts_with("N/A")`
+/// pick above.
 fn cell_color(label: &str, display: &str) -> egui::Color32 {
     if display.starts_with("N/A") {
-        return CRIMSON;
+        return NA_GRAY;
     }
     match label {
         "UCLK:MCLK" if display == "1:2" => AMBER,
-        "GDM / CR" if display.contains("N/A") => CRIMSON,
+        "GDM / CR" if display.contains("N/A") => NA_GRAY,
         "VDDCR_SOC" => {
             match display
                 .strip_suffix(" V")
@@ -814,8 +811,8 @@ mod tests {
 
     /// (a) A representative snapshot: the AMD-detected host renders
     /// exactly one block — the §3.1 grouped layout of the AMD
-    /// readout (the off-vendor Intel `N/A (unsupported hardware)`
-    /// block is omitted, C7-14) — six sections in the canonical pair
+    /// readout (the off-vendor Intel bare-`N/A` block is omitted,
+    /// C7-14) — six sections in the canonical pair
     /// order, the formatted values (not all N/A) present — clocks,
     /// the 1:2 ratio, tick timings, RZQ Ω, volts — and the `GDM / CR`
     /// row.
@@ -858,15 +855,15 @@ mod tests {
         assert_eq!(displays(&rows, "MCLK"), vec!["1600.00 MHz"]);
         assert_eq!(displays(&rows, "FCLK"), vec!["1800.00 MHz"]);
         assert_eq!(displays(&rows, "UCLK:MCLK"), vec!["1:2"]);
-        assert_eq!(displays(&rows, "gear"), vec!["N/A (not applicable)"]);
+        assert_eq!(displays(&rows, "gear"), vec!["N/A"]);
         assert_eq!(displays(&rows, "GDM / CR"), vec!["GEAR_DOWN: Enabled · CR: 1T"]);
         assert_eq!(displays(&rows, "PDM"), vec!["off"]);
         assert_eq!(displays(&rows, "tCL"), vec!["16"]);
         assert_eq!(displays(&rows, "tFAW"), vec!["16"]);
-        assert_eq!(displays(&rows, "tRFC2"), vec!["N/A (parse error: fixture)"]);
+        assert_eq!(displays(&rows, "tRFC2"), vec!["N/A"]);
         assert_eq!(displays(&rows, "RTT nom"), vec!["RZQ/10 (24.0 Ω)"]);
         assert_eq!(displays(&rows, "RTT wr"), vec!["45.0 Ω"]);
-        assert_eq!(displays(&rows, "RTT park"), vec!["N/A (not applicable)"]);
+        assert_eq!(displays(&rows, "RTT park"), vec!["N/A"]);
         assert_eq!(displays(&rows, "VDDCR_SOC"), vec!["1.150 V"]);
         assert_eq!(displays(&rows, "VPP"), vec!["1.800 V"]);
     }
@@ -885,10 +882,10 @@ mod tests {
         );
         assert_eq!(blocks[0].header, "AMD");
         assert!(blocks[0].sections.is_empty());
-        assert_eq!(blocks[0].degraded.as_deref(), Some("N/A (driver missing)"));
+        assert_eq!(blocks[0].degraded.as_deref(), Some("N/A"));
         assert_eq!(blocks[1].header, "Intel");
         assert!(blocks[1].sections.is_empty());
-        assert_eq!(blocks[1].degraded.as_deref(), Some("N/A (insufficient privilege)"));
+        assert_eq!(blocks[1].degraded.as_deref(), Some("N/A"));
         assert!(all_rows(&blocks).is_empty(), "a degraded block carries no section rows");
     }
 
@@ -958,7 +955,7 @@ mod tests {
     /// C7-14), the decoded channel 0 with its readings (incl. the
     /// channel-level RTL appended to `[Clocks & Ratios]`), the
     /// degraded channel 1 all-N/A; the Intel `GDM / CR` row degrades
-    /// to a crimson N/A pair (D-C11 not-applicable cells).
+    /// to a bare gray N/A pair (D-C11 not-applicable cells, D-5).
     #[test]
     fn intel_blocks_are_per_channel() {
         let blocks = timing_cells(&intel_populated(), &Units::default());
@@ -981,7 +978,7 @@ mod tests {
             mclk,
             vec![
                 "1600.00 MHz",
-                "N/A (parse error: DRAM frequency ratio absent (register read failed or unconfigured))",
+                "N/A",
             ]
         );
 
@@ -1001,7 +998,7 @@ mod tests {
         assert_eq!(gdm_cr.len(), 2, "one GDM / CR row per decoded channel");
         assert_eq!(
             gdm_cr[0],
-            "N/A (not applicable) · N/A (not applicable)",
+            "N/A · N/A",
             "Intel channel 0's honest D-C11 not-applicable cells"
         );
         assert!(gdm_cr[1].contains("N/A"), "channel 1 is degraded");
@@ -1010,7 +1007,7 @@ mod tests {
     /// (f) The `GDM / CR` combined row (D-7 format): each token
     /// carries its own name — the four value combinations
     /// `GEAR_DOWN: <Enabled|Disabled> · CR: <1T|2T>` — and each
-    /// absent cell degrades its own token to `N/A (<reason>)` (per
+    /// absent cell degrades its own token to bare `N/A` (D-4, per
     /// token, not the whole row); no panic on any Na combination.
     #[test]
     fn gdm_cr_row_formats_the_command_rate() {
@@ -1028,15 +1025,15 @@ mod tests {
         assert_eq!(gdm_cr(&off, &two_t), "GEAR_DOWN: Disabled · CR: 2T");
 
         // Per-token N/A degradation: the absent token renders
-        // `N/A (<reason>)`, the present token keeps its own form.
+        // bare `N/A` (D-4), the present token keeps its own form.
         assert_eq!(
             gdm_cr(&gdm_na, &one_t),
-            "N/A (not applicable) · CR: 1T",
+            "N/A · CR: 1T",
             "the gear-down token degrades on its own"
         );
         assert_eq!(
             gdm_cr(&off, &rate_na),
-            "GEAR_DOWN: Disabled · N/A (not applicable)",
+            "GEAR_DOWN: Disabled · N/A",
             "the command-rate token degrades on its own"
         );
         assert!(
@@ -1047,20 +1044,21 @@ mod tests {
     }
 
     /// (g) The semantic color picks (the renderer's cell coloring):
-    /// CYAN for values, CRIMSON for N/A, AMBER for the 1:2 divide and
-    /// a VDDCR_SOC reading above 1.30 V; the combined `GDM / CR` row
-    /// is CRIMSON when either token is absent.
+    /// CYAN for values, NA_GRAY for absent cells (bare `N/A`, D-5),
+    /// AMBER for the 1:2 divide and a VDDCR_SOC reading above 1.30 V;
+    /// the combined `GDM / CR` row is NA_GRAY when either token is
+    /// absent.
     #[test]
     fn cell_color_semantics() {
         assert_eq!(cell_color("MCLK", "1600.00 MHz"), CYAN);
         assert_eq!(cell_color("tCL", "16"), CYAN);
-        assert_eq!(cell_color("MCLK", "N/A (driver missing)"), CRIMSON);
+        assert_eq!(cell_color("MCLK", "N/A"), NA_GRAY);
         assert_eq!(cell_color("UCLK:MCLK", "1:1"), CYAN);
         assert_eq!(cell_color("UCLK:MCLK", "1:2"), AMBER);
         assert_eq!(cell_color("VDDCR_SOC", "1.150 V"), CYAN);
         assert_eq!(cell_color("VDDCR_SOC", "1.300 V"), CYAN);
         assert_eq!(cell_color("VDDCR_SOC", "1.450 V"), AMBER);
-        assert_eq!(cell_color("VDDCR_SOC", "N/A (not applicable)"), CRIMSON);
+        assert_eq!(cell_color("VDDCR_SOC", "N/A"), NA_GRAY);
         assert_eq!(
             cell_color("GDM / CR", "GEAR_DOWN: Enabled · CR: 1T"),
             CYAN,
@@ -1072,18 +1070,18 @@ mod tests {
             "both tokens present"
         );
         assert_eq!(
-            cell_color("GDM / CR", "N/A (not applicable) · N/A (not applicable)"),
-            CRIMSON,
+            cell_color("GDM / CR", "N/A · N/A"),
+            NA_GRAY,
             "both tokens absent"
         );
         assert_eq!(
-            cell_color("GDM / CR", "GEAR_DOWN: Enabled · N/A (driver missing)"),
-            CRIMSON,
+            cell_color("GDM / CR", "GEAR_DOWN: Enabled · N/A"),
+            NA_GRAY,
             "the command-rate token alone absent"
         );
         assert_eq!(
-            cell_color("GDM / CR", "N/A (not applicable) · CR: 1T"),
-            CRIMSON,
+            cell_color("GDM / CR", "N/A · CR: 1T"),
+            NA_GRAY,
             "the gear-down token alone absent"
         );
     }
@@ -1225,10 +1223,99 @@ mod tests {
 
         // The unit-agnostic rows are unchanged under the knob.
         assert_eq!(displays(&rows, "UCLK:MCLK"), vec!["1:2"]);
-        assert_eq!(displays(&rows, "gear"), vec!["N/A (not applicable)"]);
+        assert_eq!(displays(&rows, "gear"), vec!["N/A"]);
         assert_eq!(displays(&rows, "GDM / CR"), vec!["GEAR_DOWN: Enabled · CR: 1T"]);
         assert_eq!(displays(&rows, "PDM"), vec!["off"]);
         assert_eq!(displays(&rows, "tCL"), vec!["16"]);
         assert_eq!(displays(&rows, "VDDCR_SOC"), vec!["1.150 V"]);
+    }
+
+    /// (k) The bare N/A form (D-4): every `na_text` arm collapses to
+    /// exactly `N/A` (the reason stays on the wire), and no row
+    /// display or degraded whole-block display across all three
+    /// fixture snapshots carries a `N/A (<reason>)` parenthetical.
+    #[test]
+    fn na_text_arms_and_all_displays_render_bare() {
+        // The six arms of na_text all collapse to the one bare form.
+        for reason in [
+            NaReason::UnsupportedHardware,
+            NaReason::DriverMissing,
+            NaReason::InsufficientPrivilege,
+            NaReason::UnknownPmTableVersion,
+            NaReason::NotApplicable,
+            NaReason::ParseError("fixture".to_owned()),
+        ] {
+            assert_eq!(na_text(&reason), "N/A", "na_text({reason:?}) must be bare (D-4)");
+        }
+
+        // The full matrix over all three fixture shapes: any display
+        // containing `N/A` is exactly the bare form (no
+        // parenthetical survives into the GUI), and the degraded
+        // whole-block displays are bare too.
+        for snapshot in [representative(), intel_populated(), all_na()] {
+            let blocks = timing_cells(&snapshot, &Units::default());
+            for (label, display) in all_rows(&blocks) {
+                assert!(
+                    !display.contains("N/A ("),
+                    "the {label} display must not carry an N/A parenthetical (D-4), got {display:?}"
+                );
+            }
+            for block in &blocks {
+                if let Some(display) = &block.degraded {
+                    assert_eq!(display, "N/A", "the degraded display must be bare (D-4)");
+                }
+            }
+        }
+    }
+
+    /// (l) The no-telemetry placeholder renders bare `N/A` in the
+    /// muted gray (D-4/D-5 — the `(no telemetry)` parenthetical is
+    /// stripped, and the placeholder is unavailable-gray, not
+    /// fault-red).
+    #[test]
+    fn no_telemetry_placeholder_renders_bare_gray_na() {
+        let data = TelemetryData { telemetry: None, ..Default::default() };
+        let ctx = egui::Context::default();
+        ctx.begin_frame(egui::RawInput::default());
+        egui::CentralPanel::default().show(&ctx, |ui| render_telemetry_zone(ui, &data));
+        let out = ctx.end_frame();
+        let texts = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) => Some(t.galley.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            texts.contains(&"N/A"),
+            "the placeholder must paint bare N/A, got {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|t| !t.contains("no telemetry")),
+            "no parenthetical survives in the painted text, got {texts:?}"
+        );
+        // Every section of the placeholder galley is painted in the
+        // muted gray (unavailable, not a fault).
+        let colors = out
+            .shapes
+            .iter()
+            .filter(|cs| matches!(&cs.shape, egui::Shape::Text(t) if t.galley.text() == "N/A"))
+            .flat_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) => t
+                    .galley
+                    .job
+                    .sections
+                    .iter()
+                    .map(|sec| sec.format.color)
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert!(!colors.is_empty(), "the placeholder galley must carry sections");
+        assert!(
+            colors.iter().all(|c| *c == NA_GRAY),
+            "the placeholder N/A must be muted gray, got {colors:?}"
+        );
     }
 }
