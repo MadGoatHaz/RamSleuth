@@ -15,8 +15,9 @@
 //!
 //! | Byte                                   | Meaning                                            |
 //! |----------------------------------------|----------------------------------------------------|
-//! | `0x00`                                 | Row location (bits 7:5) + memory type (bits 4:0): `0x0A` DDR4 / `0x0C` DDR5 |
-//! | `0x01` / `0x02`                        | Module manufacturer JEP106 vendor / continuation nibble |
+//! | `0x00`                                 | SPD bytes used; bits 4:0 also carry the legacy memory-type check (`0x0A` DDR4 / `0x0C` DDR5) — the documented fallback when `0x02` is unrecognized (C8-02) |
+//! | `0x01` / `0x02`                        | Module manufacturer JEP106 vendor / continuation nibble (byte `0x02` doubles as the basic-info memory type) |
+//! | `0x02`                                 | Basic-info memory type (JESD79-4/5): `0x0C` = DDR4 (512 B image) / DDR5 (1024 B image — the generations share the code), `0x0B` = DDR3 — the primary classification (C8-02) |
 //! | `0x2E` / `0x2F` (DDR5), `0x100` / `0x101` (DDR4) | DRAM die manufacturer JEP106 |
 //! | `0x13`                                 | SDRAM density (code -> Gb)                         |
 //! | `0x20`                                 | Minimum data rate, in 100 MT/s units               |
@@ -68,16 +69,31 @@ use crate::spd_eeprom::SpdImage;
 // SPD layout (byte offsets; see the module doc table).
 // ---------------------------------------------------------------------------
 
-/// Byte `0x00`: row location (bits 7:5) + memory type (bits 4:0).
+/// Byte `0x00`: SPD bytes used; the legacy memory-type check reads bits
+/// 4:0 (`0x0A` DDR4 / `0x0C` DDR5) — the documented fallback when byte
+/// `0x02` carries no recognized type (C8-02).
 const BYTE_MEMORY_TYPE: usize = 0x00;
-/// DDR4 SDRAM memory-type code (`1010b`).
+/// Legacy DDR4 memory-type code (byte `0x00` bits 4:0, `1010b`).
 const MEM_TYPE_DDR4: u8 = 0x0A;
-/// DDR5 SDRAM memory-type code (`1100b`).
+/// Legacy DDR5 memory-type code (byte `0x00` bits 4:0, `1100b`).
 const MEM_TYPE_DDR5: u8 = 0x0C;
+
+/// Byte `0x02`: the basic-info memory type (JESD79-4/5) — the primary
+/// classification (C8-02): `0x0C` = DDR4 (512 B image) / DDR5 (1024 B
+/// image; the two generations share the code, disambiguated by the
+/// image length), `0x0B` = DDR3 (legacy). Shares the byte with the
+/// module-maker JEP106 continuation nibble.
+const BYTE_SPD_TYPE: usize = 0x02;
+/// DDR4 / DDR5 memory-type key at byte `0x02` (C8-02).
+const SPD_TYPE_DDR4: u8 = 0x0C;
+/// DDR3 memory-type code at byte `0x02` (the legacy `0x81` part
+/// location, C8-02).
+const SPD_TYPE_DDR3: u8 = 0x0B;
 
 /// Byte `0x01`: module manufacturer JEP106 vendor nibble.
 const BYTE_MODULE_MAKER: usize = 0x01;
-/// Byte `0x02`: module manufacturer JEP106 continuation nibble.
+/// Byte `0x02`: module manufacturer JEP106 continuation nibble (the
+/// byte also carries the basic-info memory type, [`BYTE_SPD_TYPE`]).
 const BYTE_MODULE_MAKER_CONT: usize = 0x02;
 
 /// DDR5 byte `0x2E`: DRAM die manufacturer JEP106 vendor nibble.
@@ -263,14 +279,22 @@ fn oob(off: usize) -> NaReason {
     NaReason::ParseError(format!("byte 0x{off:02X} outside image bounds"))
 }
 
-/// Classify the module by its header signature (byte `0x00`, bits 4:0):
-/// `0x0C` -> DDR5, `0x0A` -> DDR4. An unrecognized signature falls back
-/// to the image length (1024 B -> DDR5, otherwise DDR4).
+/// Classify the module: the primary check is the basic-info memory type
+/// (byte `0x02`, C8-02) — `0x0C` -> DDR5 iff the image is 1024 B (the
+/// DDR4 / DDR5 generations share the code, disambiguated by the image
+/// length), `0x0B` -> DDR3. An unrecognized / absent `0x02` falls back
+/// to the legacy byte-`0x00` check (bits 4:0: `0x0C` -> DDR5, `0x0A`
+/// -> DDR4), then to the image length (1024 B -> DDR5, otherwise
+/// DDR4) — the current last resort.
 fn classify_ddr5(data: &[u8]) -> bool {
-    match get(data, BYTE_MEMORY_TYPE).map(|b| b & 0x1F) {
-        Some(MEM_TYPE_DDR5) => true,
-        Some(MEM_TYPE_DDR4) => false,
-        _ => data.len() == SPD_IMAGE_LEN_DDR5,
+    match get(data, BYTE_SPD_TYPE) {
+        Some(SPD_TYPE_DDR4) => data.len() == SPD_IMAGE_LEN_DDR5,
+        Some(SPD_TYPE_DDR3) => false,
+        _ => match get(data, BYTE_MEMORY_TYPE).map(|b| b & 0x1F) {
+            Some(MEM_TYPE_DDR5) => true,
+            Some(MEM_TYPE_DDR4) => false,
+            _ => data.len() == SPD_IMAGE_LEN_DDR5,
+        },
     }
 }
 
@@ -373,28 +397,34 @@ fn decode_ascii(data: &[u8], start: usize, len: usize, what: &str) -> Section<St
     }
 }
 
-/// The memory-type code (byte `0x00`, bits 4:0), or `None` when the byte
-/// is outside the image bounds.
+/// The legacy memory-type code (byte `0x00`, bits 4:0), or `None` when
+/// the byte is outside the image bounds (the C8-02 fallback source —
+/// the primary type lives at byte `0x02`).
 fn memory_type(data: &[u8]) -> Option<u8> {
     get(data, BYTE_MEMORY_TYPE).map(|b| b & 0x1F)
 }
 
-/// `true` when the module's memory-type byte is DDR4 (`0x0A`); `false`
-/// for DDR2/DDR3 codes, unrecognized codes, or an out-of-bounds header
-/// (those classify to the legacy `0x81` part location on the not-DDR5
-/// path).
+/// `true` when the basic-info memory type (byte `0x02`, C8-02) is the
+/// DDR4 / DDR5 key `0x0C` on a non-DDR5 image; the legacy byte-`0x00`
+/// code `0x0A` applies when `0x02` is unrecognized. `false` for DDR3
+/// (`0x0B`), other unrecognized / out-of-bounds headers (those
+/// classify to the legacy `0x81` part location on the not-DDR5 path).
 fn is_ddr4(data: &[u8]) -> bool {
-    memory_type(data) == Some(MEM_TYPE_DDR4)
+    match get(data, BYTE_SPD_TYPE) {
+        Some(SPD_TYPE_DDR4) => data.len() != SPD_IMAGE_LEN_DDR5,
+        _ => memory_type(data) == Some(MEM_TYPE_DDR4),
+    }
 }
 
-/// Decode the module part number, generation-scoped (C7-02):
+/// Decode the module part number, generation-scoped (C7-02; the
+/// generation comes from the C8-02 byte-`0x02` classification):
 /// - DDR5 (JESD79-5): the 32-char field at `0x200..0x220`;
 /// - DDR4 (JESD79-4): the 20-char field at `0x149..0x15D`, falling back
 ///   to the 16-char field at `0x81..0x91` when the `0x149` region is
 ///   present-but-blank; a truncated image (the `0x149` region out of
 ///   bounds) keeps its own `Na(ParseError)` rather than the fallback's;
-/// - DDR2/DDR3 (everything else the classifier does not call DDR5): the
-///   16-char field at `0x81..0x91`, unchanged.
+/// - DDR2/DDR3 (the `0x0B` key and everything else not called
+///   DDR4 / DDR5): the 16-char field at `0x81..0x91`, unchanged.
 ///
 /// Reuses [`decode_ascii`]; never panics.
 fn decode_part(data: &[u8], is_ddr5: bool) -> Section<String> {
@@ -732,10 +762,10 @@ mod tests {
     /// minimum, 2 ranks, one valid XMP 2.0 profile (slot 1), blank slot 2.
     fn ddr4_image() -> SpdImage {
         let mut data = vec![0u8; 512];
-        data[0x00] = 0x0A; // DDR4 signature
+        data[0x00] = 0x0A; // legacy memory-type check: DDR4 (agrees with 0x02, C8-02)
         // Module manufacturer: Micron 0xC2 (vendor 0x02, continuation 0x0C).
         data[0x01] = 0x02;
-        data[0x02] = 0x0C;
+        data[0x02] = 0x0C; // DDR4 memory type (C8-02 primary) + JEP106 continuation
         // 8 Gb density (DDR4 code 0x13 = 2^3 Gb).
         data[0x13] = 0x13;
         // Minimum data rate 2000 MT/s (20 x 100).
@@ -769,14 +799,17 @@ mod tests {
         }
     }
 
-    /// A full synthetic DDR5 image (1024 B): Samsung module, 16 Gb, 6400
-    /// MT/s minimum, 1 rank, one valid XMP 3.0 / EXPO block, blank rest.
+    /// A full synthetic DDR5 image (1024 B): Micron module (the C8-02
+    /// re-anchor — byte `0x02` = `0x0C` is both the DDR5 type key and
+    /// the JEP106 continuation, so the maker is `0xC2`, not the former
+    /// Samsung `0x92`), 16 Gb, 6400 MT/s minimum, 1 rank, one valid
+    /// XMP 3.0 / EXPO block, blank rest.
     fn ddr5_image() -> SpdImage {
         let mut data = vec![0u8; 1024];
-        data[0x00] = 0x0C; // DDR5 signature
-        // Module manufacturer: Samsung 0x92 (vendor 0x02, continuation 0x09).
+        data[0x00] = 0x0C; // legacy memory-type check: DDR5 (agrees with 0x02, C8-02)
+        // Module manufacturer: Micron 0xC2 (vendor 0x02, continuation 0x0C).
         data[0x01] = 0x02;
-        data[0x02] = 0x09;
+        data[0x02] = 0x0C; // DDR5 type key (1024 B image, C8-02) + JEP106 continuation
         // 16 Gb density (DDR5 code 0x15).
         data[0x13] = 0x15;
         // Minimum data rate 6400 MT/s (64 x 100).
@@ -816,10 +849,10 @@ mod tests {
     /// are present, as observed live.
     fn live_5950x_image() -> SpdImage {
         let mut data = vec![0u8; 512];
-        data[0x00] = 0x0A; // DDR4 signature
+        data[0x00] = 0x0A; // legacy memory-type check: DDR4 (agrees with 0x02, C8-02)
         // Module manufacturer 0xC1 (vendor nibble 0x01, continuation 0x0C).
         data[0x01] = 0x11;
-        data[0x02] = 0x0C;
+        data[0x02] = 0x0C; // DDR4 memory type (C8-02 primary) + JEP106 continuation
         // Density 0x0D - the live code; 16 Gb per die (P6-04).
         data[0x13] = 0x0D;
         // Minimum data rate 3200 MT/s (32 x 100).
@@ -883,7 +916,9 @@ mod tests {
         let m = decode(&ddr5_image());
         assert_eq!(m.index, 0x53);
         assert!(m.is_ddr5);
-        assert_eq!(m.maker, Section::Value("Samsung".to_owned()));
+        // C8-02: byte 0x02 doubles as the JEP106 continuation, so the
+        // maker is Micron 0xC2 (the former Samsung 0x92).
+        assert_eq!(m.maker, Section::Value("Micron".to_owned()));
         assert_eq!(m.part, Section::Value("S5H1G8719011A".to_owned()));
         assert_eq!(m.serial, Section::Value("2208ABCDEF123456".to_owned()));
         assert_eq!(m.rank, Section::Value(1));
@@ -1277,6 +1312,80 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // (g2) C8-02: the byte-0x02 memory-type classification.
+    // ------------------------------------------------------------------
+
+    /// The basic-info memory type (byte `0x02`) classifies the module
+    /// (C8-02, D-2a): `0x0C` + 512 B -> DDR4 (the reported live-host
+    /// misclassification pinned: `0x00 = 0x23` is junk — the legacy
+    /// check sees `0x03` — but `0x02 = 0x0C` is the DDR4 key, and the
+    /// part now decodes from the `0x149` primary where it did not
+    /// before), `0x0C` + 1024 B -> DDR5 (the generations share the
+    /// code; the image length disambiguates), `0x0B` -> DDR3 (the
+    /// legacy `0x81` part location).
+    #[test]
+    fn memory_type_byte_0x02_classifies() {
+        // The live host shape: 0x00 = 0x23 (junk), 0x02 = 0x0C (the
+        // DDR4 key), 0x13 = 0x0D (16 Gb), 512 B -> DDR4, part from
+        // 0x149.
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x23;
+        data[0x02] = 0x0C;
+        data[0x13] = 0x0D;
+        data[0x149..0x149 + 16].copy_from_slice(b"F4-3600C18-32GVK");
+        let m = decode(&SpdImage { index: 0x52, data });
+        assert!(!m.is_ddr5, "512 B + 0x02 = 0x0C must classify DDR4");
+        assert_eq!(m.density_mbit, Section::Value(16384), "16 Gb per the live code");
+        assert_eq!(m.part, Section::Value("F4-3600C18-32GVK".to_owned()));
+
+        // The same key on a 1024 B image -> DDR5.
+        let mut data = vec![0u8; 1024];
+        data[0x02] = 0x0C;
+        let m = decode(&SpdImage { index: 0x53, data });
+        assert!(m.is_ddr5, "1024 B + 0x02 = 0x0C must classify DDR5");
+
+        // 0x0B -> DDR3: the part stays at the legacy 0x81 location.
+        let mut data = vec![0u8; 512];
+        data[0x02] = 0x0B;
+        data[0x81..0x81 + 14].copy_from_slice(b"DDR3PART-12345");
+        let m = decode(&SpdImage { index: 0x50, data });
+        assert!(!m.is_ddr5, "0x02 = 0x0B is not DDR5");
+        assert_eq!(m.part, Section::Value("DDR3PART-12345".to_owned()));
+    }
+
+    /// When byte `0x02` carries no recognized type, the legacy
+    /// byte-`0x00` check (bits 4:0) classifies (D-2a): `0x0A` ->
+    /// DDR4, `0x0C` -> DDR5; with both unrecognized the image length
+    /// is the last resort (1024 B -> DDR5). The pre-existing fixtures
+    /// (byte `0x00` + `0x02` agreeing) classify unchanged.
+    #[test]
+    fn legacy_byte_0x00_fallback_when_0x02_unrecognized() {
+        // 0x02 blank + legacy 0x0A -> DDR4.
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0A;
+        let m = decode(&SpdImage { index: 0x52, data });
+        assert!(!m.is_ddr5, "legacy 0x0A must classify DDR4");
+
+        // 0x02 blank + legacy 0x0C -> DDR5 (the legacy code wins over
+        // the 512 B length).
+        let mut data = vec![0u8; 512];
+        data[0x00] = 0x0C;
+        let m = decode(&SpdImage { index: 0x53, data });
+        assert!(m.is_ddr5, "legacy 0x0C must classify DDR5");
+
+        // Both unrecognized: the image length is the last resort.
+        for (len, expect_ddr5) in [(512usize, false), (1024, true)] {
+            let mut data = vec![0u8; len];
+            data[0x00] = 0x23; // junk (the live host shape)
+            let m = decode(&SpdImage { index: 0x50, data });
+            assert_eq!(
+                m.is_ddr5, expect_ddr5,
+                "unrecognized types: length {len} must classify {expect_ddr5}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
     // (h) C6-02: the separately carried die maker / die type / devices.
     // ------------------------------------------------------------------
 
@@ -1299,11 +1408,11 @@ mod tests {
     /// carried die maker on a DDR5 module.
     #[test]
     fn die_maker_decodes_ddr5_die_id_bytes() {
-        let mut data = ddr5_image().data; // module maker: Samsung
+        let mut data = ddr5_image().data; // module maker: Micron (C8-02)
         data[0x2E] = 0x02; // Micron 0xC2 (vendor 0x02, continuation 0x0C)
         data[0x2F] = 0x0C;
         let m = decode(&SpdImage { index: 0x53, data });
-        assert_eq!(m.maker, Section::Value("Samsung".to_owned()));
+        assert_eq!(m.maker, Section::Value("Micron".to_owned()));
         assert_eq!(m.die_maker, Section::Value("Micron".to_owned()));
     }
 
@@ -1417,7 +1526,7 @@ mod tests {
     #[test]
     fn ddr3_part_16_chars_at_0x81_unchanged() {
         let mut data = vec![0u8; 512];
-        data[0x00] = 0x02; // DDR3 memory type (not DDR4 0x0A / DDR5 0x0C)
+        data[0x00] = 0x02; // unrecognized legacy type; the 0x02 key byte is blank
         data[0x81..0x81 + 16].copy_from_slice(b"DDR3PART12345678");
         let m = decode(&SpdImage { index: 0x50, data });
         assert!(!m.is_ddr5);
