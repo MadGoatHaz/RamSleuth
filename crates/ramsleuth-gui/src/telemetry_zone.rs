@@ -1,8 +1,10 @@
 //! Zone 1 renderer: the live memory-controller & subtimings matrix
 //! (P3-27, regrouped per Grand Design §3.1 in C6-21).
 //!
-//! Grand Design §3.1 left panel: every cell of the AMD (and Intel, if
-//! present) readout as a `label / value` row — clocks & ratios
+//! Grand Design §3.1 left panel: every cell of the detected
+//! vendor's readout (C7-14: the AMD block on AMD silicon, the Intel
+//! per-channel blocks on Intel silicon, both blocks when the vendor
+//! is `Unknown`) as a `label / value` row — clocks & ratios
 //! (MCLK / UCLK / FCLK, UCLK:MCLK, gear, GDM / CR, PDM), the 27 DRAM
 //! subtimings (primary / secondary / tertiary + turnarounds, ticks),
 //! the CAD bus (drive / termination, ohms), the voltages (mV→V) —
@@ -26,10 +28,15 @@
 //! to a crimson N/A). The zone
 //! lays out at its natural height — no scroll area: at the default
 //! 1400×900 window the 3×2 grid (worst column ≈ 25 rows) fits the
-//! left column without vertical scrolling (C7-12); a whole `Na`
-//! vendor branch collapses to a single row (`AMD` / `Intel` + the
-//! reason), and no telemetry at all renders one crimson placeholder —
-//! never a panic (the no-panic contract, plan D5).
+//! left column without vertical scrolling (C7-12). The vendor
+//! blocks are conditional on the detected CPU (C7-14): an `Amd` host
+//! renders only the AMD block, an `Intel` host only the Intel
+//! per-channel blocks — the off-vendor `N/A (unsupported hardware)`
+//! row is omitted entirely — and an `Unknown` vendor keeps both; a
+//! rendered whole-`Na` branch collapses to a single row (`AMD` /
+//! `Intel` + the reason), and no telemetry at all renders one
+//! crimson placeholder — never a panic (the no-panic contract, plan
+//! D5).
 //!
 //! **Pure core:** [`timing_cells`] is I/O-free and deterministic (the
 //! unit tests exercise it without an egui context);
@@ -39,6 +46,7 @@
 use ramsleuth_telemetry::amd_readout::{
     CadBus, ClockReadout, CommandRate, DivMode, GearMode, RttValue, TimingSet, VoltageSet,
 };
+use ramsleuth_telemetry::cpuid::CpuVendor;
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 
@@ -117,11 +125,16 @@ pub struct VendorTiming {
 // The pure block builder (testable: no I/O, no egui context).
 // ---------------------------------------------------------------------
 
-/// The zone-1 vendor blocks, in canonical dump order: the AMD block
-/// (a header + the six grouped sections, or one degraded N/A row),
-/// then the Intel block (one header + section block per decoded
-/// channel, including the channel-level RTL — or one degraded row for
-/// an empty / absent readout).
+/// The zone-1 vendor blocks, filtered by the detected CPU vendor
+/// (C7-14): `CpuVendor::Amd(…)` renders only the AMD block (a
+/// header + the six grouped sections, or one degraded `N/A
+/// (<reason>)` row — an AMD host with a missing driver still shows
+/// its own block, never an Intel one); `CpuVendor::Intel(…)` only
+/// the Intel per-channel blocks (one header + section block per
+/// decoded channel, including the channel-level RTL — or one
+/// degraded row for an empty / absent readout); `CpuVendor::Unknown`
+/// both blocks (the vendor-claim-free behavior — each branch
+/// degrades to its own single N/A row).
 ///
 /// Pure and deterministic: the same snapshot always yields the same
 /// `Vec`. Each row's display is the formatted text of its
@@ -130,52 +143,63 @@ pub struct VendorTiming {
 /// `GEAR_DOWN: Enabled` / `GEAR_DOWN: Disabled` + `CR: 1T` / `CR: 2T`,
 /// `RZQ/N (x.x Ω)`) or
 /// `N/A (<reason>)` for a [`Section::Na`] (the dump renderer's form —
-/// [`NaReason`] carries no `Display`). A vendor branch that degraded
-/// whole collapses to one block with empty `sections` + the N/A
-/// display (and an Intel readout with no decoded channels does the
-/// same with `not applicable`), so an all-Na snapshot still renders
-/// the complete matrix and never panics.
+/// [`NaReason`] carries no `Display`). A rendered vendor branch that
+/// degraded whole collapses to one block with empty `sections` + the
+/// N/A display (and an Intel readout with no decoded channels does
+/// the same with `not applicable`), so an all-Na snapshot still
+/// renders the complete matrix and never panics.
 pub fn timing_cells(telemetry: &SystemMemoryTelemetry) -> Vec<VendorTiming> {
+    // The platform-conditional visibility (C7-14, item 3b): each
+    // block renders on its own vendor — the off-vendor branch is
+    // omitted even in its degraded `N/A (unsupported hardware)` form
+    // — while an `Unknown` vendor (no honest vendor claim) keeps
+    // both.
+    let show_amd = !matches!(telemetry.cpu.vendor, CpuVendor::Intel(_));
+    let show_intel = !matches!(telemetry.cpu.vendor, CpuVendor::Amd(_));
     let mut blocks: Vec<VendorTiming> = Vec::new();
 
-    match &telemetry.amd {
-        Section::Value(readout) => {
-            blocks.push(VendorTiming {
-                header: AMD.to_owned(),
-                sections: readout_sections(
-                    &readout.clocks,
-                    &readout.timings,
-                    &readout.cad_bus,
-                    &readout.voltages,
-                    None,
-                ),
-                degraded: None,
-            });
+    if show_amd {
+        match &telemetry.amd {
+            Section::Value(readout) => {
+                blocks.push(VendorTiming {
+                    header: AMD.to_owned(),
+                    sections: readout_sections(
+                        &readout.clocks,
+                        &readout.timings,
+                        &readout.cad_bus,
+                        &readout.voltages,
+                        None,
+                    ),
+                    degraded: None,
+                });
+            }
+            Section::Na(reason) => blocks.push(degraded_block(AMD, reason)),
         }
-        Section::Na(reason) => blocks.push(degraded_block(AMD, reason)),
     }
 
-    match &telemetry.intel {
-        Section::Value(readout) => {
-            if readout.channels.is_empty() {
-                blocks.push(degraded_block(INTEL, &NaReason::NotApplicable));
-            } else {
-                for channel in &readout.channels {
-                    blocks.push(VendorTiming {
-                        header: format!("{INTEL} ch {}", channel.index),
-                        sections: readout_sections(
-                            &channel.clocks,
-                            &channel.timings,
-                            &channel.cad_bus,
-                            &channel.voltages,
-                            Some(&channel.rtl),
-                        ),
-                        degraded: None,
-                    });
+    if show_intel {
+        match &telemetry.intel {
+            Section::Value(readout) => {
+                if readout.channels.is_empty() {
+                    blocks.push(degraded_block(INTEL, &NaReason::NotApplicable));
+                } else {
+                    for channel in &readout.channels {
+                        blocks.push(VendorTiming {
+                            header: format!("{INTEL} ch {}", channel.index),
+                            sections: readout_sections(
+                                &channel.clocks,
+                                &channel.timings,
+                                &channel.cad_bus,
+                                &channel.voltages,
+                                Some(&channel.rtl),
+                            ),
+                            degraded: None,
+                        });
+                    }
                 }
             }
+            Section::Na(reason) => blocks.push(degraded_block(INTEL, reason)),
         }
-        Section::Na(reason) => blocks.push(degraded_block(INTEL, reason)),
     }
 
     blocks
@@ -770,13 +794,21 @@ mod tests {
         block.sections.iter().map(|section| section.title.clone()).collect()
     }
 
-    /// (a) A representative snapshot: the §3.1 grouped layout — six
-    /// sections in the canonical pair order, the formatted values
-    /// (not all N/A) present — clocks, the 1:2 ratio, tick timings,
-    /// RZQ Ω, volts — and the new `GDM / CR` row.
+    /// (a) A representative snapshot: the AMD-detected host renders
+    /// exactly one block — the §3.1 grouped layout of the AMD
+    /// readout (the off-vendor Intel `N/A (unsupported hardware)`
+    /// block is omitted, C7-14) — six sections in the canonical pair
+    /// order, the formatted values (not all N/A) present — clocks,
+    /// the 1:2 ratio, tick timings, RZQ Ω, volts — and the `GDM / CR`
+    /// row.
     #[test]
     fn representative_cells_carry_formatted_values() {
         let blocks = timing_cells(&representative());
+        assert_eq!(
+            blocks.len(),
+            1,
+            "an AMD-detected host renders only the AMD block — the Intel N/A block is omitted (C7-14)"
+        );
         let rows = all_rows(&blocks);
         assert!(!rows.is_empty(), "the rows must not be empty");
         assert!(
@@ -821,13 +853,18 @@ mod tests {
         assert_eq!(displays(&rows, "VPP"), vec!["1.800 V"]);
     }
 
-    /// (b) The fully all-Na snapshot: one degraded block per vendor
-    /// branch (empty sections + the whole-block N/A display) — no
-    /// panic.
+    /// (b) The fully all-Na snapshot with an `Unknown` vendor: one
+    /// degraded block per vendor branch (empty sections + the
+    /// whole-block N/A display) — the vendor-claim-free state keeps
+    /// both blocks (C7-14) — no panic.
     #[test]
     fn all_na_blocks_degrade_to_single_rows_panic_free() {
         let blocks = timing_cells(&all_na());
-        assert_eq!(blocks.len(), 2, "one block per vendor branch");
+        assert_eq!(
+            blocks.len(),
+            2,
+            "the Unknown vendor keeps both blocks (C7-14)"
+        );
         assert_eq!(blocks[0].header, "AMD");
         assert!(blocks[0].sections.is_empty());
         assert_eq!(blocks[0].degraded.as_deref(), Some("N/A (driver missing)"));
@@ -846,38 +883,74 @@ mod tests {
         }
     }
 
-    /// (d) The vendor block headers are always present: a populated
-    /// section emits its header, a degraded one its single N/A row
-    /// (all three fixture shapes).
+    /// (d) Vendor-conditional block visibility (C7-14): the detected
+    /// vendor's block header is always present (a populated section
+    /// emits its header, a degraded branch its single N/A row), and
+    /// the off-vendor block is omitted entirely — an `Amd` host
+    /// renders no Intel block, an `Intel` host no AMD block, an
+    /// `Unknown` vendor keeps both.
     #[test]
-    fn vendor_headers_are_always_present() {
-        for snapshot in [representative(), intel_populated(), all_na()] {
-            let blocks = timing_cells(&snapshot);
-            assert!(
-                blocks.iter().any(|block| block.header == "AMD"),
-                "the AMD block header is expected: {blocks:?}"
-            );
-            assert!(
-                blocks.iter().any(|block| block.header == "Intel" || block.header.starts_with("Intel ch ")),
-                "the Intel block header is expected: {blocks:?}"
-            );
-        }
+    fn vendor_blocks_are_conditional_on_the_detected_vendor() {
+        // AMD host (a populated AMD branch): the AMD header renders,
+        // the off-vendor Intel block — even its degraded N/A form —
+        // is omitted.
+        let blocks = timing_cells(&representative());
+        assert!(
+            blocks.iter().any(|block| block.header == "AMD"),
+            "the AMD block header is expected: {blocks:?}"
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block.header == "Intel" || block.header.starts_with("Intel ch ")),
+            "an AMD-detected host must not render an Intel block: {blocks:?}"
+        );
+
+        // Intel host (a populated two-channel Intel branch): the
+        // Intel channel headers render, the off-vendor AMD block is
+        // omitted.
+        let blocks = timing_cells(&intel_populated());
+        assert!(
+            blocks.iter().any(|block| block.header.starts_with("Intel ch ")),
+            "the Intel channel block headers are expected: {blocks:?}"
+        );
+        assert!(
+            !blocks.iter().any(|block| block.header == "AMD"),
+            "an Intel-detected host must not render an AMD block: {blocks:?}"
+        );
+
+        // Unknown vendor (both branches degraded): both blocks
+        // render — the current vendor-claim-free behavior.
+        let blocks = timing_cells(&all_na());
+        assert!(
+            blocks.iter().any(|block| block.header == "AMD"),
+            "the AMD block header is expected: {blocks:?}"
+        );
+        assert!(
+            blocks.iter().any(|block| block.header == "Intel"),
+            "the Intel block header is expected: {blocks:?}"
+        );
     }
 
     /// (e) A populated Intel branch renders per channel: one `Intel ch
-    /// N` block per channel, the decoded channel 0 with its readings
-    /// (incl. the channel-level RTL appended to `[Clocks & Ratios]`),
-    /// the degraded channel 1 all-N/A; the Intel `GDM / CR` row
-    /// degrades to a crimson N/A pair (D-C11 not-applicable cells).
+    /// N` block per channel (the off-vendor AMD block is omitted,
+    /// C7-14), the decoded channel 0 with its readings (incl. the
+    /// channel-level RTL appended to `[Clocks & Ratios]`), the
+    /// degraded channel 1 all-N/A; the Intel `GDM / CR` row degrades
+    /// to a crimson N/A pair (D-C11 not-applicable cells).
     #[test]
     fn intel_blocks_are_per_channel() {
         let blocks = timing_cells(&intel_populated());
         let headers: Vec<String> = blocks.iter().map(|block| block.header.clone()).collect();
-        assert_eq!(headers, vec!["AMD", "Intel ch 0", "Intel ch 1"]);
+        assert_eq!(
+            headers,
+            vec!["Intel ch 0", "Intel ch 1"],
+            "an Intel-detected host renders only the Intel channel blocks — the AMD block is omitted (C7-14)"
+        );
 
         // Channel 0: the Intel channel-level RTL row (8 clocks rows vs
         // the AMD 7); the rest of the six sections are unchanged.
-        let counts: Vec<usize> = blocks[1].sections.iter().map(|s| s.rows.len()).collect();
+        let counts: Vec<usize> = blocks[0].sections.iter().map(|s| s.rows.len()).collect();
         assert_eq!(counts, vec![8, 18, 4, 8, 5, 4]);
 
         let rows = all_rows(&blocks);
@@ -900,9 +973,9 @@ mod tests {
         assert_eq!(rtl[0], "6", "channel 0's decoded RTL (ticks)");
         assert!(rtl[1].contains("N/A"), "channel 1's degraded RTL");
 
-        // The GDM / CR row across all three blocks: the AMD block
-        // (the host's Na branch — degraded, no rows), then the two
-        // Intel channels' not-applicable N/A token pairs.
+        // The GDM / CR rows across the two Intel channel blocks
+        // (the off-vendor AMD block is omitted, C7-14): both
+        // channels' not-applicable N/A token pairs.
         let gdm_cr = displays(&rows, "GDM / CR");
         assert_eq!(gdm_cr.len(), 2, "one GDM / CR row per decoded channel");
         assert_eq!(
