@@ -5,7 +5,8 @@
 //! vendor's readout (C7-14: the AMD block on AMD silicon, the Intel
 //! per-channel blocks on Intel silicon, both blocks when the vendor
 //! is `Unknown`) as a `label / value` row — clocks & ratios
-//! (MCLK / UCLK / FCLK, UCLK:MCLK, gear, GDM / CR, PDM), the 27 DRAM
+//! (MCLK / UCLK / FCLK, UCLK:MCLK, gear (Intel only), GEAR_DOWN, CR,
+//! PDM — the C8-10 `GDM / CR` split, D-6), the 27 DRAM
 //! subtimings (primary / secondary / tertiary + turnarounds, ticks),
 //! the CAD bus (drive / termination, ohms), the voltages (mV→V) —
 //! each [`Section::Value`] printed in CYAN, each [`Section::Na`]
@@ -25,11 +26,13 @@
 //! Voltages]` (the six sections, related content vertically adjacent)
 //! — each section a bold CYAN title row over its own 2-column
 //! `egui::Grid` (label/value, the compact 8.0 / 60.0 spacing so the
-//! three columns fit the zone width), and the `GDM / CR` row in
-//! `[Clocks & Ratios]` (gear down mode + DRAM command rate — e.g.
-//! `GEAR_DOWN: Enabled · CR: 1T` or `GEAR_DOWN: Disabled · CR: 2T`;
-//! an Intel channel's not-applicable cells degrade their own tokens
-//! to a bare gray N/A). The zone
+//! three columns fit the zone width), and the `GEAR_DOWN` + `CR` rows
+//! in `[Clocks & Ratios]` (the C8-10 split of the `GDM / CR` row,
+//! D-6: the gear down mode `Enabled` / `Disabled` + the DRAM command
+//! rate `1T` / `2T`, each its own row; a not-applicable cell degrades
+//! its own row to a bare gray N/A) — the `gear` row (the SA:MEM
+//! multiplier, an Intel concept) renders only on the Intel channels;
+//! the AMD block omits it (D-6). The zone
 //! lays out at its natural height — no scroll area: at the default
 //! 1400×900 window the 3×2 grid (worst column ≈ 25 rows) fits the
 //! left column without vertical scrolling (C7-12). The vendor
@@ -145,8 +148,9 @@ pub struct VendorTiming {
 /// of its [`Section::Value`] (the clock unit's form — the `MHz`
 /// default keeps its two-decimal, the `GHz` knob is
 /// [`format_clock`]'s ÷1000-trimmed — one-decimal Ω, three-decimal
-/// V, bare ticks, `1:1` / `1:2`, `1x`…`4x`, `on` / `off`,
-/// `GEAR_DOWN: Enabled` / `GEAR_DOWN: Disabled` + `CR: 1T` / `CR: 2T`,
+/// V, bare ticks, `1:1` / `1:2`, `1x`…`4x` (the `gear` row, Intel
+/// only), `on` / `off`, the `GEAR_DOWN` and `CR` row values
+/// (`Enabled` / `Disabled`, `1T` / `2T` — the C8-10 split, D-6),
 /// `RZQ/N (x.x Ω)`) or
 /// bare `N/A` for a [`Section::Na`] (the reason stays on the wire;
 /// [`NaReason`] carries no `Display`, and the GUI drops the
@@ -176,6 +180,7 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<Ven
                         &readout.cad_bus,
                         &readout.voltages,
                         None,
+                        false, // D-6: the AMD block omits the `gear` row
                         units,
                     ),
                     degraded: None,
@@ -200,6 +205,7 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<Ven
                                 &channel.cad_bus,
                                 &channel.voltages,
                                 Some(&channel.rtl),
+                                true, // D-6: the Intel channels keep the `gear` row
                                 units,
                             ),
                             degraded: None,
@@ -227,25 +233,29 @@ fn degraded_block(header: &str, reason: &NaReason) -> VendorTiming {
 
 /// The six §3.1 sections of one readout (the AMD block or one Intel
 /// channel), in storage order (the §3.1 pair rows interleaved):
-/// `[Clocks & Ratios]` (MCLK / UCLK / FCLK / UCLK:MCLK / gear /
-/// `GDM / CR` / PDM), `[Tertiary & Turnarounds]`, `[Primary Timings]`,
-/// `[CAD Bus Drive & Termination]`, `[Secondary Timings]`, `[Active
-/// System Voltages]` — the 3×2 layout (C7-12) reads them as columns
-/// of two stacked sections ([`COLUMN_SECTIONS`]). The `GDM / CR` row
-/// (C6-21, item 3; D-7 format C7-13)
-/// shows the gear down mode + the DRAM command rate, each token
-/// carrying its own name (e.g. `GEAR_DOWN: Enabled · CR: 1T`,
-/// `GEAR_DOWN: Disabled · CR: 2T`); an Intel channel's not-applicable
-/// GDM / command-rate cells degrade their own tokens to a bare gray
-/// N/A (D-5). The
-/// channel-level RTL (Intel only — the frozen `TimingSet` has no
-/// slot) is appended to `[Clocks & Ratios]`.
+/// `[Clocks & Ratios]` (MCLK / UCLK / FCLK / UCLK:MCLK / gear (Intel
+/// only) / `GEAR_DOWN` / `CR` / PDM), `[Tertiary & Turnarounds]`,
+/// `[Primary Timings]`, `[CAD Bus Drive & Termination]`, `[Secondary
+/// Timings]`, `[Active System Voltages]` — the 3×2 layout (C7-12)
+/// reads them as columns of two stacked sections
+/// ([`COLUMN_SECTIONS`]). The `GEAR_DOWN` + `CR` rows (C8-10, D-6 —
+/// the C6-21 `GDM / CR` combined row, D-7 format C7-13, split into
+/// two) show the gear down mode (`Enabled` / `Disabled`) + the DRAM
+/// command rate (`1T` / `2T`), each token its own row with a bare
+/// value; a not-applicable cell degrades its own row to a bare gray
+/// N/A (D-4/D-5). The `gear` row (the SA:MEM multiplier, an Intel
+/// concept — the AMD `gear_mode` is always not-applicable) renders
+/// only when `gear_row` is `true` (the Intel channels); the AMD
+/// block passes `false` and omits it (D-6). The channel-level RTL
+/// (Intel only — the frozen `TimingSet` has no slot) is appended to
+/// `[Clocks & Ratios]`.
 fn readout_sections(
     clocks: &ClockReadout,
     timings: &TimingSet,
     cad_bus: &CadBus,
     voltages: &VoltageSet,
     rtl: Option<&Section<u16>>,
+    gear_row: bool,
     units: &Units,
 ) -> Vec<TimingSection> {
     // The first three stored sections.
@@ -254,10 +264,20 @@ fn readout_sections(
         row("UCLK", mhz(&clocks.uclk_mhz, units)),
         row("FCLK", mhz(&clocks.fclk_mhz, units)),
         row("UCLK:MCLK", div(&clocks.div_mode)),
-        row("gear", gear(&clocks.gear_mode)),
-        row("GDM / CR", gdm_cr(&clocks.gdm, &clocks.command_rate)),
-        row("PDM", flag(&clocks.pdm)),
     ];
+    // The SA:MEM gear multiplier row — Intel only (the C8-10
+    // `gear_row` vendor param, D-6): the AMD block omits it (its
+    // `gear_mode` is always not-applicable — the row would read bare
+    // `N/A` on every AMD host).
+    if gear_row {
+        clocks_rows.push(row("gear", gear(&clocks.gear_mode)));
+    }
+    // The `GDM / CR` split (C8-10, D-6): the gear down mode + the
+    // DRAM command rate, each its own row (the D-7 token names
+    // survive as the row labels, the values bare).
+    clocks_rows.push(row("GEAR_DOWN", gdm_text(&clocks.gdm)));
+    clocks_rows.push(row("CR", cr_text(&clocks.command_rate)));
+    clocks_rows.push(row("PDM", flag(&clocks.pdm)));
     // Channel-level RTL (Intel only; the frozen `TimingSet` has no slot).
     if let Some(rtl) = rtl {
         clocks_rows.push(row("RTL", ticks(rtl)));
@@ -434,29 +454,31 @@ fn flag(section: &Section<bool>) -> String {
     }
 }
 
-/// The `GDM / CR` row (C6-21, item 3; D-7 format C7-13): the gear
-/// down mode + the DRAM command rate, each token carrying its own
-/// name — `GEAR_DOWN: Enabled` / `GEAR_DOWN: Disabled` (gdm
-/// `true` / `false`) + `CR: 1T` / `CR: 2T`, joined with `" · "` →
-/// the exact displays `GEAR_DOWN: Enabled · CR: 1T`,
-/// `GEAR_DOWN: Enabled · CR: 2T`, `GEAR_DOWN: Disabled · CR: 1T`,
-/// `GEAR_DOWN: Disabled · CR: 2T` (the previous wording is dropped —
-/// it collided with Intel gear-mode semantics). A not-applicable /
-/// failed cell degrades its own token to bare `N/A` (per token, not
-/// the whole row; the combined row colors gray when either token is
-/// absent — see [`cell_color`]). No panic on any Na combination.
-fn gdm_cr(gdm: &Section<bool>, command_rate: &Section<CommandRate>) -> String {
-    let gdm = match gdm {
-        Section::Value(true) => "GEAR_DOWN: Enabled".to_owned(),
-        Section::Value(false) => "GEAR_DOWN: Disabled".to_owned(),
+/// The `GEAR_DOWN` row (C8-10, D-6 — the C6-21 `GDM / CR` combined
+/// row, D-7 format C7-13, split into two): the gear down mode's bare
+/// value — `Enabled` (gdm `true`) / `Disabled` (gdm `false`); a
+/// not-applicable / failed cell degrades its own row to bare `N/A`
+/// (the C8-06 form, D-4 — the row colors gray via [`cell_color`]).
+/// No panic on any Na.
+fn gdm_text(gdm: &Section<bool>) -> String {
+    match gdm {
+        Section::Value(true) => "Enabled".to_owned(),
+        Section::Value(false) => "Disabled".to_owned(),
         Section::Na(reason) => na_text(reason),
-    };
-    let rate = match command_rate {
-        Section::Value(CommandRate::OneT) => "CR: 1T".to_owned(),
-        Section::Value(CommandRate::TwoT) => "CR: 2T".to_owned(),
+    }
+}
+
+/// The `CR` row (C8-10, D-6 — the C6-21 `GDM / CR` combined row,
+/// D-7 format C7-13, split into two): the DRAM command rate's bare
+/// value — `1T` / `2T`; a not-applicable / failed cell degrades its
+/// own row to bare `N/A` (the C8-06 form, D-4 — the row colors gray
+/// via [`cell_color`]). No panic on any Na.
+fn cr_text(command_rate: &Section<CommandRate>) -> String {
+    match command_rate {
+        Section::Value(CommandRate::OneT) => "1T".to_owned(),
+        Section::Value(CommandRate::TwoT) => "2T".to_owned(),
         Section::Na(reason) => na_text(reason),
-    };
-    format!("{gdm} · {rate}")
+    }
 }
 
 /// A memory-rail cell in volts (the frozen mV over 1000, three
@@ -590,18 +612,17 @@ fn render_section(
 /// (NA_GRAY) for absent cells (bare `N/A` — D-5: unavailable, not a
 /// critical fault), AMBER for the two warning conditions — a 1:2
 /// UCLK:MCLK divide (gear desync) and a VDDCR_SOC reading above
-/// [`SOC_MAX_VOLTS`] (out of spec on AM5). The combined `GDM / CR`
-/// row is gray when either of its tokens is absent (e.g.
-/// `GEAR_DOWN: Enabled · N/A` or `N/A · CR: 1T`); a display whose
-/// gear-down token is absent already hits the `starts_with("N/A")`
-/// pick above.
+/// [`SOC_MAX_VOLTS`] (out of spec on AM5). The split `GEAR_DOWN` /
+/// `CR` rows (D-6) degrade their own row to bare `N/A` when their
+/// cell is absent — that display hits the `starts_with("N/A")` pick
+/// above; their value rows (`Enabled` / `Disabled` / `1T` / `2T`)
+/// fall through to CYAN.
 fn cell_color(label: &str, display: &str) -> egui::Color32 {
     if display.starts_with("N/A") {
         return NA_GRAY;
     }
     match label {
         "UCLK:MCLK" if display == "1:2" => AMBER,
-        "GDM / CR" if display.contains("N/A") => NA_GRAY,
         "VDDCR_SOC" => {
             match display
                 .strip_suffix(" V")
@@ -616,10 +637,10 @@ fn cell_color(label: &str, display: &str) -> egui::Color32 {
 }
 
 // ---------------------------------------------------------------------
-// Tests (headless: `timing_cells` + `cell_color` + `gdm_cr` are pure —
-// no egui context, no I/O; the render path runs no-panic in a
-// headless `egui::Context` (C7-12) + the row-depth no-scroll
-// assertion, with the live render verified in the QA phase).
+// Tests (headless: `timing_cells` + `cell_color` + `gdm_text` /
+// `cr_text` are pure — no egui context, no I/O; the render path runs
+// no-panic in a headless `egui::Context` (C7-12) + the row-depth
+// no-scroll assertion, with the live render verified in the QA phase).
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
@@ -814,8 +835,8 @@ mod tests {
     /// readout (the off-vendor Intel bare-`N/A` block is omitted,
     /// C7-14) — six sections in the canonical pair
     /// order, the formatted values (not all N/A) present — clocks,
-    /// the 1:2 ratio, tick timings, RZQ Ω, volts — and the `GDM / CR`
-    /// row.
+    /// the 1:2 ratio, tick timings, RZQ Ω, volts — and the split
+    /// `GEAR_DOWN` / `CR` rows (the AMD `gear` row omitted, D-6).
     #[test]
     fn representative_cells_carry_formatted_values() {
         let blocks = timing_cells(&representative(), &Units::default());
@@ -849,14 +870,17 @@ mod tests {
         assert_eq!(
             row_counts,
             vec![7, 18, 4, 8, 5, 4],
-            "7 = clocks (+ GDM / CR), 18 = tertiary, 4 = primary, 8 = CAD, 5 = secondary, 4 = voltages"
+            "7 = clocks (the `gear` row omitted, `GDM / CR` split into `GEAR_DOWN` + `CR` — net 0, D-6), 18 = tertiary, 4 = primary, 8 = CAD, 5 = secondary, 4 = voltages"
         );
 
         assert_eq!(displays(&rows, "MCLK"), vec!["1600.00 MHz"]);
         assert_eq!(displays(&rows, "FCLK"), vec!["1800.00 MHz"]);
         assert_eq!(displays(&rows, "UCLK:MCLK"), vec!["1:2"]);
-        assert_eq!(displays(&rows, "gear"), vec!["N/A"]);
-        assert_eq!(displays(&rows, "GDM / CR"), vec!["GEAR_DOWN: Enabled · CR: 1T"]);
+        // The AMD `gear` row is omitted entirely (D-6): no `gear`
+        // label survives in the AMD block.
+        assert!(displays(&rows, "gear").is_empty(), "the AMD block omits the `gear` row (D-6)");
+        assert_eq!(displays(&rows, "GEAR_DOWN"), vec!["Enabled"]);
+        assert_eq!(displays(&rows, "CR"), vec!["1T"]);
         assert_eq!(displays(&rows, "PDM"), vec!["off"]);
         assert_eq!(displays(&rows, "tCL"), vec!["16"]);
         assert_eq!(displays(&rows, "tFAW"), vec!["16"]);
@@ -954,8 +978,9 @@ mod tests {
     /// N` block per channel (the off-vendor AMD block is omitted,
     /// C7-14), the decoded channel 0 with its readings (incl. the
     /// channel-level RTL appended to `[Clocks & Ratios]`), the
-    /// degraded channel 1 all-N/A; the Intel `GDM / CR` row degrades
-    /// to a bare gray N/A pair (D-C11 not-applicable cells, D-5).
+    /// degraded channel 1 all-N/A; the split `GEAR_DOWN` / `CR` rows
+    /// degrade to bare gray N/A (D-C11 not-applicable cells, D-4/D-5)
+    /// and the `gear` row survives on the Intel channels (D-6).
     #[test]
     fn intel_blocks_are_per_channel() {
         let blocks = timing_cells(&intel_populated(), &Units::default());
@@ -966,10 +991,13 @@ mod tests {
             "an Intel-detected host renders only the Intel channel blocks — the AMD block is omitted (C7-14)"
         );
 
-        // Channel 0: the Intel channel-level RTL row (8 clocks rows vs
-        // the AMD 7); the rest of the six sections are unchanged.
+        // Channel 0: the Intel channels keep the `gear` row (D-6) and
+        // the `GDM / CR` split adds one row (`GEAR_DOWN` + `CR` vs the
+        // single combined row) + the channel-level RTL — 9 clocks
+        // rows vs the AMD 7; the rest of the six sections are
+        // unchanged.
         let counts: Vec<usize> = blocks[0].sections.iter().map(|s| s.rows.len()).collect();
-        assert_eq!(counts, vec![8, 18, 4, 8, 5, 4]);
+        assert_eq!(counts, vec![9, 18, 4, 8, 5, 4]);
 
         let rows = all_rows(&blocks);
         let mclk = displays(&rows, "MCLK");
@@ -991,26 +1019,32 @@ mod tests {
         assert_eq!(rtl[0], "6", "channel 0's decoded RTL (ticks)");
         assert!(rtl[1].contains("N/A"), "channel 1's degraded RTL");
 
-        // The GDM / CR rows across the two Intel channel blocks
-        // (the off-vendor AMD block is omitted, C7-14): both
-        // channels' not-applicable N/A token pairs.
-        let gdm_cr = displays(&rows, "GDM / CR");
-        assert_eq!(gdm_cr.len(), 2, "one GDM / CR row per decoded channel");
+        // The split GEAR_DOWN / CR rows across the two Intel channel
+        // blocks (the off-vendor AMD block is omitted, C7-14): both
+        // channels' not-applicable cells degrade their own row to
+        // bare `N/A` (D-4).
+        let gdm = displays(&rows, "GEAR_DOWN");
         assert_eq!(
-            gdm_cr[0],
-            "N/A · N/A",
-            "Intel channel 0's honest D-C11 not-applicable cells"
+            gdm,
+            vec!["N/A", "N/A"],
+            "one GEAR_DOWN row per channel, both not-applicable (D-C11)"
         );
-        assert!(gdm_cr[1].contains("N/A"), "channel 1 is degraded");
+        let cr = displays(&rows, "CR");
+        assert_eq!(
+            cr,
+            vec!["N/A", "N/A"],
+            "one CR row per channel, both not-applicable (D-C11)"
+        );
     }
 
-    /// (f) The `GDM / CR` combined row (D-7 format): each token
-    /// carries its own name — the four value combinations
-    /// `GEAR_DOWN: <Enabled|Disabled> · CR: <1T|2T>` — and each
-    /// absent cell degrades its own token to bare `N/A` (D-4, per
-    /// token, not the whole row); no panic on any Na combination.
+    /// (f) The split `GEAR_DOWN` + `CR` rows (D-6): each row carries
+    /// its own bare value — the `GEAR_DOWN` value forms `Enabled` /
+    /// `Disabled` (gdm `true` / `false`) + the `CR` value forms
+    /// `1T` / `2T` (the D-7 token names survive as the row labels) —
+    /// and each absent cell degrades its own row to bare `N/A` (D-4,
+    /// per row, not the other); no panic on any Na combination.
     #[test]
-    fn gdm_cr_row_formats_the_command_rate() {
+    fn gdm_and_cr_rows_format_their_own_tokens() {
         let on = Section::Value(true);
         let off = Section::Value(false);
         let gdm_na: Section<bool> = Section::na(NaReason::NotApplicable);
@@ -1018,36 +1052,23 @@ mod tests {
         let one_t = Section::Value(CommandRate::OneT);
         let two_t = Section::Value(CommandRate::TwoT);
 
-        // The four value combinations (D-7's exact strings).
-        assert_eq!(gdm_cr(&on, &one_t), "GEAR_DOWN: Enabled · CR: 1T");
-        assert_eq!(gdm_cr(&on, &two_t), "GEAR_DOWN: Enabled · CR: 2T");
-        assert_eq!(gdm_cr(&off, &one_t), "GEAR_DOWN: Disabled · CR: 1T");
-        assert_eq!(gdm_cr(&off, &two_t), "GEAR_DOWN: Disabled · CR: 2T");
+        // The two value forms per row (the bare D-7 token values).
+        assert_eq!(gdm_text(&on), "Enabled");
+        assert_eq!(gdm_text(&off), "Disabled");
+        assert_eq!(cr_text(&one_t), "1T");
+        assert_eq!(cr_text(&two_t), "2T");
 
-        // Per-token N/A degradation: the absent token renders
-        // bare `N/A` (D-4), the present token keeps its own form.
-        assert_eq!(
-            gdm_cr(&gdm_na, &one_t),
-            "N/A · CR: 1T",
-            "the gear-down token degrades on its own"
-        );
-        assert_eq!(
-            gdm_cr(&off, &rate_na),
-            "GEAR_DOWN: Disabled · N/A",
-            "the command-rate token degrades on its own"
-        );
-        assert!(
-            gdm_cr(&gdm_na, &rate_na).starts_with("N/A"),
-            "both tokens absent"
-        );
-        assert!(gdm_cr(&gdm_na, &two_t).contains("N/A"));
+        // Per-row N/A degradation: the absent token renders its own
+        // row as bare `N/A` (D-4), the other row keeps its value.
+        assert_eq!(gdm_text(&gdm_na), "N/A", "the gear-down row degrades on its own");
+        assert_eq!(cr_text(&rate_na), "N/A", "the command-rate row degrades on its own");
     }
 
     /// (g) The semantic color picks (the renderer's cell coloring):
     /// CYAN for values, NA_GRAY for absent cells (bare `N/A`, D-5),
     /// AMBER for the 1:2 divide and a VDDCR_SOC reading above 1.30 V;
-    /// the combined `GDM / CR` row is NA_GRAY when either token is
-    /// absent.
+    /// the split `GEAR_DOWN` / `CR` rows are NA_GRAY when their cell
+    /// is absent (bare `N/A`) and CYAN for their value forms (D-6).
     #[test]
     fn cell_color_semantics() {
         assert_eq!(cell_color("MCLK", "1600.00 MHz"), CYAN);
@@ -1060,29 +1081,24 @@ mod tests {
         assert_eq!(cell_color("VDDCR_SOC", "1.450 V"), AMBER);
         assert_eq!(cell_color("VDDCR_SOC", "N/A"), NA_GRAY);
         assert_eq!(
-            cell_color("GDM / CR", "GEAR_DOWN: Enabled · CR: 1T"),
+            cell_color("GEAR_DOWN", "Enabled"),
             CYAN,
-            "both tokens present"
+            "the gear-down value row is CYAN"
         );
         assert_eq!(
-            cell_color("GDM / CR", "GEAR_DOWN: Disabled · CR: 2T"),
+            cell_color("CR", "1T"),
             CYAN,
-            "both tokens present"
+            "the command-rate value row is CYAN"
         );
         assert_eq!(
-            cell_color("GDM / CR", "N/A · N/A"),
+            cell_color("GEAR_DOWN", "N/A"),
             NA_GRAY,
-            "both tokens absent"
+            "the gear-down row degrades gray (bare N/A)"
         );
         assert_eq!(
-            cell_color("GDM / CR", "GEAR_DOWN: Enabled · N/A"),
+            cell_color("CR", "N/A"),
             NA_GRAY,
-            "the command-rate token alone absent"
-        );
-        assert_eq!(
-            cell_color("GDM / CR", "N/A · CR: 1T"),
-            NA_GRAY,
-            "the gear-down token alone absent"
+            "the command-rate row degrades gray (bare N/A)"
         );
     }
 
@@ -1221,10 +1237,13 @@ mod tests {
         assert_eq!(displays(&rows, "UCLK"), vec!["1.6 GHz"]);
         assert_eq!(displays(&rows, "FCLK"), vec!["1.8 GHz"]);
 
-        // The unit-agnostic rows are unchanged under the knob.
+        // The unit-agnostic rows are unchanged under the knob (the AMD
+        // `gear` row omitted, D-6; the split `GEAR_DOWN` / `CR` rows
+        // carry their bare values).
         assert_eq!(displays(&rows, "UCLK:MCLK"), vec!["1:2"]);
-        assert_eq!(displays(&rows, "gear"), vec!["N/A"]);
-        assert_eq!(displays(&rows, "GDM / CR"), vec!["GEAR_DOWN: Enabled · CR: 1T"]);
+        assert!(displays(&rows, "gear").is_empty(), "the AMD block omits the `gear` row (D-6)");
+        assert_eq!(displays(&rows, "GEAR_DOWN"), vec!["Enabled"]);
+        assert_eq!(displays(&rows, "CR"), vec!["1T"]);
         assert_eq!(displays(&rows, "PDM"), vec!["off"]);
         assert_eq!(displays(&rows, "tCL"), vec!["16"]);
         assert_eq!(displays(&rows, "VDDCR_SOC"), vec!["1.150 V"]);
