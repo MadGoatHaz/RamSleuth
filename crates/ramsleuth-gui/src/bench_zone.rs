@@ -1,5 +1,5 @@
 //! Zone 2 renderer: the AIDA64-style 4×4 benchmark grid + run controls
-//! + live progress (P3-28).
+//! + a flat status line (C7-17 — the P3-28 progress pill retired).
 //!
 //! Grand Design §3.1 right panel: the 4×4 grid — Memory / L1 / L2 / L3
 //! rows × Read / Write / Copy / Latency columns. The grid is **live
@@ -15,10 +15,13 @@
 //! for an unmeasured cell (0.0 on the wire), in an
 //! `egui_extras::TableBuilder` table (bandwidth values CYAN, latency
 //! cells AMBER — the palette's low-latency accent — `N/A` CRIMSON); a
-//! progress bar driven by the last streamed [`StreamProgress`] event
-//! (`cell_index + 1` of `total_cells` — `cell_index` is the 0-based
-//! index of the cell just completed) with a `running…` / `done` /
-//! `idle` label; and the run controls — `Run Full` + `Memory Only`
+//! flat status line (C7-17 — the progress bar's pill retired):
+//! `Status: Idle` dim at rest, `Status: Running… <m:ss>` CYAN while a
+//! run is in flight (a burn-in's elapsed from the newest tick, a
+//! normal bench's from the zone's local start clock — the `…` kept
+//! static, the 60 FPS repaint animates the elapsed), `Status: Done`
+//! in a zone-local green after a run finished (a terminal grid or
+//! kept progress); and the run controls — `Run Full` + `Memory Only`
 //! send a [`BenchCmd`] to the background poller (the poller owns the
 //! socket, D6: no render-thread I/O), and `Cancel` — shown only while
 //! a run is in flight — sets the shared cancel flag the poller's
@@ -29,19 +32,23 @@
 //! lands). **No-panic contract (D5):** the zone only reads a
 //! `&TelemetryData` snapshot and two `&` flags; every control is a
 //! fire-and-forget channel send or an atomic store, so a flapping /
-//! absent daemon degrades to the placeholder + `idle` — never a
-//! panic.
+//! absent daemon degrades to the placeholder + the dim
+//! `Status: Idle` line — never a panic.
 //!
-//! **Pure core:** [`live_grid`] (the in-flight grid accumulated from
-//! the streamed events — the latest value per cell wins) and
-//! [`grid_cells`] (the 16 `(tier · op, value-or-N/A)` pairs of the
-//! terminal result grid) are I/O-free and deterministic — the unit
+//! **Pure core:** [`grid_cells`] (the 16 `(tier · op, value-or-N/A)`
+//! pairs of the terminal result grid), [`live_grid`] (the in-flight
+//! grid accumulated from the streamed events — the latest value per
+//! cell wins), and the flat status line's view (C7-17:
+//! [`status_state`] / [`status_text`] / [`status_color`] /
+//! [`format_elapsed`]) are I/O-free and deterministic — the unit
 //! tests exercise them without an egui context; [`render_bench_zone`]
 //! is the thin `egui` surface over them (the live render is verified
 //! in the QA phase).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use ramsleuth_bench::{BenchOp, BenchmarkGrid, Metric, StreamProgress, StreamTarget, Tier};
 use ramsleuth_protocol::BenchMode;
@@ -58,6 +65,10 @@ const TIERS: [Tier; 4] = [Tier::Memory, Tier::L1, Tier::L2, Tier::L3];
 const METRICS: [Metric; 4] = [Metric::Read, Metric::Write, Metric::Copy, Metric::Latency];
 /// One table-row height (pixels).
 const ROW_HEIGHT: f32 = 26.0;
+/// The `Status: Done` line's green (C7-17): a dark-slate-compatible
+/// green, zone-local — the palette in `style.rs` stays frozen (the
+/// status colors are zone-local, not a palette entry).
+const STATUS_DONE: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x9E, 0x5B);
 
 // ---------------------------------------------------------------------
 // The pure core (testable: no I/O, no egui context).
@@ -118,31 +129,83 @@ pub fn grid_cells(grid: &BenchmarkGrid) -> Vec<(String, String)> {
     cells
 }
 
-/// The progress bar's 0.0–1.0 fraction of one streamed progress
-/// event: the event's cell just completed, so `cell_index + 1` of
-/// `total_cells` cells are done (a zero `total_cells` guards the
-/// division → 0.0).
-fn progress_fraction(progress: &StreamProgress) -> f32 {
-    if progress.total_cells == 0 {
-        return 0.0;
-    }
-    ((progress.cell_index + 1) as f32 / progress.total_cells as f32).clamp(0.0, 1.0)
+/// The bench zone's flat status line state (C7-17 — the progress
+/// bar's pill retired): the idle rest state, a run in flight (with
+/// the run's elapsed), and a finished run (a terminal grid or kept
+/// streamed progress present).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StatusState {
+    /// No run in flight and no run has finished: the dim
+    /// `Status: Idle` line.
+    Idle,
+    /// A run (a normal bench or a burn-in) is in flight: the CYAN
+    /// `Status: Running… <m:ss>` line; `elapsed_secs` is the run's
+    /// elapsed (the newest tick's for a burn-in, the zone's start
+    /// clock's for a normal bench).
+    Running { elapsed_secs: f64 },
+    /// A run finished (a terminal grid landed, or streamed progress
+    /// is kept): the green `Status: Done` line.
+    Done,
 }
 
-/// The progress line's label: `running…` (with the last event's own
-/// label) while a run is in flight, `done` after a run finished (the
-/// progress events are kept), and `idle` when no run has started.
-fn progress_label(data: &TelemetryData) -> String {
-    if data.bench.running {
-        return match data.bench.progress.last() {
-            Some(progress) => format!("running… ({})", progress.label),
-            None => "running…".to_owned(),
-        };
-    }
-    if data.bench.progress.is_empty() {
-        "idle".to_owned()
+/// The status state of one run bookkeeping: a burn-in in flight →
+/// `Running` (elapsed from the newest tick), a normal bench in
+/// flight → `Running` (elapsed from the zone's start clock), neither
+/// in flight but a terminal grid or kept streamed progress present
+/// → `Done`, the fresh state (no grid, no progress) → `Idle`.
+///
+/// The `Done` corner deliberately includes the kept-progress-only
+/// shape (a cancelled normal bench with no terminal grid): the
+/// plan's idle condition is `progress.is_empty()` — a non-empty
+/// progress list with no run in flight is a finished run, not an idle
+/// one.
+fn status_state(
+    running: bool,
+    burn_in_running: bool,
+    grid_present: bool,
+    progress_present: bool,
+    running_elapsed_secs: f64,
+) -> StatusState {
+    if burn_in_running || running {
+        StatusState::Running { elapsed_secs: running_elapsed_secs }
+    } else if grid_present || progress_present {
+        StatusState::Done
     } else {
-        "done".to_owned()
+        StatusState::Idle
+    }
+}
+
+/// One run's elapsed in the status line's `m:ss` form (the plan's
+/// `0:42`): the minutes un-padded, the seconds two-digit; a
+/// non-finite / non-positive reading renders `0:00` (a bad elapsed
+/// never panics the line, D5).
+fn format_elapsed(secs: f64) -> String {
+    let total = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+/// The flat status line's text: `Status: Idle`, `Status: Running…
+/// <m:ss>` (the `…` kept static — the 60 FPS repaint animates the
+/// elapsed, C7-17), `Status: Done`.
+fn status_text(state: StatusState) -> String {
+    match state {
+        StatusState::Idle => "Status: Idle".to_owned(),
+        StatusState::Running { elapsed_secs } => {
+            format!("Status: Running… {}", format_elapsed(elapsed_secs))
+        }
+        StatusState::Done => "Status: Done".to_owned(),
+    }
+}
+
+/// The flat status line's color: the idle line is dim (the caller
+/// supplies the UI's theme-relative `weak_text_color` — the status
+/// color is not a palette const), the running line CYAN, the done
+/// line the zone-local green [`STATUS_DONE`].
+fn status_color(state: StatusState, idle_color: egui::Color32) -> egui::Color32 {
+    match state {
+        StatusState::Idle => idle_color,
+        StatusState::Running { .. } => CYAN,
+        StatusState::Done => STATUS_DONE,
     }
 }
 
@@ -259,10 +322,10 @@ fn phase_cell_color(phase: CellPhase, metric: Metric, text: &str) -> egui::Color
 // in the QA phase).
 // ---------------------------------------------------------------------
 
-/// Zone 2: render the benchmark grid + progress + run controls from
-/// `data` — a titled SLATE frame (the zone 1 precedent) with the
-/// `egui_extras::TableBuilder` 4×4 grid, the progress bar + label,
-/// and the `Run Full` / `Memory Only` / `Cancel` buttons.
+/// Zone 2: render the benchmark grid + status line + run controls
+/// from `data` — a titled SLATE frame (the zone 1 precedent) with the
+/// `egui_extras::TableBuilder` 4×4 grid, the flat status line
+/// (C7-17), and the `Run Full` / `Memory Only` / `Cancel` buttons.
 ///
 /// `bench_tx` is the poller's [`BenchCmd`] channel (the run buttons
 /// send; the poller owns the socket — no render-thread I/O, D6);
@@ -283,7 +346,7 @@ pub fn render_bench_zone(
         ui.add_space(4.0);
         render_grid_table(ui, data);
         ui.add_space(4.0);
-        render_progress(ui, data);
+        render_status(ui, data);
         ui.add_space(4.0);
         render_controls(ui, data, bench_tx, cancel);
     });
@@ -356,21 +419,63 @@ fn render_grid_table(ui: &mut egui::Ui, data: &TelemetryData) {
         });
 }
 
-/// The progress bar + its label: the fraction from the last streamed
-/// event, the label per the run state (`running…` / `done` / `idle`).
-fn render_progress(ui: &mut egui::Ui, data: &TelemetryData) {
-    let fraction = data
-        .bench
-        .progress
-        .last()
-        .map(progress_fraction)
-        .unwrap_or(0.0);
-    let label = progress_label(data);
-    let _ = ui.add(
-        egui::ProgressBar::new(fraction)
-            .text(label)
-            .desired_width(280.0),
-    );
+/// The zone's local start clock for a normal bench run (C7-17): the
+/// moment the zone first saw a normal bench in flight (a repaint
+/// within one frame of the run's start — the 60 FPS loop). The
+/// plan's `BenchState.run_started` field (the shared state in
+/// `update.rs`, outside this chunk's scope boundary —
+/// `bench_zone.rs` only) is not added here, so the clock lives
+/// zone-local: stamped on the first in-flight frame, cleared on the
+/// terminal. The burn-in needs no clock — its newest tick carries
+/// the elapsed (`burn_in.elapsed_secs`).
+static NORMAL_RUN_START: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Stamp / clear the zone-local normal-run start clock for this
+/// frame's run state, returning the start instant while a normal
+/// bench is in flight (`None` outside one — the terminal cleared
+/// it): a poisoned lock is recovered in place (the render thread is
+/// the sole user; the no-panic contract, D5).
+fn track_run_start(running: bool) -> Option<Instant> {
+    let mut guard = NORMAL_RUN_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if running {
+        Some(*guard.get_or_insert_with(Instant::now))
+    } else {
+        *guard = None;
+        None
+    }
+}
+
+/// The bench zone's current [`StatusState`] from the snapshot: a
+/// burn-in in flight elapses from the newest tick, a normal bench in
+/// flight elapses from the zone's start clock (the frame the run was
+/// first seen in flight — ≤ one repaint of the true start).
+fn bench_status_state(data: &TelemetryData) -> StatusState {
+    let running = data.bench.running;
+    let burn_in = &data.bench.burn_in;
+    let running_elapsed = if burn_in.running {
+        burn_in.elapsed_secs
+    } else {
+        track_run_start(running).map_or(0.0, |start| start.elapsed().as_secs_f64())
+    };
+    status_state(
+        running,
+        burn_in.running,
+        data.bench.grid.is_some(),
+        !data.bench.progress.is_empty(),
+        running_elapsed,
+    )
+}
+
+/// The flat status line (C7-17 — the progress bar's pill retired): a
+/// single text line, no frame, no border, no button shape —
+/// `Status: Idle` dim, `Status: Running… <m:ss>` CYAN (the `…` kept
+/// static — the 60 FPS repaint animates the elapsed), `Status: Done`
+/// in the zone-local green.
+fn render_status(ui: &mut egui::Ui, data: &TelemetryData) {
+    let state = bench_status_state(data);
+    let text = status_text(state);
+    let color = status_color(state, ui.visuals().weak_text_color());
+    ui.label(egui::RichText::new(text).color(color));
 }
 
 /// The run controls: `Run Full` / `Memory Only` send a [`BenchCmd`]
@@ -493,53 +598,106 @@ mod tests {
         assert_eq!(cell_text(&broken, Tier::L1, Metric::Write), "N/A");
     }
 
-    /// (d) `progress_fraction`: the event's cell just completed, so
-    /// `cell_index + 1` of `total_cells` — a zero total guards the
-    /// division.
+    /// (d) `format_elapsed`: the `m:ss` form (the plan's `0:42`) —
+    /// the minutes un-padded, the seconds two-digit; a non-finite /
+    /// non-positive reading renders `0:00` (a bad elapsed never
+    /// panics the line, D5).
     #[test]
-    fn progress_fraction_counts_completed_cells() {
-        fn event(cell_index: u32, total_cells: u32) -> StreamProgress {
-            StreamProgress {
-                cell_index,
-                total_cells,
-                tier: Tier::Memory,
-                op: BenchOp::Read,
-                value: 26.0,
-                label: "Memory · Read (GB/s)".to_owned(),
-            }
-        }
-        assert_eq!(progress_fraction(&event(0, 12)), 1.0 / 12.0);
-        assert_eq!(progress_fraction(&event(11, 12)), 1.0);
-        assert_eq!(progress_fraction(&event(3, 4)), 1.0);
-        assert_eq!(progress_fraction(&event(0, 0)), 0.0);
+    fn format_elapsed_renders_minutes_and_seconds() {
+        assert_eq!(format_elapsed(0.0), "0:00");
+        assert_eq!(format_elapsed(59.9), "0:59");
+        assert_eq!(format_elapsed(60.0), "1:00");
+        assert_eq!(format_elapsed(125.0), "2:05");
+        assert_eq!(format_elapsed(3661.0), "61:01");
+        assert_eq!(format_elapsed(f64::NAN), "0:00", "NaN never panics");
+        assert_eq!(format_elapsed(-4.0), "0:00", "a negative elapsed renders zero");
+        assert_eq!(format_elapsed(f64::INFINITY), "0:00", "+inf never panics");
     }
 
-    /// (e) `progress_label`: the three run states — `idle` (no run,
-    /// no events), `running…` (+ the last event's label), `done` (a
-    /// finished run keeps its events).
+    /// (e) `status_state`: the flat line's run bookkeeping (C7-17)
+    /// — a burn-in in flight → `Running` (the newest tick's
+    /// elapsed — the normal-bench flag stays false for a burn-in,
+    /// C7-16), a normal bench in flight → `Running` (the zone's
+    /// start clock elapsed), a finished run (a terminal grid or kept
+    /// streamed progress) → `Done`, the fresh state → `Idle`.
     #[test]
-    fn progress_label_tracks_the_run_states() {
-        let mut data = TelemetryData::default();
-        assert_eq!(progress_label(&data), "idle");
-
-        data.bench.running = true;
-        assert_eq!(progress_label(&data), "running…");
-
-        data.bench.progress.push(StreamProgress {
-            cell_index: 3,
-            total_cells: 12,
-            tier: Tier::L1,
-            op: BenchOp::Copy,
-            value: 31.8,
-            label: "L1 · Copy (GB/s)".to_owned(),
-        });
-        assert_eq!(progress_label(&data), "running… (L1 · Copy (GB/s))");
-
-        data.bench.running = false;
-        assert_eq!(progress_label(&data), "done");
+    fn status_state_tracks_the_run_states() {
+        // The fresh state: no run in flight, no grid, no progress.
+        assert_eq!(
+            status_state(false, false, false, false, 0.0),
+            StatusState::Idle
+        );
+        // A normal bench in flight (progress streaming): `Running`
+        // with the start clock's elapsed — 42 s renders `0:42`.
+        assert_eq!(
+            status_state(true, false, false, true, 42.0),
+            StatusState::Running { elapsed_secs: 42.0 }
+        );
+        // A burn-in in flight: `Running` with the newest tick's
+        // elapsed — 125 s (the normal-bench flag stays false, C7-16).
+        assert_eq!(
+            status_state(false, true, false, false, 125.0),
+            StatusState::Running { elapsed_secs: 125.0 }
+        );
+        // A burn-in still in flight wins over the kept terminal grid
+        // of an earlier run.
+        assert_eq!(
+            status_state(false, true, true, false, 9.0),
+            StatusState::Running { elapsed_secs: 9.0 }
+        );
+        // A finished run: the terminal grid landed (the burn-in
+        // terminal leaves the progress empty — C7-16) → `Done`.
+        assert_eq!(status_state(false, false, true, false, 0.0), StatusState::Done);
+        // A finished run: the streamed progress is kept with no grid
+        // (a cancelled normal bench) → `Done` (the old `done`
+        // label's corner).
+        assert_eq!(status_state(false, false, false, true, 0.0), StatusState::Done);
     }
 
-    /// (f) The semantic cell color: CYAN for the bandwidth values,
+    /// (f) `status_text`: the flat line's exact strings —
+    /// `Status: Idle`, `Status: Running… <m:ss>` (the `…` kept
+    /// static — the 60 FPS repaint animates the elapsed),
+    /// `Status: Done`.
+    #[test]
+    fn status_text_renders_the_flat_lines() {
+        assert_eq!(status_text(StatusState::Idle), "Status: Idle");
+        assert_eq!(
+            status_text(StatusState::Running { elapsed_secs: 42.0 }),
+            "Status: Running… 0:42"
+        );
+        assert_eq!(
+            status_text(StatusState::Running { elapsed_secs: 125.0 }),
+            "Status: Running… 2:05"
+        );
+        assert_eq!(
+            status_text(StatusState::Running { elapsed_secs: 0.0 }),
+            "Status: Running… 0:00"
+        );
+        assert_eq!(status_text(StatusState::Done), "Status: Done");
+    }
+
+    /// (g) `status_color`: the idle line is the caller's dim
+    /// (theme-relative `weak_text_color`, passed through), the
+    /// running line CYAN, the done line the zone-local green (the
+    /// `style.rs` palette stays frozen — C7-17).
+    #[test]
+    fn status_color_tracks_the_state() {
+        let dim = egui::Color32::from_rgb(0x80, 0x80, 0x80);
+        assert_eq!(
+            status_color(StatusState::Idle, dim),
+            dim,
+            "the idle line is the dim color"
+        );
+        assert_eq!(status_color(StatusState::Running { elapsed_secs: 42.0 }, dim), CYAN);
+        assert_eq!(status_color(StatusState::Done, dim), STATUS_DONE);
+        assert_eq!(
+            (STATUS_DONE.r(), STATUS_DONE.g(), STATUS_DONE.b()),
+            (0x2E, 0x9E, 0x5B),
+            "the done green is the zone-local const"
+        );
+    }
+
+    /// (h) The semantic cell color: CYAN for the bandwidth values,
     /// AMBER for a latency cell, CRIMSON for an unmeasured cell.
     #[test]
     fn cell_color_semantics() {
@@ -561,7 +719,7 @@ mod tests {
         }
     }
 
-    /// (g) `live_grid`: each streamed event fills its (tier, op)
+    /// (i) `live_grid`: each streamed event fills its (tier, op)
     /// cell; the latest event per cell wins; the latency column and
     /// the unmeasured cells stay 0.0.
     #[test]
@@ -585,7 +743,7 @@ mod tests {
         assert_eq!(grid.cell(Tier::L3, Metric::Latency), 0.0);
     }
 
-    /// (h) `live_grid`: an empty stream and a stream of malformed
+    /// (j) `live_grid`: an empty stream and a stream of malformed
     /// (non-finite / non-positive) values never panic and never
     /// render as data — every cell stays 0.0.
     #[test]
@@ -605,7 +763,7 @@ mod tests {
         assert_eq!(grid.cell(Tier::L3, Metric::Copy), 0.0, "negative never renders");
     }
 
-    /// (i) `cell_phase`: not running → `Terminal` for every cell (the
+    /// (k) `cell_phase`: not running → `Terminal` for every cell (the
     /// result grid); running → `Live` only for the cells the live
     /// grid carries a value for, `NotStarted` otherwise (a cell not
     /// started yet, or a latency cell — no progress events).
@@ -641,7 +799,7 @@ mod tests {
         );
     }
 
-    /// (j) The phase render: terminal cells keep the existing
+    /// (l) The phase render: terminal cells keep the existing
     /// [`cell_text`] / [`cell_color`] semantics; live cells show the
     /// in-flight GB/s value + a `…` suffix in a dimmed CYAN (distinct
     /// from the final value's full CYAN); not-started cells keep the
