@@ -8,8 +8,9 @@
 //! `Section::Na(reason)` (or an empty SPD list), so a failure in one
 //! branch can never affect the others (plan D5). The per-DIMM
 //! capacities (`dimm_sizes`) derive from the SPD modules, and the total
-//! capacity falls back to `/proc/meminfo` when no DIMM carries a value
-//! (D-C3/D-C9).
+//! capacity prefers the `/proc/meminfo` `MemTotal` (the OS ground
+//! truth) over the SPD sum, which survives as the non-meminfo
+//! fallback (D-C3/D-C9, D-3).
 //!
 //! **No-panic contract:** [`collect()`] never returns `Err` and never
 //! panics — unavailable data always degrades to `Section::Na(reason)`.
@@ -32,8 +33,8 @@
 //! SPD and platform branches run on every vendor (unprivileged sysfs /
 //! DMI + `/proc` reads); the per-DIMM capacities derive from the SPD
 //! modules (`density_mbit × devices / 8192`, D-C3) and the total
-//! capacity falls back to the meminfo total when no DIMM carries a
-//! value (D-C9).
+//! capacity prefers the meminfo `MemTotal` (the OS ground truth) over
+//! the SPD sum, which survives as the non-meminfo fallback (D-C9, D-3).
 
 use crate::amd_pm;
 use crate::amd_readout::{self, AmdReadout};
@@ -62,12 +63,14 @@ use crate::spd_eeprom;
 /// - `platform`: the vendor-neutral platform identity (C6-01, D-C1);
 ///   each of its four fields degrades independently to
 ///   `Na(NotApplicable)`.
-/// - `total_capacity`: total installed memory in GiB (D-C3): the sum of
-///   the [`dimm_sizes`](Self::dimm_sizes) entries that carry a value,
-///   else the `/proc/meminfo` `MemTotal` fallback, else `Na`.
+/// - `total_capacity`: total installed memory in GiB (D-3/D-C3): the
+///   `/proc/meminfo` `MemTotal` (the OS ground truth) when it carries
+///   a value, else the sum of the [`dimm_sizes`](Self::dimm_sizes)
+///   entries that carry a value (the non-meminfo fallback), else `Na`.
 /// - `dimm_sizes`: per-DIMM capacity in GiB (D-C3/D-C9), parallel to
 ///   [`spd`](Self::spd) — entry `i` is `density_mbit × devices / 8192`
-///   for module `i`; `Na` when that module's density or devices is `Na`
+///   for module `i` (`devices` = the module's total DRAM device
+///   count, D-2); `Na` when that module's density or devices is `Na`
 ///   (carrying the offending source's reason).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SystemMemoryTelemetry {
@@ -86,14 +89,16 @@ pub struct SystemMemoryTelemetry {
     /// snapshot; every field degrades to `Na(NotApplicable)`
     /// independently.
     pub platform: SystemPlatform,
-    /// Total installed capacity in GiB (D-C3): the sum of the
-    /// `Value` [`dimm_sizes`](Self::dimm_sizes) entries when at least
-    /// one carries a value, else the `/proc/meminfo` `MemTotal`
-    /// fallback, else `Na`.
+    /// Total installed capacity in GiB (D-3/D-C3): the
+    /// `/proc/meminfo` `MemTotal` (the OS ground truth) when it
+    /// carries a value, else the sum of the `Value`
+    /// [`dimm_sizes`](Self::dimm_sizes) entries (the non-meminfo
+    /// fallback), else `Na`.
     pub total_capacity: Section<f64>,
     /// Per-DIMM capacity in GiB (D-C3/D-C9), parallel to
     /// [`spd`](Self::spd): entry `i` is `density_mbit × devices /
-    /// 8192` for module `i`, `Na` when that module's density or
+    /// 8192` for module `i` (`devices` = the module's total DRAM
+    /// device count, D-2), `Na` when that module's density or
     /// devices is `Na`.
     pub dimm_sizes: Vec<Section<f64>>,
 }
@@ -124,8 +129,9 @@ pub struct SystemMemoryTelemetry {
 /// 6. Per-DIMM capacities (D-C3/D-C9): `density_mbit × devices / 8192`
 ///    per SPD module (parallel to the SPD list; `Na` when that module's
 ///    density or devices is `Na`).
-/// 7. Total capacity (D-C3): the sum of the DIMM capacities when at
-///    least one carries a value, else the `/proc/meminfo` fallback.
+/// 7. Total capacity (D-3/D-C3): the `/proc/meminfo` `MemTotal` (the
+///    OS ground truth) when it carries a value, else the sum of the
+///    DIMM capacities (the non-meminfo fallback).
 pub fn collect() -> SystemMemoryTelemetry {
     // 1. Detect the CPU once; every vendor branch dispatches on it.
     let cpu = CpuInfo::detect();
@@ -141,8 +147,9 @@ pub fn collect() -> SystemMemoryTelemetry {
     let platform = platform_branch();
     // 6. Per-DIMM capacities (D-C3/D-C9): parallel to the SPD modules.
     let dimm_sizes = dimm_sizes(&spd);
-    // 7. Total capacity (D-C3): the sum of the DIMM capacities when at
-    //    least one carries a value, else the meminfo fallback.
+    // 7. Total capacity (D-3/D-C3): the meminfo `MemTotal` (the OS
+    //    ground truth) when it carries a value, else the DIMM sum
+    //    (the non-meminfo fallback).
     let total_capacity = total_capacity(&dimm_sizes);
     // 8. Assemble with per-branch containment (pure).
     assemble(cpu, amd, intel, spd, platform, total_capacity, dimm_sizes)
@@ -251,13 +258,12 @@ fn dimm_sizes(spd: &[SpdModule]) -> Vec<Section<f64>> {
         .collect()
 }
 
-/// Total installed capacity in GiB (D-C3): the sum of the per-DIMM
-/// capacities that carry a value, when at least one does; otherwise the
-/// `/proc/meminfo` `MemTotal` fallback (C6-01), which itself degrades
-/// to `Na(NotApplicable)` when the meminfo source is absent or
-/// unreadable — the chain ends in an honest `Na`, never a panic and
-/// never an invented value.
-fn total_capacity(dimm_sizes: &[Section<f64>]) -> Section<f64> {
+/// Sum the per-DIMM capacities that carry a value (an `Na` entry
+/// contributes nothing) when at least one does, else the honest
+/// `Na(NotApplicable)` — the non-meminfo fallback for
+/// [`total_capacity`] (D-3). Pure: no I/O, never a panic, never an
+/// invented value.
+fn sum_dimm_sizes(dimm_sizes: &[Section<f64>]) -> Section<f64> {
     let mut total = 0.0;
     let mut any_value = false;
     for cell in dimm_sizes {
@@ -269,7 +275,24 @@ fn total_capacity(dimm_sizes: &[Section<f64>]) -> Section<f64> {
     if any_value {
         Section::Value(total)
     } else {
-        platform::mem_total_gib()
+        Section::na(NaReason::NotApplicable)
+    }
+}
+
+/// Total installed capacity in GiB (D-3): the `/proc/meminfo`
+/// `MemTotal` (the OS ground truth for installed memory, C6-01) when
+/// that source carries a value — it reads slightly under the marketing
+/// figure because of reserved memory, which is the honest OS view —
+/// else the SPD sum ([`sum_dimm_sizes`], the non-meminfo fallback),
+/// the chain ending in an honest `Na`, never a panic and never an
+/// invented value. The per-DIMM sizes stay SPD-derived (D-2) — the
+/// total is never scaled to them, and they are never scaled to it.
+fn total_capacity(dimm_sizes: &[Section<f64>]) -> Section<f64> {
+    let meminfo = platform::mem_total_gib();
+    if meminfo.is_na() {
+        sum_dimm_sizes(dimm_sizes)
+    } else {
+        meminfo
     }
 }
 
@@ -1038,32 +1061,73 @@ mod tests {
         assert_eq!(sizes[2], Section::na(NaReason::ParseError("invalid rank config".to_owned())));
     }
 
-    /// (f3) `total_capacity` is the sum of the DIMM capacities that
+    /// (f3) `sum_dimm_sizes` is the sum of the DIMM capacities that
     /// carry a value (an `Na` entry contributes nothing) when at least
-    /// one does.
+    /// one does, else the honest `Na(NotApplicable)` — the
+    /// non-meminfo fallback arithmetic for [`total_capacity`] (D-3).
     #[test]
-    fn total_capacity_sums_the_dimm_sizes() {
+    fn sum_dimm_sizes_sums_the_value_cells() {
         let sizes = vec![
             Section::Value(8.0),
             Section::na(NaReason::NotApplicable),
             Section::Value(16.0),
         ];
-        assert_eq!(total_capacity(&sizes), Section::Value(24.0));
+        assert_eq!(sum_dimm_sizes(&sizes), Section::Value(24.0));
 
         // A single value module sums to itself.
-        assert_eq!(total_capacity(&[Section::Value(16.0)]), Section::Value(16.0));
+        assert_eq!(sum_dimm_sizes(&[Section::Value(16.0)]), Section::Value(16.0));
+
+        // All-`Na` (no DIMM carries a value) → the honest
+        // Na(NotApplicable); an empty list degrades the same.
+        let all_na = vec![
+            Section::na(NaReason::NotApplicable),
+            Section::na(NaReason::ParseError("invalid rank config".to_owned())),
+        ];
+        assert_eq!(sum_dimm_sizes(&all_na), Section::na(NaReason::NotApplicable));
+        assert_eq!(sum_dimm_sizes(&[]), Section::na(NaReason::NotApplicable));
 
         // The host shape (two 16 GiB DIMMs) through the full
-        // spd → dimm_sizes → total_capacity chain.
+        // spd → dimm_sizes → sum_dimm_sizes chain.
         let spd = vec![capacity_module(0x52, 16384, 8), capacity_module(0x53, 16384, 8)];
-        assert_eq!(total_capacity(&dimm_sizes(&spd)), Section::Value(32.0));
+        assert_eq!(sum_dimm_sizes(&dimm_sizes(&spd)), Section::Value(32.0));
     }
 
-    /// (f4) `total_capacity` falls back to the `/proc/meminfo` total
-    /// when no DIMM carries a value (including the empty-SPD case).
-    /// `MemTotal` is boot-constant, so the fallback is deterministic —
-    /// its own degradation (`Na(NotApplicable)` without a meminfo
-    /// source) is the chain's honest end.
+    /// (f3′) MemTotal preferred (D-3): the host shape (two 16 GiB
+    /// DIMMs, SPD sum 32.0) — when the meminfo source carries a value
+    /// the total is the OS ground truth, never the SPD sum (on the
+    /// live 5950X host the enumeration is structurally incomplete —
+    /// 2 of 4 DIMMs bound to `ee1004` — so the sum can never equal the
+    /// OS total); when the meminfo source is absent the total degrades
+    /// to the SPD sum (the non-meminfo fallback).
+    #[test]
+    fn total_capacity_prefers_meminfo_over_the_spd_sum() {
+        // Two 16 GiB DIMMs: the SPD sum would read 32.0.
+        let sizes = vec![Section::Value(16.0), Section::Value(16.0)];
+
+        match platform::mem_total_gib() {
+            // meminfo present → the OS ground truth wins over the sum
+            // (the D-3 flip, pinned).
+            meminfo @ Section::Value(gib) => {
+                assert!(
+                    gib.is_finite() && gib > 0.0,
+                    "meminfo total must be positive: {gib}"
+                );
+                assert_eq!(total_capacity(&sizes), meminfo);
+            }
+            // meminfo absent → the total is exactly the SPD sum.
+            Section::Na(_) => {
+                assert_eq!(total_capacity(&sizes), sum_dimm_sizes(&sizes));
+                assert_eq!(total_capacity(&sizes), Section::Value(32.0));
+            }
+        }
+    }
+
+    /// (f4) `total_capacity` consults the `/proc/meminfo` total first
+    /// (the D-3 primary) when no DIMM carries a value (including the
+    /// empty-SPD case). `MemTotal` is boot-constant, so the result is
+    /// deterministic — when the meminfo source is absent the total
+    /// degrades to the SPD sum's own `Na(NotApplicable)`, the chain's
+    /// honest end.
     #[test]
     fn total_capacity_falls_back_to_meminfo() {
         // No DIMM values (the fixture modules carry Na density/devices)
