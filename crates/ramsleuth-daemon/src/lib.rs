@@ -17,6 +17,9 @@
 //! - `cache` — P3-14 — the TTL lazy telemetry cache over `collect()`.
 //! - `bench_job` — P3-15 — single-flight benchmark runs over
 //!   `run_streamed`.
+//! - `dram_spike` — C10-03 (D-3) — a short DRAM load before every
+//!   SMU PM-table re-read (single-flight; the MCLK is sampled at the
+//!   operating frequency, not the idle frequency).
 //! - `rpc` — P3-16 — per-connection frame dispatch + progress
 //!   forwarding.
 //!
@@ -26,6 +29,7 @@ pub mod caps;
 pub mod socket;
 pub mod cache;
 pub mod bench_job;
+pub mod dram_spike;
 pub mod rpc;
 
 // P3-12: the SOFT privilege probe, re-exported at the root (workspace
@@ -54,6 +58,10 @@ pub use cache::TelemetryCache;
 // connection; `JobError::Busy` maps onto the wire's
 // `Response::Error("benchmark already running")` (plan D6).
 pub use bench_job::{BenchJobManager, JobError, JobEvent, JobHandle};
+// C10-03 (D-3): the short DRAM load, re-exported at the root
+// (workspace re-export style) — C10-04 (main) wraps the injected
+// collector so every SMU PM-table re-read is preceded by `spike()`.
+pub use dram_spike::spike;
 // P3-16: the per-connection async RPC loop, re-exported at the root
 // (workspace re-export style) — P3-17 (main) builds one
 // `DaemonContext` (the P3-14 cache behind a mutex + the P3-15 job
