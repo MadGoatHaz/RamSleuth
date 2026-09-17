@@ -621,10 +621,12 @@ fn decode_devices(data: &[u8], is_ddr5: bool) -> Section<u8> {
 
 /// Decode the SDRAM density (byte `0x13`) into Mbit:
 /// - DDR4: code `0x10..=0x17` -> 2^(code-0x10) Gb (1..128 Gb); `0x0D`
-///   -> 16 Gb (P6-04 live reconciliation: the 5950X G.Skill module
-///   `F4-3600C18-32GVK` - a 2x16 GiB kit, rank 1, i.e. 16 Gb per die
-///   in the standard 8x8-die config - carries `0x0D`, a vendor/legacy
-///   encoding outside the `0x10..=0x17` published family);
+///   -> 32 Gb (the C10 reconciliation of the P6-04 special case: the
+///   5950X module carries `0x0D`, a vendor/legacy encoding outside
+///   the `0x10..=0x17` published family; the operator-confirmed kit
+///   is 2x32 GiB = 64 GiB total, so `0x0D` = 32 Gb per die in the
+///   8-device config; P6-04's 16 Gb guess from the `F4-3600C18-32GVK`
+///   part-number suffix is invalidated by the live capacity);
 /// - DDR5: documented model, code `0x11..=0x18` -> 1..64 Gb.
 ///
 /// An unrecognized code -> `Na(ParseError)`; a result >= 64 Gb
@@ -650,12 +652,14 @@ fn decode_density(data: &[u8], is_ddr5: bool) -> Section<u16> {
             }
         }
     } else if code == 0x0D {
-        // P6-04 live reconciliation (2026-09-14): the 5950X G.Skill
-        // F4-3600C18-32GVK module (a 2x16 GiB kit, rank 1) has 16 Gb
-        // per die in the standard 8x8-die config and carries 0x0D at
-        // byte 0x13 - a vendor/legacy encoding outside the
-        // 0x10..=0x17 published family.
-        16
+        // C10 reconciliation (2026-09-17, supersedes P6-04): the
+        // 5950X G.Skill module carries 0x0D at byte 0x13 - a
+        // vendor/legacy encoding outside the 0x10..=0x17 published
+        // family. The operator-confirmed kit is 2x32 GiB (64 GiB
+        // total), so 0x0D = 32 Gb per die in the 8-device config
+        // -> 32 GiB per DIMM; P6-04's 16 Gb "2x16 GiB kit" guess
+        // from the part-number suffix was wrong.
+        32
     } else if (0x10..=0x17).contains(&code) {
         1u32 << (code - 0x10)
     } else {
