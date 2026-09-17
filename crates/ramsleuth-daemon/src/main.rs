@@ -10,6 +10,13 @@
 //! SIGTERM/SIGINT stops the daemon gracefully (stop accepting,
 //! best-effort socket removal, exit 0).
 //!
+//! C10 (D-2): the injected collector is spike-wrapped — every
+//! re-collect (a cold cache or a TTL-expired `get()`) runs a ≤ 250 ms
+//! `spike()` DRAM load immediately before `collect()` re-reads the
+//! SMU PM table, so the `MCLK` sample is taken at the operating
+//! frequency, not the idle frequency; the in-TTL clone path never
+//! spikes (the collector is not called).
+//!
 //! **The daemon never panics** (plan D5): missing root or
 //! `CAP_SYS_RAWIO` only warns — the daemon keeps serving with its
 //! privileged fields degraded to `N/A`. The only permitted exits are
@@ -38,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ramsleuth_daemon::{
-    handle_connection, probe, setup_listener, BenchJobManager, DaemonContext, TelemetryCache,
+    handle_connection, probe, setup_listener, spike, BenchJobManager, DaemonContext, TelemetryCache,
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use tokio::signal::unix::SignalKind;
@@ -171,7 +178,7 @@ async fn main() {
     // cache TTL) + the P3-15 single-flight benchmark job manager.
     let ctx = Arc::new(DaemonContext {
         cache: Arc::new(Mutex::new(TelemetryCache::new(
-            ramsleuth_telemetry::collect,
+            || { spike(); ramsleuth_telemetry::collect() },
             args.max_age,
         ))),
         jobs: Arc::new(BenchJobManager::new()),
