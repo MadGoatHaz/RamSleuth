@@ -2,6 +2,55 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Cycle 9 (v2.0.0 RAM topology / Graphs lifecycle / CPU-temp hwmon / right-column layout) — 2026-09-16 — COMPLETE
+
+### What was delivered
+Cycle 9 (v2.0.0 RAM topology / Graphs lifecycle / CPU-temp hwmon / right-column layout) is COMPLETE: **all 8 chunks merged into `v2-development` (C9-01…C9-08)** from baseline `6cc9840` (the Cycle 8 compaction) to tip `c2f40a5` — the four operator tasks:
+
+**Operator task 1 — RAM topology header:**
+- The header RAM line renders the topology grouped by (size, rank word) — `2x16 GiB Single-Rank` (the Na/0 rank omits the word) — plus a slot note (`2 of 4 slots SPD-visible`) when MemTotal exceeds the SPD sum (D-1, C9-01).
+
+**Operator task 2 — Graphs window telemetry lifecycle + poll control:**
+- Opening the Graphs window forces auto-refresh ON (saving the original) and closing reverts to the saved original; one transition detector covers both close paths (the button toggle + the WM close_requested) (D-2, C9-02).
+- The in-window `Poll` combo (500/1000/2000/5000/10000 ms presets; a non-preset stored value shows its exact ms figure) writes the shared `settings.poll_interval_ms`, which the poller re-reads live (D-2, C9-03 co-land).
+
+**Operator task 3 — CPU temperature graphing:**
+- `read_cpu_temp_c` is now an ordered scan: the hwmon source first (each `hwmon*` `name` matched case-insensitive + trimmed, `k10temp` > `zenpower`, reading `temp1_input` ÷1000 — never a fixed `hwmonN`), then the pre-existing `cpu_thermal` zone scan as fallback; first finite wins, every failure class → NaN (D-3, C9-04). On the live host (hwmon4 = `k10temp`) the CPU TEMP row now plots instead of N/A.
+
+**Operator task 4 — main window layout uniformity:**
+- The left-column frames (bench C9-06, telemetry C9-08) gain `set_min_width(available_width)` so their borders fill the column (D-4a).
+- The right column is vertically split — bench at natural height, status at the remaining-height slice, inside the retained ScrollArea overflow fallback (D-4b, C9-05) — and the status frame fills the full width AND the remaining height (C9-07).
+
+**Chunks (all `--no-ff` merged):**
+- **C9-01** RAM header — `dimm_summary` groups by (size, rank word) → `2x16 GiB Single-Rank` (Na/0 omits the word); `rank_word` + `slot_note` render `2 of 4 slots SPD-visible` when MemTotal > the SPD sum; main.rs only, no wire/deps diff (66c7246).
+- **C9-02** Graphs lifecycle — force-on on the `graphs_open` rising edge (saving the original), restore of the saved original on the falling edge; one detector covers both close paths; main.rs only (1e20bfd).
+- **C9-03** poll control co-land — the in-Graphs `Poll` combo writing `settings.poll_interval_ms` (&mut u64 co-land; the child frame flips read→write lock, the D6 settings-write precedent); graph.rs + main.rs (985248f).
+- **C9-04** CPU temp hwmon — `read_cpu_temp_c` ordered scan: `k10temp` > `zenpower` name-match first (`temp1_input` ÷1000 via the shared `parse_millidegrees`), the `cpu_thermal` zone scan retained verbatim as fallback; graph.rs only (02af5f2).
+- **C9-05** right-column split — the right column = two stacked slices inside the retained ScrollArea overflow fallback (bench at natural height, status at the remaining `row_h − bench_h − 8 − item-gap`); main.rs only (502c7b7).
+- **C9-06** bench width — the bench frame gains `set_min_width(available_width)` (D-4a left-column width-fill); bench_zone.rs only (b88784f).
+- **C9-07** status fill — the status frame gains `set_min_width(available_width)` + `set_min_height(available_height)` (D-4a width + D-4b vertical fill of the C9-05 remaining-height slice); status_zone.rs only (c2f40a5).
+- **C9-08** telemetry width — the telemetry frame gains `set_min_width(available_width)` (D-4a left-column width-fill); telemetry_zone.rs only (3899f21).
+
+### Key plan decisions
+- **D-1:** RAM topology is a no-wire-change — the rank is already on the wire via `SpdModule.rank` (C8-03); the rank word + slot note are joined GUI-locally in the header.
+- **D-2:** Graphs force-on open / revert close (one transition detector covers both close paths) + the in-window `Poll` combo writing `settings.poll_interval_ms` (persists to Settings, not a Graphs-local override).
+- **D-3:** CPU temp via the hwmon source by name-match — walk `/sys/class/hwmon/`, `k10temp` > `zenpower` (never a fixed `hwmonN`), read `temp1_input` ÷1000; the `cpu_thermal` zone scan retained as fallback.
+- **D-4:** layout uniformity — `set_min_width` / `set_min_height` fill on the zone frames (left-column width fill + the status full width & remaining height) + the right-column vertical split (bench natural height, status remaining slice).
+
+### Quality
+- **541/541 tests green (debug AND release, whole workspace)** — up from 527 at the Cycle 8 close; **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); **MSRV 1.75** held; **6 release binaries** build; **zero new deps**; **zero wire changes** (all 8 chunks are GUI-local — no protocol / `messages.rs` shape delta; per-merge frozen-shape audits clean).
+- **QA verdict: PASS-WITH-MANUAL-LIVE-VERIFY** — all 8 chunks merged; the operator live GUI run is the remaining manual gate.
+
+### Push state (operator gate)
+Local `v2-development` tip = **`c2f40a5`** (Cycle 9 range `6cc9840..c2f40a5`; `origin/v2-development` still `b908f7b`) — **unpushed, operator-gated** (this compaction performs no push). The 8 remote `branch/chunk-c9-*` chunk branches (pushed during the cycle; the local branches + worktrees already pruned) are the handover prune target (all fully merged into `v2-development`; tip `c2f40a5` untouched). On the operator's go-ahead: **fast-forward to `c2f40a5` (NEVER force-push) → prune the remote chunk branches → optional `v2.0.0` tag**.
+
+### Open items carried
+1. **Operator live GUI run (pending)** — `plans/CYCLE9-LIVE-CHECKLIST.md` (5950X host; needs interactive sudo): the RAM topology header (`2x16 GiB Single-Rank` + slot note), the Graphs force-on/revert lifecycle + in-window Poll combo, the CPU TEMP row now plotting k10temp, the full-width/full-height zone frames — closes the PASS-WITH-MANUAL-LIVE-VERIFY verdict.
+2. **Push to GitHub** — operator go-ahead (ff to `c2f40a5`, prune the remote chunk branches, optional `v2.0.0` tag; strictly no force-push, no pre-go-ahead remote mutation).
+3. The remaining Cycle 8 open items carry as listed in the Cycle 8 section (the Cycle 8 live GUI run; Intel MCHBAR decode — hardware-gated; MSRV 1.75 vs newer; CAD/RTT/drive SMN bitfields; AIDA64 parity gate).
+
+Cycle 9 close-out (2026-09-16): this compaction recorded the Cycle 9 section in `MASTER_LOG.md` and reset `DEV_LOG.md` (base line → `c2f40a5`, ACTIVE_WORKERS cleared, CURRENT_STATE = COMPLETE, the per-lease history archived). No commit and no push (the commit lands in a separate follow-up subtask).
+
 ## Cycle 8 (v2.0.0 header truth) — 2026-09-16 — COMPLETE
 
 ### What was delivered
