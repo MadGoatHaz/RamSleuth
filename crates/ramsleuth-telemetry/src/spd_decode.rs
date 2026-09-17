@@ -912,7 +912,7 @@ mod tests {
         data[0x13] = 0x13;
         // Minimum data rate 2000 MT/s (20 x 100).
         data[0x20] = 0x14;
-        // Module organization (C8-03): 2 ranks (0x0C bit 1 + 1); x16
+        // Module organization (C8-03): 2 ranks (0x0C bits 3:4 = 01 + 1); x16
         // width (0x0C bits 2:0 code 3 unrecognized -> the 0x81
         // fallback, code 2); 4 devices per rank (0x80 bits 3:0).
         // 4 x 16 = the 64-bit bus -> consistent -> 2 x 4 = 8 total.
@@ -994,12 +994,13 @@ mod tests {
 
     /// A synthetic reconstruction of the live 5950X host module
     /// (P6-04): G.Skill `F4-3600C18-32GVK` - a 64 GiB kit
-    /// (2x32 GiB, the C10 operator-confirmed truth), rank 1 x 8
-    /// devices (C8-03: the vendor hub's per-rank 1 fails the
+    /// (2x32 GiB, the C10 operator-confirmed truth), rank 2 x 8
+    /// devices (16 total, dual-rank - the C11 JESD79-4 decode of
+    /// `0x0C = 0x09` bits 3:4; the vendor hub's per-rank 1 fails the
     /// consistency rule -> the per-rank is derived as 64 / 8),
     /// 3200 MT/s minimum. The module-maker field carries
     /// `0xC1` and the density byte carries `0x0D` (the two codes
-    /// P6-04 reconciles; the density re-reconciled by C10); the
+    /// P6-04 reconciles; the density restored by C11); the
     /// serial is blank and no XMP profiles are present, as
     /// observed live.
     fn live_5950x_image() -> SpdImage {
@@ -1008,16 +1009,17 @@ mod tests {
         // Module manufacturer 0xC1 (vendor nibble 0x01, continuation 0x0C).
         data[0x01] = 0x11;
         data[0x02] = 0x0C; // DDR4 memory type (C8-02 primary) + JEP106 continuation
-        // Density 0x0D - the live code; 32 Gb per die (the C10 reconciliation).
+        // Density 0x0D - the live code; 16 Gb per die (P6-04, restored by C11).
         data[0x13] = 0x0D;
         // Minimum data rate 3200 MT/s (32 x 100).
         data[0x20] = 0x20;
-        // Module organization (C8-03): 1 rank (0x0C bit 1 + 1), x8
-        // width (0x0C bits 2:0 code 1; the live 0x81 = 0x11 lower
-        // nibble agrees); the vendor hub (0x80 = 0x11) carries
-        // per-rank 1, which fails the consistency rule (1 x 8 != 64)
-        // -> the per-rank is derived as 64 / 8 = 8 -> 8 total devices
-        // (32 Gb x 8 / 8192 = 32 GiB per slot).
+        // Module organization (C11, per JESD79-4): 2 ranks (0x0C
+        // bits 3:4 = 01 + 1), x8 width (0x0C bits 2:0 code 1; the
+        // live 0x81 = 0x11 lower nibble agrees); the vendor hub
+        // (0x80 = 0x11) carries per-rank 1, which fails the
+        // consistency rule (1 x 8 != 64) -> the per-rank is derived
+        // as 64 / 8 = 8 -> 2 ranks x 8 = 16 total devices (16 Gb x
+        // 16 / 8192 = 32 GiB per slot).
         data[0x0C] = 0x09;
         data[0x81] = 0x11;
         data[0x80] = 0x11;
@@ -1347,22 +1349,22 @@ mod tests {
 
     /// The codes observed on the live 5950X module now decode: maker
     /// `0xC1` -> G.Skill (reconciled against the part number
-    /// `F4-3600C18-32GVK`), density `0x0D` -> 32 Gb = 32768 Mbit
-    /// (32 GiB rank-1 module, standard 8x8-die config), rank 1,
+    /// `F4-3600C18-32GVK`), density `0x0D` -> 16 Gb = 16384 Mbit
+    /// (the 32 GiB dual-rank module: 16 Gb x 16 devices), rank 2,
     /// 3200 MT/s, and the part number as observed live.
     #[test]
     fn live_5950x_reconciled_codes_decode() {
         let m = decode(&live_5950x_image());
         assert!(!m.is_ddr5);
         assert_eq!(m.maker, Section::Value("G.Skill".to_owned()));
-        assert_eq!(m.density_mbit, Section::Value(32768));
-        assert_eq!(m.rank, Section::Value(1));
+        assert_eq!(m.density_mbit, Section::Value(16384));
+        assert_eq!(m.rank, Section::Value(2));
         // C8-03: the vendor hub (0x80 = 0x11, per-rank 1) fails the
         // consistency rule (1 x 8 != the 64-bit bus) -> the per-rank
-        // is derived as 64 / 8 = 8 -> 8 total devices (32 Gb x 8 /
+        // is derived as 64 / 8 = 8 -> 16 total devices (16 Gb x 16 /
         // 8192 = 32 GiB per slot); the live fixture carries no
         // die-ID bytes and the die-type label defaults to Na.
-        assert_eq!(m.devices, Section::Value(8));
+        assert_eq!(m.devices, Section::Value(16));
         assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
         assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
         assert_eq!(m.speed_mts, Section::Value(3200));
@@ -1372,21 +1374,21 @@ mod tests {
     }
 
     /// The operator's live shape (C8-03, D-2; the reported `2 GiB`
-    /// defect pinned as a regression): 32 Gb dies (`0x13 = 0x0D`),
-    /// 1 rank (`0x0C = 0x09` bit 1 + 1), x8 width (`0x0C` bits 2:0;
-    /// the `0x81 = 0x11` lower nibble agrees), and the vendor's
-    /// non-compliant hub (`0x80 = 0x11`: per-rank 1 fails
+    /// defect pinned as a regression): 16 Gb dies (`0x13 = 0x0D`),
+    /// 2 ranks (`0x0C = 0x09` bits 3:4 = 01 + 1), x8 width (`0x0C`
+    /// bits 2:0; the `0x81 = 0x11` lower nibble agrees), and the
+    /// vendor's non-compliant hub (`0x80 = 0x11`: per-rank 1 fails
     /// `1 x 8 != 64` -> the per-rank is derived as `64 / 8 = 8`) ->
-    /// **8 total devices** -> the per-slot capacity `32768 x 8 /
+    /// **16 total devices** -> the per-slot capacity `16384 x 16 /
     /// 8192 = 32 GiB` (not the 2 GiB the old per-rank nibble
     /// produced).
     #[test]
     fn live_shape_total_devices() {
         let m = decode(&live_5950x_image());
         assert!(!m.is_ddr5);
-        assert_eq!(m.rank, Section::Value(1), "0x0C = 0x09 bit 1 -> rank 1");
-        assert_eq!(m.devices, Section::Value(8), "8 total devices (derived per-rank)");
-        assert_eq!(m.density_mbit, Section::Value(32768), "32 Gb per die (0x13 = 0x0D)");
+        assert_eq!(m.rank, Section::Value(2), "0x0C = 0x09 bits 3:4 -> rank 2");
+        assert_eq!(m.devices, Section::Value(16), "16 total devices (2 ranks x derived per-rank 8)");
+        assert_eq!(m.density_mbit, Section::Value(16384), "16 Gb per die (0x13 = 0x0D)");
         // The facade's per-slot arithmetic (density_mbit x devices /
         // 8192) fed by the corrected decode: 32 GiB per slot.
         let (Some(density), Some(devices)) = (m.density_mbit.value(), m.devices.value()) else {
@@ -1395,7 +1397,7 @@ mod tests {
         assert_eq!(
             *density as f64 * *devices as f64 / 8192.0,
             32.0,
-            "32768 x 8 / 8192 = 32 GiB per slot"
+            "16384 x 16 / 8192 = 32 GiB per slot"
         );
     }
 
@@ -1424,9 +1426,10 @@ mod tests {
 
     /// Regression: the DDR4 density published family `0x10..=0x17`
     /// is unchanged (1..=32 Gb decode to Mbit; 64 / 128 Gb overflow the
-    /// u16 cell -> `Na(ParseError)`), the C10 `0x0D` -> 32 Gb is
-    /// present, and codes outside both sets degrade to `Na(ParseError)`
-    /// naming the code (no panic).
+    /// u16 cell -> `Na(ParseError)`), the P6-04 `0x0D` -> 16 Gb is
+    /// present (the C11 revert of the C10 32 Gb paint), and codes
+    /// outside both sets degrade to `Na(ParseError)` naming the code
+    /// (no panic).
     #[test]
     fn ddr4_density_regression_family_plus_0x0d() {
         // 0x10..=0x15 -> 1..=32 Gb fit the u16 Mbit cell.
@@ -1455,12 +1458,12 @@ mod tests {
                 "{detail}"
             );
         }
-        // The C10 reconciled code: 0x0D -> 32 Gb = 32768 Mbit.
+        // The reconciled code (the C11 revert of the C10 paint): 0x0D -> 16 Gb = 16384 Mbit.
         let mut data = vec![0u8; 512];
         data[0x00] = 0x0A;
         data[0x13] = 0x0D;
         let m = decode(&SpdImage { index: 0x50, data });
-        assert_eq!(m.density_mbit, Section::Value(32768));
+        assert_eq!(m.density_mbit, Section::Value(16384));
         // Unknown codes remain Na(ParseError) and name the code.
         for code in [0x00u8, 0x0F, 0x80] {
             let mut data = vec![0u8; 512];
@@ -1523,7 +1526,7 @@ mod tests {
     #[test]
     fn memory_type_byte_0x02_classifies() {
         // The live host shape: 0x00 = 0x23 (junk), 0x02 = 0x0C (the
-        // DDR4 key), 0x13 = 0x0D (32 Gb), 512 B -> DDR4, part from
+        // DDR4 key), 0x13 = 0x0D (16 Gb), 512 B -> DDR4, part from
         // 0x149.
         let mut data = vec![0u8; 512];
         data[0x00] = 0x23;
@@ -1532,7 +1535,7 @@ mod tests {
         data[0x149..0x149 + 16].copy_from_slice(b"F4-3600C18-32GVK");
         let m = decode(&SpdImage { index: 0x52, data });
         assert!(!m.is_ddr5, "512 B + 0x02 = 0x0C must classify DDR4");
-        assert_eq!(m.density_mbit, Section::Value(32768), "32 Gb per the live code");
+        assert_eq!(m.density_mbit, Section::Value(16384), "16 Gb per the live code");
         assert_eq!(m.part, Section::Value("F4-3600C18-32GVK".to_owned()));
 
         // The same key on a 1024 B image -> DDR5.
@@ -1628,16 +1631,17 @@ mod tests {
         assert_eq!(m.die_maker, Section::Value("0xAB".to_owned()));
     }
 
-    /// The rank is the DDR4 `0x0C` bit 1 + 1 primary (C8-03, D-2):
-    /// `0x09` -> 1, `0x0A` / `0x0B` / `0x1B` -> 2 (bit 1 is the rank
-    /// code; bits 2:0 carry the width code, sharing the bit); the byte `0x80` hub nibble
-    /// (bits 7:4) is the fallback when `0x0C` is blank / absent
-    /// (`0x80 = 0x84` -> 8); the DDR5 hub model reads the `0x80`
-    /// bits 7:4 (`0x38` -> 3); a zero rank nibble ->
+    /// The rank is the DDR4 `0x0C` bits 3:4 + 1 primary (C11, per
+    /// JESD79-4 - the number-of-ranks code `00 = 1 / 01 = 2 / 10 = 3
+    /// / 11 = 4`; bits 2:0 carry the width code, no bit sharing):
+    /// `0x09` / `0x0A` / `0x0B` -> 2, `0x1B` -> 4; the byte `0x80`
+    /// hub nibble (bits 7:4) is the fallback when `0x0C` is blank /
+    /// absent (`0x80 = 0x84` -> 8); the DDR5 hub model reads the
+    /// `0x80` bits 7:4 (`0x38` -> 3); a zero rank nibble ->
     /// `Na(ParseError)` naming `0x80`.
     #[test]
     fn rank_from_0x0c_primary_with_0x80_fallback() {
-        for (org, ranks) in [(0x09u8, 1u8), (0x0A, 2), (0x0B, 2), (0x1B, 2)] {
+        for (org, ranks) in [(0x09u8, 2u8), (0x0A, 2), (0x0B, 2), (0x1B, 4)] {
             let mut data = vec![0u8; 512];
             data[0x00] = 0x0A;
             data[0x0C] = org;
@@ -1677,12 +1681,13 @@ mod tests {
     /// The total device count is generation-scoped (C8-03, D-2): the
     /// per-rank hub nibble is trusted when it is consistent with the
     /// bus (`per_rank x width == 64`), else derived (`bus / width`);
-    /// the rank is the DDR4 `0x0C` bit 1 + 1 (or the DDR5 `0x80`
+    /// the rank is the DDR4 `0x0C` bits 3:4 + 1 (or the DDR5 `0x80`
     /// hub nibble). Re-derived expected values: `0x80 = 0x24` +
     /// `0x0C = 0x0B` (width via the `0x81` fallback) -> total 8 /
     /// rank 2; `0x80 = 0x18` + `0x81 = 0x01` (DDR5) -> total 8 /
     /// rank 1; the live-shape derivation (`0x80 = 0x11` per-rank 1
-    /// fails 1 x 8 != 64) -> total 8 / rank 1.
+    /// fails 1 x 8 != 64) -> total 16 / rank 2 (2 ranks x derived
+    /// per-rank 8).
     #[test]
     fn devices_total_generation_scoped() {
         // DDR4: 0x0C = 0x0B (rank 2; width code 3 unrecognized) +
@@ -1707,16 +1712,16 @@ mod tests {
         assert_eq!(m.devices, Section::Value(8), "0x18 + 0x01");
         assert_eq!(m.rank, Section::Value(1), "0x18 + 0x01");
 
-        // The live-shape derivation: 0x0C = 0x09 (rank 1, x8) +
+        // The live-shape derivation: 0x0C = 0x09 (rank 2, x8) +
         // 0x80 = 0x11 (per-rank 1; 1 x 8 != 64 -> derived 64 / 8 =
-        // 8) -> 1 x 8 = 8 total (the vendor hub worked around, D-2).
+        // 8) -> 2 x 8 = 16 total (the vendor hub worked around, D-2).
         let mut data = vec![0u8; 512];
         data[0x00] = 0x0A;
         data[0x0C] = 0x09;
         data[0x80] = 0x11;
         let m = decode(&SpdImage { index: 0x50, data });
-        assert_eq!(m.devices, Section::Value(8), "derived per-rank");
-        assert_eq!(m.rank, Section::Value(1), "derived per-rank");
+        assert_eq!(m.devices, Section::Value(16), "2 ranks x derived per-rank 8");
+        assert_eq!(m.rank, Section::Value(2), "0x0C bits 3:4 = 01 + 1");
     }
 
     /// Invalid module-organization configs gate `devices` to
@@ -1731,9 +1736,9 @@ mod tests {
     /// `bus_width`'s single extension bit.)
     #[test]
     fn devices_invalid_org_gates_naming_the_byte() {
-        // Per-rank 0: 0x0C = 0x09 (rank 1, x8) + 0x80 = 0x80
+        // Per-rank 0: 0x0C = 0x09 (rank 2, x8) + 0x80 = 0x80
         // (per-rank 0) -> devices Na naming 0x80; the rank source
-        // (0x0C) is well-formed -> rank 1.
+        // (0x0C) is well-formed -> rank 2.
         let mut data = vec![0u8; 512];
         data[0x00] = 0x0A;
         data[0x0C] = 0x09;
@@ -1744,11 +1749,11 @@ mod tests {
             "per-rank 0 must name byte 0x80: {:?}",
             m.devices
         );
-        assert_eq!(m.rank, Section::Value(1), "the 0x0C rank source is well-formed");
+        assert_eq!(m.rank, Section::Value(2), "the 0x0C rank source is well-formed");
 
         // Unrecognized width: 0x0C = 0x0F (rank 2; width code 7) +
         // 0x81 = 0x0F (fallback code 7) + 0x80 = 0x18 -> devices Na
-        // naming 0x81; the rank (0x0C bit 1 + 1) is 2.
+        // naming 0x81; the rank (0x0C bits 3:4 + 1) is 2.
         let mut data = vec![0u8; 512];
         data[0x00] = 0x0A;
         data[0x0C] = 0x0F;
