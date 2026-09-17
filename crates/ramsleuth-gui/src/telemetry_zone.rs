@@ -514,6 +514,11 @@ pub fn render_telemetry_zone(ui: &mut egui::Ui, data: &TelemetryData) {
         .stroke(egui::Stroke::new(1.0_f32, CYAN))
         .inner_margin(egui::Margin::symmetric(10.0, 6.0));
     let _ = frame.show(ui, |ui| {
+        // D-4a width fill: force the content — and hence this frame's
+        // border — to span the full allocated column width; a `Frame`
+        // otherwise shrinks to its content's natural width (the
+        // 3×2 grid's), leaving dead space to the right of the border.
+        ui.set_min_width(ui.available_width());
         ui.label(egui::RichText::new(ZONE_TITLE).strong().color(CYAN));
         ui.add_space(4.0);
         match &data.telemetry {
@@ -1336,5 +1341,63 @@ mod tests {
             colors.iter().all(|c| *c == NA_GRAY),
             "the placeholder N/A must be muted gray, got {colors:?}"
         );
+    }
+
+    /// (m) The D-4a width fill (the left-column balancing half): the
+    /// frame's painted border spans the full available width of the
+    /// parent ui. `set_min_width(available_width)` as the first line
+    /// inside the frame closure forces the content — and hence this
+    /// `Frame`'s border — to the allocated column width; a `Frame`
+    /// otherwise shrinks to its content's natural width (the 3×2
+    /// grid's, well under the panel width), leaving dead space to
+    /// the right of the border. Asserted by rendering the zone into
+    /// a bounded central panel and measuring the one painted
+    /// CYAN-stroked rect (the frame's border itself — the labels are
+    /// `Shape::Text`, so the filter is unique): its width must equal
+    /// the panel's available width, for the populated matrix and the
+    /// no-telemetry placeholder alike.
+    #[test]
+    fn render_telemetry_zone_frame_fills_available_width() {
+        // A bounded screen (a left-column-shaped allocation, not the
+        // default headless size): the central panel's content ui is
+        // the parent the frame allocates into.
+        let screen = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(600.0, 500.0));
+        for telemetry in [Some(representative()), None] {
+            let data = TelemetryData { telemetry, ..Default::default() };
+            let ctx = egui::Context::default();
+            ctx.begin_frame(egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            });
+            let mut available = 0.0_f32;
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                available = ui.available_width();
+                assert!(
+                    available > 400.0,
+                    "a bounded panel to measure against, got {available}"
+                );
+                render_telemetry_zone(ui, &data);
+            });
+            let out = ctx.end_frame();
+            // The zone's frame is the only CYAN-stroked rect painted.
+            let frame_rects: Vec<egui::Rect> = out
+                .shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Rect(r) if r.stroke.color == CYAN => Some(r.rect),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                frame_rects.len(),
+                1,
+                "the zone must paint exactly one CYAN-stroked frame rect, got {frame_rects:?}"
+            );
+            let width = frame_rects[0].width();
+            assert!(
+                (width - available).abs() < 1.0,
+                "the frame border must fill the available width: {width} != {available}"
+            );
+        }
     }
 }
