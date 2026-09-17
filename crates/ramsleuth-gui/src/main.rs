@@ -34,10 +34,13 @@
 //!   registers it every frame (the keep-alive — egui GCs a child
 //!   the first frame the root stops registering it, which is the
 //!   close); the child's body renders the C7-20
-//!   `render_graphs_window` over the shared state (a pure reader —
-//!   the poller stays the only writer, D6) on its own ~60 FPS
-//!   cadence; the child's WM close button clears the same flag the
-//!   header button toggles (D-C7: the two close paths are
+//!   `render_graphs_window` over the shared state on its own ~60
+//!   FPS cadence — a pure reader of the data fields (the poller
+//!   stays their only writer, D6), the one permitted write being
+//!   the C9-03 `Poll` combo over the shared
+//!   `settings.poll_interval_ms` knob (the settings-panel D-2 / D6
+//!   write precedent); the child's WM close button clears the same
+//!   flag the header button toggles (D-C7: the two close paths are
 //!   behaviorally identical).
 //! - **Keyboard (C6-30):** the spec's key legend is live — a fresh
 //!   key-down of F2 / F3 / Q (egui marks OS key-repeats
@@ -1067,12 +1070,15 @@ fn show_graphs_viewport(
 /// The Graphs child viewport's frame body (C7-21, D-3): one
 /// idempotent style set over the shared context (the main window's
 /// `AppCreator` already set it — this keeps a fresh context correct
-/// too), one brief read of the shared state (the child is a pure
-/// reader — the poller stays the only writer, D6), the window's
-/// render, the child's own ~60 FPS cadence, and the WM close path —
-/// a `close_requested()` clears the shared flag so the root stops
-/// re-registering and egui GCs the window (the button's close is
-/// the same path, D-C7).
+/// too), one brief write of the shared state for the render — the
+/// C9-03 `Poll` combo's write of the shared
+/// `settings.poll_interval_ms` knob (the settings-panel D-2 / D6
+/// write precedent: the render thread's one permitted write, no
+/// I/O; the poller stays the only writer of the data fields) — the
+/// window's render, the child's own ~60 FPS cadence, and the WM
+/// close path — a `close_requested()` clears the shared flag so
+/// the root stops re-registering and egui GCs the window (the
+/// button's close is the same path, D-C7).
 fn run_graphs_child_frame(
     ctx: &egui::Context,
     state: &Arc<RwLock<TelemetryData>>,
@@ -1080,8 +1086,17 @@ fn run_graphs_child_frame(
 ) {
     ctx.set_style(build_style());
     {
-        let data = state.read().unwrap();
-        render_graphs_window(ctx, &data.graph);
+        // The C9-03 co-land: a write lock (the settings-panel D6
+        // write precedent — the `Poll` combo writes the shared
+        // `settings.poll_interval_ms` knob the poller re-reads
+        // live; the data fields stay poller-written). The knob is
+        // copied out (a `u64`) and written back: a shared borrow of
+        // `data.graph` and a mutable borrow of the knob through the
+        // guard's deref cannot coexist in one expression.
+        let mut data = state.write().unwrap();
+        let mut poll_interval_ms = data.settings.poll_interval_ms;
+        render_graphs_window(ctx, &data.graph, &mut poll_interval_ms);
+        data.settings.poll_interval_ms = poll_interval_ms;
     }
     ctx.request_repaint_after(REPAINT);
     if ctx.input(|i| i.viewport().close_requested()) {

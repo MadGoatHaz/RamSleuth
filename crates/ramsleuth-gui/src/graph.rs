@@ -34,7 +34,9 @@
 //!   bounded). The background poller is the only writer (D6 — the
 //!   Na-guarded [`record_graph_sample`] hook appends one sample per
 //!   successful poll); the render thread + the child window are
-//!   pure readers.
+//!   pure readers (the child's one permitted write is the C9-03
+//!   `Poll` combo over the shared settings knob — the settings-
+//!   panel D6 precedent).
 //! - [`read_cpu_temp_c`] — the direct unprivileged thermal-zone
 //!   scan (the runtime source of D-4): every failure class (no
 //!   dir, no matching zone, an unreadable / non-numeric `temp`)
@@ -46,7 +48,8 @@
 //!   dim subtitle (the live window + the sample count), the
 //!   window-resolution row (four selectable `1 / 5 / 15 / 60 min`
 //!   buttons — the default 5 min is the static view of C7-20;
-//!   selecting one resets the pan), and the five series rows in
+//!   selecting one resets the pan) + the `Poll` combo (C9-03, D-2:
+//!   the shared poll-interval knob), and the five series rows in
 //!   fixed order — each a hand-rolled time-windowed plot (the pure
 //!   [`window_points`] helper over the view window: non-finite
 //!   samples skipped, a flat window on the midline, every division
@@ -110,6 +113,20 @@ const WINDOW_MINUTES: [u32; 4] = [1, 5, 15, 60];
 /// The default window length (minutes): the static five-minute view
 /// of C7-20.
 const DEFAULT_WINDOW_MINUTES: u32 = 5;
+
+/// The poll-interval presets (ms) for the header's `Poll` combo
+/// (C9-03, D-2): 0.5 / 1 / 2 / 5 / 10 s. The combo writes the
+/// shared `GuiSettings.poll_interval_ms` knob (the settings panel's
+/// drag value, C6-27 — the two always agree); the poller re-reads
+/// it live per tick, so a selection takes effect on the next tick
+/// without a restart.
+const POLL_INTERVAL_PRESETS: [(u64, &str); 5] = [
+    (500, "0.5 s"),
+    (1000, "1 s"),
+    (2000, "2 s"),
+    (5000, "5 s"),
+    (10000, "10 s"),
+];
 
 /// The dim pan hint on the resolution row (C7-22 item 7f): a drag
 /// on any row pans the window.
@@ -474,6 +491,18 @@ fn window_seconds_for(minutes: u32) -> f64 {
     }
 }
 
+/// The `Poll` combo's selected text (C9-03, D-2): the preset label
+/// for a stored value matching one of [`POLL_INTERVAL_PRESETS`], or
+/// the exact millisecond figure (`custom` display) when it does not
+/// (a hand-edited Settings value — the presets stay selectable, the
+/// button shows the live knob).
+fn poll_interval_display(ms: u64) -> String {
+    match POLL_INTERVAL_PRESETS.iter().find(|(preset, _)| *preset == ms) {
+        Some((_, label)) => (*label).to_owned(),
+        None => format!("{ms} ms"),
+    }
+}
+
 /// Clamp a pan offset (seconds back from the newest sample) into
 /// the recorded data (C7-22 item 7f): the window may not reach
 /// before the oldest sample (max pan = newest − oldest −
@@ -717,7 +746,10 @@ fn graph_row(
 ///
 /// - the window-resolution row: four selectable `1 / 5 / 15 / 60
 ///   min` buttons (the default 5 min is the static view of C7-20;
-///   selecting one resets the pan to 0);
+///   selecting one resets the pan to 0) + the `Poll` combo (C9-03,
+///   D-2: the poll-interval control — the presets write the shared
+///   `settings.poll_interval_ms` knob the poller re-reads live; a
+///   non-preset stored value shows its exact millisecond figure);
 /// - horizontal pan: a drag on any row pans the window
 ///   (`pan_offset_s += dx × seconds_per_px`, clamped to the data
 ///   by [`clamp_pan`]) + the dim `« pan »` hint;
@@ -730,10 +762,14 @@ fn graph_row(
 ///   crosshair.
 ///
 /// Pure read over [`GraphState`] (no I/O, D6 — the poller is the
-/// only writer): an empty state renders the five no-source rows
-/// (the VDDCR_CPU row is permanent) and never panics (the D5
-/// contract; the `render_history` headless-test precedent).
-pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState) {
+/// only writer of the data fields): an empty state renders the
+/// five no-source rows (the VDDCR_CPU row is permanent) and never
+/// panics (the D5 contract; the `render_history` headless-test
+/// precedent). The one permitted write is the `Poll` combo's
+/// `poll_interval_ms: &mut u64` — the shared settings knob the
+/// poller re-reads live (the settings-panel D6 write precedent,
+/// C9-03, D-2).
+pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState, poll_interval_ms: &mut u64) {
     egui::CentralPanel::default()
         .frame(egui::Frame::default().fill(SLATE))
         .show(ctx, |ui| {
@@ -774,7 +810,9 @@ pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState) {
             ui.add_space(8.0);
             // The window-resolution row (C7-22 item 7f): four
             // selectable buttons (selecting one resets the pan to
-            // 0) + the dim pan hint, right-aligned.
+            // 0) + the `Poll` combo (C9-03, D-2: the poll-interval
+            // control over the shared settings knob) + the dim pan
+            // hint, right-aligned.
             ui.horizontal(|ui| {
                 for minutes in WINDOW_MINUTES {
                     if ui
@@ -788,6 +826,21 @@ pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState) {
                         view.pan_offset_s = 0.0;
                     }
                 }
+                // The poll-interval control (C9-03, D-2): the
+                // shared `GuiSettings.poll_interval_ms` knob (the
+                // settings panel's drag value, C6-27 — the two
+                // always agree) — the poller re-reads it live per
+                // tick, so a selection takes effect on the next
+                // tick without a restart. A preset pick writes the
+                // knob; a non-preset stored value shows its exact
+                // millisecond figure (the presets stay selectable).
+                let _ = egui::ComboBox::from_label("Poll")
+                    .selected_text(poll_interval_display(*poll_interval_ms))
+                    .show_ui(ui, |ui| {
+                        for (ms, label) in POLL_INTERVAL_PRESETS {
+                            ui.selectable_value(poll_interval_ms, ms, label);
+                        }
+                    });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(PAN_HINT).color(dim));
                 });
@@ -1264,9 +1317,13 @@ mod tests {
     /// single-sample state (the dot path).
     #[test]
     fn render_graphs_window_runs_headless_without_panicking() {
+        // The shared poll-interval knob (C9-03): the render's one
+        // permitted write (the `Poll` combo, D-2) — the default
+        // cadence.
+        let mut iv = 2000u64;
         // Empty: five no-source rows (the window is collapsed).
         run_headless_frame(|ctx| {
-            render_graphs_window(ctx, &GraphState::default());
+            render_graphs_window(ctx, &GraphState::default(), &mut iv);
         });
 
         // Fully populated: 20 samples over two minutes (all in the
@@ -1284,7 +1341,7 @@ mod tests {
             ));
         }
         run_headless_frame(|ctx| {
-            render_graphs_window(ctx, &full);
+            render_graphs_window(ctx, &full, &mut iv);
         });
 
         // Sparse: only a finite clock (the other three series are
@@ -1292,7 +1349,7 @@ mod tests {
         let mut sparse = GraphState::default();
         sparse.samples.push(sample(1000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN));
         run_headless_frame(|ctx| {
-            render_graphs_window(ctx, &sparse);
+            render_graphs_window(ctx, &sparse, &mut iv);
         });
 
         // A single sample: the dot path (one in-window point per
@@ -1300,7 +1357,7 @@ mod tests {
         let mut one = GraphState::default();
         one.samples.push(sample(1000.0, 3600.0, 1150.0, 45.0, 26.35));
         run_headless_frame(|ctx| {
-            render_graphs_window(ctx, &one);
+            render_graphs_window(ctx, &one, &mut iv);
         });
     }
 
@@ -1313,11 +1370,15 @@ mod tests {
     /// label + the self-cleared notes).
     #[test]
     fn render_graphs_window_no_source_note_renders_bare_na() {
+        // The shared poll-interval knob (C9-03): the render's one
+        // permitted write (the `Poll` combo, D-2) — the default
+        // cadence.
+        let mut iv = 2000u64;
         // The empty state: every data row its bare note + the
         // permanent VDDCR_CPU label (the note lives in the label).
         let ctx = egui::Context::default();
         ctx.begin_frame(egui::RawInput::default());
-        render_graphs_window(&ctx, &GraphState::default());
+        render_graphs_window(&ctx, &GraphState::default(), &mut iv);
         let out = ctx.end_frame();
         let texts = painted_texts(&out);
         assert!(
@@ -1347,7 +1408,7 @@ mod tests {
         }
         let ctx = egui::Context::default();
         ctx.begin_frame(egui::RawInput::default());
-        render_graphs_window(&ctx, &full);
+        render_graphs_window(&ctx, &full, &mut iv);
         let out = ctx.end_frame();
         let texts = painted_texts(&out);
         assert!(
@@ -1596,6 +1657,10 @@ mod tests {
     /// crosshair drops again on a pointer-gone frame.
     #[test]
     fn render_graphs_window_hover_raises_the_crosshair_without_panicking() {
+        // The shared poll-interval knob (C9-03): the render's one
+        // permitted write (the `Poll` combo, D-2) — the default
+        // cadence.
+        let mut iv = 2000u64;
         // 20 samples, 10 s apart (t = 1000..1190): all inside the
         // default 5-min window [890, 1190].
         let mut full = GraphState::default();
@@ -1612,7 +1677,7 @@ mod tests {
         let ctx = egui::Context::default();
         // Frame 1: no pointer — lay out the window + the row rect.
         ctx.begin_frame(egui::RawInput::default());
-        render_graphs_window(&ctx, &GraphState::default());
+        render_graphs_window(&ctx, &GraphState::default(), &mut iv);
         let out = ctx.end_frame();
         let row = first_row_rect(&out).expect("the first row background was painted");
         let hover = Pos2::new(row.center().x, row.center().y);
@@ -1620,14 +1685,14 @@ mod tests {
         // The empty state + hover: no panic, no crosshair (no
         // samples to snap to).
         ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(hover)], None));
-        render_graphs_window(&ctx, &GraphState::default());
+        render_graphs_window(&ctx, &GraphState::default(), &mut iv);
         let out = ctx.end_frame();
         assert!(!has_crosshair_line(&out, hover.x), "no samples → no crosshair");
 
         // The full state + hover: the crosshair at the pointer x.
         // The tooltip area is new this frame — not painted yet.
         ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(hover)], None));
-        render_graphs_window(&ctx, &full);
+        render_graphs_window(&ctx, &full, &mut iv);
         let out = ctx.end_frame();
         assert!(has_crosshair_line(&out, hover.x), "the crosshair line paints at the hover x");
 
@@ -1635,7 +1700,7 @@ mod tests {
         // hover maps to t = 1040 = the exact 5th sample: 3640 MHz ·
         // 1154 mV · 45.4 °C · 26.35 GB/s @ 00:17:20).
         ctx.begin_frame(egui::RawInput::default());
-        render_graphs_window(&ctx, &full);
+        render_graphs_window(&ctx, &full, &mut iv);
         let out = ctx.end_frame();
         assert!(has_crosshair_line(&out, hover.x), "the crosshair persists while hovering");
         let texts = painted_texts(&out);
@@ -1650,7 +1715,7 @@ mod tests {
 
         // The pointer goes: the crosshair drops again.
         ctx.begin_frame(pointer_input(vec![egui::Event::PointerGone], None));
-        render_graphs_window(&ctx, &full);
+        render_graphs_window(&ctx, &full, &mut iv);
         let out = ctx.end_frame();
         assert!(!has_crosshair_line(&out, hover.x), "no hover → no crosshair");
 
@@ -1661,10 +1726,10 @@ mod tests {
         let mut partial = GraphState::default();
         partial.samples.push(sample(1000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN));
         ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(hover)], None));
-        render_graphs_window(&ctx, &partial);
+        render_graphs_window(&ctx, &partial, &mut iv);
         let _out = ctx.end_frame();
         ctx.begin_frame(egui::RawInput::default());
-        render_graphs_window(&ctx, &partial);
+        render_graphs_window(&ctx, &partial, &mut iv);
         let out = ctx.end_frame();
         assert!(has_crosshair_line(&out, hover.x), "a partial sample still raises the crosshair");
         let texts = painted_texts(&out);
@@ -1681,6 +1746,10 @@ mod tests {
     /// following pointer-less frames.
     #[test]
     fn render_graphs_window_drag_pans_the_window_and_clamps_to_the_data() {
+        // The shared poll-interval knob (C9-03): the render's one
+        // permitted write (the `Poll` combo, D-2) — the default
+        // cadence.
+        let mut iv = 2000u64;
         // 36 samples, 10 s apart (t = 1000..1350): span 350 s >
         // the default 300 s window → max pan = 50 s.
         let mut history = GraphState::default();
@@ -1698,19 +1767,19 @@ mod tests {
 
         let ctx = egui::Context::default();
         ctx.begin_frame(pointer_input(vec![], screen));
-        render_graphs_window(&ctx, &history);
+        render_graphs_window(&ctx, &history, &mut iv);
         let out = ctx.end_frame();
         let row = first_row_rect(&out).expect("the first row background was painted");
 
         // Press the primary button on the left edge of the row …
         let press = Pos2::new(row.left() + 1.0, row.center().y);
         ctx.begin_frame(pointer_input(vec![button_event(press, true)], screen));
-        render_graphs_window(&ctx, &history);
+        render_graphs_window(&ctx, &history, &mut iv);
         let _out = ctx.end_frame();
         // … then drag the pointer to the center of the row.
         let drag_to = Pos2::new(row.center().x, row.center().y);
         ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(drag_to)], screen));
-        render_graphs_window(&ctx, &history);
+        render_graphs_window(&ctx, &history, &mut iv);
         let _out = ctx.end_frame();
         // The pan = the drag × (window / width): far beyond the max
         // (50 s) → clamped to exactly span − window.
@@ -1720,10 +1789,10 @@ mod tests {
 
         // Release + a pointer-less frame: the pan persists.
         ctx.begin_frame(pointer_input(vec![button_event(drag_to, false)], screen));
-        render_graphs_window(&ctx, &history);
+        render_graphs_window(&ctx, &history, &mut iv);
         let _out = ctx.end_frame();
         ctx.begin_frame(pointer_input(vec![], screen));
-        render_graphs_window(&ctx, &history);
+        render_graphs_window(&ctx, &history, &mut iv);
         let _out = ctx.end_frame();
         let view = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(view_id(), GraphView::default));
         assert_eq!(view.pan_offset_s, 50.0, "the pan persists after the release, got {view:?}");
@@ -1736,6 +1805,10 @@ mod tests {
     /// click).
     #[test]
     fn render_graphs_window_button_reselects_the_window_and_resets_the_pan() {
+        // The shared poll-interval knob (C9-03): the render's one
+        // permitted write (the `Poll` combo, D-2) — the default
+        // cadence.
+        let mut iv = 2000u64;
         // 36 samples, 10 s apart (t = 1000..1350): span 350 s → an
         // in-range pan of 37 s against the 5-min window.
         let mut history = GraphState::default();
@@ -1758,7 +1831,7 @@ mod tests {
         });
 
         ctx.begin_frame(egui::RawInput::default());
-        render_graphs_window(&ctx, &history);
+        render_graphs_window(&ctx, &history, &mut iv);
         let out = ctx.end_frame();
         // Find the `60 min` button by its label (the only thing
         // painted with that exact text) and click its center.
@@ -1776,12 +1849,12 @@ mod tests {
 
         // Press …
         ctx.begin_frame(pointer_input(vec![button_event(click, true)], None));
-        render_graphs_window(&ctx, &history);
+        render_graphs_window(&ctx, &history, &mut iv);
         let _out = ctx.end_frame();
         // … then release on the button: clicked → re-select +
         // reset the pan.
         ctx.begin_frame(pointer_input(vec![button_event(click, false)], None));
-        render_graphs_window(&ctx, &history);
+        render_graphs_window(&ctx, &history, &mut iv);
         let _out = ctx.end_frame();
         let view = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(view_id(), GraphView::default));
         assert_eq!(
@@ -1792,5 +1865,153 @@ mod tests {
             },
             "selecting the window re-selects it and resets the pan"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // C9-03 — the Poll combo (the poll-interval control, D-2).
+    // ------------------------------------------------------------------
+
+    /// The click point of a painted text shape (its galley center —
+    /// the `TextShape` `pos` is the top-left of the laid-out text).
+    fn text_click_pos(out: &egui::FullOutput, text: &str) -> Option<Pos2> {
+        out.shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text() == text => Some(Pos2::new(
+                    t.pos.x + t.galley.size().x / 2.0,
+                    t.pos.y + t.galley.size().y / 2.0,
+                )),
+                _ => None,
+            })
+    }
+
+    /// (s) The `Poll` combo (C9-03, D-2): the resolution row carries
+    /// the poll-interval control; a preset selection writes the
+    /// shared knob (`*poll_interval_ms`); a non-preset stored value
+    /// shows its exact millisecond figure (the `custom` display)
+    /// while the presets stay selectable — the settings panel's
+    /// drag value and the combo always agree on the same knob.
+    #[test]
+    fn render_graphs_window_poll_interval_combo_writes_the_shared_knob() {
+        // A few samples so the window renders its full layout (the
+        // combo sits in the resolution row regardless of the data).
+        let mut full = GraphState::default();
+        for i in 0..10 {
+            full.samples.push(sample(
+                1000.0 + 10.0 * f64::from(i),
+                3600.0,
+                1150.0,
+                45.0,
+                26.35,
+            ));
+        }
+
+        let ctx = egui::Context::default();
+        // The shared poll-interval knob (the settings panel's drag
+        // value, C6-27) — the default cadence.
+        let mut iv = 2000u64;
+
+        // Frame 1: the row carries the combo — the button shows the
+        // preset label for the stored 2000 ms (`2 s`) + the `Poll`
+        // label.
+        ctx.begin_frame(egui::RawInput::default());
+        render_graphs_window(&ctx, &full, &mut iv);
+        let out = ctx.end_frame();
+        let texts = painted_texts(&out);
+        assert!(
+            texts.contains(&"Poll"),
+            "the `Poll` label paints in the row, got {texts:?}"
+        );
+        assert!(
+            texts.contains(&"2 s"),
+            "the stored 2000 ms shows its preset label, got {texts:?}"
+        );
+        let click =
+            text_click_pos(&out, "2 s").expect("the combo button painted its selected text");
+
+        // Frames 2-3: press + release on the button → the popup
+        // opens (the combo toggles on the click).
+        ctx.begin_frame(pointer_input(vec![button_event(click, true)], None));
+        render_graphs_window(&ctx, &full, &mut iv);
+        let _ = ctx.end_frame();
+        ctx.begin_frame(pointer_input(vec![button_event(click, false)], None));
+        render_graphs_window(&ctx, &full, &mut iv);
+        let _ = ctx.end_frame();
+
+        // Frame 4: the popup paints (egui areas paint from the frame
+        // after they first appear — the tooltip precedent): all five
+        // presets are selectable.
+        ctx.begin_frame(egui::RawInput::default());
+        render_graphs_window(&ctx, &full, &mut iv);
+        let out = ctx.end_frame();
+        let texts = painted_texts(&out);
+        for label in ["0.5 s", "1 s", "2 s", "5 s", "10 s"] {
+            assert!(
+                texts.contains(&label),
+                "the popup lists the preset `{label}`, got {texts:?}"
+            );
+        }
+        let pick = text_click_pos(&out, "5 s").expect("the popup painted the `5 s` preset");
+
+        // Frames 5-6: press + release on `5 s` → the knob writes
+        // 5000 (the shared-knob ruling: the settings panel's drag
+        // value and the combo always agree).
+        ctx.begin_frame(pointer_input(vec![button_event(pick, true)], None));
+        render_graphs_window(&ctx, &full, &mut iv);
+        let _ = ctx.end_frame();
+        ctx.begin_frame(pointer_input(vec![button_event(pick, false)], None));
+        render_graphs_window(&ctx, &full, &mut iv);
+        let _ = ctx.end_frame();
+        assert_eq!(iv, 5000, "selecting the `5 s` preset writes the shared knob");
+
+        // A non-preset stored value (a hand-edited Settings figure):
+        // the button shows the exact millisecond figure (the
+        // `custom` display), and a preset pick still writes.
+        iv = 750;
+        ctx.begin_frame(egui::RawInput::default());
+        render_graphs_window(&ctx, &full, &mut iv);
+        let out = ctx.end_frame();
+        let texts = painted_texts(&out);
+        assert!(
+            texts.contains(&"750 ms"),
+            "a non-preset value shows its exact figure, got {texts:?}"
+        );
+        let click = text_click_pos(&out, "750 ms")
+            .expect("the combo button painted its custom text");
+        ctx.begin_frame(pointer_input(vec![button_event(click, true)], None));
+        render_graphs_window(&ctx, &full, &mut iv);
+        let _ = ctx.end_frame();
+        ctx.begin_frame(pointer_input(vec![button_event(click, false)], None));
+        render_graphs_window(&ctx, &full, &mut iv);
+        let _ = ctx.end_frame();
+        ctx.begin_frame(egui::RawInput::default());
+        render_graphs_window(&ctx, &full, &mut iv);
+        let out = ctx.end_frame();
+        let pick = text_click_pos(&out, "10 s").expect("the popup painted the `10 s` preset");
+        ctx.begin_frame(pointer_input(vec![button_event(pick, true)], None));
+        render_graphs_window(&ctx, &full, &mut iv);
+        let _ = ctx.end_frame();
+        ctx.begin_frame(pointer_input(vec![button_event(pick, false)], None));
+        render_graphs_window(&ctx, &full, &mut iv);
+        let _ = ctx.end_frame();
+        assert_eq!(iv, 10000, "a preset pick from a non-preset value writes the knob");
+    }
+
+    /// (t) The `Poll` combo's selected text (the pure display rule):
+    /// a stored preset shows its label; any other value (a
+    /// hand-edited Settings figure) shows its exact millisecond
+    /// figure — never a wrong preset.
+    #[test]
+    fn poll_interval_display_maps_presets_and_degrades_to_the_custom_figure() {
+        assert_eq!(poll_interval_display(500), "0.5 s");
+        assert_eq!(poll_interval_display(1000), "1 s");
+        assert_eq!(poll_interval_display(2000), "2 s");
+        assert_eq!(poll_interval_display(5000), "5 s");
+        assert_eq!(poll_interval_display(10000), "10 s");
+        // Non-preset values (a hand-edited Settings figure — the
+        // drag value's 100..=60 000 ms range): the exact figure.
+        assert_eq!(poll_interval_display(750), "750 ms");
+        assert_eq!(poll_interval_display(60_000), "60000 ms");
+        assert_eq!(poll_interval_display(0), "0 ms");
     }
 }
