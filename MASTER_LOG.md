@@ -2,6 +2,47 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Cycle 11 (v2.0.0 DIMM identity: revert C10 density paint + fix DDR4 rank decode to JESD79-4 bits 3:4) — 2026-09-17 — COMPLETE
+
+### What was delivered
+Cycle 11 (v2.0.0 DIMM identity: revert C10 density paint + fix DDR4 rank decode to JESD79-4 bits 3:4) is COMPLETE: **all 2 chunks merged into `v2-development` (C11-01+C11-02, one atomic `--no-ff` merge)** from baseline `a7bf7bb` (the Cycle 10 compaction) to tip `d170a3f` — driven by the operator's DIMM-identity pushback:
+
+**Operator pushback (the cycle driver):**
+- "We need to make sure we are identifying the DIMMs correctly and not just painting a value or guessing." — Cycle 10 had painted the density `0x0D` → 32 Gb to make the total capacity work out, but that only reconciled under a wrong rank-1 × 8-device decode; the operator confirmed the DIMMs are **dual-rank**.
+
+**The fix (C11-01, two coupled parts):**
+1. **Revert the C10 density paint** — density `0x0D` → **16 Gb** (the P6-04 value restored). 16 Gb per die is correct for a 32 GiB dual-rank DIMM: **16 Gb × 16 devices = 32 GiB**.
+2. **Fix the DDR4 rank decode** — read **bits 3:4 of byte 0x0C** (the JESD79-4 "Number of Ranks" field: 00=1 / 01=2 / 10=3 / 11=4) instead of bit 1 (which was actually part of the width field). For the live `0x0C = 0x09`: `(0x09 >> 3) & 0x03 = 1` → **rank 2 (dual-rank)** (and width bits 2:0 = 1 → x8).
+
+**Why this is correct (not a guess):**
+- The live SPD bytes were **read directly from the EEPROMs** — `0x0C = 0x09`, `0x13 = 0x0D`, both DIMMs identical.
+- The JESD79-4 byte 0x0C layout (width bits 2:0, rank bits 3:4) was **verified against 2 working decoders + JESD79-4** (HIGH confidence).
+- `0x09` decodes to **(x8, 2 ranks)**, matching the operator's confirmed dual-rank truth; **16 Gb × 16 devices = 32 GiB** per DIMM matches the 64 GiB total (2x32 GiB kit).
+
+**Chunks (one atomic `--no-ff` merge):**
+- **C11-01** rank decode + density revert — DDR4 rank decode reads byte 0x0C bits 3:4 (not bit 1); density `0x0D` reverted from 32 Gb to 16 Gb (the P6-04 value); 6 doc sites reworded; telemetry-only (81245f2).
+- **C11-02** test re-anchoring — the 7 pinned tests + the live fixture doc in `spd_decode.rs` re-anchored to rank 2 / 16 devices / 16 Gb (16384 Mbit); telemetry-only (f781b5a).
+- **Atomic merge** — C11-01 + C11-02 landed as one `--no-ff` merge **d170a3f** (the decode fix and its test re-anchoring are inseparable; c11-01/c11-02 branches pruned).
+
+### Key plan decisions
+- **D-1:** density `0x0D` → **16 Gb** (the P6-04 value restored) — the C10 32 Gb paint is reverted; 16 Gb × 16 devices = 32 GiB per dual-rank DIMM.
+- **D-2:** DDR4 rank = **byte 0x0C bits 3:4** (JESD79-4 "Number of Ranks": 00=1 / 01=2 / 10=3 / 11=4), not bit 1 (a width-field bit); width = bits 2:0 (live `0x09` → x8, rank 2).
+- **D-3:** identity over capacity-math — the decode is anchored to the live EEPROM bytes + the verified JESD79-4 field layout (2 working decoders, HIGH confidence), never painted to make the total work out.
+
+### Quality
+- **546/546 tests green (debug AND release, whole workspace)** — held from the Cycle 10 close (the 7 C11-02 tests re-anchored in place, no count change); **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); **MSRV 1.75** held; **6 release binaries** build; **zero new deps**; **zero-wire audit clean** (only `crates/ramsleuth-telemetry/src/spd_decode.rs` changed vs `a7bf7bb`; frozen structs / serde shapes byte-identical; protocol + all other crate diffs empty).
+- **QA verdict: PASS-WITH-MANUAL-LIVE-VERIFY** — both chunks merged; the operator live GUI run is the remaining manual gate.
+
+### Push state (operator gate)
+Local `v2-development` tip = **`d170a3f`** (Cycle 11 range `a7bf7bb..d170a3f`; `origin/v2-development` still `b908f7b`) — **unpushed, operator-gated** (this compaction performs no push). The c11-01/c11-02 chunk branches were pruned at the atomic merge (all fully merged into `v2-development`; tip `d170a3f` untouched). On the operator's go-ahead: **fast-forward to `d170a3f` (NEVER force-push) → prune the remote chunk branches → optional `v2.0.0` tag**.
+
+### Open items carried
+1. **Operator live GUI run (pending)** — `plans/CYCLE11-LIVE-CHECKLIST.md` (5950X host; needs interactive sudo): the header RAM line showing 2x32 GiB **Dual-Rank** (64 GiB kit) with no slot note, the 16 Gb / 16 devices / 16384 Mbit decode, and the unchanged MCLK — closes the PASS-WITH-MANUAL-LIVE-VERIFY verdict.
+2. **Push to GitHub** — operator go-ahead (ff to `d170a3f`, prune the remote chunk branches, optional `v2.0.0` tag; strictly no force-push, no pre-go-ahead remote mutation).
+3. The remaining Cycle 10 open items carry as listed in the Cycle 10 section (the Cycle 10 live GUI run — superseded by the Cycle 11 live run above; Intel MCHBAR decode — hardware-gated; MSRV 1.75 vs newer; CAD/RTT/drive SMN bitfields; AIDA64 parity gate).
+
+Cycle 11 close-out (2026-09-17): this compaction recorded the Cycle 11 section in `MASTER_LOG.md` and reset `DEV_LOG.md` (base line → `d170a3f`, ACTIVE_WORKERS cleared, CURRENT_STATE = COMPLETE, the per-lease history archived). No commit and no push (the commit lands in a separate follow-up subtask).
+
 ## Cycle 10 (v2.0.0 density 0x0D→32Gb + daemon DRAM-spike-before-MCLK-read) — 2026-09-17 — COMPLETE
 
 ### What was delivered
