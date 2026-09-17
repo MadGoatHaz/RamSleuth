@@ -2,6 +2,46 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Cycle 10 (v2.0.0 density 0x0D→32Gb + daemon DRAM-spike-before-MCLK-read) — 2026-09-17 — COMPLETE
+
+### What was delivered
+Cycle 10 (v2.0.0 density 0x0D→32Gb + daemon DRAM-spike-before-MCLK-read) is COMPLETE: **all 4 chunks merged into `v2-development` (C10-01…C10-04)** from baseline `f4ee93b` (the Cycle 9 compaction) to tip `5610e67` — the two operator tasks:
+
+**Operator task 1 — RAM density misdecode fix:**
+- The header RAM line showed "2x16 GiB" but the operator-confirmed truth is **2x32 GiB = 64 GiB total**. Root cause: the P6-04 0x0D → 16 Gb special case was wrong — it is actually **32 Gb per die**; the `decode_density` arm re-anchored with the live-module tests re-anchored to match (D-1, C10-01 + C10-02).
+
+**Operator task 2 — daemon DRAM-spike before MCLK re-read:**
+- Live MCLK reads low when the DIMMs sit in a low-power idle state; the daemon now spikes ~250 ms of DRAM load before each re-collect so the SMU PM `MCLK` reads the operating frequency (D-2/D-3, C10-03 + C10-04). The GUI "spiking" indicator (C10-05) was reviewed and documented no-op — it would have been a wire change; the effect rides the existing MCLK field (D-5).
+
+**Chunks (all `--no-ff` merged):**
+- **C10-01** density decode — `decode_density` 0x0D arm 16→32 Gb (32 GiB DIMM) + the P6-04 comment/doc reworded to the C10 reconciliation; telemetry-only, fixture bytes unchanged (8ac43e6).
+- **C10-02** test re-anchoring — the 5 live-module spots in `spd_decode.rs` tests re-anchored to 32 Gb / 32768 Mbit / 32 GiB (fixture doc "64 GiB kit (2x32 GiB)"); telemetry-only (60f3345).
+- **C10-03** spike module — new `crates/ramsleuth-daemon/src/dram_spike.rs` (256 MiB buffer, 250 ms duration, single-flight `AtomicBool` gate + RAII `RunningGuard`, strided read/write loop with a `black_box` sink, std-only surface, 5 tests) + 3-line `lib.rs` registration (5e89c7e).
+- **C10-04** collector wrap — the `main.rs` `TelemetryCache` collector wrapped `|| { spike(); ramsleuth_telemetry::collect() }` (the D-2 hook at the collector boundary, not a pre-lock call in rpc.rs); every re-collect runs `spike()` first; `rpc.rs`/`cache.rs`/CLI untouched (842adba).
+- **Wave 1 atomic merge** — C10-01 + C10-02 landed as one `--no-ff` merge **5ddec39** (c10-01/c10-02 branches pruned; the decode fix and its test re-anchoring are inseparable).
+- **Wave 2 chain merge** — C10-03 + C10-04 landed as one `--no-ff` merge **0d86359** (c10-03 pruned with c10-04, c10-04 worktree removed; the two waves file-disjoint, no rebase).
+
+### Key plan decisions
+- **D-1:** density 0x0D → **32 Gb** (32 GiB DIMM, 2x32=64 GiB kit) — the P6-04 "2x16 GiB kit" assumption from the part number was wrong; operator-confirmed 2x32 GiB.
+- **D-2:** the spike hook is the collector wrap in `main.rs` (`|| { spike(); collect() }` at the `TelemetryCache::new` site), NOT a pre-lock call in rpc.rs:207.
+- **D-3:** the spike module (`dram_spike.rs`) = 256 MiB buffer, 250 ms duration, single-flight `AtomicBool` gate + RAII `RunningGuard`, std-only surface.
+- **D-4:** ZERO-WIRE — the density fix changes a decoded value, not the wire format; the spike is daemon-internal; protocol + telemetry wire shapes byte-identical.
+- **D-5:** no GUI change — C10-05 (the "spiking" indicator) documented no-op; a "spiking" indicator would be a wire change, so the effect rides the existing MCLK field.
+
+### Quality
+- **546/546 tests green (debug AND release, whole workspace)** — up from 541 at the Cycle 9 close (541 baseline + 5 spike tests); **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); **MSRV 1.75** held; **6 release binaries** build; **zero new deps**; **zero-wire audit clean** (D-4: no protocol / `messages.rs` shape delta).
+- **QA verdict: PASS-WITH-MANUAL-LIVE-VERIFY** — all 4 chunks merged; the operator live GUI run is the remaining manual gate.
+
+### Push state (operator gate)
+Local `v2-development` tip = **`5610e67`** (Cycle 10 range `f4ee93b..5610e67`; `origin/v2-development` still `b908f7b`) — **unpushed, operator-gated** (this compaction performs no push). The 4 merged `branch/chunk-c10-*` chunk branches are the handover prune target (all fully merged into `v2-development`; tip `5610e67` untouched). On the operator's go-ahead: **fast-forward to `5610e67` (NEVER force-push) → prune the remote chunk branches → optional `v2.0.0` tag**.
+
+### Open items carried
+1. **Operator live GUI run (pending)** — `plans/CYCLE10-LIVE-CHECKLIST.md` (5950X host; needs interactive sudo): the header RAM line now showing 2x32 GiB (64 GiB kit) + MCLK reading the operating frequency after the pre-collect spike — closes the PASS-WITH-MANUAL-LIVE-VERIFY verdict.
+2. **Push to GitHub** — operator go-ahead (ff to `5610e67`, prune the remote chunk branches, optional `v2.0.0` tag; strictly no force-push, no pre-go-ahead remote mutation).
+3. The remaining Cycle 9 open items carry as listed in the Cycle 9 section (the Cycle 9 live GUI run; Intel MCHBAR decode — hardware-gated; MSRV 1.75 vs newer; CAD/RTT/drive SMN bitfields; AIDA64 parity gate).
+
+Cycle 10 close-out (2026-09-17): this compaction recorded the Cycle 10 section in `MASTER_LOG.md` and reset `DEV_LOG.md` (base line → `5610e67`, ACTIVE_WORKERS cleared, CURRENT_STATE = COMPLETE, the per-lease history archived). No commit and no push (the commit lands in a separate follow-up subtask).
+
 ## Cycle 9 (v2.0.0 RAM topology / Graphs lifecycle / CPU-temp hwmon / right-column layout) — 2026-09-16 — COMPLETE
 
 ### What was delivered
