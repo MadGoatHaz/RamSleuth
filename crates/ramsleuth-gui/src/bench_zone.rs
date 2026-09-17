@@ -459,6 +459,11 @@ pub fn render_bench_zone(
         .stroke(egui::Stroke::new(1.0_f32, CYAN))
         .inner_margin(egui::Margin::symmetric(10.0, 6.0));
     let _ = frame.show(ui, |ui| {
+        // D-4a width fill: force the content — and hence this frame's
+        // border — to span the full allocated column width; a `Frame`
+        // otherwise shrinks to its content's natural width (the
+        // table's), leaving dead space to the right of the border.
+        ui.set_min_width(ui.available_width());
         ui.label(egui::RichText::new(ZONE_TITLE).strong().color(CYAN));
         ui.add_space(4.0);
         render_grid_table(ui, data);
@@ -1301,5 +1306,46 @@ mod tests {
             latency_ns: [86.84, 1.12, 4.20, 13.90],
         });
         render_bench_headless(&done);
+    }
+
+    /// (s) The D-4a width fill: the frame's allocation spans the full
+    /// available width of the parent ui. `set_min_width(
+    /// available_width)` as the first line inside the frame closure
+    /// forces the content (and hence the `Frame` border) to the
+    /// allocated column width — a `Frame` otherwise shrinks to its
+    /// content's natural width (the table's, well under the panel
+    /// width), leaving dead space to the right of the border. Asserted
+    /// by rendering the zone into a bounded central panel and
+    /// measuring the panel ui's allocation: the frame's outer rect
+    /// (the widest allocation in the panel) must equal the panel's
+    /// available width.
+    #[test]
+    fn render_bench_zone_frame_fills_available_width() {
+        let data = TelemetryData::default();
+        let (tx, _rx) = std::sync::mpsc::channel::<BenchCmd>();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        // A bounded screen (a right-column-shaped allocation, not the
+        // 10000×10000 headless default): the central panel's ui is the
+        // parent the frame allocates into.
+        let screen = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(600.0, 500.0));
+        let ctx = egui::Context::default();
+        ctx.begin_frame(egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        });
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let available = ui.available_width();
+            assert!(available > 400.0, "a bounded panel to measure against");
+            render_bench_zone(ui, &data, &tx, &cancel);
+            // The frame's outer rect is the widest allocation in the
+            // panel ui; with the width-fill it spans the full
+            // available width (the border reaches the column edge).
+            let allocated = ui.max_rect().width();
+            assert!(
+                (allocated - available).abs() < 1.0,
+                "the bench frame must fill the available width: allocated {allocated} != available {available}"
+            );
+        });
     }
 }
