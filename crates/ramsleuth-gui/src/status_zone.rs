@@ -270,6 +270,14 @@ pub fn render_status_zone(ui: &mut egui::Ui, data: &TelemetryData) -> GuiAction 
         .stroke(egui::Stroke::new(1.0_f32, CYAN))
         .inner_margin(egui::Margin::symmetric(10.0, 6.0));
     let inner = frame.show(ui, |ui| {
+        // D-4a/D-4b fill: force the content — and hence this
+        // frame's border — to span the full allocated column width
+        // and the C9-05 status slice's remaining height; a `Frame`
+        // otherwise shrinks to its content's natural size (the
+        // SPD-card grid's), leaving dead space to the right of and
+        // below the border.
+        ui.set_min_width(ui.available_width());
+        ui.set_min_height(ui.available_height());
         ui.label(egui::RichText::new(ZONE_TITLE).strong().color(CYAN));
         ui.add_space(4.0);
         render_spd_cards(ui, data);
@@ -743,5 +751,81 @@ mod tests {
         assert_eq!(card_value_color("none"), CYAN);
         assert_eq!(card_value_color("N/A"), NA_GRAY);
         assert_eq!(card_value_color("N/A N/A-N/A-N/A-N/A @ N/A"), NA_GRAY);
+    }
+
+    /// (g) The C9-07 width + height fill (D-4a + D-4b): the zone
+    /// frame spans the full available width AND the full available
+    /// height of the parent ui (the C9-05 status slice).
+    /// `set_min_width` / `set_min_height` as the first lines inside
+    /// the frame closure force the content — and hence the `Frame`
+    /// border — to the allocated slice; a `Frame` otherwise shrinks
+    /// to its content's natural size (the SPD-card grid's), leaving
+    /// dead space to the right of and below the border. Asserted by
+    /// rendering the zone into a bounded box and measuring the
+    /// outermost CYAN-stroked rect (the frame border itself — the
+    /// per-card frames are the other CYAN rects, each strictly
+    /// inside the outer one): its size must equal the box's
+    /// available width and height, for a populated snapshot (two
+    /// cards), a no-SPD snapshot, and the no-telemetry placeholder
+    /// alike.
+    #[test]
+    fn render_status_zone_frame_fills_available_width_and_height() {
+        // The C9-05 status slice's shape: bounded, taller than the
+        // content's natural height (so the vertical fill has room to
+        // act) and wider than the card grid's natural width.
+        const W: f32 = 420.0;
+        const H: f32 = 640.0;
+        for telemetry in [Some(representative()), Some(no_spd()), None] {
+            let data = TelemetryData { telemetry, ..Default::default() };
+            let ctx = egui::Context::default();
+            ctx.begin_frame(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(W + 40.0, H + 40.0),
+                )),
+                ..Default::default()
+            });
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::Vec2::new(W, H),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        assert!((ui.available_width() - W).abs() < 1.0);
+                        assert!((ui.available_height() - H).abs() < 1.0);
+                        render_status_zone(ui, &data);
+                    },
+                );
+            });
+            let out = ctx.end_frame();
+            // The outer zone frame + one CYAN-stroked rect per SPD
+            // card; the cards sit inside the outer frame, so the
+            // outer is the largest-area rect.
+            let frame_rects: Vec<egui::Rect> = out
+                .shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Rect(r) if r.stroke.color == CYAN => Some(r.rect),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !frame_rects.is_empty(),
+                "the zone must paint its CYAN-stroked frame"
+            );
+            let outer = frame_rects
+                .iter()
+                .max_by(|a, b| a.area().total_cmp(&b.area()))
+                .unwrap();
+            assert!(
+                (outer.width() - W).abs() < 1.0,
+                "the frame border must fill the available width: {} != {W}",
+                outer.width()
+            );
+            assert!(
+                (outer.height() - H).abs() < 1.0,
+                "the frame border must fill the available height: {} != {H}",
+                outer.height()
+            );
+        }
     }
 }
