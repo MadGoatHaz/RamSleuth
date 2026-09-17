@@ -2,6 +2,62 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Cycle 8 (v2.0.0 header truth) — 2026-09-16 — COMPLETE
+
+### What was delivered
+Cycle 8 (v2.0.0 header truth) is COMPLETE: **all 11 chunks merged into `v2-development` (C8-01…C8-11)** — the four operator tasks:
+
+**Operator task 1 — AGESA relabel (honest provenance):**
+- Wire freeze adds the additive `smu_version` field (C8-01); the header now renders a provenance fragment — "AGESA <v>" (AGESA present, suppresses the SMU value) / "SMU <v>" (SMU only) / "AGESA N/A" — never a hybrid or a fabricated string (D-1, C8-11).
+
+**Operator task 2 — RAM capacity:**
+- SPD type classification re-anchored to byte 0x02 (0x0C → DDR4 512 B / DDR5 1024 B, 0x0B → DDR3); the live-host shape now classifies DDR4 and the part decodes from the 0x149 primary (C8-02).
+- Total-device decode per JESD79-4/5 (devices = total) → per-slot 16 GiB (D-2, C8-03).
+- Total flipped to MemTotal-preferred (OS ground truth); the SPD sum demoted to a pure `sum_dimm_sizes` non-meminfo fallback (D-3, C8-04).
+
+**Operator task 3 — N/A formatting + styling:**
+- `NA_GRAY` muted gray (0x8A8A94) const added to the palette (D-5, C8-05).
+- Zone 1 (C8-06), Zone 3 SPD cards (C8-07), Zone 2 bench cells (C8-08), and the Graphs no-source note (C8-09) all render bare "N/A" in NA_GRAY (D-4/D-5); fault-red preserved — the daemon status + `!` error line stay CRIMSON.
+
+**Operator task 4 — gear-metric removal:**
+- The redundant AMD gear row removed (gear_mode is always NotApplicable) + the combined GDM/CR row split into separate GEAR_DOWN + CR rows; Intel keeps its gear row (D-6, C8-10).
+
+**Chunks (all `--no-ff` merged):**
+- **C8-01** wire freeze — `SystemPlatform += smu_version` (additive, shape-checked; agesa narrowed to BIOS-string-only); 27 test literals co-landed across 16 files (c6ef83d).
+- **C8-02** byte-0x02 classification — the SPD type key re-anchored with the legacy byte-0x00 + image-length fallbacks preserved (8e4ceb7).
+- **C8-03** total-device decode — devices = total per JESD79-4/5 (per-slot 16 GiB) (c83bc6f).
+- **C8-04** MemTotal total — `total_capacity` prefers `/proc/meminfo`; the SPD sum demoted to `sum_dimm_sizes` (678430b).
+- **C8-05** NA_GRAY — the muted gray 0x8A8A94 const + re-export (14084b4).
+- **C8-06** Zone 1 N/A — six na_text arms + the no-telemetry placeholder render bare N/A; N/A cells recolored CRIMSON → NA_GRAY (7cdb4f8).
+- **C8-07** Zone 3 N/A — the SPD-card fields + placeholders render bare N/A in NA_GRAY; the daemon/error lines stay CRIMSON (f63cf1a).
+- **C8-08** Zone 2 N/A — bench unmeasured + NotStarted cells recolored CRIMSON → NA_GRAY (5ed3cff).
+- **C8-09** graph N/A — the no-source note + the permanent VDDCR_CPU row label render bare "N/A" (558d04a).
+- **C8-10** gear row + split — the AMD gear row removed; the combined GDM/CR row split into GEAR_DOWN + CR rows (0bbab2b).
+- **C8-11** header relabel — the provenance fragment in the header line per D-1 (+2 tests pinning the live "SMU 56.78.0" shape) (51d660f).
+
+### Key plan decisions
+- **D-1:** honest AGESA/SMU relabel by provenance — AGESA present → "AGESA <v>" (suppresses SMU); SMU only → "SMU <v>"; neither → "AGESA N/A"; never a hybrid or a fabricated string.
+- **D-2:** per-slot total-device decode — devices = total (JESD79-4/5); per-slot DIMM sizes stay SPD-derived.
+- **D-3:** MemTotal-preferred total — OS `/proc/meminfo` ground truth; the SPD sum demoted to the non-meminfo fallback.
+- **D-4:** bare "N/A" in the GUI — verbose parentheticals stripped; the reason stays on the wire.
+- **D-5:** `NA_GRAY` (0x8A8A94) for N/A (unavailable, not critical) + fault-red preserved (the daemon status + error line stay CRIMSON).
+- **D-6:** the redundant AMD gear row removed + the combined GDM/CR row split into GEAR_DOWN + CR rows (Intel keeps its gear row).
+
+### Quality
+- **527/527 tests green (debug AND release, whole workspace)** — up from 515 at the Cycle 7 close; **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); **MSRV 1.75** held; **6 release binaries** build; **zero new deps** (empty `Cargo.toml`/`Cargo.lock` diff over `9ea4b3b..5730b33`).
+- **Frozen-shape audit:** the ONLY wire change is the additive `SystemPlatform.smu_version: Section<String>` (appended after `agesa`; all pre-existing fields byte-identical; `SpdModule` field lines byte-identical — `devices` stays `Section<u8>`, a value-semantics fix per D-2; `ClockReadout` + `AmdPmSnapshot` unchanged; `messages.rs` changed only inside `mod tests`).
+- **QA verdict: PASS-WITH-MANUAL-LIVE-VERIFY** — all 11 chunks merged; the operator live GUI run is the remaining manual gate.
+
+### Push state (operator gate)
+Local `v2-development` tip = **`5730b33`** — **unpushed, operator-gated** (this compaction performs no push). The 11 merged `branch/chunk-c8-*` chunk branches are the handover prune target (all fully merged into `v2-development`; the tip `5730b33` untouched). On the operator's go-ahead: **fast-forward to `5730b33` (NEVER force-push) → prune the remote chunk branches → optional `v2.0.0` tag**.
+
+### Open items carried
+1. **Operator live GUI run (pending)** — `plans/CYCLE8-LIVE-CHECKLIST.md` (5950X host; needs interactive sudo): the header SMU relabel, RAM 62.68 GiB (2×16 GiB), the gray N/As, the GEAR_DOWN/CR split, the Graphs note, the flapping-daemon no-crash — closes the PASS-WITH-MANUAL-LIVE-VERIFY verdict.
+2. **Push to GitHub** — operator go-ahead (ff to `5730b33`, prune the remote chunk branches, optional `v2.0.0` tag; strictly no force-push, no pre-go-ahead remote mutation).
+3. The remaining Cycle 7 open items carry as listed in the Cycle 7 section (Intel MCHBAR decode — hardware-gated; MSRV 1.75 vs newer; CAD/RTT/drive SMN bitfields; AIDA64 parity gate).
+
+Cycle 8 close-out (2026-09-16): this compaction recorded the Cycle 8 section in `MASTER_LOG.md` and reset `DEV_LOG.md` (base line → `5730b33`, ACTIVE_WORKERS cleared, CURRENT_STATE = COMPLETE, the per-lease history archived). No commit and no push (the commit lands in a separate follow-up subtask).
+
 ## Cycle 7 (v2.0.0 Polish: UI Refactor, Telemetry Lifecycle, Burn-In, Graphs Window) — 2026-09-16 — COMPLETE
 
 ### What was delivered
