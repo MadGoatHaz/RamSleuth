@@ -993,20 +993,22 @@ mod tests {
     }
 
     /// A synthetic reconstruction of the live 5950X host module
-    /// (P6-04): G.Skill `F4-3600C18-32GVK` - a 32 GiB kit (2x16 GiB),
-    /// rank 1 x 8 devices (C8-03: the vendor hub's per-rank 1 fails
-    /// the consistency rule -> the per-rank is derived as 64 / 8),
+    /// (P6-04): G.Skill `F4-3600C18-32GVK` - a 64 GiB kit
+    /// (2x32 GiB, the C10 operator-confirmed truth), rank 1 x 8
+    /// devices (C8-03: the vendor hub's per-rank 1 fails the
+    /// consistency rule -> the per-rank is derived as 64 / 8),
     /// 3200 MT/s minimum. The module-maker field carries
     /// `0xC1` and the density byte carries `0x0D` (the two codes
-    /// P6-04 reconciles); the serial is blank and no XMP profiles
-    /// are present, as observed live.
+    /// P6-04 reconciles; the density re-reconciled by C10); the
+    /// serial is blank and no XMP profiles are present, as
+    /// observed live.
     fn live_5950x_image() -> SpdImage {
         let mut data = vec![0u8; 512];
         data[0x00] = 0x0A; // legacy memory-type check: DDR4 (agrees with 0x02, C8-02)
         // Module manufacturer 0xC1 (vendor nibble 0x01, continuation 0x0C).
         data[0x01] = 0x11;
         data[0x02] = 0x0C; // DDR4 memory type (C8-02 primary) + JEP106 continuation
-        // Density 0x0D - the live code; 16 Gb per die (P6-04).
+        // Density 0x0D - the live code; 32 Gb per die (the C10 reconciliation).
         data[0x13] = 0x0D;
         // Minimum data rate 3200 MT/s (32 x 100).
         data[0x20] = 0x20;
@@ -1015,7 +1017,7 @@ mod tests {
         // nibble agrees); the vendor hub (0x80 = 0x11) carries
         // per-rank 1, which fails the consistency rule (1 x 8 != 64)
         // -> the per-rank is derived as 64 / 8 = 8 -> 8 total devices
-        // (16 Gb x 8 / 8192 = 16 GiB per slot).
+        // (32 Gb x 8 / 8192 = 32 GiB per slot).
         data[0x0C] = 0x09;
         data[0x81] = 0x11;
         data[0x80] = 0x11;
@@ -1345,20 +1347,20 @@ mod tests {
 
     /// The codes observed on the live 5950X module now decode: maker
     /// `0xC1` -> G.Skill (reconciled against the part number
-    /// `F4-3600C18-32GVK`), density `0x0D` -> 16 Gb = 16384 Mbit (16
-    /// GiB rank-1 module, standard 8x8-die config), rank 1, 3200 MT/s,
-    /// and the part number as observed live.
+    /// `F4-3600C18-32GVK`), density `0x0D` -> 32 Gb = 32768 Mbit
+    /// (32 GiB rank-1 module, standard 8x8-die config), rank 1,
+    /// 3200 MT/s, and the part number as observed live.
     #[test]
     fn live_5950x_reconciled_codes_decode() {
         let m = decode(&live_5950x_image());
         assert!(!m.is_ddr5);
         assert_eq!(m.maker, Section::Value("G.Skill".to_owned()));
-        assert_eq!(m.density_mbit, Section::Value(16384));
+        assert_eq!(m.density_mbit, Section::Value(32768));
         assert_eq!(m.rank, Section::Value(1));
         // C8-03: the vendor hub (0x80 = 0x11, per-rank 1) fails the
         // consistency rule (1 x 8 != the 64-bit bus) -> the per-rank
-        // is derived as 64 / 8 = 8 -> 8 total devices (16 Gb x 8 /
-        // 8192 = 16 GiB per slot); the live fixture carries no
+        // is derived as 64 / 8 = 8 -> 8 total devices (32 Gb x 8 /
+        // 8192 = 32 GiB per slot); the live fixture carries no
         // die-ID bytes and the die-type label defaults to Na.
         assert_eq!(m.devices, Section::Value(8));
         assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
@@ -1370,13 +1372,13 @@ mod tests {
     }
 
     /// The operator's live shape (C8-03, D-2; the reported `2 GiB`
-    /// defect pinned as a regression): 16 Gb dies (`0x13 = 0x0D`),
+    /// defect pinned as a regression): 32 Gb dies (`0x13 = 0x0D`),
     /// 1 rank (`0x0C = 0x09` bit 1 + 1), x8 width (`0x0C` bits 2:0;
     /// the `0x81 = 0x11` lower nibble agrees), and the vendor's
     /// non-compliant hub (`0x80 = 0x11`: per-rank 1 fails
     /// `1 x 8 != 64` -> the per-rank is derived as `64 / 8 = 8`) ->
-    /// **8 total devices** -> the per-slot capacity `16384 x 8 /
-    /// 8192 = 16 GiB` (not the 2 GiB the old per-rank nibble
+    /// **8 total devices** -> the per-slot capacity `32768 x 8 /
+    /// 8192 = 32 GiB` (not the 2 GiB the old per-rank nibble
     /// produced).
     #[test]
     fn live_shape_total_devices() {
@@ -1384,16 +1386,16 @@ mod tests {
         assert!(!m.is_ddr5);
         assert_eq!(m.rank, Section::Value(1), "0x0C = 0x09 bit 1 -> rank 1");
         assert_eq!(m.devices, Section::Value(8), "8 total devices (derived per-rank)");
-        assert_eq!(m.density_mbit, Section::Value(16384), "16 Gb per die (0x13 = 0x0D)");
+        assert_eq!(m.density_mbit, Section::Value(32768), "32 Gb per die (0x13 = 0x0D)");
         // The facade's per-slot arithmetic (density_mbit x devices /
-        // 8192) fed by the corrected decode: 16 GiB per slot.
+        // 8192) fed by the corrected decode: 32 GiB per slot.
         let (Some(density), Some(devices)) = (m.density_mbit.value(), m.devices.value()) else {
             panic!("the live shape must decode density + devices");
         };
         assert_eq!(
             *density as f64 * *devices as f64 / 8192.0,
-            16.0,
-            "16384 x 8 / 8192 = 16 GiB per slot"
+            32.0,
+            "32768 x 8 / 8192 = 32 GiB per slot"
         );
     }
 
@@ -1422,7 +1424,7 @@ mod tests {
 
     /// Regression: the DDR4 density published family `0x10..=0x17`
     /// is unchanged (1..=32 Gb decode to Mbit; 64 / 128 Gb overflow the
-    /// u16 cell -> `Na(ParseError)`), the P6-04 `0x0D` -> 16 Gb is
+    /// u16 cell -> `Na(ParseError)`), the C10 `0x0D` -> 32 Gb is
     /// present, and codes outside both sets degrade to `Na(ParseError)`
     /// naming the code (no panic).
     #[test]
@@ -1453,12 +1455,12 @@ mod tests {
                 "{detail}"
             );
         }
-        // The P6-04 reconciled code: 0x0D -> 16 Gb = 16384 Mbit.
+        // The C10 reconciled code: 0x0D -> 32 Gb = 32768 Mbit.
         let mut data = vec![0u8; 512];
         data[0x00] = 0x0A;
         data[0x13] = 0x0D;
         let m = decode(&SpdImage { index: 0x50, data });
-        assert_eq!(m.density_mbit, Section::Value(16384));
+        assert_eq!(m.density_mbit, Section::Value(32768));
         // Unknown codes remain Na(ParseError) and name the code.
         for code in [0x00u8, 0x0F, 0x80] {
             let mut data = vec![0u8; 512];
@@ -1521,7 +1523,7 @@ mod tests {
     #[test]
     fn memory_type_byte_0x02_classifies() {
         // The live host shape: 0x00 = 0x23 (junk), 0x02 = 0x0C (the
-        // DDR4 key), 0x13 = 0x0D (16 Gb), 512 B -> DDR4, part from
+        // DDR4 key), 0x13 = 0x0D (32 Gb), 512 B -> DDR4, part from
         // 0x149.
         let mut data = vec![0u8; 512];
         data[0x00] = 0x23;
@@ -1530,7 +1532,7 @@ mod tests {
         data[0x149..0x149 + 16].copy_from_slice(b"F4-3600C18-32GVK");
         let m = decode(&SpdImage { index: 0x52, data });
         assert!(!m.is_ddr5, "512 B + 0x02 = 0x0C must classify DDR4");
-        assert_eq!(m.density_mbit, Section::Value(16384), "16 Gb per the live code");
+        assert_eq!(m.density_mbit, Section::Value(32768), "32 Gb per the live code");
         assert_eq!(m.part, Section::Value("F4-3600C18-32GVK".to_owned()));
 
         // The same key on a 1024 B image -> DDR5.
