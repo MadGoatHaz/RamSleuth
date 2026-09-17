@@ -18,7 +18,7 @@
 //! | `0x00`                                 | SPD bytes used; bits 4:0 also carry the legacy memory-type check (`0x0A` DDR4 / `0x0C` DDR5) — the documented fallback when `0x02` is unrecognized (C8-02) |
 //! | `0x01` / `0x02`                        | Module manufacturer JEP106 vendor / continuation nibble (byte `0x02` doubles as the basic-info memory type) |
 //! | `0x02`                                 | Basic-info memory type (JESD79-4/5): `0x0C` = DDR4 (512 B image) / DDR5 (1024 B image — the generations share the code), `0x0B` = DDR3 — the primary classification (C8-02) |
-//! | `0x0C`                                 | DDR4 module organization (JESD79-4): package ranks per DIMM - 1 (bit 1) + SDRAM device width (bits 2:0: `0 = x4 / 1 = x8 / 2 = x16`) — the DDR4 rank + width primary (C8-03) |
+//! | `0x0C`                                 | DDR4 module organization (JESD79-4): data width (bits 2:0: `0 = x4 / 1 = x8 / 2 = x16 / 3 = x32`) + number of ranks (bits 3:4: `00 = 1 / 01 = 2 / 10 = 3 / 11 = 4`) — the DDR4 rank + width primary (C11, per JESD79-4; the C10 bit-1 rank read is a bug — that bit belongs to the width field) |
 //! | `0x0D`                                 | DDR4 SDRAM bus-width extension (bit 4) — the consistency rule's bus = 64 + extension (C8-03) |
 //! | `0x2E` / `0x2F` (DDR5), `0x100` / `0x101` (DDR4) | DRAM die manufacturer JEP106 |
 //! | `0x13`                                 | SDRAM density (code -> Gb)                         |
@@ -116,9 +116,10 @@ const BYTE_BASE_SPEED: usize = 0x20;
 /// bits 7:4 also carry the rank in the DDR5 hub model (and the DDR4
 /// rank fallback when byte `0x0C` is blank/absent).
 const BYTE_RANK_CONFIG: usize = 0x80;
-/// Byte `0x0C`: DDR4 module organization (JESD79-4, C8-03): bit 1 =
-/// package ranks per DIMM - 1 (rank = bit + 1), bits 2:0 = SDRAM device
-/// width code (`0 = x4 / 1 = x8 / 2 = x16`, else unrecognized).
+/// Byte `0x0C`: DDR4 module organization (JESD79-4, C11): bits 3:4 =
+/// number of ranks (`00 = 1 / 01 = 2 / 10 = 3 / 11 = 4`; rank = code
+/// + 1), bits 2:0 = SDRAM device width code (`0 = x4 / 1 = x8 / 2 =
+/// x16`, else unrecognized -> the `0x81` fallback).
 const BYTE_RANK_WIDTH: usize = 0x0C;
 /// Byte `0x0D`: DDR4 SDRAM bus-width extension (JESD79-4, C8-03): bit 4
 /// extends the 64-bit desktop bus (the consistency rule's bus = 64 or
@@ -238,7 +239,7 @@ pub struct SpdModule {
     /// plus the `0x0D` bit-4 extension), else derived as
     /// `bus / width` (the non-compliant vendor hub is worked around,
     /// never trusted, D-2); the rank is generation-scoped (DDR4 byte
-    /// `0x0C` bit 3 + 1, DDR5 byte `0x80` bits 7:4). The per-DIMM
+    /// `0x0C` bits 3:4 + 1, DDR5 byte `0x80` bits 7:4). The per-DIMM
     /// capacity is `density_mbit × devices / 8192` GiB (the facade's
     /// D-C3 arithmetic consumes the total). `Na` when the module
     /// organization is absent or invalid (the same gating as
@@ -252,9 +253,10 @@ pub struct SpdModule {
     /// Module serial number (bytes `0x91..0xA1`, 16 ASCII chars).
     pub serial: Section<String>,
     /// Number of ranks (C8-03, generation-scoped): DDR4 byte `0x0C`
-    /// bit 1 + 1 (the JESD79-4 package-ranks-per-DIMM - 1 code; the
-    /// byte `0x80` bits 7:4 hub nibble when `0x0C` is blank/absent),
-    /// DDR5 byte `0x80` bits 7:4 (the documented hub model).
+    /// bits 3:4 + 1 (the JESD79-4 number-of-ranks code
+    /// `00 = 1 / 01 = 2 / 10 = 3 / 11 = 4`; the byte `0x80` bits 7:4
+    /// hub nibble when `0x0C` is blank/absent), DDR5 byte `0x80`
+    /// bits 7:4 (the documented hub model).
     pub rank: Section<u8>,
     /// Per-DRAM density in Mbit.
     pub density_mbit: Section<u16>,
@@ -510,18 +512,18 @@ fn device_width(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
 }
 
 /// The module's rank count (C8-03, D-2), generation-scoped: DDR4 =
-/// byte `0x0C` bit 1 + 1 (the JESD79-4 package-ranks-per-DIMM - 1
-/// code), falling back to the byte `0x80` bits 7:4 hub nibble when
-/// `0x0C` is blank / absent; DDR5 = byte `0x80` bits 7:4 (the
-/// documented hub model). A zero rank from either source -> `NaReason`
-/// naming the byte; never a panic.
+/// byte `0x0C` bits 3:4 + 1 (the JESD79-4 number-of-ranks code),
+/// falling back to the byte `0x80` bits 7:4 hub nibble when `0x0C`
+/// is blank / absent; DDR5 = byte `0x80` bits 7:4 (the documented
+/// hub model). A zero rank from either source -> `NaReason` naming
+/// the byte; never a panic.
 fn rank_count(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
     if is_ddr5 {
         let hub = get(data, BYTE_RANK_CONFIG).ok_or_else(|| oob(BYTE_RANK_CONFIG))?;
         return rank_from_nibble(hub, BYTE_RANK_CONFIG);
     }
     match get(data, BYTE_RANK_WIDTH) {
-        Some(rw) if rw != 0 => Ok(((rw >> 1) & 1) + 1),
+        Some(rw) if rw != 0 => Ok(((rw >> 3) & 0x03) + 1),
         // `0x0C` blank / absent: the byte `0x80` hub nibble stands in
         // for the rank.
         _ => {
@@ -621,12 +623,11 @@ fn decode_devices(data: &[u8], is_ddr5: bool) -> Section<u8> {
 
 /// Decode the SDRAM density (byte `0x13`) into Mbit:
 /// - DDR4: code `0x10..=0x17` -> 2^(code-0x10) Gb (1..128 Gb); `0x0D`
-///   -> 32 Gb (the C10 reconciliation of the P6-04 special case: the
-///   5950X module carries `0x0D`, a vendor/legacy encoding outside
-///   the `0x10..=0x17` published family; the operator-confirmed kit
-///   is 2x32 GiB = 64 GiB total, so `0x0D` = 32 Gb per die in the
-///   8-device config; P6-04's 16 Gb guess from the `F4-3600C18-32GVK`
-///   part-number suffix is invalidated by the live capacity);
+///   -> 16 Gb (the P6-04 special case, restored by C11: the
+///   dual-rank decode of the live `0x0C = 0x09` (bits 3:4) reconciles
+///   16 Gb x 16 devices to the operator-confirmed 32 GiB per DIMM;
+///   the C10 32 Gb paint is a mis-reconciliation under the wrong
+///   rank-1 x 8 decode and is reverted);
 /// - DDR5: documented model, code `0x11..=0x18` -> 1..64 Gb.
 ///
 /// An unrecognized code -> `Na(ParseError)`; a result >= 64 Gb
@@ -652,14 +653,13 @@ fn decode_density(data: &[u8], is_ddr5: bool) -> Section<u16> {
             }
         }
     } else if code == 0x0D {
-        // C10 reconciliation (2026-09-17, supersedes P6-04): the
-        // 5950X G.Skill module carries 0x0D at byte 0x13 - a
+        // The 5950X G.Skill module carries 0x0D at byte 0x13 - a
         // vendor/legacy encoding outside the 0x10..=0x17 published
-        // family. The operator-confirmed kit is 2x32 GiB (64 GiB
-        // total), so 0x0D = 32 Gb per die in the 8-device config
-        // -> 32 GiB per DIMM; P6-04's 16 Gb "2x16 GiB kit" guess
-        // from the part-number suffix was wrong.
-        32
+        // family. 16 Gb per die (the P6-04 reconciliation, restored
+        // by C11: 16 Gb x 16 devices (2 ranks x 8) = 32 GiB per
+        // DIMM; the C10 32 Gb paint is reverted - it closed the
+        // capacity loop under the wrong rank-1 x 8 decode).
+        16
     } else if (0x10..=0x17).contains(&code) {
         1u32 << (code - 0x10)
     } else {
