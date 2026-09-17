@@ -872,13 +872,16 @@ impl RamSleuthApp {
 
     /// The three zones: the telemetry matrix (zone 1) on the left; the
     /// benchmark grid + controls (zone 2) stacked over the hardware /
-    /// SPD status (zone 3) on the right — the columns take the
+    /// SPD status (zone 3) on the right as two slices (C9-05, D-4b:
+    /// the bench at its natural height, the status at the remaining
+    /// column height, the 8 pt gap preserved) — the columns take the
     /// central panel's full height (C7-19 removed the embedded
     /// 10-minute trend history strip; the trend data now lives in
     /// the Graphs window, C7-21) — all visible, non-scrolling at the
-    /// 1400×900 size (the right column degrades to a scroll area in
-    /// a small window). Returns the [`GuiAction`] the status zone
-    /// reported this frame (`None` when no button was clicked).
+    /// 1400×900 size (in a small window the right column's slices
+    /// degrade to a scroll area — the overflow fallback). Returns the
+    /// [`GuiAction`] the status zone reported this frame (`None` when
+    /// no button was clicked).
     fn render_zones(&self, ctx: &egui::Context, data: &TelemetryData) -> GuiAction {
         let mut action = GuiAction::None;
         let bench_tx = &self.bench_tx;
@@ -910,15 +913,66 @@ impl RamSleuthApp {
                         |ui| render_telemetry_zone(ui, data),
                     );
                     ui.add_space(COLUMN_GAP);
-                    // Right: zone 2 stacked over zone 3.
+                    // Right: zone 2 over zone 3 as two stacked
+                    // slices (C9-05, D-4b): the bench slice at its
+                    // natural height, the preserved 8 pt gap, then
+                    // the status slice at the remaining column
+                    // height — two `allocate_ui_with_layout` children
+                    // of the column's single allocation (the border /
+                    // balance against zone 1 is unchanged). The
+                    // `ScrollArea` stays as the overflow fallback:
+                    // in a small window the bench's natural height
+                    // alone exceeds the column, the status slice
+                    // takes its zero budget, and the content scrolls
+                    // below — never a clipped / overflowing paint.
                     ui.allocate_ui_with_layout(
                         egui::Vec2::new(right_w, row_h),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
                             let _ = egui::ScrollArea::vertical().show(ui, |ui| {
-                                render_bench_zone(ui, data, bench_tx, cancel);
+                                // The slice width is the scroll
+                                // content's available width:
+                                // `right_w` with no scrollbar,
+                                // `right_w` minus the gutter while
+                                // the fallback scrolls (today's
+                                // exact width behavior — no
+                                // regression).
+                                let slice_w = ui.available_size().x.max(0.0);
+                                // Slice 1: the bench at its natural
+                                // height — the zero-budget
+                                // allocation: top-down content
+                                // self-sizes past the zero rect (egui
+                                // never clips a child to it) and
+                                // advances the layout by the drawn
+                                // `min_rect`, whose height is the
+                                // natural size.
+                                let bench = ui.allocate_ui_with_layout(
+                                    egui::Vec2::new(slice_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| render_bench_zone(ui, data, bench_tx, cancel),
+                                );
+                                let bench_h = bench.response.rect.height().max(0.0);
                                 ui.add_space(8.0);
-                                action = render_status_zone(ui, data);
+                                // Slice 2: the status at the
+                                // remaining column height
+                                // (`row_h - bench_h - 8`, minus the
+                                // item gap egui leaves after the
+                                // bench allocation — reserving it
+                                // keeps the filled status slice
+                                // (C9-07) exactly at the column's
+                                // bottom: no permanent scrollbar at
+                                // 1400×900, C7-19). Zero when the
+                                // bench alone overflows (the scroll
+                                // fallback above).
+                                let gap = ui.spacing().item_spacing.y;
+                                let status_h = (row_h - bench_h - 8.0 - gap).max(0.0);
+                                let _ = ui.allocate_ui_with_layout(
+                                    egui::Vec2::new(slice_w, status_h),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        action = render_status_zone(ui, data);
+                                    },
+                                );
                             });
                         },
                     );
@@ -2427,6 +2481,124 @@ mod tests {
             // A held-closed frame: no edge, the original stands.
             app.apply_graphs_lifecycle();
             assert_eq!(gate(&app), original, "a held-closed frame must not touch the gate");
+        }
+        fs::remove_dir_all(&out_dir).expect("cleanup");
+    }
+    /// (u1) The C9-05 right-column split (D-4b): the right column
+    /// renders the bench and the status as two stacked slices — the
+    /// bench at its natural height over the status, the 8 pt gap
+    /// preserved — and degrades to the `ScrollArea` overflow
+    /// fallback in a small window (the bench's natural height alone
+    /// exceeds the column, the status slice takes its zero budget,
+    /// and the content scrolls below). No panic at either size, no
+    /// action without a click, one CYAN frame per zone.
+    #[test]
+    fn render_zones_right_column_split_two_stacked_slices() {
+        let out_dir = temp_out_dir("right-split");
+        // (w, h): the default 1400×900 (the non-scrolling dashboard,
+        // C7-19 — both slices fit the column) and a small window
+        // (the scroll fallback path — the bench alone overflows).
+        for (case, (w, h)) in [(1400.0, 900.0), (900.0, 220.0)].into_iter().enumerate() {
+            let (bench_tx, _bench_rx) = std::sync::mpsc::channel::<BenchCmd>();
+            let app = RamSleuthApp {
+                state: Arc::new(RwLock::new(TelemetryData::default())),
+                bench_tx,
+                stop: Arc::new(AtomicBool::new(false)),
+                cancel: Arc::new(AtomicBool::new(false)),
+                settings_open: false,
+                graphs_open: Arc::new(AtomicBool::new(false)),
+                saved_refresh: None,
+                last_graphs_open: false,
+                out_dir: out_dir.clone(),
+                poller: None,
+                notice: None,
+            };
+            let data = TelemetryData::default();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(w, h));
+            let ctx = egui::Context::default();
+            ctx.begin_frame(egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            });
+            let action = app.render_zones(&ctx, &data);
+            let out = ctx.end_frame();
+
+            assert_eq!(action, GuiAction::None, "a no-click frame must report no action");
+
+            // The zone frames: the CYAN-stroked rects of frame size
+            // (the header / settings strips use `HEADER_STROKE`, not
+            // CYAN; glyphs are `Shape::Text`, not `Shape::Rect`).
+            let frames: Vec<egui::Rect> = out
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.stroke.color == CYAN && rect.rect.width() >= 100.0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .collect();
+            // The right-column frames: those sharing the rightmost
+            // column's left edge (the telemetry frame is the lone
+            // left one).
+            let total = frames.len();
+            let right_x = frames.iter().fold(0.0_f32, |mx, r| mx.max(r.min.x));
+            let mut right: Vec<egui::Rect> =
+                frames.into_iter().filter(|r| (r.min.x - right_x).abs() < 2.0).collect();
+            if case == 0 {
+                // Default window: all three frames are visible —
+                // one per zone (the placeholder status draws no SPD
+                // cards).
+                assert_eq!(
+                    right.len(),
+                    2,
+                    "the right column must hold the bench + status slices (frames: {total})"
+                );
+                right.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
+                let (bench, status) = (right[0], right[1]);
+                assert!(bench.max.y < status.min.y, "the bench slice must sit above the status slice");
+                let gap = status.min.y - bench.max.y;
+                assert!(gap >= 7.9, "the preserved 8 pt gap must separate the slices (got {gap})");
+                assert!(
+                    gap <= 25.0,
+                    "the gap is 8 pt + one item spacing, not a layout blow-up (got {gap})"
+                );
+                // The bench slice keeps its natural height — far
+                // from stretched to the column (filling the
+                // remainder is the status slice's job, C9-07).
+                let bench_h = bench.height();
+                assert!(
+                    bench_h < 0.6 * (h - 100.0),
+                    "the bench slice must stay at its natural height (got {bench_h} of {h})"
+                );
+                // Both slices fit the column — the fallback stays
+                // dormant (the non-scrolling dashboard, C7-19).
+                assert!(
+                    status.max.y <= h - 3.9,
+                    "the status frame must fit the column (bottom {} of {})",
+                    status.max.y,
+                    h
+                );
+            } else {
+                // Small window: the bench's natural height alone
+                // exceeds the column — the scroll fallback is
+                // active: the bench overflows the window bottom and
+                // the status (stacked below it) is clipped off-
+                // screen until scrolled into view.
+                assert_eq!(
+                    right.len(),
+                    1,
+                    "the visible right-column slice is the bench (frames: {total})"
+                );
+                assert!(
+                    right[0].max.y > h - 3.9,
+                    "the bench must overflow the small column (the scroll fallback), bottom {} of {}",
+                    right[0].max.y,
+                    h
+                );
+            }
         }
         fs::remove_dir_all(&out_dir).expect("cleanup");
     }
