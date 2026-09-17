@@ -366,6 +366,16 @@ struct RamSleuthApp {
     /// write this shared flag (D-C7: the two close paths are
     /// behaviorally identical).
     graphs_open: Arc<AtomicBool>,
+    /// The pre-open `settings.refresh_enabled` saved by the Graphs
+    /// telemetry lifecycle detector (C9-02, D-2): `Some` while the
+    /// window is open (the opening edge force-enabled the gate),
+    /// restored + cleared on the closing edge — either close path
+    /// clears the same flag, D-C7.
+    saved_refresh: Option<bool>,
+    /// The previous frame's `graphs_open` value: the C9-02 edge
+    /// detector's memory (rising = the window opened, falling = it
+    /// closed).
+    last_graphs_open: bool,
     /// The export destination dir (F2 / F3 write here — `$HOME`).
     out_dir: PathBuf,
     /// The background poller thread (joined — bounded — on drop so the
@@ -463,6 +473,13 @@ impl eframe::App for RamSleuthApp {
                 self.handle_action(ctx, keyed_action);
             }
         }
+
+        // The Graphs window's telemetry lifecycle (C9-02, D-2): the
+        // per-frame transition detector — force-on on the opening
+        // edge, restore on the closing edge (both close paths clear
+        // the same flag, D-C7) — before the keep-alive re-
+        // registration below.
+        self.apply_graphs_lifecycle();
 
         // The Graphs window (C7-21, D-3): while open, re-register
         // the deferred child viewport every frame — the keep-alive
@@ -954,6 +971,35 @@ impl RamSleuthApp {
             GuiAction::None => {}
         }
     }
+
+    /// The Graphs window's telemetry lifecycle (C9-02, D-2): run
+    /// once per frame from `update` — the single `graphs_open`
+    /// transition detector. The opening edge saves the current
+    /// refresh gate and forces it on (the window's live streaming
+    /// runs regardless of the auto-refresh knob — the poller
+    /// re-reads it every tick, C6-27, so no poller change is
+    /// needed); the closing edge restores the saved pre-open value
+    /// and clears it. Both close paths (the header button toggle +
+    /// the child's WM `close_requested`) clear the same shared
+    /// flag, so one falling edge covers both (D-C7) — no per-site
+    /// hooks. The settings write is the render thread's one
+    /// permitted mutation (no I/O, D6 — the settings-panel
+    /// precedent); the brief write lock is taken only on an edge,
+    /// never per frame.
+    fn apply_graphs_lifecycle(&mut self) {
+        let now_open = self.graphs_open.load(Ordering::Relaxed);
+        if now_open != self.last_graphs_open {
+            let mut guard = self.state.write().unwrap();
+            if let Some(refresh) = apply_refresh_transition(
+                &mut self.saved_refresh,
+                &mut self.last_graphs_open,
+                now_open,
+                guard.settings.refresh_enabled,
+            ) {
+                guard.settings.refresh_enabled = refresh;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1043,6 +1089,39 @@ fn run_graphs_child_frame(
     }
 }
 
+/// The Graphs window's telemetry lifecycle transition (C9-02, D-2):
+/// the pure edge logic over the detector's memory — the app's
+/// [`RamSleuthApp::apply_graphs_lifecycle`] runs it on each edge
+/// under a brief write lock. The opening edge (closed → open) saves
+/// the current refresh gate and forces it on (the window's live
+/// streaming runs regardless of the auto-refresh knob); the closing
+/// edge (open → closed) restores the saved pre-open value and
+/// clears it. Both close paths (the header button toggle + the
+/// child's WM `close_requested`) clear the same shared flag, so one
+/// falling edge covers both (D-C7). A no-edge frame writes nothing.
+/// Returns the `refresh_enabled` to write, or `None` for no change.
+fn apply_refresh_transition(
+    saved: &mut Option<bool>,
+    last: &mut bool,
+    now_open: bool,
+    current: bool,
+) -> Option<bool> {
+    let change = if now_open && !*last {
+        // Opening edge: save the original, then force on.
+        *saved = Some(current);
+        Some(true)
+    } else if !now_open && *last {
+        // Closing edge: restore the saved original (`None` — the
+        // defensive no-op when nothing was saved).
+        saved.take()
+    } else {
+        // No edge: nothing changes.
+        None
+    };
+    *last = now_open;
+    change
+}
+
 fn main() -> ExitCode {
     // 1. Parse the command line (usage error → exit 2).
     let args = match parse_args(std::env::args().skip(1)) {
@@ -1109,6 +1188,8 @@ fn main() -> ExitCode {
                 cancel,
                 settings_open: false,
                 graphs_open,
+                saved_refresh: None,
+                last_graphs_open: false,
                 out_dir,
                 poller: Some(poller),
                 notice: None,
@@ -2209,5 +2290,129 @@ mod tests {
             !flag.load(Ordering::Relaxed),
             "close_requested must clear the open flag (the D-3 close)"
         );
+    }
+
+    /// (g5) The C9-02 transition detector's pure edge logic: the
+    /// opening edge saves the current gate and forces it on (even
+    /// with auto-refresh off), the closing edge restores the saved
+    /// original (a pre-enabled original stays enabled) and consumes
+    /// the save, a no-edge frame writes nothing, and a close edge
+    /// with no saved value (defensive) writes nothing.
+    #[test]
+    fn refresh_transition_open_forces_on_and_close_restores() {
+        // Opening with auto-refresh OFF (the default): the detector
+        // saves the `false` original and forces the gate on.
+        let mut saved = None;
+        let mut last = false;
+        assert_eq!(
+            apply_refresh_transition(&mut saved, &mut last, true, false),
+            Some(true),
+            "the opening edge must force the gate on"
+        );
+        assert_eq!(saved, Some(false), "the pre-open original must be saved");
+        assert!(last, "the edge memory must now read open");
+
+        // A held-open frame is a no-edge: no write.
+        assert_eq!(apply_refresh_transition(&mut saved, &mut last, true, true), None);
+        assert_eq!(saved, Some(false));
+
+        // Closing (either path — both clear the same flag, D-C7):
+        // restore the saved `false` + consume the save.
+        assert_eq!(
+            apply_refresh_transition(&mut saved, &mut last, false, true),
+            Some(false),
+            "the closing edge must restore the saved original"
+        );
+        assert_eq!(saved, None, "the save must be consumed on the close edge");
+        assert!(!last, "the edge memory must now read closed");
+
+        // A held-closed frame is a no-edge: no write.
+        assert_eq!(apply_refresh_transition(&mut saved, &mut last, false, false), None);
+        assert_eq!(saved, None);
+
+        // Opening with the gate already ON: the detector saves the
+        // `true` original and re-asserts on.
+        assert_eq!(apply_refresh_transition(&mut saved, &mut last, true, true), Some(true));
+        assert_eq!(saved, Some(true));
+
+        // Closing: a pre-enabled original stays enabled.
+        assert_eq!(
+            apply_refresh_transition(&mut saved, &mut last, false, true),
+            Some(true),
+            "a pre-enabled original must stay enabled after the close"
+        );
+        assert_eq!(saved, None);
+
+        // Defensive: a close edge with no saved value writes
+        // nothing (the flag cannot be open without the app having
+        // seen the opening edge, but the detector must stay no-op
+        // safe).
+        let mut last = true;
+        assert_eq!(apply_refresh_transition(&mut saved, &mut last, false, false), None);
+        assert!(!last);
+    }
+
+    /// (g6) The C9-02 lifecycle through the app itself (the
+    /// per-frame detector's wiring, headless — `update` calls
+    /// `apply_graphs_lifecycle`): opening the window force-enables
+    /// the shared refresh gate even with auto-refresh off, and
+    /// closing it (either path — both store the same flag `false`,
+    /// D-C7: the g1 button toggle and the g4 WM close) reverts the
+    /// gate to the saved original; a pre-enabled original stays
+    /// enabled after the close.
+    #[test]
+    fn graphs_lifecycle_force_enables_and_reverts_the_refresh_gate() {
+        let out_dir = temp_out_dir("graphs-lifecycle");
+        for original in [false, true] {
+            let (bench_tx, _bench_rx) = std::sync::mpsc::channel::<BenchCmd>();
+            let mut app = RamSleuthApp {
+                state: Arc::new(RwLock::new(TelemetryData {
+                    settings: GuiSettings {
+                        refresh_enabled: original,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })),
+                bench_tx,
+                stop: Arc::new(AtomicBool::new(false)),
+                cancel: Arc::new(AtomicBool::new(false)),
+                settings_open: false,
+                graphs_open: Arc::new(AtomicBool::new(false)),
+                saved_refresh: None,
+                last_graphs_open: false,
+                out_dir: out_dir.clone(),
+                poller: None,
+                notice: None,
+            };
+            let gate = |app: &RamSleuthApp| app.state.read().unwrap().settings.refresh_enabled;
+
+            // The opening edge (the header button's click stores
+            // `true`, g1): the detector force-enables the gate.
+            app.graphs_open.store(true, Ordering::Relaxed);
+            app.apply_graphs_lifecycle();
+            assert!(gate(&app), "open must force the gate on (original: {original})");
+            assert_eq!(
+                app.saved_refresh,
+                Some(original),
+                "the pre-open original must be saved"
+            );
+
+            // A held-open frame: no edge, the gate stays on.
+            app.apply_graphs_lifecycle();
+            assert!(gate(&app), "a held-open frame must not touch the gate");
+
+            // The closing edge (either path stores `false` — the
+            // g1 button toggle / the g4 WM close): the detector
+            // reverts to the saved original.
+            app.graphs_open.store(false, Ordering::Relaxed);
+            app.apply_graphs_lifecycle();
+            assert_eq!(gate(&app), original, "close must restore the saved original (original: {original})");
+            assert_eq!(app.saved_refresh, None, "the save must be consumed on the close edge");
+
+            // A held-closed frame: no edge, the original stands.
+            app.apply_graphs_lifecycle();
+            assert_eq!(gate(&app), original, "a held-closed frame must not touch the gate");
+        }
+        fs::remove_dir_all(&out_dir).expect("cleanup");
     }
 }
