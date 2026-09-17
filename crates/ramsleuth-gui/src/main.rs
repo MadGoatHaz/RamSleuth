@@ -109,6 +109,7 @@ use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
 use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::Section;
+use ramsleuth_telemetry::spd_decode::SpdModule;
 use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
 
 /// How long a transient header notice (an F2 / F3 export result) stays
@@ -569,19 +570,46 @@ fn age_fragment(platform: &SystemPlatform) -> String {
     }
 }
 
+/// The rank word for the header breakdown (C9-01, D-1): mirrors the
+/// SPD cards' rank label — `1` → `Single-Rank`, `2` → `Dual-Rank`,
+/// `n > 0` → `<n>-Rank` — but returns `None` for a `Na`/`0` rank:
+/// the compact header omits the word entirely (never prints `N/A`).
+/// The rank is the C8-03 wire field (`SpdModule.rank`), read, never
+/// written — no wire change this cycle.
+fn rank_word(rank: &Section<u8>) -> Option<String> {
+    match rank {
+        Section::Value(0) | Section::Na(_) => None,
+        Section::Value(1) => Some("Single-Rank".to_owned()),
+        Section::Value(2) => Some("Dual-Rank".to_owned()),
+        Section::Value(other) => Some(format!("{other}-Rank")),
+    }
+}
+
 /// The per-DIMM capacity summary (the mockup's `2x32GB`): one
 /// `<count>x<size>` group per distinct carried size (first-seen
 /// order, ` + `-joined) with the size rendered in the selected
 /// capacity unit (C7-11: `format_capacity` — the `x`-group prefix is
-/// kept); the `Na` entries contribute nothing, and an all-`Na` /
+/// kept); C9-01 (D-1): the group key is `(size, rank word)` — the
+/// rank word from the parallel `spd` slice (the C8-03 wire field,
+/// positionally aligned with `sizes`, the facade contract) is
+/// appended to the group when present (`2x16 GiB Single-Rank`; a
+/// `Na`/`0` rank omits the word, degrading to the bare `2x16 GiB`);
+/// the `Na` size entries contribute nothing, and an all-`Na` /
 /// empty list degrades to `N/A`.
-fn dimm_summary(sizes: &[Section<f64>], units: &Units) -> String {
-    let mut groups: Vec<(f64, usize)> = Vec::new();
-    for cell in sizes {
+fn dimm_summary(sizes: &[Section<f64>], spd: &[SpdModule], units: &Units) -> String {
+    let mut groups: Vec<(f64, Option<String>, usize)> = Vec::new();
+    for (slot, cell) in sizes.iter().enumerate() {
         if let Some(gib) = cell.value() {
-            match groups.iter_mut().find(|(value, _)| (value - gib).abs() < 0.05) {
-                Some(group) => group.1 += 1,
-                None => groups.push((*gib, 1)),
+            // A slot beyond the SPD list (the degradation path — the
+            // facade keeps the two equal-length) or a `Na`/`0` rank
+            // carries no word.
+            let rank = spd.get(slot).and_then(|module| rank_word(&module.rank));
+            match groups
+                .iter_mut()
+                .find(|(value, word, _)| (value - gib).abs() < 0.05 && *word == rank)
+            {
+                Some(group) => group.2 += 1,
+                None => groups.push((*gib, rank, 1)),
             }
         }
     }
@@ -590,7 +618,10 @@ fn dimm_summary(sizes: &[Section<f64>], units: &Units) -> String {
     } else {
         groups
             .iter()
-            .map(|(gib, count)| format!("{count}x{}", format_capacity(*gib, units)))
+            .map(|(gib, rank, count)| match rank {
+                Some(word) => format!("{count}x{} {word}", format_capacity(*gib, units)),
+                None => format!("{count}x{}", format_capacity(*gib, units)),
+            })
             .collect::<Vec<_>>()
             .join(" + ")
     }
@@ -608,23 +639,68 @@ fn channel_mode(dimm_count: usize) -> String {
     }
 }
 
+/// The total-vs-breakdown slot note (C9-01, D-1): the OS total
+/// (`total_capacity`, MemTotal-preferred — C8-04) can strictly
+/// exceed the SPD-visible sum when the host installs more DIMMs
+/// than the SPD bus binds (the live host: 4×16 GiB installed, 2
+/// bound). A uniform per-module size `u` whose quotient
+/// `total / u` lands within a tenth of a module of an integer
+/// `n` above the visible count → `<visible> of <n> slots
+/// SPD-visible` (the OS reserves a fraction of the installed
+/// capacity, so the quotient sits just below the integer); any
+/// other excess → the generic `SPD sees <visible> of the
+/// installed capacity`. A `Na` / non-finite total, no visible
+/// modules, or `total ≤ sum` → `None` (no false alarm).
+/// Unit-agnostic: counts, not GiB.
+fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String> {
+    let total = total.value().copied().filter(|value| value.is_finite())?;
+    let visible: Vec<f64> = sizes.iter().filter_map(|cell| cell.value().copied()).collect();
+    if visible.is_empty() {
+        return None;
+    }
+    let sum = visible.iter().sum::<f64>();
+    if total <= sum {
+        return None;
+    }
+    let uniform = visible.iter().all(|value| (value - visible[0]).abs() < 0.05);
+    if uniform {
+        let unit = visible[0];
+        if unit > 0.0 {
+            let quotient = total / unit;
+            let slots = quotient.round();
+            if (quotient - slots).abs() <= 0.1 && slots > visible.len() as f64 {
+                return Some(format!("{} of {slots:.0} slots SPD-visible", visible.len()));
+            }
+        }
+    }
+    Some(format!("SPD sees {} of the installed capacity", visible.len()))
+}
+
 /// Line 3's non-mode part (the mockup's `RAM: 64.0 GB (2x32GB)
 /// DDR5-6000 MT/s | Dual-Channel | Mode: `): the total capacity in
 /// the selected capacity unit (C7-11: `format_capacity` — the
 /// default GiB keeps the carried wire value, the GB arm converts
-/// × 1.073741824), the per-DIMM summary, the max SPD speed (omitted
-/// entirely when no module carries one), the channel mode, and the
-/// `Mode: ` lead-in the mode segment completes.
+/// × 1.073741824), the per-DIMM breakdown (C9-01, D-1: with the
+/// rank word from the parallel SPD list — `2x16 GiB Single-Rank`),
+/// the max SPD speed (omitted entirely when no module carries one),
+/// the channel mode, the total-vs-breakdown slot note when the OS
+/// total strictly exceeds the SPD sum (C9-01, D-1: `2 of 4 slots
+/// SPD-visible`), and the `Mode: ` lead-in the mode segment
+/// completes.
 fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
     let total = match t.total_capacity.value() {
         Some(gib) => format_capacity(*gib, units),
         None => "N/A".to_owned(),
     };
-    let mut line = format!("RAM: {total} ({})", dimm_summary(&t.dimm_sizes, units));
+    let mut line = format!("RAM: {total} ({})", dimm_summary(&t.dimm_sizes, &t.spd, units));
     if let Some(mts) = t.spd.iter().filter_map(|m| m.speed_mts.value().copied()).max() {
         line.push_str(&format!(" {mts} MT/s"));
     }
-    line.push_str(&format!(" | {} | Mode: ", channel_mode(t.dimm_sizes.len())));
+    line.push_str(&format!(" | {}", channel_mode(t.dimm_sizes.len())));
+    if let Some(note) = slot_note(&t.total_capacity, &t.dimm_sizes) {
+        line.push_str(&format!(" | {note}"));
+    }
+    line.push_str(" | Mode: ");
     line
 }
 
@@ -1545,12 +1621,18 @@ mod tests {
     /// capacity unit (C7-11: `format_capacity` — default GiB, the GB
     /// knob converts × 1.073741824) — 2×16 → `2x16 GiB`, a mixed kit
     /// → `1x16 GiB + 1x32 GiB` (the Na entry contributes nothing),
-    /// all-Na / empty → `N/A`, a non-whole size keeps one decimal.
+    /// all-Na / empty → `N/A`, a non-whole size keeps one decimal;
+    /// C9-01 (D-1): the parallel SPD list's rank word groups with
+    /// the size — same-size same-rank stays one `<count>x` group
+    /// with the word (`2x16 GiB Single-Rank`), same-size
+    /// different-rank splits into two groups, and a `Na`/`0` rank
+    /// omits the word (the bare form; the mixed-kit case keeps
+    /// `1x16 GiB + 1x32 GiB` when the ranks are absent).
     #[test]
     fn dimm_summary_groups_and_degrades() {
         let default_units = Units::default();
         assert_eq!(
-            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &default_units),
+            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &[], &default_units),
             "2x16 GiB"
         );
         assert_eq!(
@@ -1560,22 +1642,136 @@ mod tests {
                     Section::na(NaReason::NotApplicable),
                     Section::Value(32.0),
                 ],
+                &[],
                 &default_units,
             ),
             "1x16 GiB + 1x32 GiB"
         );
         assert_eq!(
-            dimm_summary(&[Section::na(NaReason::NotApplicable)], &default_units),
+            dimm_summary(&[Section::na(NaReason::NotApplicable)], &[], &default_units),
             "N/A"
         );
-        assert_eq!(dimm_summary(&[], &default_units), "N/A");
-        assert_eq!(dimm_summary(&[Section::Value(4.5)], &default_units), "1x4.5 GiB");
+        assert_eq!(dimm_summary(&[], &[], &default_units), "N/A");
+        assert_eq!(
+            dimm_summary(&[Section::Value(4.5)], &[], &default_units),
+            "1x4.5 GiB"
+        );
 
         // The GB knob (C7-11): 16 GiB → 17.2 GB per group.
         let gb = Units { capacity: CapacityUnit::GB, ..Units::default() };
         assert_eq!(
-            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &gb),
+            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &[], &gb),
             "2x17.2 GB"
+        );
+
+        // C9-01 (D-1): the rank word from the parallel SPD list
+        // groups with the size (single-rank fixture modules).
+        let single_rank = || {
+            let mut module = fixture_spd_module(Some(3200));
+            module.rank = Section::Value(1);
+            module
+        };
+        let dual_rank = || {
+            let mut module = fixture_spd_module(Some(3200));
+            module.rank = Section::Value(2);
+            module
+        };
+        assert_eq!(
+            dimm_summary(
+                &[Section::Value(16.0), Section::Value(16.0)],
+                &[single_rank(), single_rank()],
+                &default_units,
+            ),
+            "2x16 GiB Single-Rank"
+        );
+        assert_eq!(
+            dimm_summary(
+                &[Section::Value(16.0), Section::Value(16.0)],
+                &[single_rank(), dual_rank()],
+                &default_units,
+            ),
+            "1x16 GiB Single-Rank + 1x16 GiB Dual-Rank"
+        );
+        assert_eq!(
+            dimm_summary(
+                &[Section::Value(16.0), Section::Value(32.0)],
+                &[single_rank(), dual_rank()],
+                &default_units,
+            ),
+            "1x16 GiB Single-Rank + 1x32 GiB Dual-Rank"
+        );
+        // A `Na` rank omits the word: the ranked + unranked pair
+        // splits into two groups (first-seen order).
+        assert_eq!(
+            dimm_summary(
+                &[Section::Value(16.0), Section::Value(16.0)],
+                &[single_rank(), fixture_spd_module(None)],
+                &default_units,
+            ),
+            "1x16 GiB Single-Rank + 1x16 GiB"
+        );
+    }
+
+    /// (h4b) `rank_word` (C9-01, D-1): the SPD cards' rank label
+    /// for the compact header — `1` → `Single-Rank`, `2` →
+    /// `Dual-Rank`, `n > 0` → `<n>-Rank` — with a `Na`/`0` rank
+    /// yielding `None` (the word is omitted, never `N/A`).
+    #[test]
+    fn rank_word_arms() {
+        assert_eq!(rank_word(&Section::Value(1)), Some("Single-Rank".to_owned()));
+        assert_eq!(rank_word(&Section::Value(2)), Some("Dual-Rank".to_owned()));
+        assert_eq!(rank_word(&Section::Value(4)), Some("4-Rank".to_owned()));
+        assert_eq!(rank_word(&Section::Value(0)), None);
+        assert_eq!(rank_word(&Section::na(NaReason::NotApplicable)), None);
+    }
+
+    /// (h4c) `slot_note` (C9-01, D-1): the total-vs-breakdown
+    /// note — total > SPD sum with a uniform module size
+    /// near-dividing the total (the live host: 62.68 GiB over
+    /// 2×16 GiB, the OS reserves a fraction) → `2 of 4 slots
+    /// SPD-visible`; a non-integer quotient → the generic note;
+    /// total ≤ sum, a `Na` total, or no visible modules → `None`
+    /// (no false alarm).
+    #[test]
+    fn slot_note_arms() {
+        // The live host shape: 4×16 GiB installed (62.68 GiB OS
+        // total), 2 bound to the SPD bus (32 GiB sum).
+        assert_eq!(
+            slot_note(&Section::Value(62.68), &[Section::Value(16.0), Section::Value(16.0)]),
+            Some("2 of 4 slots SPD-visible".to_owned())
+        );
+        // An exact multiple (no reserved fraction): 3 slots, 2
+        // visible.
+        assert_eq!(
+            slot_note(&Section::Value(48.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            Some("2 of 3 slots SPD-visible".to_owned())
+        );
+        // A non-integer quotient (50/16 = 3.125, more than a tenth
+        // of a module off) → the generic note.
+        assert_eq!(
+            slot_note(&Section::Value(50.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            Some("SPD sees 2 of the installed capacity".to_owned())
+        );
+        // total ≤ sum → no note (the breakdown accounts for the
+        // whole total).
+        assert_eq!(
+            slot_note(&Section::Value(32.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            None
+        );
+        assert_eq!(
+            slot_note(&Section::Value(16.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            None
+        );
+        // A `Na` total → no note.
+        assert_eq!(
+            slot_note(&Section::na(NaReason::NotApplicable), &[Section::Value(16.0)]),
+            None
+        );
+        // No visible modules (all-Na sizes) → no note, even with a
+        // `Value` total.
+        assert_eq!(
+            slot_note(&Section::Value(62.68), &[Section::na(NaReason::NotApplicable)]),
+            None
         );
     }
 
@@ -1593,9 +1789,13 @@ mod tests {
     /// (h6) `ram_line_prefix`: the spec's line 3 minus the mode —
     /// the total in the selected capacity unit (C7-11:
     /// `format_capacity` — default GiB, the GB knob converts
-    /// × 1.073741824), the per-DIMM summary, the max SPD speed
-    /// (omitted when no module carries one), and the channel mode;
-    /// the degraded tail renders the honest N/A segments.
+    /// × 1.073741824), the per-DIMM breakdown (C9-01, D-1: with
+    /// the rank word — `2x16 GiB Single-Rank`), the max SPD speed
+    /// (omitted when no module carries one), the channel mode, the
+    /// total-vs-breakdown slot note when the OS total strictly
+    /// exceeds the SPD sum (C9-01, D-1: `2 of 4 slots
+    /// SPD-visible`), and the `Mode: ` lead-in; the degraded tail
+    /// renders the honest N/A segments (no note — total ≤ sum / Na).
     #[test]
     fn ram_line_prefix_populated_and_degraded() {
         let t = fixture_telemetry(
@@ -1647,6 +1847,36 @@ mod tests {
         assert_eq!(
             ram_line_prefix(&t, &gb),
             "RAM: 34.4 GB (2x17.2 GB) 3200 MT/s | Dual-Channel | Mode: "
+        );
+
+        // C9-01 (D-1): the live host shape — single-rank modules
+        // + the OS total (62.68 GiB) above the SPD sum (32 GiB):
+        // the rank word in the breakdown + the slot note segment.
+        let single_rank = || {
+            let mut module = fixture_spd_module(Some(3200));
+            module.rank = Section::Value(1);
+            module
+        };
+        let ranked = fixture_telemetry(
+            Section::Value(62.68),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![single_rank(), single_rank()],
+        );
+        assert_eq!(
+            ram_line_prefix(&ranked, &Units::default()),
+            "RAM: 62.7 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | 2 of 4 slots SPD-visible | Mode: "
+        );
+
+        // The rank word with total ≤ the SPD sum: no note (no
+        // false alarm).
+        let balanced = fixture_telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![single_rank(), single_rank()],
+        );
+        assert_eq!(
+            ram_line_prefix(&balanced, &Units::default()),
+            "RAM: 32 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | Mode: "
         );
     }
 
