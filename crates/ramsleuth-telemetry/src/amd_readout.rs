@@ -14,7 +14,8 @@
 //! - [`TimingSet`] — the 27 DRAM subtimings, in ticks.
 //! - [`CadBus`] — CAD-bus ODT / driver strengths in ohms + the three RTT
 //!   fields as [`RttValue`].
-//! - [`VoltageSet`] — the four memory rails, in millivolts.
+//! - [`VoltageSet`] — the five rails (the four memory/SOC + Vcore, C12),
+//!   in millivolts.
 //! - [`AmdReadout`] — the AMD aggregate of clocks + the three sets.
 //!
 //! Every field is a [`Section<T>`]: a value, or a structured [`NaReason`] when
@@ -280,6 +281,11 @@ pub struct VoltageSet {
     pub vdd_misc_mv: Section<u16>,
     /// VPP (mV).
     pub vpp_mv: Section<u16>,
+    /// Vcore / VDDCR_VDD (mV; C12 — SMU PM-table sourced, board-agnostic;
+    /// additive wire field, the C8-01 `smu_version` pattern).
+    /// `Na(NotApplicable)` on Intel; `Na(ParseError)` when the PM reading
+    /// is absent / out of band.
+    pub vcore_mv: Section<u16>,
 }
 
 /// The AMD-specific aggregate of the four vendor-neutral display sets.
@@ -466,6 +472,7 @@ pub fn map_amd(snap: &AmdPmSnapshot) -> AmdReadout {
             vddio_mem_mv: map_voltage(v.vddio_mem_mv),
             vdd_misc_mv: map_voltage(v.vdd_misc_mv),
             vpp_mv: map_voltage(v.vpp_mv),
+            vcore_mv: map_voltage(v.vcore_mv),
         },
     }
 }
@@ -530,6 +537,7 @@ mod tests {
                 vddio_mem_mv: 1350,
                 vdd_misc_mv: 1000,
                 vpp_mv: 1800,
+                vcore_mv: 1150,
             },
         }
     }
@@ -574,6 +582,7 @@ mod tests {
         assert_eq!(ro.voltages.vddio_mem_mv, Section::Value(1350));
         assert_eq!(ro.voltages.vdd_misc_mv, Section::Value(1000));
         assert_eq!(ro.voltages.vpp_mv, Section::Value(1800));
+        assert_eq!(ro.voltages.vcore_mv, Section::Value(1150));
     }
 
     /// (b) A zero or absurd clock degrades that clock to `Na(ParseError)`
@@ -694,12 +703,13 @@ mod tests {
             assert!(s.value().is_some());
         }
 
-        // VoltageSet — all four `Section<u16>` mV, all Value
-        let volt_secs: [&Section<u16>; 4] = [
+        // VoltageSet — all five `Section<u16>` mV, all Value
+        let volt_secs: [&Section<u16>; 5] = [
             &ro.voltages.vddcr_soc_mv,
             &ro.voltages.vddio_mem_mv,
             &ro.voltages.vdd_misc_mv,
             &ro.voltages.vpp_mv,
+            &ro.voltages.vcore_mv,
         ];
         for s in &volt_secs {
             assert!(!s.is_na(), "good-snapshot voltage must be Value");
@@ -896,6 +906,7 @@ mod tests {
                 vddio_mem_mv: na_cell(),
                 vdd_misc_mv: na_cell(),
                 vpp_mv: na_cell(),
+                vcore_mv: na_cell(),
             },
         }
     }
