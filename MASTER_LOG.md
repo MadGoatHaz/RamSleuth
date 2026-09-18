@@ -2,6 +2,49 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Cycle 15 (GUI layout fix: missing right borders + viewport clipping on right-column panels — symmetric 8 pt outer margin + widened 968×600/892×600 window + stroke-aware split) — 2026-09-18 — COMPLETE
+
+### What was delivered
+Cycle 15 (GUI layout fix) is COMPLETE: **all 2 code chunks merged into `v2-development` (C15-01, C15-02), C15-03 QA PASS, C15-04 this compaction** from baseline `4f0c6d9` (the Cycle 14 compacted state) to tip `035ad3e` — driven by the operator's defect report on the main-view right column:
+
+**Operator defect report (the cycle driver):**
+- **(DEFECT-1)** Panels **"2 · BENCHMARK ENGINE"** and **"3 · HARDWARE & SPD"** (the right column) are **missing their right-side cyan border strokes**.
+- **(DEFECT-2)** The right-column frames **expand past / are clipped by the viewport right edge** (top / left / bottom borders intact).
+- **(DEFECT-3)** **Asymmetry:** panel 1 ("1 · MEMORY CONTROLLER & SUBTIMINGS") has balanced outer padding and a fully enclosed 4-sided border; the right side lacks the matching outer margin.
+
+**Root causes:**
+- **Flush right edge** — the Cycle-13 "flush" split made `left_w + COLUMN_GAP + right_w == avail.x` exactly, so the right allocation ended exactly at the CentralPanel edge with zero trailing space.
+- **Zero right margin in the budget** — the 960 pt window budget was `8 + 504 + 8 + 440` (0 pt right margin).
+- **Centered stroke clipped** — the zone frames are 1.0 px CYAN strokes centered on the frame rect; half the stroke (0.5 px) paints outside the allocation, and with the right allocation flush at the panel edge that outer half lands in the clip rect and is clipped → the visually missing right border (panel 1 survives: its left edge sits at x = 8, so its outer half lands inside the panel); egui's automatic 8 pt row `item_spacing` was the residual gap that made the right edge flush.
+
+**Chunks (all `--no-ff` merged; range `4f0c6d9..035ad3e` = 8 commits):**
+- **C15-01** `crates/ramsleuth-gui/src/main.rs` — the fix: new `OUTER_MARGIN: f32 = 8.0` (the central panel's symmetric side margin), `DEFAULT_WINDOW_SIZE` `[960,600]` → `[968,600]`, `MIN_WINDOW_SIZE` `[884,600]` → `[892,600]`, the `render_zones` split computed against `inner = (avail.x − OUTER_MARGIN).max(0.0)` with the new exact-sum invariant `left_w + COLUMN_GAP + right_w + OUTER_MARGIN == avail.x`, a trailing `OUTER_MARGIN` after the right-column allocation, the row's automatic main-axis `item_spacing` zeroed (the injected 8 pt was the true root cause of the flush/clipped right edge) with the original spacing restored in both column closures, 6 prose sites 960→968, and the co-landed test re-anchored with the margin-symmetry (both margins == `OUTER_MARGIN`, ±1.0 pt) + 0.5 pt stroke-clearance pins (case 0 only) (89f174a → merge 6a378e4).
+- **C15-02** `crates/ramsleuth-gui/src/telemetry_zone.rs` — docs-only: the 7 default-window doc sites reworded 960×600 → 968×600 (the 952 × 0.55 ≈ 524 → 504 arithmetic kept); no production change, no test-literal change (a9a8c5c → merge 035ad3e).
+
+**Process note (rebase conflict — bookkeeping-only, not a code defect):**
+- C15-02's first review rebase onto the merged C15-01 tip conflicted in `DEV_LOG.md` (its lease-board entries forked from the pre-merge tip); per protocol the reviewer did not force-resolve — rebase aborted, branch restored (REVIEW-C15-02 FAILED) — and the Conflict Resolution Specialist resolved the conflict as bookkeeping-only before the full review re-ran clean and merged. The branch's code (the telemetry_zone.rs docs commit) was never affected.
+
+### Key plan decisions
+- **D-15.1 (symmetric outer margin + an 8 pt-widened window):** the 8 pt right margin is bought by widening the window 960 → 968 (min 884 → 892) — every zone-level geometry pin stays byte-identical (at the 968 default: `inner = 952`, `left_w = 504`, `right_w = 440` — the content geometry is unchanged; the only visible delta is the new right margin + the restored right borders).
+- **D-15.2 (zone frames unchanged):** all three zone frames keep their identical 1.0 px CYAN stroke + (10,6) inner margin + `set_min_width(available_width)` — "identical in stroke to panel 1" is met by identity; the defect was purely the allocation being flush at the clip edge (fixed in D-15.1) — so no production change in `status_zone.rs`, `bench_zone.rs`, or `telemetry_zone.rs` (the latter docs-only).
+- **D-15.3 (full test re-anchoring survey):** every geometry pin enumerated — the only one needing a re-anchor was `render_zones_right_column_split_two_stacked_slices` (C15-01); all other main.rs / telemetry / status / bench tests verified unaffected (the 556 count held).
+
+### Quality
+- **556/556 tests green (debug AND release, whole workspace)** — the Cycle 14 count held (assertions added in place to one existing test; zero added, zero removed); **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); **MSRV 1.75** held; **6 release binaries** build; **zero new deps** (`Cargo.toml`/`Cargo.lock` diff over `4f0c6d9..035ad3e` = empty).
+- **Wire audit = zero protocol / telemetry / TUI / CLI / bench changes** — the cycle diff is exactly `main.rs` (the layout fix) + `telemetry_zone.rs` (docs-only) in `crates/ramsleuth-gui`; nothing outside `crates/ramsleuth-gui/` changes.
+- **No-panic audit clean** (no new `unwrap` / `expect` / `panic!` in the changed code).
+- **QA verdict: PASS** — C15-03 ran the full regression + audits on `035ad3e`; the operator live GUI run is the remaining manual gate.
+
+### Push state (operator gate)
+Local `v2-development` tip = **`035ad3e`** (the C15-02 merge — the Cycle 15 tip; this compaction commits on top of it) — **unpushed, operator-gated** (this compaction performs no push of `v2-development`). The merged local `branch/chunk-c15-01` / `branch/chunk-c15-02` branches are deleted by this compaction, and their remote counterparts on origin are pruned by it as well (the operator-authorized prune of the two fully-merged C15 branches — strictly no force-push; `v2-development` itself stays local). On the operator's go-ahead: **fast-forward to the post-compaction tip (NEVER force-push) → prune the remaining remote chunk branches (p5/c6–c14) → optional `v2.0.0` tag**.
+
+### Open items carried
+1. **Operator live GUI run (pending)** — `plans/CYCLE15-LIVE-CHECKLIST.md` (5950X host; needs interactive sudo): visual confirmation of the border fix — panels 2 & 3 complete 4-sided CYAN borders identical to panel 1, symmetric 8 pt side margins, no right-column viewport clipping, the 892×600 min + 150% DPI, no regression (Graphs window, bench/burn-in, SPD cards, settings).
+2. **Push to GitHub** — operator go-ahead (ff to the post-compaction tip, prune the remaining remote chunk branches, optional `v2.0.0` tag; strictly no force-push, no pre-go-ahead remote mutation).
+3. **The Cycle 14 / Cycle 13 open items carry** — the operator live GUI runs (`plans/CYCLE14-LIVE-CHECKLIST.md`, `plans/CYCLE13-LIVE-CHECKLIST.md`) and the remaining Cycle 12/11 items (Intel MCHBAR decode — hardware-gated; MSRV 1.75 vs newer; AIDA64 parity gate).
+
+Cycle 15 close-out (2026-09-18): this compaction recorded the Cycle 15 section in `MASTER_LOG.md`, reset `DEV_LOG.md` (base line → `035ad3e`, ACTIVE_WORKERS cleared, CURRENT_STATE = COMPLETE, the per-lease history archived), refreshed `Docs/HANDOVER.md` (header + §2 + the Cycle 15 section), committed `plans/CYCLE15-LIVE-CHECKLIST.md`, and deleted the merged local `branch/chunk-c15-*` branches (their remote counterparts pruned per the operator's authorization). No push of `v2-development`.
+
 ## Cycle 14 (runtime bug fixes: clock first-sample warm-up+settle, non-blocking burn-in per-tick brief lock) — 2026-09-18 — COMPLETE
 
 ### What was delivered
