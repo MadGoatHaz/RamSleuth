@@ -12,10 +12,11 @@
 //!
 //! C10 (D-2): the injected collector is spike-wrapped — every
 //! re-collect (a cold cache or a TTL-expired `get()`) runs a ≤ 250 ms
-//! `spike()` DRAM load immediately before `collect()` re-reads the
-//! SMU PM table, so the `MCLK` sample is taken at the operating
-//! frequency, not the idle frequency; the in-TTL clone path never
-//! spikes (the collector is not called).
+//! `spike()` DRAM load, then the 150 ms `CLOCK_SETTLE` settle delay
+//! (C14, M1), immediately before `collect()` re-reads the SMU PM
+//! table, so the `MCLK` sample is taken at the operating frequency,
+//! not the idle frequency; the in-TTL clone path never spikes (the
+//! collector is not called).
 //!
 //! **The daemon never panics** (plan D5): missing root or
 //! `CAP_SYS_RAWIO` only warns — the daemon keeps serving with its
@@ -49,6 +50,12 @@ use ramsleuth_daemon::{
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use tokio::signal::unix::SignalKind;
+
+/// Settle window between the DRAM spike and the PM-table read (C14, M1):
+/// after the spike wakes the memory controller out of idle, give the SMU
+/// 150 ms before sampling MCLK/UCLK/FCLK so first (and TTL-expired) reads
+/// settle at the operating frequency, not a transient idle one.
+const CLOCK_SETTLE: Duration = Duration::from_millis(150);
 
 /// The daemon's parsed command-line arguments (P3-17).
 ///
@@ -178,7 +185,11 @@ async fn main() {
     // cache TTL) + the P3-15 single-flight benchmark job manager.
     let ctx = Arc::new(DaemonContext {
         cache: Arc::new(Mutex::new(TelemetryCache::new(
-            || { spike(); ramsleuth_telemetry::collect() },
+            || {
+                spike();
+                std::thread::sleep(CLOCK_SETTLE);
+                ramsleuth_telemetry::collect()
+            },
             args.max_age,
         ))),
         jobs: Arc::new(BenchJobManager::new()),
