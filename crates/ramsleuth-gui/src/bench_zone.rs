@@ -482,7 +482,12 @@ pub fn render_bench_zone(
 }
 
 /// The 4×4 `egui_extras::TableBuilder` table: a header row (the four
-/// metric names) + one row per tier. Every cell renders its phase:
+/// metric names) + one row per tier. Column widths (D-13.3(2), R2b):
+/// the `tier` column is `initial(90)` and the first three metric
+/// columns are `initial(70)`, and the last metric column is
+/// `remainder()` — the table spans the frame's full inner width, so
+/// no dead space is left at the right border. Every cell renders its
+/// phase:
 /// while a run is in flight, a cell with a live value shows the live
 /// in-flight fill (dimmed CYAN + a `…` suffix — a normal bench's
 /// `StreamProgress` accumulation, or a burn-in's `latest`, C7-18) and
@@ -522,7 +527,8 @@ fn render_grid_table(ui: &mut egui::Ui, data: &TelemetryData) {
     egui_extras::TableBuilder::new(ui)
         .striped(false)
         .column(egui_extras::Column::initial(90.0))
-        .columns(egui_extras::Column::initial(70.0), METRICS.len())
+        .columns(egui_extras::Column::initial(70.0), 3)
+        .column(egui_extras::Column::remainder())
         .header(ROW_HEIGHT, |mut header| {
             header.col(|ui| {
                 ui.label(egui::RichText::new("tier").strong().color(CYAN));
