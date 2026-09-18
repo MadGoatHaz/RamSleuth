@@ -10,10 +10,11 @@
 //!
 //! - `CPU FREQ (MHz)` — the live core frequency
 //!   (`SystemPlatform.cpu_clock_mhz`).
-//! - `VDDCR_CPU` — no source anywhere (the unprivileged SMU surface
-//!   carries no VDDCR_CPU cell): a permanent label-only row whose
-//!   label carries the bare `N/A` note, no fake geometry
-//!   (D-4).
+//! - `VDDCR_CPU (mV)` — the Vcore rail (C12: SMU PM-table Vcore,
+//!   0x0A0, the C12-01 frozen `VoltageSet.vcore_mv` field —
+//!   board-agnostic): data-driven like the SOC row — a no-source
+//!   note while the window holds no finite Vcore (D-4,
+//!   self-clearing).
 //! - `VDDCR_SOC (mV)` — the AMD SOC rail
 //!   (`AmdReadout.voltages.vddcr_soc_mv`).
 //! - `CPU TEMP (°C)` — the ordered CPU-temp source scan
@@ -27,7 +28,7 @@
 //!
 //! The state + render:
 //!
-//! - [`GraphSample`] / [`GraphState`] — one timestamped five-field
+//! - [`GraphSample`] / [`GraphState`] — one timestamped six-field
 //!   sample per successful poll (an absent value = `f64::NAN`, the
 //!   non-finite-skip rule of the plot) in the
 //!   [`GRAPH_CAPACITY`]-deep ring (1800 = 60 min at the 2 s poll
@@ -70,9 +71,8 @@
 //!   fields as `N/A`) + the `HH:MM:SS` timestamp; no hover → no
 //!   crosshair. A series whose window holds no finite sample draws
 //!   a label + the bare `N/A` note and no geometry (D-4 — a
-//!   flat 0 line would be a lie, 0 ≠ N/A): the `VDDCR_CPU` note
-//!   lives in the label (permanent), the `CPU TEMP` / `MEM
-//!   BANDWIDTH` notes self-clear when data appears.
+//!   flat 0 line would be a lie, 0 ≠ N/A): the `VDDCR_CPU` / `CPU
+//!   TEMP` / `MEM BANDWIDTH` notes self-clear when data appears.
 //!
 //! - The render-local view state (`GraphView` — the window length +
 //!   the pan offset) lives in the IdTypeMap of the child context
@@ -168,13 +168,19 @@ const NO_SOURCE_NOTE: &str = "N/A";
 ///   (`SystemPlatform.cpu_clock_mhz`), else NaN.
 /// - `vddcr_soc_mv` — the AMD SOC rail (`vddcr_soc_mv` — a `u16`, so
 ///   a present cell is always finite), else NaN.
+/// - `vddcr_cpu_mv` — the Vcore / VDDCR_VDD rail (C12: the C12-01
+///   frozen `VoltageSet.vcore_mv`, SMU PM table 0x0A0 — a `u16`, so a
+///   present cell is always finite), else NaN.
 /// - `cpu_temp_c` — the thermal-zone scan ([`read_cpu_temp_c`]),
 ///   else NaN.
 /// - `bandwidth_gbps` — the latest bench / burn-in `Memory · Read`
 ///   figure (D-5), else NaN (no sample yet).
 ///
-/// There is deliberately no VDDCR_CPU field: the series has no
-/// source anywhere (D-4) — its row is a permanent no-source note.
+/// The `vddcr_cpu_mv` field is GUI-local (C12): `GraphSample` is
+/// the in-process ring buffer and never crosses the socket — the
+/// Vcore value rides the frozen wire field `VoltageSet.vcore_mv`
+/// that the GUI already receives (the C12-01 additive field,
+/// board-agnostic).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GraphSample {
     /// The poll's unix seconds (fractional).
@@ -183,6 +189,9 @@ pub struct GraphSample {
     pub cpu_freq_mhz: f64,
     /// VDDCR_SOC rail (mV), else NaN.
     pub vddcr_soc_mv: f64,
+    /// Vcore / VDDCR_VDD rail (mV — the C12-01 frozen `vcore_mv`),
+    /// else NaN.
+    pub vddcr_cpu_mv: f64,
     /// CPU temperature (°C — the thermal-zone scan), else NaN.
     pub cpu_temp_c: f64,
     /// Memory-read bandwidth (GB/s — the D-5 step series), else NaN.
@@ -245,6 +254,9 @@ fn unix_now() -> f64 {
 /// - `cpu_freq_mhz` = `platform.cpu_clock_mhz` (finite or NaN);
 /// - `vddcr_soc_mv` = `amd.voltages.vddcr_soc_mv` (finite or NaN —
 ///   a `u16`, so a present cell is always finite);
+/// - `vddcr_cpu_mv` = `amd.voltages.vcore_mv` (the C12-01 frozen
+///   additive field, PM table 0x0A0 — finite or NaN; a `u16`, so a
+///   present cell is always finite);
 /// - `cpu_temp_c` = the passed scan value ([`read_cpu_temp_c`] —
 ///   the caller runs the I/O on the poller thread, D6);
 /// - `bandwidth_gbps` = the passed latest `Memory · Read` figure
@@ -264,6 +276,7 @@ pub fn record_graph_sample(
 ) {
     let mut freq = f64::NAN;
     let mut soc = f64::NAN;
+    let mut vcore = f64::NAN;
     if let Some(snapshot) = telemetry {
         if let Some(value) = snapshot
             .platform
@@ -281,15 +294,30 @@ pub fn record_graph_sample(
         {
             soc = f64::from(value);
         }
+        // The C12-01 frozen Vcore field (PM table 0x0A0, board-
+        // agnostic): a `u16`, so a present cell is always finite.
+        if let Some(value) = snapshot
+            .amd
+            .value()
+            .and_then(|readout| readout.voltages.vcore_mv.value().copied())
+        {
+            vcore = f64::from(value);
+        }
     }
     // The no-hole rule: an all-NaN sample never lands in the ring.
-    if !freq.is_finite() && !soc.is_finite() && !cpu_temp_c.is_finite() && !bandwidth_gbps.is_finite() {
+    if !freq.is_finite()
+        && !soc.is_finite()
+        && !vcore.is_finite()
+        && !cpu_temp_c.is_finite()
+        && !bandwidth_gbps.is_finite()
+    {
         return;
     }
     graph.samples.push(GraphSample {
         t: unix_now(),
         cpu_freq_mhz: freq,
         vddcr_soc_mv: soc,
+        vddcr_cpu_mv: vcore,
         cpu_temp_c,
         bandwidth_gbps,
     });
@@ -699,7 +727,8 @@ fn value_token(value: f64, prec: usize) -> String {
 /// 7e): line 1 = the wall-clock time of the nearest sample
 /// (`HH:MM:SS` from that unix `t` — the sample the values come
 /// from), line 2 = the value of every series at that sample in
-/// `1800 MHz · 1150 mV · 47.3 °C · 26.35 GB/s`-style (a
+/// `1800 MHz · VDDCR_CPU 1150 mV · VDDCR_SOC 1150 mV · 47.3 °C ·
+/// 26.35 GB/s`-style (both mV tokens disambiguated, C12; a
 /// non-finite field degrades to `N/A` — D-4). Empty (no lines, no
 /// panic) for no samples or a non-finite `t`.
 fn tooltip_lines(samples: &[GraphSample], t: f64) -> Vec<String> {
@@ -711,8 +740,9 @@ fn tooltip_lines(samples: &[GraphSample], t: f64) -> Vec<String> {
     vec![
         format!("{h:02}:{m:02}:{s:02}"),
         format!(
-            "{} MHz · {} mV · {} °C · {} GB/s",
+            "{} MHz · VDDCR_CPU {} mV · VDDCR_SOC {} mV · {} °C · {} GB/s",
             value_token(sample.cpu_freq_mhz, 0),
+            value_token(sample.vddcr_cpu_mv, 0),
             value_token(sample.vddcr_soc_mv, 0),
             value_token(sample.cpu_temp_c, 1),
             value_token(sample.bandwidth_gbps, 2),
@@ -730,9 +760,9 @@ fn tooltip_lines(samples: &[GraphSample], t: f64) -> Vec<String> {
 /// filled dot for a single in-window sample, a polyline for more,
 /// a dim newest-value readout top-right) or (b) when the window
 /// holds no finite sample, the bare `N/A` note (D-4 — it
-/// self-clears when data appears; the permanent `VDDCR_CPU` row
-/// carries the note in its label instead — `note_in_label`) —
-/// never fake geometry, never a panic.
+/// self-clears when data appears; a row that embeds the note in its
+/// label passes `note_in_label` to skip the duplicate) — never fake
+/// geometry, never a panic.
 ///
 /// The row senses drags (`Sense::drag()` — C7-22): the caller reads
 /// the returned [`egui::Response`] for the pan (`dragged_by` +
@@ -770,9 +800,9 @@ fn graph_row(
         let points = window_points(samples, &field, t_start, t_end, rect);
         if points.is_empty() {
             // No finite sample in the window: the no-source note
-            // (D-4) — no geometry, no fake 0 line. The permanent
-            // `VDDCR_CPU` row carries the note in its label instead
-            // (no double note).
+            // (D-4) — no geometry, no fake 0 line. A row that embeds
+            // the note in its label skips the duplicate
+            // (`note_in_label`).
             if !note_in_label {
                 painter.text(
                     rect.right_top() + Vec2::new(-TEXT_MARGIN, TEXT_MARGIN),
@@ -825,10 +855,11 @@ fn graph_row(
 /// five series rows in fixed order over the view window:
 ///
 /// 1. `CPU FREQ (MHz)` — the live core frequency.
-/// 2. `VDDCR_CPU` — the permanent no-source row (D-4: the label
-///    carries `— N/A` — the series has no source
-///    anywhere; no geometry, it self-populates if one ever
-///    appears, no layout change — the row is data-driven).
+/// 2. `VDDCR_CPU (mV)` — the Vcore rail (C12: the SMU PM-table
+///    0x0A0 reading via the C12-01 frozen `VoltageSet.vcore_mv`,
+///    board-agnostic) — data-driven like the SOC row: a no-source
+///    note while the window holds no finite Vcore (D-4,
+///    self-clearing when data appears).
 /// 3. `VDDCR_SOC (mV)` — the AMD SOC rail.
 /// 4. `CPU TEMP (°C)` — the thermal-zone scan; a no-source row
 ///    while the window holds no finite temp (D-4, self-clearing).
@@ -859,8 +890,8 @@ fn graph_row(
 ///
 /// Pure read over [`GraphState`] (no I/O, D6 — the poller is the
 /// only writer of the data fields): an empty state renders the
-/// five no-source rows (the VDDCR_CPU row is permanent) and never
-/// panics (the D5 contract; the `render_history` headless-test
+/// five no-source rows (the VDDCR_CPU row is data-driven, C12) and
+/// never panics (the D5 contract; the `render_history` headless-test
 /// precedent). The one permitted write is the `Poll` combo's
 /// `poll_interval_ms: &mut u64` — the shared settings knob the
 /// poller re-reads live (the settings-panel D6 write precedent,
@@ -967,11 +998,11 @@ pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState, poll_interv
             };
             add_row(ui, &|s| s.cpu_freq_mhz, "CPU FREQ (MHz)", AMBER, &samples, false, (t_start, t_end));
             ui.add_space(2.0);
-            // The permanent no-source row (D-4): the label carries
-            // the bare `N/A` note (item 7d); the empty slice
-            // keeps it data-driven (it self-populates if a source
-            // ever appears, no layout change).
-            add_row(ui, &|_s| f64::NAN, "VDDCR_CPU — N/A", AMBER, &[], true, (t_start, t_end));
+            // The Vcore row (C12: data-driven from the C12-01 frozen
+            // `vcore_mv` field — PM table 0x0A0, board-agnostic):
+            // the no-source note self-clears when Vcore data appears
+            // (like `CPU TEMP` — `note_in_label` is `false`).
+            add_row(ui, &|s| s.vddcr_cpu_mv, "VDDCR_CPU (mV)", AMBER, &samples, false, (t_start, t_end));
             ui.add_space(2.0);
             add_row(ui, &|s| s.vddcr_soc_mv, "VDDCR_SOC (mV)", AMBER, &samples, false, (t_start, t_end));
             ui.add_space(2.0);
@@ -1073,18 +1104,20 @@ mod tests {
     }
 
     /// One sample with explicit fields (the test geometry).
-    fn sample(t: f64, freq: f64, soc: f64, temp: f64, bw: f64) -> GraphSample {
+    fn sample(t: f64, freq: f64, soc: f64, vcore: f64, temp: f64, bw: f64) -> GraphSample {
         GraphSample {
             t,
             cpu_freq_mhz: freq,
             vddcr_soc_mv: soc,
+            vddcr_cpu_mv: vcore,
             cpu_temp_c: temp,
             bandwidth_gbps: bw,
         }
     }
 
-    /// An AMD readout with VDDCR_SOC = `soc_mv` and every other cell
-    /// sanity-mapped (the `populated_snapshot` fixture from
+    /// An AMD readout with VDDCR_SOC = `soc_mv` (+ the C12-01
+    /// frozen Vcore 1150 mV) and every other cell sanity-mapped (the
+    /// `populated_snapshot` fixture from
     /// `update.rs` — the DDR4-3200-class synthetic PM-table
     /// snapshot).
     fn readout_with_soc(soc_mv: u16) -> ramsleuth_telemetry::amd_readout::AmdReadout {
@@ -1202,6 +1235,7 @@ mod tests {
         assert!(s.t.is_finite() && s.t > 0.0, "the t stamp is unix seconds");
         assert_eq!(s.cpu_freq_mhz, 3600.0, "the clock lands in MHz");
         assert_eq!(s.vddcr_soc_mv, 1150.0, "VDDCR_SOC lands in mV");
+        assert_eq!(s.vddcr_cpu_mv, 1150.0, "Vcore (the frozen vcore_mv) lands in mV");
         assert_eq!(s.cpu_temp_c, 47.3, "the passed temp lands in °C");
         assert_eq!(s.bandwidth_gbps, 26.35, "the passed bandwidth lands in GB/s");
     }
@@ -1246,8 +1280,38 @@ mod tests {
         let s = graph.samples.last().expect("the sample landed");
         assert_eq!(s.cpu_freq_mhz, 3600.0);
         assert!(s.vddcr_soc_mv.is_nan(), "an absent VDDCR_SOC stays NaN");
+        assert!(s.vddcr_cpu_mv.is_nan(), "an absent vcore stays NaN");
         assert!(s.cpu_temp_c.is_nan(), "an absent temp stays NaN");
         assert!(s.bandwidth_gbps.is_nan(), "an absent bandwidth stays NaN");
+    }
+
+    /// (c2) The Vcore carrier (C12): a vcore-present snapshot
+    /// carries `vddcr_cpu_mv` from the C12-01 frozen
+    /// `VoltageSet.vcore_mv` field (GUI-local — `GraphSample` is the
+    /// in-process ring buffer and never crosses the socket); a
+    /// vcore-Na snapshot degrades that field to NaN while the sample
+    /// still lands via its other finite fields (the no-hole rule
+    /// counts vcore).
+    #[test]
+    fn record_graph_sample_carries_vcore() {
+        // Vcore present (the fixture readout carries `vcore_mv:
+        // 1150`): the sample carries it in mV, next to the paired
+        // SOC rail.
+        let mut graph = GraphState::default();
+        record_graph_sample(&mut graph, &Some(snapshot(Some(3600.0), Some(1150))), f64::NAN, f64::NAN);
+        assert_eq!(graph.len(), 1, "the vcore-present snapshot lands a sample");
+        let s = graph.samples.last().expect("the sample landed");
+        assert_eq!(s.vddcr_cpu_mv, 1150.0, "the frozen vcore_mv lands in mV");
+        assert_eq!(s.vddcr_soc_mv, 1150.0, "the paired SOC rail lands too");
+
+        // Vcore Na (the AMD branch is Na whole): the field degrades
+        // to NaN, the sample still lands via the finite clock.
+        let mut graph = GraphState::default();
+        record_graph_sample(&mut graph, &Some(snapshot(Some(3600.0), None)), f64::NAN, f64::NAN);
+        assert_eq!(graph.len(), 1, "a vcore-Na snapshot still lands via its finite clock");
+        let s = graph.samples.last().expect("the sample landed");
+        assert!(s.vddcr_cpu_mv.is_nan(), "an absent vcore stays NaN");
+        assert!(s.vddcr_soc_mv.is_nan(), "an absent SOC stays NaN");
     }
 
     // ------------------------------------------------------------------
@@ -1264,6 +1328,7 @@ mod tests {
         assert_eq!(graph.samples.capacity(), GRAPH_CAPACITY);
         for i in 0..(GRAPH_CAPACITY + 5) {
             graph.samples.push(sample(
+                i as f64,
                 i as f64,
                 i as f64,
                 i as f64,
@@ -1379,14 +1444,14 @@ mod tests {
             "an empty slice yields no points"
         );
         let all_nan = vec![
-            sample(1010.0, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
-            sample(1050.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, f64::NAN),
+            sample(1010.0, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+            sample(1050.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, f64::NAN, f64::NAN),
         ];
         assert!(
             window_points(&all_nan, |s| s.cpu_freq_mhz, t_start, t_end, plot_rect()).is_empty(),
             "an all-NaN series yields no points"
         );
-        let data = vec![sample(1010.0, 1.0, 1.0, 1.0, 1.0)];
+        let data = vec![sample(1010.0, 1.0, 1.0, f64::NAN, 1.0, 1.0)];
         assert!(
             window_points(&data, |s| s.cpu_freq_mhz, t_start, t_start, plot_rect()).is_empty(),
             "a collapsed window yields no points"
@@ -1404,9 +1469,9 @@ mod tests {
     fn window_points_flat_series_sits_on_the_midline() {
         let (t_start, t_end) = window();
         let samples = vec![
-            sample(1010.0, 42.0, 42.0, 42.0, 42.0),
-            sample(1050.0, 42.0, 42.0, 42.0, 42.0),
-            sample(1100.0, 42.0, 42.0, 42.0, 42.0),
+            sample(1010.0, 42.0, 42.0, f64::NAN, 42.0, 42.0),
+            sample(1050.0, 42.0, 42.0, f64::NAN, 42.0, 42.0),
+            sample(1100.0, 42.0, 42.0, f64::NAN, 42.0, 42.0),
         ];
         let points = window_points(&samples, |s| s.cpu_freq_mhz, t_start, t_end, plot_rect());
         assert_eq!(points.len(), 3);
@@ -1424,8 +1489,8 @@ mod tests {
     fn window_points_extremes_hit_the_corners() {
         let (t_start, t_end) = window();
         let samples = vec![
-            sample(1000.0, 0.0, 0.0, 0.0, 0.0),
-            sample(1100.0, 10.0, 10.0, 10.0, 10.0),
+            sample(1000.0, 0.0, 0.0, f64::NAN, 0.0, 0.0),
+            sample(1100.0, 10.0, 10.0, f64::NAN, 10.0, 10.0),
         ];
         let points = window_points(&samples, |s| s.cpu_freq_mhz, t_start, t_end, plot_rect());
         assert_eq!(points.len(), 2);
@@ -1450,9 +1515,9 @@ mod tests {
     fn window_points_out_of_window_samples_are_dropped() {
         let (t_start, t_end) = window();
         let samples = vec![
-            sample(900.0, 1.0, 1.0, 1.0, 1.0), // before the window
-            sample(1050.0, 5.0, 5.0, 5.0, 5.0), // in the window
-            sample(1200.0, 9.0, 9.0, 9.0, 9.0), // after the window
+            sample(900.0, 1.0, 1.0, f64::NAN, 1.0, 1.0), // before the window
+            sample(1050.0, 5.0, 5.0, f64::NAN, 5.0, 5.0), // in the window
+            sample(1200.0, 9.0, 9.0, f64::NAN, 9.0, 9.0), // after the window
         ];
         let points = window_points(&samples, |s| s.bandwidth_gbps, t_start, t_end, plot_rect());
         assert_eq!(points.len(), 1, "only the in-window sample plots");
@@ -1478,10 +1543,10 @@ mod tests {
 
     /// (j) The full window runs headless without panicking: an empty
     /// state (every row its no-source note), a fully populated state
-    /// (four plotted rows + the permanent VDDCR_CPU no-source row),
-    /// a sparse state (only a finite clock — the VDDCR_SOC / CPU
-    /// TEMP / MEM BANDWIDTH rows their no-source notes), and a
-    /// single-sample state (the dot path).
+    /// (five plotted rows — the VDDCR_CPU row data-driven, C12), a
+    /// sparse state (only a finite clock — the VDDCR_CPU /
+    /// VDDCR_SOC / CPU TEMP / MEM BANDWIDTH rows their no-source
+    /// notes), and a single-sample state (the dot path).
     #[test]
     fn render_graphs_window_runs_headless_without_panicking() {
         // The shared poll-interval knob (C9-03): the render's one
@@ -1495,13 +1560,14 @@ mod tests {
 
         // Fully populated: 20 samples over two minutes (all in the
         // five-minute window) — the polyline path (the
-        // `windows(2)` segments) on four rows + the permanent
-        // VDDCR_CPU no-source row.
+        // `windows(2)` segments) on all five rows (the VDDCR_CPU row
+        // data-driven, C12).
         let mut full = GraphState::default();
         for i in 0..20 {
             full.samples.push(sample(
                 1000.0 + 10.0 * f64::from(i),
                 3600.0 + 10.0 * f64::from(i),
+                1150.0 + f64::from(i),
                 1150.0 + f64::from(i),
                 45.0 + 0.1 * f64::from(i),
                 26.35,
@@ -1511,10 +1577,11 @@ mod tests {
             render_graphs_window(ctx, &full, &mut iv);
         });
 
-        // Sparse: only a finite clock (the other three series are
-        // their no-source notes; VDDCR_CPU is permanent).
+        // Sparse: only a finite clock (the other four series —
+        // VDDCR_CPU, VDDCR_SOC, CPU TEMP, MEM BANDWIDTH — are their
+        // no-source notes).
         let mut sparse = GraphState::default();
-        sparse.samples.push(sample(1000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN));
+        sparse.samples.push(sample(1000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN, f64::NAN));
         run_headless_frame(|ctx| {
             render_graphs_window(ctx, &sparse, &mut iv);
         });
@@ -1522,38 +1589,39 @@ mod tests {
         // A single sample: the dot path (one in-window point per
         // finite series).
         let mut one = GraphState::default();
-        one.samples.push(sample(1000.0, 3600.0, 1150.0, 45.0, 26.35));
+        one.samples.push(sample(1000.0, 3600.0, 1150.0, 1150.0, 45.0, 26.35));
         run_headless_frame(|ctx| {
             render_graphs_window(ctx, &one, &mut iv);
         });
     }
 
     /// (r) The no-source note renders bare `N/A` (D-4 — the
-    /// parenthetical is stripped): the permanent `VDDCR_CPU` row
-    /// label reads `VDDCR_CPU — N/A`, each source-less data row
-    /// paints the bare note top-right, and no painted text carries
-    /// a `no source` parenthetical — in the empty state (all four
-    /// data rows no-source) and the populated state (the permanent
-    /// label + the self-cleared notes).
+    /// parenthetical is stripped): the `VDDCR_CPU` row label reads
+    /// `VDDCR_CPU (mV)` (data-driven, C12 — no embedded note), each
+    /// source-less data row paints the bare note top-right, and no
+    /// painted text carries a `no source` parenthetical — in the
+    /// empty state (all five data rows no-source) and the populated
+    /// state (the five plotted rows, the notes self-cleared).
     #[test]
     fn render_graphs_window_no_source_note_renders_bare_na() {
         // The shared poll-interval knob (C9-03): the render's one
         // permitted write (the `Poll` combo, D-2) — the default
         // cadence.
         let mut iv = 2000u64;
-        // The empty state: every data row its bare note + the
-        // permanent VDDCR_CPU label (the note lives in the label).
+        // The empty state: every data row its bare note (the
+        // VDDCR_CPU row is data-driven — its label carries no note,
+        // C12).
         let ctx = egui::Context::default();
         ctx.begin_frame(egui::RawInput::default());
         render_graphs_window(&ctx, &GraphState::default(), &mut iv);
         let out = ctx.end_frame();
         let texts = painted_texts(&out);
         assert!(
-            texts.contains(&"VDDCR_CPU — N/A"),
-            "the permanent row label is bare N/A, got {texts:?}"
+            texts.contains(&"VDDCR_CPU (mV)"),
+            "the data-driven VDDCR_CPU row label carries no note, got {texts:?}"
         );
         assert!(
-            texts.iter().filter(|t| **t == "N/A").count() == 4,
+            texts.iter().filter(|t| **t == "N/A").count() == 5,
             "each source-less data row shows the bare note, got {texts:?}"
         );
         assert!(
@@ -1561,13 +1629,14 @@ mod tests {
             "no painted text carries the parenthetical, got {texts:?}"
         );
 
-        // The populated state: the four data rows their newest-value
-        // readouts (the notes self-cleared) + the permanent label.
+        // The populated state: the five data rows their newest-value
+        // readouts (the notes self-cleared) + the data-driven label.
         let mut full = GraphState::default();
         for i in 0..20 {
             full.samples.push(sample(
                 1000.0 + 10.0 * f64::from(i),
                 3600.0 + 10.0 * f64::from(i),
+                1150.0 + f64::from(i),
                 1150.0 + f64::from(i),
                 45.0 + 0.1 * f64::from(i),
                 26.35,
@@ -1579,8 +1648,8 @@ mod tests {
         let out = ctx.end_frame();
         let texts = painted_texts(&out);
         assert!(
-            texts.contains(&"VDDCR_CPU — N/A"),
-            "the permanent row label stays bare N/A, got {texts:?}"
+            texts.contains(&"VDDCR_CPU (mV)"),
+            "the data-driven VDDCR_CPU row label carries no note, got {texts:?}"
         );
         assert!(
             !texts.contains(&"N/A"),
@@ -1620,7 +1689,7 @@ mod tests {
     #[test]
     fn clamp_pan_stays_inside_the_data() {
         // A 10-min span (600 s) against a 5-min window: max pan 300.
-        let ten = vec![sample(1000.0, 1.0, 1.0, 1.0, 1.0), sample(1600.0, 2.0, 2.0, 2.0, 2.0)];
+        let ten = vec![sample(1000.0, 1.0, 1.0, f64::NAN, 1.0, 1.0), sample(1600.0, 2.0, 2.0, f64::NAN, 2.0, 2.0)];
         assert_eq!(clamp_pan(-50.0, &ten, 300.0), 0.0, "a negative pan clamps to 0");
         assert_eq!(clamp_pan(100.0, &ten, 300.0), 100.0, "an in-range pan is kept");
         assert_eq!(
@@ -1629,12 +1698,12 @@ mod tests {
             "a past-the-data pan clamps to span − window"
         );
         // The span fits the window: nothing to pan.
-        let two = vec![sample(1000.0, 1.0, 1.0, 1.0, 1.0), sample(1240.0, 2.0, 2.0, 2.0, 2.0)];
+        let two = vec![sample(1000.0, 1.0, 1.0, f64::NAN, 1.0, 1.0), sample(1240.0, 2.0, 2.0, f64::NAN, 2.0, 2.0)];
         assert_eq!(clamp_pan(999.0, &two, 300.0), 0.0, "a span that fits the window never pans");
         // No data / one sample: no pan.
         assert_eq!(clamp_pan(50.0, &[], 300.0), 0.0, "no samples never pan");
         assert_eq!(
-            clamp_pan(50.0, &[sample(1000.0, 1.0, 1.0, 1.0, 1.0)], 300.0),
+            clamp_pan(50.0, &[sample(1000.0, 1.0, 1.0, f64::NAN, 1.0, 1.0)], 300.0),
             0.0,
             "one sample never pans"
         );
@@ -1655,9 +1724,9 @@ mod tests {
     #[test]
     fn hover_timestamp_maps_the_window_and_snaps_to_the_nearest_sample() {
         let samples = vec![
-            sample(1010.0, 1.0, 1.0, 1.0, 1.0),
-            sample(1050.0, 2.0, 2.0, 2.0, 2.0),
-            sample(1090.0, 3.0, 3.0, 3.0, 3.0),
+            sample(1010.0, 1.0, 1.0, f64::NAN, 1.0, 1.0),
+            sample(1050.0, 2.0, 2.0, f64::NAN, 2.0, 2.0),
+            sample(1090.0, 3.0, 3.0, f64::NAN, 3.0, 3.0),
         ];
         let w = (1000.0, 1100.0);
         assert_eq!(
@@ -1723,30 +1792,31 @@ mod tests {
 
     /// (n) The tooltip lists the value of every series at the hover
     /// timestamp in the plan style
-    /// (`1800 MHz · 1150 mV · 47.3 °C · 26.35 GB/s`) + the
+    /// (`1800 MHz · VDDCR_CPU 1150 mV · VDDCR_SOC 1150 mV · 47.3 °C ·
+    /// 26.35 GB/s` — both mV tokens disambiguated, C12) + the
     /// `HH:MM:SS` timestamp: a fully populated sample, a partial
     /// sample (missing fields as `N/A` — D-4), and the degenerate
     /// inputs (no samples / a NaN t → no lines, no panic).
     #[test]
     fn tooltip_lines_list_every_series_at_the_hover_timestamp() {
         let samples = vec![
-            sample(1_700_000_000.0, 3600.0, 1150.0, 47.3, 26.35),
-            sample(1_700_000_060.0, 3700.0, 1160.0, 48.0, 26.4),
+            sample(1_700_000_000.0, 3600.0, 1150.0, 1150.0, 47.3, 26.35),
+            sample(1_700_000_060.0, 3700.0, 1160.0, 1160.0, 48.0, 26.4),
         ];
         // The first sample (t = 1_700_000_000 → 22:13:20).
         let lines = tooltip_lines(&samples, 1_700_000_000.0);
         assert_eq!(lines.len(), 2, "the timestamp line + the values line");
         assert_eq!(lines[0], "22:13:20");
-        assert_eq!(lines[1], "3600 MHz · 1150 mV · 47.3 °C · 26.35 GB/s");
+        assert_eq!(lines[1], "3600 MHz · VDDCR_CPU 1150 mV · VDDCR_SOC 1150 mV · 47.3 °C · 26.35 GB/s");
         // The nearest sample wins (t + 31 → the second, 29 s away).
         let lines = tooltip_lines(&samples, 1_700_000_031.0);
         assert_eq!(lines[0], "22:14:20");
-        assert_eq!(lines[1], "3700 MHz · 1160 mV · 48.0 °C · 26.40 GB/s");
+        assert_eq!(lines[1], "3700 MHz · VDDCR_CPU 1160 mV · VDDCR_SOC 1160 mV · 48.0 °C · 26.40 GB/s");
         // A partial sample: the missing fields degrade to N/A (D-4),
         // the present one keeps its value.
-        let partial = vec![sample(1_700_000_000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN)];
+        let partial = vec![sample(1_700_000_000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN, f64::NAN)];
         let lines = tooltip_lines(&partial, 1_700_000_000.0);
-        assert_eq!(lines[1], "3600 MHz · N/A mV · N/A °C · N/A GB/s");
+        assert_eq!(lines[1], "3600 MHz · VDDCR_CPU N/A mV · VDDCR_SOC N/A mV · N/A °C · N/A GB/s");
         // Degenerate inputs: no lines, no panic.
         assert!(tooltip_lines(&[], 1.0).is_empty());
         assert!(tooltip_lines(&samples, f64::NAN).is_empty());
@@ -1836,6 +1906,7 @@ mod tests {
                 1000.0 + 10.0 * f64::from(i),
                 3600.0 + 10.0 * f64::from(i),
                 1150.0 + f64::from(i),
+                1150.0 + f64::from(i),
                 45.0 + 0.1 * f64::from(i),
                 26.35,
             ));
@@ -1864,8 +1935,9 @@ mod tests {
         assert!(has_crosshair_line(&out, hover.x), "the crosshair line paints at the hover x");
 
         // The pointer stays: the tooltip now paints (the mid-row
-        // hover maps to t = 1040 = the exact 5th sample: 3640 MHz ·
-        // 1154 mV · 45.4 °C · 26.35 GB/s @ 00:17:20).
+        // hover maps to t = 1040 = the exact 5th sample:
+        // 3640 MHz · VDDCR_CPU 1154 mV · VDDCR_SOC 1154 mV ·
+        // 45.4 °C · 26.35 GB/s @ 00:17:20).
         ctx.begin_frame(egui::RawInput::default());
         render_graphs_window(&ctx, &full, &mut iv);
         let out = ctx.end_frame();
@@ -1876,7 +1948,9 @@ mod tests {
             "the tooltip shows the HH:MM:SS timestamp, got {texts:?}"
         );
         assert!(
-            texts.contains(&"3640 MHz · 1154 mV · 45.4 °C · 26.35 GB/s"),
+            texts.contains(
+                &"3640 MHz · VDDCR_CPU 1154 mV · VDDCR_SOC 1154 mV · 45.4 °C · 26.35 GB/s"
+            ),
             "the tooltip lists every series at that timestamp, got {texts:?}"
         );
 
@@ -1891,7 +1965,7 @@ mod tests {
         // the tooltip area reappears fresh, so two hover frames
         // again.
         let mut partial = GraphState::default();
-        partial.samples.push(sample(1000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN));
+        partial.samples.push(sample(1000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN, f64::NAN));
         ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(hover)], None));
         render_graphs_window(&ctx, &partial, &mut iv);
         let _out = ctx.end_frame();
@@ -1901,7 +1975,7 @@ mod tests {
         assert!(has_crosshair_line(&out, hover.x), "a partial sample still raises the crosshair");
         let texts = painted_texts(&out);
         assert!(
-            texts.contains(&"3600 MHz · N/A mV · N/A °C · N/A GB/s"),
+            texts.contains(&"3600 MHz · VDDCR_CPU N/A mV · VDDCR_SOC N/A mV · N/A °C · N/A GB/s"),
             "the tooltip degrades the missing fields to N/A, got {texts:?}"
         );
     }
@@ -1924,6 +1998,7 @@ mod tests {
             history.samples.push(sample(
                 1000.0 + 10.0 * f64::from(i),
                 3600.0 + f64::from(i),
+                1150.0,
                 1150.0,
                 45.0,
                 26.35,
@@ -1983,6 +2058,7 @@ mod tests {
             history.samples.push(sample(
                 1000.0 + 10.0 * f64::from(i),
                 3600.0 + f64::from(i),
+                1150.0,
                 1150.0,
                 45.0,
                 26.35,
@@ -2067,6 +2143,7 @@ mod tests {
             full.samples.push(sample(
                 1000.0 + 10.0 * f64::from(i),
                 3600.0,
+                1150.0,
                 1150.0,
                 45.0,
                 26.35,

@@ -331,7 +331,12 @@ fn readout_sections(
         row("CKE drive", ohms(&cad_bus.cke_drv)),
     ];
 
+    // The Vcore row (C12: the C12-01 frozen additive `vcore_mv`
+    // field, SMU PM table 0x0A0 — Vcore is the primary rail) is
+    // prepended before VDDCR_SOC; on Intel it renders bare `N/A`
+    // (the `Na(NotApplicable)` cell, D-4 per-row degradation).
     let voltage_rows: Vec<(String, String)> = vec![
+        row("VDDCR_VDD", volts(&voltages.vcore_mv)),
         row("VDDCR_SOC", volts(&voltages.vddcr_soc_mv)),
         row("VDDIO_MEM", volts(&voltages.vddio_mem_mv)),
         row("VDD_MISC", volts(&voltages.vdd_misc_mv)),
@@ -875,8 +880,8 @@ mod tests {
             blocks[0].sections.iter().map(|section| section.rows.len()).collect();
         assert_eq!(
             row_counts,
-            vec![7, 18, 4, 8, 5, 4],
-            "7 = clocks (the `gear` row omitted, `GDM / CR` split into `GEAR_DOWN` + `CR` — net 0, D-6), 18 = tertiary, 4 = primary, 8 = CAD, 5 = secondary, 4 = voltages"
+            vec![7, 18, 4, 8, 5, 5],
+            "7 = clocks (the `gear` row omitted, `GDM / CR` split into `GEAR_DOWN` + `CR` — net 0, D-6), 18 = tertiary, 4 = primary, 8 = CAD, 5 = secondary, 5 = voltages (the VDDCR_VDD row prepended, C12)"
         );
 
         assert_eq!(displays(&rows, "MCLK"), vec!["1600.00 MHz"]);
@@ -894,6 +899,7 @@ mod tests {
         assert_eq!(displays(&rows, "RTT nom"), vec!["RZQ/10 (24.0 Ω)"]);
         assert_eq!(displays(&rows, "RTT wr"), vec!["45.0 Ω"]);
         assert_eq!(displays(&rows, "RTT park"), vec!["N/A"]);
+        assert_eq!(displays(&rows, "VDDCR_VDD"), vec!["1.150 V"]);
         assert_eq!(displays(&rows, "VDDCR_SOC"), vec!["1.150 V"]);
         assert_eq!(displays(&rows, "VPP"), vec!["1.800 V"]);
     }
@@ -1000,10 +1006,11 @@ mod tests {
         // Channel 0: the Intel channels keep the `gear` row (D-6) and
         // the `GDM / CR` split adds one row (`GEAR_DOWN` + `CR` vs the
         // single combined row) + the channel-level RTL — 9 clocks
-        // rows vs the AMD 7; the rest of the six sections are
-        // unchanged.
+        // rows vs the AMD 7; the voltages section carries the
+        // VDDCR_VDD row (C12 — bare `N/A` on Intel, D-4), the rest of
+        // the six sections are unchanged.
         let counts: Vec<usize> = blocks[0].sections.iter().map(|s| s.rows.len()).collect();
-        assert_eq!(counts, vec![9, 18, 4, 8, 5, 4]);
+        assert_eq!(counts, vec![9, 18, 4, 8, 5, 5]);
 
         let rows = all_rows(&blocks);
         let mclk = displays(&rows, "MCLK");
