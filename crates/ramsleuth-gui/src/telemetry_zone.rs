@@ -901,6 +901,9 @@ mod tests {
         assert_eq!(displays(&rows, "RTT park"), vec!["N/A"]);
         assert_eq!(displays(&rows, "VDDCR_VDD"), vec!["1.150 V"]);
         assert_eq!(displays(&rows, "VDDCR_SOC"), vec!["1.150 V"]);
+        // VDDIO_MEM value path (C12-05): the fixture carries
+        // `Value(1350)`, and the `volts()` formatter renders `1.350 V`.
+        assert_eq!(displays(&rows, "VDDIO_MEM"), vec!["1.350 V"]);
         assert_eq!(displays(&rows, "VPP"), vec!["1.800 V"]);
     }
 
@@ -1047,6 +1050,15 @@ mod tests {
             cr,
             vec!["N/A", "N/A"],
             "one CR row per channel, both not-applicable (D-C11)"
+        );
+
+        // VDDIO_MEM Na path (C12-05): the Intel voltage is structurally
+        // all-Na, so each VDDIO_MEM row renders bare `N/A` (one per
+        // channel) — the all-Na state the C12-04-fed slot degrades to.
+        assert_eq!(
+            displays(&rows, "VDDIO_MEM"),
+            vec!["N/A", "N/A"],
+            "one VDDIO_MEM row per channel, both bare N/A (all-Na voltage, D-4)"
         );
     }
 
