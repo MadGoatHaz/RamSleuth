@@ -540,6 +540,7 @@ mod tests {
                 vddio_mem_mv: Section::Value(1350),
                 vdd_misc_mv: Section::Value(1100),
                 vpp_mv: Section::Value(1800),
+                vcore_mv: Section::na(NaReason::NotApplicable),
             },
         }
     }

@@ -5,7 +5,8 @@
 //!
 //! - **Clocks** — MCLK / UCLK / FCLK (MHz) and the UCLK:MCLK divide mode
 //!   (derived: `UCLK == MCLK` → 1:1 coupled, otherwise 1:2);
-//! - **Voltage** — VDDCR_SOC (mV, converted from the table's volt unit).
+//! - **Voltage** — VDDCR_SOC and Vcore / VDDCR_VDD (mV, converted from
+//!   the table's volt unit).
 //!
 //! The remaining fields of the frozen snapshot shape (GDM / PDM /
 //! command-rate mode flags, the 27 DRAM subtimings, the 8 CAD-bus codes,
@@ -36,10 +37,11 @@
 //! # Field layout (f32 offsets, verified on 5950X silicon via monitor_cpu)
 //!
 //! ```text
-//! 0x0B0   VDDCR_SOC   f32 LE   (volts; ×1000 → mV)
-//! 0x0C0   FCLK        f32 LE   (MHz)
-//! 0x0C8   UCLK        f32 LE   (MHz)
-//! 0x0CC   MCLK        f32 LE   (MHz)
+//! 0x0A0   VDDCR_VDD (Vcore)  f32 LE   (volts; ×1000 → mV)
+//! 0x0B0   VDDCR_SOC          f32 LE   (volts; ×1000 → mV)
+//! 0x0C0   FCLK               f32 LE   (MHz)
+//! 0x0C8   UCLK               f32 LE   (MHz)
+//! 0x0CC   MCLK               f32 LE   (MHz)
 //! ```
 //!
 //! Minimum blob length [`MIN_LEN`] = 0x518 (326 × f32). Every field read
@@ -57,6 +59,11 @@
 
 use crate::amd_smu::SmuContext;
 use crate::error::{TelemetryError, TelemetryResult};
+
+/// Byte offset of the Vcore / VDDCR_VDD voltage (volts) — little-endian
+/// f32. The measured CPU core rail (C12 — 0x0A0 is the telemetry slot;
+/// 0x09C is the setpoint and is not read).
+const VDDCR_VDD_OFF: usize = 0x0A0;
 
 /// Byte offset of the VDDCR_SOC voltage (volts) — little-endian f32.
 const VDDCR_SOC_OFF: usize = 0x0B0;
@@ -222,6 +229,9 @@ pub struct AmdPmVoltages {
     pub vdd_misc_mv: u16,
     /// VPP in mV.
     pub vpp_mv: u16,
+    /// Vcore / VDDCR_VDD in mV (PM table 0x0A0, f32 volts × 1000 — C12;
+    /// board-agnostic on any AM4 PM layout we accept).
+    pub vcore_mv: u16,
 }
 
 /// A structured, version-guarded parse of the AMD SMU PM table (frozen
@@ -311,11 +321,12 @@ fn to_u16(v: f32) -> u16 {
 ///    safe even if an offset constant is edited later.
 ///
 /// Fields: FCLK / UCLK / MCLK (MHz, f32 at [`FCLK_OFF`] / [`UCLK_OFF`] /
-/// [`MCLK_OFF`], rounded to integer MHz) and VDDCR_SOC (volts, f32 at
-/// [`VDDCR_SOC_OFF`], ×1000 → mV). The divide mode is derived (`UCLK ==
-/// MCLK` → 1:1, else 1:2). GDM / PDM / command rate, the 27 timings,
-/// the 8 CAD codes, and the other three voltages are not present in
-/// this table → `0` (honest Na / Disabled under the P2-05 gates).
+/// [`MCLK_OFF`], rounded to integer MHz) and VDDCR_SOC / Vcore (volts,
+/// f32 at [`VDDCR_SOC_OFF`] / [`VDDCR_VDD_OFF`], ×1000 → mV). The
+/// divide mode is derived (`UCLK == MCLK` → 1:1, else 1:2). GDM / PDM /
+/// command rate, the 27 timings, the 8 CAD codes, and the other three
+/// voltages are not present in this table → `0` (honest Na / Disabled
+/// under the P2-05 gates).
 ///
 /// Pure: no I/O, no `unsafe`, no panic on any input (non-finite floats
 /// and negative values degrade to `0`).
@@ -335,6 +346,7 @@ pub fn parse(ctx: &SmuContext) -> TelemetryResult<AmdPmSnapshot> {
         });
     }
 
+    let vddcr_vdd_v = read_f32le(pm, VDDCR_VDD_OFF)?;
     let vddcr_soc_v = read_f32le(pm, VDDCR_SOC_OFF)?;
     let fclk = read_f32le(pm, FCLK_OFF)?;
     let uclk = read_f32le(pm, UCLK_OFF)?;
@@ -404,6 +416,10 @@ pub fn parse(ctx: &SmuContext) -> TelemetryResult<AmdPmSnapshot> {
             vddio_mem_mv: 0,
             vdd_misc_mv: 0,
             vpp_mv: 0,
+            // Vcore (VDDCR_VDD, 0x0A0) is in the table: non-finite /
+            // negative readings degrade to `0` mV → honest Na under the
+            // P2-05 voltage gate (no new failure mode).
+            vcore_mv: to_u16(vddcr_vdd_v * 1000.0),
         },
     })
 }
@@ -424,8 +440,9 @@ mod tests {
 
     /// Builds a blob of exactly [`MIN_LEN`] with the given f32 values
     /// written at the field offsets `parse` reads.
-    fn synthetic_blob(fclk: f32, uclk: f32, mclk: f32, vddcr_soc_v: f32) -> Vec<u8> {
+    fn synthetic_blob(fclk: f32, uclk: f32, mclk: f32, vddcr_soc_v: f32, vcore_v: f32) -> Vec<u8> {
         let mut blob = vec![0u8; MIN_LEN];
+        write_f32le(&mut blob, VDDCR_VDD_OFF, vcore_v);
         write_f32le(&mut blob, VDDCR_SOC_OFF, vddcr_soc_v);
         write_f32le(&mut blob, FCLK_OFF, fclk);
         write_f32le(&mut blob, UCLK_OFF, uclk);
@@ -442,6 +459,7 @@ mod tests {
         fclk_mhz: u16,
         div_mode: u8,
         vddcr_soc_mv: u16,
+        vcore_mv: u16,
     ) -> AmdPmSnapshot {
         AmdPmSnapshot {
             version,
@@ -496,6 +514,7 @@ mod tests {
                 vddio_mem_mv: 0,
                 vdd_misc_mv: 0,
                 vpp_mv: 0,
+                vcore_mv,
             },
         }
     }
@@ -555,11 +574,11 @@ mod tests {
     fn parse_known_vermeer_blob() {
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05),
+            pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.35),
         };
         assert_eq!(
             parse(&ctx),
-            Ok(known_snapshot(V_VERMEER, 1800, 1800, 1800, 0, 1050))
+            Ok(known_snapshot(V_VERMEER, 1800, 1800, 1800, 0, 1050, 1350))
         );
     }
 
@@ -569,13 +588,13 @@ mod tests {
     fn parse_div_mode_derived_1to2() {
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: synthetic_blob(1792.8, 800.4, 1600.6, 0.95),
+            pm: synthetic_blob(1792.8, 800.4, 1600.6, 0.95, 1.2),
         };
         // fclk 1792.8 → 1793, uclk 800.4 → 800, mclk 1600.6 → 1601,
-        // 0.95 V → 950 mV, div mode 1:2.
+        // 0.95 V → 950 mV, 1.2 V → 1200 mV (Vcore), div mode 1:2.
         assert_eq!(
             parse(&ctx),
-            Ok(known_snapshot(V_VERMEER, 1601, 800, 1793, 1, 950))
+            Ok(known_snapshot(V_VERMEER, 1601, 800, 1793, 1, 950, 1200))
         );
     }
 
@@ -584,11 +603,11 @@ mod tests {
     fn parse_known_matisse_blob() {
         let ctx = SmuContext {
             version: V_MATISSE,
-            pm: synthetic_blob(1200.0, 1200.0, 1200.0, 0.9),
+            pm: synthetic_blob(1200.0, 1200.0, 1200.0, 0.9, 1.1),
         };
         assert_eq!(
             parse(&ctx),
-            Ok(known_snapshot(V_MATISSE, 1200, 1200, 1200, 0, 900))
+            Ok(known_snapshot(V_MATISSE, 1200, 1200, 1200, 0, 900, 1100))
         );
     }
 
@@ -599,7 +618,7 @@ mod tests {
     fn parse_zeroes_command_rate_like_gdm_and_pdm() {
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05),
+            pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.05),
         };
         let snap = parse(&ctx).expect("synthetic blob must parse");
         assert_eq!(snap.command_rate, 0);
@@ -613,10 +632,10 @@ mod tests {
     fn non_finite_fields_degrade_to_zero() {
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: synthetic_blob(f32::NAN, f32::INFINITY, f32::INFINITY, f32::NAN),
+            pm: synthetic_blob(f32::NAN, f32::INFINITY, f32::INFINITY, f32::NAN, f32::NAN),
         };
         // uclk == mclk (both +inf) -> derived 1:1; everything else 0.
-        assert_eq!(parse(&ctx), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 0, 0)));
+        assert_eq!(parse(&ctx), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 0, 0, 0)));
     }
 
     /// (e) Negative (but finite) floats degrade to the zero value.
@@ -624,17 +643,17 @@ mod tests {
     fn negative_fields_degrade_to_zero() {
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: synthetic_blob(-1.0, -2.0, -4.0, -0.5),
+            pm: synthetic_blob(-1.0, -2.0, -4.0, -0.5, -1.5),
         };
         // -2.0 != -4.0 -> derived 1:2.
-        assert_eq!(parse(&ctx), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 1, 0)));
+        assert_eq!(parse(&ctx), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 1, 0, 0)));
     }
 
     /// (b) Truncated blobs — every length from 0 up to one byte short of
     /// [`MIN_LEN`] — yield `Err(Parse)`; no panic, no out-of-bounds read.
     #[test]
     fn truncated_blobs_yield_parse_error_not_panic() {
-        let full = synthetic_blob(1600.0, 1600.0, 1600.0, 1.0);
+        let full = synthetic_blob(1600.0, 1600.0, 1600.0, 1.0, 1.2);
         assert_eq!(full.len(), MIN_LEN);
         for len in 0..MIN_LEN {
             let ctx = SmuContext {
@@ -653,7 +672,7 @@ mod tests {
     /// parses — the gate is a minimum length, not an exact match.
     #[test]
     fn oversized_blob_still_parses() {
-        let mut blob = synthetic_blob(1600.0, 1600.0, 1600.0, 1.0);
+        let mut blob = synthetic_blob(1600.0, 1600.0, 1600.0, 1.0, 1.2);
         blob.extend_from_slice(&[0u8; 16]);
         let ctx = SmuContext {
             version: V_VERMEER,
@@ -661,7 +680,32 @@ mod tests {
         };
         assert_eq!(
             parse(&ctx),
-            Ok(known_snapshot(V_VERMEER, 1600, 1600, 1600, 0, 1000))
+            Ok(known_snapshot(V_VERMEER, 1600, 1600, 1600, 0, 1000, 1200))
+        );
+    }
+
+    /// (d) Vcore (PM 0x0A0): f32 volts × 1000 → mV, the same conversion
+    /// path as VDDCR_SOC; a 0.0 V reading → 0 mV (an honest Na under
+    /// the P2-05 voltage gate downstream).
+    #[test]
+    fn parse_vcore_volts_to_mv() {
+        let cases: [(f32, u16); 2] = [(0.75, 750), (1.35, 1350)];
+        for (vcore_v, expected_mv) in cases {
+            let ctx = SmuContext {
+                version: V_VERMEER,
+                pm: synthetic_blob(1600.0, 1600.0, 1600.0, 1.0, vcore_v),
+            };
+            let snap = parse(&ctx).expect("synthetic blob must parse");
+            assert_eq!(snap.voltages.vcore_mv, expected_mv);
+        }
+        // 0.0 V → 0 mV → out of band → Na downstream.
+        let ctx = SmuContext {
+            version: V_VERMEER,
+            pm: synthetic_blob(1600.0, 1600.0, 1600.0, 1.0, 0.0),
+        };
+        assert_eq!(
+            parse(&ctx).expect("synthetic blob must parse").voltages.vcore_mv,
+            0
         );
     }
 

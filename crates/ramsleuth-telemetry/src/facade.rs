@@ -643,6 +643,7 @@ mod tests {
                 vddio_mem_mv: Section::Value(1350),
                 vdd_misc_mv: Section::Value(1100),
                 vpp_mv: Section::Value(1800),
+                vcore_mv: Section::Value(1150),
             },
         }
     }
@@ -756,6 +757,7 @@ mod tests {
                 vddio_mem_mv: 0,
                 vdd_misc_mv: 0,
                 vpp_mv: 0,
+                vcore_mv: 1050,
             },
         }
     }

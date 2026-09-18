@@ -1141,6 +1141,7 @@ mod tests {
                 vddio_mem_mv: 1350,
                 vdd_misc_mv: 1000,
                 vpp_mv: 1800,
+                vcore_mv: 1150,
             },
         })
     }

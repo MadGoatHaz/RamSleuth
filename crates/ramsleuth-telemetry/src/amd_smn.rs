@@ -699,6 +699,7 @@ mod tests {
                 vddio_mem_mv: 0,
                 vdd_misc_mv: 0,
                 vpp_mv: 0,
+                vcore_mv: 0,
             },
         }
     }

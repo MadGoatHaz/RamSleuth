@@ -365,6 +365,7 @@ pub fn decode_channel(index: u8, mclk_reg: Option<u32>, regs: [Option<u32>; 4]) 
         vddio_mem_mv: Section::na(NaReason::NotApplicable),
         vdd_misc_mv: Section::na(NaReason::NotApplicable),
         vpp_mv: Section::na(NaReason::NotApplicable),
+        vcore_mv: Section::na(NaReason::NotApplicable),
     };
 
     IntelChannel {
@@ -798,12 +799,13 @@ mod tests {
             assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
         }
 
-        // (d) voltages (4 rails) → Na(NotApplicable).
+        // (d) voltages (5 rails, incl. Vcore — C12) → Na(NotApplicable).
         for s in [
             &ch.voltages.vddcr_soc_mv,
             &ch.voltages.vddio_mem_mv,
             &ch.voltages.vdd_misc_mv,
             &ch.voltages.vpp_mv,
+            &ch.voltages.vcore_mv,
         ] {
             assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
         }
@@ -925,6 +927,7 @@ mod tests {
             &ch.voltages.vddio_mem_mv,
             &ch.voltages.vdd_misc_mv,
             &ch.voltages.vpp_mv,
+            &ch.voltages.vcore_mv,
         ] {
             assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
         }
