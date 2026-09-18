@@ -5,6 +5,10 @@ Base branch: `v2-development` @ a505fcc (C16-01 merged — .gitignore Docs/ plan
 @@@ ACTIVE_WORKERS @@@
 (no active leases)
 
+- [DONE] ID: C16-08-REVIEW | STATUS: SUCCESS | BRANCH: v2-development, tip 1945a71 (--no-ff merge of branch/chunk-c16-08 @ ae52b63)
+DECISION: Review PASS — rebase onto 3e8bed6 was a clean no-op; post-rebase diff is exactly the one L32 comment line in packaging/ryzen-smu-dkms/dkms.conf (/sys/kernel/ryzen_smu/pm_table -> /sys/kernel/ryzen_smu_drv/pm_table, plan C16-08) + 4 DEV_LOG.md lease-bookkeeping lines; all functional directives (PACKAGE_NAME/VERSION, BUILT_MODULE_NAME, DEST_MODULE_LOCATION, AUTOINSTALL, MAKE, MODULE_STRIP) byte-identical; PII scan of the changed file (/home/, madgoat ci, email regex) = zero hits; cargo metadata OK; merged in an isolated detached worktree; v2-development NOT pushed (operator-gated); chunk branch pushed to origin.
+AHEAD: C16-09 QA runs against tip 1945a71 — all implementation chunks C16-01..C16-08 merged; push-bound PII certificate + workspace gate; C16-11 push last (strict ff, never force; no v2.0.0 tag).
+
 @@@ CURRENT_STATE @@@
 
 - [DONE] ID: C16-08 | STATUS: SUCCESS | BRANCH: branch/chunk-c16-08
