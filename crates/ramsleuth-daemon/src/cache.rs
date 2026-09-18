@@ -10,9 +10,15 @@
 //! without hardware.
 //!
 //! Semantics:
-//! - [`TelemetryCache::get`] on a cold cache (or one whose snapshot is
-//!   stale, `last_at.elapsed() >= ttl`) re-collects, stores the snapshot
-//!   plus a fresh [`std::time::Instant`], and returns it;
+//! - the **first** [`TelemetryCache::get`] on a cold cache collects
+//!   **twice** (C14, M2 first-read warm-up): the warm-up read is
+//!   discarded — its spike + settle wakes and settles the SMU — and the
+//!   second read is stored with a fresh [`std::time::Instant`] and
+//!   returned, so the first *served and cached* sample is the settled
+//!   one, not a cold idle-frequency transient;
+//! - a later `get()` on a stale snapshot (`last_at.elapsed() >= ttl`)
+//!   re-collects once, stores the snapshot plus a fresh
+//!   [`std::time::Instant`], and returns it;
 //! - a `get()` inside the TTL returns a **clone** of the cached
 //!   snapshot — no collector call;
 //! - nothing in this module panics by itself: the only dynamic work is
@@ -36,11 +42,14 @@ use ramsleuth_telemetry::SystemMemoryTelemetry;
 ///   (the daemon's `--max-age`, default 2 s, P3-17).
 /// - `last` / `last_at`: the most recent snapshot and the instant it was
 ///   collected; both `None` while the cache is cold.
+/// - `warmed`: `false` until the first `get()` completes its warm-up
+///   double-read; `true` forever after (C14, M2).
 pub struct TelemetryCache {
     collector: Box<dyn Fn() -> SystemMemoryTelemetry + Send + Sync>,
     ttl: Duration,
     last: Option<SystemMemoryTelemetry>,
     last_at: Option<Instant>,
+    warmed: bool,
 }
 
 impl TelemetryCache {
@@ -57,22 +66,34 @@ impl TelemetryCache {
             ttl,
             last: None,
             last_at: None,
+            warmed: false,
         }
     }
 
     /// Return the current snapshot.
     ///
-    /// Fresh (`last`/`last_at` both set and `last_at.elapsed() < ttl`)
-    /// → a **clone** of the cached snapshot, no collector call. Stale or
-    /// cold → call the collector, store the result plus
-    /// [`Instant::now()`], and return it. Never panics by itself (a
-    /// panicking collector is the collector's fault — the real
-    /// `collect()` is no-panic by the Phase 2 contract).
+    /// Cold (`!warmed`) → the collector runs **twice**: the first
+    /// (warm-up) result is discarded — its spike + settle wakes and
+    /// settles the SMU — and the second is stored with
+    /// [`Instant::now()`] and returned (C14, M2). Warm and fresh
+    /// (`last_at.elapsed() < ttl`) → a **clone** of the cached
+    /// snapshot, no collector call. Warm and stale → re-collect once,
+    /// store the result plus [`Instant::now()`], and return it. Never
+    /// panics by itself (a panicking collector is the collector's
+    /// fault — the real `collect()` is no-panic by the Phase 2
+    /// contract).
     pub fn get(&mut self) -> SystemMemoryTelemetry {
-        if let (Some(last), Some(last_at)) = (&self.last, &self.last_at) {
-            if last_at.elapsed() < self.ttl {
-                return last.clone();
+        if self.warmed {
+            if let (Some(last), Some(last_at)) = (&self.last, &self.last_at) {
+                if last_at.elapsed() < self.ttl {
+                    return last.clone();
+                }
             }
+        } else {
+            // Cold cache: warm-up read (discarded) — its spike+settle+read
+            // wakes and settles the SMU — then the settled read is cached.
+            let _warmup = (self.collector)();
+            self.warmed = true;
         }
         let snap = (self.collector)();
         self.last = Some(snap.clone());
@@ -133,10 +154,10 @@ mod tests {
         }
     }
 
-    /// (a) The first `get()` on a cold cache calls the collector exactly
-    /// once and returns its value.
+    /// (a) The first `get()` on a cold cache calls the collector twice
+    /// (warm-up + settled read) and returns the second call's value.
     #[test]
-    fn first_get_collects_once() {
+    fn first_get_warms_then_collects() {
         let counter = Arc::new(AtomicUsize::new(0));
         let mut cache = TelemetryCache::new(
             counting_collector(Arc::clone(&counter)),
@@ -145,12 +166,18 @@ mod tests {
 
         let snap = cache.get();
 
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "cold cache: warm-up read + settled read"
+        );
         assert_eq!(snap, mock_snapshot());
     }
 
-    /// (b) A second `get()` inside the TTL does not re-collect and
-    /// returns a snapshot equal to the first (a clone of the cache).
+    /// (b) A second `get()` inside the TTL does not re-collect: the
+    /// first `get()` already consumed the warm-up double-read, so two
+    /// `get()`s leave counter == 2 — and returns a snapshot equal to the
+    /// first (a clone of the cache).
     #[test]
     fn second_get_within_ttl_does_not_recollect() {
         let counter = Arc::new(AtomicUsize::new(0));
@@ -164,16 +191,17 @@ mod tests {
 
         assert_eq!(
             counter.load(Ordering::SeqCst),
-            1,
-            "TTL not yet expired: no second collect"
+            2,
+            "warm-up double-read from the first get; in-TTL second get adds no collect"
         );
         assert_eq!(second, first, "the cached snapshot is returned by clone");
         assert_eq!(second, mock_snapshot());
     }
 
-    /// (c) A `get()` after the TTL expires re-collects (counter == 2).
-    /// A 1 ms TTL + a 20 ms sleep makes staleness deterministic without
-    /// sleeping anywhere near the production 2 s default.
+    /// (c) A `get()` after the TTL expires re-collects exactly once
+    /// (counter == 3: 2 warm-up + 1 TTL re-collect). A 1 ms TTL + a 20 ms
+    /// sleep makes staleness deterministic without sleeping anywhere near
+    /// the production 2 s default.
     #[test]
     fn get_after_ttl_expiry_recollects() {
         let counter = Arc::new(AtomicUsize::new(0));
@@ -188,14 +216,15 @@ mod tests {
 
         assert_eq!(
             counter.load(Ordering::SeqCst),
-            2,
-            "stale snapshot must be re-collected"
+            3,
+            "2 warm-up collects + 1 TTL-expired re-collect"
         );
         assert_eq!(snap, mock_snapshot());
     }
 
-    /// (d) Returned values equal the mock's snapshot field-for-field,
-    /// and the `ttl` accessor reports the configured TTL.
+    /// (d) Returned values equal the mock's snapshot field-for-field
+    /// (the cold first `get()` consumed the warm-up double-read,
+    /// counter == 2), and the `ttl` accessor reports the configured TTL.
     #[test]
     fn returned_value_matches_mock_and_ttl_accessor_reports_config() {
         let counter = Arc::new(AtomicUsize::new(0));
@@ -207,6 +236,11 @@ mod tests {
         assert_eq!(cache.ttl(), Duration::from_secs(3));
         let snap = cache.get();
 
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "cold cache: warm-up read + settled read"
+        );
         // Field-level equality against the mock (SystemMemoryTelemetry
         // derives PartialEq; the mock's vendor branches are all-Na +
         // empty SPD).
