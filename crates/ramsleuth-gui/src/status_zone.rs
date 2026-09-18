@@ -293,11 +293,15 @@ pub fn render_status_zone(ui: &mut egui::Ui, data: &TelemetryData) -> GuiAction 
     inner.inner
 }
 
-/// The per-slot SPD module cards: one framed card per bound module
-/// (the `slot 0xNN (DDR4|DDR5)` header + the [`spd_cards`] rows); an
-/// empty SPD list renders a gray `driver missing` placeholder, and
-/// no telemetry at all renders one gray placeholder — never a
-/// panic (plan D5).
+/// The per-slot SPD module cards as a 2-column flow grid (R1):
+/// one framed card per bound module (the `slot 0xNN (DDR4|DDR5)`
+/// header + the [`spd_cards`] rows), the DIMM cards side-by-side in
+/// row pairs — 1 DIMM → `1×1` (left cell), 2 → `1×2`,
+/// 3 → `2+1`, 4 → `2×2` balanced — each card allocated
+/// half the available inner width, so the cards fill the column
+/// with no interior void. An empty SPD list renders a gray
+/// `SPD: N/A` placeholder, and no telemetry at all renders one gray
+/// placeholder — never a panic (plan D5).
 fn render_spd_cards(ui: &mut egui::Ui, data: &TelemetryData) {
     match &data.telemetry {
         Some(telemetry) => {
@@ -305,9 +309,42 @@ fn render_spd_cards(ui: &mut egui::Ui, data: &TelemetryData) {
                 ui.label(egui::RichText::new("SPD: N/A").color(NA_GRAY));
                 return;
             }
-            for (module, card) in telemetry.spd.iter().zip(spd_cards(telemetry)) {
-                render_spd_card(ui, module, &card);
-                ui.add_space(4.0);
+            // R1 (D-13.1): row-pair flow — `(n + 1) / 2` rows of up
+            // to 2 cards (1 → 1×1 left cell, 2 → 1×2, 3 → 2+1,
+            // 4 → 2×2 balanced), each allocated
+            // `(avail − item_spacing.x) / 2`: the layout's item
+            // spacing lands between the pair, so the two columns
+            // sum to the full inner width. The zero-height
+            // allocation draws each card at its natural height (the
+            // bench-slice precedent, main.rs:949-954); the 4 pt row
+            // spacing replaces the old per-card vertical gap.
+            let cards = spd_cards(telemetry);
+            let n = telemetry.spd.len();
+            let col_w = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).max(0.0);
+            let rows = n.div_ceil(2); // (n + 1) / 2, MSRV 1.75
+            for r in 0..rows {
+                // A `ui.horizontal` row would not do: it is
+                // `left_to_right(Align::Center)`, cross-axis centered —
+                // with unequal card heights (a populated 0x52 over an
+                // all-`Na` 0x53) the second card centers against the
+                // first's expanded height instead of top-aligning
+                // (staggered, not a grid). An explicit top-aligned
+                // row keeps both cards on the row's top edge.
+                let _ = ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                    for c in 0..2 {
+                        let idx = r * 2 + c;
+                        if idx < n {
+                            ui.allocate_ui_with_layout(
+                                egui::Vec2::new(col_w, 0.0),
+                                egui::Layout::top_down(egui::Align::LEFT),
+                                |ui| render_spd_card(ui, &telemetry.spd[idx], &cards[idx]),
+                            );
+                        }
+                    }
+                });
+                if r + 1 < rows {
+                    ui.add_space(4.0);
+                }
             }
         }
         None => {
@@ -327,6 +364,11 @@ fn render_spd_card(ui: &mut egui::Ui, module: &SpdModule, card: &[(String, Strin
         .stroke(egui::Stroke::new(1.0_f32, CYAN))
         .inner_margin(egui::Margin::symmetric(8.0, 4.0));
     let _ = frame.show(ui, |ui| {
+        // D-4a fill (D-13.1): the card's CYAN border spans its
+        // allocated half-column — a `Frame` otherwise shrinks to
+        // its content's natural width, leaving dead space inside
+        // the allocation.
+        ui.set_min_width(ui.available_width());
         ui.label(egui::RichText::new(&header).strong().color(CYAN));
         let _ = egui::Grid::new(format!("ramsleuth_spd_card_0x{:02X}", module.index))
             .spacing(egui::vec2(12.0, 1.0))
@@ -334,9 +376,16 @@ fn render_spd_card(ui: &mut egui::Ui, module: &SpdModule, card: &[(String, Strin
             .show(ui, |ui| {
                 for (label, display) in card {
                     ui.add(egui::Label::new(egui::RichText::new(label.as_str())));
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(display.as_str()).color(card_value_color(display)),
-                    ));
+                    // A long value (a full product line) exceeds
+                    // the half-column's inner width in its natural
+                    // single-line form — wrapping keeps it inside
+                    // the card (no clip, no cross-card overlap).
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(display.as_str()).color(card_value_color(display)),
+                        )
+                        .wrap(true),
+                    );
                     ui.end_row();
                 }
             });
