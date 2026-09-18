@@ -10,7 +10,10 @@
 //! capacities (`dimm_sizes`) derive from the SPD modules, and the total
 //! capacity prefers the `/proc/meminfo` `MemTotal` (the OS ground
 //! truth) over the SPD sum, which survives as the non-meminfo
-//! fallback (D-C3/D-C9, D-3).
+//! fallback (D-C3/D-C9, D-3). The board-VRM read (C12-03) runs after
+//! the platform branch and feeds the fill-when-Na `vddio_mem_mv`
+//! overlay at assembly (D-5: a carried `Value` is never clobbered;
+//! VPP / VDD_MISC unmapped, untouched).
 //!
 //! **No-panic contract:** [`collect()`] never returns `Err` and never
 //! panics — unavailable data always degrades to `Section::Na(reason)`.
@@ -23,7 +26,8 @@
 //! CpuInfo::detect() ──┬─ AMD:      amd_smu::acquire() → amd_pm::parse() → amd_smn::apply_smn (overlay) → amd_readout::map_amd()
 //!                     ├─ Intel:    intel_mchbar::acquire() → intel_readout::read_intel()
 //!                     ├─ SPD:      spd_eeprom::acquire() → spd_decode::decode() (per image)
-//!                     └─ Platform: platform::collect_platform() (C6-01) → dimm_sizes + total_capacity (D-C3)
+//!                     ├─ Platform: platform::collect_platform() (C6-01) → dimm_sizes + total_capacity (D-C3)
+//!                     └─ Board VRM: board_vrm::read_board_vrm(&platform.motherboard) (C12-03) → fill-when-Na vddio_mem_mv overlay (D-5)
 //! ```
 //!
 //! A vendor branch runs only on matching silicon: the AMD branch gates
@@ -40,6 +44,7 @@ use crate::amd_pm;
 use crate::amd_readout::{self, AmdReadout};
 use crate::amd_smn;
 use crate::amd_smu;
+use crate::board_vrm::{self, BoardVrmReadout};
 use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_mchbar;
@@ -126,10 +131,17 @@ pub struct SystemMemoryTelemetry {
 /// 5. Platform branch (all vendors, C6-01): `platform::collect_platform()`
 ///    — every field degrades independently and it never fails the
 ///    process.
-/// 6. Per-DIMM capacities (D-C3/D-C9): `density_mbit × devices / 8192`
+/// 6. Board VRM branch (all vendors, C12-03):
+///    `board_vrm::read_board_vrm(&platform.motherboard)` — the
+///    DMI-keyed profile + nct6798 in13 read; every rail degrades to
+///    `Na(NotApplicable)` when the board is unknown / the device is
+///    absent (§9). Its VDDIO_MEM reading feeds the fill-when-Na
+///    `vddio_mem_mv` overlay at assembly (D-5); the I/O stays here,
+///    never in `assemble`.
+/// 7. Per-DIMM capacities (D-C3/D-C9): `density_mbit × devices / 8192`
 ///    per SPD module (parallel to the SPD list; `Na` when that module's
 ///    density or devices is `Na`).
-/// 7. Total capacity (D-3/D-C3): the `/proc/meminfo` `MemTotal` (the
+/// 8. Total capacity (D-3/D-C3): the `/proc/meminfo` `MemTotal` (the
 ///    OS ground truth) when it carries a value, else the sum of the
 ///    DIMM capacities (the non-meminfo fallback).
 pub fn collect() -> SystemMemoryTelemetry {
@@ -145,14 +157,28 @@ pub fn collect() -> SystemMemoryTelemetry {
     // 5. Platform branch (vendor-independent, C6-01; never fails the
     //    process — every field degrades independently).
     let platform = platform_branch();
-    // 6. Per-DIMM capacities (D-C3/D-C9): parallel to the SPD modules.
+    // 6. Board VRM branch (vendor-independent, C12-03; the DMI-keyed
+    //    profile + nct6798 in13 read — every rail degrades to
+    //    Na(NotApplicable) on an unknown board / absent device, §9).
+    let board_vrm = board_vrm::read_board_vrm(&platform.motherboard);
+    // 7. Per-DIMM capacities (D-C3/D-C9): parallel to the SPD modules.
     let dimm_sizes = dimm_sizes(&spd);
-    // 7. Total capacity (D-3/D-C3): the meminfo `MemTotal` (the OS
+    // 8. Total capacity (D-3/D-C3): the meminfo `MemTotal` (the OS
     //    ground truth) when it carries a value, else the DIMM sum
     //    (the non-meminfo fallback).
     let total_capacity = total_capacity(&dimm_sizes);
-    // 8. Assemble with per-branch containment (pure).
-    assemble(cpu, amd, intel, spd, platform, total_capacity, dimm_sizes)
+    // 9. Assemble with per-branch containment + the fill-when-Na
+    //    VDDIO_MEM overlay (pure).
+    assemble(
+        cpu,
+        amd,
+        intel,
+        spd,
+        platform,
+        total_capacity,
+        dimm_sizes,
+        board_vrm,
+    )
 }
 
 /// Map a frozen [`TelemetryError`] to its display [`NaReason`] tag.
@@ -305,6 +331,14 @@ fn total_capacity(dimm_sizes: &[Section<f64>]) -> Section<f64> {
 /// capacities (`dimm_sizes` / `total_capacity`, computed in
 /// [`collect()`] from the SPD modules — D-C3/D-C9) are carried through
 /// as-is.
+///
+/// The board-VRM readout (C12-03, read in [`collect()`] — the I/O never
+/// happens here) feeds the fill-when-Na `vddio_mem_mv` overlay (D-5):
+/// the PM table carries no VDDIO voltage, so the AMD slot is
+/// structurally `Na` and the profile's in13 reading fills it; a
+/// carried `Value` is never clobbered, the Intel branch is out of the
+/// overlay's reach, and VPP / VDD_MISC (unmapped, D-3) are untouched.
+#[allow(clippy::too_many_arguments)] // C12-04 frozen shape: the board-VRM readout is a trailing parameter (plan §3)
 fn assemble(
     cpu: CpuInfo,
     amd: TelemetryResult<AmdReadout>,
@@ -313,8 +347,9 @@ fn assemble(
     platform: SystemPlatform,
     total_capacity: Section<f64>,
     dimm_sizes: Vec<Section<f64>>,
+    board_vrm: BoardVrmReadout,
 ) -> SystemMemoryTelemetry {
-    SystemMemoryTelemetry {
+    let mut telemetry = SystemMemoryTelemetry {
         cpu,
         amd: section_from(amd),
         intel: section_from(intel),
@@ -322,7 +357,20 @@ fn assemble(
         platform,
         total_capacity,
         dimm_sizes,
+    };
+    // The C12-04 overlay (D-5): fill-when-Na only — the AMD slot is
+    // structurally `Na` from the PM table, so the board profile's in13
+    // reading fills it; a carried `Value` always stands (a hypothetical
+    // future PM-sourced value can never be clobbered).
+    match (&mut telemetry.amd, &board_vrm.vddio_mem_mv) {
+        (Section::Value(readout), Section::Value(mv))
+            if readout.voltages.vddio_mem_mv.is_na() =>
+        {
+            readout.voltages.vddio_mem_mv = Section::Value(*mv);
+        }
+        _ => {}
     }
+    telemetry
 }
 
 /// Map one vendor-branch result to a `Section`: `Ok` → `Value`,
@@ -481,9 +529,13 @@ mod tests {
             platform.clone(),
             total_capacity.clone(),
             dimm_sizes.clone(),
+            board_vrm::BoardVrmReadout::all_na(),
         );
 
-        // AMD: its own Err → Na(DriverMissing).
+        // AMD: its own Err → Na(DriverMissing) — the overlay only runs
+        // on a `Value` amd readout, so the `vddio_mem_mv` slot stays
+        // the Na the branch already carries (all-Na board readout:
+        // inert).
         assert_eq!(t.amd, Section::Na(NaReason::DriverMissing));
         // Intel: independently Na(UnsupportedHardware).
         assert_eq!(t.intel, Section::Na(NaReason::UnsupportedHardware));
@@ -525,9 +577,12 @@ mod tests {
             platform.clone(),
             total_capacity.clone(),
             dimm_sizes.clone(),
+            board_vrm::BoardVrmReadout::all_na(),
         );
 
-        // AMD: independently Na(UnsupportedHardware).
+        // AMD: independently Na(UnsupportedHardware) — the overlay only
+        // reaches the AMD branch, so this arm never touches
+        // `vddio_mem_mv` (all-Na board readout: inert).
         assert_eq!(t.amd, Section::Na(NaReason::UnsupportedHardware));
         // Intel: its own Err → Na(InsufficientPrivilege).
         assert_eq!(t.intel, Section::Na(NaReason::InsufficientPrivilege));
@@ -1178,5 +1233,104 @@ mod tests {
         assert_value_or_na("bios", &p.bios);
         assert_value_or_na("agesa", &p.agesa);
         assert_value_or_na("smu_version", &p.smu_version);
+    }
+
+    // ------------------------------------------------------------------
+    // (g) C12-04: the fill-when-Na VDDIO_MEM overlay (D-5).
+    // ------------------------------------------------------------------
+
+    /// (g1) The merge: a profile `Value` fills the AMD `vddio_mem_mv`
+    /// slot **only when it is `Na`** (the PM table carries no VDDIO
+    /// voltage, so the slot is structurally Na); a carried `Value` is
+    /// never clobbered (a hypothetical future PM-sourced reading wins);
+    /// an all-Na readout leaves the slot `Na` (the §9 graceful path).
+    /// VPP / VDD_MISC are unmapped (D-3) and survive every arm
+    /// untouched; the Intel branch is out of the overlay reach.
+    #[test]
+    fn merge_board_vrm_fills_na_vddio_only() {
+        fn amd_cpu() -> CpuInfo {
+            CpuInfo {
+                vendor: CpuVendor::Amd(AmdZen::Zen3),
+                brand: "Ryzen 9 5950X".to_owned(),
+            }
+        }
+        fn intel_err() -> TelemetryResult<IntelReadout> {
+            Err(TelemetryError::UnsupportedHardware {
+                vendor: "Intel (AMD SMU telemetry requires AMD silicon)".to_owned(),
+            })
+        }
+
+        // Arm 1 — fill-when-Na: the structural Na slot + a profile
+        // Value → the in13 reading lands.
+        let mut amd_readout = fixture_amd();
+        amd_readout.voltages.vddio_mem_mv = Section::na(NaReason::NotApplicable);
+        let mut board_vrm = BoardVrmReadout::all_na();
+        board_vrm.vddio_mem_mv = Section::Value(1200);
+        let t = assemble(
+            amd_cpu(),
+            Ok(amd_readout),
+            intel_err(),
+            Vec::new(),
+            fixture_platform(),
+            Section::na(NaReason::NotApplicable),
+            Vec::new(),
+            board_vrm,
+        );
+        match &t.amd {
+            Section::Value(readout) => {
+                assert_eq!(readout.voltages.vddio_mem_mv, Section::Value(1200));
+                // VPP / VDD_MISC: unmapped (D-3) — untouched.
+                assert_eq!(readout.voltages.vpp_mv, Section::Value(1800));
+                assert_eq!(readout.voltages.vdd_misc_mv, Section::Value(1100));
+            }
+            other => panic!("AMD branch must stay Value: {other:?}"),
+        }
+
+        // Arm 2 — no-clobber: a carried Value (the fixture 1350 mV) +
+        // a profile Value → the carried value stands (D-5).
+        let amd_readout = fixture_amd();
+        let mut board_vrm = BoardVrmReadout::all_na();
+        board_vrm.vddio_mem_mv = Section::Value(1200);
+        let t = assemble(
+            amd_cpu(),
+            Ok(amd_readout),
+            intel_err(),
+            Vec::new(),
+            fixture_platform(),
+            Section::na(NaReason::NotApplicable),
+            Vec::new(),
+            board_vrm,
+        );
+        match &t.amd {
+            Section::Value(readout) => assert_eq!(
+                readout.voltages.vddio_mem_mv,
+                Section::Value(1350),
+                "a carried Value is never clobbered (D-5)"
+            ),
+            other => panic!("AMD branch must stay Value: {other:?}"),
+        }
+
+        // Arm 3 — all-Na fallback: the structural Na slot + an all-Na
+        // readout (unknown board / absent device, §9 item 2) → the slot
+        // stays Na(NotApplicable).
+        let mut amd_readout = fixture_amd();
+        amd_readout.voltages.vddio_mem_mv = Section::na(NaReason::NotApplicable);
+        let t = assemble(
+            amd_cpu(),
+            Ok(amd_readout),
+            intel_err(),
+            Vec::new(),
+            fixture_platform(),
+            Section::na(NaReason::NotApplicable),
+            Vec::new(),
+            BoardVrmReadout::all_na(),
+        );
+        match &t.amd {
+            Section::Value(readout) => assert_eq!(
+                readout.voltages.vddio_mem_mv,
+                Section::na(NaReason::NotApplicable)
+            ),
+            other => panic!("AMD branch must stay Value: {other:?}"),
+        }
     }
 }
