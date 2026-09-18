@@ -2,6 +2,59 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Cycle 12 (SMU Vcore additive wire field + board-profile VDDIO_MEM via NCT6798 in13) — 2026-09-18 — COMPLETE
+
+### What was delivered
+Cycle 12 (SMU Vcore additive wire field + board-profile VDDIO_MEM via NCT6798 in13) is COMPLETE: **all 5 chunks merged into `v2-development` (C12-01..C12-05)** from baseline `84f6036` (the Cycle 11 compaction) to tip `0003f6f` — driven by the operator's directive:
+
+**Operator directive (the cycle driver):**
+- Add the missing VRM-rail telemetry per the "Low-Level Hardware Telemetry & Register Gathering" doc, using **SMU direct telemetry (Priority 1, board-agnostic)** + a **DMI-keyed board profile database** for the Super I/O (graceful N/A fallback) — **not guessing raw ADC magnitudes**.
+
+**The 2 rails added:**
+1. **Vcore (VDDCR_VDD) — board-agnostic:** from the `ryzen_smu` PM table offset **0x0A0** (f32 volts — the read value, not the 0x09C setpoint, per `Docs/C12-RESEARCH-RYZEN-SMU.md`), carried as a **NEW ADDITIVE wire field** `VoltageSet.vcore_mv: Section<u16>` (the C8-01 `smu_version` precedent: appended, shape-checked, all 14 construction literals co-landed).
+2. **VDDIO_MEM (DRAM):** from the **NCT6798 Super I/O in13** via the DMI-keyed board profile (the LibreHardwareMonitor Crosshair VIII Hero table: in13→DRAM, in0→Vcore, in6→SoC), filling the **EXISTING `vddio_mem_mv` slot** (zero-wire).
+
+**Graceful-degradation rulings:**
+- VPP / VDD_MISC (Chipset) unmapped by the LHM tables → N/A muted gray (by design).
+- Unknown board / no nct6798 present → all-Na (no panic).
+- hwmon unit is mV (driver-scaled — no re-application of LHM's 8 mV/count).
+- Fill-when-Na only: an existing Value is never clobbered; AMD branch only.
+
+**Chunks (all `--no-ff` merged; range `84f6036..0003f6f`):**
+- **C12-01** wire-freeze — additive `VoltageSet.vcore_mv: Section<u16>` + `AmdPmVoltages.vcore_mv` from PM table 0x0A0 (f32 V ×1000 → mV, non-finite/negative → 0 → gate → Na) + all 14 `VoltageSet`/`AmdPmVoltages` construction literals co-landed in ONE commit (75cdce5 → merge 30e613a).
+- **C12-02** GUI Vcore — the VDDCR_CPU row data-driven from the frozen `vcore_mv` field (GUI-local `GraphSample.vddcr_cpu_mv`; VDDCR_VDD prepended in voltage_rows) (c853ac9 → merge 318a76e).
+- **C12-03** board_vrm.rs — the DMI-keyed profile database (PROFILES registry + CROSSHAIR_VIII_HERO: in13→VddioMem, in0→Vcore, in6→Soc) + the NCT6798 name-only hwmon binder (per-rail `in{N}_input` mV reads, gate bands, per-rail containment, all-Na fallback) (7ff5367 → merge c49d4fc).
+- **C12-04** facade merge — fill-when-Na VDDIO_MEM from the board_vrm binder (AMD branch only; a carried Value is never clobbered; VPP/VDD_MISC untouched; zero-wire — the existing slot) (1228568 → merge f8c0194).
+- **C12-05** GUI VDDIO_MEM display assertions — test-only pins in telemetry_zone.rs (the Value path renders volts, Na renders bare N/A) (14e507a → merge 46faf89).
+- **Final tip `0003f6f`** — the C12-05 review lease sign-out (state update; the C12-06 QA close).
+
+### Key plan decisions
+- **D-1:** SMU direct telemetry is Priority 1 and board-agnostic — Vcore from the PM table 0x0A0 (the researched read value, not the 0x09C setpoint).
+- **D-2:** Super I/O rails come from a DMI-keyed board profile database (the LibreHardwareMonitor table per board), never raw ADC guesses — the Crosshair VIII Hero: in13→DRAM, in0→Vcore, in6→SoC.
+- **D-3:** additive-only wire change — exactly one new field, `VoltageSet.vcore_mv: Section<u16>` (the C8-01 `smu_version` precedent); VDDIO_MEM fills the existing slot (zero-wire).
+- **D-4:** graceful degradation — unmapped rails (VPP/VDD_MISC) → N/A muted gray; unknown board / no nct6798 → all-Na; no panic.
+- **D-5:** hwmon `in{N}_input` is already mV (driver-scaled) — no re-application of LHM's 8 mV/count scaling.
+- **D-6:** fill-when-Na only — a carried Value is never clobbered; the AMD branch only.
+
+### Quality
+- **555/555 tests green (debug AND release, whole workspace)** — up from the 546 baseline (546 + 9 net-new C12 tests); **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); **MSRV 1.75** held; **6 release binaries** build; **zero new deps** (empty `Cargo.toml`/`Cargo.lock` diff over the cycle range); **no-panic clean** (all telemetry + GUI production sections free of panic/unwrap/expect on hw data; board_vrm all-Na graceful).
+- **Wire audit = exactly the additive `VoltageSet.vcore_mv` field** — protocol 0-diff; all 8 frozen wire structs byte-identical; `AmdPmVoltages.vcore_mv` (u16, internal, no serde), `BoardVrmReadout` (in-crate, no serde), and GUI-local `GraphSample.vddcr_cpu_mv` (f64, no serde) are all off-wire.
+- **QA verdict: PASS-WITH-MANUAL-LIVE-VERIFY** — all 5 chunks merged; the operator live GUI run is the remaining manual gate.
+
+### Live finding
+- On the 5950X Hero host, **nct6798 in13 = 1376 mV (1.376 V)** — verified as a **Value** by the C12-03 worker's live host-tolerant test (the DRAM rail now carries data, not N/A).
+
+### Push state (operator gate)
+Local `v2-development` tip = **`0003f6f`** (Cycle 12 range `84f6036..0003f6f`; `origin/v2-development` still `b908f7b`) — **unpushed, operator-gated** (this compaction performs no push). The 5 merged `branch/chunk-c12-*` chunk branches were pruned during the cycle (none remain local; all fully merged into `v2-development`). On the operator's go-ahead: **fast-forward to `0003f6f` (NEVER force-push) → prune the remote chunk branches → optional `v2.0.0` tag**.
+
+### Open items carried
+1. **Operator live GUI run (pending)** — `plans/CYCLE12-LIVE-CHECKLIST.md` (5950X host; needs interactive sudo): the 5 live checks (a–e) for the Vcore value + the VDDIO_MEM display — closes the PASS-WITH-MANUAL-LIVE-VERIFY verdict.
+2. **Push to GitHub** — operator go-ahead (ff to `0003f6f`, prune the remote chunk branches, optional `v2.0.0` tag; strictly no force-push, no pre-go-ahead remote mutation).
+3. **Domain A follow-up (NOT in this cycle — a future cycle)** — the SMN CAD/ProcODT/RTT PHY registers (root, UMC-space `0x00050000`/`0x00051000`/`0x0001B000`; decode-table reconciliation; active-rank indexing).
+4. The remaining Cycle 11 open items carry as listed in the Cycle 11 section (Intel MCHBAR decode — hardware-gated; MSRV 1.75 vs newer; AIDA64 parity gate).
+
+Cycle 12 close-out (2026-09-18): this compaction recorded the Cycle 12 section in `MASTER_LOG.md` and reset `DEV_LOG.md` (base line → `0003f6f`, ACTIVE_WORKERS cleared, CURRENT_STATE = COMPLETE, the per-lease history archived). No commit and no push (the commit lands in a separate follow-up subtask).
+
 ## Cycle 11 (v2.0.0 DIMM identity: revert C10 density paint + fix DDR4 rank decode to JESD79-4 bits 3:4) — 2026-09-17 — COMPLETE
 
 ### What was delivered
