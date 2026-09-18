@@ -34,7 +34,7 @@
 //! multiplier, an Intel concept) renders only on the Intel channels;
 //! the AMD block omits it (D-6). The zone
 //! lays out at its natural height — no scroll area: at the default
-//! 960×600 window the 3×2 grid (worst column ≈ 25 rows) fits the
+//! 968×600 window the 3×2 grid (worst column ≈ 25 rows) fits the
 //! left column without vertical scrolling (C7-12). The vendor
 //! blocks are conditional on the detected CPU (C7-14): an `Amd` host
 //! renders only the AMD block, an `Intel` host only the Intel
@@ -67,7 +67,7 @@ const AMD: &str = "AMD";
 const INTEL: &str = "Intel";
 /// The compact section-grid spacing (C7-12; C13-03): the 8.0 pt
 /// label↔value gap (down from 12.0) + the 0.0 pt row pitch (down
-/// from 1.0 — at the 960×600 default the equal-width columns wrap
+/// from 1.0 — at the 968×600 default the equal-width columns wrap
 /// their longest section titles onto a second line, and the zero
 /// pitch reclaims that ~23 pt of the worst column, keeping it within
 /// the zone's content budget).
@@ -507,7 +507,7 @@ fn volts(section: &Section<u16>) -> String {
 /// Zone 1: render the timing matrix from `data` — a titled SLATE
 /// frame holding the §3.1 3-column × 2-row section grid per vendor
 /// block (C7-12): the zone lays out at its natural height — no
-/// scroll area — and at the default 960×600 window the grid (worst
+/// scroll area — and at the default 968×600 window the grid (worst
 /// column ≈ 25 rows) fits the left column without vertical scrolling.
 ///
 /// Rows: the label in default text, the value in CYAN, an absent cell
@@ -620,7 +620,7 @@ fn render_section(
     let Some(section) = section else {
         return;
     };
-    // The title wraps (D-13.2): at the 960×600 default each column
+    // The title wraps (D-13.2): at the 968×600 default each column
     // is ≈ (504 − 20 − 16) / 3 ≈ 156 pt wide, and the `CAD Bus
     // Drive & Termination` title would otherwise paint into the next
     // column.
@@ -1154,7 +1154,7 @@ mod tests {
         );
     }
 
-    /// The zone's content budget at the default 960×600 size
+    /// The zone's content budget at the default 968×600 size
     /// (C13-03, re-anchored from C7-12's 1400×900 pin): the 600 pt
     /// window (`DEFAULT_WINDOW_SIZE[1]`) minus the header strip
     /// (~70 pt), the column-row bottom gap (8 pt), the zone frame's
@@ -1179,7 +1179,7 @@ mod tests {
     /// (h) Row depth (C7-12, the no-scroll gate's unit stand-in): the
     /// worst column of the 3×2 layout — two stacked sections + their
     /// two titles — stays within [`ZONE_CONTENT_BUDGET`] at the
-    /// default 960×600 size. The worst column (5 + 18 rows + 2
+    /// default 968×600 size. The worst column (5 + 18 rows + 2
     /// titles = 25) at the 18 pt row pitch is ≈ 450 pt (the plan's
     /// number) — no vertical scroll (the QA live gate measures the
     /// rendered window).
@@ -1221,7 +1221,7 @@ mod tests {
     fn renders_headlessly_without_panic_and_within_budget() {
         // The zone's column allocation (main.rs: 55% of the panel
         // width, clamped to `max_left` = avail − MIN_RIGHT_W −
-        // COLUMN_GAP): 952 × 0.55 ≈ 524 pt → 504 pt at the 960 pt
+        // COLUMN_GAP): 952 × 0.55 ≈ 524 pt → 504 pt at the 968 pt
         // default window (right column = MIN_RIGHT_W 440); the full
         // 600 pt height = `DEFAULT_WINDOW_SIZE[1]` (main.rs, C13-01 —
         // mirrored literal: a lib module cannot reference the bin's
