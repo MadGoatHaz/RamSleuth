@@ -7,6 +7,10 @@ Base branch: `v2-development` @ a505fcc (C16-01 merged — .gitignore Docs/ plan
 
 @@@ CURRENT_STATE @@@
 
+- [DONE] ID: C16-08 | STATUS: SUCCESS | BRANCH: branch/chunk-c16-08
+DECISION: Fixed the stale P5-08 sysfs path in the Purpose: comment (L32) of packaging/ryzen-smu-dkms/dkms.conf: /sys/kernel/ryzen_smu/pm_table to /sys/kernel/ryzen_smu_drv/pm_table — comment-only; all functional directives (PACKAGE_NAME/VERSION, BUILT_MODULE_NAME, DEST_MODULE_LOCATION, AUTOINSTALL, MAKE, MODULE_STRIP) byte-identical.
+AHEAD: Reviewer: single-file diff = exactly that one comment line; grep -n ryzen_smu_drv -> L32 present; no PII introduced.
+
 - [DONE] ID: C16-02-REVIEW | STATUS: SUCCESS | BRANCH: v2-development, tip 3886bac (--no-ff merge of rebased branch/chunk-c16-02 @ 61827a6)
 DECISION: Review PASS — post-rebase diff is exactly README.md (142 lines, new) + DEV_LOG.md lease lines (6); all 12 D-16.2 sections present; PII scan: /home/ + email regex = zero, madgoat (ci) = 1 whitelisted hit (the MadGoatHaz repo URL — D-16.4 whitelist: handle + project repo URL); spot-checks grounded — daemon --socket/--max-age(2), bench --avx512/--json, telemetry --json verified against crates/*/src/main.rs; DEFAULT_SOCKET_PATH = /run/ramsleuth/ramsleuth.sock; the 9 GUI system libs match .github/workflows/ci.yml exactly; 556/556 debug tests green on the rebased tree; rebase onto 317b52a conflicted only in the DEV_LOG lease region (resolved keeping the rebase side's state, C16-01 history preserved below); merged in an isolated worktree, 31/31 local docs restored post-merge (byte-identical to the pre-rebase /tmp backup); v2-development NOT pushed (operator-gated); rebased chunk branch force-pushed to origin.
 AHEAD: Wave 2 (C16-03..C16-08) forks from this tip (3886bac) — the 21 docs stay untracked+ignored (physical copies local only, 31/31); C16-09 QA runs the workspace gate + the push-bound PII certificate; C16-11 push (strict ff, go-ahead given; never force; no v2.0.0 tag) last.
