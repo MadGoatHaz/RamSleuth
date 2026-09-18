@@ -7,6 +7,12 @@ Base branch: `v2-development` @ a505fcc (C16-01 merged — .gitignore Docs/ plan
 
 @@@ CURRENT_STATE @@@
 
+Cycle 16 (documentation review/update, README v2.0 creation, gitignore Docs/ plans/ .kilo/ + untrack, PII audit, operator-authorized push) IN PROGRESS — C16-02 README.md created (142 lines; every claim grounded in workspace Cargo.toml / crates/*/src/main.rs usage blocks / .github/workflows/ci.yml / packaging/README.md / systemd/ramsleuth.service / MASTER_LOG.md; zero PII; the v2.0.0-branded v2-development line) committed bf16b86 + pushed; C16-01 (.gitignore + 21-file untrack) merging in parallel, no file overlap; Wave 2 remainder, QA (C16-09) and push (C16-11) pending; v2-development @ 8ee2f60 unpushed (operator-gated).
+
+- [DONE] ID: C16-02 | STATUS: SUCCESS | BRANCH: branch/chunk-c16-02
+DECISION: Created root README.md (142 lines, new file) per PLAN-CYCLE16 D-16.2 — title, what-it-is (dual layer + privilege separation + Bincode + no-panic), features, 7-crate architecture, the 6 binaries with key flags/exit codes, build (MSRV 1.75 + GUI system libs), running, install (AUR ramsleuth-git + makepkg), AMD telemetry requirement (ryzen-smu-dkms + scripts/install-ryzen-smu-dkms.sh), testing (556/556 debug+release, clippy, CI matrix), project layout, MIT license + v2.0.0-development-line footer; all claims grounded, PII scan clean.
+AHEAD: Reviewer: no file overlap with C16-01; rebase onto the running v2-development tip if C16-01 merges first (DEV_LOG lease lines are the only shared hotspot).
+
 - [DONE] ID: C16-01-REVIEW | STATUS: SUCCESS | BRANCH: v2-development, tip a505fcc (--no-ff merge of branch/chunk-c16-01)
 DECISION: Review PASS — diff is exactly .gitignore (+Docs/ +plans/ +.kilo/) + DEV_LOG bookkeeping + the 21 index-only deletions (zero source/Cargo change); on-branch ls-files Docs/ plans/ empty, check-ignore matches all three rules, 31/31 local docs intact (the 21 byte-identical to base 8ee2f60); cargo metadata OK; merged in an isolated worktree (main tree was occupied by active C16-02), 21 docs restored post-merge; v2-development NOT pushed (operator-gated); chunk branch already on origin.
 AHEAD: Main tree sits on branch/chunk-c16-02 @ bf16b86 (pre-merge base) — rebase onto a505fcc before further work (the DEV_LOG lease line is the only shared hotspot); the 21 docs are untracked+ignored from a505fcc on, their physical copies live in the main tree, and any branch switch from the pre-merge base deletes them (recoverable from git history/origin); C16-09 QA and C16-11 push proceed against a505fcc.
