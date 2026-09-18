@@ -2,6 +2,47 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Cycle 14 (runtime bug fixes: clock first-sample warm-up+settle, non-blocking burn-in per-tick brief lock) — 2026-09-18 — COMPLETE
+
+### What was delivered
+Cycle 14 (runtime bug fixes) is COMPLETE: **all 3 chunks merged into `v2-development` (C14-01..C14-03)** from baseline `d60cd34` (the Cycle 13 compacted state) to tip `80b2374` — driven by the operator's two bug reports:
+
+**Operator bug reports (the cycle drivers):**
+- **(BUG-1)** "MCLK, UCLK, FCLK don't always report correctly when first starting the app" — intermittent, first-startup only.
+- **(BUG-2)** "'Run Burn-in' locks up the app UI while it's running for the duration selected. Graphs lock up as well."
+
+**Root causes:**
+- **BUG-1** — the first PM-table read is LAZY (fires on the GUI's immediate first poll, <1 s after daemon boot, the least-settled moment), reads with ZERO settle time after the 250 ms spike, and the low idle value PASSES the 1–4096 MHz gate and gets CACHED for the full 2 s TTL (the GUI polls at exactly 2 s, so the visible first sample IS the unvalidated cold value).
+- **BUG-2** — the GUI poller thread (a background std::thread) held the shared-state RwLock WRITE guard ACROSS THE ENTIRE bench/burn-in stream drain (update.rs `run_burn_in`/`run_bench` called with `&mut state.write().unwrap()`), starving the egui main thread's per-frame `state.read()` — freezing BOTH viewports (main + Graphs share one eframe event loop) for the whole run. "Run Full"/"Memory Only" shared the defect (just shorter).
+
+**Chunks (all `--no-ff` merged; range `d60cd34..80b2374`):**
+- **C14-01** first-read warm-up (BUG-1, M2) — `crates/ramsleuth-daemon/src/cache.rs`: a `warmed: bool` field; on a cold cache the collector is called TWICE, the first discarded as warm-up, the second (settled) value cached+returned, so the first served clock sample is settled; warm-path TTL logic unchanged (b6982a0 → merge 9903d86).
+- **C14-02** post-spike settle delay (BUG-1, M1) — `crates/ramsleuth-daemon/src/main.rs`: a named const `CLOCK_SETTLE` = 150 ms sleep after the spike, before the PM-table read, giving the SMU time to move MCLK to the operating freq; spike params (256 MiB/250 ms) and TTL unchanged (a9c3362 → merge bfe8460).
+- **C14-03** per-tick brief state lock (BUG-2, O1) — `crates/ramsleuth-gui/src/update.rs`: `run_bench`/`run_burn_in` now take the `Arc<RwLock<TelemetryData>>` and acquire the write lock ONLY briefly per tick (acquire→update→release) between `recv()` calls, so the lock is never held across the drain and the UI stays responsive during runs; + a new in-flight reader regression test (064b432 → merge 83b1b98).
+
+**Process note (stranded commit + stale-parent rebase — process artifacts, not code defects):**
+- C14-02's commit was briefly stranded on C14-01's branch (a worktree flip) and rescued; C14-02/C14-03 were rebased onto the current `v2-development` tip before merge (stale-parent artifacts, not code defects — all merges verified clean, single-file purity confirmed).
+
+### Key plan decisions
+- **D-1 (BUG-1, warm-up):** the first PM-table read is warmed — on a cold cache the collector runs twice (first discarded as warm-up, second settled and cached), so the first served clock sample is the settled operating frequency, never the <1 s idle cold value.
+- **D-2 (BUG-1, settle):** a 150 ms settle delay (`CLOCK_SETTLE`) after the 250 ms DRAM spike, before the PM-table read, gives the SMU time to move MCLK to the operating frequency.
+- **D-3 (BUG-2, brief lock):** the GUI poller acquires the shared-state write lock only per tick (acquire→update→release) between stream `recv()` calls — never held across the drain — so the egui main thread's per-frame read is not starved and both viewports (main + Graphs) stay responsive for the whole run.
+
+### Quality
+- **556/556 tests green (debug AND release, whole workspace)** — up from the 555 baseline (555 + 1 new in-flight reader regression test, C14-03); **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); **MSRV 1.75** held; **6 release binaries** build; **zero new deps**; **no-panic clean**.
+- **Wire audit = zero protocol / telemetry / TUI / CLI / bench changes** — the cycle diff is exactly the daemon `cache.rs` + `main.rs` and the GUI `update.rs` (no wire / telemetry / TUI / CLI / bench delta).
+- **QA verdict: PASS** — all 3 chunks merged; the operator live GUI run is the remaining manual gate.
+
+### Push state (operator gate)
+Local `v2-development` tip = **`80b2374`** (Cycle 14 range `d60cd34..80b2374`) — **unpushed, operator-gated** (this compaction performs no push). The merged `branch/chunk-c14-*` chunk branches are the handover prune target (all fully merged into `v2-development`; tip `80b2374` untouched). On the operator's go-ahead: **fast-forward to `80b2374` (NEVER force-push) → prune the remote chunk branches → optional `v2.0.0` tag**.
+
+### Open items carried
+1. **Operator live GUI run (pending)** — `plans/CYCLE14-LIVE-CHECKLIST.md` (5950X host; needs interactive sudo): clock first-sample correctness across 3-5 restarts, burn-in UI responsiveness ≥2 min, Run Full responsiveness, no regression — closes the PASS verdict.
+2. **Push to GitHub** — operator go-ahead (ff to `80b2374`, prune the remote chunk branches, optional `v2.0.0` tag; strictly no force-push, no pre-go-ahead remote mutation).
+3. **The Cycle 13 open items carry** — the operator live GUI run (`plans/CYCLE13-LIVE-CHECKLIST.md`) and the remaining Cycle 12/11 items (Intel MCHBAR decode — hardware-gated; MSRV 1.75 vs newer; AIDA64 parity gate).
+
+Cycle 14 close-out (2026-09-18): this compaction recorded the Cycle 14 section in `MASTER_LOG.md` and reset `DEV_LOG.md` (base line → `80b2374`, ACTIVE_WORKERS cleared, CURRENT_STATE = COMPLETE, the per-lease history archived). No commit and no push (the commit lands in a separate follow-up subtask).
+
 ## Cycle 13 (GUI LAYOUT refactoring: horizontal 2×2 SPD card grid + 3 equal-width column fill + window auto-size 960×600 + bench right-margin fill) — 2026-09-18 — COMPLETE
 
 ### What was delivered
