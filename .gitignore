@@ -7,3 +7,10 @@
 .vscode/
 *.swp
 .DS_Store
+
+# Local working docs (cycle plans, checklists, research notes, handover) — stay local
+Docs/
+plans/
+
+# Agent state (carries a full origin/master checkout) — never committable
+.kilo/
