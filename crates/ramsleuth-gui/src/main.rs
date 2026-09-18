@@ -9,7 +9,7 @@
 //!   [`DEFAULT_SOCKET_PATH`]); an unknown flag / positional / missing
 //!   value is a `String` error (exit 2 — the ramsleuth-daemon P3-17 /
 //!   ramsleuth-client P3-21 / ramsleuth-tui P3-24 precedent).
-//! - **App** — a 960×600 eframe window carrying the dark-slate
+//! - **App** — a 968×600 eframe window carrying the dark-slate
 //!   [`build_style`]: the spec's 3-line header (Grand Design §3.1,
 //!   C6-20) — line 1 the `RamSleuth v2.0.0` title, the platform tag,
 //!   the daemon status (naming the live settings socket — C6-30),
@@ -70,7 +70,7 @@
 //! Manual verification (a live display, the QA phase): with the dev
 //! daemon running (`cargo run -p ramsleuth-daemon -- --socket
 //! /tmp/ramsleuth.sock`), `cargo run -p ramsleuth-gui -- --socket
-//! /tmp/ramsleuth.sock` opens the 960×600 window with all three zones
+//! /tmp/ramsleuth.sock` opens the 968×600 window with all three zones
 //! live (values update at the configured poll interval, default
 //! ~2 s); the F2 / F3 keys and their status-zone buttons both write
 //! `ramsleuth-snapshot-<unix-ts>.png` /
@@ -127,17 +127,18 @@ const POLLER_JOIN_DEADLINE: Duration = Duration::from_secs(10);
 /// The join-poll granularity while waiting for the poller.
 const JOIN_POLL: Duration = Duration::from_millis(50);
 /// The main dashboard's default inner size (D-13.4 — tight,
-/// content-derived 960×600: 8 (left margin) + 504 (left column =
-/// min(952·0.55, 952−440−8)) + 8 (COLUMN_GAP) + 440
-/// (MIN_RIGHT_W); H = 70 (header) + 8 (row bottom gap) + 522 (row_h,
-/// >= 11 pt headroom over both columns' natural content).
-const DEFAULT_WINDOW_SIZE: [f32; 2] = [960.0, 600.0];
+/// content-derived 968×600: 8 (OUTER_MARGIN, left) + 504 (left
+/// column = min(952·0.55, 952−440−8) over inner = 968 − 16) +
+/// 8 (COLUMN_GAP) + 440 (MIN_RIGHT_W) + 8 (OUTER_MARGIN, right);
+/// H = 70 (header) + 8 (row bottom gap) + 522 (row_h, >= 11 pt
+/// headroom over both columns' natural content).
+const DEFAULT_WINDOW_SIZE: [f32; 2] = [968.0, 600.0];
 /// The main dashboard's minimum inner size (D-13.4 — both
-/// columns at their minima: 8 + 420 (MIN_LEFT_W) + 8 + 440
-/// (MIN_RIGHT_W) = 884, exact sum; H = 600 = default — below
-/// that the status zone's bottom rows clip (it has no scroll of its
-/// own)).
-const MIN_WINDOW_SIZE: [f32; 2] = [884.0, 600.0];
+/// columns at their minima: 8 (OUTER_MARGIN) + 420 (MIN_LEFT_W) +
+/// 8 (COLUMN_GAP) + 440 (MIN_RIGHT_W) + 8 (OUTER_MARGIN) = 892,
+/// exact sum; H = 600 = default — below that the status zone's
+/// bottom rows clip (it has no scroll of its own)).
+const MIN_WINDOW_SIZE: [f32; 2] = [892.0, 600.0];
 /// The Graphs window's initial inner size (C7-21, D-3 — the deferred
 /// child viewport; the plan's default, a bit narrower + shorter
 /// than the main dashboard).
@@ -155,6 +156,12 @@ const MIN_LEFT_W: f32 = 420.0;
 const MIN_RIGHT_W: f32 = 440.0;
 /// The gap between the two columns.
 const COLUMN_GAP: f32 = 8.0;
+/// The central panel's symmetric side margin (D-15.1): the row's
+/// left + right outer margin — equal to the pre-existing left
+/// margin (symmetric by construction) and ≥ the frame stroke's
+/// 0.5 pt outer half with 15× clearance (the missing-right-border
+/// fix).
+const OUTER_MARGIN: f32 = 8.0;
 /// The header strip's stroke (a dim line over the SLATE fill).
 const HEADER_STROKE: egui::Color32 = egui::Color32::from_rgb(0x34, 0x34, 0x40);
 
@@ -888,7 +895,7 @@ impl RamSleuthApp {
     /// central panel's full height (C7-19 removed the embedded
     /// 10-minute trend history strip; the trend data now lives in
     /// the Graphs window, C7-21) — all visible, non-scrolling at the
-    /// 960×600 size (in a small window the right column's slices
+    /// 968×600 size (in a small window the right column's slices
     /// degrade to a scroll area — the overflow fallback). Returns the
     /// [`GuiAction`] the status zone reported this frame (`None` when
     /// no button was clicked).
@@ -906,25 +913,50 @@ impl RamSleuthApp {
                 // collapses the row to zero (never a negative
                 // allocation, never a panic).
                 let row_h = (ui.available_size().y - COLUMN_GAP).max(0.0);
+                // The style's item_spacing, captured before the row
+                // zeroes its main axis below (the row manages its
+                // horizontal spacing explicitly, D-15.1); each
+                // column's content restores it — the zones' grids
+                // read item_spacing.x for their inner gaps.
+                let item_spacing = ui.spacing().item_spacing;
                 ui.horizontal(|ui| {
-                    ui.add_space(8.0);
+                    // The row is spaced entirely by its explicit
+                    // `add_space` calls (the two OUTER_MARGINs + the
+                    // COLUMN_GAP). Zero the layout's automatic
+                    // main-axis item_spacing so it does not double-
+                    // count against the split budget (D-15.1) — the
+                    // cross-axis (y) spacing is kept and inherited by
+                    // each column's vertical content.
+                    ui.style_mut().spacing.item_spacing =
+                        egui::vec2(0.0, item_spacing.y);
+                    ui.add_space(OUTER_MARGIN);
                     let avail = ui.available_size();
-                    // The right column always keeps MIN_RIGHT_W and
-                    // left_w + COLUMN_GAP + right_w sums to avail.x
-                    // exactly (the 8 pt left margin is spent before
-                    // avail is measured). A pathological avail.x
+                    // The split is computed against `inner` (avail.x
+                    // minus the trailing OUTER_MARGIN the row ends
+                    // with after the right column): left_w +
+                    // COLUMN_GAP + right_w + OUTER_MARGIN == avail.x
+                    // exactly, the right column always keeps
+                    // MIN_RIGHT_W, and the right allocation ends
+                    // OUTER_MARGIN (8 pt) inside the panel edge —
+                    // the frame stroke's 0.5 pt outer half clears
+                    // the clip rect (D-15.1). A pathological avail.x
                     // below both minima degenerates left-first
                     // (never a negative allocation, never a panic).
-                    let max_left = (avail.x - MIN_RIGHT_W - COLUMN_GAP).max(0.0);
+                    let inner = (avail.x - OUTER_MARGIN).max(0.0);
+                    let max_left = (inner - MIN_RIGHT_W - COLUMN_GAP).max(0.0);
                     let min_left = MIN_LEFT_W.min(max_left);
-                    let left_w = (avail.x * 0.55).clamp(min_left, max_left);
-                    let right_w = (avail.x - left_w - COLUMN_GAP).max(0.0);
+                    let left_w = (inner * 0.55).clamp(min_left, max_left);
+                    let right_w = (inner - left_w - COLUMN_GAP).max(0.0);
                     // Left: zone 1 (the live timing matrix, its own
                     // bounded scroll area).
                     ui.allocate_ui_with_layout(
                         egui::Vec2::new(left_w, row_h),
                         egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| render_telemetry_zone(ui, data),
+                        |ui| {
+                            ui.style_mut().spacing.item_spacing =
+                                item_spacing;
+                            render_telemetry_zone(ui, data)
+                        },
                     );
                     ui.add_space(COLUMN_GAP);
                     // Right: zone 2 over zone 3 as two stacked
@@ -943,6 +975,8 @@ impl RamSleuthApp {
                         egui::Vec2::new(right_w, row_h),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
+                            ui.style_mut().spacing.item_spacing =
+                                item_spacing;
                             let _ = egui::ScrollArea::vertical().show(ui, |ui| {
                                 // The slice width is the scroll
                                 // content's available width:
@@ -975,7 +1009,7 @@ impl RamSleuthApp {
                                 // keeps the filled status slice
                                 // (C9-07) exactly at the column's
                                 // bottom: no permanent scrollbar at
-                                // 960×600, C7-19). Zero when the
+                                // 968×600, C7-19). Zero when the
                                 // bench alone overflows (the scroll
                                 // fallback above).
                                 let gap = ui.spacing().item_spacing.y;
@@ -990,6 +1024,7 @@ impl RamSleuthApp {
                             });
                         },
                     );
+                    ui.add_space(OUTER_MARGIN);
                 });
             });
         action
@@ -1248,7 +1283,7 @@ fn main() -> ExitCode {
     //    benchmark stream.
     let poller = spawn_poller(state.clone(), bench_rx, stop.clone(), cancel.clone());
 
-    // 4. The eframe window: 960×600 initial, the dark-slate style set
+    // 4. The eframe window: 968×600 initial, the dark-slate style set
     //    once at creation (eframe 0.27 `AppCreator`: a plain
     //    `Box<dyn App>`, no `Result` wrapper). `main_stop` keeps a
     //    handle in main for the post-shutdown stop (the app takes the
@@ -2511,7 +2546,7 @@ mod tests {
     #[test]
     fn render_zones_right_column_split_two_stacked_slices() {
         let out_dir = temp_out_dir("right-split");
-        // (w, h): the default 960×600 (the non-scrolling dashboard,
+        // (w, h): the default 968×600 (the non-scrolling dashboard,
         // C7-19 — both slices fit the column) and a small window
         // (the scroll fallback path — the bench alone overflows).
         for (case, (w, h)) in [
@@ -2566,7 +2601,12 @@ mod tests {
             // column's left edge (the telemetry frame is the lone
             // left one).
             let total = frames.len();
+            // The outer margins (D-15.1): the leftmost frame edge's
+            // margin from the screen's left edge, and the rightmost
+            // frame edge's margin from the screen's right edge.
+            let left_x = frames.iter().fold(f32::INFINITY, |mn, r| mn.min(r.min.x));
             let right_x = frames.iter().fold(0.0_f32, |mx, r| mx.max(r.min.x));
+            let rightmost_x = frames.iter().fold(0.0_f32, |mx, r| mx.max(r.max.x));
             let mut right: Vec<egui::Rect> =
                 frames.into_iter().filter(|r| (r.min.x - right_x).abs() < 2.0).collect();
             if case == 0 {
@@ -2602,6 +2642,29 @@ mod tests {
                     "the status frame must fit the column (bottom {} of {})",
                     status.max.y,
                     h
+                );
+                // The symmetric outer margins (D-15.1): the left
+                // margin == the right margin (both = OUTER_MARGIN),
+                // and the right margin clears the frame stroke's
+                // 0.5 pt outer half — the missing right border is
+                // gone and stays gone.
+                let left_margin = left_x;
+                let right_margin = w - rightmost_x;
+                assert!(
+                    (left_margin - right_margin).abs() <= 1.0,
+                    "the left and right outer margins must be symmetric (left {left_margin}, right {right_margin})"
+                );
+                assert!(
+                    (left_margin - OUTER_MARGIN).abs() <= 1.0,
+                    "the left margin must be OUTER_MARGIN (got {left_margin})"
+                );
+                assert!(
+                    (right_margin - OUTER_MARGIN).abs() <= 1.0,
+                    "the right margin must be OUTER_MARGIN (got {right_margin})"
+                );
+                assert!(
+                    right_margin >= 0.5,
+                    "the right margin must clear the frame stroke's 0.5 pt outer half (got {right_margin})"
                 );
             } else {
                 // Small window: the bench's natural height alone
