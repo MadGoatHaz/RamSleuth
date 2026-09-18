@@ -34,7 +34,7 @@
 //! multiplier, an Intel concept) renders only on the Intel channels;
 //! the AMD block omits it (D-6). The zone
 //! lays out at its natural height — no scroll area: at the default
-//! 1400×900 window the 3×2 grid (worst column ≈ 25 rows) fits the
+//! 960×600 window the 3×2 grid (worst column ≈ 25 rows) fits the
 //! left column without vertical scrolling (C7-12). The vendor
 //! blocks are conditional on the detected CPU (C7-14): an `Amd` host
 //! renders only the AMD block, an `Intel` host only the Intel
@@ -65,9 +65,13 @@ const ZONE_TITLE: &str = "1 · MEMORY CONTROLLER & SUBTIMINGS";
 const AMD: &str = "AMD";
 /// The Intel vendor-section label (the same role as [`AMD`]).
 const INTEL: &str = "Intel";
-/// The compact section-grid spacing (C7-12): the 8.0 pt label↔value
-/// gap (down from 12.0) + the 1.0 pt row pitch.
-const SECTION_SPACING: egui::Vec2 = egui::vec2(8.0, 1.0);
+/// The compact section-grid spacing (C7-12; C13-03): the 8.0 pt
+/// label↔value gap (down from 12.0) + the 0.0 pt row pitch (down
+/// from 1.0 — at the 960×600 default the equal-width columns wrap
+/// their longest section titles onto a second line, and the zero
+/// pitch reclaims that ~23 pt of the worst column, keeping it within
+/// the zone's content budget).
+const SECTION_SPACING: egui::Vec2 = egui::vec2(8.0, 0.0);
 /// The compact section-grid minimum column width (C7-12: down from
 /// 80.0 so the three columns fit the zone width at the default size).
 const MIN_COL_WIDTH: f32 = 60.0;
@@ -503,7 +507,7 @@ fn volts(section: &Section<u16>) -> String {
 /// Zone 1: render the timing matrix from `data` — a titled SLATE
 /// frame holding the §3.1 3-column × 2-row section grid per vendor
 /// block (C7-12): the zone lays out at its natural height — no
-/// scroll area — and at the default 1400×900 window the grid (worst
+/// scroll area — and at the default 960×600 window the grid (worst
 /// column ≈ 25 rows) fits the left column without vertical scrolling.
 ///
 /// Rows: the label in default text, the value in CYAN, an absent cell
@@ -563,8 +567,9 @@ fn render_vendor_block(ui: &mut egui::Ui, index: usize, block: &VendorTiming) {
     }
 }
 
-/// The §3.1 3-column × 2-row body (C7-12): the block's six sections
-/// (stored in the pair-row order) read as three columns of two
+/// The §3.1 3-column × 2-row body (C7-12; equal-width columns
+/// D-13.2 / C13-03): the block's six sections (stored in the
+/// pair-row order) read as three **equal-width** columns of two
 /// stacked sections each — column 1 = `[Clocks & Ratios]` over
 /// `[Primary Timings]`, column 2 = `[Secondary Timings]` over
 /// `[Tertiary & Turnarounds]`, column 3 = `[CAD Bus Drive &
@@ -572,15 +577,30 @@ fn render_vendor_block(ui: &mut egui::Ui, index: usize, block: &VendorTiming) {
 /// bold CYAN title row over its own 2-column `egui::Grid` (label /
 /// value) with the compact [`SECTION_SPACING`] / [`MIN_COL_WIDTH`],
 /// a [`SECTION_GAP`] between the stacked sections, and the columns
-/// separated by the surrounding layout's item spacing.
+/// separated by the surrounding layout's item spacing. Each column
+/// is allocated `(available − 2·gap) / 3` (D-13.2), so
+/// `3·col_w + 2·gap == available` exactly — the three columns
+/// span the full parent width and the dead void right of column 3
+/// disappears; the row is top-aligned (`Align::TOP`) so unequal-
+/// height columns line up at the top, not center-staggered.
 fn render_section_grid(ui: &mut egui::Ui, index: usize, sections: &[TimingSection]) {
-    ui.horizontal(|ui| {
+    // D-13.2: equal-width columns — each of the three columns gets
+    // a zero-height allocation of `(available − 2·item_spacing) / 3`;
+    // the layout's own item spacing lands the two gaps, so the sum
+    // is the full available width exactly.
+    let gap = ui.spacing().item_spacing.x;
+    let col_w = (ui.available_width() - 2.0 * gap) / 3.0;
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
         for (column, (top, bottom)) in COLUMN_SECTIONS.iter().enumerate() {
-            ui.vertical(|ui| {
-                render_section(ui, index, column * 2, sections.get(*top));
-                ui.add_space(SECTION_GAP);
-                render_section(ui, index, column * 2 + 1, sections.get(*bottom));
-            });
+            ui.allocate_ui_with_layout(
+                egui::Vec2::new(col_w, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    render_section(ui, index, column * 2, sections.get(*top));
+                    ui.add_space(SECTION_GAP);
+                    render_section(ui, index, column * 2 + 1, sections.get(*bottom));
+                },
+            );
         }
     });
 }
@@ -600,9 +620,16 @@ fn render_section(
     let Some(section) = section else {
         return;
     };
-    ui.add(egui::Label::new(
-        egui::RichText::new(section.title.as_str()).strong().color(CYAN),
-    ));
+    // The title wraps (D-13.2): at the 960×600 default each column
+    // is ≈ (504 − 20 − 16) / 3 ≈ 156 pt wide, and the `CAD Bus
+    // Drive & Termination` title would otherwise paint into the next
+    // column.
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(section.title.as_str()).strong().color(CYAN),
+        )
+        .wrap(true),
+    );
     let _ = egui::Grid::new(format!("ramsleuth_telemetry_section_{block_index}_{slot}"))
         .spacing(SECTION_SPACING)
         .min_col_width(MIN_COL_WIDTH)
@@ -1127,13 +1154,17 @@ mod tests {
         );
     }
 
-    /// The zone's content budget at the default 1400×900 size
-    /// (C7-12): the 900 pt window minus the header strip (~70 pt),
-    /// the column-row bottom gap (8 pt), the zone frame's inner
-    /// margin (2×6 pt), and the zone title row + space (~26 pt)
-    /// ≈ 784 pt — the full column, since the history strip's removal
-    /// (C7-19) returns its ~165 pt budget to the columns.
-    const ZONE_CONTENT_BUDGET: f32 = 900.0 - 70.0 - 8.0 - 12.0 - 26.0;
+    /// The zone's content budget at the default 960×600 size
+    /// (C13-03, re-anchored from C7-12's 1400×900 pin): the 600 pt
+    /// window (`DEFAULT_WINDOW_SIZE[1]`) minus the header strip
+    /// (~70 pt), the column-row bottom gap (8 pt), the zone frame's
+    /// inner margin (2×6 pt), and the zone title row + space (~26 pt)
+    /// ≈ 484 pt — the full column, since the history strip's removal
+    /// (C7-19) returns its ~165 pt budget to the columns. The 600 pt
+    /// window height is `DEFAULT_WINDOW_SIZE[1]` (main.rs, C13-01):
+    /// this module is a lib and cannot reference the bin's constant,
+    /// so the value is mirrored as a literal.
+    const ZONE_CONTENT_BUDGET: f32 = 600.0 - 70.0 - 8.0 - 12.0 - 26.0;
 
     /// One headless frame on a fresh context (the `begin_frame`
     /// pattern from the `egui` docs — the fonts load there; the
@@ -1148,7 +1179,7 @@ mod tests {
     /// (h) Row depth (C7-12, the no-scroll gate's unit stand-in): the
     /// worst column of the 3×2 layout — two stacked sections + their
     /// two titles — stays within [`ZONE_CONTENT_BUDGET`] at the
-    /// default 1400×900 size. The worst column (5 + 18 rows + 2
+    /// default 960×600 size. The worst column (5 + 18 rows + 2
     /// titles = 25) at the 18 pt row pitch is ≈ 450 pt (the plan's
     /// number) — no vertical scroll (the QA live gate measures the
     /// rendered window).
@@ -1189,11 +1220,15 @@ mod tests {
     #[test]
     fn renders_headlessly_without_panic_and_within_budget() {
         // The zone's column allocation (main.rs: 55% of the panel
-        // width, clamped): 1400 × 0.55 ≈ 770 pt; the full 900 pt
-        // height — the zone lays out at its natural height (no
+        // width, clamped to `max_left` = avail − MIN_RIGHT_W −
+        // COLUMN_GAP): 952 × 0.55 ≈ 524 pt → 504 pt at the 960 pt
+        // default window (right column = MIN_RIGHT_W 440); the full
+        // 600 pt height = `DEFAULT_WINDOW_SIZE[1]` (main.rs, C13-01 —
+        // mirrored literal: a lib module cannot reference the bin's
+        // constant) — the zone lays out at its natural height (no
         // scroll area).
-        const ZONE_W: f32 = 770.0;
-        const ZONE_H: f32 = 900.0;
+        const ZONE_W: f32 = 504.0;
+        const ZONE_H: f32 = 600.0;
         for telemetry in [
             Some(representative()),
             Some(intel_populated()),
