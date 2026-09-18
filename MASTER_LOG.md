@@ -2,6 +2,46 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Cycle 13 (GUI LAYOUT refactoring: horizontal 2×2 SPD card grid + 3 equal-width column fill + window auto-size 960×600 + bench right-margin fill) — 2026-09-18 — COMPLETE
+
+### What was delivered
+Cycle 13 (GUI LAYOUT refactoring) is COMPLETE: **all 4 chunks merged into `v2-development` (C13-01..C13-04)** from baseline `d62b21f` (the Cycle 12 compaction) to tip `cae8064` — driven by the operator's directive:
+
+**Operator directive (the cycle driver):**
+- **GUI LAYOUT refactoring** — the three requirements:
+  - **(R1)** Panel 3 (HARDWARE & SPD): the DIMM slot cards go horizontal side-by-side — a balanced 2×2 for up to 4 DIMMs — instead of the vertical stack.
+  - **(R2)** Better horizontal space utilization — Panel 1 (MEMORY CONTROLLER) 3 columns fill the parent width (kill the dead void right of column 3) and Panels 2+3 stretch to the right margin uniformly.
+  - **(R3)** Initial window auto-sizing — open tight around content (~960×600 default, ~884×600 min) instead of the old oversized 1400×900, respect DPI, no clipping of panels/footer/daemon socket path.
+
+**Chunks (all `--no-ff` merged; range `d62b21f..cae8064`):**
+- **C13-01** window auto-size + flush split (R3) — main.rs: `WINDOW_SIZE` renamed `DEFAULT_WINDOW_SIZE` `[960,600]` + new `MIN_WINDOW_SIZE` `[884,600]`, viewport `with_min_inner_size`, the right-column split math flushed so `left + gap + right == avail.x` exactly (55% ratio + MIN_LEFT_W/MIN_RIGHT_W clamp preserved, non-negative at the 884×600 minimum), co-landed test pin re-anchored to the constants (d75b159 → merge 14c8933).
+- **C13-02** horizontal SPD card grid (R1) — status_zone.rs: `render_spd_cards` vertical stack → horizontal 2-column grid, side-by-side, 2+1 / balanced 2×2 flow for up to 4 DIMMs; the `render_spd_card` body unchanged (3af7787 → merge fc109d9).
+- **C13-04** bench table right-margin fill (R2b) — bench_zone.rs: the bench TableBuilder's last metric column `initial(70)` → `Column::remainder()` (90 + 3×`initial(70)` + remainder) so the table fills the frame's full inner width — the right-border dead space gone (fa733bc → merge 4dc3a2a).
+- **C13-03** 3 equal-width section columns (R2a) — telemetry_zone.rs: `render_section_grid` three natural-width columns → three equal-width top-aligned columns, each `(available − 2·gap)/3` (`3·col_w + 2·gap == available` exactly — the dead void right of column 3 gone), test pins re-anchored to the 960×600 default (ZONE_CONTENT_BUDGET 484, ZONE_W 504, ZONE_H 600), `SECTION_SPACING.y` 1→0 tightening (section titles now `.wrap(true)` at 960×600) (217651d → merge cae8064, tip).
+
+**Process note (stale-parent rebase — process artifact, not a code defect):**
+- C13-02/C13-04/C13-03 were initially forked from stale pre-merge parents (C13-02 from `d62b21f` pre-C13-01; C13-04 from the `d62b21f`-based review-FAIL state pre-C13-02; C13-03 from `fc109d9` pre-C13-04), so their first-pass diffs appeared to REVERT already-merged chunks (C13-02's main.rs carried the old 1400×900 / no-min-size; C13-04's status_zone.rs reverted the merged C13-02 grid; C13-03's bench_zone.rs reverted the merged C13-04 `remainder()`). Each was caught at the purity review, TRUE-rebased onto the current `v2-development` tip (gates re-run: 162/162 debug + release, clippy zero), re-reviewed PASS, then merged — the three 3-way merges verified clean.
+
+### Key plan decisions
+- **D-1 (R1):** Panel 3 DIMM slot cards = horizontal 2-column grid (2+1 / balanced 2×2 for up to 4 DIMMs); the card body untouched.
+- **D-2 (R2):** Panels 2+3 stretch to the right margin uniformly — Panel 1's 3 section columns become equal-width top-aligned `(available − 2·gap)/3` (no dead void) and the bench table's last metric column becomes `Column::remainder()` (R2a + R2b).
+- **D-3 (R3):** initial window auto-sizing — `DEFAULT_WINDOW_SIZE [960,600]` + `MIN_WINDOW_SIZE [884,600]` via `with_min_inner_size` (DPI-respected; no clipping of panels/footer/daemon socket path); the right-column split flushed so `left + gap + right == avail.x` exactly.
+
+### Quality
+- **555/555 tests green (debug AND release, whole workspace)** — held from the Cycle 12 baseline (no count change; the 6 layout pins re-anchored to 960×600); **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); **MSRV 1.75** held; **6 release binaries** build; **zero new deps** (empty `Cargo.toml`/`Cargo.lock` diff over the cycle range); **no-panic clean** (the SPD 2-col grid is idx<n-guarded with the empty/all-Na placeholder fallback; the column-split clamp is non-negative at the 884×600 minimum).
+- **Wire audit = zero protocol / telemetry / TUI / CLI / daemon / bench changes** — the GUI diff is exactly the 4 layout files (main.rs, telemetry_zone.rs, status_zone.rs, bench_zone.rs; 169 ins / 57 del).
+- **QA verdict: PASS** — all 4 chunks merged; the operator live GUI run is the remaining manual gate.
+
+### Push state (operator gate)
+Local `v2-development` tip = **`cae8064`** (Cycle 13 range `d62b21f..cae8064`) — **unpushed, operator-gated** (this compaction performs no push). The merged `branch/chunk-c13-*` chunk branches are the handover prune target (all fully merged into `v2-development`; tip `cae8064` untouched). On the operator's go-ahead: **fast-forward to `cae8064` (NEVER force-push) → prune the remote chunk branches → optional `v2.0.0` tag**.
+
+### Open items carried
+1. **Operator live GUI run (pending)** — `plans/CYCLE13-LIVE-CHECKLIST.md` (5950X host; needs interactive sudo): the horizontal 2×2 SPD cards, the 3 equal-width columns filling the parent width (no dead void), the bench table filling the right margin, the tight 960×600 default (884×600 min, DPI-respected, no panel/footer/daemon-socket-path clipping) — closes the PASS verdict.
+2. **Push to GitHub** — operator go-ahead (ff to `cae8064`, prune the remote chunk branches, optional `v2.0.0` tag; strictly no force-push, no pre-go-ahead remote mutation).
+3. **The Cycle 12 open items carry** — the operator live GUI run (`plans/CYCLE12-LIVE-CHECKLIST.md`: the Vcore value + the VDDIO_MEM display) and the remaining Cycle 11 items (Intel MCHBAR decode — hardware-gated; MSRV 1.75 vs newer; AIDA64 parity gate).
+
+Cycle 13 close-out (2026-09-18): this compaction recorded the Cycle 13 section in `MASTER_LOG.md` and reset `DEV_LOG.md` (base line → `cae8064`, ACTIVE_WORKERS cleared, CURRENT_STATE = COMPLETE, the per-lease history archived). No commit and no push (the commit lands in a separate follow-up subtask).
+
 ## Cycle 12 (SMU Vcore additive wire field + board-profile VDDIO_MEM via NCT6798 in13) — 2026-09-18 — COMPLETE
 
 ### What was delivered
