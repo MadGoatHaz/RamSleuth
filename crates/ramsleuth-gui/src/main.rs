@@ -9,7 +9,7 @@
 //!   [`DEFAULT_SOCKET_PATH`]); an unknown flag / positional / missing
 //!   value is a `String` error (exit 2 — the ramsleuth-daemon P3-17 /
 //!   ramsleuth-client P3-21 / ramsleuth-tui P3-24 precedent).
-//! - **App** — a 1400×900 eframe window carrying the dark-slate
+//! - **App** — a 960×600 eframe window carrying the dark-slate
 //!   [`build_style`]: the spec's 3-line header (Grand Design §3.1,
 //!   C6-20) — line 1 the `RamSleuth v2.0.0` title, the platform tag,
 //!   the daemon status (naming the live settings socket — C6-30),
@@ -70,7 +70,7 @@
 //! Manual verification (a live display, the QA phase): with the dev
 //! daemon running (`cargo run -p ramsleuth-daemon -- --socket
 //! /tmp/ramsleuth.sock`), `cargo run -p ramsleuth-gui -- --socket
-//! /tmp/ramsleuth.sock` opens the 1400×900 window with all three zones
+//! /tmp/ramsleuth.sock` opens the 960×600 window with all three zones
 //! live (values update at the configured poll interval, default
 //! ~2 s); the F2 / F3 keys and their status-zone buttons both write
 //! `ramsleuth-snapshot-<unix-ts>.png` /
@@ -126,8 +126,18 @@ const NOTICE_TTL: Duration = Duration::from_secs(5);
 const POLLER_JOIN_DEADLINE: Duration = Duration::from_secs(10);
 /// The join-poll granularity while waiting for the poller.
 const JOIN_POLL: Duration = Duration::from_millis(50);
-/// The window's initial inner size (the plan's 1400×900 dashboard).
-const WINDOW_SIZE: [f32; 2] = [1400.0, 900.0];
+/// The main dashboard's default inner size (D-13.4 — tight,
+/// content-derived 960×600: 8 (left margin) + 504 (left column =
+/// min(952·0.55, 952−440−8)) + 8 (COLUMN_GAP) + 440
+/// (MIN_RIGHT_W); H = 70 (header) + 8 (row bottom gap) + 522 (row_h,
+/// >= 11 pt headroom over both columns' natural content).
+const DEFAULT_WINDOW_SIZE: [f32; 2] = [960.0, 600.0];
+/// The main dashboard's minimum inner size (D-13.4 — both
+/// columns at their minima: 8 + 420 (MIN_LEFT_W) + 8 + 440
+/// (MIN_RIGHT_W) = 884, exact sum; H = 600 = default — below
+/// that the status zone's bottom rows clip (it has no scroll of its
+/// own)).
+const MIN_WINDOW_SIZE: [f32; 2] = [884.0, 600.0];
 /// The Graphs window's initial inner size (C7-21, D-3 — the deferred
 /// child viewport; the plan's default, a bit narrower + shorter
 /// than the main dashboard).
@@ -878,7 +888,7 @@ impl RamSleuthApp {
     /// central panel's full height (C7-19 removed the embedded
     /// 10-minute trend history strip; the trend data now lives in
     /// the Graphs window, C7-21) — all visible, non-scrolling at the
-    /// 1400×900 size (in a small window the right column's slices
+    /// 960×600 size (in a small window the right column's slices
     /// degrade to a scroll area — the overflow fallback). Returns the
     /// [`GuiAction`] the status zone reported this frame (`None` when
     /// no button was clicked).
@@ -899,11 +909,15 @@ impl RamSleuthApp {
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
                     let avail = ui.available_size();
-                    // A pathological window can be narrower than both
-                    // minima — the right column collapses (never a
-                    // negative allocation, never a panic).
-                    let max_left = (avail.x - MIN_RIGHT_W - COLUMN_GAP).max(MIN_LEFT_W);
-                    let left_w = (avail.x * 0.55).clamp(MIN_LEFT_W, max_left);
+                    // The right column always keeps MIN_RIGHT_W and
+                    // left_w + COLUMN_GAP + right_w sums to avail.x
+                    // exactly (the 8 pt left margin is spent before
+                    // avail is measured). A pathological avail.x
+                    // below both minima degenerates left-first
+                    // (never a negative allocation, never a panic).
+                    let max_left = (avail.x - MIN_RIGHT_W - COLUMN_GAP).max(0.0);
+                    let min_left = MIN_LEFT_W.min(max_left);
+                    let left_w = (avail.x * 0.55).clamp(min_left, max_left);
                     let right_w = (avail.x - left_w - COLUMN_GAP).max(0.0);
                     // Left: zone 1 (the live timing matrix, its own
                     // bounded scroll area).
@@ -961,7 +975,7 @@ impl RamSleuthApp {
                                 // keeps the filled status slice
                                 // (C9-07) exactly at the column's
                                 // bottom: no permanent scrollbar at
-                                // 1400×900, C7-19). Zero when the
+                                // 960×600, C7-19). Zero when the
                                 // bench alone overflows (the scroll
                                 // fallback above).
                                 let gap = ui.spacing().item_spacing.y;
@@ -1234,7 +1248,7 @@ fn main() -> ExitCode {
     //    benchmark stream.
     let poller = spawn_poller(state.clone(), bench_rx, stop.clone(), cancel.clone());
 
-    // 4. The eframe window: 1400×900 initial, the dark-slate style set
+    // 4. The eframe window: 960×600 initial, the dark-slate style set
     //    once at creation (eframe 0.27 `AppCreator`: a plain
     //    `Box<dyn App>`, no `Result` wrapper). `main_stop` keeps a
     //    handle in main for the post-shutdown stop (the app takes the
@@ -1242,7 +1256,9 @@ fn main() -> ExitCode {
     let main_stop = stop.clone();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size(WINDOW_SIZE),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(DEFAULT_WINDOW_SIZE)
+            .with_min_inner_size(MIN_WINDOW_SIZE),
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -2495,10 +2511,16 @@ mod tests {
     #[test]
     fn render_zones_right_column_split_two_stacked_slices() {
         let out_dir = temp_out_dir("right-split");
-        // (w, h): the default 1400×900 (the non-scrolling dashboard,
+        // (w, h): the default 960×600 (the non-scrolling dashboard,
         // C7-19 — both slices fit the column) and a small window
         // (the scroll fallback path — the bench alone overflows).
-        for (case, (w, h)) in [(1400.0, 900.0), (900.0, 220.0)].into_iter().enumerate() {
+        for (case, (w, h)) in [
+            (DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1]),
+            (900.0, 220.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let (bench_tx, _bench_rx) = std::sync::mpsc::channel::<BenchCmd>();
             let app = RamSleuthApp {
                 state: Arc::new(RwLock::new(TelemetryData::default())),
