@@ -2567,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "ramsleuth-bench"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "bincode",
  "libc",
@@ -2576,7 +2576,7 @@ dependencies = [
 
 [[package]]
 name = "ramsleuth-client"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "ramsleuth-bench",
  "ramsleuth-protocol",
@@ -2585,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "ramsleuth-daemon"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "libc",
  "ramsleuth-bench",
@@ -2596,7 +2596,7 @@ dependencies = [
 
 [[package]]
 name = "ramsleuth-gui"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "eframe",
  "egui",
@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "ramsleuth-protocol"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "bincode",
  "ramsleuth-bench",
@@ -2622,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "ramsleuth-telemetry"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "bincode",
  "nix 0.29.0",
@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "ramsleuth-tui"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "crossterm",
  "ramsleuth-bench",
