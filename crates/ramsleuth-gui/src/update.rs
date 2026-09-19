@@ -964,7 +964,7 @@ mod tests {
     impl TempSocket {
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "ramsleuth-gui-{name}-{}.sock",
+                "ramsleuth-{name}-{}.sock",
                 process::id()
             ));
             let _ = std::fs::remove_file(&path); // stale file from a crashed earlier run
