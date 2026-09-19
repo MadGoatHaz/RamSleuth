@@ -84,7 +84,7 @@
 //! `disconnected` + the start hint — no crash.
 //!
 //! ```text
-//! Usage: ramsleuth-gui [OPTIONS]
+//! Usage: ramsleuth [OPTIONS]
 //!
 //! Options:
 //!   --socket <path>   Daemon Unix socket
@@ -103,10 +103,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ramsleuth_gui::{
-    build_style, export_json, format_capacity, format_clock, render_bench_zone,
-    render_graphs_window, render_settings_panel, render_status_zone,
-    render_telemetry_zone, snapshot_png, spawn_poller, BenchCmd, GuiAction, GuiError,
-    GuiSettings, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
+    build_style, diagnose, export_json, format_capacity, format_clock, render_bench_zone,
+    render_graphs_window, render_requirements_strip, render_settings_panel,
+    render_status_zone, render_telemetry_zone, snapshot_png, spawn_poller, BenchCmd,
+    GuiAction, GuiError, GuiSettings, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
@@ -171,9 +171,9 @@ const HEADER_STROKE: egui::Color32 = egui::Color32::from_rgb(0x34, 0x34, 0x40);
 /// value (P3-10) as a literal: `concat!` only accepts literals, and
 /// the protocol freeze test pins the string.
 const USAGE: &str = concat!(
-    "ramsleuth-gui — the live desktop dashboard (F2/F3/Q)\n",
+    "ramsleuth — the live desktop dashboard (F2/F3/Q)\n",
     "\n",
-    "Usage: ramsleuth-gui [OPTIONS]\n",
+    "Usage: ramsleuth [OPTIONS]\n",
     "\n",
     "Options:\n",
     "  --socket <path>   Daemon Unix socket\n",
@@ -377,6 +377,13 @@ struct RamSleuthApp {
     /// below the header and mutates `state.settings` (the render
     /// thread's one permitted write — no I/O, D6).
     settings_open: bool,
+    /// Whether the SETUP requirements strip (C18, D-18.5) is open:
+    /// auto-shown at first launch while a requirement is present
+    /// (initialized `true` — the strip renders only while [`diagnose`]
+    /// reports one); the header's `Setup` toggle and the strip's
+    /// "Got it" both write it — the render thread's one-permitted
+    /// write class, no I/O, D6.
+    requirements_open: bool,
     /// Whether the Graphs window (C7-21, D-3 — the eframe deferred
     /// child viewport) is open: while set, `update` re-registers
     /// the viewport every frame (the keep-alive — egui GCs a child
@@ -420,7 +427,7 @@ impl Drop for RamSleuthApp {
                     // the process is exiting — detach it (the TUI
                     // P3-24 bounded-join precedent).
                     eprintln!(
-                        "ramsleuth-gui: the poller did not finish within {POLLER_JOIN_DEADLINE:?}; detaching"
+                        "ramsleuth: the poller did not finish within {POLLER_JOIN_DEADLINE:?}; detaching"
                     );
                     break;
                 }
@@ -464,18 +471,36 @@ impl eframe::App for RamSleuthApp {
                 .next()
         });
         // The top strips allocate in a fixed per-frame order (header,
-        // settings while open, then the central panel): each takes
-        // its own brief lock (the render thread does no I/O, D6 —
-        // the settings strip is its one permitted write).
+        // requirements while one is present, settings while open,
+        // then the central panel): each takes its own brief lock
+        // (the render thread does no I/O, D6 — the settings strip is
+        // its one permitted write).
         {
             let data = self.state.read().unwrap();
             Self::render_header(
                 ctx,
                 &data,
                 &mut self.settings_open,
+                &mut self.requirements_open,
                 &self.graphs_open,
                 &self.notice,
             );
+        }
+        // The SETUP requirements strip (C18, D-18.5): while the
+        // header's `Setup` toggle is open, allocate it between the
+        // header and the settings strip only while a requirement is
+        // present — presence-driven, it disappears on its own once
+        // the daemon connects / the driver loads (and can be
+        // re-opened any time; the strip's "Got it" + the toggle
+        // write the same flag, D-C7).
+        if self.requirements_open {
+            let present = {
+                let data = self.state.read().unwrap();
+                !diagnose(&data).is_empty()
+            };
+            if present {
+                self.render_requirements_area(ctx);
+            }
         }
         if self.settings_open {
             self.render_settings_area(ctx);
@@ -777,8 +802,9 @@ impl RamSleuthApp {
     /// The header strip (Grand Design §3.1): the spec's 3-line
     /// header — line 1 the `RamSleuth v2.0.0` title, the platform
     /// tag, the daemon status (naming the live settings socket —
-    /// C6-30), the `Settings` toggle, the `Graphs` window toggle
-    /// (C7-21, D-3), and the `[F2] snapshot · [F3] export · [Q]
+    /// C6-30), the `Settings` toggle, the `Setup` requirements
+    /// toggle (C18, D-18.5), the `Graphs` window toggle (C7-21,
+    /// D-3), and the `[F2] snapshot · [F3] export · [Q]
     /// quit` legend; line 2 the CPU + platform identity; line 3
     /// the RAM summary, channel, and sync mode (the capacity +
     /// clock segments render in the live `units` knob's units —
@@ -789,16 +815,18 @@ impl RamSleuthApp {
     ///
     /// An associated function (no `self`): it needs only the
     /// snapshot + the `settings_open` toggle (the `Settings` button
-    /// flips it, C6-30) + the shared `graphs_open` flag (the
-    /// `Graphs` button toggles it, C7-21) + the transient notice
-    /// (the last F2 / F3 result line) — so the call site can hold
-    /// the state's read guard and the `settings_open` /
-    /// `graphs_open` / `notice` field borrows at once (the field
-    /// split the borrow checker enforces).
+    /// flips it, C6-30) + the `requirements_open` toggle (the
+    /// `Setup` button flips it, C18) + the shared `graphs_open`
+    /// flag (the `Graphs` button toggles it, C7-21) + the transient
+    /// notice (the last F2 / F3 result line) — so the call site can
+    /// hold the state's read guard and the `settings_open` /
+    /// `requirements_open` / `graphs_open` / `notice` field borrows
+    /// at once (the field split the borrow checker enforces).
     fn render_header(
         ctx: &egui::Context,
         data: &TelemetryData,
         settings_open: &mut bool,
+        requirements_open: &mut bool,
         graphs_open: &Arc<AtomicBool>,
         notice: &Option<(String, Instant)>,
     ) {
@@ -858,6 +886,23 @@ impl RamSleuthApp {
                             .clicked()
                         {
                             *settings_open = !*settings_open;
+                        }
+                        ui.add_space(8.0);
+                        // The Setup toggle (C18, D-18.5): left of
+                        // Settings in the right-to-left cluster —
+                        // selected while the requirements strip is
+                        // open; a click flips the local flag (the
+                        // strip's "Got it" writes the same flag —
+                        // D-C7: the two close paths are
+                        // behaviorally identical).
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("Setup"))
+                                    .selected(*requirements_open),
+                            )
+                            .clicked()
+                        {
+                            *requirements_open = !*requirements_open;
                         }
                         ui.add_space(8.0);
                         ui.label(
@@ -1054,6 +1099,36 @@ impl RamSleuthApp {
             });
     }
 
+    /// The SETUP requirements strip (C18, D-18.5): shown below the
+    /// header (above the settings strip while both are open — the
+    /// per-frame allocation order: header, requirements, settings,
+    /// central) while `requirements_open` — presence-driven: the
+    /// caller allocates it only while [`diagnose`] reports a
+    /// requirement, so it disappears on its own once the daemon
+    /// connects / the driver loads (and the header's `Setup` toggle
+    /// re-opens it any time). The strip's "Got it" writes
+    /// `requirements_open` (the render thread's one-permitted-write
+    /// class, no I/O, D6); its `Copy` buttons touch only the
+    /// clipboard (D-18.5, risk (a)). No-panic: a daemon-less
+    /// snapshot yields at most the single daemon requirement
+    /// (plan D5).
+    fn render_requirements_area(&mut self, ctx: &egui::Context) {
+        // One brief read snapshot (no I/O, D6) drives the strip.
+        let requirements = {
+            let data = self.state.read().unwrap();
+            diagnose(&data)
+        };
+        egui::TopBottomPanel::top("ramsleuth_requirements")
+            .frame(
+                egui::Frame::default()
+                    .fill(SLATE)
+                    .stroke(egui::Stroke::new(1.0_f32, HEADER_STROKE)),
+            )
+            .show(ctx, |ui| {
+                render_requirements_strip(ui, &requirements, &mut self.requirements_open);
+            });
+    }
+
     /// Execute the status zone's [`GuiAction`] — the one side effect
     /// the render loop performs: F2 / F3 run [`perform_export`] (a
     /// one-shot file write into `out_dir`) and flash the result as the
@@ -1245,7 +1320,7 @@ fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(error) => {
-            eprintln!("ramsleuth-gui: {error}");
+            eprintln!("ramsleuth: {error}");
             eprintln!("{USAGE}");
             return ExitCode::from(2);
         }
@@ -1307,6 +1382,7 @@ fn main() -> ExitCode {
                 stop,
                 cancel,
                 settings_open: false,
+                requirements_open: true,
                 graphs_open,
                 saved_refresh: None,
                 last_graphs_open: false,
@@ -1326,7 +1402,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("ramsleuth-gui: {error}");
+            eprintln!("ramsleuth: {error}");
             ExitCode::from(1)
         }
     }
@@ -1355,7 +1431,7 @@ mod tests {
     /// temp-path precedent); created now, removed by the test.
     fn temp_out_dir(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("ramsleuth-gui-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ramsleuth-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("the test out dir must be created");
         dir
     }
@@ -1539,7 +1615,7 @@ mod tests {
             ..Default::default()
         };
         let missing = std::env::temp_dir()
-            .join(format!("ramsleuth-gui-nodir-{}", std::process::id()))
+            .join(format!("ramsleuth-nodir-{}", std::process::id()))
             .join("no-such-subdir");
         let err = perform_export(GuiAction::ExportJson, &data, &missing)
             .expect_err("a missing dir must fail");
@@ -2294,10 +2370,12 @@ mod tests {
             let ctx = egui::Context::default();
             ctx.begin_frame(egui::RawInput::default());
             let mut settings_open = false;
+            let mut requirements_open = true;
             RamSleuthApp::render_header(
                 &ctx,
                 &TelemetryData::default(),
                 &mut settings_open,
+                &mut requirements_open,
                 &flag,
                 &None,
             );
@@ -2497,6 +2575,7 @@ mod tests {
                 stop: Arc::new(AtomicBool::new(false)),
                 cancel: Arc::new(AtomicBool::new(false)),
                 settings_open: false,
+                requirements_open: false,
                 graphs_open: Arc::new(AtomicBool::new(false)),
                 saved_refresh: None,
                 last_graphs_open: false,
@@ -2563,6 +2642,7 @@ mod tests {
                 stop: Arc::new(AtomicBool::new(false)),
                 cancel: Arc::new(AtomicBool::new(false)),
                 settings_open: false,
+                requirements_open: false,
                 graphs_open: Arc::new(AtomicBool::new(false)),
                 saved_refresh: None,
                 last_graphs_open: false,
