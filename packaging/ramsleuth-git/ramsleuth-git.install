@@ -6,6 +6,7 @@
 # The daemon degrades gracefully without the ryzen_smu module
 # (N/A (DriverMissing), exit 0, no panic) and is not removed from
 # unit files on upgrade.
+# post_install is informative (the hook cannot be interactive — the AUR-parity offer, plan D-18.4).
 
 pre_install() {
     # The daemon unit uses Group=ramsleuth; the group must exist on the
@@ -22,6 +23,17 @@ post_install() {
     if ! systemctl enable --now ramsleuth.service 2>/dev/null; then
         echo "ramsleuth-git: ramsleuth.service not started (non-fatal);" \
              "run: systemctl enable --now ramsleuth" >&2
+    fi
+
+    # Informative block (non-interactive, non-fatal — plan D-18.4):
+    # the binary names + the optional pinned ryzen_smu DKMS offer.
+    echo "ramsleuth-git: installed — start the GUI with \`ramsleuth\` (the TUI with \`ramsleuth-tui\`)"
+    if grep -q "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
+        echo "ramsleuth-git: AMD host — full telemetry: sudo ramsleuth-install-ryzen-smu-dkms"
+        echo "ramsleuth-git:   (pinned upstream, shown + confirmed before any build; or: yay -S ryzen-smu-dkms)"
+        echo "ramsleuth-git:   RamSleuth runs without it — the AMD section reads N/A (DriverMissing)"
+    else
+        echo "ramsleuth-git: Intel host — built-in MCHBAR decode, no extra driver needed"
     fi
 }
 
