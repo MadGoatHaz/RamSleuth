@@ -2,6 +2,68 @@
 
 Durable per-cycle compaction of `DEV_LOG.md`. Newest cycle first.
 
+## Cycle 16 (documentation review/update, README v2.0 creation, gitignore Docs/ + plans/ + .kilo/ + untrack of the 21 tracked working docs, pre-push personal-info audit, operator-authorized push) — 2026-09-18 — COMPLETE (push pending C16-11)
+
+### What was delivered
+Cycle 16 (documentation review/update + README v2.0 + gitignore/untrack + PII audit + push) is COMPLETE: **all 8 implementation chunks merged into `v2-development` (C16-01..C16-08; C16-04..C16-07 as working-tree edits to now-untracked files) + C16-09 QA PASS + C16-10 this compaction** from baseline `8ee2f60` (the Cycle 15 compaction) to tip `12b8e22` — driven by the operator 5 instructions (verbatim scope in `plans/PLAN-CYCLE16.md` §1):
+
+**Operator instructions (the cycle drivers):**
+1. Review and update all documentation.
+2. Rewrite the README for the new v2.0. — **FINDING: no root `README.md` existed** → the v2.0 README is **created**.
+3. Add `Docs/` and `plans/` to `.gitignore`.
+4. Review for personal info before pushing (the operator noreply email `111608787+MadGoatHaz@users.noreply.github.com`, the `MadGoatHaz` handle, and the project repo URL are **whitelisted**).
+5. Push to GitHub (go-ahead **given** this cycle).
+
+**Chunks (all merged; range `8ee2f60..12b8e22` = 274 commits over `origin/v2-development` @ `b908f7b`; zero source-code changes):**
+- **C16-01** [CRITICAL-PATH] `.gitignore` + 21-file untrack (merge `a505fcc`) — `.gitignore` gains `Docs/` + `plans/` (the operator ask) + `.kilo/` (a reported safety addition: the agent state carries a full `origin/master` checkout, never committable); `git rm -r --cached Docs/ plans/` untracks the 21 tracked working docs (local files preserved, now gitignored). Zero source change.
+- **C16-02** [ISOLATED] `README.md` (new, 142 lines, 12 sections) (merge `3886bac`) — created the root v2.0 README: title / what-it-is (the dual layer + privilege separation: one `CAP_SYS_RAWIO` daemon, 0660 Unix socket `/run/ramsleuth/ramsleuth.sock`, unprivileged clients) / features / the 7-crate architecture / the 6 binaries with key flags + exit codes / build (MSRV 1.75 + the GUI system-library set from `ci.yml`) / running / install (AUR `ramsleuth-git` + the optional `ryzen-smu-dkms` extra) / the AMD telemetry requirement / testing (556/556) / project layout / MIT license (the v2.0.0-development-line footer). Every claim grounded in the verified source; PII clean.
+- **C16-03** [ISOLATED] `FULLSCOPEvsCOMPLETED.md` refresh (merge `3e8bed6`) — refreshed the most-stale doc to Cycle 15 ground truth: tip `8ee2f60` / 260-ahead, the GUI row → ✅ COMPLETE (Cycles 6–15), the ALL-8-ITEMS-CLOSED banner, O1 closed / O5 resolved / O6 in-progress (push this cycle) / O2 + OC open.
+- **C16-04** [ISOLATED] `Docs/HANDOVER.md` — the 4 stale spots (the header audience/tip/260-ahead, §8 current state, L407 board line, §13 re-anchored to Cycle 16). **Working-tree edit of a now-untracked file — no commit (declared deviation, D-16.3).**
+- **C16-05** [ISOLATED] `Docs/RamSleuth-v2.md` — the 5 status spots (Edition 2021; the Cycle-15 status line; 556/556; `KickOffPrompt.md` → `KickOff-Cycle4.md`; the 2026-09-12 snapshot annotated historical). **Working-tree edit of a now-untracked file — no commit (declared deviation).**
+- **C16-06** [ISOLATED] `plans/PLAN-CYCLE8.md` — L16 PII fix `madgoat` → `the local OS user`. **Working-tree edit of a now-untracked file — no commit (declared deviation).**
+- **C16-07** [ISOLATED] `Docs/KickOff-Cycle4.md` — L5 PII fix `/home/madgoat/...` → `the repository root (RamSleuth/)`. **Working-tree edit of a now-untracked file — no commit (declared deviation).**
+- **C16-08** [ISOLATED] `packaging/ryzen-smu-dkms/dkms.conf` (merge `1945a71`) — the L32 `Purpose:` comment stale path `/sys/kernel/ryzen_smu/pm_table` → `/sys/kernel/ryzen_smu_drv/pm_table` (the P5-08 canonical kobject). Comment-only; all functional keys byte-identical.
+- **C16-09** QA PASS @ `12b8e22` — full regression + static audit on the pre-push tip: scope clean (the diff vs base `8ee2f60` is exactly the 8 chunk files + the 21 untrack deletions + the bookkeeping — **zero `.rs` / `Cargo.*` / protocol / telemetry changes**), 556/556 debug + release (20 targets), clippy `--workspace --all-targets -- -D warnings` zero, 6 release binaries, and the **clean PII certificate** (see Quality).
+- **C16-10** this compaction — record Cycle 16 in `MASTER_LOG.md`, reset `DEV_LOG.md`, capture the pre-push branch state + the C16-11 push plan.
+
+**Notable incidents:**
+1. **Post-untrack worktree hazard** — after C16-01 untracked the 21 docs, any checkout crossing the tracked→untracked boundary deletes those 21 docs from disk (git removes them on the switch). Handled via **backup-first + isolated worktrees** (each merge restored the local docs byte-identical; the C16-02 review confirmed 31/31 local docs intact). All 31 local docs intact at this compaction.
+2. **C16-04..C16-07 target gitignored files** — their targets (`Docs/HANDOVER.md`, `Docs/RamSleuth-v2.md`, `plans/PLAN-CYCLE8.md`, `Docs/KickOff-Cycle4.md`) became untracked after C16-01, so the plan branch/commit prescriptions were void for them; they were applied as **working-tree edits** (declared deviations, recorded here).
+
+**Process note (rebase conflict — bookkeeping-only, not a code defect):** C16-02 first review rebase onto the running tip conflicted only in the `DEV_LOG.md` lease region (its lease entries forked from the pre-merge tip); resolved keeping the rebase side state (C16-01 history preserved below). All merges verified clean; single-file purity confirmed.
+
+### Key plan decisions
+- **D-16.1 (gitignore + untrack):** `.gitignore` gains `Docs/` + `plans/` (the operator ask) + `.kilo/` (the reported safety addition — the agent state carries a full `origin/master` checkout and must never be committable) + the same-chunk `git rm -r --cached` untrack of the 21 files (one logical change; local files preserved).
+- **D-16.2 (README is a creation, fully grounded):** no root README existed → created; every factual claim grounded in the verified source (no invented features); the workspace `version` stays `0.1.0` (the `v2.0.0` tag is a separate operator decision — not this cycle).
+- **D-16.3 (surgical staleness updates):** `FULLSCOPEvsCOMPLETED.md` gets the full Cycle-15 refresh; `HANDOVER.md` the 4 stale spots only (its §3 per-cycle history preserved); `RamSleuth-v2.md` the status block only; the two PII fixes are single-line; `dkms.conf` the one-line comment. No change to the Grand Design spec / the two research notes / the `KickOff` body / `MASTER_LOG` (C16-10 only) / `packaging/README.md` / `ci.yml` / the systemd unit / `scripts/*` / any `Cargo.toml`.
+- **D-16.4 (PII audit over the push-bound tree):** the push-bound `git ls-files` scan (`/home/`, `madgoat` case-insensitive, the email regex) + `git log --format=%ae %ce | sort -u`; the whitelist is exactly the operator noreply email, the `MadGoatHaz` handle, the project repo URL, and the six third-party upstream refs.
+- **D-16.5 (push mechanics, C16-11):** strict fast-forward (a moved origin stops the cycle — **never force**), plain push, an ancestry-gated prune of the merged remote chunk refs (the live count re-measured, not asserted), verify `ls-remote` = 2 heads, no `v2.0.0` tag, `origin/master` untouched.
+
+### Quality
+- **556/556 tests green (debug AND release, whole workspace)** — the Cycle 15 count held (docs-only cycle, no tests added/removed); **zero clippy warnings** (`clippy --workspace --all-targets -- -D warnings`); **MSRV 1.75** held; **6 release binaries** build; **zero new deps** (the `Cargo.toml`/`Cargo.lock` diff over `8ee2f60..12b8e22` is empty).
+- **Scope audit = zero source-code changes** — the cycle diff vs base `8ee2f60` is exactly the 8 chunk files (`.gitignore`, `README.md` new, `FULLSCOPEvsCOMPLETED.md`, `Docs/HANDOVER.md`, `Docs/RamSleuth-v2.md`, `plans/PLAN-CYCLE8.md`, `Docs/KickOff-Cycle4.md`, `packaging/ryzen-smu-dkms/dkms.conf`) + the 21 untrack deletions + the bookkeeping — **no `.rs` / `Cargo.*` / protocol / telemetry / daemon / TUI / GUI / bench delta**.
+- **PII certificate CLEAN** (C16-09, over all 82 tracked files): zero email addresses, zero personal home paths, zero phones, zero secrets; the only `/home/` survivor is the `crates/ramsleuth-gui/src/main.rs:1582` `"/home/x/ramsleuth-export-1.json"` generic test fixture (user `x` — the reviewed false-positive, kept); the only `madgoat` hits are the whitelisted `MadGoatHaz` handle / repo-URL forms. **Full git history: exactly one author + committer identity** — the operator noreply `111608787+MadGoatHaz@users.noreply.github.com` (526/526 at the QA-audit tip `7a4a740`; 527 at this compaction tip `12b8e22`) + the single name `MadGoatHaz`.
+- **QA verdict: PASS** — C16-09 ran the full regression + the static audits on `12b8e22`; the branch is push-ready.
+
+### Push state (operator gate) — C16-11 pending
+Local `v2-development` tip = **`12b8e22`** (the C16-09 QA bookkeeping — the Cycle 16 pre-push tip; this compaction C16-10 commits on top of it, so the C16-11 push target is this compaction resulting sha, measured at push) — **unpushed, operator-gated** (this compaction performs no push). `origin/v2-development` = **`b908f7b`** (a strict ancestor of `12b8e22` — verified strict ff, **274 commits ahead**; re-measure at push). The remote currently holds **103 `branch/chunk-*` refs** to prune (99 legacy p5/c6–c14 + 4× C16: `c16-01` `8dfaa7f`, `c16-02` `61827a6`, `c16-03` `779b173`, `c16-08` `ae52b63`) — **C16-11 must re-measure the live count, not assert it**. `origin/master` = **`782022a`** (the divergent legacy Python-v1 line) — **NEVER touched** (not merged, not branched from, not deleted). **No `v2.0.0` tag** (not requested — a separate operator decision, recorded as open). The 21 untracked working docs are removed from the remote by the push — the explicit intent of the operator (instruction 3); they remain on disk locally, gitignored.
+
+**The C16-11 push plan (strict ff, never force):**
+1. `git fetch origin` → re-verify strict-ff ancestry (`git merge-base --is-ancestor origin/v2-development v2-development`); any non-ff → **stop and report**.
+2. `git push origin v2-development` (plain; **NEVER force**).
+3. **Prune gate:** for each live `branch/chunk-*` ref, `git merge-base --is-ancestor <sha> v2-development` — all must pass; the count is re-measured (not asserted); assert none is `master` / `v2-development`.
+4. `git push origin --delete <the merged chunk refs>` (one generated command).
+5. Verify `git ls-remote --heads origin` → exactly **2 refs** (`master`, `v2-development`).
+6. **No `v2.0.0` tag**; `origin/master` **untouched**.
+7. A final bookkeeping commit records the remote state (the push itself creates no commit).
+
+### Open items carried
+1. **Push to GitHub (C16-11, next)** — operator go-ahead given: strict ff to the post-compaction tip (**never force**) → the live-measured prune of the merged remote chunk refs → verify 2 heads → **no tag**; `origin/master` untouched.
+2. **Operator live GUI runs (pending)** — `plans/CYCLE15-LIVE-CHECKLIST.md` + `plans/CYCLE14-LIVE-CHECKLIST.md` (now local-only files after C16-01; needs interactive sudo) + the remaining hardware-gated items (Intel MCHBAR decode — i5-6600; Domain A; MSRV 1.75 vs newer; AIDA64 parity gate).
+3. **`v2.0.0` tag / workspace version bump** — separate operator decisions, not this cycle (the workspace version stays `0.1.0`).
+
+Cycle 16 close-out (2026-09-18): this compaction (C16-10) recorded the Cycle 16 section in `MASTER_LOG.md`, reset `DEV_LOG.md` (base line → the C16 pre-push tip `12b8e22`, ACTIVE_WORKERS cleared, CURRENT_STATE = Cycle 16 COMPLETE + push-pending, the per-lease history archived), and captured the pre-push branch state + the C16-11 push plan. No push of `v2-development` (that is C16-11, landing on top of this commit).
+
 ## Cycle 15 (GUI layout fix: missing right borders + viewport clipping on right-column panels — symmetric 8 pt outer margin + widened 968×600/892×600 window + stroke-aware split) — 2026-09-18 — COMPLETE
 
 ### What was delivered
