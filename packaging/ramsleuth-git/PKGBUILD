@@ -5,7 +5,7 @@
 #
 # Ships:
 #   - 6 binaries -> /usr/bin: ramsleuth-daemon (the unit's ExecStart),
-#     ramsleuth-client, ramsleuth-tui, ramsleuth-gui, ramsleuth-bench,
+#     ramsleuth-client, ramsleuth-tui, ramsleuth, ramsleuth-bench,
 #     ramsleuth-telemetry (ramsleuth-protocol is lib-only — never installed)
 #   - the frozen daemon unit systemd/ramsleuth.service -> /usr/lib/systemd/system/
 #     (verbatim copy, never modified — plan D4)
@@ -13,6 +13,12 @@
 #     (enables ramsleuth.service by default — plan D4, chunk P5-01)
 #   - the system group `ramsleuth` — THE ONE REAL INSTALL GAP: the unit's
 #     Group=ramsleuth fails to start without it (plan D3, idempotent)
+#   - the shared pinned ryzen_smu DKMS helper -> /usr/bin/ramsleuth-install-ryzen-smu-dkms
+#     (the ramsleuth-owned copy of scripts/install-ryzen-smu-dkms.sh — same file as the
+#     ryzen-smu-dkms package's /usr/bin/ryzen-smu-dkms-install, different name, no
+#     conflict; plan D-18.4)
+#   - install.sh -> /usr/share/ramsleuth/install.sh (the self-contained transparency
+#     artifact — AUR users can re-run/audit the full flow post-install; plan D-18.4)
 #
 # No-panic contract (plan D7): installation never fails on the absence of
 # the ryzen_smu module, AVX-512, or a display; after a bare install the
@@ -60,7 +66,7 @@ package() {
 
     # (1) the 6 installable binaries
     for bin in ramsleuth-daemon ramsleuth-client ramsleuth-tui \
-               ramsleuth-gui ramsleuth-bench ramsleuth-telemetry; do
+               ramsleuth ramsleuth-bench ramsleuth-telemetry; do
         install -Dm755 "target/release/$bin" "$pkgdir/usr/bin/$bin"
     done
 
@@ -72,6 +78,15 @@ package() {
     # (plan D4; content per chunk P5-01)
     install -Dm644 "packaging/ramsleuth-git/ramsleuth.preset" \
         "$pkgdir/usr/lib/systemd/system-preset/ramsleuth.preset"
+
+    # (4) the ramsleuth-owned copy of the pinned ryzen_smu DKMS helper — present
+    # in the -git checkout the AUR clones (same repo; plan D-18.4)
+    install -Dm755 "scripts/install-ryzen-smu-dkms.sh" \
+        "$pkgdir/usr/bin/ramsleuth-install-ryzen-smu-dkms"
+
+    # (5) the self-contained entrypoint — shipped for audit/re-run (the transparency
+    # artifact; plan D-18.4)
+    install -Dm755 "install.sh" "$pkgdir/usr/share/ramsleuth/install.sh"
 
     # NOTE: the ramsleuth group is created on the TARGET system by the .install
     # pre_install/pre_upgrade hooks (package() runs in the build env, not the target).
