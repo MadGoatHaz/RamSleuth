@@ -17,13 +17,20 @@ set -euo pipefail
 # --- Constants --------------------------------------------------------------
 KERNEL="$(uname -r)"
 MODULE="ryzen_smu"
-# Upstream default (VERIFIED): amkillam/ryzen_smu — branch `main`, v0.1.7,
-# actively maintained; builds module `ryzen_smu`, exposes
-# /sys/kernel/ryzen_smu_drv/pm_table, ships its own dkms.conf + monitor_cpu
-# CLI (Zen3+, kernel 7.2+). The former 53XU/ryzen_smu default is DEAD
-# (HTTP 404). Still overridable via RYZEN_SMU_URL — verify the upstream at
-# setup time (HANDOVER §7 step 2), do NOT trust a cached URL if it moves.
+# Upstream (VERIFIED): amkillam/ryzen_smu — PINNED to commit
+# d2983668300dd2a598e5a7dc40e71ce0678cc270 (verified 2026-08-15: the current
+# `main` HEAD, "Fix cpuid include on 7.2+ kernels (#53)", and exactly what
+# the dev host already runs as 1.d298366). Builds module `ryzen_smu`,
+# exposes /sys/kernel/ryzen_smu_drv/pm_table, ships its own dkms.conf +
+# monitor_cpu CLI (Zen3+, kernel 7.2+). Never track branch HEAD
+# (anti-contamination): the pin is a hard freeze — shown + checksummed +
+# confirmed before any build; if upstream deletes/force-pushes it, this
+# helper dies with a clear message and the fix is a one-line RYZEN_SMU_PIN
+# re-pin. The former 53XU/ryzen_smu default is DEAD (HTTP 404). The URL is
+# still overridable via RYZEN_SMU_URL — verify the upstream at setup time
+# (HANDOVER §7 step 2); do NOT trust a cached URL if it moves.
 UPSTREAM_URL="${RYZEN_SMU_URL:-https://github.com/amkillam/ryzen_smu.git}"
+UPSTREAM_PIN="${RYZEN_SMU_PIN:-d2983668300dd2a598e5a7dc40e71ce0678cc270}"
 # Verified sysfs kobject (amkillam drv.c; matches the daemon, P5-08):
 # canonical ryzen_smu_drv path first, legacy ryzen_smu path as secondary.
 PM_TABLE="/sys/kernel/ryzen_smu_drv/pm_table"
@@ -76,17 +83,49 @@ if [[ ! -d "/lib/modules/${KERNEL}/build" ]]; then
 fi
 log "Kernel build tree OK: /lib/modules/${KERNEL}/build"
 
-# --- Step 2: clone the ryzen_smu source (verify URL at setup time) --------------
+# --- Step 2: fetch the PINNED ryzen_smu source (never branch HEAD) --------------
+# Provenance BEFORE the fetch (transparency): the URL + the full pin + the
+# short pin, so the operator sees exactly which commit will be built.
 log "Upstream: ${UPSTREAM_URL}"
+log "Pinned commit: ${UPSTREAM_PIN} (short: ${UPSTREAM_PIN:0:7}) — never branch HEAD"
 if [[ -d "${SRC_DIR}/.git" ]]; then
-  # Existing tree: update it, tolerating a failed pull (e.g. offline host).
-  git -C "${SRC_DIR}" pull --ff-only || log "git pull --ff-only failed — continuing with existing tree"
+  # Existing tree: skip the fetch when already at the pin (idempotent +
+  # offline-tolerant), else fetch + checkout the pin.
+  if [[ "$(git -C "${SRC_DIR}" rev-parse HEAD)" == "${UPSTREAM_PIN}" ]]; then
+    log "Source tree already at the pinned commit — skipping fetch"
+  else
+    git -C "${SRC_DIR}" fetch --depth 1 origin "${UPSTREAM_PIN}" \
+      || die "git fetch of pinned commit ${UPSTREAM_PIN:0:7} from ${UPSTREAM_URL} failed — verify the network (and that the pin still exists upstream) and retry"
+    git -C "${SRC_DIR}" checkout -q "${UPSTREAM_PIN}" \
+      || die "git checkout of pinned commit ${UPSTREAM_PIN:0:7} failed — inspect ${SRC_DIR} and retry"
+  fi
 else
-  # Fresh shallow clone; wipe a stale non-git dir of unknown provenance.
+  # Fresh shallow clone, then fetch + checkout the pinned commit; wipe a
+  # stale non-git dir of unknown provenance first.
   rm -rf "${SRC_DIR}"
   git clone --depth 1 "${UPSTREAM_URL}" "${SRC_DIR}" \
     || die "git clone of ${UPSTREAM_URL} failed — verify the URL (and network) and retry"
+  git -C "${SRC_DIR}" fetch --depth 1 origin "${UPSTREAM_PIN}" \
+    || die "git fetch of pinned commit ${UPSTREAM_PIN:0:7} failed — verify the pin still exists upstream (fix: a one-line RYZEN_SMU_PIN re-pin) and retry"
+  git -C "${SRC_DIR}" checkout -q "${UPSTREAM_PIN}" \
+    || die "git checkout of pinned commit ${UPSTREAM_PIN:0:7} failed — inspect ${SRC_DIR} and retry"
 fi
+# Hard verify (the anti-contamination core): the tree must be exactly at the
+# pin — no silent branch-HEAD fallback. If upstream deleted/force-pushed the
+# commit, the fetch above dies; the fix is a one-line RYZEN_SMU_PIN re-pin.
+[[ "$(git -C "${SRC_DIR}" rev-parse HEAD)" == "${UPSTREAM_PIN}" ]] \
+  || die "pinned source check failed (no silent branch-HEAD fallback)"
+# Provenance AFTER the pinned fetch (auditable): the exact commit + the
+# sha256sum fingerprint of the six files that get staged (the staged copies
+# land verbatim in ${STAGE_DIR}).
+log "Pinned source: $(git -C "${SRC_DIR}" log -1 --format='%h  %ad  %an  %s' --date=short)"
+for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
+  if [[ -f "${SRC_DIR}/${f}" ]]; then
+    sha256sum "${SRC_DIR}/${f}"
+  else
+    log "  (no ${f} in ${SRC_DIR} — tolerated, not staged)"
+  fi
+done
 
 # --- Step 3: stage source into /usr/src/<module>-<version> (P5-11 fix) -----------
 # DKMS only discovers a module whose source is staged in
@@ -124,6 +163,24 @@ if [[ -d "${SRC_DIR}/userspace" ]] && make -C "${SRC_DIR}/userspace" && [[ -f "$
     || log "WARNING: could not install monitor_cpu to /usr/bin — continuing (module install is priority)"
 else
   log "WARNING: monitor_cpu unavailable (no userspace dir / build failed) — continuing"
+fi
+
+# --- Verify-pause: confirm the pinned source before the first system mutation ----
+# The provenance above (the exact commit + its checksums, the staged source
+# inspectable at ${SRC_DIR} / ${STAGE_DIR}) is the human gate. A non-TTY
+# (fully scripted) context logs and continues; answering `n` is a clean skip
+# (exit 0 — the app keeps working without the module; re-run this script to
+# build later).
+if [[ -t 0 ]]; then
+  read -r -p "Build this pinned source now? [Y/n] " ANS || ANS=""
+  case "${ANS:-Y}" in
+    n|N)
+      log "Skipped — no DKMS build performed; the pinned source stays staged at ${STAGE_DIR}."
+      exit 0
+      ;;
+  esac
+else
+  log "No TTY (scripted context) — continuing with the pinned source without an interactive confirm"
 fi
 
 # --- Step 4: dkms add + build + install -----------------------------------------
