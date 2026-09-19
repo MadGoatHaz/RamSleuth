@@ -1,8 +1,8 @@
 # RamSleuth v2 — Full Scope vs. Completed
 
 > **Authoritative "full project scope vs. what is done" reference.** Self-contained: a new reader should understand the entire project from this document alone.
-> **Branch:** `v2-development` — local tip = **`c32abd5`** (the C16-02 README merge bookkeeping — the running tip; Cycles 1–15 complete); **267 commits ahead of `origin/v2-development` @ `b908f7b`** (strict fast-forward verified — everything up to `b908f7b` is on origin), all local-only, unpushed; the push is **in progress in Cycle 16 — operator go-ahead GIVEN** (ff to the post-compaction tip + prune all merged `branch/chunk-*` refs + no `v2.0.0` tag; never force-push; HANDOVER §8). **Status date:** 2026-09-18 (Cycle 15 close — **Cycles 6–15 complete**: the GUI workstream (all 8 §3.1 gap items closed in Cycles 6–7), the 7 v2.0.0 polish areas (Cycle 7), header truth (Cycle 8), topology / Graphs / layout (Cycles 9–13), runtime fixes (Cycle 14), the layout-fix close (Cycle 15); **556/556** tests green debug + release, clippy zero, MSRV 1.75, 6 binaries).
-> **Grounded in:** `Docs/HANDOVER.md` (the standing handover — read it first), `Docs/Grand Design & Architecture Specification.md`, `Docs/RamSleuth-v2.md`, `MASTER_LOG.md` (Cycles 1–15), `plans/PLAN-PHASE6.md`, `plans/PLAN-CYCLE9.md`…`plans/PLAN-CYCLE15.md`, workspace `Cargo.toml` (7 members).
+> **Branch:** `v2-development` — local tip = **`39c18f4`** (the C18-13 packaging/README merge — the running tip; **Cycles 1–17 complete + pushed**, Cycle 18 in progress); **26 commits ahead of `origin/v2-development` @ `974467a`** (the Cycle 17 post-push tip, tag `v2.0.0` on it; everything up to `974467a` is on origin; every push to date a strict fast-forward — never force-pushed); the Cycle 18 push is **C18-17 (operator standing go-ahead; strict ff; no new tag — `v2.0.0` already exists)**. **Status date:** 2026-09-19 (Cycle 17 complete + pushed (tag `v2.0.0`, default branch `v2-development`); Cycle 18 in progress — the `ramsleuth` binary rename, the self-contained `install.sh`, the pinned shared DKMS helper, AUR parity, the in-app first-run/SETUP UI; **562/562** tests green debug + release, clippy zero, MSRV 1.75, 6 binaries).
+> **Grounded in:** `Docs/HANDOVER.md` (the standing handover — read it first), `Docs/Grand Design & Architecture Specification.md`, `Docs/RamSleuth-v2.md`, `MASTER_LOG.md` (Cycles 1–17), `plans/PLAN-PHASE6.md`, `plans/PLAN-CYCLE9.md`…`plans/PLAN-CYCLE18.md`, workspace `Cargo.toml` (7 members).
 
 ---
 
@@ -113,12 +113,12 @@ Status legend: ✅ COMPLETE · ⏳ PENDING / OPEN (carried forward, not a defect
 
 ---
 
-## 4. Cross-Cutting Open Items (updated at Cycle 15 close, 2026-09-18 — O1 closed, O5 resolved, O6 in progress, O2/CAD remain)
+## 4. Cross-Cutting Open Items (updated in Cycle 18, 2026-09-19 — O1 closed, O5 resolved, O6 closed (Cycles 16–17), O2/CAD remain)
 
 1. **O1 — GUI — CLOSED (Cycles 6–15).** The primary workstream (operator: "we have not even gotten near the GUI yet") is done: the initial 3-zone dashboard (Cycle 3, Phase 4) is now the full Grand Design §3.1/§3.2 dashboard — all 8 gap items closed in Cycles 6–7 (the header + its data-model wire extensions — motherboard/BIOS/AGESA provenance, total RAM, the command-rate slot, the die maker; the grouped timing sections; the GDM/CR row; per-cell live bench updates; the SPD card content; the dedicated Graphs window; Settings; export parity + keyboard actions), refined in Cycles 8–15 (header truth, topology, Graphs lifecycle, layout; the 968×600 / 892×600 auto-sized window). Closure record: the "GUI Gap" section above. **Not hardware-gated** — implemented on the 5950X host.
 2. **O2 — Intel live MCHBAR decode (hardware-gated).** The i5-6600 (Skylake, LGA-1151, dual-channel) is **not yet attached**. When it is: the live decode + per-channel tCL/tRCD/tRP/tRAS + command-rate/gear vs. known-good; the IMC register offsets are still SKELETON (the first pass reconciles them — plan D6: verify-first, reconcile-if-divergent; the wire shapes never change); Intel voltages/CAD = `Na(NotApplicable)`. P6-06 is parked for exactly this.
 3. **O5 — MSRV 1.75 vs. 1.89 — RESOLVED: 1.75 held through Cycles 6–15.** All lockfile packages MSRV ≤ 1.75; the AVX-512F bodies compile green on the CI `1.75` leg and are runtime-gated (never exercised on this AVX2-only host); **the CI 1.75 leg is the standing proof; no bump decided** (the plan's P6-07 docs-only record was parked; the decision stands at 1.75).
-4. **O6 — push to GitHub — IN PROGRESS in Cycle 16 (operator go-ahead GIVEN).** Fast-forward `origin/v2-development` (`b908f7b`) to the post-compaction tip (**NEVER force-push**), then prune all fully-merged remote `branch/chunk-*` branches (the **99** Cycle 1–15 refs — 17 p5 + 23 c6 + 22 c7 + 11 c8 + 8 c9 + 4 c10 + 2 c11 + 5 c12 + 4 c13 + 3 c14, the c15 pair already pruned at the Cycle 15 compaction — plus the 2 c16 refs merged so far; the prune gate re-verifies the ancestry of each remote SHA; `master` / `v2-development` are never pruned), verify `git ls-remote --heads origin` = exactly 2 refs; **no `v2.0.0` tag** this cycle (a separate operator decision). Runbook = HANDOVER §8 + D-16.5.
+4. **O6 — push to GitHub — CLOSED (Cycles 16-17: pushed + tag + default branch).** Cycle 16 (C16-11, 2026-09-19): strict ff push `b908f7b..23207ef` (275 commits) + pruned the live-measured **103** remote `branch/chunk-*` refs (ancestry-gated per D-16.5; `master` / `v2-development` never pruned; remote = exactly 2 refs). Cycle 17 (C17-08, 2026-09-19): strict ff push `42e8a20..974467a` + the annotated **`v2.0.0` tag** on `974467a` + the GitHub default branch switched `master` → `v2-development` + the 5 stale `c17-*` refs pruned. Remote now = exactly `master` @ `782022a` (divergent legacy, untouched) + `v2-development` @ `974467a` + tag `v2.0.0`; **never force-pushed**. The Cycle 18 push (C18-17) is the open instance of the same runbook (HANDOVER §8 + D-18.7): strict ff to the post-merge tip, no new tag.
 5. **CAD/RTT/drive + PDM SMN bitfields (honest N/A — driver-side confirmation pending).** Unconfirmed in the ryzen_smu driver source (the amkillam v0.1.7 audit, P6-02); the confirm-or-Na position is held (no field displayed with an unverified mapping); needs an AMD-published UMC register map or an upstream bitfield publication. Non-fatal: the O1 PASS treats the CAD gate as informational.
 ## 5. Verification Environment
 
@@ -167,7 +167,7 @@ flowchart TD
     CLIENT --> W6["CORE GATE PASSED ✅"]
 
     P4 --> TUI["ramsleuth-tui — ratatui + crossterm ✅"]
-    P4 --> GUI["ramsleuth-gui — COMPLETE — full §3.1/§3.2 dashboard (Cycles 6–15), 968×600 ✅"]
+    P4 --> GUI["ramsleuth (the ramsleuth-gui crate) — COMPLETE — full §3.1/§3.2 dashboard (Cycles 6–15) + the first-run SETUP requirements strip (Cycle 18), 968×600 ✅"]
     TUI --> X1["3 zones + R/S/Q + 2s updater ✅"]
     GUI --> X2["3 zones + Graphs window + Settings + F2/F3 export + 60 FPS ✅"]
     GUI --> X3["GUI Gap vs Grand Design §3.1/§3.2 — ALL 8 ITEMS CLOSED ✅ (Cycles 6–7; refinements Cycles 8–15)"]
@@ -179,7 +179,7 @@ flowchart TD
     P5 --> Y4["GitHub Actions CI: 1.75/stable matrix + 6-binary artifact ✅"]
     P5 --> Y5["ryzen_smu uAPI reconciliation: ryzen_smu_drv paths + amkillam upstream ✅"]
     P5 --> Y6["AMD PM-table model reconciliation: Vermeer f32 + TableVersionId sets ✅"]
-    P5 --> Y7["Push to GitHub — IN PROGRESS (Cycle 16: go-ahead given — ff to the post-compaction tip + prune all merged chunk refs, no tag)"]
+    P5 --> Y7["Push to GitHub — CLOSED ✅ (Cycles 16–17: strict-ff pushes + tag v2.0.0 + default branch v2-development; origin/master untouched)"]
 
     P6 --> Z0["8 chunks merged ✅ (P6-01…P6-05 + P6-09/10/11; QA all green at Cycle 5 close — 556/556 at Cycle 15 close)"]
     P6 --> Z1["Ground-truth script: VERDICT PASS, 31 active gates ✅ (amd-ground-truth.sh)"]
@@ -189,11 +189,11 @@ flowchart TD
     P6 --> Z5["monitor_cpu -f + 0xffffffff sentinel + rc=124 fixes ✅ (P6-09/10/11)"]
     P6 --> Z6["Intel live decode ⏳ (P6-06 parked — hardware-gated)"]
 
-    ROOT -. "standing open items (Cycle 15 close)" .-> OPEN["Cross-cutting open items"]
+    ROOT -. "standing open items (Cycle 18)" .-> OPEN["Cross-cutting open items"]
     OPEN --> O1["GUI — CLOSED ✅ (Cycles 6–15 — the full §3.1/§3.2 dashboard)"]
     OPEN --> O2["Intel MCHBAR live decode ⏳ (i5-6600 not yet attached)"]
     OPEN --> O5["MSRV 1.75 vs 1.89 — RESOLVED ✅ (1.75 held; the CI 1.75 leg the standing proof)"]
-    OPEN --> O6["GitHub push — IN PROGRESS (Cycle 16: go-ahead given — ff + prune the merged chunk refs, no tag)"]
+    OPEN --> O6["GitHub push — CLOSED ✅ (Cycles 16–17: pushed + tag v2.0.0 + default branch v2-development)"]
     OPEN --> OC["CAD/RTT/drive + PDM bitfields ⏳ (driver-side confirm; honest N/A)"]
 ```
 ## 7. How to Run (quick reference, release)
@@ -219,7 +219,7 @@ target/release/ramsleuth-client --socket /tmp/ramsleuth.sock -- dump
 
 # 3) TUI (R = refresh, S = snapshot, Q = quit) / 4) GUI (F2 = PNG, F3 = JSON, Q = quit)
 target/release/ramsleuth-tui
-target/release/ramsleuth-gui
+target/release/ramsleuth
 
 # Ground truth + the Cycle 5 cross-check (VERDICT PASS; the cross-check needs the daemon up + root)
 sudo scripts/amd-ground-truth.sh      # monitor_cpu -f vs ramsleuth-client -- dump vs one-shot monitor_cpu -m
@@ -243,7 +243,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ramsleuth
 
 ## 8. Git / Push State
 
-- **Dev branch:** `v2-development` @ **`c32abd5`** (the C16-02 README merge bookkeeping — the running tip; Cycles 1–15 complete), tree clean — **267 commits ahead of `origin/v2-development` @ `b908f7b`** (everything up to `b908f7b` is on origin; every push to date has been a strict fast-forward — no force-push): the full Cycles 6–15 line (the GUI workstream, the v2.0.0 polish, header truth, topology/Graphs/layout, runtime fixes, the layout-fix close — see `MASTER_LOG.md`) + the Cycle 16 doc/config work so far (C16-01 the gitignore + untrack, C16-02 the v2.0 README) — all local-only, unpushed. `origin/master` is divergent legacy — the operator confirmed `v2-development` is the canonical line; `master` is never touched (not merged into, not branched from, not deleted — a read-only reference). **All 101 remote `branch/chunk-*` branches remain on origin — the 99 Cycle 1–15 refs (17 p5 + 23 c6 + 22 c7 + 11 c8 + 8 c9 + 4 c10 + 2 c11 + 5 c12 + 4 c13 + 3 c14 — the c15 pair was pruned at the Cycle 15 compaction; all earlier Cycle 1–3 chunk branches were pruned at their close-outs) + the 2 Cycle-16 refs (c16-01, c16-02) — all fully merged, prune candidates at the Cycle 16 push** (the prune gate re-verifies the ancestry of each remote SHA before deleting; `master` / `v2-development` are never pruned).
-- **Push policy (Cycle 16 — operator go-ahead GIVEN):** the **confirmed, tested, working** end-result app condition has been **met since Cycle 3** (Phase 5 packaging done in Cycle 4; the live AMD verification closed in Cycle 5 with VERDICT PASS; 556/556 + clippy zero + MSRV 1.75 + 6 binaries at Cycle 15 close). On the post-compaction tip: **fast-forward** `origin/v2-development` to the tip (NEVER force-push; if the origin is not a strict ancestor, stop and report), **prune all merged remote `branch/chunk-*` branches** (the 101 above — ancestry-gated per D-16.5), **verify `git ls-remote --heads origin` = exactly 2 refs** (`master` + `v2-development`), and **no `v2.0.0` tag** this cycle (a separate operator decision). Executing in Cycle 16 (C16-11).
+- **Dev branch:** `v2-development` @ **`7197db5`** (the C18-12 README merge — the running tip at the C18-14 fork; Cycles 1–17 complete + pushed, Cycle 18 in progress), tree clean — **24 commits ahead of `origin/v2-development` @ `974467a`** (the Cycle 17 post-push tip, tag `v2.0.0` on it; everything up to `974467a` is on origin; every push to date has been a strict fast-forward — no force-push): the pushed Cycles 16–17 line (the doc review + README v2.0 + the `v2.0.0` version bump + the operator-authorized pushes + tag + the default-branch switch — see `MASTER_LOG.md`) + the Cycle 18 line so far (the `ramsleuth` binary rename — C18-01…C18-07 + C18-12; the self-contained `install.sh` — C18-08; the pinned shared `ryzen_smu` DKMS helper — C18-09; AUR parity — C18-05/06; the in-app first-run/SETUP strip — C18-02/10/11; the transparency docs — C18-12, C18-13) — all local-only until C18-17. `origin/master` is divergent legacy — the operator confirmed `v2-development` is the canonical line (the GitHub default branch since Cycle 17); `master` is never touched (not merged into, not branched from, not deleted — a read-only reference). **Remote `branch/chunk-*` refs:** every Cycle 1–17 ref was pruned at its push gate (C16-11: the live-measured 103 refs; C17-08: the 5 stale `c17-*` refs) — the **14** Cycle 18 refs (`branch/chunk-c18-01`…`c18-14`) accumulate on origin as each chunk pushes and are prune candidates at the C18-17 push (the prune gate re-verifies the ancestry of each remote SHA; `master` / `v2-development` are never pruned).
+- **Push policy (Cycle 18 — operator standing go-ahead; C18-17):** the **confirmed, tested, working** end-result app condition has been **met since Cycle 3** (Phase 5 packaging done in Cycle 4; the live AMD verification closed in Cycle 5 with VERDICT PASS; 562/562 + clippy zero + MSRV 1.75 + 6 binaries at the Cycle 18 measurement, 2026-09-19). On the post-merge tip: **fast-forward** `origin/v2-development` to the tip (NEVER force-push; if the origin is not a strict ancestor, stop and report), **prune all merged remote `branch/chunk-c18-*` refs** (the 14 above — ancestry-gated), **verify the remote heads = exactly `master` @ `782022a` + `v2-development` @ the tip**, and **no new tag** (`v2.0.0` already exists on `974467a`; a `v2.0.1`/`v2.1.0` bump is a separate operator decision). Runbook = HANDOVER §8 + D-18.7.
 
-**This document: `FULLSCOPEvsCOMPLETED.md` — refreshed at Cycle 15 close (2026-09-18) for the Cycle 16 handover: the GUI workstream marked COMPLETE (the full Grand Design §3.1/§3.2 dashboard — all 8 gap items closed in Cycles 6–7, refined in Cycles 8–15; the "GUI Gap" section kept as the historical record with the per-item closure record), O1 closed + O5 resolved (MSRV 1.75) + O6 in progress (the Cycle 16 operator-authorized push: strict ff + prune all merged chunk refs + no tag; O2/CAD remain open), the 556/556 / clippy-zero / MSRV-1.75 / 6-binary ground truth, and the scope map + git state updated.**
+**This document: `FULLSCOPEvsCOMPLETED.md` — refreshed in Cycle 18 (2026-09-19): the GUI binary renamed `ramsleuth-gui` → `ramsleuth` (the `ramsleuth-gui` crate; the TUI `ramsleuth-tui` unchanged), the self-contained transparent `install.sh` GitHub installer + the pinned shared `ryzen_smu` DKMS helper (`amkillam/ryzen_smu` @ `d2983668300dd2a598e5a7dc40e71ce0678cc270` — shown + checksummed + confirmed before any build) + AUR parity (`ramsleuth-git` ships the helper + `install.sh`; the informative `post_install`), the in-app first-run/SETUP requirements strip, O6 closed (Cycles 16–17: pushed + the `v2.0.0` tag + the `v2-development` default branch), O1/O5 as before (O2/CAD remain open; a version bump is a separate operator decision), the 562/562 / clippy-zero / MSRV-1.75 / 6-binary ground truth, and the scope map + git state updated.**
