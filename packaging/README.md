@@ -7,7 +7,7 @@ Operator/end-user guide for installing and running RamSleuth v2: the `ramsleuth-
 RamSleuth v2 is 100% pure Rust — a Cargo workspace of 7 crates, built with `cargo build --release --locked`, producing one privileged daemon and five unprivileged clients:
 
 - `ramsleuth-daemon` — runs as root but holds only `CAP_SYS_RAWIO` (the capability required for the SMU and `/dev/mem` MCHBAR reads) and listens on a Unix socket.
-- `ramsleuth-client` (CLI), `ramsleuth-tui`, `ramsleuth-gui` (needs a display), `ramsleuth-bench`, `ramsleuth-telemetry`.
+- `ramsleuth-client` (CLI), `ramsleuth-tui`, `ramsleuth` (the GUI — needs a display, the `ramsleuth-gui` crate), `ramsleuth-bench`, `ramsleuth-telemetry`.
 
 The socket lands at `/run/ramsleuth/ramsleuth.sock` (mode `0660`, group-owned; systemd creates the directory via `RuntimeDirectory=ramsleuth`). Clients need no privileges — only membership in the `ramsleuth` group.
 
@@ -17,10 +17,12 @@ The socket lands at `/run/ramsleuth/ramsleuth.sock` (mode `0660`, group-owned; s
 
 | Artifact | Destination |
 | --- | --- |
-| 6 binaries: `ramsleuth-daemon`, `ramsleuth-client`, `ramsleuth-tui`, `ramsleuth-gui`, `ramsleuth-bench`, `ramsleuth-telemetry` | `/usr/bin/` |
+| 6 binaries: `ramsleuth-daemon`, `ramsleuth-client`, `ramsleuth-tui`, `ramsleuth`, `ramsleuth-bench`, `ramsleuth-telemetry` | `/usr/bin/` |
 | The frozen daemon unit (`systemd/ramsleuth.service`) | `/usr/lib/systemd/system/ramsleuth.service` |
 | The systemd preset (`00 enable ramsleuth.service`) | `/usr/lib/systemd/system-preset/ramsleuth.preset` |
 | The `ramsleuth` system group | created on the target by the `.install` `pre_install`/`pre_upgrade` hooks (idempotent `groupadd -r`) |
+| The ramsleuth-owned copy of the pinned `ryzen_smu` DKMS helper (`scripts/install-ryzen-smu-dkms.sh`) | `/usr/bin/ramsleuth-install-ryzen-smu-dkms` |
+| The self-contained installer (`install.sh` — the transparency artifact, re-runnable/auditable post-install) | `/usr/share/ramsleuth/install.sh` |
 
 `ramsleuth-protocol` is a library-only crate and is never installed.
 
@@ -39,7 +41,7 @@ cd packaging/ramsleuth-git
 makepkg -si
 ```
 
-Build deps: `rust`, `cargo`, `pkgconf`, plus the X11/Wayland/GL library set in the PKGBUILD (`libxkbcommon` is the only strict build-time link dep). The `post_install` hook runs `systemctl enable --now ramsleuth.service` — the daemon is started and enabled automatically, and the preset keeps it enabled on future `systemctl preset` runs.
+Build deps: `rust`, `cargo`, `pkgconf`, plus the X11/Wayland/GL library set in the PKGBUILD (`libxkbcommon` is the only strict build-time link dep). The `post_install` hook runs `systemctl enable --now ramsleuth.service` — the daemon is started and enabled automatically, and the preset keeps it enabled on future `systemctl preset` runs. It also prints the next steps: start the GUI with `ramsleuth` (the TUI with `ramsleuth-tui`), and on AMD hosts the optional `sudo ramsleuth-install-ryzen-smu-dkms` (pinned upstream, shown + confirmed before any build; the AUR-extra alternative is `yay -S ryzen-smu-dkms`), while Intel hosts get the note that the built-in MCHBAR decode needs no extra driver.
 
 ## The `ramsleuth` group
 
@@ -87,7 +89,7 @@ To enable live AMD subtimings on an AMD host:
    sudo ryzen-smu-dkms-install
    ```
 
-   Or, from a source checkout (no package needed): `scripts/install-ryzen-smu-dkms.sh`. The helper is idempotent, re-execs under `sudo`, requires the matching kernel headers (build tree `/lib/modules/$(uname -r)/build` — for custom-kernel hosts it lists candidate packages and stops, never guessing), clones the verified upstream (default `https://github.com/amkillam/ryzen_smu.git`, branch `main` v0.1.7, overridable via `RYZEN_SMU_URL`) to `/opt/ryzen-smu-src`, then runs `dkms install`, `modprobe`, and persists `/etc/modules-load.d/ryzen_smu.conf`.
+   Or, from a source checkout (no package needed): `scripts/install-ryzen-smu-dkms.sh`. The helper is idempotent, re-execs under `sudo`, requires the matching kernel headers (build tree `/lib/modules/$(uname -r)/build` — for custom-kernel hosts it lists candidate packages and stops, never guessing), builds the **pinned** upstream `amkillam/ryzen_smu` @ `d2983668300dd2a598e5a7dc40e71ce0678cc270` (verified 2026-08-15, the current `main` HEAD; fetched, shown, checksummed, and confirmed before any build; the pin overridable via `RYZEN_SMU_PIN`, the URL via `RYZEN_SMU_URL`) to `/opt/ryzen-smu-src`, then runs `dkms install`, `modprobe`, and persists `/etc/modules-load.d/ryzen_smu.conf`.
 
 `AUTOINSTALL=yes` in the `dkms.conf` auto-rebuilds the module on kernel updates. Verify:
 
@@ -96,6 +98,18 @@ ls /sys/kernel/ryzen_smu_drv/pm_table
 ```
 
 The module also ships a `monitor_cpu` CLI for ground-truth comparison: run it side-by-side with RamSleuth and expect clocks within ±1 MHz, voltages within ±10 mV, and matching CAD/subtimings.
+
+### AUR parity & transparency
+
+An AUR install gets the same scripting as the GitHub path (`./install.sh` from a source checkout) — plus a third, driver-less path:
+
+- `sudo ramsleuth-install-ryzen-smu-dkms` — the helper the `ramsleuth-git` package ships at that path (the ramsleuth-owned copy of `scripts/install-ryzen-smu-dkms.sh`), or
+- the separate `ryzen-smu-dkms` extra (the two-step flow above): `yay -S ryzen-smu-dkms && sudo ryzen-smu-dkms-install`, or
+- no driver at all — RamSleuth runs and degrades gracefully (`N/A (DriverMissing)`, exit 0, no panic).
+
+Whichever path builds the module, the upstream source is **pinned, never branch-HEAD**: `amkillam/ryzen_smu` @ `d2983668300dd2a598e5a7dc40e71ce0678cc270` (verified 2026-08-15, the current `main` HEAD). The helper prints the URL, the full pin, and the short sha before any fetch, shows the fetched commit + the `sha256sum` of the staged source files after the fetch, hard-verifies that `HEAD` equals the pin before any build (no silent branch-HEAD fallback), and pauses for a confirmation before the first system mutation (a non-interactive run logs and continues; `n` skips cleanly, exit 0). The staged source stays inspectable at `/usr/src/ryzen_smu-1.d298366`.
+
+Build posture: the `ramsleuth-git` package compiles **only this repository** (branch-pinned, `--locked`, no third-party code in the build chroot) and depends on **no third-party AUR package** — the `ryzen-smu-dkms` extra is optional and co-install-safe (it ships the same helper under a different name, so the two packages never conflict). Every installed file is byte-identical to a file in this repository (auditable via `git show`), including the shipped helper and `install.sh` (`/usr/share/ramsleuth/install.sh`), so the whole flow can be re-run and audited post-install.
 
 ## CI
 
