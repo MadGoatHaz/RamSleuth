@@ -25,7 +25,7 @@
 # plus the eframe 0.27 / winit dlopen + fallback runtime surface.
 
 pkgname=ramsleuth-git
-pkgver=0.1.0   # placeholder — makepkg recomputes via pkgver() below
+pkgver=2.0.0   # placeholder — makepkg recomputes via pkgver() below
 pkgrel=1
 pkgdesc="Pure-Rust RAM latency/bandwidth telemetry: privileged daemon + unprivileged CLI/TUI/GUI clients"
 arch=(x86_64)
