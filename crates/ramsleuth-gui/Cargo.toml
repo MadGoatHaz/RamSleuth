@@ -13,7 +13,7 @@ name = "ramsleuth_gui"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ramsleuth-gui"
+name = "ramsleuth"
 path = "src/main.rs"
 
 [dependencies]
