@@ -70,6 +70,6 @@ jobs:
             target/release/ramsleuth-daemon
             target/release/ramsleuth-client
             target/release/ramsleuth-tui
-            target/release/ramsleuth-gui
+            target/release/ramsleuth
             target/release/ramsleuth-bench
             target/release/ramsleuth-telemetry
