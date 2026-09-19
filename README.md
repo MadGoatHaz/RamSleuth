@@ -139,4 +139,4 @@ RamSleuth/
 
 MIT — the workspace `Cargo.toml` declares `license = "MIT"`. Repository: <https://github.com/MadGoatHaz/RamSleuth>.
 
-This README describes the **v2.0.0 development line** (branch `v2-development`); the workspace package version stays `0.1.0` — the `v2.0.0` tag is a separate operator decision.
+This README describes **RamSleuth v2.0.0** (branch `v2-development`); the workspace package version is `2.0.0` and the `v2.0.0` tag was created in Cycle 17.
