@@ -16,7 +16,7 @@ RamSleuth v2 is a 100% pure-Rust (Cargo workspace) Linux memory diagnostics suit
 
 ## 2. Architecture — the Concrete Deliverable
 
-The workspace root `Cargo.toml` defines exactly these **7 member crates** (Edition 2021, resolver 2, `rust-version = 1.75`, MIT, `version 0.1.0`):
+The workspace root `Cargo.toml` defines exactly these **7 member crates** (Edition 2021, resolver 2, `rust-version = 1.75`, MIT, `version 2.0.0`):
 
 | Crate | Role | Phase | Status |
 |---|---|---|---|
