@@ -1,6 +1,6 @@
 //! ramsleuth-gui — the unprivileged desktop GUI (Phase 3, egui + eframe).
 //!
-//! This is the **library** the `ramsleuth-gui` binary (P3-30) renders
+//! This is the **library** the `ramsleuth` binary (P3-30) renders
 //! from: the semantic style + palette (Grand Design §3.2), the two
 //! file exports — F2 [`snapshot_png`] / F3 [`export_json`] — and the
 //! shared update state + background poller the app shell reads behind
@@ -50,11 +50,16 @@
 //!   hand-rolled time-windowed [`graph::render_graphs_window`] (no
 //!   chart crate, D-3). The child viewport lands in C7-21, the
 //!   interactivity in C7-22.
+//! - `first_run` — C18 — the first-run/SETUP requirements strip
+//!   (D-18.5): [`first_run::diagnose`] (the pure, headless-testable
+//!   daemon / group / pinned-`ryzen_smu` builder) +
+//!   [`first_run::render_requirements_strip`] (copy + "Got it"; no-panic).
 //!
 //! (The eframe app shell in `main.rs` lands in P3-30.)
 
 pub mod bench_zone;
 pub mod graph;
+pub mod first_run;
 pub mod history;
 pub mod settings;
 pub mod status_zone;
@@ -125,3 +130,10 @@ pub use settings::{
     format_bw, format_capacity, format_clock, render_settings_panel, CapacityUnit, ClockUnit,
     GuiSettings, Theme, Units, DEFAULT_POLL_INTERVAL_MS,
 };
+
+// C18: the first-run/SETUP requirements strip (D-18.5), re-exported at
+// the root (workspace re-export style) — the app shell (C18-02) runs
+// `diagnose` over the shared `TelemetryData` snapshot and renders the
+// strip between the header and the settings strip (auto-shown on first
+// launch, presence-driven, no-panic).
+pub use first_run::{diagnose, render_requirements_strip, Requirement, RYZEN_SMU_PIN_SHORT};
