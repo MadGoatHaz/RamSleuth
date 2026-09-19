@@ -561,7 +561,7 @@ mod tests {
     /// Unique temp path per test (pid-scoped — the client's
     /// temp-socket precedent).
     fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("ramsleuth-gui-{name}-{}", std::process::id()))
+        std::env::temp_dir().join(format!("ramsleuth-{name}-{}", std::process::id()))
     }
 
     /// The PNG signature (first 8 bytes of every valid PNG file).
