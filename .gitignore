@@ -14,3 +14,7 @@ plans/
 
 # Agent state (carries a full origin/master checkout) — never committable
 .kilo/
+
+# Development log files (lease board + durable cycle history) — not for end users, local-only
+MASTER_LOG.md
+DEV_LOG.md
