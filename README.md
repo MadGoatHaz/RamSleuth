@@ -9,7 +9,7 @@ RamSleuth v2 is a Cargo workspace of 7 crates with two layers:
 1. **Live telemetry** — the memory controller's operating state: SMU clocks (MCLK/UCLK/FCLK), 27 DRAM subtimings, GDM and command rate on AMD; a read-only MCHBAR decode path on Intel; plus fully unprivileged SPD EEPROM decode (JEP106 makers, rank, density, base speed, XMP 2.0/3.0/EXPO profiles).
 2. **Benchmark engine** — an AIDA64-style 4×4 bandwidth/latency grid: native AVX2/AVX-512F kernels, one worker thread pinned per physical core, pointer-chase latency, and a burn-in mode.
 
-**Privilege separation.** Every privileged read goes through a single daemon (`ramsleuth-daemon`) that runs as root but holds *only* `CAP_SYS_RAWIO` — the capability the SMU and `/dev/mem` MCHBAR reads require. It listens on a Unix socket at `/run/ramsleuth/ramsleuth.sock` (mode `0660`, group-owned). All clients — the CLI, the TUI, the GUI — run fully unprivileged; you only need membership in the `ramsleuth` group. The wire protocol is length-prefixed Bincode frames (u32-LE length + `bincode` 1.3 payload).
+**Privilege separation.** Every privileged read goes through a single daemon (`ramsleuth-daemon`) that runs as root but holds *only* `CAP_SYS_RAWIO` — the capability the SMU and `/dev/mem` MCHBAR reads require. It listens on a Unix socket at `/run/ramsleuth/ramsleuth.sock` (mode `0660`, group-owned). All clients — the CLI, the TUI, the GUI — run fully unprivileged; you need membership in the `ramsleuth` group (the in-app one-click **Set up RamSleuth** grants it — plus a current-session socket ACL, no re-login; see Quickstart). The wire protocol is length-prefixed Bincode frames (u32-LE length + `bincode` 1.3 payload).
 
 **No-panic contract.** A missing driver, privilege, or hardware never crashes the daemon or any client: the affected fields render as a structured `N/A (<reason>)` (e.g. `N/A (DriverMissing)`) and the process exits 0.
 
@@ -66,8 +66,7 @@ RamSleuth v2 is a Cargo workspace of 7 crates with two layers:
    sandboxed (`CapabilityBoundingSet=CAP_SYS_RAWIO`, `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `Restart=on-failure`).
    Unprivileged dev run (the privileged fields degrade to `N/A`, with warnings on stderr):
    `cargo run -p ramsleuth-daemon -- --socket /tmp/ramsleuth.sock`.
-2. **Clients.** Grant a normal user access to the `0660` group-owned socket:
-   `sudo usermod -aG ramsleuth <user>` (re-login required). Then:
+2. **Clients.** Grant a normal user access to the `0660` group-owned socket — the in-app **Set up RamSleuth** button does it in one click (no re-login; Quickstart), and `sudo ramsleuth-setup` is the same single step from a terminal. Then:
 
    ```sh
    ramsleuth-client dump      # the full telemetry listing
@@ -103,7 +102,7 @@ cd packaging/ramsleuth   # or: packaging/ramsleuth-bin / packaging/ramsleuth-git
 makepkg -si
 ```
 
-The package installs the 6 binaries to `/usr/bin/`, the frozen daemon unit to `/usr/lib/systemd/system/ramsleuth.service` (plus a preset that keeps it enabled on `systemctl preset` runs), and creates the `ramsleuth` system group (idempotent `groupadd -r`). The `post_install` hook runs `systemctl enable --now ramsleuth` — the daemon starts automatically.
+The package installs the 6 binaries to `/usr/bin/`, the frozen daemon unit to `/usr/lib/systemd/system/ramsleuth.service` (plus a preset that keeps it enabled on `systemctl preset` runs), and creates the `ramsleuth` system group (idempotent `groupadd -r`). The `post_install` hook runs `systemctl enable --now ramsleuth` — the daemon starts automatically — and self-grants the invoking user (`SUDO_USER`) the `ramsleuth` group + a socket ACL, so a GUI install opens with full access already in place.
 
 Day-2:
 
@@ -112,12 +111,22 @@ systemctl status ramsleuth
 journalctl -u ramsleuth
 ```
 
+## Quickstart
+
+1. **Install** — any path above: the AUR triple (`yay -S ramsleuth` / `ramsleuth-bin` / `ramsleuth-git`) or the self-contained `./install.sh`.
+2. **Open the app** — the `ramsleuth` binary, or its desktop-menu entry (the `ramsleuth` / `ramsleuth-bin` packages and `install.sh` install one; the app carries its own RamSleuth window icon).
+3. **One click** — on first launch the `SETUP` strip offers **Set up RamSleuth** (on AMD hosts: **Set up RamSleuth + AMD driver**). One polkit password prompt runs every privileged step in a single pass: daemon enable + start, `ramsleuth` group join, and a socket ACL for your user.
+4. **Full capabilities, immediately** — no re-login, no reboot, no copy-paste. On AMD the pinned `ryzen_smu` driver is built **offline** (vendored, checksum-verified) and `modprobe`d in the same run; group membership is written too, so a plain re-login keeps working on future sessions.
+
+No-desktop box? The same one step from a terminal is `sudo ramsleuth-setup` (add `--with-dkms` on AMD) — appendix below.
+
 ## AMD telemetry requirement (live subtimings)
 
 Live AMD SMU telemetry requires the `ryzen_smu` kernel module. **It is not a hard dependency** — without it, the AMD subtiming fields read `N/A (DriverMissing)` and everything else keeps serving.
 
+- **One click (every install path):** the `SETUP` strip's **Set up RamSleuth + AMD driver** button — or `sudo ramsleuth-setup --with-dkms` from a terminal — builds + loads it in the same run (Quickstart).
 - **AUR extra:** `yay -S ryzen-smu-dkms`, then `sudo ryzen-smu-dkms-install`.
-- **From a source checkout:** `scripts/install-ryzen-smu-dkms.sh` — idempotent, re-execs under `sudo`, requires the matching kernel headers, builds the **pinned** upstream `amkillam/ryzen_smu` @ `d298366` (shown + checksummed + confirmed before any build; overridable via `RYZEN_SMU_URL` / `RYZEN_SMU_PIN`), then `dkms install` + `modprobe` + a persistent `/etc/modules-load.d/ryzen_smu.conf`. The `./install.sh` entrypoint walks you through it (AMD hosts). `AUTOINSTALL=yes` rebuilds the module on kernel updates.
+- **Shared helper / source checkout:** `sudo ramsleuth-install-ryzen-smu-dkms` (installed by every RamSleuth path) or `scripts/install-ryzen-smu-dkms.sh` from a checkout — idempotent, re-execs under `sudo`, requires the matching kernel headers. It builds the **pinned** `ryzen_smu` @ `d298366` **offline from the vendored in-repo source** (every file verified against `vendor/SUMS.sha256` before staging; the git-pinned fetch remains the `RYZEN_SMU_FORCE_REMOTE=1` fallback), then `dkms install` + `modprobe` (immediate — no reboot) + a persistent `/etc/modules-load.d/ryzen_smu.conf`. `AUTOINSTALL=yes` rebuilds the module on kernel updates.
 
 Verify: `ls /sys/kernel/ryzen_smu_drv/pm_table`. The module ships a `monitor_cpu` CLI for ground-truth comparison (expect clocks within ±1 MHz, voltages within ±10 mV); `scripts/amd-ground-truth.sh` runs the side-by-side check.
 
@@ -126,7 +135,8 @@ Verify: `ls /sys/kernel/ryzen_smu_drv/pm_table`. The module ships a `monitor_cpu
 The install path is auditable end to end:
 
 - **Own code only in the build.** The `ramsleuth` and `ramsleuth-git` AUR packages and `./install.sh` compile **only this repository** — tag-/branch-pinned, `cargo build --locked`, no third-party code in a build chroot, no `sha256sums` needed. `ramsleuth-bin` compiles nothing: it downloads the release binary tarball, pinned by `sha256`.
-- **The only third-party source** is the optional AMD `ryzen_smu` kernel module, **pinned to commit `d2983668300dd2a598e5a7dc40e71ce0678cc270` of `amkillam/ryzen_smu`** (verified 2026-08-15, "Fix cpuid include on 7.2+ kernels (#53)"). The bundled helper fetches, shows, checksums, and confirms it **on the target** (never in a build chroot), and the staged source stays inspectable at `/usr/src/ryzen_smu-1.d298366`.
+- **The only third-party source** is the optional AMD `ryzen_smu` kernel module, **pinned to commit `d2983668300dd2a598e5a7dc40e71ce0678cc270` of `amkillam/ryzen_smu`** (verified 2026-08-15, "Fix cpuid include on 7.2+ kernels (#53)"), **vendored in-repo** at `packaging/ryzen-smu-dkms/vendor/` (byte-identical — the offline build; the git fetch is the fallback). The bundled helper shows, checksums, and confirms it **on the target** (never in a build chroot), and the staged source stays inspectable at `/usr/src/ryzen_smu-1.d298366`.
+- **The vendor dir is a separate work.** `ryzen_smu` is **GPL-2.0**; it is never compiled into or linked with any MIT-licensed RamSleuth binary — DKMS builds it standalone in `/usr/src` (its verbatim upstream `LICENSE` + `NOTICE.md` ship with the vendor dir).
 - **No dependency on any third-party AUR package.** The `ryzen-smu-dkms` extra is optional and co-install-safe (it ships the same helper under a different filename, so it never conflicts with the RamSleuth packages).
 - **Every installed file is byte-identical to a file in this repository** (auditable via `git show`): the helper ships as `/usr/bin/ramsleuth-install-ryzen-smu-dkms` (from `ramsleuth-git`) and `/usr/bin/ryzen-smu-dkms-install` (from the extra), and `install.sh` ships as `/usr/share/ramsleuth/install.sh`, so the whole flow can be re-run and audited post-install.
 
@@ -155,6 +165,25 @@ RamSleuth/
 ├── scripts/                   # install-ryzen-smu-dkms.sh, amd-ground-truth.sh
 └── .github/workflows/ci.yml   # MSRV × stable test matrix + release build
 ```
+
+## Appendix — manual fallback (copy-paste)
+
+For headless boxes, sessions without a graphical polkit agent, or whenever you prefer the terminal, the one-click setup is the same helper with `sudo`:
+
+```sh
+sudo ramsleuth-setup              # daemon enable+start + group join + socket ACL
+sudo ramsleuth-setup --with-dkms  # the same, plus the offline AMD driver build
+```
+
+The finer-grained equivalents (what the GUI's per-row `Copy` buttons also offer):
+
+```sh
+sudo systemctl enable --now ramsleuth    # enable + start the daemon
+sudo usermod -aG ramsleuth "$USER"       # group membership (effective at your next login)
+sudo ramsleuth-install-ryzen-smu-dkms    # AMD: build + load the pinned ryzen_smu module
+```
+
+Health: `systemctl status ramsleuth`, `journalctl -u ramsleuth`; confirm the ACL grant with `getfacl /run/ramsleuth/ramsleuth.sock`.
 
 ## License
 
