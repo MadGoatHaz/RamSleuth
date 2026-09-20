@@ -18,17 +18,28 @@
 //! inside the app). Intel (the built-in MCHBAR decode) and healthy AMD
 //! → no requirements at all.
 //!
-//! [`render_requirements_strip`] paints that list as the `SETUP` strip
-//! the app shell shows on launch (the C18-02 integration): a bold-CYAN
-//! title, one row per requirement (an AMBER `!`, the summary, the dim
-//! detail, the command with a **Copy** button), a
-//! `Got it — keep using RamSleuth` button, and the dim no-panic footer.
+//! [`render_requirements_strip_with_setup`] paints that list as the
+//! `SETUP` strip the app shell shows on launch (the C18-02
+//! integration): a bold-CYAN title, the primary CYAN
+//! **`Set up RamSleuth`** button (C21 — the one-click wizard; the AMD
+//! `DriverMissing` case labels it `+ AMD driver`) + its dim live status
+//! line (idle / `running…` / `done — full capabilities active` /
+//! `failed: <msg>`), one row per requirement (an AMBER `!`, the
+//! summary, the dim detail, the command with a **Copy** button — the
+//! secondary fallback), a `Got it — keep using RamSleuth` button, and
+//! the dim no-panic footer.
 //!
-//! **Copy-only affordance (D-18.5, risk (a)):** the GUI is
-//! unprivileged; the clipboard is the "run it" path — the app NEVER
-//! spawns a terminal and NEVER shells out to `sudo` (a Wayland/X11
-//! terminal spawn is unreliable and would block the UI on a password
-//! prompt; copy + paste is the grace line).
+//! **One-click setup (C21) + the Copy fallback (D-18.5, risk (a)):**
+//! the primary affordance is the `Set up RamSleuth` button — a thin
+//! client over the pkexec-able `ramsleuth-setup` root helper (one
+//! privileged pass: daemon enable+start, group join, the socket ACL —
+//! and on AMD the offline DKMS driver build + `modprobe`; no
+//! re-login, no reboot). The render thread only flips
+//! [`SetupOutcome::running`] (D6: zero I/O on the render thread — the
+//! actual `pkexec` spawn is the setup worker's job, C21-06). The
+//! per-row **Copy** buttons are KEPT as the secondary polkit-less
+//! fallback (the D-18.5 grace line for the `polkit`/`acl`-less edge;
+//! the clipboard path — no terminal spawn, no `sudo` shell-out).
 //!
 //! **No-panic contract (plan D5):** [`diagnose`] is pure and total — a
 //! daemon-less [`TelemetryData::default()`] yields the single daemon
@@ -40,6 +51,12 @@
 //! C18-02 consumes it (the header's `Setup` toggle + the auto-shown
 //! strip between the header and the settings area — presence-driven:
 //! it disappears on its own once every requirement is resolved).
+//! C21-04 adds the one-click setup wizard ([`setup_argv`] +
+//! [`SetupOutcome`] + [`setup_with_dkms`] +
+//! [`render_requirements_strip_with_setup`]); C21-05 re-exports the
+//! wizard symbols, C21-06 wires the app shell's setup worker to the
+//! 4-arg entry (the 3-arg [`render_requirements_strip`] stays as the
+//! pre-worker call site, the wizard rendering idle).
 
 use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
@@ -54,6 +71,10 @@ use crate::{AMBER, CYAN, NA_GRAY, SLATE};
 /// in the shared helper, C18-09). This short form is the in-app
 /// transparency line (the AMD requirement's detail).
 pub const RYZEN_SMU_PIN_SHORT: &str = "d298366";
+
+/// The manual/CLI fallback command for the AMD driver (the DKMS
+/// requirement's command — the secondary polkit-less path, D-18.5).
+pub const DKMS_INSTALL_CMD: &str = "sudo ramsleuth-install-ryzen-smu-dkms";
 
 /// One actionable first-run requirement: the one-line summary (the
 /// bold row text), the dim detail, and the exact command to run
@@ -99,7 +120,7 @@ fn dkms_requirement() -> Requirement {
             "the helper builds the pinned upstream `amkillam/ryzen_smu @ {RYZEN_SMU_PIN_SHORT}` — \
              shown + checksummed + confirmed before any build; RamSleuth runs without it"
         ),
-        command: Some("sudo ramsleuth-install-ryzen-smu-dkms".to_owned()),
+        command: Some(DKMS_INSTALL_CMD.to_owned()),
     }
 }
 
@@ -161,14 +182,89 @@ pub fn diagnose(data: &TelemetryData) -> Vec<Requirement> {
     requirements
 }
 
-/// Render the `SETUP` requirements strip into `ui` (the C18-02 panel
-/// body): the bold-CYAN title, one row per requirement (an AMBER `!`,
-/// the summary, the dim detail, the command with the **Copy** button —
-/// `ui.ctx().copy_text`, the clipboard-only affordance, D-18.5), the
-/// `Got it — keep using RamSleuth` button (it flips `*open` — the
-/// render thread's one permitted write, no I/O, the D6 settings
-/// precedent), and the dim no-panic footer.
-pub fn render_requirements_strip(ui: &mut egui::Ui, requirements: &[Requirement], open: &mut bool) {
+/// The one-click setup helper's fixed argv (the frozen C21-01
+/// contract: `ramsleuth-setup [--with-dkms] [--user <name>]` — any
+/// flag order). Pure + headless-testable, zero I/O: the render thread
+/// never spawns anything (D6) — the setup worker wired in C21-06 runs
+/// this under `pkexec`. Under `pkexec` the caller must pass `--user`
+/// with the current user's name (`SUDO_USER` may be unset).
+pub fn setup_argv(with_dkms: bool, user: &str) -> Vec<String> {
+    let mut argv = vec![
+        "/usr/bin/ramsleuth-setup".to_owned(),
+        "--user".to_owned(),
+        user.to_owned(),
+    ];
+    if with_dkms {
+        argv.push("--with-dkms".to_owned());
+    }
+    argv
+}
+
+/// The live setup status shared between the render thread and the
+/// setup worker (C21-06). GUI-local: it NEVER crosses the wire (no
+/// serde — the protocol crate stays byte-frozen, the zero-wire gate).
+///
+/// Ownership: the render thread's only permitted write is flipping
+/// `running` on a button click (D6 — no I/O on the render thread);
+/// the worker (the `pkexec` spawn of [`setup_argv`]) clears `running`
+/// and sets `done` (the helper exited 0 — all requested steps
+/// succeeded or were no-ops) or `failure` (the helper's trailing
+/// diagnostic, exit 1, or the spawn itself failed).
+///
+/// The strip's dim status line renders the four states: idle (the
+/// default) / `running…` / `done — full capabilities active` /
+/// `failed: <msg>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetupOutcome {
+    /// The helper is running (a button click flipped this; the worker
+    /// clears it when the helper exits). The button is disabled while
+    /// set (no double-click).
+    pub running: bool,
+    /// The helper exited 0 — all requested setup steps succeeded or
+    /// were no-ops; full capabilities are active in the current
+    /// session (no re-login, no reboot).
+    pub done: bool,
+    /// The helper failed: the trailing diagnostic for the status line
+    /// (`failed: <msg>`).
+    pub failure: Option<String>,
+}
+
+/// Decide the `--with-dkms` flag from the diagnosed requirements:
+/// true iff the AMD `DriverMissing` case (case 3 — the reused GUI AMD
+/// detection: the `cpuid` vendor + the `Na(DriverMissing)` reason) is
+/// present. On AMD the one click also builds + `modprobe`s the
+/// offline driver; otherwise daemon/group/ACL only.
+pub fn setup_with_dkms(requirements: &[Requirement]) -> bool {
+    requirements
+        .iter()
+        .any(|r| r.command.as_deref() == Some(DKMS_INSTALL_CMD))
+}
+
+/// Render the `SETUP` requirements strip with the one-click setup
+/// wizard into `ui` (the C18-02 panel body + the C21-04 wizard): the
+/// bold-CYAN title, the primary CYAN **`Set up RamSleuth`** button
+/// (the AMD `DriverMissing` case labels it `+ AMD driver` —
+/// [`setup_with_dkms`]), its dim live status line (idle / `running…`
+/// / `done — full capabilities active` / `failed: <msg>`), one row
+/// per requirement (an AMBER `!`, the summary, the dim detail, the
+/// command with the **Copy** button — `ui.ctx().copy_text`, the
+/// secondary polkit-less fallback, D-18.5), the `Got it — keep using
+/// RamSleuth` button (it flips `*open` — the render thread's one
+/// permitted write, no I/O, the D6 settings precedent), and the dim
+/// no-panic footer.
+///
+/// The wizard's click handler only flips `setup.running` (the render
+/// thread does zero I/O — D6; the `pkexec` spawn is the C21-06
+/// worker's job). No-panic degradation: the button + status line hide
+/// entirely when there is nothing to set up (`requirements` empty —
+/// the strip is presence-driven), and the button is disabled while
+/// the helper runs.
+pub fn render_requirements_strip_with_setup(
+    ui: &mut egui::Ui,
+    requirements: &[Requirement],
+    open: &mut bool,
+    setup: &mut SetupOutcome,
+) {
     let frame = egui::Frame::default()
         .fill(SLATE)
         .stroke(egui::Stroke::new(1.0_f32, CYAN))
@@ -179,6 +275,47 @@ pub fn render_requirements_strip(ui: &mut egui::Ui, requirements: &[Requirement]
                 .strong()
                 .color(CYAN),
         );
+        // The one-click wizard (C21): the primary affordance —
+        // hidden when there is nothing to set up (no-panic
+        // degradation).
+        if !requirements.is_empty() {
+            let label = if setup_with_dkms(requirements) {
+                "Set up RamSleuth + AMD driver"
+            } else {
+                "Set up RamSleuth"
+            };
+            let _ = ui.horizontal(|ui| {
+                // The palette's primary accent: CYAN fill + SLATE
+                // text; disabled while the helper runs (no
+                // double-click).
+                let resp = ui.add_enabled(
+                    !setup.running,
+                    egui::Button::new(egui::RichText::new(label).color(SLATE)).fill(CYAN),
+                );
+                if resp.clicked() {
+                    // The render thread's one permitted write (no
+                    // I/O, D6): the setup worker (C21-06) picks up
+                    // `running` and spawns the `pkexec` helper.
+                    setup.running = true;
+                }
+            });
+            let (status, color) = if setup.running {
+                ("running…".to_owned(), CYAN)
+            } else if setup.done {
+                ("done — full capabilities active".to_owned(), CYAN)
+            } else if let Some(failure) = &setup.failure {
+                (format!("failed: {failure}"), AMBER)
+            } else {
+                (
+                    "one click runs all the privileged setup — no re-login, no reboot".to_owned(),
+                    NA_GRAY,
+                )
+            };
+            ui.add(
+                egui::Label::new(egui::RichText::new(status.as_str()).weak().color(color))
+                    .wrap(true),
+            );
+        }
         for requirement in requirements.iter() {
             let _ = ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("!").color(AMBER));
@@ -223,9 +360,21 @@ pub fn render_requirements_strip(ui: &mut egui::Ui, requirements: &[Requirement]
     });
 }
 
+/// Render the `SETUP` requirements strip into `ui` (the pre-C21-04
+/// 3-arg entry — the app shell's current call site): the wizard
+/// renders in its idle state over a throwaway local outcome (a click
+/// there only flashes for a frame — no setup worker is wired yet).
+/// The app shell moves to [`render_requirements_strip_with_setup`] in
+/// C21-06 (its `AppState` owns the shared [`SetupOutcome`]).
+pub fn render_requirements_strip(ui: &mut egui::Ui, requirements: &[Requirement], open: &mut bool) {
+    let mut setup = SetupOutcome::default();
+    render_requirements_strip_with_setup(ui, requirements, open, &mut setup);
+}
+
 // ---------------------------------------------------------------------
-// Tests (headless: the five `diagnose` cases + the strip's `Got it`
-// over the settings.rs two-frame `ctx.run` idiom).
+// Tests (headless: the five `diagnose` cases, the setup wizard (the
+// frozen C21-01 argv + the `--with-dkms` decision + the button over
+// the settings.rs two-frame `ctx.run` idiom) + the strip's `Got it`).
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
@@ -489,6 +638,164 @@ mod tests {
         let _ = ctx.run(frame_input(vec![click(true), click(false)]), |ctx| {
             show_strip(ctx, &requirement, &mut open)
         });
+        assert!(!open, "a click on the Got-it button must close the strip");
+    }
+
+    /// (g) The frozen C21-01 helper argv: `--user <name>` always
+    /// (under `pkexec` the user must be explicit — `SUDO_USER` may be
+    /// unset), `--with-dkms` only on the AMD variant.
+    #[test]
+    fn setup_argv_contract() {
+        assert_eq!(
+            setup_argv(false, "alice"),
+            vec![
+                "/usr/bin/ramsleuth-setup".to_owned(),
+                "--user".to_owned(),
+                "alice".to_owned()
+            ]
+        );
+        assert_eq!(
+            setup_argv(true, "alice"),
+            vec![
+                "/usr/bin/ramsleuth-setup".to_owned(),
+                "--user".to_owned(),
+                "alice".to_owned(),
+                "--with-dkms".to_owned()
+            ]
+        );
+    }
+
+    /// (h) The `--with-dkms` decision reuses the GUI AMD detection
+    /// (the diagnosed requirements): the DKMS case (3) present → the
+    /// full setup; daemon/group-only → plain; empty → plain.
+    #[test]
+    fn setup_with_dkms_decision() {
+        assert!(!setup_with_dkms(&[]));
+        assert!(!setup_with_dkms(&[daemon_down_requirement("disconnected")]));
+        assert!(!setup_with_dkms(&[group_requirement()]));
+        assert!(setup_with_dkms(&[group_requirement(), dkms_requirement()]));
+    }
+
+    /// (i) The wizard over the two-frame `ctx.run` idiom: the primary
+    /// button paints (the AMD label when the DKMS requirement is
+    /// present), the click flips `SetupOutcome::running` (the render
+    /// thread's one permitted write — the status line paints
+    /// `running…` in the same frame), and `Got it` still closes the
+    /// strip (the wizard doesn't steal the existing affordance).
+    #[test]
+    fn first_run_setup_wizard_frames() {
+        let requirement = dkms_requirement(); // the AMD variant
+        let ctx = egui::Context::default();
+        let mut open = true;
+        let mut setup = SetupOutcome::default();
+        let frame_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(968.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        fn show_strip(
+            ctx: &egui::Context,
+            requirement: &Requirement,
+            open: &mut bool,
+            setup: &mut SetupOutcome,
+        ) {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_requirements_strip_with_setup(
+                    ui,
+                    std::slice::from_ref(requirement),
+                    open,
+                    setup,
+                );
+            });
+        }
+
+        // Frame 1: the layout — the AMD-labelled primary button + the
+        // idle status line paint; no click leaves the outcome idle.
+        let first = ctx.run(frame_input(Vec::new()), |ctx| {
+            show_strip(ctx, &requirement, &mut open, &mut setup)
+        });
+        assert!(
+            !setup.running && !setup.done && setup.failure.is_none(),
+            "no click leaves the outcome idle"
+        );
+        let texts: Vec<&str> = first
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&"Set up RamSleuth + AMD driver"),
+            "the AMD-labelled primary button must paint: {texts:?}"
+        );
+
+        // Frame 2: a click on the button's painted label flips
+        // `running` (the render thread does zero I/O) and the same
+        // frame paints `running…`.
+        let pos = first
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text)
+                    if text.galley.text() == "Set up RamSleuth + AMD driver" =>
+                {
+                    Some(egui::pos2(
+                        text.pos.x + text.galley.size().x / 2.0,
+                        text.pos.y + text.galley.size().y / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .expect("the setup button's label must be painted");
+        let click_at = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let second = ctx.run(
+            frame_input(vec![click_at(pos, true), click_at(pos, false)]),
+            |ctx| show_strip(ctx, &requirement, &mut open, &mut setup),
+        );
+        assert!(setup.running, "the button click must flip running");
+        let texts: Vec<&str> = second
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&"running…"),
+            "the status line must paint running…: {texts:?}"
+        );
+
+        // Frame 3: `Got it` still closes the strip.
+        let pos = second
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text)
+                    if text.galley.text() == "Got it — keep using RamSleuth" =>
+                {
+                    Some(egui::pos2(
+                        text.pos.x + text.galley.size().x / 2.0,
+                        text.pos.y + text.galley.size().y / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .expect("the Got-it button's label must be painted");
+        let _ = ctx.run(
+            frame_input(vec![click_at(pos, true), click_at(pos, false)]),
+            |ctx| show_strip(ctx, &requirement, &mut open, &mut setup),
+        );
         assert!(!open, "a click on the Got-it button must close the strip");
     }
 }
