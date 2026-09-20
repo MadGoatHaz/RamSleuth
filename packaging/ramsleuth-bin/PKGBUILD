@@ -17,6 +17,7 @@
 #   scripts/install-ryzen-smu-dkms.sh — the shared pinned DKMS helper
 #   install.sh                    — the self-contained transparency entrypoint
 #   LICENSE                       — MIT (AUR license-compliance install path)
+#   ramsleuth.desktop             — the application-menu entry
 #
 # sha256sums pins that exact asset. The v2.1.0 release is published (C19-08);
 # the sha256 below is the real hash of the release tarball, captured from
@@ -76,6 +77,10 @@ package() {
 
     # (6) the MIT license — the AUR license-compliance install path
     install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/ramsleuth-bin/LICENSE"
+
+    # (7) the application-menu entry — at the tarball top level
+    install -Dm644 "ramsleuth.desktop" \
+        "$pkgdir/usr/share/applications/ramsleuth.desktop"
 
     # NOTE: the ramsleuth group is created on the TARGET system by the .install
     # pre_install/pre_upgrade hooks (package() runs in the build env, not the target).
