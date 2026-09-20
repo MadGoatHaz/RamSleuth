@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=RamSleuth
+Comment=Pure-Rust RAM latency/bandwidth telemetry
+Exec=/usr/bin/ramsleuth
+Terminal=false
+Categories=System;Monitor;
