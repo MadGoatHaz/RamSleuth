@@ -18,11 +18,10 @@
 #   install.sh                    — the self-contained transparency entrypoint
 #   LICENSE                       — MIT (AUR license-compliance install path)
 #
-# sha256sums pins that exact asset. NOTE: the v2.1.0 release does not exist
-# yet — the tag is cut in C19-08. The sha256 below is a PLACEHOLDER (all
-# zeros): makepkg fails the checksum until it is finalized in C19-08b from
-# the published release .sha256. AUR requires a real sha256 (no SKIP), so
-# the placeholder MUST be replaced before submission (expected to fail now).
+# sha256sums pins that exact asset. The v2.1.0 release is published (C19-08);
+# the sha256 below is the real hash of the release tarball, captured from
+# the published release .sha256 asset (finalized in C19-08b). AUR requires a real
+# sha256 (no SKIP).
 #
 # Mutual conflict: ramsleuth (source) and ramsleuth-bin (precompiled)
 # install the identical file surface, so the user picks exactly one.
@@ -42,9 +41,8 @@ arch=(x86_64)
 url="https://github.com/MadGoatHaz/RamSleuth"
 license=(MIT)
 source=("https://github.com/MadGoatHaz/RamSleuth/releases/download/v$pkgver/ramsleuth-$pkgver-x86_64.tar.zst")
-# PLACEHOLDER — finalized in C19-08b from the published release .sha256 after the v2.1.0 tag is cut.
-# AUR requires a real sha256 (no SKIP): makepkg fails this checksum until then (expected).
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+# sha256 of the published v2.1.0 release tarball (captured from the release .sha256 asset; finalized in C19-08b).
+sha256sums=('d8db88fa4cafbb6e995713bdbd7dd7278043d558778d9d011f310c6fa3388b39')
 install=ramsleuth-bin.install
 conflicts=('ramsleuth')
 depends=(libx11 libxkbcommon wayland libxrandr libxi libxcursor libxinerama mesa)
