@@ -34,6 +34,7 @@
 #   - install.sh -> /usr/share/ramsleuth/install.sh (the self-contained transparency
 #     artifact — AUR users can re-run/audit the full flow post-install)
 #   - LICENSE -> /usr/share/licenses/ramsleuth/LICENSE (MIT compliance, AUR requirement)
+#   - the application-menu entry -> /usr/share/applications/ramsleuth.desktop
 #
 # No-panic contract: installation never fails on the absence of
 # the ryzen_smu module, AVX-512, or a display; after a bare install the
@@ -95,6 +96,10 @@ package() {
 
     # (6) the MIT license — the AUR license-compliance install path
     install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/ramsleuth/LICENSE"
+
+    # (7) the application-menu entry — shared asset next to the preset
+    install -Dm644 "packaging/ramsleuth-git/ramsleuth.desktop" \
+        "$pkgdir/usr/share/applications/ramsleuth.desktop"
 
     # NOTE: the ramsleuth group is created on the TARGET system by the .install
     # pre_install/pre_upgrade hooks (package() runs in the build env, not the target).
