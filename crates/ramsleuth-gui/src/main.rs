@@ -201,7 +201,11 @@ fn decode_icon_png(bytes: &[u8]) -> Option<egui::IconData> {
     }
     let mut rgba = vec![0u8; reader.output_buffer_size()];
     reader.next_frame(&mut rgba).ok()?;
-    Some(egui::IconData { rgba, width, height })
+    Some(egui::IconData {
+        rgba,
+        width,
+        height,
+    })
 }
 
 /// The app's window icon (C21-26): the embedded master — decoded
@@ -1495,13 +1499,9 @@ fn show_graphs_viewport(
     // startup); `None` (a decode failure) stays legal — eframe's
     // default icon (no-panic, D5).
     viewport.icon = icon.clone();
-    ctx.show_viewport_deferred(
-        graphs_viewport_id(),
-        viewport,
-        move |child_ctx, _class| {
-            run_graphs_child_frame(child_ctx, &shared, &flag);
-        },
-    );
+    ctx.show_viewport_deferred(graphs_viewport_id(), viewport, move |child_ctx, _class| {
+        run_graphs_child_frame(child_ctx, &shared, &flag);
+    });
 }
 
 /// The Graphs child viewport's frame body (C7-21, D-3): one
@@ -3137,15 +3137,18 @@ mod tests {
     #[test]
     fn window_icon_png_decode() {
         // A 3×2 RGBA PNG, one distinct pixel per cell.
-        let rgba: Vec<u8> =
-            (0..6).flat_map(|i| [i * 4 + 1, i * 4 + 2, i * 4 + 3, 255]).collect();
+        let rgba: Vec<u8> = (0..6)
+            .flat_map(|i| [i * 4 + 1, i * 4 + 2, i * 4 + 3, 255])
+            .collect();
         let mut png_bytes = Vec::new();
         {
             let mut encoder = png::Encoder::new(&mut png_bytes, 3, 2);
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
             let mut writer = encoder.write_header().expect("a valid header encodes");
-            writer.write_image_data(&rgba).expect("a valid RGBA8 frame encodes");
+            writer
+                .write_image_data(&rgba)
+                .expect("a valid RGBA8 frame encodes");
         }
         let icon = decode_icon_png(&png_bytes).expect("a valid RGBA8 PNG decodes");
         assert_eq!((icon.width, icon.height), (3, 2));
