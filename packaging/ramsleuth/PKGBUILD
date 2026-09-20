@@ -56,6 +56,7 @@ license=(MIT)
 # The "$pkgname::" rename extracts to $srcdir/ramsleuth (see header note above).
 source=("$pkgname::git+https://github.com/MadGoatHaz/RamSleuth.git#tag=v$pkgver")
 install=ramsleuth.install
+conflicts=('ramsleuth-bin')
 makedepends=(rust cargo pkgconf libx11 libxkbcommon wayland wayland-protocols libxrandr libxi libxcursor libxinerama mesa)
 depends=(libx11 libxkbcommon wayland libxrandr libxi libxcursor libxinerama mesa)
 
