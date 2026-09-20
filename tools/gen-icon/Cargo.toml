@@ -1,0 +1,16 @@
+[package]
+name = "ramsleuth-gen-icon"
+description = "RamSleuth application icon generator (hicolor PNG set + window-embed master)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The sole dependency is `png` 0.17 (locked at 0.17.16, rust-version 1.57) —
+# already in Cargo.lock via ramsleuth-gui (the snapshot_png encoder
+# precedent, style.rs L288–296). Zero new external packages: this chunk's
+# Cargo.lock delta is the local member entry only (plan §7.3 gate).
+png = "0.17"
