@@ -17,7 +17,8 @@ name: Release
 #       bin/ramsleuth-daemon, bin/ramsleuth-bench, bin/ramsleuth-telemetry,
 #       systemd/ramsleuth.service, systemd/ramsleuth.preset,
 #       scripts/install-ryzen-smu-dkms.sh, install.sh, LICENSE, ramsleuth.desktop,
-#       ramsleuth-setup.sh, 90-ramsleuth-setup.policy
+#       ramsleuth-setup.sh, 90-ramsleuth-setup.policy,
+#       assets/icons/ (the hicolor tree, 8 sizes — one artifact; C21-27)
 #
 # NOTE: this is a SEPARATE workflow from .github/workflows/ci.yml (which is
 # untouched). Determinism: fixed file order (tar --sort=name), fixed
@@ -106,10 +107,15 @@ jobs:
               missing=1
             fi
           done
+          if [ ! -d "assets/icons" ]; then
+            echo "::error::Missing release artifact: assets/icons"
+            missing=1
+          fi
           [ "$missing" -eq 0 ] || { echo "Refusing to publish: release artifacts missing"; exit 1; }
-          echo "All 14 release artifacts present (6 binaries + 8 auxiliary)"
-          # NOTE (C21-27): the assets/icons hicolor tree is staged next, bringing
-          # the release-artifact count to 15 (6 binaries + 9 auxiliary).
+          echo "All 15 release artifacts present (6 binaries + 9 auxiliary)"
+          # NOTE (C21-27): the assets/icons hicolor tree is staged into the
+          # tarball by the Stage step below; the release-artifact count is 15
+          # (6 binaries + 9 auxiliary — the tree counts as one artifact).
 
       - name: Stage artifacts
         run: |
@@ -125,6 +131,7 @@ jobs:
           cp install.sh "$S/"
           cp LICENSE "$S/"
           cp packaging/ramsleuth-git/ramsleuth.desktop "$S/"
+          cp -r assets/icons "$S/"
           cp scripts/ramsleuth-setup.sh "$S/"
           cp packaging/polkit/90-ramsleuth-setup.policy "$S/"
           chmod +x "$S/bin/"* "$S/scripts/"*.sh "$S/install.sh" "$S/ramsleuth-setup.sh"

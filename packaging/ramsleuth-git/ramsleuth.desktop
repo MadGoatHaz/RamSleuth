@@ -3,5 +3,6 @@ Type=Application
 Name=RamSleuth
 Comment=Pure-Rust RAM latency/bandwidth telemetry
 Exec=/usr/bin/ramsleuth
+Icon=ramsleuth
 Terminal=false
 Categories=System;Monitor;
