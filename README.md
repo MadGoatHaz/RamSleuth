@@ -87,16 +87,19 @@ git clone https://github.com/MadGoatHaz/RamSleuth && cd RamSleuth && ./install.s
 
 Interactive and visually sectioned; transparent — it prints every source, the exact commit being installed, and the pinned third-party source before doing anything; AUR-equivalent — the 6 binaries + the frozen daemon unit + the preset + the `ramsleuth` group to `/usr` via sudo; idempotent (a re-run after any failure is safe). It then **asks** about the `ryzen_smu` DKMS module (AMD hosts only) and walks you through the pinned shared helper; the app runs without it — the AMD section reads `N/A (DriverMissing)`.
 
-**AUR (Arch):**
+**AUR (Arch) — the two stable packages:**
 
 ```sh
-yay -S ramsleuth-git   # or: paru -S ramsleuth-git
+yay -S ramsleuth      # stable — builds from the official git tag (source)
+yay -S ramsleuth-bin  # precompiled binary from the GitHub Release — the fastest install
 ```
+
+(or `paru -S ramsleuth` / `paru -S ramsleuth-bin` in place of `yay`). The two install the same file set and **mutually conflict** — pick exactly one. The bleeding-edge dev option (the moving `v2-development` branch, for testing unreleased work) is `yay -S ramsleuth-git`; the optional AMD telemetry driver is the separate extra `yay -S ryzen-smu-dkms` (then `sudo ryzen-smu-dkms-install` — AMD hosts only; without it the AMD subtimings read `N/A (DriverMissing)`).
 
 **Manual (from a source checkout):**
 
 ```sh
-cd packaging/ramsleuth-git
+cd packaging/ramsleuth   # or: packaging/ramsleuth-bin / packaging/ramsleuth-git
 makepkg -si
 ```
 
@@ -122,9 +125,9 @@ Verify: `ls /sys/kernel/ryzen_smu_drv/pm_table`. The module ships a `monitor_cpu
 
 The install path is auditable end to end:
 
-- **Own code only in the build.** The `ramsleuth-git` AUR package and `./install.sh` compile **only this repository** — branch-pinned, `cargo build --locked`, no third-party code in a build chroot, no `sha256sums` needed.
+- **Own code only in the build.** The `ramsleuth` and `ramsleuth-git` AUR packages and `./install.sh` compile **only this repository** — tag-/branch-pinned, `cargo build --locked`, no third-party code in a build chroot, no `sha256sums` needed. `ramsleuth-bin` compiles nothing: it downloads the release binary tarball, pinned by `sha256`.
 - **The only third-party source** is the optional AMD `ryzen_smu` kernel module, **pinned to commit `d2983668300dd2a598e5a7dc40e71ce0678cc270` of `amkillam/ryzen_smu`** (verified 2026-08-15, "Fix cpuid include on 7.2+ kernels (#53)"). The bundled helper fetches, shows, checksums, and confirms it **on the target** (never in a build chroot), and the staged source stays inspectable at `/usr/src/ryzen_smu-1.d298366`.
-- **No dependency on any third-party AUR package.** The `ryzen-smu-dkms` extra is optional and co-install-safe (it ships the same helper under a different filename, so the two packages never conflict).
+- **No dependency on any third-party AUR package.** The `ryzen-smu-dkms` extra is optional and co-install-safe (it ships the same helper under a different filename, so it never conflicts with the RamSleuth packages).
 - **Every installed file is byte-identical to a file in this repository** (auditable via `git show`): the helper ships as `/usr/bin/ramsleuth-install-ryzen-smu-dkms` (from `ramsleuth-git`) and `/usr/bin/ryzen-smu-dkms-install` (from the extra), and `install.sh` ships as `/usr/share/ramsleuth/install.sh`, so the whole flow can be re-run and audited post-install.
 
 ## Testing
@@ -147,7 +150,7 @@ RamSleuth/
 │   ├── ramsleuth-tui/         # ratatui terminal dashboard
 │   └── ramsleuth-gui/         # egui/eframe desktop dashboard
 ├── systemd/ramsleuth.service  # sandboxed daemon unit (CAP_SYS_RAWIO only)
-├── packaging/                 # ramsleuth-git AUR package + ryzen-smu-dkms extra
+├── packaging/                 # the 3-tier AUR packages (ramsleuth, ramsleuth-bin, ramsleuth-git) + the ryzen-smu-dkms extra
 ├── install.sh                 # self-contained installer (the GitHub path — AUR-parity)
 ├── scripts/                   # install-ryzen-smu-dkms.sh, amd-ground-truth.sh
 └── .github/workflows/ci.yml   # MSRV × stable test matrix + release build
