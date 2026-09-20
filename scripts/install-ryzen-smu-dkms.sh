@@ -11,6 +11,20 @@
 # the operator's sudo prompt appears there). Safe to re-run: every step is
 # guarded; any failure prints a clear message + exits non-zero, never leaving
 # DKMS in a silent half-state. Never touches ramsleuth state.
+#
+# Source resolution order (C21-08, vendor-first):
+#   1. RYZEN_SMU_URL / RYZEN_SMU_PIN env overrides — honored by the git
+#      path (an override selects a specific upstream commit; the vendor,
+#      which carries only the default pin, is then skipped).
+#   2. Local vendored source (offline, zero network): the repo's
+#      packaging/ryzen-smu-dkms/vendor/ryzen-smu (dev checkout) or the
+#      installed /usr/share/ryzen-smu-dkms/vendor/ryzen-smu (C21-09) — every
+#      file verified against vendor/SUMS.sha256 before staging; a mismatch
+#      dies (no silent fallback).
+#   3. Pinned git clone (the unchanged fallback when no vendor tree is
+#      present, e.g. the ramsleuth-bin tarball install) —
+#      RYZEN_SMU_FORCE_REMOTE=1 forces this path even when a vendor tree
+#      is present.
 
 set -euo pipefail
 
@@ -54,6 +68,22 @@ resolve_dkms_conf() {
   return 1
 }
 
+# Vendor-source resolution (C21-07/C21-08, offline): first EXISTING of the
+# repo-relative vendored tree (dev checkout — the script's real path is
+# canonicalized via readlink, so a symlinked invocation resolves to the repo
+# it points into) or the installed /usr/share copy (the ryzen-smu-dkms
+# package, C21-09). Prints the chosen dir; fails if neither exists.
+resolve_vendor_src() {
+  local real dir c
+  real="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+  dir="$(cd -- "$(dirname -- "${real}")/.." 2>/dev/null && pwd)"
+  for c in "${dir}/packaging/ryzen-smu-dkms/vendor/ryzen-smu" \
+           "/usr/share/ryzen-smu-dkms/vendor/ryzen-smu"; do
+    if [[ -d "${c}" ]]; then printf '%s\n' "${c}"; return 0; fi
+  done
+  return 1
+}
+
 # --- Idempotent fast path ------------------------------------------------------
 # Already loaded (re-run, or AUTOINSTALL=yes rebuilt after a kernel update).
 # Canonical ryzen_smu_drv path first, legacy ryzen_smu path as fallback.
@@ -88,37 +118,65 @@ log "Kernel build tree OK: /lib/modules/${KERNEL}/build"
 # short pin, so the operator sees exactly which commit will be built.
 log "Upstream: ${UPSTREAM_URL}"
 log "Pinned commit: ${UPSTREAM_PIN} (short: ${UPSTREAM_PIN:0:7}) — never branch HEAD"
-if [[ -d "${SRC_DIR}/.git" ]]; then
-  # Existing tree: skip the fetch when already at the pin (idempotent +
-  # offline-tolerant), else fetch + checkout the pin.
-  if [[ "$(git -C "${SRC_DIR}" rev-parse HEAD)" == "${UPSTREAM_PIN}" ]]; then
-    log "Source tree already at the pinned commit — skipping fetch"
+# Vendor-first (C21-07/08, offline): a local, SUMS-verified vendored source
+# replaces the network fetch when (a) a vendor tree is present, (b) no
+# RYZEN_SMU_PIN override is set (an override selects a specific upstream
+# commit — only the git path can build it), and (c) RYZEN_SMU_FORCE_REMOTE
+# is not 1 (the escape that keeps the git path reachable).
+VENDOR_SRC="$(resolve_vendor_src || true)"
+USE_VENDOR=0
+if [[ -n "${VENDOR_SRC}" ]]; then
+  if [[ "${RYZEN_SMU_FORCE_REMOTE:-0}" == "1" ]]; then
+    log "RYZEN_SMU_FORCE_REMOTE=1 — using the git path (the vendored source at ${VENDOR_SRC} is ignored)"
+  elif [[ -n "${RYZEN_SMU_PIN:-}" ]]; then
+    log "RYZEN_SMU_PIN override set — using the git path (the vendor carries only the default pin)"
   else
+    USE_VENDOR=1
+    SRC_DIR="${VENDOR_SRC}"
+    PKGVER="1.${UPSTREAM_PIN:0:7}"    # fixed version — no git rev-list on the vendor path
+    log "Vendored source (offline, no network fetch): ${SRC_DIR}"
+    log "Pinned commit: ${UPSTREAM_PIN} (short: ${UPSTREAM_PIN:0:7}) — vendored copy (no git metadata)"
+    SUMS_FILE="$(dirname -- "${SRC_DIR}")/SUMS.sha256"
+    [[ -f "${SUMS_FILE}" ]] \
+      || die "vendor tree found at ${SRC_DIR} but its ${SUMS_FILE} manifest is missing — refusing to build from unverified source"
+    (cd -- "$(dirname -- "${SRC_DIR}")" && sha256sum -c --quiet SUMS.sha256) \
+      || die "vendor source verification FAILED (${SUMS_FILE} mismatch) — no silent fallback: restore the vendored files (C21-07) or set RYZEN_SMU_FORCE_REMOTE=1 for the git path"
+    log "Vendor source verified against SUMS.sha256 (offline provenance OK)"
+  fi
+fi
+if [[ "${USE_VENDOR}" -eq 0 ]]; then
+  if [[ -d "${SRC_DIR}/.git" ]]; then
+    # Existing tree: skip the fetch when already at the pin (idempotent +
+    # offline-tolerant), else fetch + checkout the pin.
+    if [[ "$(git -C "${SRC_DIR}" rev-parse HEAD)" == "${UPSTREAM_PIN}" ]]; then
+      log "Source tree already at the pinned commit — skipping fetch"
+    else
+      git -C "${SRC_DIR}" fetch --depth 1 origin "${UPSTREAM_PIN}" \
+        || die "git fetch of pinned commit ${UPSTREAM_PIN:0:7} from ${UPSTREAM_URL} failed — verify the network (and that the pin still exists upstream) and retry"
+      git -C "${SRC_DIR}" checkout -q "${UPSTREAM_PIN}" \
+        || die "git checkout of pinned commit ${UPSTREAM_PIN:0:7} failed — inspect ${SRC_DIR} and retry"
+    fi
+  else
+    # Fresh shallow clone, then fetch + checkout the pinned commit; wipe a
+    # stale non-git dir of unknown provenance first.
+    rm -rf "${SRC_DIR}"
+    git clone --depth 1 "${UPSTREAM_URL}" "${SRC_DIR}" \
+      || die "git clone of ${UPSTREAM_URL} failed — verify the URL (and network) and retry"
     git -C "${SRC_DIR}" fetch --depth 1 origin "${UPSTREAM_PIN}" \
-      || die "git fetch of pinned commit ${UPSTREAM_PIN:0:7} from ${UPSTREAM_URL} failed — verify the network (and that the pin still exists upstream) and retry"
+      || die "git fetch of pinned commit ${UPSTREAM_PIN:0:7} failed — verify the pin still exists upstream (fix: a one-line RYZEN_SMU_PIN re-pin) and retry"
     git -C "${SRC_DIR}" checkout -q "${UPSTREAM_PIN}" \
       || die "git checkout of pinned commit ${UPSTREAM_PIN:0:7} failed — inspect ${SRC_DIR} and retry"
   fi
-else
-  # Fresh shallow clone, then fetch + checkout the pinned commit; wipe a
-  # stale non-git dir of unknown provenance first.
-  rm -rf "${SRC_DIR}"
-  git clone --depth 1 "${UPSTREAM_URL}" "${SRC_DIR}" \
-    || die "git clone of ${UPSTREAM_URL} failed — verify the URL (and network) and retry"
-  git -C "${SRC_DIR}" fetch --depth 1 origin "${UPSTREAM_PIN}" \
-    || die "git fetch of pinned commit ${UPSTREAM_PIN:0:7} failed — verify the pin still exists upstream (fix: a one-line RYZEN_SMU_PIN re-pin) and retry"
-  git -C "${SRC_DIR}" checkout -q "${UPSTREAM_PIN}" \
-    || die "git checkout of pinned commit ${UPSTREAM_PIN:0:7} failed — inspect ${SRC_DIR} and retry"
+  # Hard verify (the anti-contamination core): the tree must be exactly at the
+  # pin — no silent branch-HEAD fallback. If upstream deleted/force-pushed the
+  # commit, the fetch above dies; the fix is a one-line RYZEN_SMU_PIN re-pin.
+  [[ "$(git -C "${SRC_DIR}" rev-parse HEAD)" == "${UPSTREAM_PIN}" ]] \
+    || die "pinned source check failed (no silent branch-HEAD fallback)"
+  log "Pinned source: $(git -C "${SRC_DIR}" log -1 --format='%h  %ad  %an  %s' --date=short)"
 fi
-# Hard verify (the anti-contamination core): the tree must be exactly at the
-# pin — no silent branch-HEAD fallback. If upstream deleted/force-pushed the
-# commit, the fetch above dies; the fix is a one-line RYZEN_SMU_PIN re-pin.
-[[ "$(git -C "${SRC_DIR}" rev-parse HEAD)" == "${UPSTREAM_PIN}" ]] \
-  || die "pinned source check failed (no silent branch-HEAD fallback)"
-# Provenance AFTER the pinned fetch (auditable): the exact commit + the
+# Provenance AFTER the source resolution (auditable, both paths): the
 # sha256sum fingerprint of the six files that get staged (the staged copies
 # land verbatim in ${STAGE_DIR}).
-log "Pinned source: $(git -C "${SRC_DIR}" log -1 --format='%h  %ad  %an  %s' --date=short)"
 for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
   if [[ -f "${SRC_DIR}/${f}" ]]; then
     sha256sum "${SRC_DIR}/${f}"
@@ -132,8 +190,11 @@ done
 # /usr/src/<module>-<version>/ containing a dkms.conf; the original script
 # cloned to $SRC_DIR and never staged it -> "Arguments <module> and
 # <module-version> are not specified". Flow follows the working AUR
-# ryzen_smu-dkms-git PKGBUILD (pkgver = rev-count . short-hash).
-PKGVER="$(cd -- "${SRC_DIR}" && printf '%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)")"
+# ryzen_smu-dkms-git PKGBUILD (pkgver = rev-count . short-hash; the vendor
+# path above uses the fixed 1.<short> — no git rev-list).
+if [[ "${USE_VENDOR}" -eq 0 ]]; then
+  PKGVER="$(cd -- "${SRC_DIR}" && printf '%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)")"
+fi
 STAGE_DIR="/usr/src/${MODULE}-${PKGVER}"
 install -d "${STAGE_DIR}"
 for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
