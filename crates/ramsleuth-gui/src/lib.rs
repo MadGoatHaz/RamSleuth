@@ -53,13 +53,17 @@
 //! - `first_run` — C18 — the first-run/SETUP requirements strip
 //!   (D-18.5): [`first_run::diagnose`] (the pure, headless-testable
 //!   daemon / group / pinned-`ryzen_smu` builder) +
-//!   [`first_run::render_requirements_strip`] (copy + "Got it"; no-panic).
+//!   [`first_run::render_requirements_strip`] (copy + "Got it"; no-panic)
+//!   + the C21-04 one-click setup wizard ([`first_run::setup_argv`],
+//!     [`first_run::SetupOutcome`], [`first_run::setup_with_dkms`],
+//!     [`first_run::DKMS_INSTALL_CMD`],
+//!     [`first_run::render_requirements_strip_with_setup`]).
 //!
 //! (The eframe app shell in `main.rs` lands in P3-30.)
 
 pub mod bench_zone;
-pub mod graph;
 pub mod first_run;
+pub mod graph;
 pub mod history;
 pub mod settings;
 pub mod status_zone;
@@ -71,7 +75,9 @@ pub mod update;
 // (workspace re-export style) — P3-26…P3-30 consume the palette,
 // `build_style`, and the F2/F3 export helpers from here. `GuiError`
 // rides along (the `ClientError` precedent) for the app shell's toasts.
-pub use style::{build_style, export_json, snapshot_png, GuiError, AMBER, CRIMSON, CYAN, NA_GRAY, SLATE};
+pub use style::{
+    build_style, export_json, snapshot_png, GuiError, AMBER, CRIMSON, CYAN, NA_GRAY, SLATE,
+};
 
 // P3-26: the shared update state + the background poller, re-exported
 // at the root (workspace re-export style) — the app shell (P3-30)
@@ -87,7 +93,7 @@ pub use style::{build_style, export_json, snapshot_png, GuiError, AMBER, CRIMSON
 // and C7-21's child viewport renders `render_graphs_window` over the
 // shared state (a pure reader, D6).
 pub use graph::{
-    record_graph_sample, read_cpu_temp_c, render_graphs_window, GraphSample, GraphState,
+    read_cpu_temp_c, record_graph_sample, render_graphs_window, GraphSample, GraphState,
     GRAPH_CAPACITY,
 };
 
@@ -135,5 +141,11 @@ pub use settings::{
 // the root (workspace re-export style) — the app shell (C18-02) runs
 // `diagnose` over the shared `TelemetryData` snapshot and renders the
 // strip between the header and the settings strip (auto-shown on first
-// launch, presence-driven, no-panic).
-pub use first_run::{diagnose, render_requirements_strip, Requirement, RYZEN_SMU_PIN_SHORT};
+// launch, presence-driven, no-panic). The C21-04 one-click setup
+// wizard symbols ride along for the C21-06 app-shell worker (the
+// detached `pkexec` spawn over `setup_argv` + the AppState-owned
+// `SetupOutcome`).
+pub use first_run::{
+    diagnose, render_requirements_strip, render_requirements_strip_with_setup, setup_argv,
+    setup_with_dkms, Requirement, SetupOutcome, DKMS_INSTALL_CMD, RYZEN_SMU_PIN_SHORT,
+};
