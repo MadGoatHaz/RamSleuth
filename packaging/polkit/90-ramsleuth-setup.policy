@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig-dtd.txt">
+<policyconfig>
+
+  <!--
+    RamSleuth — polkit policy for the one-click privileged setup helper.
+
+    Purpose: make `pkexec ramsleuth-setup` (invoked by the in-app "Set up
+    RamSleuth" wizard — plan C21-04/C21-06) prompt the active local user for
+    a password and then run /usr/bin/ramsleuth-setup as root, in a single
+    polkit action. That is what lets the GUI do its whole privileged
+    one-shot (daemon enable+start, group join, socket ACL grant, and on AMD
+    the offline DKMS build + modprobe) with one clean auth_admin prompt.
+    This file is the in-repo source of truth / shared asset for the helper
+    itself (scripts/ramsleuth-setup.sh, chunk C21-01).
+
+    Installation: NOT installed here. The packaging chunks copy this file to
+    /usr/share/polkit-1/actions/90-ramsleuth-setup.policy:
+      - C21-10  packaging/ramsleuth-git/PKGBUILD
+      - C21-12  packaging/ramsleuth/PKGBUILD
+      - C21-14  packaging/ramsleuth-bin/PKGBUILD (from the release tarball)
+      - C21-16  install.sh (the self-contained manual installer)
+    polkit is in the Arch `base` group, so the loader is present on every
+    stock system (plan §6 risk 1).
+
+    Results: auth_admin for any/active/inactive/other — admin (password)
+    auth for the invoking local user, as the plan specifies.
+
+    License: MIT (see the repo root LICENSE).
+  -->
+
+  <vendor>MadGoatHaz</vendor>
+  <vendor_url type="href">https://github.com/MadGoatHaz/RamSleuth</vendor_url>
+  <icon_name>ramsleuth</icon_name>
+
+  <action id="org.freedesktop.ramsleuth.setup">
+    <description>Run the RamSleuth one-click privileged setup</description>
+    <message>Authentication is required to set up RamSleuth for this user. This enables and starts the RamSleuth daemon, grants your user access to its socket (so the app works immediately, without re-logging in), and — on AMD systems — builds and loads the ryzen_smu telemetry driver.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_active>auth_admin</allow_active>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_other>auth_admin</allow_other>
+    </defaults>
+    <!-- Map pkexec to the installed helper: /usr/bin/ramsleuth-setup, any args -->
+    <annotate>
+      <key>org.freedesktop.policykit.exec.path</key>
+      <value>/usr/bin/ramsleuth-setup</value>
+    </annotate>
+    <annotate>
+      <key>org.freedesktop.policykit.exec.arguments</key>
+      <value></value>
+    </annotate>
+  </action>
+
+</policyconfig>
