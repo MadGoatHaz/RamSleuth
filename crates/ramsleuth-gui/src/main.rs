@@ -57,7 +57,9 @@
 //!   no I/O). The status zone's [`GuiAction`] is the one side effect
 //!   the render loop performs: F2 / F3 run [`perform_export`] (a
 //!   one-shot file write) and Q sets the stop flag + closes the
-//!   viewport.
+//!   viewport. The one-click setup's `running` edge (the wizard
+//!   button, C21-06) detaches the `pkexec` worker the same way —
+//!   the spawn + the helper run are entirely off the render thread.
 //!
 //! **No-panic contract (plan D5):** a missing daemon never crashes the
 //! GUI — the poller records the friendly error in the state (the
@@ -95,7 +97,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
@@ -103,10 +105,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ramsleuth_gui::{
-    build_style, diagnose, export_json, format_capacity, format_clock, render_bench_zone,
-    render_graphs_window, render_requirements_strip, render_settings_panel,
-    render_status_zone, render_telemetry_zone, snapshot_png, spawn_poller, BenchCmd,
-    GuiAction, GuiError, GuiSettings, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
+    build_style, diagnose, export_json,
+    first_run::{render_requirements_strip_with_setup, setup_argv, setup_with_dkms, SetupOutcome},
+    format_capacity, format_clock, render_bench_zone, render_graphs_window, render_settings_panel,
+    render_status_zone, render_telemetry_zone, snapshot_png, spawn_poller, BenchCmd, GuiAction,
+    GuiError, GuiSettings, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
@@ -353,8 +356,8 @@ fn notice_color(text: &str) -> egui::Color32 {
 
 /// The eframe app (P3-30): the shared state, the poller's command
 /// channel, the stop / cancel flags, the settings-panel visibility,
-/// the export dir, the poller thread, and the transient header
-/// notice.
+/// the one-click setup outcome (C21-06), the export dir, the poller
+/// thread, and the transient header notice.
 struct RamSleuthApp {
     /// The shared presentation state — includes the in-memory
     /// `GuiSettings` knobs (C6-26 / C6-27 / C6-30: the poll cadence +
@@ -384,6 +387,13 @@ struct RamSleuthApp {
     /// "Got it" both write it — the render thread's one-permitted
     /// write class, no I/O, D6.
     requirements_open: bool,
+    /// The one-click setup outcome (C21-06): shared between the
+    /// render thread (the wizard button's one permitted write —
+    /// flipping `running`, no I/O, D6) and the detached `pkexec`
+    /// worker (which clears `running` and sets `done` / `failure` —
+    /// a brief per-mutation lock hand-off, never held across the
+    /// spawn, C14-03).
+    setup: Arc<RwLock<SetupOutcome>>,
     /// Whether the Graphs window (C7-21, D-3 — the eframe deferred
     /// child viewport) is open: while set, `update` re-registers
     /// the viewport every frame (the keep-alive — egui GCs a child
@@ -502,6 +512,12 @@ impl eframe::App for RamSleuthApp {
                 self.render_requirements_area(ctx);
             }
         }
+        // The one-click setup worker (C21-06): the wizard button's
+        // click (the render thread's one permitted write, D6) flips
+        // `setup.running`; this per-tick hand-off consumes the edge
+        // (a brief lock, C14-03 — never held across the spawn) and
+        // detaches the `pkexec` worker.
+        self.maybe_spawn_setup_worker();
         if self.settings_open {
             self.render_settings_area(ctx);
         }
@@ -1099,19 +1115,21 @@ impl RamSleuthApp {
             });
     }
 
-    /// The SETUP requirements strip (C18, D-18.5): shown below the
-    /// header (above the settings strip while both are open — the
-    /// per-frame allocation order: header, requirements, settings,
-    /// central) while `requirements_open` — presence-driven: the
-    /// caller allocates it only while [`diagnose`] reports a
-    /// requirement, so it disappears on its own once the daemon
-    /// connects / the driver loads (and the header's `Setup` toggle
-    /// re-opens it any time). The strip's "Got it" writes
-    /// `requirements_open` (the render thread's one-permitted-write
-    /// class, no I/O, D6); its `Copy` buttons touch only the
-    /// clipboard (D-18.5, risk (a)). No-panic: a daemon-less
-    /// snapshot yields at most the single daemon requirement
-    /// (plan D5).
+    /// The SETUP requirements strip (C18, D-18.5 + the C21-06
+    /// one-click setup wizard): shown below the header (above the
+    /// settings strip while both are open — the per-frame
+    /// allocation order: header, requirements, settings, central)
+    /// while `requirements_open` — presence-driven: the caller
+    /// allocates it only while [`diagnose`] reports a requirement,
+    /// so it disappears on its own once the daemon connects / the
+    /// driver loads (and the header's `Setup` toggle re-opens it
+    /// any time). The strip's "Got it" writes `requirements_open`
+    /// (the render thread's one-permitted-write class, no I/O,
+    /// D6); its `Copy` buttons touch only the clipboard (D-18.5,
+    /// risk (a)); the wizard's `Set up RamSleuth` click flips
+    /// `setup.running` (the detached worker consumes the edge per
+    /// tick, C21-06). No-panic: a daemon-less snapshot yields at
+    /// most the single daemon requirement (plan D5).
     fn render_requirements_area(&mut self, ctx: &egui::Context) {
         // One brief read snapshot (no I/O, D6) drives the strip.
         let requirements = {
@@ -1125,8 +1143,61 @@ impl RamSleuthApp {
                     .stroke(egui::Stroke::new(1.0_f32, HEADER_STROKE)),
             )
             .show(ctx, |ui| {
-                render_requirements_strip(ui, &requirements, &mut self.requirements_open);
+                // A brief per-frame write (the C14-03 pattern — the
+                // guard drops at the end of the closure, never held
+                // across I/O): the wizard's click flips `running`,
+                // the worker's terminal state is painted here.
+                let mut setup = self.setup.write().unwrap();
+                render_requirements_strip_with_setup(
+                    ui,
+                    &requirements,
+                    &mut self.requirements_open,
+                    &mut setup,
+                );
             });
+    }
+
+    /// The one-click setup worker's per-tick hand-off (C21-06): the
+    /// wizard button's click (the render thread's one permitted
+    /// write — no I/O, D6) flips `setup.running`; when this tick
+    /// observes the edge, a brief write-lock block (released before
+    /// the spawn — never held across it, C14-03) consumes it,
+    /// gathers the worker's inputs (the `--with-dkms` decision from
+    /// the diagnosed requirements + the current user, explicit
+    /// under `pkexec` — `SUDO_USER` may be unset, the C21-01
+    /// contract), and detaches [`spawn_setup_worker`]. An
+    /// unresolvable user degrades to the `failure` state with the
+    /// manual `sudo` pointer (no-panic, plan D5 / risk 1).
+    fn maybe_spawn_setup_worker(&mut self) {
+        // The common case: no edge — one brief read, no spawn.
+        if !self.setup.read().unwrap().running {
+            return;
+        }
+        // Consume the edge + gather the inputs (a brief write, the
+        // C14-03 pattern — released before the spawn below).
+        let (with_dkms, user) = {
+            let mut setup = self.setup.write().unwrap();
+            setup.running = false;
+            let requirements = {
+                let data = self.state.read().unwrap();
+                diagnose(&data)
+            };
+            (setup_with_dkms(&requirements), current_user())
+        };
+        match user {
+            Some(user) => spawn_setup_worker(Arc::clone(&self.setup), with_dkms, user),
+            None => {
+                // The mandatory `--user` value is unresolvable here:
+                // degrade to the manual floor (plan risk 1).
+                let mut setup = self.setup.write().unwrap();
+                setup.done = false;
+                setup.failure = Some(
+                    "cannot resolve the current user for the setup helper — run \
+                     `sudo ramsleuth-setup --user <you>` in a terminal"
+                        .to_owned(),
+                );
+            }
+        }
     }
 
     /// Execute the status zone's [`GuiAction`] — the one side effect
@@ -1181,6 +1252,131 @@ impl RamSleuthApp {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// The one-click setup worker (C21-06 — the GUI face of the frozen
+// C21-01 helper contract): the wizard button's `running` edge
+// detaches a `pkexec` run of `ramsleuth-setup` (no shell — the argv
+// is [`setup_argv`]'s fixed vector; the mandatory `--user` is the
+// GUI's current user, explicit — under `pkexec` `SUDO_USER` may
+// be unset) entirely off the render thread (D6); the outcome lands
+// in the shared [`SetupOutcome`] with one brief write-lock hand-off
+// (C14-03), and every fallible step degrades to the `failure` state
+// (no-panic, plan D5 — risk 1: polkit is the GUI's convenience,
+// `sudo` is the floor).
+// ---------------------------------------------------------------------
+
+/// The current user's name for the helper's mandatory `--user`
+/// (the C21-01 contract: under `pkexec` `SUDO_USER` may be unset,
+/// so the GUI passes it explicitly): `$USER`, else `$LOGNAME`;
+/// `None` (an env with neither set) degrades to the manual `sudo`
+/// pointer (no-panic, plan risk 1).
+fn current_user() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .filter(|user| !user.is_empty())
+        .or_else(|| {
+            std::env::var("LOGNAME")
+                .ok()
+                .filter(|user| !user.is_empty())
+        })
+}
+
+/// The manual `sudo` equivalent of the one click (plan risk 1:
+/// polkit is the GUI's convenience, `sudo` is the floor — the
+/// wizard's `failure` state points at it when `pkexec` is absent or
+/// the spawn fails): pure, zero I/O.
+fn sudo_setup_command(user: &str, with_dkms: bool) -> String {
+    if with_dkms {
+        format!("sudo ramsleuth-setup --user {user} --with-dkms")
+    } else {
+        format!("sudo ramsleuth-setup --user {user}")
+    }
+}
+
+/// The stderr tail for the `failed:` status line (the frozen C21-01
+/// contract: a hard failure prints the structured
+/// `[ramsleuth-setup] ERROR:` line on stderr): the last such line,
+/// else the last non-empty stderr line, else the generic manual
+/// pointer (plan risk 1). Pure, zero I/O.
+fn setup_stderr_tail(stderr: &str) -> String {
+    const ERROR_MARKER: &str = "[ramsleuth-setup] ERROR:";
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    lines
+        .iter()
+        .rev()
+        .find(|line| line.contains(ERROR_MARKER))
+        .map(|line| (*line).trim().to_owned())
+        .or_else(|| lines.last().map(|line| (*line).trim().to_owned()))
+        .unwrap_or_else(|| {
+            "the setup helper failed — run `sudo ramsleuth-setup --user <you>` in a terminal"
+                .to_owned()
+        })
+}
+
+/// Map the helper's exit code into the [`SetupOutcome`] the status
+/// line renders (the frozen C21-01 contract: 0 = success/no-op,
+/// 1 = hard failure with the [`setup_stderr_tail`], 2 = usage —
+/// should not happen via the GUI; any other value, including the
+/// worker's `-1` for a signal-killed helper, is a hard failure
+/// too): pure, zero I/O — the worker is its only caller.
+fn map_setup_exit(code: i32, stderr: &str) -> SetupOutcome {
+    let failure = match code {
+        0 => None,
+        2 => Some(
+            "the setup helper rejected its arguments (usage, exit 2 — this should \
+                 not happen via the GUI) — run `sudo ramsleuth-setup --user <you>` in a \
+                 terminal"
+                .to_owned(),
+        ),
+        // Exit 1 (and any other non-zero code, incl. `-1`): the
+        // structured stderr tail.
+        _ => Some(setup_stderr_tail(stderr)),
+    };
+    SetupOutcome {
+        running: false,
+        done: code == 0,
+        failure,
+    }
+}
+
+/// The detached setup worker (C21-06; the [`spawn_poller`]'s
+/// `thread::spawn` precedent): runs the frozen C21-01 helper under
+/// `pkexec` entirely off the render thread, then maps the result
+/// into the shared [`SetupOutcome`] with one brief write-lock
+/// hand-off (C14-03 — no lock is held across the spawn: the
+/// `pkexec` run is the whole job, and it may take minutes on the
+/// AMD DKMS build). No-panic (plan D5): a spawn failure (a missing
+/// `pkexec` — plan risk 1: polkit is the GUI's convenience,
+/// `sudo` is the floor) degrades to the `failure` state pointing at
+/// the manual `sudo ramsleuth-setup` command.
+fn spawn_setup_worker(setup: Arc<RwLock<SetupOutcome>>, with_dkms: bool, user: String) {
+    std::thread::spawn(move || {
+        let argv = setup_argv(with_dkms, &user);
+        let outcome = match Command::new("pkexec").args(&argv).output() {
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                map_setup_exit(output.status.code().unwrap_or(-1), &stderr)
+            }
+            Err(error) => SetupOutcome {
+                running: false,
+                done: false,
+                failure: Some(format!(
+                    "`pkexec` could not run the setup helper ({error}) — run `{}` \
+                     manually (sudo is the floor, plan risk 1)",
+                    sudo_setup_command(&user, with_dkms)
+                )),
+            },
+        };
+        // The one brief write-lock hand-off (the sanctioned D6
+        // idiom — held only for the assignment, never across the
+        // spawn).
+        *setup.write().unwrap() = outcome;
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -1347,6 +1543,12 @@ fn main() -> ExitCode {
     // button — both write it, the root's per-frame re-registration
     // reads it (the keep-alive).
     let graphs_open = Arc::new(AtomicBool::new(false));
+    // The one-click setup outcome (C21-06): the wizard button's
+    // `running` flip (the render thread's one permitted write, D6)
+    // is consumed per tick by the app, which detaches the `pkexec`
+    // worker (its `done` / `failure` land back here — brief locks
+    // only, C14-03).
+    let setup = Arc::new(RwLock::new(SetupOutcome::default()));
     // Exports land in $HOME (fall back to the CWD if it is unset).
     let out_dir = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -1383,6 +1585,7 @@ fn main() -> ExitCode {
                 cancel,
                 settings_open: false,
                 requirements_open: true,
+                setup,
                 graphs_open,
                 saved_refresh: None,
                 last_graphs_open: false,
@@ -2576,6 +2779,7 @@ mod tests {
                 cancel: Arc::new(AtomicBool::new(false)),
                 settings_open: false,
                 requirements_open: false,
+                setup: Arc::new(RwLock::new(SetupOutcome::default())),
                 graphs_open: Arc::new(AtomicBool::new(false)),
                 saved_refresh: None,
                 last_graphs_open: false,
@@ -2643,6 +2847,7 @@ mod tests {
                 cancel: Arc::new(AtomicBool::new(false)),
                 settings_open: false,
                 requirements_open: false,
+                setup: Arc::new(RwLock::new(SetupOutcome::default())),
                 graphs_open: Arc::new(AtomicBool::new(false)),
                 saved_refresh: None,
                 last_graphs_open: false,
@@ -2766,5 +2971,85 @@ mod tests {
             }
         }
         fs::remove_dir_all(&out_dir).expect("cleanup");
+    }
+
+    /// (s1) The exit-code → [`SetupOutcome`] mapping (the frozen
+    /// C21-01 contract, headless): exit 0 = done with no failure;
+    /// exit 1 = the structured `[ramsleuth-setup] ERROR:` tail (the
+    /// last such line wins, else the last non-empty line, else the
+    /// generic `sudo` pointer); exit 2 = the usage note; a signal
+    /// death (the worker's `-1`) degrades to the tail — no panic.
+    #[test]
+    fn setup_exit_code_maps_to_the_outcome() {
+        // Exit 0: success / no-op.
+        let outcome = map_setup_exit(0, "");
+        assert!(
+            !outcome.running,
+            "the worker's terminal state clears running"
+        );
+        assert!(outcome.done, "exit 0 must set done");
+        assert!(outcome.failure.is_none(), "exit 0 must carry no failure");
+
+        // Exit 1: the structured ERROR line (the last one wins).
+        let stderr = "step 1: daemon enabled\n[ramsleuth-setup] ERROR: usermod failed (exit 3)\n\
+                      [ramsleuth-setup] ERROR: step 4 failed";
+        let outcome = map_setup_exit(1, stderr);
+        assert!(!outcome.done, "exit 1 must not set done");
+        assert_eq!(
+            outcome.failure.as_deref(),
+            Some("[ramsleuth-setup] ERROR: step 4 failed"),
+            "exit 1 must carry the last structured ERROR line"
+        );
+
+        // Exit 1 without the marker: the last non-empty line.
+        let outcome = map_setup_exit(
+            1,
+            "info line\nmodprobe: FATAL: Module ryzen_smu_drv not found\n",
+        );
+        assert_eq!(
+            outcome.failure.as_deref(),
+            Some("modprobe: FATAL: Module ryzen_smu_drv not found"),
+        );
+
+        // Exit 1 with empty stderr: the generic `sudo` pointer.
+        assert!(
+            map_setup_exit(1, "")
+                .failure
+                .as_deref()
+                .is_some_and(|message| message.contains("sudo ramsleuth-setup")),
+            "a marker-less empty stderr must point at the manual floor"
+        );
+
+        // Exit 2: usage (should not happen via the GUI).
+        let outcome = map_setup_exit(2, "whatever");
+        assert!(
+            outcome
+                .failure
+                .as_deref()
+                .is_some_and(|message| message.contains("usage, exit 2")),
+            "exit 2 must name the usage error: {:?}",
+            outcome.failure
+        );
+
+        // A signal death (the worker maps it to -1): hard failure,
+        // no panic.
+        let outcome = map_setup_exit(-1, "killed");
+        assert!(!outcome.done);
+        assert_eq!(outcome.failure.as_deref(), Some("killed"));
+    }
+
+    /// (s2) The manual-floor command (plan risk 1): the `sudo`
+    /// equivalent of the one click, the `--with-dkms` flag only on
+    /// the AMD variant.
+    #[test]
+    fn sudo_setup_command_is_the_manual_floor() {
+        assert_eq!(
+            sudo_setup_command("alice", false),
+            "sudo ramsleuth-setup --user alice"
+        );
+        assert_eq!(
+            sudo_setup_command("alice", true),
+            "sudo ramsleuth-setup --user alice --with-dkms"
+        );
     }
 }
