@@ -128,6 +128,7 @@ transparency_block() {
   done
   step "frozen unit   → /usr/lib/systemd/system/ramsleuth.service"
   step "systemd preset → /usr/lib/systemd/system-preset/ramsleuth.preset"
+  step "app-menu entry → /usr/share/applications/ramsleuth.desktop"
   step "system group   → 'ramsleuth'  (groupadd -r; the unit runs as Group=ramsleuth)"
   step "shared helper  → /usr/bin/ramsleuth-install-ryzen-smu-dkms"
   step "this installer → /usr/share/ramsleuth/install.sh   (kept for audit / re-run)"
@@ -169,6 +170,8 @@ do_install() {
   ok "/usr/lib/systemd/system/ramsleuth.service  (frozen unit, verbatim)"
   install -Dm644 "packaging/ramsleuth-git/ramsleuth.preset" "/usr/lib/systemd/system-preset/ramsleuth.preset"
   ok "/usr/lib/systemd/system-preset/ramsleuth.preset"
+  install -Dm644 "packaging/ramsleuth-git/ramsleuth.desktop" "/usr/share/applications/ramsleuth.desktop"
+  ok "/usr/share/applications/ramsleuth.desktop  (app-menu entry)"
   # The system group (idempotent getent guard).
   if getent group ramsleuth >/dev/null 2>&1; then
     ok "group 'ramsleuth' already present"
