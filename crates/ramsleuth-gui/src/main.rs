@@ -11,7 +11,7 @@
 //!   ramsleuth-client P3-21 / ramsleuth-tui P3-24 precedent).
 //! - **App** — a 968×600 eframe window carrying the dark-slate
 //!   [`build_style`]: the spec's 3-line header (Grand Design §3.1,
-//!   C6-20) — line 1 the `RamSleuth v2.0.0` title, the platform tag,
+//!   C6-20) — line 1 the `RamSleuth v2.1.0` title, the platform tag,
 //!   the daemon status (naming the live settings socket — C6-30),
 //!   the `Settings` toggle, the `Graphs` window toggle (C7-21,
 //!   D-3), and the `[F2] snapshot · [F3] export · [Q] quit`
@@ -800,7 +800,7 @@ fn sync_mode(t: &SystemMemoryTelemetry, units: &Units) -> (String, Option<egui::
 
 impl RamSleuthApp {
     /// The header strip (Grand Design §3.1): the spec's 3-line
-    /// header — line 1 the `RamSleuth v2.0.0` title, the platform
+    /// header — line 1 the `RamSleuth v2.1.0` title, the platform
     /// tag, the daemon status (naming the live settings socket —
     /// C6-30), the `Settings` toggle, the `Setup` requirements
     /// toggle (C18, D-18.5), the `Graphs` window toggle (C7-21,
@@ -861,7 +861,7 @@ impl RamSleuthApp {
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
                     ui.label(
-                        egui::RichText::new("RamSleuth v2.0.0").strong().color(CYAN).size(20.0),
+                        egui::RichText::new(format!("RamSleuth v{}", env!("CARGO_PKG_VERSION"))).strong().color(CYAN).size(20.0),
                     );
                     ui.separator();
                     ui.label(egui::RichText::new(format!("[{tag}]")));

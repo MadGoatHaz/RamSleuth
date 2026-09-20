@@ -33,7 +33,7 @@ cd -- "$SCRIPT_DIR"
 
 # --- Constants ---------------------------------------------------------------
 VERSION="$(awk -F'"' '$1 ~ /^version/{print $2; exit}' "$REPO_ROOT/Cargo.toml" 2>/dev/null)" || VERSION=""
-[[ -n "$VERSION" ]] || VERSION="2.0.0"
+[[ -n "$VERSION" ]] || VERSION="2.1.0"
 CPU_VENDOR="$(grep -m1 'vendor_id' /proc/cpuinfo 2>/dev/null | awk '{print $3}')" || CPU_VENDOR="unknown"
 COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null)" || COMMIT="unknown"
 BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)" || BRANCH="unknown"

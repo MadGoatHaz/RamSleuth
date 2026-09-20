@@ -1,4 +1,4 @@
-# RamSleuth v2.0.0
+# RamSleuth v2.1.0
 
 Live memory-controller telemetry and an AIDA64-style benchmark engine for PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
 
@@ -157,4 +157,4 @@ RamSleuth/
 
 MIT — the workspace `Cargo.toml` declares `license = "MIT"`. Repository: <https://github.com/MadGoatHaz/RamSleuth>.
 
-This README describes **RamSleuth v2.0.0** (branch `v2-development`); the workspace package version is `2.0.0` and the `v2.0.0` tag was created in Cycle 17.
+This README describes **RamSleuth v2.1.0** (branch `v2-development`); the workspace package version is `2.1.0` (bumped in Cycle 19); the Cycle 17 release tag remains in the git history.

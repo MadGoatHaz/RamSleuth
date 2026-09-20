@@ -13,7 +13,7 @@
 //!   file) + a `bench` key (the grid object, or `null` before the
 //!   first completed run).
 //! - [`snapshot_png`] — the F2 validation card: a 640×420 PNG with a
-//!   title row (`RamSleuth v2.0.0` + the UTC wall clock), a CPU line
+//!   title row (`RamSleuth v2.1.0` + the UTC wall clock), a CPU line
 //!   (brand + clock) and a RAM line (capacity + channel, honest `N/A`
 //!   for absent cells) over the 4×4 [`BenchmarkGrid`], each cell
 //!   colored by its value magnitude along the CYAN → AMBER → CRIMSON
@@ -187,7 +187,7 @@ pub fn export_json(
 // ---------------------------------------------------------------------
 
 // The F2 validation card (C6-28): a 640×420 PNG — the title row
-// (`RamSleuth v2.0.0` + the UTC wall clock), the CPU line (brand +
+// (`RamSleuth v2.1.0` + the UTC wall clock), the CPU line (brand +
 // clock), and the RAM line (capacity + channel), each the 5×7 font at
 // 2× scale, a dim separator, then the 4×4 [`BenchmarkGrid`] pinned to
 // the bottom margin (4 × 64 + 3 × 16 = 304 tall, 4 × 140 + 3 × 16 =
@@ -224,7 +224,7 @@ const DIM_CELL: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x3A, 0x44);
 /// as a 640×420 data-visualization PNG and write it to `path`.
 ///
 /// The card (C6-28): a SLATE background, the 5×7-font title row
-/// `RamSleuth v2.0.0 <YYYY-MM-DD HH:MM:SS>`, the CPU line (brand +
+/// `RamSleuth v2.1.0 <YYYY-MM-DD HH:MM:SS>`, the CPU line (brand +
 /// platform clock), the RAM line (total capacity + channel mode from
 /// the bound-DIMM count), a dim separator, then the 4×4 block of
 /// cells — one per [`Tier`] row × [`Metric`] column, the AIDA64
@@ -253,7 +253,7 @@ pub fn snapshot_png(
     // line — absent telemetry / cells degrade to the honest `N/A`
     // text (never a panic).
     let stamp = wall_clock_string(now_epoch_secs());
-    let title = format!("RamSleuth v2.0.0  {stamp}");
+    let title = format!("RamSleuth v{}  {}", env!("CARGO_PKG_VERSION"), stamp);
     let cpu = telemetry.map(snapshot_cpu_line).unwrap_or_else(|| "CPU: N/A".to_owned());
     let ram = telemetry.map(snapshot_ram_line).unwrap_or_else(|| "RAM: N/A".to_owned());
     draw_text(&mut pixels, MARGIN, TITLE_Y0, &title, CYAN);
