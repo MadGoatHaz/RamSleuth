@@ -26,6 +26,7 @@ pkgbase = ramsleuth
 	depends = libxcursor
 	depends = libxinerama
 	depends = mesa
+	conflicts = ramsleuth-bin
 	source = ramsleuth::git+https://github.com/MadGoatHaz/RamSleuth.git#tag=v2.1.0
 
 pkgname = ramsleuth
