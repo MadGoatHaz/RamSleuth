@@ -18,6 +18,10 @@
 //!   [`SocketSetupError::Chmod`] — the documented client contract), and
 //!   apply a **best-effort** group chown to `ramsleuth` (fallback
 //!   `wheel`) — a chown failure only warns, it never blocks startup;
+//! - re-apply the **per-user** POSIX ACLs on the socket from
+//!   `/etc/ramsleuth/authorized-users` (the C21-01 state file) —
+//!   best-effort and warn-only, and run on **every** socket creation
+//!   because `/run` is a tmpfs that is wiped on reboot;
 //! - set the socket non-blocking and hand it to the async side via
 //!   `from_std` (which needs a runtime context — see [`setup_listener``]);
 //!
@@ -180,6 +184,134 @@ fn apply_socket_group(path: &Path) {
     }
 }
 
+/// The C21-01 state file (frozen contract): one authorized username
+/// per line (LF, no comments, no duplicates); dir `0755`, file `0644`.
+const AUTHORIZED_USERS: &str = "/etc/ramsleuth/authorized-users";
+
+/// Split the state file's content into candidate usernames: one per
+/// line, trimmed, blank lines dropped, duplicates collapsed (the
+/// C21-01 contract already forbids duplicates — this only defends
+/// against a hand-edited file).
+fn authorized_usernames(content: &str) -> Vec<String> {
+    let mut users = Vec::new();
+    for line in content.lines() {
+        let user = line.trim();
+        if !user.is_empty() && !users.iter().any(|u| u == user) {
+            users.push(user.to_owned());
+        }
+    }
+    users
+}
+
+/// Look up a user's uid via `getpwnam`; `None` when the user does not
+/// exist (the same shape as [`group_gid`]).
+fn user_uid(name: &str) -> Option<libc::uid_t> {
+    let c_name = CString::new(name).ok()?;
+    // SAFETY: `c_name` is a valid NUL-terminated byte string;
+    // `getpwnam` returns either null (user absent) or a valid pointer
+    // to a `passwd` entry that stays valid until the next `getpwnam`
+    // call.
+    let entry = unsafe { libc::getpwnam(c_name.as_ptr()) };
+    if entry.is_null() {
+        None
+    } else {
+        // SAFETY: a non-null result is a valid `passwd` entry for the
+        // duration of this call; we read only its `pw_uid` field.
+        Some(unsafe { (*entry).pw_uid })
+    }
+}
+
+/// Probe whether `setfacl` is usable (the plan's `Command` probe):
+/// `false` when it is absent from `PATH` or `--version` fails.
+fn setfacl_available() -> bool {
+    match std::process::Command::new("setfacl")
+        .arg("--version")
+        .output()
+    {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Best-effort `setfacl -m u:<uid>:rw` on `path` for one authorized
+/// user. The numeric spec is resolved via [`user_uid`] so no
+/// user-controlled string ever reaches the spawned command. `Err`
+/// when the user is unknown, `setfacl` is absent, or `setfacl`
+/// reports a nonzero status — the caller warns and continues.
+fn apply_user_acl(path: &Path, user: &str) -> io::Result<()> {
+    let uid = user_uid(user).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("user `{user}` is not in /etc/passwd"),
+        )
+    })?;
+    // A socket path containing an interior NUL cannot be spawned;
+    // `Command::output` reports it as a normal `Err` (warn-only).
+    match std::process::Command::new("setfacl")
+        .arg("-m")
+        .arg(format!("u:{uid}:rw"))
+        .arg(path)
+        .output()
+    {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(io::Error::other(format!(
+            "setfacl exited with {status}: {stderr}",
+            status = out.status,
+            stderr = String::from_utf8_lossy(&out.stderr)
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Re-apply the per-user POSIX ACLs on the freshly bound socket at
+/// `socket_path` from the state file at `state_path` (the
+/// [`apply_socket_group`] precedent: best-effort, never blocks
+/// startup). A missing state file only notes (the not-yet-seeded
+/// fresh-install case — not an error); an unreadable state file, an
+/// unavailable `setfacl`, an unknown user, or a failed `setfacl` run
+/// only warns — the remaining users are still processed.
+fn apply_authorized_user_acls(socket_path: &Path, state_path: &Path) {
+    let content = match fs::read_to_string(state_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "ramsleuth-daemon: note: no authorized-users state file at {} — no per-user socket ACLs to apply (mode 0660 + the group path are unaffected)",
+                state_path.display()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!(
+                "ramsleuth-daemon: warning: could not read the authorized-users state file {} ({e}) — skipping the per-user socket ACLs",
+                state_path.display()
+            );
+            return;
+        }
+    };
+    let users = authorized_usernames(&content);
+    if users.is_empty() {
+        return;
+    }
+    if !setfacl_available() {
+        eprintln!(
+            "ramsleuth-daemon: warning: `setfacl` is not available — skipping the per-user socket ACLs for {} authorized user(s) (mode 0660 + the group path still work)",
+            users.len()
+        );
+        return;
+    }
+    for user in users {
+        match apply_user_acl(socket_path, &user) {
+            Ok(()) => eprintln!(
+                "ramsleuth-daemon: granted per-user socket ACL u:rw on {} to `{user}` (from the authorized-users state file)",
+                socket_path.display()
+            ),
+            Err(e) => eprintln!(
+                "ramsleuth-daemon: warning: could not apply the per-user socket ACL for `{user}` ({e}) — continuing"
+            ),
+        }
+    }
+}
+
 /// Prepare the daemon's Unix socket listener at `socket_path`.
 ///
 /// Synchronous startup step (the async accept loop is P3-16/P3-17):
@@ -194,14 +326,17 @@ fn apply_socket_group(path: &Path) {
 ///    failure);
 /// 4. set the file mode to `0660` ([`SocketSetupError::Chmod`] on
 ///    failure — the documented client contract);
-/// 5. best-effort group chown (`ramsleuth` → `wheel`); a failure only
-///    warns, it never errors;
+/// 5. best-effort group chown (`ramsleuth` → `wheel`) plus a
+///    best-effort re-apply of the per-user POSIX ACLs (step 5b, from
+///    `/etc/ramsleuth/authorized-users`): a failure only warns (a
+///    missing state file only notes), it never errors — the ACL pass
+///    runs on every socket creation because `/run` is a tmpfs;
 /// 6. set the socket non-blocking and convert it to a `tokio` listener
 ///    via `from_std` (a `from_std` conversion error maps to
 ///    [`SocketSetupError::Bind`]).
 ///
 /// This function never panics or exits — every failure is a `Result`
-/// error (or a stderr warning for the best-effort chown).
+/// error (or a stderr warning for the best-effort chown/ACL steps).
 ///
 /// **Runtime context:** the final `from_std` step registers the socket
 /// with the current tokio runtime's IO driver, so this function must be
@@ -243,6 +378,11 @@ pub fn setup_listener(socket_path: &Path) -> Result<TokioUnixListener, SocketSet
 
     // (5) Best-effort group chown; a failure only warns (never an error).
     apply_socket_group(socket_path);
+
+    // (5b) Best-effort per-user ACLs from the C21-01 state file; a
+    // failure only warns (never an error) — `/run` is tmpfs, so this
+    // runs on every socket creation.
+    apply_authorized_user_acls(socket_path, Path::new(AUTHORIZED_USERS));
 
     // (6) Hand the bound socket to the async side. tokio's `from_std`
     // requires the socket to be non-blocking (its debug assert panics
@@ -376,6 +516,43 @@ mod tests {
             "the DirCreate error must carry the --socket hint: {err}"
         );
 
+        cleanup(&dir);
+    }
+
+    /// (e) The state-file parser: one username per line, stray
+    /// whitespace trimmed, blank lines dropped, duplicates collapsed
+    /// (first occurrence wins).
+    #[test]
+    fn authorized_usernames_parsing() {
+        assert_eq!(
+            authorized_usernames("alice\n\n  bob  \nalice\n\ncarol\n"),
+            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+        );
+        assert_eq!(authorized_usernames(""), Vec::<String>::new());
+        assert_eq!(authorized_usernames("\n   \n\t\n"), Vec::<String>::new());
+    }
+
+    /// (f) The best-effort ACL step degrades cleanly, never panicking:
+    /// a missing state file is a no-op (the not-yet-seeded
+    /// fresh-install case) and an unknown user only warns — `setfacl`
+    /// is never spawned for one, so this holds with or without the
+    /// `acl` package installed (the plan's CI case).
+    #[test]
+    fn acl_step_degrades_without_panicking() {
+        let dir = test_dir("acl-degrade");
+        let socket_path = dir.join("amsleuth.sock");
+        fs::File::create(&socket_path).expect("plant the stand-in socket file");
+
+        apply_authorized_user_acls(&socket_path, &dir.join("no-such-state-file"));
+
+        let state = dir.join("authorized-users");
+        fs::write(&state, "no-such-user-c21-03\n").expect("plant the state file");
+        apply_authorized_user_acls(&socket_path, &state);
+
+        assert!(
+            socket_path.exists(),
+            "the socket file must survive the best-effort step"
+        );
         cleanup(&dir);
     }
 }
