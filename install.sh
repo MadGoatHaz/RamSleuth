@@ -4,7 +4,8 @@
 # Plan: PLAN-CYCLE18.md chunk C18-08, design D-18.2.
 #
 # Lands RamSleuth in the EXACT state of the AUR (ramsleuth-git): the 6 binaries +
-# the frozen unit + the preset + the `ramsleuth` group into /usr via sudo, built
+# the frozen unit + the preset + the `ramsleuth` group + the one-click setup
+# helper (ramsleuth-setup) + its polkit policy into /usr via sudo, built
 # with `cargo build --release --workspace --locked`. Interactive, visually
 # sectioned, and TRANSPARENT: before anything touches the system it shows the
 # host, the exact commit being installed, and every artifact + destination, then
@@ -131,6 +132,8 @@ transparency_block() {
   step "app-menu entry → /usr/share/applications/ramsleuth.desktop"
   step "system group   → 'ramsleuth'  (groupadd -r; the unit runs as Group=ramsleuth)"
   step "shared helper  → /usr/bin/ramsleuth-install-ryzen-smu-dkms"
+  step "setup helper   → /usr/bin/ramsleuth-setup   (one-click privileged setup; pkexec-able)"
+  step "polkit policy  → /usr/share/polkit-1/actions/90-ramsleuth-setup.policy"
   step "this installer → /usr/share/ramsleuth/install.sh   (kept for audit / re-run)"
   printf '\n'
   printf '  %sThird-party source statement:%s\n' "${C_BOLD}" "${C_RESET}"
@@ -183,7 +186,17 @@ do_install() {
   if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
     if ask "Add ${SUDO_USER} to the ramsleuth group (unprivileged CLI/TUI access)? [Y/n] " "Y"; then
       usermod -aG ramsleuth "$SUDO_USER"
-      ok "${SUDO_USER} added to group 'ramsleuth' (effective at next login)"
+      ok "${SUDO_USER} added to group 'ramsleuth' (persistent; effective at next login)"
+      # Seed the ACL state file too (the C21 'no re-login' contract): the daemon
+      # re-applies a per-user socket ACL from it on every (re)start, so the
+      # CURRENT session gets socket access immediately. Idempotent (exact-line
+      # dedupe); dir 0755, file 0644, one username per line.
+      install -d -m 0755 /etc/ramsleuth
+      if ! grep -qx -F -- "$SUDO_USER" /etc/ramsleuth/authorized-users 2>/dev/null; then
+        printf '%s\n' "$SUDO_USER" >> /etc/ramsleuth/authorized-users
+      fi
+      chmod 0644 /etc/ramsleuth/authorized-users
+      ok "${SUDO_USER} seeded in /etc/ramsleuth/authorized-users (current-session access, no re-login)"
     else
       info "  ${C_DIM}Skipped group membership for ${SUDO_USER}.${C_RESET}"
     fi
@@ -191,6 +204,13 @@ do_install() {
   # The two shipped transparency artifacts (re-runnable + auditable post-install).
   install -Dm755 "scripts/install-ryzen-smu-dkms.sh" "/usr/bin/ramsleuth-install-ryzen-smu-dkms"
   ok "/usr/bin/ramsleuth-install-ryzen-smu-dkms  (the shared pinned helper)"
+  # The one-click setup pair (AUR-parity: the same two artifacts every AUR package installs).
+  [[ -f "scripts/ramsleuth-setup.sh" ]] || die "Missing scripts/ramsleuth-setup.sh — incomplete checkout; the one-click setup helper cannot be installed." 1
+  [[ -f "packaging/polkit/90-ramsleuth-setup.policy" ]] || die "Missing packaging/polkit/90-ramsleuth-setup.policy — incomplete checkout; the polkit policy cannot be installed." 1
+  install -Dm755 "scripts/ramsleuth-setup.sh" "/usr/bin/ramsleuth-setup"
+  ok "/usr/bin/ramsleuth-setup  (the one-click privileged setup helper)"
+  install -Dm644 "packaging/polkit/90-ramsleuth-setup.policy" "/usr/share/polkit-1/actions/90-ramsleuth-setup.policy"
+  ok "/usr/share/polkit-1/actions/90-ramsleuth-setup.policy  (its polkit policy)"
   install -Dm755 "install.sh" "/usr/share/ramsleuth/install.sh"
   ok "/usr/share/ramsleuth/install.sh  (this installer)"
   # systemd (guarded, non-fatal — the no-panic install contract).
@@ -225,7 +245,9 @@ do_summary() {
   header "Summary"
   printf '  %s✓ Installed RamSleuth v%s%s  (commit %s, branch %s)\n' "${C_GREEN}" "$VERSION" "${C_RESET}" "$COMMIT" "$BRANCH"
   printf '  %sStart now:%s\n' "${C_BOLD}" "${C_RESET}"
-  step "ramsleuth                 # the GUI (live desktop dashboard)"
+  step "ramsleuth                 # the GUI — one click on 'Set up RamSleuth' (no re-login, no reboot)"
+  step "sudo ramsleuth-setup        # the same one-click setup from a terminal (CLI equivalent)"
+  printf '  %sManual fallback (copy-paste):%s\n' "${C_DIM}" "${C_RESET}"
   step "ramsleuth-tui             # the terminal UI"
   step "ramsleuth-client dump     # one-shot CLI telemetry"
   printf '  %sDay-2:%s\n' "${C_BOLD}" "${C_RESET}"
@@ -234,7 +256,7 @@ do_summary() {
   if [[ "$DKMS_STATE" == "skipped" ]]; then
     printf '\n  %sDegradation note:%s without the ryzen_smu module the AMD section reads\n' "${C_AMBER}" "${C_RESET}"
     printf '  N/A (DriverMissing), exit 0, no panic. Enable live AMD subtimings with:\n'
-    printf '     %ssudo ramsleuth-install-ryzen-smu-dkms%s\n' "${C_CYAN}" "${C_RESET}"
+    printf '     %ssudo ramsleuth-setup --with-dkms%s  (or the helper: sudo ramsleuth-install-ryzen-smu-dkms)\n' "${C_CYAN}" "${C_RESET}"
   fi
   printf '\n  %sTransparency footer:%s every installed file is byte-identical to a file in this\n' "${C_DIM}" "${C_RESET}"
   printf '  repo (audit with: git show). The build was --locked from commit %s. The only\n' "$COMMIT"
