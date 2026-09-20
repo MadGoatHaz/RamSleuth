@@ -18,11 +18,17 @@
 #   install.sh                    — the self-contained transparency entrypoint
 #   LICENSE                       — MIT (AUR license-compliance install path)
 #   ramsleuth.desktop             — the application-menu entry
+#   ramsleuth-setup.sh            — the one-click setup helper (top-level; C21-17,
+#                                   lands with the v2.2.0 re-cut)
+#   90-ramsleuth-setup.policy     — the shared polkit policy (top-level; C21-17,
+#                                   lands with the v2.2.0 re-cut)
 #
 # sha256sums pins that exact asset. The v2.1.1 release is published (C20-06);
 # the sha256 below is the real hash of the release tarball, captured from
 # the published release .sha256 asset (finalized in C20-06). AUR requires a real
-# sha256 (no SKIP).
+# sha256 (no SKIP). The two new top-level entries (ramsleuth-setup.sh,
+# 90-ramsleuth-setup.policy) are NOT in the pinned v2.1.1 tarball; they land with
+# the C21-24 re-cut, and package() installs them only when present (the guard).
 #
 # Mutual conflict: ramsleuth (source) and ramsleuth-bin (precompiled)
 # install the identical file surface, so the user picks exactly one.
@@ -81,6 +87,25 @@ package() {
     # (7) the application-menu entry — at the tarball top level
     install -Dm644 "ramsleuth.desktop" \
         "$pkgdir/usr/share/applications/ramsleuth.desktop"
+
+    # (8) the one-click setup helper -> /usr/bin/ramsleuth-setup (0755), at the
+    # tarball top level (the C21-17 contract: scripts/ramsleuth-setup.sh staged
+    # as ramsleuth-setup.sh). GUARDED: the currently-pinned v2.1.1 tarball
+    # predates this member (it lands with the C21-24 re-cut), so a build against
+    # the old tarball skips it cleanly — the no-panic contract: the install must
+    # not fail on its absence.
+    if [ -f "ramsleuth-setup.sh" ]; then
+        install -Dm755 "ramsleuth-setup.sh" "$pkgdir/usr/bin/ramsleuth-setup"
+    fi
+
+    # (9) the shared polkit policy -> /usr/share/polkit-1/actions/90-ramsleuth-
+    # setup.policy (0644), at the tarball top level (the C21-17 contract:
+    # packaging/polkit/90-ramsleuth-setup.policy). GUARDED exactly as (8) for
+    # the same old-tarball reason.
+    if [ -f "90-ramsleuth-setup.policy" ]; then
+        install -Dm644 "90-ramsleuth-setup.policy" \
+            "$pkgdir/usr/share/polkit-1/actions/90-ramsleuth-setup.policy"
+    fi
 
     # NOTE: the ramsleuth group is created on the TARGET system by the .install
     # pre_install/pre_upgrade hooks (package() runs in the build env, not the target).
