@@ -60,6 +60,11 @@
 //!   viewport. The one-click setup's `running` edge (the wizard
 //!   button, C21-06) detaches the `pkexec` worker the same way —
 //!   the spawn + the helper run are entirely off the render thread.
+//! - **Window icon (C21-26):** the root + the Graphs child viewport
+//!   carry the embedded hicolor master (the 256×256
+//!   `assets/icons/ramsleuth-256.png` PNG — C21-25), decoded once at
+//!   startup; a decode failure degrades to eframe's default icon
+//!   (no-panic, D5).
 //!
 //! **No-panic contract (plan D5):** a missing daemon never crashes the
 //! GUI — the poller records the friendly error in the state (the
@@ -167,6 +172,52 @@ const COLUMN_GAP: f32 = 8.0;
 const OUTER_MARGIN: f32 = 8.0;
 /// The header strip's stroke (a dim line over the SLATE fill).
 const HEADER_STROKE: egui::Color32 = egui::Color32::from_rgb(0x34, 0x34, 0x40);
+
+/// The window-embed icon (C21-26): the C21-25 committed hicolor
+/// master — 256×256 RGBA8 (covers any title-bar DPI).
+const ICON_PNG: &[u8] = include_bytes!("../../../assets/icons/ramsleuth-256.png");
+/// The icon decode's dimension cap (no-panic, D5): a corrupt PNG
+/// header must not drive an unbounded RGBA allocation.
+const MAX_ICON_DIM: u32 = 1024;
+
+/// Decode an RGBA8 PNG payload into native window-icon data (the egui
+/// [`IconData`] the root + the Graphs child viewport carry — C21-26).
+/// Any failure — a bad signature, a corrupt frame, a payload that is
+/// not 8-bit-per-sample RGBA, a dimension over [`MAX_ICON_DIM`] —
+/// returns `None` (the no-panic degradation, plan D5: the app runs
+/// with eframe's default icon).
+fn decode_icon_png(bytes: &[u8]) -> Option<egui::IconData> {
+    let mut reader = png::Decoder::new(bytes).read_info().ok()?;
+    let info = reader.info();
+    let (width, height) = (info.width, info.height);
+    if width > MAX_ICON_DIM || height > MAX_ICON_DIM {
+        return None;
+    }
+    // The icon data must be 8-bit-per-sample RGBA (`IconData`'s
+    // layout); the committed master is (the C21-25 generator).
+    let (color, depth) = reader.output_color_type();
+    if color != png::ColorType::Rgba || depth != png::BitDepth::Eight {
+        return None;
+    }
+    let mut rgba = vec![0u8; reader.output_buffer_size()];
+    reader.next_frame(&mut rgba).ok()?;
+    Some(egui::IconData { rgba, width, height })
+}
+
+/// The app's window icon (C21-26): the embedded master — decoded
+/// once at startup (`main()`), then shared by the root viewport and
+/// the Graphs child (via the app). A decode failure degrades to
+/// `None` — eframe's default icon — with a single note (no-panic,
+/// D5: never a startup crash).
+fn window_icon() -> Option<Arc<egui::IconData>> {
+    match decode_icon_png(ICON_PNG) {
+        Some(icon) => Some(Arc::new(icon)),
+        None => {
+            eprintln!("ramsleuth: icon decode failed; using eframe's default");
+            None
+        }
+    }
+}
 
 /// Usage text printed on parse errors (exit 2) — the ramsleuth-daemon
 /// P3-17 / ramsleuth-client P3-21 / ramsleuth-tui P3-24 precedent. The
@@ -356,8 +407,9 @@ fn notice_color(text: &str) -> egui::Color32 {
 
 /// The eframe app (P3-30): the shared state, the poller's command
 /// channel, the stop / cancel flags, the settings-panel visibility,
-/// the one-click setup outcome (C21-06), the export dir, the poller
-/// thread, and the transient header notice.
+/// the one-click setup outcome (C21-06), the window icon (C21-26),
+/// the export dir, the poller thread, and the transient header
+/// notice.
 struct RamSleuthApp {
     /// The shared presentation state — includes the in-memory
     /// `GuiSettings` knobs (C6-26 / C6-27 / C6-30: the poll cadence +
@@ -394,6 +446,10 @@ struct RamSleuthApp {
     /// a brief per-mutation lock hand-off, never held across the
     /// spawn, C14-03).
     setup: Arc<RwLock<SetupOutcome>>,
+    /// The window-embed icon (C21-26): the C21-25 master decoded
+    /// once at startup — the root viewport + the Graphs child share
+    /// it (a decode failure degrades to `None`, no-panic, D5).
+    icon: Option<Arc<egui::IconData>>,
     /// Whether the Graphs window (C7-21, D-3 — the eframe deferred
     /// child viewport) is open: while set, `update` re-registers
     /// the viewport every frame (the keep-alive — egui GCs a child
@@ -548,7 +604,7 @@ impl eframe::App for RamSleuthApp {
         // registering it, which is how both close paths destroy the
         // OS window).
         if self.graphs_open.load(Ordering::Relaxed) {
-            show_graphs_viewport(ctx, &self.state, &self.graphs_open);
+            show_graphs_viewport(ctx, &self.state, &self.graphs_open, &self.icon);
         }
 
         // ~60 FPS: eframe's vsync drives the present; this only asks
@@ -1421,20 +1477,27 @@ fn graphs_button(ui: &mut egui::Ui, graphs_open: &Arc<AtomicBool>) -> egui::Resp
 /// child's body ([`run_graphs_child_frame`]) runs on its own native
 /// window's frame with its own viewport input over this one shared
 /// context — no second eframe lifecycle, no second event loop (the
-/// Wayland-safe design, D-3).
+/// Wayland-safe design, D-3). The viewport also carries the
+/// window icon (C21-26 — the same decode as the root).
 fn show_graphs_viewport(
     ctx: &egui::Context,
     state: &Arc<RwLock<TelemetryData>>,
     graphs_open: &Arc<AtomicBool>,
+    icon: &Option<Arc<egui::IconData>>,
 ) {
     let shared = Arc::clone(state);
     let flag = Arc::clone(graphs_open);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("RamSleuth — Graphs")
+        .with_inner_size(GRAPHS_WINDOW_SIZE)
+        .with_min_inner_size(GRAPHS_WINDOW_MIN_SIZE);
+    // The same decoded icon as the root (C21-26 — one decode at
+    // startup); `None` (a decode failure) stays legal — eframe's
+    // default icon (no-panic, D5).
+    viewport.icon = icon.clone();
     ctx.show_viewport_deferred(
         graphs_viewport_id(),
-        egui::ViewportBuilder::default()
-            .with_title("RamSleuth — Graphs")
-            .with_inner_size(GRAPHS_WINDOW_SIZE)
-            .with_min_inner_size(GRAPHS_WINDOW_MIN_SIZE),
+        viewport,
         move |child_ctx, _class| {
             run_graphs_child_frame(child_ctx, &shared, &flag);
         },
@@ -1566,11 +1629,20 @@ fn main() -> ExitCode {
     //    handle in main for the post-shutdown stop (the app takes the
     //    other clone).
     let main_stop = stop.clone();
+    // The window-embed icon (C21-26): decoded once at startup — the
+    // root viewport + the Graphs child (via the app) share this same
+    // decode; `None` (a decode failure) stays legal — eframe's
+    // default icon (no-panic, D5).
+    let icon = window_icon();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(DEFAULT_WINDOW_SIZE)
-            .with_min_inner_size(MIN_WINDOW_SIZE),
+        viewport: {
+            let mut viewport = egui::ViewportBuilder::default()
+                .with_inner_size(DEFAULT_WINDOW_SIZE)
+                .with_min_inner_size(MIN_WINDOW_SIZE);
+            viewport.icon = icon.clone();
+            viewport
+        },
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -1586,6 +1658,7 @@ fn main() -> ExitCode {
                 settings_open: false,
                 requirements_open: true,
                 setup,
+                icon,
                 graphs_open,
                 saved_refresh: None,
                 last_graphs_open: false,
@@ -2609,7 +2682,7 @@ mod tests {
 
         // Root frame 1: the spawn — the deferred child is registered.
         ctx.begin_frame(egui::RawInput::default());
-        show_graphs_viewport(&ctx, &state, &flag);
+        show_graphs_viewport(&ctx, &state, &flag, &None);
         let out = ctx.end_frame();
         let registered = out.viewport_output.get(&child).cloned();
         assert!(registered.is_some(), "the deferred child must be registered on spawn");
@@ -2638,7 +2711,7 @@ mod tests {
         // Root frame 2 (flag still open): the re-registration keeps
         // the child alive (the keep-alive).
         ctx.begin_frame(egui::RawInput::default());
-        show_graphs_viewport(&ctx, &state, &flag);
+        show_graphs_viewport(&ctx, &state, &flag, &None);
         let out = ctx.end_frame();
         assert!(
             out.viewport_output.contains_key(&child),
@@ -2672,7 +2745,7 @@ mod tests {
 
         // Register the child once (the context learns its parent).
         ctx.begin_frame(egui::RawInput::default());
-        show_graphs_viewport(&ctx, &state, &flag);
+        show_graphs_viewport(&ctx, &state, &flag, &None);
         let _ = ctx.end_frame();
 
         // The WM close: the child's frame carries `ViewportEvent::
@@ -2780,6 +2853,7 @@ mod tests {
                 settings_open: false,
                 requirements_open: false,
                 setup: Arc::new(RwLock::new(SetupOutcome::default())),
+                icon: None,
                 graphs_open: Arc::new(AtomicBool::new(false)),
                 saved_refresh: None,
                 last_graphs_open: false,
@@ -2848,6 +2922,7 @@ mod tests {
                 settings_open: false,
                 requirements_open: false,
                 setup: Arc::new(RwLock::new(SetupOutcome::default())),
+                icon: None,
                 graphs_open: Arc::new(AtomicBool::new(false)),
                 saved_refresh: None,
                 last_graphs_open: false,
@@ -3051,5 +3126,39 @@ mod tests {
             sudo_setup_command("alice", true),
             "sudo ramsleuth-setup --user alice --with-dkms"
         );
+    }
+
+    /// (C21-26) The window-icon decode path: a small in-memory RGBA
+    /// PNG (the `snapshot_png` encoder precedent) round-trips through
+    /// the same decoder the icon uses — the dimensions + a pixel
+    /// value survive; corrupt bytes degrade to `None` (no-panic,
+    /// D5); the committed C21-25 256×256 master decodes at the
+    /// advertised size.
+    #[test]
+    fn window_icon_png_decode() {
+        // A 3×2 RGBA PNG, one distinct pixel per cell.
+        let rgba: Vec<u8> =
+            (0..6).flat_map(|i| [i * 4 + 1, i * 4 + 2, i * 4 + 3, 255]).collect();
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 3, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("a valid header encodes");
+            writer.write_image_data(&rgba).expect("a valid RGBA8 frame encodes");
+        }
+        let icon = decode_icon_png(&png_bytes).expect("a valid RGBA8 PNG decodes");
+        assert_eq!((icon.width, icon.height), (3, 2));
+        // The pixel at (x=2, y=1) survives the round-trip (row-major).
+        let idx = 5 * 4;
+        assert_eq!(&icon.rgba[idx..idx + 4], &rgba[idx..idx + 4]);
+
+        // Corrupt payload: `None`, never a panic (no-panic, D5).
+        assert!(decode_icon_png(&[0, 1, 2, 3]).is_none());
+
+        // The committed C21-25 window-embed master: 256×256 RGBA8.
+        let embedded = window_icon().expect("the committed 256×256 master decodes");
+        assert_eq!((embedded.width, embedded.height), (256, 256));
+        assert_eq!(embedded.rgba.len(), 256 * 256 * 4);
     }
 }
