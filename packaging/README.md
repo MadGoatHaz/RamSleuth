@@ -1,6 +1,6 @@
 # RamSleuth v2 — Packaging
 
-Operator/end-user guide for installing and running RamSleuth v2: the `ramsleuth-git` package, the `ramsleuth` group, the sandboxed systemd unit, the optional `ryzen_smu` DKMS extra, and CI.
+Operator/end-user guide for installing and running RamSleuth v2: the three-tier AUR packages (`ramsleuth` stable source, `ramsleuth-bin` precompiled, `ramsleuth-git` bleeding-edge), the `ramsleuth` group, the sandboxed systemd unit, the optional `ryzen_smu` DKMS extra, the unified version bump, and CI.
 
 ## Overview
 
@@ -13,7 +13,7 @@ The socket lands at `/run/ramsleuth/ramsleuth.sock` (mode `0660`, group-owned; s
 
 ## What the install does
 
-`makepkg -si` from `packaging/ramsleuth-git/` (or the AUR package) builds the 7-crate workspace and installs:
+The AUR packages (or `makepkg -si` from any of `packaging/ramsleuth/`, `packaging/ramsleuth-bin/`, `packaging/ramsleuth-git/`) install:
 
 | Artifact | Destination |
 | --- | --- |
@@ -28,20 +28,43 @@ The socket lands at `/run/ramsleuth/ramsleuth.sock` (mode `0660`, group-owned; s
 
 ## Installation
 
-### AUR
+### AUR — the three-tier model
 
 ```sh
-yay -S ramsleuth-git   # or: paru -S ramsleuth-git
+yay -S ramsleuth      # STABLE source — builds from the official git tag v$pkgver
+yay -S ramsleuth-bin  # PRECOMPILED — the binary from the GitHub Release (fastest install, no build)
+yay -S ramsleuth-git  # BLEEDING-EDGE — builds from the moving v2-development branch (dev/testing)
 ```
+
+(or `paru -S ...` in place of `yay`.)
+
+- **`ramsleuth`** — the stable source package: builds the workspace from the official `v$pkgver` git tag (a reproducible, auditable snapshot). The default recommendation for production installs.
+- **`ramsleuth-bin`** — the precompiled package: downloads the release binary tarball (`ramsleuth-$pkgver-x86_64.tar.zst`) from the official GitHub Release and installs it as-is — no build, no makedepends. The fastest install path.
+- **`ramsleuth-git`** — the bleeding-edge dev package: tracks the moving `v2-development` branch (its `pkgver()` recomputes from `git describe`). For testing unreleased work; not a stable install.
+
+**Mutual conflict:** `ramsleuth` and `ramsleuth-bin` install the identical file set, so each declares the other in `conflicts=` — the user picks exactly one. (The optional `ryzen-smu-dkms` extra stays co-install-safe with all three — see below.)
 
 ### Manual (from a source checkout)
 
 ```sh
-cd packaging/ramsleuth-git
+cd packaging/ramsleuth   # or: packaging/ramsleuth-bin / packaging/ramsleuth-git
 makepkg -si
 ```
 
-Build deps: `rust`, `cargo`, `pkgconf`, plus the X11/Wayland/GL library set in the PKGBUILD (`libxkbcommon` is the only strict build-time link dep). The `post_install` hook runs `systemctl enable --now ramsleuth.service` — the daemon is started and enabled automatically, and the preset keeps it enabled on future `systemctl preset` runs. It also prints the next steps: start the GUI with `ramsleuth` (the TUI with `ramsleuth-tui`), and on AMD hosts the optional `sudo ramsleuth-install-ryzen-smu-dkms` (pinned upstream, shown + confirmed before any build; the AUR-extra alternative is `yay -S ryzen-smu-dkms`), while Intel hosts get the note that the built-in MCHBAR decode needs no extra driver.
+Build deps (the source packages `ramsleuth`/`ramsleuth-git`; `ramsleuth-bin` compiles nothing): `rust`, `cargo`, `pkgconf`, plus the X11/Wayland/GL library set in the PKGBUILD (`libxkbcommon` is the only strict build-time link dep). The `post_install` hook runs `systemctl enable --now ramsleuth.service` — the daemon is started and enabled automatically, and the preset keeps it enabled on future `systemctl preset` runs. It also prints the next steps: start the GUI with `ramsleuth` (the TUI with `ramsleuth-tui`), and on AMD hosts the optional `sudo ramsleuth-install-ryzen-smu-dkms` (pinned upstream, shown + confirmed before any build; the AUR-extra alternative is `yay -S ryzen-smu-dkms`), while Intel hosts get the note that the built-in MCHBAR decode needs no extra driver.
+
+## Version bump (unified versioning)
+
+The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml` — all 7 member crates inherit it, and the GUI window titles derive it at compile time via `env!("CARGO_PKG_VERSION")`, so a bump updates the titles automatically (no manual edit). The full bump flow:
+
+1. Bump `[workspace.package].version` in the root `Cargo.toml` (e.g. `2.1.0` → `2.2.0`).
+2. `cargo update -w` to sync `Cargo.lock` (the 7 member lines).
+3. Commit + push.
+4. Cut the git tag `v<ver>` — the release workflow (`.github/workflows/release.yml`) fires on the tag and auto-builds + publishes the GitHub Release with the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` and its `sha256` companion.
+5. Update the AUR packages: `pkgver` in `packaging/ramsleuth/PKGBUILD` (the git-tag source) and `pkgver` in `packaging/ramsleuth-bin/PKGBUILD` (the tarball download), then finalize the `ramsleuth-bin` `sha256sums` from the **published** release `.sha256` (AUR requires a real `sha256` — no SKIP; the value is a placeholder until the release exists).
+6. Push both AUR packages.
+
+`ramsleuth-git` needs no version bump — its `pkgver()` recomputes from `git describe` on the moving branch.
 
 ## The `ramsleuth` group
 
@@ -103,13 +126,13 @@ The module also ships a `monitor_cpu` CLI for ground-truth comparison: run it si
 
 An AUR install gets the same scripting as the GitHub path (`./install.sh` from a source checkout) — plus a third, driver-less path:
 
-- `sudo ramsleuth-install-ryzen-smu-dkms` — the helper the `ramsleuth-git` package ships at that path (the ramsleuth-owned copy of `scripts/install-ryzen-smu-dkms.sh`), or
+- `sudo ramsleuth-install-ryzen-smu-dkms` — the helper all three AUR packages ship at that path (the ramsleuth-owned copy of `scripts/install-ryzen-smu-dkms.sh`), or
 - the separate `ryzen-smu-dkms` extra (the two-step flow above): `yay -S ryzen-smu-dkms && sudo ryzen-smu-dkms-install`, or
 - no driver at all — RamSleuth runs and degrades gracefully (`N/A (DriverMissing)`, exit 0, no panic).
 
 Whichever path builds the module, the upstream source is **pinned, never branch-HEAD**: `amkillam/ryzen_smu` @ `d2983668300dd2a598e5a7dc40e71ce0678cc270` (verified 2026-08-15, the current `main` HEAD). The helper prints the URL, the full pin, and the short sha before any fetch, shows the fetched commit + the `sha256sum` of the staged source files after the fetch, hard-verifies that `HEAD` equals the pin before any build (no silent branch-HEAD fallback), and pauses for a confirmation before the first system mutation (a non-interactive run logs and continues; `n` skips cleanly, exit 0). The staged source stays inspectable at `/usr/src/ryzen_smu-1.d298366`.
 
-Build posture: the `ramsleuth-git` package compiles **only this repository** (branch-pinned, `--locked`, no third-party code in the build chroot) and depends on **no third-party AUR package** — the `ryzen-smu-dkms` extra is optional and co-install-safe (it ships the same helper under a different name, so the two packages never conflict). Every installed file is byte-identical to a file in this repository (auditable via `git show`), including the shipped helper and `install.sh` (`/usr/share/ramsleuth/install.sh`), so the whole flow can be re-run and audited post-install.
+Build posture: the `ramsleuth` and `ramsleuth-git` packages compile **only this repository** (tag-/branch-pinned, `--locked`, no third-party code in the build chroot), and `ramsleuth-bin` compiles nothing — it downloads the release tarball pinned by `sha256sums`. None depends on **any third-party AUR package** — the `ryzen-smu-dkms` extra is optional and co-install-safe (it ships the same helper under a different name, so it never conflicts with the RamSleuth packages). Every installed file is byte-identical to a file in this repository (auditable via `git show`), including the shipped helper and `install.sh` (`/usr/share/ramsleuth/install.sh`), so the whole flow can be re-run and audited post-install.
 
 ## CI
 
