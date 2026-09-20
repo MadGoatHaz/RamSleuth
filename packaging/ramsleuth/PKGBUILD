@@ -35,6 +35,11 @@
 #     artifact — AUR users can re-run/audit the full flow post-install)
 #   - LICENSE -> /usr/share/licenses/ramsleuth/LICENSE (MIT compliance, AUR requirement)
 #   - the application-menu entry -> /usr/share/applications/ramsleuth.desktop
+#   - the one-click setup helper scripts/ramsleuth-setup.sh -> /usr/bin/ramsleuth-setup
+#     (the pkexec-able root helper; polkit is Arch base — no new runtime dep; plan C21-01)
+#   - the shared polkit policy packaging/polkit/90-ramsleuth-setup.policy ->
+#     /usr/share/polkit-1/actions/90-ramsleuth-setup.policy (the org.freedesktop.
+#     ramsleuth.setup action; plan C21-02)
 #
 # No-panic contract: installation never fails on the absence of
 # the ryzen_smu module, AVX-512, or a display; after a bare install the
@@ -100,6 +105,15 @@ package() {
     # (7) the application-menu entry — shared asset next to the preset
     install -Dm644 "packaging/ramsleuth-git/ramsleuth.desktop" \
         "$pkgdir/usr/share/applications/ramsleuth.desktop"
+
+    # (8) the one-click setup helper — the pkexec-able root helper (plan C21-01);
+    # pkexec/polkit are Arch base, so no new runtime dep (plan §6)
+    install -Dm755 "scripts/ramsleuth-setup.sh" "$pkgdir/usr/bin/ramsleuth-setup"
+
+    # (9) the shared polkit policy — the org.freedesktop.ramsleuth.setup action
+    # (plan C21-02)
+    install -Dm644 "packaging/polkit/90-ramsleuth-setup.policy" \
+        "$pkgdir/usr/share/polkit-1/actions/90-ramsleuth-setup.policy"
 
     # NOTE: the ramsleuth group is created on the TARGET system by the .install
     # pre_install/pre_upgrade hooks (package() runs in the build env, not the target).
