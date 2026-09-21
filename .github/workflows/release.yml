@@ -16,7 +16,7 @@ name: Release
 #       bin/ramsleuth, bin/ramsleuth-tui, bin/ramsleuth-client,
 #       bin/ramsleuth-daemon, bin/ramsleuth-bench, bin/ramsleuth-telemetry,
 #       systemd/ramsleuth.service, systemd/ramsleuth.preset,
-#       scripts/install-ryzen-smu-dkms.sh, install.sh, LICENSE, ramsleuth.desktop,
+#       scripts/install-ryzen-smu-dkms.sh, install.sh, LICENSE, RamSleuth.desktop,
 #       ramsleuth-setup.sh, 90-ramsleuth-setup.policy,
 #       assets/icons/ (the hicolor tree, 8 sizes — one artifact; C21-27)
 #
@@ -95,7 +95,7 @@ jobs:
             target/release/ramsleuth-telemetry \
             systemd/ramsleuth.service \
             packaging/ramsleuth-git/ramsleuth.preset \
-            packaging/ramsleuth-git/ramsleuth.desktop \
+            packaging/ramsleuth-git/RamSleuth.desktop \
             scripts/install-ryzen-smu-dkms.sh \
             install.sh \
             LICENSE \
@@ -130,7 +130,7 @@ jobs:
           cp scripts/install-ryzen-smu-dkms.sh "$S/scripts/"
           cp install.sh "$S/"
           cp LICENSE "$S/"
-          cp packaging/ramsleuth-git/ramsleuth.desktop "$S/"
+          cp packaging/ramsleuth-git/RamSleuth.desktop "$S/"
           cp -r assets/icons "$S/"
           cp scripts/ramsleuth-setup.sh "$S/"
           cp packaging/polkit/90-ramsleuth-setup.policy "$S/"
