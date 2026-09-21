@@ -10,9 +10,9 @@
 //!
 //! - **Zone 1 — live memory controller & subtimings:** every cell of the
 //!   AMD (and Intel, if present) readout as `key: value` or `key: N/A
-//!   (<reason>)` — clocks/ratios (MCLK/UCLK/FCLK), gear/GDM, primary /
+//!   (<reason>)` — clocks/ratios (MCLK/UCLK/FCLK), GEAR_DOWN/CR, primary /
 //!   secondary / tertiary + turnaround timings, CAD drive/termination
-//!   (Ω), voltages.
+//!   (Ω), voltages (the VDDCR_VDD primary rail first).
 //! - **Zone 2 — AIDA-style benchmark engine:** the 4×4 grid (tier rows ×
 //!   Read/Write/Copy/Latency columns) with metric values or `N/A`, plus a
 //!   progress line (`idle` / `running` / `[i/total] …` / `done`).
@@ -46,7 +46,7 @@ use ratatui::Frame;
 
 use ramsleuth_bench::{BenchmarkGrid, Metric, StreamProgress, Tier};
 use ramsleuth_telemetry::amd_readout::{
-    CadBus, ClockReadout, DivMode, GearMode, RttValue, TimingSet, VoltageSet,
+    CadBus, ClockReadout, CommandRate, DivMode, RttValue, TimingSet, VoltageSet,
 };
 use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
@@ -784,8 +784,11 @@ fn readout_items(
         _ => CYAN,
     };
     items.push(cell_row("UCLK:MCLK", &clocks.div_mode, div_color, fmt_div));
-    items.push(cell_row("gear", &clocks.gear_mode, CYAN, fmt_gear));
-    items.push(cell_row("GDM", &clocks.gdm, CYAN, fmt_flag));
+    // The `GDM / CR` split (the GUI's D-6 form): the gear-down mode and
+    // the DRAM command rate each own a bare-value row; an absent cell
+    // degrades its row to the GUI's bare `N/A` (D-4).
+    items.push(bare_na_row("GEAR_DOWN", &clocks.gdm, CYAN, fmt_gear_down));
+    items.push(bare_na_row("CR", &clocks.command_rate, CYAN, fmt_cr));
     items.push(cell_row("PDM", &clocks.pdm, CYAN, fmt_flag));
 
     let primary: &[(&str, &Section<u16>)] = &[
@@ -841,6 +844,9 @@ fn readout_items(
     items.push(cell_row("CKE drive", &cad_bus.cke_drv, CYAN, fmt_ohms));
 
     items.push(sub_item("voltages"));
+    // The Vcore primary rail (the C12 frozen wire field) leads the
+    // section exactly as the GUI; on Intel it degrades to a bare N/A.
+    items.push(bare_na_row("VDDCR_VDD", &voltages.vcore_mv, CYAN, fmt_volts));
     // A SOC rail above 1.30 V is out of spec on AM5 -> amber warning.
     let soc_color = match &voltages.vddcr_soc_mv {
         Section::Value(mv) if f64::from(*mv) > 1300.0 => AMBER,
@@ -1089,6 +1095,22 @@ fn cell_row<T>(key: &str, section: &Section<T>, color: Color, fmt: impl Fn(&T) -
     }
 }
 
+/// A cell row in the GUI's bare-`N/A` form (D-4): the value in `color`,
+/// or a bare crimson `N/A` (the reason stays on the wire, never a
+/// parenthetical). The zone-1 `GEAR_DOWN` / `CR` / `VDDCR_VDD` rows
+/// mirror the GUI's per-row degradation exactly.
+fn bare_na_row<T>(
+    key: &str,
+    section: &Section<T>,
+    color: Color,
+    fmt: impl Fn(&T) -> String,
+) -> ListItem<'static> {
+    match section {
+        Section::Value(value) => row(key, &fmt(value), color),
+        Section::Na(_) => row(key, "N/A", CRIMSON),
+    }
+}
+
 /// One plain colored line.
 fn text_item(text: &str, color: Color) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(text.to_owned(), Style::default().fg(color))))
@@ -1163,12 +1185,22 @@ fn fmt_div(v: &DivMode) -> String {
     }
 }
 
-/// The SA:MEM gear multiplier: `1x` / `2x` / `4x`.
-fn fmt_gear(v: &GearMode) -> String {
+/// The `GEAR_DOWN` row value (the GUI's D-6 form): the gear-down
+/// mode's bare `Enabled` / `Disabled`.
+fn fmt_gear_down(v: &bool) -> String {
+    if *v {
+        "Enabled".to_owned()
+    } else {
+        "Disabled".to_owned()
+    }
+}
+
+/// The `CR` row value (the GUI's D-6 form): the DRAM command rate's
+/// bare `1T` / `2T`.
+fn fmt_cr(v: &CommandRate) -> String {
     match v {
-        GearMode::One => "1x".to_owned(),
-        GearMode::Two => "2x".to_owned(),
-        GearMode::Four => "4x".to_owned(),
+        CommandRate::OneT => "1T".to_owned(),
+        CommandRate::TwoT => "2T".to_owned(),
     }
 }
 
@@ -1433,7 +1465,8 @@ mod tests {
         assert!(text.contains("42.50"), "{text}");
         assert!(text.contains("1.10"), "{text}");
         assert!(text.contains("ns/hop"), "{text}");
-        // the unmeasured cells stay N/A (14 grid cells + the gear cell)
+        // the unmeasured cells stay N/A (14 grid cells + the zone-1 Na
+        // cells: rfc2, rtt_park, the bare-N/A VDDCR_VDD)
         assert!(text.matches("N/A").count() >= 13, "{text}");
     }
 
@@ -1517,7 +1550,7 @@ mod tests {
             ..Default::default()
         };
         // 100×62: the 3-row header leaves a 57-row inner zone surface
-        // (channel 0 is 54 rows), just enough to reach the second
+        // (channel 0 is 55 rows), just enough to reach the second
         // channel's label; a shorter terminal clips it.
         let text = draw_at(&state, 100, 62);
 
@@ -2087,5 +2120,154 @@ mod tests {
             "{}",
             lines[2]
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TUI-12 — the zone-1 VDDCR_VDD + GEAR_DOWN/CR rows.
+    // ------------------------------------------------------------------
+
+    /// (t) The zone-1 clocks section is the GUI's 7-row shape (D-6):
+    /// MCLK / UCLK / FCLK / UCLK:MCLK / GEAR_DOWN / CR / PDM (the old
+    /// `gear` row and the combined `GDM` row gone), and the voltages
+    /// section is the GUI's 5-row shape with the VDDCR_VDD primary rail
+    /// first (C12).
+    #[test]
+    fn zone1_clocks_and_voltages_row_shape() {
+        // 100×62: the 55-line AMD readout (incl. the voltages section)
+        // needs the taller surface — the 30-row default clips it.
+        let text = draw_at(&representative(), 100, 62);
+        // Zone 1 occupies the leftmost screen columns: extract its
+        // inner segment per row (the text between the first two
+        // vertical borders), skipping the frame corners.
+        let z1: Vec<String> = text
+            .split('\n')
+            .filter_map(|line| {
+                line.split('│')
+                    .nth(1)
+                    .map(|segment| segment.trim_end().to_owned())
+            })
+            .collect();
+
+        let rows_between = |from: &str, to: &str| -> Vec<&str> {
+            let start = z1
+                .iter()
+                .position(|line| line == from)
+                .expect("the start subheader must render");
+            let end = z1
+                .iter()
+                .position(|line| line == to)
+                .expect("the end marker must render");
+            z1[start + 1..end].iter().map(|line| line.as_str()).collect()
+        };
+
+        let clocks = rows_between("--- clocks & ratios ---", "--- primary timings ---");
+        assert_eq!(
+            clocks,
+            vec![
+                "MCLK: 1600.00 MHz",
+                "UCLK: 1600.00 MHz",
+                "FCLK: 1800.00 MHz",
+                "UCLK:MCLK: 1:2",
+                "GEAR_DOWN: Enabled",
+                "CR: 1T",
+                "PDM: off",
+            ],
+            "the 7 clocks rows (the GUI's AMD shape, D-6)"
+        );
+
+        let voltages = rows_between("--- voltages ---", "Intel: N/A (unsupported hardware)");
+        assert_eq!(
+            voltages,
+            vec![
+                "VDDCR_VDD: N/A",
+                "VDDCR_SOC: 1.150 V",
+                "VDDIO_MEM: 1.350 V",
+                "VDD_MISC: 1.100 V",
+                "VPP: 1.800 V",
+            ],
+            "the 5 voltages rows (VDDCR_VDD first, C12)"
+        );
+
+        // The old rows are gone entirely (no `gear` label, no `GDM`
+        // row — the combined form is split, D-6).
+        assert!(!z1.iter().any(|line| line.starts_with("gear:")));
+        assert!(!z1.iter().any(|line| line.starts_with("GDM:")));
+    }
+
+    /// (u) The VDDCR_VDD row (the C12 frozen wire field — the Vcore
+    /// primary rail): a measured value renders in volts (the mV→V
+    /// display rule); the Na cell (the Intel-shape cell) degrades to
+    /// the GUI's bare `N/A`.
+    #[test]
+    fn vddcr_vdd_value_and_na() {
+        // The fixture's vcore is Na (the Intel-shape cell) -> bare N/A.
+        let text = draw_at(&representative(), 100, 62);
+        assert!(text.contains("VDDCR_VDD: N/A"), "{text}");
+
+        // A measured Vcore rail: 1150 mV -> 1.150 V.
+        let mut state = representative();
+        if let Some(ref mut t) = state.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.voltages.vcore_mv = Section::Value(1150);
+            }
+        }
+        let text = draw_at(&state, 100, 62);
+        assert!(text.contains("VDDCR_VDD: 1.150 V"), "{text}");
+    }
+
+    /// (v) The CR row (the GUI's D-6 form): the command rate's bare
+    /// `1T` / `2T`; the Na cell degrades to the bare `N/A`.
+    #[test]
+    fn cr_value_and_na() {
+        // The fixture's command rate is 1T.
+        let text = draw_at(&representative(), 100, 62);
+        assert!(text.contains("CR: 1T"), "{text}");
+
+        let mut state = representative();
+        if let Some(ref mut t) = state.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.clocks.command_rate = Section::Value(CommandRate::TwoT);
+            }
+        }
+        let text = draw_at(&state, 100, 62);
+        assert!(text.contains("CR: 2T"), "{text}");
+
+        // The Na degradation (a driver-missing command rate).
+        let mut na = representative();
+        if let Some(ref mut t) = na.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.clocks.command_rate = Section::na(NaReason::DriverMissing);
+            }
+        }
+        let text = draw_at(&na, 100, 62);
+        assert!(text.contains("CR: N/A"), "{text}");
+    }
+
+    /// (w) The GEAR_DOWN row (the GUI's D-6 form): the gear-down flag's
+    /// bare `Enabled` / `Disabled`; the Na cell degrades to the bare
+    /// `N/A` (the value semantics — the `gdm` flag — unchanged).
+    #[test]
+    fn gear_down_text_matrix() {
+        // The fixture carries gdm = true.
+        let text = draw_at(&representative(), 100, 62);
+        assert!(text.contains("GEAR_DOWN: Enabled"), "{text}");
+
+        let mut off = representative();
+        if let Some(ref mut t) = off.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.clocks.gdm = Section::Value(false);
+            }
+        }
+        let text = draw_at(&off, 100, 62);
+        assert!(text.contains("GEAR_DOWN: Disabled"), "{text}");
+
+        let mut na = representative();
+        if let Some(ref mut t) = na.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.clocks.gdm = Section::na(NaReason::NotApplicable);
+            }
+        }
+        let text = draw_at(&na, 100, 62);
+        assert!(text.contains("GEAR_DOWN: N/A"), "{text}");
     }
 }
