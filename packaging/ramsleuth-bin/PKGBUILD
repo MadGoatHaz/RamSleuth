@@ -23,7 +23,7 @@
 #                                   lands with the v2.2.0 re-cut)
 #   90-ramsleuth-setup.policy     — the shared polkit policy (top-level; C21-17,
 #                                   lands with the v2.2.0 re-cut)
-#   assets/icons/                 — the hicolor icon tree (8 sizes, installed
+#   icons/                        — the hicolor icon tree (8 sizes, installed
 #                                   bare + NxN; top-level; C21-27, lands
 #                                   with the v2.2.0 re-cut; C21-42)
 #
@@ -32,7 +32,7 @@
 # finalized in C21-24b (it replaced the all-zeros fail-loud placeholder; the
 # v2.1.1 pin, finalized in C20-06, is replaced by this bump). The three new
 # top-level entries (ramsleuth-setup.sh, 90-ramsleuth-setup.policy,
-# assets/icons/) are in the v2.2.0 tarball by the C21-17/C21-27 contract;
+# icons/) are in the v2.2.0 tarball by the C21-17/C21-27 contract;
 # package() installs them
 # only when present (the guard — an old-tarball build skips them cleanly).
 #
@@ -125,7 +125,7 @@ package() {
     # the bare dirs; a bare-only install shows a missing-icon placeholder in
     # the menu, C21-42) + the 48px legacy /usr/share/pixmaps/ramsleuth.png
     # fallback (the Icon=ramsleuth resolution; plan C21-25, C21-42), at the
-    # tarball top level (the C21-27 contract: assets/icons/ staged
+    # tarball top level (the C21-27 contract: icons/ staged
     # preserving the hicolor layout). Every icon is ALSO installed under the
     # name RamSleuth.png (bare + NxN + pixmaps) — KWin's direct icon-name
     # fallback when the Wayland app_id "RamSleuth" is used verbatim as the
@@ -136,22 +136,22 @@ package() {
     # cleanly — the no-panic contract: the install must not fail on its
     # absence.
     for size in 16 24 32 48 64 128 256 512; do
-        if [ -f "assets/icons/hicolor/$size/apps/ramsleuth.png" ]; then
-            install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" \
+        if [ -f "icons/hicolor/$size/apps/ramsleuth.png" ]; then
+            install -Dm644 "icons/hicolor/$size/apps/ramsleuth.png" \
                 "$pkgdir/usr/share/icons/hicolor/$size/apps/ramsleuth.png"
-            install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" \
+            install -Dm644 "icons/hicolor/$size/apps/ramsleuth.png" \
                 "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/ramsleuth.png"
             # The app_id-named fallback (C21-45)
-            install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" \
+            install -Dm644 "icons/hicolor/$size/apps/ramsleuth.png" \
                 "$pkgdir/usr/share/icons/hicolor/$size/apps/RamSleuth.png"
-            install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" \
+            install -Dm644 "icons/hicolor/$size/apps/ramsleuth.png" \
                 "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/RamSleuth.png"
         fi
     done
-    if [ -f "assets/icons/hicolor/48/apps/ramsleuth.png" ]; then
-        install -Dm644 "assets/icons/hicolor/48/apps/ramsleuth.png" \
+    if [ -f "icons/hicolor/48/apps/ramsleuth.png" ]; then
+        install -Dm644 "icons/hicolor/48/apps/ramsleuth.png" \
             "$pkgdir/usr/share/pixmaps/ramsleuth.png"
-        install -Dm644 "assets/icons/hicolor/48/apps/ramsleuth.png" \
+        install -Dm644 "icons/hicolor/48/apps/ramsleuth.png" \
             "$pkgdir/usr/share/pixmaps/RamSleuth.png"
     fi
 
