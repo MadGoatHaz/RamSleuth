@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(iter.next(), Some(&9));
         assert_eq!(iter.size_hint(), (0, Some(0)));
         assert_eq!(iter.next(), None, "the (len + 1)th element must be None");
-        assert_eq!(iter.nth(0), None, "an exhausted iterator stays exhausted");
+        assert_eq!(iter.next(), None, "an exhausted iterator stays exhausted");
     }
 
     /// (h) The live window crossing the physical end of the backing
