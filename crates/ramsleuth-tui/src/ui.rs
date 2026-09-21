@@ -48,10 +48,10 @@ use ramsleuth_bench::{BenchmarkGrid, Metric, StreamProgress, Tier};
 use ramsleuth_telemetry::amd_readout::{
     CadBus, ClockReadout, DivMode, GearMode, RttValue, TimingSet, VoltageSet,
 };
-use ramsleuth_telemetry::cpuid::CpuVendor;
+use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
-use ramsleuth_telemetry::SystemMemoryTelemetry;
+use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
 
 use crate::graphs::GraphState;
 
@@ -225,8 +225,10 @@ pub struct AppState {
 
 /// Render the three-zone dashboard into `frame` from `state`.
 ///
-/// The screen splits vertically into a one-row header strip (title + CPU +
-/// daemon + key legend) and the three zones side by side. Every zone is a
+/// The screen splits vertically into a three-row header strip (line 1
+/// the title + platform tag + daemon status + key legend, line 2 the
+/// CPU/platform identity, line 3 the RAM summary slot — TUI-11) and the
+/// three zones side by side. Every zone is a
 /// titled `Block` on a slate background; content that does not fit is
 /// clipped, never wrapped or scrolled. Safe at any terminal size — the
 /// all-`Na`, empty-SPD, daemon-down, and default states all render without
@@ -235,10 +237,18 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Fill(1)])
+        .constraints([Constraint::Length(3), Constraint::Fill(1)])
         .split(area);
 
-    frame.render_widget(Paragraph::new(header_line(state)), outer[0]);
+    let width = usize::from(outer[0].width);
+    frame.render_widget(
+        Paragraph::new(vec![
+            header_line1(state, width),
+            header_line2(state),
+            header_line3(state),
+        ]),
+        outer[0],
+    );
 
     let zones = Layout::default()
         .direction(Direction::Horizontal)
@@ -263,36 +273,184 @@ fn zone_block(title: &'static str) -> Block<'static> {
         .style(Style::default().bg(SLATE))
 }
 
-/// The header strip: `RamSleuth` + the CPU identity + the daemon state +
-/// the key legend (one line, no wrap).
-fn header_line(state: &AppState) -> Line<'static> {
-    let cpu = match &state.telemetry {
-        Some(telemetry) => format!(
-            "{} · {}",
-            vendor_text(&telemetry.cpu.vendor),
-            telemetry.cpu.brand
-        ),
-        None => "cpu: --".to_owned(),
-    };
-    let (daemon, daemon_color) = if state.error.is_some() {
-        let status = if state.daemon_status.is_empty() {
+/// Header line 1 (Grand Design §3.1, TUI-10 — the GUI's line-1 mirror):
+/// `RamSleuth v<version> [<platform tag>] · daemon: <status> · <key
+/// legend>`. The title is bold cyan; the bracketed platform tag
+/// ([`platform_tag`]) is dim (the honest bare `Platform` without
+/// telemetry); the daemon status keeps the existing color rule (crimson
+/// on error, dim otherwise — the empty-status states degrade to `down`
+/// on error, `—` without); the full §2.2 key legend is dim and truncated
+/// to the `width` budget on entry boundaries ([`key_legend`]).
+fn header_line1(state: &AppState, width: usize) -> Line<'static> {
+    let title = format!("RamSleuth v{}", env!("CARGO_PKG_VERSION"));
+    let tag = platform_tag(state.telemetry.as_ref().map(|t| &t.cpu.vendor));
+    let status = if state.daemon_status.is_empty() {
+        if state.error.is_some() {
             "down"
         } else {
-            state.daemon_status.as_str()
-        };
-        (format!("daemon: {status}"), CRIMSON)
-    } else if state.daemon_status.is_empty() {
-        ("daemon: --".to_owned(), DIM)
+            "—"
+        }
     } else {
-        (format!("daemon: {}", state.daemon_status), DIM)
+        state.daemon_status.as_str()
     };
+    let status_color = if state.error.is_some() { CRIMSON } else { DIM };
+    // The legend budget: the fixed prefix measured in columns (the em
+    // dash is the only non-ASCII cell; `chars()` counts it as one) plus
+    // the ` · ` separator that precedes the legend.
+    let fixed = title.chars().count()
+        + format!(" [{tag}]").chars().count()
+        + format!(" · daemon: {status}").chars().count();
+    let budget = width.saturating_sub(fixed + 3);
+    let legend = key_legend(budget);
+    let mut spans = vec![
+        Span::styled(title, Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" [{tag}]"), Style::default().fg(DIM)),
+        Span::styled(format!(" · daemon: {status}"), Style::default().fg(status_color)),
+    ];
+    if !legend.is_empty() {
+        spans.push(Span::styled(format!(" · {legend}"), Style::default().fg(DIM)));
+    }
+    Line::from(spans)
+}
+
+/// Header line 2 (the GUI `cpu_line_text` mirror, C6-20): `CPU: <brand>
+/// <clock> | <motherboard> | BIOS <bios> | <AGESA|SMU>` — the CPUID
+/// brand + the platform clock in the selected unit (the `clock_mhz`
+/// setting, [`format_clock`]), the DMI motherboard / BIOS cells (each
+/// `Na` degrades to its `N/A` text), and the AGESA/SMU provenance
+/// fragment ([`age_fragment`] — the true-AGESA-suppresses-SMU
+/// precedence, C8-11/D-1). No telemetry degrades the cells to `—`
+/// placeholders (the fragment stays the honest `AGESA N/A`) — never a
+/// panic.
+fn header_line2(state: &AppState) -> Line<'static> {
+    let Some(telemetry) = &state.telemetry else {
+        return Line::from(Span::styled(
+            "CPU: — | — | BIOS — | AGESA N/A",
+            Style::default().fg(DIM),
+        ));
+    };
+    let platform = &telemetry.platform;
+    let clock = match &platform.cpu_clock_mhz {
+        Section::Value(mhz) => format_clock(*mhz, state.settings.clock_mhz),
+        Section::Na(_) => "N/A".to_owned(),
+    };
+    let age = age_fragment(platform);
+    let age_style = if age == "AGESA N/A" {
+        Style::default().fg(DIM)
+    } else {
+        Style::default().fg(CYAN)
+    };
+    let value = Style::default().fg(CYAN);
+    let label = Style::default().fg(DIM);
     Line::from(vec![
-        Span::styled("RamSleuth", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled(" live memory dashboard", Style::default().fg(DIM)),
-        Span::styled(format!("  [{cpu}]"), Style::default().fg(DIM)),
-        Span::styled(format!("  [{daemon}]"), Style::default().fg(daemon_color)),
-        Span::styled("  [R]efresh [S]napshot [Q]uit", Style::default().fg(DIM)),
+        Span::styled("CPU: ", label),
+        Span::styled(format!("{} {}", telemetry.cpu.brand, clock), value),
+        Span::styled(" | ", label),
+        Span::styled(cell_text(&platform.motherboard), value),
+        Span::styled(" | BIOS ", label),
+        Span::styled(cell_text(&platform.bios), value),
+        Span::styled(" | ", label),
+        Span::styled(age, age_style),
     ])
+}
+
+/// Header line 3 (the TUI-11 RAM-summary slot): a dim `RAM: —`
+/// placeholder until TUI-11 lands the TUI-local `dimm_summary` /
+/// `channel_mode` / `sync_mode` composition (`RAM: <total> (<summary>)
+/// <max SPD> | <channel> | <note> | Mode: <sync>`).
+fn header_line3(_state: &AppState) -> Line<'static> {
+    Line::from(Span::styled("RAM: —", Style::default().fg(DIM)))
+}
+
+/// Line 1's platform tag (the GUI's line-1 tag mirror, C6-20): the CPU
+/// vendor + a best-effort socket family — the Zen 1–3 map to `AM4`,
+/// Zen 4/5 to `AM5`, Intel to the generic `LGA` family (a generation
+/// does not identify a socket number unambiguously — mobile and desktop
+/// share generations), and no telemetry (or an unrecognized vendor)
+/// carries the honest bare `Platform`.
+fn platform_tag(vendor: Option<&CpuVendor>) -> String {
+    match vendor {
+        Some(CpuVendor::Amd(AmdZen::Zen1 | AmdZen::Zen2 | AmdZen::Zen3)) => {
+            "AMD AM4 Platform".to_owned()
+        }
+        Some(CpuVendor::Amd(AmdZen::Zen4 | AmdZen::Zen5)) => "AMD AM5 Platform".to_owned(),
+        Some(CpuVendor::Intel(_)) => "Intel LGA Platform".to_owned(),
+        _ => "Platform".to_owned(),
+    }
+}
+
+/// The §2.2 frozen key map (canonical R/S/Q-first order) as the compact
+/// dim legend line 1 carries: the longest prefix of entries that fits
+/// `budget` columns (`" · "` between entries) — an entry that does not
+/// fit is dropped whole, never cut mid-token (the width-truncation
+/// rule); a zero budget yields the empty legend.
+fn key_legend(budget: usize) -> String {
+    const ENTRIES: &[&str] = &[
+        "R refresh", "S snapshot", "Q quit", "B bench", "M memory", "X burn-in",
+        "C cancel", "E export", "G graphs", "T settings", "D reqs", "P poll",
+        "U cap", "K clock", "A auto", "W window",
+    ];
+    let mut text = String::new();
+    for entry in ENTRIES {
+        let candidate = if text.is_empty() {
+            entry.to_string()
+        } else {
+            format!("{text} · {entry}")
+        };
+        if candidate.chars().count() > budget {
+            break;
+        }
+        text = candidate;
+    }
+    text
+}
+
+/// One clock readout (the carried MHz wire value) as display text in
+/// the selected clock unit (the GUI `format_clock`/`trim` mirror,
+/// C7-11): the MHz arm keeps the value (`3500 MHz`), the GHz arm ÷1000
+/// (`3.5 GHz`); a whole number renders without decimals, one decimal
+/// otherwise; a non-finite value degrades to the honest `N/A`.
+fn format_clock(mhz: f64, clock_mhz: bool) -> String {
+    if !mhz.is_finite() {
+        return "N/A".to_owned();
+    }
+    let trim = |v: f64| {
+        if (v - v.round()).abs() < 0.05 {
+            format!("{v:.0}")
+        } else {
+            format!("{v:.1}")
+        }
+    };
+    if clock_mhz {
+        format!("{} MHz", trim(mhz))
+    } else {
+        format!("{} GHz", trim(mhz / 1000.0))
+    }
+}
+
+/// One `Section<String>` cell as display text (the header's honest
+/// degradation rule): the contained value, or `N/A`.
+fn cell_text(cell: &Section<String>) -> String {
+    match cell {
+        Section::Value(v) => v.clone(),
+        Section::Na(_) => "N/A".to_owned(),
+    }
+}
+
+/// Line 2's AGESA/SMU provenance fragment (the GUI `age_fragment`
+/// mirror, C8-11/D-1): the header labels the value by where it came
+/// from — a true AGESA token (the DMI BIOS string scan) renders
+/// `AGESA <v>` and suppresses the SMU value (the D-1 precedence); else
+/// a shape-checked `ryzen_smu` firmware version renders under its own
+/// `SMU` label (never the reported `AGESA <smu value>` mislabel); else
+/// the honest `AGESA N/A`. One value, one true label — no hybrid, never
+/// fabricated.
+fn age_fragment(platform: &SystemPlatform) -> String {
+    match (&platform.agesa, &platform.smu_version) {
+        (Section::Value(v), _) => format!("AGESA {v}"),
+        (Section::Na(_), Section::Value(v)) => format!("SMU {v}"),
+        (Section::Na(_), Section::Na(_)) => "AGESA N/A".to_owned(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -714,16 +872,6 @@ fn na_text(reason: &NaReason) -> String {
     }
 }
 
-/// The CPU vendor as a display string (the snapshot carries vendor +
-/// brand only — no family / stepping / feature flags).
-fn vendor_text(vendor: &CpuVendor) -> String {
-    match vendor {
-        CpuVendor::Amd(zen) => format!("AMD {zen:?}"),
-        CpuVendor::Intel(gen) => format!("Intel {gen:?}"),
-        CpuVendor::Unknown => "unknown".to_owned(),
-    }
-}
-
 /// The display name of a grid tier row (`Mem` — the AIDA64 grid
 /// convention, which also fits the column budget).
 fn tier_name(tier: Tier) -> &'static str {
@@ -815,7 +963,7 @@ mod tests {
     use ratatui::Terminal;
     use ramsleuth_bench::BenchOp;
     use ramsleuth_telemetry::amd_readout::{AmdReadout, CommandRate};
-    use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo};
+    use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, IntelGen};
     use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
     use ramsleuth_telemetry::SystemPlatform;
 
@@ -984,6 +1132,8 @@ mod tests {
         assert!(text.contains("3200 MT/s"), "{text}");
         assert!(text.contains("16384 Mbit"), "{text}");
         assert!(text.contains("XMP 1"), "{text}");
+        // header line 2 (TUI-10): the CPU/platform identity
+        assert!(text.contains("CPU: Ryzen 9 5950X"), "{text}");
         assert!(text.contains("daemon: up"), "{text}");
     }
 
@@ -1116,13 +1266,191 @@ mod tests {
             daemon_status: "up".to_owned(),
             ..Default::default()
         };
-        // 100×60: zone 1's 27-row surface would clip the second channel
-        // block; a taller terminal reaches it.
-        let text = draw_at(&state, 100, 60);
+        // 100×62: the 3-row header leaves a 57-row inner zone surface
+        // (channel 0 is 54 rows), just enough to reach the second
+        // channel's label; a shorter terminal clips it.
+        let text = draw_at(&state, 100, 62);
 
         assert!(text.contains("Intel ch 0"), "{text}");
         assert!(text.contains("Intel ch 1"), "{text}");
         assert!(text.contains("1600.00 MHz"), "{text}");
         assert!(text.contains("SPD: N/A"), "{text}");
+    }
+
+    /// (f) The 3-line header (TUI-10): line 1 the title + platform tag
+    /// + daemon status, line 2 the CPU/platform identity (the
+    /// representative's Zen 3 / 3500 MHz / Test Board / BIOS 1.0 /
+    /// all-Na AGESA+SMU shape), line 3 the RAM summary slot (the
+    /// TUI-11 placeholder).
+    #[test]
+    fn header_is_three_lines_with_values() {
+        let text = draw(&representative());
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "the header occupies the top three rows");
+        let l1 = &lines[0];
+        assert!(
+            l1.contains(&format!("RamSleuth v{}", env!("CARGO_PKG_VERSION"))),
+            "{l1}"
+        );
+        assert!(l1.contains("[AMD AM4 Platform]"), "{l1}");
+        assert!(l1.contains("daemon: up · /tmp/ramsleuth.sock"), "{l1}");
+        assert_eq!(
+            lines[1],
+            "CPU: Ryzen 9 5950X 3500 MHz | Test Board | BIOS 1.0 | AGESA N/A",
+            "{}",
+            lines[1]
+        );
+        assert_eq!(lines[2], "RAM: —", "{}", lines[2]);
+    }
+
+    /// (g) The no-telemetry header degrades to the `—` / `N/A`
+    /// placeholders (TUI-10): line 1 the honest bare `Platform` tag +
+    /// `daemon: —`, line 2 the full placeholder line, line 3 the RAM
+    /// placeholder — never a panic.
+    #[test]
+    fn header_no_telemetry_placeholders() {
+        let text = draw(&AppState::default());
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        let l1 = &lines[0];
+        assert!(l1.contains("[Platform]"), "{l1}");
+        assert!(l1.contains("daemon: —"), "{l1}");
+        assert_eq!(lines[1], "CPU: — | — | BIOS — | AGESA N/A", "{}", lines[1]);
+        assert_eq!(lines[2], "RAM: —", "{}", lines[2]);
+    }
+
+    /// (h) The AGESA/SMU precedence matrix (the GUI `age_fragment`
+    /// mirror, C8-11/D-1): a true AGESA wins and suppresses the SMU
+    /// value; else the shape-checked `ryzen_smu` firmware version
+    /// renders under its own `SMU` label; else the honest `AGESA N/A`.
+    /// No hybrid, never fabricated.
+    #[test]
+    fn age_fragment_by_provenance() {
+        let base = SystemPlatform {
+            cpu_clock_mhz: Section::Value(3600.0),
+            motherboard: Section::Value("ProArt X570-CREATOR".to_owned()),
+            bios: Section::Value("5601".to_owned()),
+            agesa: Section::na(NaReason::NotApplicable),
+            smu_version: Section::na(NaReason::NotApplicable),
+        };
+        assert_eq!(age_fragment(&base), "AGESA N/A");
+
+        let smu = SystemPlatform {
+            smu_version: Section::Value("56.78.0".to_owned()),
+            ..base.clone()
+        };
+        assert_eq!(age_fragment(&smu), "SMU 56.78.0");
+
+        let agesa = SystemPlatform {
+            agesa: Section::Value("ComboAm4v2 PI 1.2.0.12".to_owned()),
+            ..base.clone()
+        };
+        assert_eq!(age_fragment(&agesa), "AGESA ComboAm4v2 PI 1.2.0.12");
+
+        // The precedence (D-1): a true AGESA suppresses the SMU value.
+        let both = SystemPlatform {
+            agesa: Section::Value("ComboAm4v2 PI 1.2.0.12".to_owned()),
+            smu_version: Section::Value("56.78.0".to_owned()),
+            ..base.clone()
+        };
+        assert_eq!(age_fragment(&both), "AGESA ComboAm4v2 PI 1.2.0.12");
+    }
+
+    /// (i) The platform-tag matrix (the GUI's line-1 tag mirror): Zen
+    /// 1–3 → `AM4`, Zen 4/5 → `AM5`, Intel → the generic `LGA` family;
+    /// no telemetry (`None`) and the unrecognized vendor carry the
+    /// honest bare `Platform`.
+    #[test]
+    fn platform_tag_matrix() {
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Amd(AmdZen::Zen1))),
+            "AMD AM4 Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Amd(AmdZen::Zen2))),
+            "AMD AM4 Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Amd(AmdZen::Zen3))),
+            "AMD AM4 Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Amd(AmdZen::Zen4))),
+            "AMD AM5 Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Amd(AmdZen::Zen5))),
+            "AMD AM5 Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Intel(IntelGen::Skylake))),
+            "Intel LGA Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Intel(IntelGen::Unrecognized))),
+            "Intel LGA Platform"
+        );
+        assert_eq!(platform_tag(Some(&CpuVendor::Unknown)), "Platform");
+        assert_eq!(platform_tag(None), "Platform");
+    }
+
+    /// (j) The line-2 clock unit knob (the GUI `format_clock`/`trim`
+    /// mirror, C7-11): MHz keeps the carried wire value (`3500 MHz`),
+    /// GHz ÷1000 (`3.5 GHz`); the trim arms (whole → no decimals,
+    /// else one) and the non-finite → `N/A` degradation.
+    #[test]
+    fn header_line2_clock_unit_knob() {
+        let mut state = representative();
+        state.settings.clock_mhz = false;
+        let text = draw(&state);
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        assert_eq!(
+            lines[1],
+            "CPU: Ryzen 9 5950X 3.5 GHz | Test Board | BIOS 1.0 | AGESA N/A",
+            "{}",
+            lines[1]
+        );
+        assert_eq!(format_clock(3600.0, true), "3600 MHz");
+        assert_eq!(format_clock(1800.0, true), "1800 MHz");
+        assert_eq!(format_clock(3600.0, false), "3.6 GHz");
+        assert_eq!(format_clock(1800.0, false), "1.8 GHz");
+        assert_eq!(format_clock(f64::NAN, true), "N/A");
+        assert_eq!(format_clock(f64::INFINITY, false), "N/A");
+    }
+
+    /// (k) The key legend truncates by width on entry boundaries
+    /// (TUI-10): at a wide terminal the full §2.2 map fits (the last
+    /// entry `W window` present); at the 100-col test surface a
+    /// prefix of it (the entries that no longer fit are dropped
+    /// whole, never cut mid-token, and the line stays in budget); at a
+    /// narrow surface with a short daemon status only the first entry
+    /// survives (the measured truncation points: 250 cols → all 16
+    /// entries, 100 cols → `R refresh · S snapshot`, 60 cols →
+    /// `R refresh`).
+    #[test]
+    fn header_legend_truncated_by_width() {
+        // Wide (250 cols): the full legend fits.
+        let text = draw_at(&representative(), 250, 30);
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        assert!(lines[0].contains("R refresh"), "{}", lines[0]);
+        assert!(lines[0].contains("W window"), "{}", lines[0]);
+
+        // 100 cols: the prefix ends before the third entry.
+        let text = draw(&representative());
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        let l1 = &lines[0];
+        assert!(l1.contains("S snapshot"), "{l1}");
+        assert!(!l1.contains("Q quit"), "{l1}");
+        assert!(!l1.contains("B bench"), "{l1}");
+        assert!(l1.chars().count() <= 100, "{}", l1.chars().count());
+
+        // 60 cols with a short daemon status: only the first entry.
+        let mut state = representative();
+        state.daemon_status = "up".to_owned();
+        let text = draw_at(&state, 60, 30);
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        let l1 = &lines[0];
+        assert!(l1.contains("R refresh"), "{l1}");
+        assert!(!l1.contains("S snapshot"), "{l1}");
+        assert!(l1.chars().count() <= 60, "{}", l1.chars().count());
     }
 }
