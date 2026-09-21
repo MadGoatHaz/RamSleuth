@@ -65,6 +65,18 @@
 //!   `assets/icons/ramsleuth-256.png` PNG — C21-25), decoded once at
 //!   startup; a decode failure degrades to eframe's default icon
 //!   (no-panic, D5).
+//! - **Post-setup restart prompt (C21-36):** a successful one-click
+//!   setup (the helper's exit 0, the `done` outcome) leaves the
+//!   *current* process without the new group membership (it is
+//!   picked up only on re-exec), so the app shows a modal
+//!   "Setup complete" dialog: `Restart now` spawns a detached new
+//!   instance of the current executable (all streams nulled, the
+//!   `Child` dropped so it survives) and exits this process — the
+//!   fresh window opens with the membership active; `Later`
+//!   dismisses it (the app keeps running as-is). The dialog's
+//!   full-screen, topmost layer blocks every other interaction
+//!   while open; a failed setup keeps the existing `failed:` strip
+//!   line (no dialog).
 //!
 //! **No-panic contract (plan D5):** a missing daemon never crashes the
 //! GUI — the poller records the friendly error in the state (the
@@ -102,7 +114,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
@@ -411,9 +423,9 @@ fn notice_color(text: &str) -> egui::Color32 {
 
 /// The eframe app (P3-30): the shared state, the poller's command
 /// channel, the stop / cancel flags, the settings-panel visibility,
-/// the one-click setup outcome (C21-06), the window icon (C21-26),
-/// the export dir, the poller thread, and the transient header
-/// notice.
+/// the one-click setup outcome (C21-06), the post-setup restart
+/// prompt's dismissal (C21-36), the window icon (C21-26), the export
+/// dir, the poller thread, and the transient header notice.
 struct RamSleuthApp {
     /// The shared presentation state — includes the in-memory
     /// `GuiSettings` knobs (C6-26 / C6-27 / C6-30: the poll cadence +
@@ -481,6 +493,13 @@ struct RamSleuthApp {
     /// The transient header notice: the last F2 / F3 result text +
     /// when it was set (it fades after [`NOTICE_TTL`]).
     notice: Option<(String, Instant)>,
+    /// The C21-36 post-setup restart prompt's dismissal: `true`
+    /// once the user has chosen `Later` — the modal dialog (shown
+    /// while the setup outcome is `done`, the helper's exit 0)
+    /// stays closed for this process (a second, idempotent setup
+    /// run does not re-prompt); a `Restart now` exits the process
+    /// instead, so the fresh instance starts `false`.
+    restart_prompt_dismissed: bool,
 }
 
 impl Drop for RamSleuthApp {
@@ -523,23 +542,41 @@ impl eframe::App for RamSleuthApp {
         if expired {
             self.notice = None;
         }
+        // The C21-36 post-setup restart prompt's open state: the
+        // helper succeeded (the `done` outcome) and the user has
+        // not dismissed it with `Later` — while open, the dialog's
+        // two buttons are the only interactive content: the key
+        // legend below is gated, the dispatch skipped, and the
+        // dialog's full-screen layer consumes the pointer over the
+        // rest of the UI. One brief read, D6 — no I/O on the
+        // render thread.
+        let prompt_open = {
+            let setup = self.setup.read().unwrap();
+            setup_prompt_open(setup.done, self.restart_prompt_dismissed)
+        };
         // The keyboard (C6-30, the spec's key legend): a fresh
         // key-down — egui marks OS key-repeats `repeat: true`, so a
         // held key fires exactly once, the button's click semantics —
         // routes through the same [`GuiAction`] dispatch as the
         // status zone's buttons (D-C7: keys and buttons are
         // behaviorally identical).
-        let keyed_action = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|event| match event {
-                    egui::Event::Key { key, pressed: true, repeat: false, .. } => {
-                        key_action(*key)
-                    }
-                    _ => None,
-                })
-                .next()
-        });
+        let keyed_action = if prompt_open {
+            // The modal dialog blocks the key legend (F2 / F3 / Q)
+            // while open.
+            None
+        } else {
+            ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|event| match event {
+                        egui::Event::Key { key, pressed: true, repeat: false, .. } => {
+                            key_action(*key)
+                        }
+                        _ => None,
+                    })
+                    .next()
+            })
+        };
         // The top strips allocate in a fixed per-frame order (header,
         // requirements while one is present, settings while open,
         // then the central panel): each takes its own brief lock
@@ -588,10 +625,16 @@ impl eframe::App for RamSleuthApp {
         // One dispatch path for both sources: the button (the
         // explicit affordance) runs first, then a distinct key
         // action; a duplicate (button + key, same action) fires once.
-        self.handle_action(ctx, button_action);
-        if let Some(keyed_action) = keyed_action {
-            if keyed_action != button_action {
-                self.handle_action(ctx, keyed_action);
+        // While the C21-36 modal prompt is open, no dispatch — the
+        // dialog's full-screen layer has consumed the pointer and
+        // the key legend is gated above: the dialog's two buttons
+        // are the only interactive content.
+        if !prompt_open {
+            self.handle_action(ctx, button_action);
+            if let Some(keyed_action) = keyed_action {
+                if keyed_action != button_action {
+                    self.handle_action(ctx, keyed_action);
+                }
             }
         }
 
@@ -609,6 +652,13 @@ impl eframe::App for RamSleuthApp {
         // OS window).
         if self.graphs_open.load(Ordering::Relaxed) {
             show_graphs_viewport(ctx, &self.state, &self.graphs_open, &self.icon);
+        }
+
+        // The C21-36 modal prompt: allocated last (topmost) so its
+        // full-screen layer covers the header, the strips, and the
+        // central panel.
+        if prompt_open {
+            self.render_setup_complete_dialog(ctx);
         }
 
         // ~60 FPS: eframe's vsync drives the present; this only asks
@@ -1312,6 +1362,111 @@ impl RamSleuthApp {
             }
         }
     }
+
+    /// The C21-36 modal dialog (rendered from
+    /// [`RamSleuthApp::update`] while `setup_prompt_open`): two
+    /// topmost (`Order::Foreground`) areas — the dimmed full-screen
+    /// block (allocated first) that consumes every pointer event
+    /// over the dashboard (the rest of the UI is unreachable while
+    /// open), and the centered "Setup complete" box (allocated after
+    /// the block — the hit test picks the frontmost widget under
+    /// the pointer, so the dialog's buttons beat the block) in the
+    /// SETUP strip's palette: the SLATE-filled, 1-pt-CYAN-stroked
+    /// frame, the strong-CYAN title, and its two buttons —
+    /// `Restart now` (the primary CYAN fill + the SLATE text, the
+    /// wizard button's precedent) and `Later` (plain, the `Got it`
+    /// precedent). A new area is hidden by egui for exactly one
+    /// frame (the first-frame placement heuristic — hidden also
+    /// disables it, so the block's input capture comes online with
+    /// the visibility, one frame in), and the dialog paints from
+    /// the second frame on. The `Restart now` spawn is the render
+    /// thread's one-shot process exit (the F2 / F3 export's
+    /// one-file-write side-effect precedent — both terminal
+    /// actions, no daemon I/O).
+    fn render_setup_complete_dialog(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        // The dim + the modal block: its own full-screen area — the
+        // dimmed paint + a full-screen click allocation that
+        // consumes every pointer event outside the dialog's
+        // buttons.
+        egui::Area::new(egui::Id::new("ramsleuth_setup_complete_block"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.set_max_size(screen.size());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
+                let _ = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+            });
+        // The centered dialog: a second area, allocated after the
+        // block, so its buttons are the frontmost interactive
+        // widgets. The layout centers the frame on both axes at its
+        // natural size (the centered `…_justified` variant would
+        // stretch it to fill the screen).
+        egui::Area::new(egui::Id::new("ramsleuth_setup_complete"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.set_max_size(screen.size());
+                ui.with_layout(
+                    egui::Layout::from_main_dir_and_cross_align(
+                        egui::Direction::TopDown,
+                        egui::Align::Center,
+                    ),
+                    |ui| {
+                        let frame = egui::Frame::default()
+                            .fill(SLATE)
+                            .stroke(egui::Stroke::new(1.0_f32, CYAN))
+                            .inner_margin(egui::Margin::symmetric(12.0, 10.0));
+                        frame.show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Setup complete")
+                                    .strong()
+                                    .color(CYAN),
+                            );
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    "RamSleuth was set up successfully. The app must be \
+                                     restarted for the changes to take effect.",
+                                )
+                                .wrap(true),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                // Primary (the wizard button's
+                                // precedent): the CYAN fill + the
+                                // SLATE text.
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("Restart now").color(SLATE),
+                                        )
+                                        .fill(CYAN),
+                                    )
+                                    .clicked()
+                                {
+                                    // The in-place relaunch: a
+                                    // detached new instance + this
+                                    // process's exit. A spawn
+                                    // failure degrades to the
+                                    // `Later` close (no-panic, D5).
+                                    if !restart_in_place() {
+                                        self.restart_prompt_dismissed = true;
+                                    }
+                                }
+                                // Secondary (the `Got it`
+                                // precedent): plain — the app keeps
+                                // running as-is.
+                                if ui.add(egui::Button::new("Later")).clicked() {
+                                    self.restart_prompt_dismissed = true;
+                                }
+                            });
+                        });
+                    },
+                );
+            });
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1437,6 +1592,55 @@ fn spawn_setup_worker(setup: Arc<RwLock<SetupOutcome>>, with_dkms: bool, user: S
         // spawn).
         *setup.write().unwrap() = outcome;
     });
+}
+
+// ---------------------------------------------------------------------
+// The post-setup restart prompt (C21-36 — the fresh-install UX): a
+// successful helper run (exit 0, the `done` outcome) leaves the
+// *current* process without the new group membership (it is picked
+// up only on re-exec), so the app shows a modal "Setup complete"
+// dialog offering the in-place relaunch — `Restart now` (a detached
+// new instance + this process's exit) or `Later` (the app keeps
+// running as-is). A failed run keeps the existing `failed:` strip
+// line (no dialog).
+// ---------------------------------------------------------------------
+
+/// The restart prompt's open gate: shown while the setup outcome is
+/// `done` (the helper exited 0) and the user has not dismissed it
+/// with `Later`. Pure — `update` and the headless test share the one
+/// rule.
+fn setup_prompt_open(done: bool, dismissed: bool) -> bool {
+    done && !dismissed
+}
+
+/// Relaunch the app in-place (the `Restart now` button): spawn a
+/// detached new instance of the current executable — all three
+/// streams nulled (no terminal dependency), the environment
+/// inherited (the display vars), the `Child` deliberately dropped
+/// (no `wait` — it survives) — then exit this process (0): the
+/// fresh instance's window opens with the new group membership
+/// active (Wayland / X11 alike — a fresh OS window, no special
+/// hand-off). Returns `false` only when the spawn fails (an
+/// unresolvable `current_exe`, a fork failure — no-panic, D5): the
+/// caller degrades to the `Later` close (the app keeps running, the
+/// user can relaunch manually).
+fn restart_in_place() -> bool {
+    match std::env::current_exe() {
+        Ok(exe) => match Command::new(exe)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(_child) => {
+                // The new instance is detached: dropping the `Child`
+                // does not kill it.
+                std::process::exit(0);
+            }
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1665,6 +1869,7 @@ fn main() -> ExitCode {
                 out_dir,
                 poller: Some(poller),
                 notice: None,
+                restart_prompt_dismissed: false,
             })
         }),
     );
@@ -2860,6 +3065,7 @@ mod tests {
                 out_dir: out_dir.clone(),
                 poller: None,
                 notice: None,
+                restart_prompt_dismissed: false,
             };
             let gate = |app: &RamSleuthApp| app.state.read().unwrap().settings.refresh_enabled;
 
@@ -2929,6 +3135,7 @@ mod tests {
                 out_dir: out_dir.clone(),
                 poller: None,
                 notice: None,
+                restart_prompt_dismissed: false,
             };
             let data = TelemetryData::default();
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(w, h));
@@ -3163,5 +3370,163 @@ mod tests {
         let embedded = window_icon().expect("the committed 256×256 master decodes");
         assert_eq!((embedded.width, embedded.height), (256, 256));
         assert_eq!(embedded.rgba.len(), 256 * 256 * 4);
+    }
+
+    // ------------------------------------------------------------------
+    // C21-36: the post-setup restart prompt (headless: the modal
+    // render + the gate + the `Later` dismissal; `Restart now` is a
+    // process exit and is never clicked in tests).
+    // ------------------------------------------------------------------
+
+    /// (p1) The open gate: `done` + not dismissed → open; a
+    /// dismissed prompt stays closed; a non-done outcome never
+    /// opens.
+    #[test]
+    fn setup_prompt_open_gate() {
+        assert!(
+            setup_prompt_open(true, false),
+            "done + undismissed must open the prompt"
+        );
+        assert!(
+            !setup_prompt_open(true, true),
+            "a dismissed prompt must stay closed"
+        );
+        assert!(
+            !setup_prompt_open(false, false),
+            "a non-done outcome must never open the prompt"
+        );
+        assert!(!setup_prompt_open(false, true));
+    }
+
+    /// (p2) The modal dialog renders headless — the title, the body,
+    /// and both buttons paint — and a two-frame press / release on
+    /// `Later` (the graph.rs idiom) dismisses it: the next gated
+    /// frame paints no dialog. `Restart now` is painted but never
+    /// clicked (its handler exits the process).
+    #[test]
+    fn setup_complete_dialog_later_dismisses_headless() {
+        const BODY: &str = "RamSleuth was set up successfully. The app must be restarted for the changes to take effect.";
+        let out_dir = temp_out_dir("restart-prompt");
+        let (bench_tx, _bench_rx) = std::sync::mpsc::channel::<BenchCmd>();
+        let mut app = RamSleuthApp {
+            state: Arc::new(RwLock::new(TelemetryData::default())),
+            bench_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            settings_open: false,
+            requirements_open: false,
+            setup: Arc::new(RwLock::new(SetupOutcome {
+                running: false,
+                done: true,
+                failure: None,
+            })),
+            icon: None,
+            graphs_open: Arc::new(AtomicBool::new(false)),
+            saved_refresh: None,
+            last_graphs_open: false,
+            out_dir: out_dir.clone(),
+            poller: None,
+            notice: None,
+            restart_prompt_dismissed: false,
+        };
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(968.0, 600.0));
+        let frame_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        // The app's per-frame gate, verbatim from `update`: the
+        // dialog renders only while `done` + not dismissed.
+        let frame = |events: Vec<egui::Event>, app: &mut RamSleuthApp| {
+            ctx.run(frame_input(events), |ctx| {
+                // One brief read, scoped (the C14-03 pattern): the
+                // guard must drop before the dialog's mutable borrow
+                // of the app.
+                let open = {
+                    let setup = app.setup.read().unwrap();
+                    setup_prompt_open(setup.done, app.restart_prompt_dismissed)
+                };
+                if open {
+                    app.render_setup_complete_dialog(ctx);
+                }
+            })
+        };
+
+        // Frame 1: the two areas are new — egui hides a new area
+        // for exactly one frame (the first-frame placement
+        // heuristic — hidden also disables it), so nothing paints
+        // and the block captures no input yet; both come online
+        // from the next frame.
+        frame(Vec::new(), &mut app);
+        // Frame 2 (no events): the areas are known — the modal
+        // dialog paints (the title, the body, both buttons).
+        let first = frame(Vec::new(), &mut app);
+        let texts: Vec<&str> = first
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"Setup complete"), "the title must paint: {texts:?}");
+        assert!(texts.contains(&BODY), "the body must paint: {texts:?}");
+        assert!(
+            texts.contains(&"Restart now"),
+            "the primary button must paint: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Later"),
+            "the secondary button must paint: {texts:?}"
+        );
+        assert!(!app.restart_prompt_dismissed, "no click must not dismiss");
+
+        // The `Later` label's center (the graph.rs text-click idiom).
+        let later = first
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Later" => {
+                    Some(egui::pos2(
+                        text.pos.x + text.galley.size().x / 2.0,
+                        text.pos.y + text.galley.size().y / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .expect("the Later button's label must be painted");
+
+        // Frames 3 + 4: press, then release, on `Later` (the
+        // graph.rs two-frame idiom) → the click dismisses.
+        let click = |pressed: bool| egui::Event::PointerButton {
+            pos: later,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![click(true)], &mut app);
+        frame(vec![click(false)], &mut app);
+        assert!(
+            app.restart_prompt_dismissed,
+            "a press + release on Later must dismiss the prompt"
+        );
+
+        // Frame 5 (the gate): a dismissed prompt repaints no dialog.
+        let fourth = frame(Vec::new(), &mut app);
+        let texts: Vec<&str> = fourth
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !texts.iter().any(|t| *t == "Setup complete"),
+            "a dismissed prompt must not repaint the dialog: {texts:?}"
+        );
+
+        fs::remove_dir_all(&out_dir).expect("cleanup");
     }
 }
