@@ -411,9 +411,14 @@ fn run(args: TuiArgs) -> ExitCode {
                             stop.store(true, Ordering::Relaxed);
                             break;
                         }
-                        // TUI-19/20/22: wire real dispatch
+                        // TUI-19/20/22: wire real dispatch (bench class);
+                        // TUI-22: wire the view class
                         Action::BenchFull | Action::BenchMemory | Action::BurnIn
-                            | Action::Cancel => {}
+                            | Action::Cancel | Action::ToggleGraphs
+                            | Action::ToggleSettings | Action::ToggleRequirements
+                            | Action::ExportJson | Action::CyclePoll
+                            | Action::ToggleCapacity | Action::ToggleClock
+                            | Action::ToggleRefresh | Action::CycleWindow => {}
                     }
                 }
             }

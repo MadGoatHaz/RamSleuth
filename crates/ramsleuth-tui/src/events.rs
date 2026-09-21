@@ -14,15 +14,24 @@
 //!
 //! The frozen table (case-insensitive, modifiers ignored):
 //!
-//! | key         | action                 | effect (P3-24)                                 |
-//! |-------------|------------------------|------------------------------------------------|
-//! | `r` / `R`   | [`Action::Refresh`]    | force a telemetry refresh now                  |
-//! | `s` / `S`   | [`Action::Snapshot`]   | write a timestamped `.txt` snapshot to the CWD |
-//! | `q` / `Q`   | [`Action::Quit`]       | leave the TUI (exit 0)                         |
-//! | `b` / `B`   | [`Action::BenchFull`]  | start a full bench run (`StartBenchmark`)      |
-//! | `m` / `M`   | [`Action::BenchMemory`]| start a memory-only bench (`StartBenchmark`)   |
-//! | `x` / `X`   | [`Action::BurnIn`]     | start a 5-min burn-in soak (`StartBurnIn`)     |
-//! | `c` / `C`   | [`Action::Cancel`]     | cancel the in-flight run (`CancelBenchmark`)   |
+//! | key         | action                         | effect (P3-24)                                 |
+//! |------------|-------------------------------|-----------------------------------------------|
+//! | `r` / `R`   | [`Action::Refresh`]            | force a telemetry refresh now                  |
+//! | `s` / `S`   | [`Action::Snapshot`]           | write a timestamped `.txt` snapshot to the CWD |
+//! | `q` / `Q`   | [`Action::Quit`]               | leave the TUI (exit 0)                         |
+//! | `b` / `B`   | [`Action::BenchFull`]          | start a full bench run (`StartBenchmark`)      |
+//! | `m` / `M`   | [`Action::BenchMemory`]        | start a memory-only bench (`StartBenchmark`)   |
+//! | `x` / `X`   | [`Action::BurnIn`]             | start a 5-min burn-in soak (`StartBurnIn`)     |
+//! | `c` / `C`   | [`Action::Cancel`]             | cancel the in-flight run (`CancelBenchmark`)   |
+//! | `g` / `G`   | [`Action::ToggleGraphs`]       | toggle the graphs panel                        |
+//! | `t` / `T`   | [`Action::ToggleSettings`]     | toggle the settings strip                      |
+//! | `d` / `D`   | [`Action::ToggleRequirements`] | toggle the requirements strip                  |
+//! | `e` / `E`   | [`Action::ExportJson`]         | write `{ telemetry, bench }` JSON to `$HOME`   |
+//! | `p` / `P`   | [`Action::CyclePoll`]          | cycle poll interval (100 ms → 60 s, wrap)      |
+//! | `u` / `U`   | [`Action::ToggleCapacity`]     | toggle capacity GiB ↔ GB                       |
+//! | `k` / `K`   | [`Action::ToggleClock`]        | toggle clock MHz ↔ GHz                         |
+//! | `a` / `A`   | [`Action::ToggleRefresh`]      | toggle refresh on ↔ off                        |
+//! | `w` / `W`   | [`Action::CycleWindow`]        | cycle graphs window (1 → 60 min)               |
 //!
 //! Everything else (other chars, `Esc`, `Enter`, arrows, function keys,
 //! mouse, resize) maps to `None` and is ignored — the terminal re-reads
@@ -31,8 +40,11 @@
 use crossterm::event::{Event, KeyEvent, KeyCode};
 
 /// The user-facing TUI actions: the P3-22 trio (`Refresh`/`Snapshot`/
-/// `Quit`) plus the TUI-01 bench-class quartet (`BenchFull`/`BenchMemory`/
-/// `BurnIn`/`Cancel`), additive per the TUI-parity plan.
+/// `Quit`), the TUI-01 bench-class quartet (`BenchFull`/`BenchMemory`/
+/// `BurnIn`/`Cancel`), plus the TUI-02 view class (`ToggleGraphs`/
+/// `ToggleSettings`/`ToggleRequirements`/`ExportJson`/`CyclePoll`/
+/// `ToggleCapacity`/`ToggleClock`/`ToggleRefresh`/`CycleWindow`),
+/// additive per the TUI-parity plan.
 ///
 /// `Copy` so the P3-24 main loop can dispatch on owned values; the derived
 /// `Eq` keeps the dispatch a plain `match`.
@@ -52,13 +64,31 @@ pub enum Action {
     BurnIn,
     /// Cancel the in-flight bench/burn-in run (shared flag + `CancelBenchmark`).
     Cancel,
+    /// Toggle the graphs overlay panel (the 5-series sparkline view).
+    ToggleGraphs,
+    /// Toggle the settings strip (poll interval, units, refresh, socket).
+    ToggleSettings,
+    /// Toggle the requirements strip (setup prerequisites, presence-driven).
+    ToggleRequirements,
+    /// Write a `{ telemetry, bench }` JSON export to `$HOME` (F3 parity).
+    ExportJson,
+    /// Cycle the poll-interval presets: 100 ms … 60 s (default 2 s).
+    CyclePoll,
+    /// Toggle the capacity units: GiB ↔ GB.
+    ToggleCapacity,
+    /// Toggle the clock units: MHz ↔ GHz.
+    ToggleClock,
+    /// Toggle auto-refresh on ↔ off (`r`/`R` still forces a poll).
+    ToggleRefresh,
+    /// Cycle the graphs window presets: 1 → 5 → 15 → 60 min (default 5).
+    CycleWindow,
 }
 
 /// Pure key -> action mapping: the whole keybinding table in one function.
 ///
-/// Case-insensitive on the seven action keys (`r`/`R`, `s`/`S`, `q`/`Q`,
-/// `b`/`B`, `m`/`M`, `x`/`X`, `c`/`C`); key modifiers are **ignored** (a
-/// `Ctrl`- or `Alt`-prefixed action char still maps — simple and
+/// Case-insensitive on the sixteen action keys (`r`/`s`/`q`/`b`/`m`/`x`/
+/// `c`/`g`/`t`/`d`/`e`/`p`/`u`/`k`/`a`/`w`); key modifiers are **ignored**
+/// (a `Ctrl`- or `Alt`-prefixed action char still maps — simple and
 /// deterministic, per the P3-22 scope boundary).
 /// Every other key (`Esc`, `Enter`, arrows, function keys, other chars)
 /// maps to `None`.
@@ -87,6 +117,15 @@ pub fn key_to_action(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('m') | KeyCode::Char('M') => Some(Action::BenchMemory),
         KeyCode::Char('x') | KeyCode::Char('X') => Some(Action::BurnIn),
         KeyCode::Char('c') | KeyCode::Char('C') => Some(Action::Cancel),
+        KeyCode::Char('g') | KeyCode::Char('G') => Some(Action::ToggleGraphs),
+        KeyCode::Char('t') | KeyCode::Char('T') => Some(Action::ToggleSettings),
+        KeyCode::Char('d') | KeyCode::Char('D') => Some(Action::ToggleRequirements),
+        KeyCode::Char('e') | KeyCode::Char('E') => Some(Action::ExportJson),
+        KeyCode::Char('p') | KeyCode::Char('P') => Some(Action::CyclePoll),
+        KeyCode::Char('u') | KeyCode::Char('U') => Some(Action::ToggleCapacity),
+        KeyCode::Char('k') | KeyCode::Char('K') => Some(Action::ToggleClock),
+        KeyCode::Char('a') | KeyCode::Char('A') => Some(Action::ToggleRefresh),
+        KeyCode::Char('w') | KeyCode::Char('W') => Some(Action::CycleWindow),
         _ => None,
     }
 }
@@ -142,11 +181,7 @@ mod tests {
     // (d) other chars -> None
     #[test]
     fn other_chars_map_to_none() {
-        for code in [
-            KeyCode::Char('a'),
-            KeyCode::Char('0'),
-            KeyCode::Char(' '),
-        ] {
+        for code in [KeyCode::Char('0'), KeyCode::Char(' ')] {
             assert_eq!(key_to_action(key(code)), None, "{code:?} must not be an action");
         }
     }
@@ -206,12 +241,84 @@ mod tests {
             Action::BenchMemory,
             Action::BurnIn,
             Action::Cancel,
+            Action::ToggleGraphs,
+            Action::ToggleSettings,
+            Action::ToggleRequirements,
+            Action::ExportJson,
+            Action::CyclePoll,
+            Action::ToggleCapacity,
+            Action::ToggleClock,
+            Action::ToggleRefresh,
+            Action::CycleWindow,
         ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
                 assert_ne!(all[i], all[j], "every Action variant is distinct");
             }
         }
+    }
+
+    // (k) 'g' / 'G' -> ToggleGraphs
+    #[test]
+    fn g_key_maps_to_toggle_graphs() {
+        assert_eq!(key_to_action(key(KeyCode::Char('g'))), Some(Action::ToggleGraphs));
+        assert_eq!(key_to_action(key(KeyCode::Char('G'))), Some(Action::ToggleGraphs));
+    }
+
+    // (l) 't' / 'T' -> ToggleSettings
+    #[test]
+    fn t_key_maps_to_toggle_settings() {
+        assert_eq!(key_to_action(key(KeyCode::Char('t'))), Some(Action::ToggleSettings));
+        assert_eq!(key_to_action(key(KeyCode::Char('T'))), Some(Action::ToggleSettings));
+    }
+
+    // (m) 'd' / 'D' -> ToggleRequirements
+    #[test]
+    fn d_key_maps_to_toggle_requirements() {
+        assert_eq!(key_to_action(key(KeyCode::Char('d'))), Some(Action::ToggleRequirements));
+        assert_eq!(key_to_action(key(KeyCode::Char('D'))), Some(Action::ToggleRequirements));
+    }
+
+    // (n) 'e' / 'E' -> ExportJson
+    #[test]
+    fn e_key_maps_to_export_json() {
+        assert_eq!(key_to_action(key(KeyCode::Char('e'))), Some(Action::ExportJson));
+        assert_eq!(key_to_action(key(KeyCode::Char('E'))), Some(Action::ExportJson));
+    }
+
+    // (o) 'p' / 'P' -> CyclePoll
+    #[test]
+    fn p_key_maps_to_cycle_poll() {
+        assert_eq!(key_to_action(key(KeyCode::Char('p'))), Some(Action::CyclePoll));
+        assert_eq!(key_to_action(key(KeyCode::Char('P'))), Some(Action::CyclePoll));
+    }
+
+    // (p) 'u' / 'U' -> ToggleCapacity
+    #[test]
+    fn u_key_maps_to_toggle_capacity() {
+        assert_eq!(key_to_action(key(KeyCode::Char('u'))), Some(Action::ToggleCapacity));
+        assert_eq!(key_to_action(key(KeyCode::Char('U'))), Some(Action::ToggleCapacity));
+    }
+
+    // (q) 'k' / 'K' -> ToggleClock
+    #[test]
+    fn k_key_maps_to_toggle_clock() {
+        assert_eq!(key_to_action(key(KeyCode::Char('k'))), Some(Action::ToggleClock));
+        assert_eq!(key_to_action(key(KeyCode::Char('K'))), Some(Action::ToggleClock));
+    }
+
+    // (r) 'a' / 'A' -> ToggleRefresh
+    #[test]
+    fn a_key_maps_to_toggle_refresh() {
+        assert_eq!(key_to_action(key(KeyCode::Char('a'))), Some(Action::ToggleRefresh));
+        assert_eq!(key_to_action(key(KeyCode::Char('A'))), Some(Action::ToggleRefresh));
+    }
+
+    // (s) 'w' / 'W' -> CycleWindow
+    #[test]
+    fn w_key_maps_to_cycle_window() {
+        assert_eq!(key_to_action(key(KeyCode::Char('w'))), Some(Action::CycleWindow));
+        assert_eq!(key_to_action(key(KeyCode::Char('W'))), Some(Action::CycleWindow));
     }
 
     // modifiers are ignored: every action key maps with any modifier set
@@ -225,6 +332,15 @@ mod tests {
             assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('m'), mods)), Some(Action::BenchMemory));
             assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('x'), mods)), Some(Action::BurnIn));
             assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('c'), mods)), Some(Action::Cancel));
+            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('g'), mods)), Some(Action::ToggleGraphs));
+            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('t'), mods)), Some(Action::ToggleSettings));
+            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('d'), mods)), Some(Action::ToggleRequirements));
+            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('e'), mods)), Some(Action::ExportJson));
+            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('p'), mods)), Some(Action::CyclePoll));
+            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('u'), mods)), Some(Action::ToggleCapacity));
+            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('k'), mods)), Some(Action::ToggleClock));
+            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('a'), mods)), Some(Action::ToggleRefresh));
+            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('w'), mods)), Some(Action::CycleWindow));
         }
     }
 }
