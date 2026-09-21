@@ -37,6 +37,14 @@ path = "src/main.rs"
 # `cargo metadata` if the lock is ever regenerated.
 crossterm = "0.28"
 ratatui = "0.29"
+# TUI-04: the F3-parity JSON export (TUI-21) round-trips the telemetry +
+# bench snapshot through pretty JSON (`ExportSnapshot`). The entry is the
+# EXISTING workspace `serde` (derive) — already locked via the wire crates;
+# `serde_json` 1 (1.0.151, declared 1.71) is MSRV-safe (plan D1). Both are
+# already in `Cargo.lock` (the GUI/telemetry/bench closure) — no new
+# [[package]] entries, no version bumps; only the 2-line member entry update.
+serde = { workspace = true }
+serde_json = "1"
 ramsleuth-bench = { path = "../ramsleuth-bench" }
 ramsleuth-client = { path = "../ramsleuth-client" }
 ramsleuth-protocol = { path = "../ramsleuth-protocol" }
