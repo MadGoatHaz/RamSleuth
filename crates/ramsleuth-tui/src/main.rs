@@ -411,6 +411,9 @@ fn run(args: TuiArgs) -> ExitCode {
                             stop.store(true, Ordering::Relaxed);
                             break;
                         }
+                        // TUI-19/20/22: wire real dispatch
+                        Action::BenchFull | Action::BenchMemory | Action::BurnIn
+                            | Action::Cancel => {}
                     }
                 }
             }
