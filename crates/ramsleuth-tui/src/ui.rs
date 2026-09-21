@@ -227,8 +227,9 @@ pub struct AppState {
 ///
 /// The screen splits vertically into a three-row header strip (line 1
 /// the title + platform tag + daemon status + key legend, line 2 the
-/// CPU/platform identity, line 3 the RAM summary slot — TUI-11) and the
-/// three zones side by side. Every zone is a
+/// CPU/platform identity, line 3 the RAM summary — the capacity,
+/// per-DIMM breakdown, SPD speed, channel mode, and UCLK:MCLK sync
+/// mode) and the three zones side by side. Every zone is a
 /// titled `Block` on a slate background; content that does not fit is
 /// clipped, never wrapped or scrolled. Safe at any terminal size — the
 /// all-`Na`, empty-SPD, daemon-down, and default states all render without
@@ -354,12 +355,261 @@ fn header_line2(state: &AppState) -> Line<'static> {
     ])
 }
 
-/// Header line 3 (the TUI-11 RAM-summary slot): a dim `RAM: —`
-/// placeholder until TUI-11 lands the TUI-local `dimm_summary` /
-/// `channel_mode` / `sync_mode` composition (`RAM: <total> (<summary>)
-/// <max SPD> | <channel> | <note> | Mode: <sync>`).
-fn header_line3(_state: &AppState) -> Line<'static> {
-    Line::from(Span::styled("RAM: —", Style::default().fg(DIM)))
+/// Header line 3 (TUI-11 — the RAM summary, the GUI C6-20/C9-01
+/// line-3 mirror): `RAM: <total> (<summary>) <max SPD MT/s> |
+/// <channel> | <note> | Mode: <sync>` — the total capacity in the
+/// selected capacity unit (`settings.capacity_gib`), the per-DIMM
+/// breakdown ([`dimm_summary`], with the rank word), the max SPD speed
+/// (omitted when no module carries one), the channel mode
+/// ([`channel_mode`]), the total-vs-breakdown slot note
+/// ([`slot_note`], when the OS total strictly exceeds the SPD sum),
+/// and the UCLK:MCLK sync mode ([`sync_mode`] — `Synchronous 1:1`
+/// amber, `Asynchronous 1:2` crimson, `N/A` dim). The capacity + clock
+/// segments honor the frozen unit knobs. No telemetry degrades to the
+/// dim `RAM: —` placeholder (never a panic).
+fn header_line3(state: &AppState) -> Line<'static> {
+    let Some(telemetry) = &state.telemetry else {
+        return Line::from(Span::styled("RAM: —", Style::default().fg(DIM)));
+    };
+    let (total, summary, speed, channel, note, (mode, mode_color)) = ram_line3_parts(
+        telemetry,
+        state.settings.capacity_gib,
+        state.settings.clock_mhz,
+    );
+    let value = Style::default().fg(CYAN);
+    let label = Style::default().fg(DIM);
+    let mut spans = vec![
+        Span::styled("RAM: ", label),
+        Span::styled(total, value),
+        Span::styled(format!(" ({summary})"), value),
+    ];
+    if let Some(speed) = speed {
+        spans.push(Span::styled(format!(" {speed}"), value));
+    }
+    spans.push(Span::styled(" | ", label));
+    spans.push(Span::styled(channel, value));
+    if let Some(note) = note {
+        spans.push(Span::styled(" | ", label));
+        spans.push(Span::styled(note, Style::default().fg(AMBER)));
+    }
+    spans.push(Span::styled(" | Mode: ", label));
+    spans.push(Span::styled(mode, Style::default().fg(mode_color)));
+    Line::from(spans)
+}
+
+/// The binary → decimal capacity conversion factor (1 GiB =
+/// 1.073741824 GB; the GUI `GIB_TO_GB` mirror).
+const GIB_TO_GB: f64 = 1.073741824;
+
+/// One capacity readout (the carried GiB wire value) as display text in
+/// the selected capacity unit (the GUI `format_capacity`/`trim` mirror,
+/// C7-11): the GiB arm keeps the value (`16 GiB`), the GB arm converts
+/// × [`GIB_TO_GB`] (`17.2 GB`); a whole number renders without
+/// decimals, one decimal otherwise; a non-finite value degrades to the
+/// honest `N/A`.
+fn format_capacity(gib: f64, capacity_gib: bool) -> String {
+    if !gib.is_finite() {
+        return "N/A".to_owned();
+    }
+    let trim = |v: f64| {
+        if (v - v.round()).abs() < 0.05 {
+            format!("{v:.0}")
+        } else {
+            format!("{v:.1}")
+        }
+    };
+    if capacity_gib {
+        format!("{} GiB", trim(gib))
+    } else {
+        format!("{} GB", trim(gib * GIB_TO_GB))
+    }
+}
+
+/// The rank word for the header breakdown (the GUI `rank_word` mirror,
+/// C9-01/D-1): `1` → `Single-Rank`, `2` → `Dual-Rank`, `n > 0` →
+/// `<n>-Rank`; a `Na`/`0` rank yields `None` (the word is omitted from
+/// the group, never printed as `N/A`).
+fn rank_word(rank: &Section<u8>) -> Option<String> {
+    match rank {
+        Section::Value(0) | Section::Na(_) => None,
+        Section::Value(1) => Some("Single-Rank".to_owned()),
+        Section::Value(2) => Some("Dual-Rank".to_owned()),
+        Section::Value(other) => Some(format!("{other}-Rank")),
+    }
+}
+
+/// The per-DIMM capacity summary (the GUI `dimm_summary` mirror,
+/// C9-01/D-1): one `<count>x<size>` group per distinct carried
+/// `(size, rank word)` (first-seen order, ` + `-joined, the size in the
+/// selected capacity unit — [`format_capacity`]); the rank word from
+/// the parallel `spd` slice (positionally aligned with `sizes`, the
+/// facade contract) is appended when present (`2x16 GiB Single-Rank`);
+/// a `Na` size contributes nothing; an all-`Na` / empty list degrades
+/// to `N/A`.
+fn dimm_summary(sizes: &[Section<f64>], spd: &[SpdModule], capacity_gib: bool) -> String {
+    let mut groups: Vec<(f64, Option<String>, usize)> = Vec::new();
+    for (slot, cell) in sizes.iter().enumerate() {
+        if let Some(gib) = cell.value() {
+            let rank = spd.get(slot).and_then(|module| rank_word(&module.rank));
+            match groups
+                .iter_mut()
+                .find(|(value, word, _)| (value - gib).abs() < 0.05 && *word == rank)
+            {
+                Some(group) => group.2 += 1,
+                None => groups.push((*gib, rank, 1)),
+            }
+        }
+    }
+    if groups.is_empty() {
+        "N/A".to_owned()
+    } else {
+        groups
+            .iter()
+            .map(|(gib, rank, count)| match rank {
+                Some(word) => format!("{count}x{} {word}", format_capacity(*gib, capacity_gib)),
+                None => format!("{count}x{}", format_capacity(*gib, capacity_gib)),
+            })
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+}
+
+/// The channel mode from the DIMM count (the GUI `channel_mode` mirror,
+/// D-C8): 1 / 2 / 4 → Single- / Dual- / Quad-Channel; any other count
+/// (0, odd) degrades to `N/A`.
+fn channel_mode(dimm_count: usize) -> String {
+    match dimm_count {
+        1 => "Single-Channel".to_owned(),
+        2 => "Dual-Channel".to_owned(),
+        4 => "Quad-Channel".to_owned(),
+        _ => "N/A".to_owned(),
+    }
+}
+
+/// The total-vs-breakdown slot note (the GUI `slot_note` mirror,
+/// C9-01/D-1): the OS total can strictly exceed the SPD-visible sum
+/// when the host installs more DIMMs than the SPD bus binds (the live
+/// host: 4×16 GiB installed, 2 bound). A uniform per-module size whose
+/// quotient `total / u` lands within a tenth of a module of an integer
+/// `n` above the visible count → `<visible> of <n> slots SPD-visible`
+/// (the OS reserves a fraction of the installed capacity, so the
+/// quotient sits just below the integer); any other excess → `SPD sees
+/// <visible> of the installed capacity`. A `Na` / non-finite total, no
+/// visible modules, or `total ≤ sum` → `None` (no false alarm).
+/// Unit-agnostic: counts, not GiB.
+fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String> {
+    let total = total.value().copied().filter(|value| value.is_finite())?;
+    let visible: Vec<f64> = sizes.iter().filter_map(|cell| cell.value().copied()).collect();
+    if visible.is_empty() {
+        return None;
+    }
+    let sum = visible.iter().sum::<f64>();
+    if total <= sum {
+        return None;
+    }
+    let uniform = visible.iter().all(|value| (value - visible[0]).abs() < 0.05);
+    if uniform {
+        let unit = visible[0];
+        if unit > 0.0 {
+            let quotient = total / unit;
+            let slots = quotient.round();
+            if (quotient - slots).abs() <= 0.1 && slots > visible.len() as f64 {
+                return Some(format!("{} of {slots:.0} slots SPD-visible", visible.len()));
+            }
+        }
+    }
+    Some(format!("SPD sees {} of the installed capacity", visible.len()))
+}
+
+/// Line 3's mode segment over one clock readout (the GUI
+/// `sync_mode_from_clocks` mirror, D-C8): the UCLK:MCLK ratio + its
+/// semantic color — AMBER for `Synchronous 1:1` (with the MCLK in the
+/// selected clock unit when it carries one — [`format_clock`]),
+/// CRIMSON for `Asynchronous 1:2`, and DIM for the honest `N/A`.
+fn sync_mode_from_clocks(clocks: &ClockReadout, clock_mhz: bool) -> (String, Color) {
+    match clocks.div_mode.value() {
+        Some(DivMode::OneToOne) => {
+            let text = match clocks.mclk_mhz.value() {
+                Some(mhz) => {
+                    format!("Synchronous 1:1 (UCLK = MCLK = {})", format_clock(*mhz, clock_mhz))
+                }
+                None => "Synchronous 1:1".to_owned(),
+            };
+            (text, AMBER)
+        }
+        Some(DivMode::OneToTwo) => ("Asynchronous 1:2".to_owned(), CRIMSON),
+        None => ("N/A".to_owned(), DIM),
+    }
+}
+
+/// Line 3's mode segment over a whole snapshot (the GUI `sync_mode`
+/// mirror): the AMD branch must carry a value whose `div_mode` is
+/// usable, else the honest `N/A` (DIM) — the Intel / driver-missing /
+/// degraded states all degrade here (never a panic).
+fn sync_mode(t: &SystemMemoryTelemetry, clock_mhz: bool) -> (String, Color) {
+    match t.amd.value() {
+        Some(readout) => sync_mode_from_clocks(&readout.clocks, clock_mhz),
+        None => ("N/A".to_owned(), DIM),
+    }
+}
+
+/// The line-3 pieces — the single source of truth for the flat
+/// [`ram_line_prefix`] text and the per-segment-coloured
+/// [`header_line3`]: the total (selected capacity unit), the
+/// breakdown, the optional max-SPD speed, the channel mode, the
+/// optional slot note, and the mode segment (text + color).
+fn ram_line3_parts(
+    t: &SystemMemoryTelemetry,
+    capacity_gib: bool,
+    clock_mhz: bool,
+) -> (
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    (String, Color),
+) {
+    let total = match t.total_capacity.value() {
+        Some(gib) => format_capacity(*gib, capacity_gib),
+        None => "N/A".to_owned(),
+    };
+    let summary = dimm_summary(&t.dimm_sizes, &t.spd, capacity_gib);
+    let speed = t
+        .spd
+        .iter()
+        .filter_map(|m| m.speed_mts.value().copied())
+        .max()
+        .map(|mts| format!("{mts} MT/s"));
+    let channel = channel_mode(t.dimm_sizes.len());
+    let note = slot_note(&t.total_capacity, &t.dimm_sizes);
+    let mode = sync_mode(t, clock_mhz);
+    (total, summary, speed, channel, note, mode)
+}
+
+/// Line 3's non-mode part (the GUI `ram_line_prefix` mirror, C6-20/
+/// C9-01): the total capacity in the selected capacity unit, the
+/// per-DIMM breakdown (with the rank word), the max SPD speed (omitted
+/// when no module carries one), the channel mode, the slot note when
+/// the OS total strictly exceeds the SPD sum, and the `Mode: ` lead-in
+/// the mode segment completes.
+///
+/// Test-only: [`header_line3`] builds its per-segment-coloured spans
+/// from [`ram_line3_parts`] directly; this flat-text form exists so the
+/// composed line is assertable string-for-string (the GUI mirror).
+#[cfg(test)]
+fn ram_line_prefix(t: &SystemMemoryTelemetry, capacity_gib: bool) -> String {
+    let (total, summary, speed, channel, note, _) = ram_line3_parts(t, capacity_gib, true);
+    let mut line = format!("RAM: {total} ({summary})");
+    if let Some(speed) = speed {
+        line.push_str(&format!(" {speed}"));
+    }
+    line.push_str(&format!(" | {channel}"));
+    if let Some(note) = note {
+        line.push_str(&format!(" | {note}"));
+    }
+    line.push_str(" | Mode: ");
+    line
 }
 
 /// Line 1's platform tag (the GUI's line-1 tag mirror, C6-20): the CPU
@@ -1277,11 +1527,11 @@ mod tests {
         assert!(text.contains("SPD: N/A"), "{text}");
     }
 
-    /// (f) The 3-line header (TUI-10): line 1 the title + platform tag
-    /// + daemon status, line 2 the CPU/platform identity (the
-    ///   representative's Zen 3 / 3500 MHz / Test Board / BIOS 1.0 /
-    ///   all-Na AGESA+SMU shape), line 3 the RAM summary slot (the
-    ///   TUI-11 placeholder).
+    /// (f) The 3-line header — line 1 the title + platform tag + daemon
+    /// status, line 2 the CPU/platform identity (the representative's
+    /// Zen 3 / 3500 MHz / Test Board / BIOS 1.0 / all-Na AGESA+SMU
+    /// shape), line 3 the composed RAM summary (the TUI-11 capacity /
+    /// breakdown / SPD speed / channel / sync mode).
     #[test]
     fn header_is_three_lines_with_values() {
         let text = draw(&representative());
@@ -1300,7 +1550,16 @@ mod tests {
             "{}",
             lines[1]
         );
-        assert_eq!(lines[2], "RAM: —", "{}", lines[2]);
+        // Line 3 (TUI-11): the composed RAM summary — the 16 GiB total,
+        // the single Dual-Rank 16 GiB DIMM, the 3200 MT/s SPD speed, the
+        // Single-Channel mode (one bound module), and the Asynchronous
+        // 1:2 UCLK:MCLK (the fixture's div mode).
+        assert_eq!(
+            lines[2],
+            "RAM: 16 GiB (1x16 GiB Dual-Rank) 3200 MT/s | Single-Channel | Mode: Asynchronous 1:2",
+            "{}",
+            lines[2]
+        );
     }
 
     /// (g) The no-telemetry header degrades to the `—` / `N/A`
@@ -1452,5 +1711,381 @@ mod tests {
         assert!(l1.contains("R refresh"), "{l1}");
         assert!(!l1.contains("S snapshot"), "{l1}");
         assert!(l1.chars().count() <= 60, "{}", l1.chars().count());
+    }
+
+    // ------------------------------------------------------------------
+    // TUI-11 — the header line-3 (RAM summary) pure helpers.
+    // ------------------------------------------------------------------
+
+    /// A minimal SPD module fixture for the line-3 tests (every cell
+    /// `Na` except the `rank` / `speed_mts` the helpers consume).
+    fn module(rank: Section<u8>, speed: Option<u16>) -> SpdModule {
+        SpdModule {
+            index: 0x52,
+            is_ddr5: false,
+            maker: Section::na(NaReason::NotApplicable),
+            die_maker: Section::na(NaReason::NotApplicable),
+            die_type: Section::na(NaReason::NotApplicable),
+            devices: Section::na(NaReason::NotApplicable),
+            part: Section::na(NaReason::NotApplicable),
+            serial: Section::na(NaReason::NotApplicable),
+            rank,
+            density_mbit: Section::na(NaReason::NotApplicable),
+            speed_mts: match speed {
+                Some(value) => Section::Value(value),
+                None => Section::na(NaReason::NotApplicable),
+            },
+            profiles: Vec::new(),
+        }
+    }
+
+    /// A line-3 test snapshot: the configurable capacity tail + SPD
+    /// list over an Na AMD / Intel branch (the mode segment degrades;
+    /// the helpers under test here do not read it).
+    fn telemetry(
+        total_capacity: Section<f64>,
+        dimm_sizes: Vec<Section<f64>>,
+        spd: Vec<SpdModule>,
+    ) -> SystemMemoryTelemetry {
+        SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Unknown,
+                brand: "synthetic".to_owned(),
+            },
+            amd: Section::na(NaReason::NotApplicable),
+            intel: Section::na(NaReason::UnsupportedHardware),
+            spd,
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3600.0),
+                motherboard: Section::Value("Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity,
+            dimm_sizes,
+        }
+    }
+
+    /// A clock-readout fixture (every cell `Na` except the two the
+    /// mode segment consumes).
+    fn clocks_with(div_mode: Section<DivMode>, mclk_mhz: Section<f64>) -> ClockReadout {
+        ClockReadout {
+            mclk_mhz,
+            uclk_mhz: Section::na(NaReason::NotApplicable),
+            fclk_mhz: Section::na(NaReason::NotApplicable),
+            div_mode,
+            gear_mode: Section::na(NaReason::NotApplicable),
+            gdm: Section::na(NaReason::NotApplicable),
+            pdm: Section::na(NaReason::NotApplicable),
+            command_rate: Section::na(NaReason::NotApplicable),
+        }
+    }
+
+    /// (l) `format_capacity`: the GiB arm keeps the wire value, the GB
+    /// arm converts × [`GIB_TO_GB`]; a whole number renders without
+    /// decimals, one decimal otherwise; non-finite → `N/A`.
+    #[test]
+    fn format_capacity_arms() {
+        assert_eq!(format_capacity(16.0, true), "16 GiB");
+        assert_eq!(format_capacity(32.0, true), "32 GiB");
+        assert_eq!(format_capacity(4.5, true), "4.5 GiB");
+        assert_eq!(format_capacity(16.0, false), "17.2 GB");
+        assert_eq!(format_capacity(32.0, false), "34.4 GB");
+        assert_eq!(format_capacity(f64::NAN, true), "N/A");
+        assert_eq!(format_capacity(f64::INFINITY, false), "N/A");
+    }
+
+    /// (m) `rank_word` (the GUI C9-01/D-1 mirror): `1` → Single-Rank,
+    /// `2` → Dual-Rank, `n > 0` → `<n>-Rank`; a `Na`/`0` rank yields
+    /// `None` (the word is omitted, never `N/A`).
+    #[test]
+    fn rank_word_arms() {
+        assert_eq!(rank_word(&Section::Value(1)), Some("Single-Rank".to_owned()));
+        assert_eq!(rank_word(&Section::Value(2)), Some("Dual-Rank".to_owned()));
+        assert_eq!(rank_word(&Section::Value(4)), Some("4-Rank".to_owned()));
+        assert_eq!(rank_word(&Section::Value(0)), None);
+        assert_eq!(rank_word(&Section::na(NaReason::NotApplicable)), None);
+    }
+
+    /// (n) `dimm_summary`: distinct-size grouping in the selected
+    /// capacity unit (the GB knob converts × [`GIB_TO_GB`]), the Na
+    /// entry contributes nothing, all-Na / empty → `N/A`, and the rank
+    /// word from the parallel SPD slice groups with the size (same-size
+    /// same-rank stays one group with the word, same-size different-rank
+    /// splits, a `Na` rank omits the word).
+    #[test]
+    fn dimm_summary_groups_and_degrades() {
+        // No rank words (the empty SPD list): grouped by size alone.
+        assert_eq!(
+            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &[], true),
+            "2x16 GiB"
+        );
+        // A Na entry contributes nothing; the mixed kit → two groups.
+        assert_eq!(
+            dimm_summary(
+                &[
+                    Section::Value(16.0),
+                    Section::na(NaReason::NotApplicable),
+                    Section::Value(32.0),
+                ],
+                &[],
+                true,
+            ),
+            "1x16 GiB + 1x32 GiB"
+        );
+        // All-Na / empty → N/A; a non-whole size keeps one decimal.
+        assert_eq!(dimm_summary(&[Section::na(NaReason::NotApplicable)], &[], true), "N/A");
+        assert_eq!(dimm_summary(&[], &[], true), "N/A");
+        assert_eq!(dimm_summary(&[Section::Value(4.5)], &[], true), "1x4.5 GiB");
+        // The GB knob: 16 GiB → 17.2 GB per group.
+        assert_eq!(
+            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &[], false),
+            "2x17.2 GB"
+        );
+        // The rank word groups with the size.
+        let single = module(Section::Value(1), Some(3200));
+        let dual = module(Section::Value(2), Some(3200));
+        assert_eq!(
+            dimm_summary(
+                &[Section::Value(16.0), Section::Value(16.0)],
+                &[single.clone(), single.clone()],
+                true,
+            ),
+            "2x16 GiB Single-Rank"
+        );
+        assert_eq!(
+            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &[single, dual], true),
+            "1x16 GiB Single-Rank + 1x16 GiB Dual-Rank"
+        );
+        // A `Na` rank omits the word: the ranked + unranked pair splits
+        // into two groups (first-seen order).
+        let na_rank = module(Section::na(NaReason::NotApplicable), Some(3200));
+        assert_eq!(
+            dimm_summary(
+                &[Section::Value(16.0), Section::Value(16.0)],
+                &[module(Section::Value(1), Some(3200)), na_rank],
+                true,
+            ),
+            "1x16 GiB Single-Rank + 1x16 GiB"
+        );
+    }
+
+    /// (o) `channel_mode`: 1 / 2 / 4 → Single / Dual / Quad, every
+    /// other count (0, odd) → `N/A`.
+    #[test]
+    fn channel_mode_from_dimm_count() {
+        assert_eq!(channel_mode(1), "Single-Channel");
+        assert_eq!(channel_mode(2), "Dual-Channel");
+        assert_eq!(channel_mode(4), "Quad-Channel");
+        assert_eq!(channel_mode(0), "N/A");
+        assert_eq!(channel_mode(3), "N/A");
+    }
+
+    /// (p) `slot_note`: the total-vs-breakdown note — total > SPD sum
+    /// with a uniform module size near-dividing the total → `<visible>
+    /// of <n> slots SPD-visible`; a non-integer quotient → the generic
+    /// note; total ≤ sum, a `Na` total, or no visible modules → `None`
+    /// (no false alarm).
+    #[test]
+    fn slot_note_arms() {
+        // The live-host shape: 4×16 GiB installed (62.68 GiB OS total),
+        // 2 bound to the SPD bus (32 GiB sum).
+        assert_eq!(
+            slot_note(&Section::Value(62.68), &[Section::Value(16.0), Section::Value(16.0)]),
+            Some("2 of 4 slots SPD-visible".to_owned())
+        );
+        // An exact multiple (no reserved fraction): 3 slots, 2 visible.
+        assert_eq!(
+            slot_note(&Section::Value(48.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            Some("2 of 3 slots SPD-visible".to_owned())
+        );
+        // A non-integer quotient (50/16 = 3.125) → the generic note.
+        assert_eq!(
+            slot_note(&Section::Value(50.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            Some("SPD sees 2 of the installed capacity".to_owned())
+        );
+        // total ≤ sum → no note.
+        assert_eq!(
+            slot_note(&Section::Value(32.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            None
+        );
+        assert_eq!(
+            slot_note(&Section::Value(16.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            None
+        );
+        // A `Na` total → no note; no visible modules → no note.
+        assert_eq!(
+            slot_note(&Section::na(NaReason::NotApplicable), &[Section::Value(16.0)]),
+            None
+        );
+        assert_eq!(
+            slot_note(&Section::Value(62.68), &[Section::na(NaReason::NotApplicable)]),
+            None
+        );
+    }
+
+    /// (q) line 3's composed non-mode text ([`ram_line_prefix`]):
+    /// populated (the total + breakdown + speed + channel + the
+    /// `Mode: ` lead-in), the speed omitted when no module carries
+    /// one, the single-Na-DIMM and all-Na degradations, the GB knob,
+    /// and the live-host shape (the rank word + the slot note).
+    #[test]
+    fn ram_line_prefix_populated_and_degraded() {
+        let t = telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![module(Section::na(NaReason::NotApplicable), Some(3200))],
+        );
+        assert_eq!(
+            ram_line_prefix(&t, true),
+            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | Mode: "
+        );
+        // No module carries a speed: the segment is omitted entirely.
+        let no_speed = telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![module(Section::na(NaReason::NotApplicable), None)],
+        );
+        assert_eq!(
+            ram_line_prefix(&no_speed, true),
+            "RAM: 32 GiB (2x16 GiB) | Dual-Channel | Mode: "
+        );
+        // A single Na DIMM still counts as one bound module (the
+        // channel is the count, not the sizes): Single-Channel.
+        let degraded = telemetry(
+            Section::na(NaReason::NotApplicable),
+            vec![Section::na(NaReason::NotApplicable)],
+            Vec::new(),
+        );
+        assert_eq!(
+            ram_line_prefix(&degraded, true),
+            "RAM: N/A (N/A) | Single-Channel | Mode: "
+        );
+        // No bound modules at all: every segment degrades to N/A.
+        let empty = telemetry(Section::na(NaReason::NotApplicable), Vec::new(), Vec::new());
+        assert_eq!(
+            ram_line_prefix(&empty, true),
+            "RAM: N/A (N/A) | N/A | Mode: "
+        );
+        // The GB knob: 32 GiB → 34.4 GB total, 16 GiB → 17.2 GB per
+        // group.
+        assert_eq!(
+            ram_line_prefix(&t, false),
+            "RAM: 34.4 GB (2x17.2 GB) 3200 MT/s | Dual-Channel | Mode: "
+        );
+        // The live-host shape: single-rank modules + the OS total
+        // (62.68 GiB) above the SPD sum (32 GiB) → the rank word in
+        // the breakdown + the slot-note segment.
+        let single = module(Section::Value(1), Some(3200));
+        let ranked = telemetry(
+            Section::Value(62.68),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![single.clone(), single],
+        );
+        assert_eq!(
+            ram_line_prefix(&ranked, true),
+            "RAM: 62.7 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | 2 of 4 slots SPD-visible | Mode: "
+        );
+        // The rank word with total ≤ the SPD sum: no note (no false
+        // alarm).
+        let single2 = module(Section::Value(1), Some(3200));
+        let balanced = telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![single2.clone(), single2],
+        );
+        assert_eq!(
+            ram_line_prefix(&balanced, true),
+            "RAM: 32 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | Mode: "
+        );
+    }
+
+    /// (r) the sync-mode segment matrix: 1:1 with an MCLK (AMBER; the
+    /// MCLK in the selected clock unit — the GHz knob ÷1000), 1:1
+    /// without (AMBER, the bare text), 1:2 (CRIMSON), a Na ratio (the
+    /// honest N/A, DIM), and the Na-AMD-branch degradation (independent
+    /// of the clock unit).
+    #[test]
+    fn sync_mode_matrix() {
+        assert_eq!(
+            sync_mode_from_clocks(
+                &clocks_with(Section::Value(DivMode::OneToOne), Section::Value(1800.0)),
+                true,
+            ),
+            ("Synchronous 1:1 (UCLK = MCLK = 1800 MHz)".to_owned(), AMBER)
+        );
+        assert_eq!(
+            sync_mode_from_clocks(
+                &clocks_with(Section::Value(DivMode::OneToOne), Section::na(NaReason::NotApplicable)),
+                true,
+            ),
+            ("Synchronous 1:1".to_owned(), AMBER)
+        );
+        assert_eq!(
+            sync_mode_from_clocks(
+                &clocks_with(Section::Value(DivMode::OneToTwo), Section::Value(1800.0)),
+                true,
+            ),
+            ("Asynchronous 1:2".to_owned(), CRIMSON)
+        );
+        assert_eq!(
+            sync_mode_from_clocks(
+                &clocks_with(Section::na(NaReason::NotApplicable), Section::Value(1800.0)),
+                true,
+            ),
+            ("N/A".to_owned(), DIM)
+        );
+        // The GHz knob: 1800 MHz → 1.8 GHz.
+        assert_eq!(
+            sync_mode_from_clocks(
+                &clocks_with(Section::Value(DivMode::OneToOne), Section::Value(1800.0)),
+                false,
+            ),
+            ("Synchronous 1:1 (UCLK = MCLK = 1.8 GHz)".to_owned(), AMBER)
+        );
+        // A Na AMD branch (Intel silicon / the driver missing) degrades
+        // the whole segment (independent of the clock unit).
+        let t = telemetry(Section::Value(32.0), Vec::new(), Vec::new());
+        assert_eq!(sync_mode(&t, true), ("N/A".to_owned(), DIM));
+        assert_eq!(sync_mode(&t, false), ("N/A".to_owned(), DIM));
+    }
+
+    /// (s) line 3 end-to-end over the composed spans: the unit knobs
+    /// apply (the GB capacity + the GHz clock unit) and the mode
+    /// segment colors (the 1:1 amber, the 1:2 crimson) — asserted
+    /// through the rendered buffer text of a 1:1 synchronous snapshot.
+    #[test]
+    fn line3_unit_knobs_and_mode_text() {
+        // A 1:1 synchronous AMD readout (the mode segment's MCLK in
+        // the selected clock unit).
+        let mut state = representative();
+        if let Some(ref mut t) = state.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.clocks.div_mode = Section::Value(DivMode::OneToOne);
+                readout.clocks.mclk_mhz = Section::Value(1800.0);
+            }
+        }
+        // A wide surface — the composed 1:1 line with the MCLK is
+        // ~108 columns, beyond the 100-col default.
+        let text = draw_at(&state, 130, 30);
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        assert_eq!(
+            lines[2],
+            "RAM: 16 GiB (1x16 GiB Dual-Rank) 3200 MT/s | Single-Channel | Mode: Synchronous 1:1 (UCLK = MCLK = 1800 MHz)",
+            "{}",
+            lines[2]
+        );
+        // The GB capacity knob + the GHz clock knob.
+        state.settings.capacity_gib = false;
+        state.settings.clock_mhz = false;
+        let text = draw_at(&state, 130, 30);
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        assert_eq!(
+            lines[2],
+            "RAM: 17.2 GB (1x17.2 GB Dual-Rank) 3200 MT/s | Single-Channel | Mode: Synchronous 1:1 (UCLK = MCLK = 1.8 GHz)",
+            "{}",
+            lines[2]
+        );
     }
 }
