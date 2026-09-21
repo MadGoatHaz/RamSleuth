@@ -128,7 +128,7 @@ USE_VENDOR=0
 if [[ -n "${VENDOR_SRC}" ]]; then
   if [[ "${RYZEN_SMU_FORCE_REMOTE:-0}" == "1" ]]; then
     log "RYZEN_SMU_FORCE_REMOTE=1 — using the git path (the vendored source at ${VENDOR_SRC} is ignored)"
-  elif [[ -n "${RYZEN_SMU_PIN:-}" ]]; then
+  elif [[ -n "${RYZEN_SMU_PIN:-}" || -n "${RYZEN_SMU_URL:-}" ]]; then
     log "RYZEN_SMU_PIN override set — using the git path (the vendor carries only the default pin)"
   else
     USE_VENDOR=1
