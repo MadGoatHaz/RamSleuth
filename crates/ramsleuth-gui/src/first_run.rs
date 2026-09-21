@@ -206,8 +206,9 @@ pub fn setup_argv(with_dkms: bool, user: &str) -> Vec<String> {
 ///
 /// Ownership: the render thread's only permitted write is flipping
 /// `running` on a button click (D6 — no I/O on the render thread);
-/// the worker (the `pkexec` spawn of [`setup_argv`]) clears `running`
-/// and sets `done` (the helper exited 0 — all requested steps
+/// the per-tick edge consumer (the C21-06 worker in main.rs) clears
+/// `running` AT SPAWN of the detached `pkexec` [`setup_argv`] helper,
+/// which then sets `done` (the helper exited 0 — all requested steps
 /// succeeded or were no-ops) or `failure` (the helper's trailing
 /// diagnostic, exit 1, or the spawn itself failed).
 ///
@@ -216,9 +217,11 @@ pub fn setup_argv(with_dkms: bool, user: &str) -> Vec<String> {
 /// `failed: <msg>`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SetupOutcome {
-    /// The helper is running (a button click flipped this; the worker
-    /// clears it when the helper exits). The button is disabled while
-    /// set (no double-click).
+    /// The setup edge: a button click flips this, and the per-tick
+    /// edge consumer (the C21-06 worker, main.rs) clears it AT SPAWN
+    /// of the detached `pkexec` helper — so the button re-enables
+    /// while the helper runs, and a re-click spawns a second
+    /// (idempotent) helper run.
     pub running: bool,
     /// The helper exited 0 — all requested setup steps succeeded or
     /// were no-ops; full capabilities are active in the current
@@ -257,8 +260,10 @@ pub fn setup_with_dkms(requirements: &[Requirement]) -> bool {
 /// thread does zero I/O — D6; the `pkexec` spawn is the C21-06
 /// worker's job). No-panic degradation: the button + status line hide
 /// entirely when there is nothing to set up (`requirements` empty —
-/// the strip is presence-driven), and the button is disabled while
-/// the helper runs.
+/// the strip is presence-driven); the button is disabled only while
+/// the `running` edge is pending (consumed at the next tick's spawn)
+/// and re-enables while the detached helper runs (a re-click spawns a
+/// second, idempotent helper run).
 pub fn render_requirements_strip_with_setup(
     ui: &mut egui::Ui,
     requirements: &[Requirement],
