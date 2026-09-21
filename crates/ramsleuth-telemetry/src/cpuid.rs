@@ -112,17 +112,22 @@ impl CpuInfo {
 
 /// Run CPUID detection on `x86_64`.
 #[cfg(target_arch = "x86_64")]
+// `__cpuid` is an `unsafe fn` on MSRV 1.75 and pre-stabilization stables
+// (the block is mandatory there — E0133) and a safe intrinsic on recent
+// stables (where it would trip `unused_unsafe`); block + allow keeps
+// every toolchain warning-free (C21-34).
+#[allow(unused_unsafe)]
 fn detect_x86() -> CpuInfo {
     use std::arch::x86_64::__cpuid;
 
-    let leaf0 = __cpuid(0);
+    let leaf0 = unsafe { __cpuid(0) };
     let kind = vendor_kind_from_words(leaf0.ebx, leaf0.ecx, leaf0.edx);
-    let max_ext = __cpuid(0x80000000).eax;
+    let max_ext = unsafe { __cpuid(0x80000000).eax };
 
     let vendor = match kind {
         VendorKind::Amd => {
             let zen = if max_ext >= 0x80000001 {
-                let eax = __cpuid(0x80000001).eax;
+                let eax = unsafe { __cpuid(0x80000001).eax };
                 // Kernel-compatible family decode: 4-bit field + 8-bit
                 // extension (bits 27:20) once the field saturates at 0xF.
                 amd_zen_from_family((eax >> 8) & 0xF, (eax >> 20) & 0xFF)
@@ -135,7 +140,7 @@ fn detect_x86() -> CpuInfo {
             }
         }
         VendorKind::Intel => {
-            let eax = __cpuid(1).eax;
+            let eax = unsafe { __cpuid(1).eax };
             let family = (eax >> 8) & 0xF;
             let full_family = if family < 0xF {
                 family
@@ -163,6 +168,8 @@ fn detect_x86() -> CpuInfo {
 ///
 /// Returns an empty string when the extended leaves are absent; never panics.
 #[cfg(target_arch = "x86_64")]
+// `__cpuid` safety crosses stables — see the `detect_x86` note (C21-34).
+#[allow(unused_unsafe)]
 fn read_brand(max_ext: u32) -> String {
     use std::arch::x86_64::__cpuid;
 
@@ -171,7 +178,7 @@ fn read_brand(max_ext: u32) -> String {
     }
     let mut buf = [0u8; 48];
     for (i, leaf) in [0x80000002u32, 0x80000003, 0x80000004].iter().enumerate() {
-        let r = __cpuid(*leaf);
+        let r = unsafe { __cpuid(*leaf) };
         let words = [r.eax, r.ebx, r.ecx, r.edx];
         for (j, &w) in words.iter().enumerate() {
             let off = i * 16 + j * 4;
