@@ -130,7 +130,8 @@ transparency_block() {
   step "frozen unit   → /usr/lib/systemd/system/ramsleuth.service"
   step "systemd preset → /usr/lib/systemd/system-preset/ramsleuth.preset"
   step "app-menu entry → /usr/share/applications/ramsleuth.desktop"
-  step "hicolor icons  → /usr/share/icons/hicolor/{16,24,32,48,64,128,256,512}/apps/ramsleuth.png"
+  step "hicolor icons  → /usr/share/icons/hicolor/<size>/apps/ + <size>x<size>/apps/ramsleuth.png  (bare + NxN)"
+  step "pixmaps icon   → /usr/share/pixmaps/ramsleuth.png  (the 48px legacy fallback)"
   step "system group   → 'ramsleuth'  (groupadd -r; the unit runs as Group=ramsleuth)"
   step "shared helper  → /usr/bin/ramsleuth-install-ryzen-smu-dkms"
   step "setup helper   → /usr/bin/ramsleuth-setup   (one-click privileged setup; pkexec-able)"
@@ -176,14 +177,24 @@ do_install() {
   ok "/usr/lib/systemd/system-preset/ramsleuth.preset"
   install -Dm644 "packaging/ramsleuth-git/ramsleuth.desktop" "/usr/share/applications/ramsleuth.desktop"
   ok "/usr/share/applications/ramsleuth.desktop  (app-menu entry)"
-  # The 8 hicolor icons (AUR-parity: the same sizes every AUR package installs, C21-27) —
-  # they back the app-menu entry's Icon=ramsleuth (the hicolor theme lookup).
+  # The 8 hicolor icons (AUR-parity: the same sizes every AUR package installs,
+  # C21-27) — installed to BOTH the bare <size>/apps/ and the <size>x<size>/
+  # apps/ dirs: freedesktop index.theme files that declare only the NxN dirs
+  # make KIconLoader skip the bare dirs, so a bare-only install shows a
+  # missing-icon placeholder in the menu (C21-42) — they back the app-menu
+  # entry Icon=ramsleuth (the hicolor theme lookup).
   local size
   for size in 16 24 32 48 64 128 256 512; do
     [[ -f "assets/icons/hicolor/$size/apps/ramsleuth.png" ]] || die "Missing assets/icons/hicolor/$size/apps/ramsleuth.png — incomplete checkout; the hicolor icons cannot be installed." 1
     install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" "/usr/share/icons/hicolor/$size/apps/ramsleuth.png"
     ok "/usr/share/icons/hicolor/$size/apps/ramsleuth.png"
+    install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" "/usr/share/icons/hicolor/${size}x${size}/apps/ramsleuth.png"
+    ok "/usr/share/icons/hicolor/${size}x${size}/apps/ramsleuth.png"
   done
+  # The 48px legacy pixmaps fallback (the X11 legacy icon lookup path;
+  # C21-42) — the source file was die-guarded by the loop above (48).
+  install -Dm644 "assets/icons/hicolor/48/apps/ramsleuth.png" "/usr/share/pixmaps/ramsleuth.png"
+  ok "/usr/share/pixmaps/ramsleuth.png"
   # The system group (idempotent getent guard).
   if getent group ramsleuth >/dev/null 2>&1; then
     ok "group 'ramsleuth' already present"
