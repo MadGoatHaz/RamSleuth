@@ -23,7 +23,7 @@
 //! integration): a bold-CYAN title, the primary CYAN
 //! **`Set up RamSleuth`** button (C21 — the one-click wizard; the AMD
 //! `DriverMissing` case labels it `+ AMD driver`) + its dim live status
-//! line (idle / `running…` / `done — full capabilities active` /
+//! line (idle / `running…` / `done — restart RamSleuth to activate` /
 //! `failed: <msg>`), one row per requirement (an AMBER `!`, the
 //! summary, the dim detail, the command with a **Copy** button — the
 //! secondary fallback), a `Got it — keep using RamSleuth` button, and
@@ -213,7 +213,7 @@ pub fn setup_argv(with_dkms: bool, user: &str) -> Vec<String> {
 /// diagnostic, exit 1, or the spawn itself failed).
 ///
 /// The strip's dim status line renders the four states: idle (the
-/// default) / `running…` / `done — full capabilities active` /
+/// default) / `running…` / `done — restart RamSleuth to activate` /
 /// `failed: <msg>`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SetupOutcome {
@@ -224,8 +224,10 @@ pub struct SetupOutcome {
     /// (idempotent) helper run.
     pub running: bool,
     /// The helper exited 0 — all requested setup steps succeeded or
-    /// were no-ops; full capabilities are active in the current
-    /// session (no re-login, no reboot).
+    /// were no-ops. The new session state (the group membership, the
+    /// socket ACL) activates in the *next* app launch — the current
+    /// process's session predates it (no re-login, no reboot); the
+    /// C21-36 modal prompt offers the in-place relaunch.
     pub done: bool,
     /// The helper failed: the trailing diagnostic for the status line
     /// (`failed: <msg>`).
@@ -248,7 +250,7 @@ pub fn setup_with_dkms(requirements: &[Requirement]) -> bool {
 /// bold-CYAN title, the primary CYAN **`Set up RamSleuth`** button
 /// (the AMD `DriverMissing` case labels it `+ AMD driver` —
 /// [`setup_with_dkms`]), its dim live status line (idle / `running…`
-/// / `done — full capabilities active` / `failed: <msg>`), one row
+/// / `done — restart RamSleuth to activate` / `failed: <msg>`), one row
 /// per requirement (an AMBER `!`, the summary, the dim detail, the
 /// command with the **Copy** button — `ui.ctx().copy_text`, the
 /// secondary polkit-less fallback, D-18.5), the `Got it — keep using
@@ -307,7 +309,7 @@ pub fn render_requirements_strip_with_setup(
             let (status, color) = if setup.running {
                 ("running…".to_owned(), CYAN)
             } else if setup.done {
-                ("done — full capabilities active".to_owned(), CYAN)
+                ("done — restart RamSleuth to activate".to_owned(), CYAN)
             } else if let Some(failure) = &setup.failure {
                 (format!("failed: {failure}"), AMBER)
             } else {
