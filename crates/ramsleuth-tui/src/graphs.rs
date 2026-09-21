@@ -1,7 +1,7 @@
-//! TUI-05 — the graphs core, part 1: the sample + state + record
-//! hook (plan `PLAN-TUI-PARITY` §3; this file's parts 2/3 — the
-//! CPU-temp source scan + the window filter / sparkline panel —
-//! land in TUI-06/TUI-07).
+//! TUI-05/06 — the graphs core, parts 1+2: the sample + state +
+//! record hook + the CPU-temp source scan (plan `PLAN-TUI-PARITY`
+//! §3; this file's part 3 — the window filter / sparkline panel —
+//! lands in TUI-07).
 //!
 //! A self-contained mirror of the GUI `graph.rs` sample core (the
 //! five-series graphs window), re-implemented TUI-local: the TUI
@@ -23,6 +23,12 @@
 //!   C7-20 source map): one sample per successful poll, appended
 //!   only when ≥ 1 field is finite — an all-NaN reading is a hole,
 //!   never a point (the `record_history_sample` precedent).
+//! - [`read_cpu_temp_c`] — the ordered CPU-temp source scan
+//!   (TUI-06 — the runtime source of the `cpu_temp_c` series; the
+//!   TUI-local copy of the GUI's C9-04 scan: the `k10temp` /
+//!   `zenpower` hwmon `temp1_input` first, the `cpu_thermal`
+//!   thermal-zone fallback; every failure class → `f64::NAN`, std
+//!   `fs` only, poller-thread — plan D6).
 //!
 //! **Poller-only writer:** the background updater (TUI-17/18) is
 //! the only caller of [`record_graph_sample`]; the render path is
@@ -33,10 +39,12 @@
 //! [`GRAPH_CAPACITY`] (no unbounded growth), and nothing here
 //! allocates per call except the sample push.
 //!
-//! This chunk declares the module in `lib.rs` (the minimal wiring
-//! the crate needs to compile the new file) — TUI-23 does the final
-//! module-map update + the root re-exports.
+//! The module was declared in `lib.rs` by TUI-05 (the minimal
+//! wiring the crate needs to compile this file) — TUI-23 does the
+//! final module-map update + the root re-exports.
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ramsleuth_telemetry::SystemMemoryTelemetry;
@@ -206,8 +214,157 @@ pub fn record_graph_sample(
 }
 
 // ---------------------------------------------------------------------
-// Tests (headless: no TTY, no I/O — the fixtures are synthetic
-// snapshots, the record core is pure).
+// The CPU-temperature source scan (TUI-06 — the runtime source of
+// the `cpu_temp_c` series; the GUI's C9-04 ordered scan: hwmon
+// first, thermal-zone fallback).
+// ---------------------------------------------------------------------
+
+/// The ordered CPU-temperature source scan (the runtime source of
+/// the `cpu_temp_c` series — the TUI-local copy of the GUI
+/// `graph.rs` C9-04 scan): first the hwmon sensor
+/// ([`read_hwmon_temp_c`] — the AMD `k10temp` / `zenpower`
+/// `temp1_input`), then the `cpu_thermal` thermal-zone scan (the
+/// pre-C9-04 fallback, kept verbatim). The first finite reading
+/// wins.
+///
+/// Every failure class degrades to `f64::NAN`: no hwmon class at
+/// all, no matching sensor name, no matching `cpu_thermal` zone
+/// (e.g. the host's iwlwifi-only thermal set), an unreadable
+/// `name` / `type`, or an unreadable / non-numeric reading (the
+/// ENODATA sensor case). Nothing panics — std `fs` reads only, no
+/// parsing that can divide. Runs on the poller thread (plan D6 —
+/// never the render thread).
+pub fn read_cpu_temp_c() -> f64 {
+    let hwmon = read_hwmon_temp_c();
+    if hwmon.is_finite() {
+        return hwmon; // the hwmon source (k10temp/zenpower) wins.
+    }
+    // The fallback: the `cpu_thermal` thermal-zone scan (the
+    // pre-C9-04 form, kept verbatim).
+    let Ok(zones) = fs::read_dir("/sys/class/thermal") else {
+        return f64::NAN; // no thermal class at all.
+    };
+    for entry in zones.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue; // a non-UTF-8 zone name: not the CPU zone.
+        };
+        if !name.starts_with("thermal_zone") {
+            continue;
+        }
+        let dir = entry.path();
+        let Ok(zone_type) = fs::read_to_string(dir.join("type")) else {
+            continue; // the zone's type is unreadable: not it.
+        };
+        if zone_type.trim().eq_ignore_ascii_case("cpu_thermal") {
+            // The first matching zone wins.
+            return read_zone_temp_c(&dir);
+        }
+    }
+    f64::NAN // no `cpu_thermal` zone (the host's iwlwifi-only case).
+}
+
+/// The hwmon CPU-temperature scan (the GUI's C9-04/D-3): walk
+/// `/sys/class/hwmon/`, read each `hwmon*` device's `name` (the
+/// kernel sensor name, trimmed + case-insensitive), select the
+/// preferred one by name only ([`select_hwmon_dir`] — `k10temp`
+/// first, else `zenpower`, never a fixed `hwmonN` index — the
+/// index is unstable across boots/CPUs), and return that device's
+/// `temp1_input` (millidegrees ÷ 1000) in °C.
+///
+/// Every failure class degrades to `f64::NAN`: no hwmon class at
+/// all, no `hwmon*` device with a readable `name`, no matching
+/// sensor name, or an unreadable / non-numeric / non-finite
+/// `temp1_input` (the ENODATA sensor case — e.g. the host's `asus`
+/// / `iwlwifi` hwmons). Nothing panics — std `fs` reads only.
+fn read_hwmon_temp_c() -> f64 {
+    let Ok(devices) = fs::read_dir("/sys/class/hwmon") else {
+        return f64::NAN; // no hwmon class at all.
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in devices.flatten() {
+        let Ok(raw_name) = entry.file_name().into_string() else {
+            continue; // a non-UTF-8 device name: skip.
+        };
+        if !raw_name.starts_with("hwmon") {
+            continue; // not an hwmon device dir.
+        }
+        let dir = entry.path();
+        let Ok(name) = fs::read_to_string(dir.join("name")) else {
+            continue; // the device's `name` is unreadable: not it.
+        };
+        names.push(name.trim().to_string());
+        dirs.push(dir);
+    }
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let Some(selected) = select_hwmon_dir(&name_refs) else {
+        return f64::NAN; // no `k10temp` / `zenpower` device.
+    };
+    let Some(dir) = names.iter().position(|name| name == selected).and_then(|i| dirs.get(i))
+    else {
+        // `selected` came from `names`: not expected, still degrades.
+        return f64::NAN;
+    };
+    read_hwmon_temp1_c(dir)
+}
+
+/// The hwmon name selection (the GUI's C9-04/D-3 — pure, I/O-free):
+/// prefer `k10temp` (the AMD classic CPU sensor) over `zenpower`
+/// (the newer AMD sensor) over no match. Case-insensitive on the
+/// trimmed name; by name only — a fixed `hwmonN` index is never
+/// matched (it is unstable across boots/CPUs).
+fn select_hwmon_dir<'a>(names: &'a [&'a str]) -> Option<&'a str> {
+    let mut zenpower: Option<&str> = None;
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.eq_ignore_ascii_case("k10temp") {
+            return Some(trimmed); // the preferred sensor wins.
+        }
+        if trimmed.eq_ignore_ascii_case("zenpower") {
+            zenpower.get_or_insert(trimmed); // the fallback: first wins.
+        }
+    }
+    zenpower
+}
+
+/// One hwmon device's `temp1_input` (millidegrees) in °C; every
+/// failure class (missing / unreadable / non-numeric / non-finite)
+/// degrades to NaN (the no-panic contract — the ENODATA sensor
+/// case, e.g. the host's `asus` / `iwlwifi` hwmons).
+fn read_hwmon_temp1_c(dir: &Path) -> f64 {
+    let Ok(raw) = fs::read_to_string(dir.join("temp1_input")) else {
+        return f64::NAN; // missing (ENODATA sensor) or unreadable.
+    };
+    // A non-numeric / non-finite reading degrades to NaN (no panic).
+    parse_millidegrees(&raw).unwrap_or(f64::NAN)
+}
+
+/// One thermal zone's `temp` (millidegrees) in °C; every failure
+/// class (missing / unreadable / non-numeric / non-finite)
+/// degrades to NaN (the no-panic contract).
+fn read_zone_temp_c(zone_dir: &Path) -> f64 {
+    let Ok(raw) = fs::read_to_string(zone_dir.join("temp")) else {
+        return f64::NAN; // missing (ENODATA sensor) or unreadable.
+    };
+    // A non-numeric / non-finite reading degrades to NaN (no panic).
+    parse_millidegrees(&raw).unwrap_or(f64::NAN)
+}
+
+/// One millidegree reading (the kernel's `temp` / `temp1_input`
+/// encoding) in °C; a non-numeric or non-finite reading yields
+/// `None` (the no-panic contract).
+fn parse_millidegrees(raw: &str) -> Option<f64> {
+    match raw.trim().parse::<f64>() {
+        Ok(millidegrees) if millidegrees.is_finite() => Some(millidegrees / 1000.0),
+        _ => None, // a non-numeric reading: not data.
+    }
+}
+
+// ---------------------------------------------------------------------
+// Tests (headless: no TTY — the record fixtures are synthetic
+// snapshots, the record core is pure; the scan helpers are pure;
+// the two full-scan tests are host-dependent and assert no-panic +
+// a sane reading, never a fixed value).
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
@@ -456,5 +613,88 @@ mod tests {
         for pair in stamps.windows(2) {
             assert!(pair[0] <= pair[1], "t must be non-decreasing: {pair:?}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // read_cpu_temp_c — the CPU-temperature source scan (TUI-06 —
+    // the helper level is pure; the full scan is host-dependent,
+    // QA eyeballs the live value).
+    // ------------------------------------------------------------------
+
+    /// (g) The ordered scan never panics; a reading is either the
+    /// honest NaN (no hwmon sensor + no `cpu_thermal` zone) or a
+    /// finite value in a sane temperature range (this host: the
+    /// `k10temp` hwmon source).
+    #[test]
+    fn read_cpu_temp_c_never_panics_and_degrades_to_nan() {
+        let temp = read_cpu_temp_c();
+        assert!(
+            temp.is_nan() || (temp > -50.0 && temp < 150.0),
+            "a finite reading must be a sane temperature, got {temp}"
+        );
+    }
+
+    /// (h) The hwmon scan never panics: a reading is either the
+    /// honest NaN (no `k10temp` / `zenpower` device — a host
+    /// without the AMD sensor) or a finite value in a sane
+    /// temperature range (this host's `k10temp` `temp1_input`).
+    #[test]
+    fn read_hwmon_temp_c_never_panics_and_degrades_to_nan() {
+        let temp = read_hwmon_temp_c();
+        assert!(
+            temp.is_nan() || (temp > -50.0 && temp < 150.0),
+            "a finite reading must be a sane temperature, got {temp}"
+        );
+    }
+
+    /// (i) The name selection prefers `k10temp` over `zenpower`,
+    /// falls back to `zenpower`, and matches by name only (a fixed
+    /// `hwmonN` index is never a sensor name) — case-insensitive,
+    /// trimmed.
+    #[test]
+    fn select_hwmon_dir_prefers_k10temp_over_zenpower() {
+        assert_eq!(select_hwmon_dir(&["zenpower", "k10temp"]), Some("k10temp"));
+        assert_eq!(select_hwmon_dir(&["k10temp", "zenpower"]), Some("k10temp"));
+        assert_eq!(select_hwmon_dir(&["zenpower"]), Some("zenpower"));
+        assert_eq!(select_hwmon_dir(&[]), None, "no devices: no source");
+        assert_eq!(
+            select_hwmon_dir(&["acpi", "nvme", "asus", "iwlwifi_1"]),
+            None,
+            "non-CPU sensor names: no source"
+        );
+        assert_eq!(
+            select_hwmon_dir(&["hwmon4"]),
+            None,
+            "a fixed hwmonN index is not a sensor name"
+        );
+        assert_eq!(
+            select_hwmon_dir(&[" K10TEMP "]),
+            Some("K10TEMP"),
+            "the match is case-insensitive + trimmed"
+        );
+    }
+
+    /// (j) The millidegree parse (shared by the zone + hwmon
+    /// readers) maps `33125` → `33.125` °C (trimmed — the kernel's
+    /// trailing newline) and rejects non-numeric / non-finite
+    /// readings.
+    #[test]
+    fn parse_millidegrees_maps_and_rejects() {
+        assert_eq!(parse_millidegrees("33125"), Some(33.125));
+        assert_eq!(parse_millidegrees(" 29125\n"), Some(29.125));
+        assert_eq!(parse_millidegrees("garbage"), None, "non-numeric: not data");
+        assert_eq!(parse_millidegrees(""), None, "empty: not data");
+        assert_eq!(parse_millidegrees("inf"), None, "non-finite: not data");
+        assert_eq!(parse_millidegrees("1e999"), None, "overflow: not data");
+    }
+
+    /// (k) Every source reader degrades to NaN on a missing source
+    /// (no `temp1_input` on the hwmon device, no `temp` on the zone
+    /// — the no-source classes never panic).
+    #[test]
+    fn temp_source_readers_degrade_to_nan_on_missing_sources() {
+        let missing = Path::new("/nonexistent/ramsleuth_tui_06");
+        assert!(read_hwmon_temp1_c(missing).is_nan(), "a missing hwmon device: NaN");
+        assert!(read_zone_temp_c(missing).is_nan(), "a missing thermal zone: NaN");
     }
 }
