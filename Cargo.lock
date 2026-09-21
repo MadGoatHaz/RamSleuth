@@ -2600,6 +2600,8 @@ dependencies = [
  "ramsleuth-protocol",
  "ramsleuth-telemetry",
  "ratatui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
