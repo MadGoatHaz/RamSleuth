@@ -1,7 +1,6 @@
-//! TUI-05/06 — the graphs core, parts 1+2: the sample + state +
-//! record hook + the CPU-temp source scan (plan `PLAN-TUI-PARITY`
-//! §3; this file's part 3 — the window filter / sparkline panel —
-//! lands in TUI-07).
+//! TUI-05/06/07 — the graphs core, parts 1+2+3: the sample +
+//! state + record hook, the CPU-temp source scan, and the window
+//! filter + block sparkline panel (plan `PLAN-TUI-PARITY` §3).
 //!
 //! A self-contained mirror of the GUI `graph.rs` sample core (the
 //! five-series graphs window), re-implemented TUI-local: the TUI
@@ -29,6 +28,20 @@
 //!   `zenpower` hwmon `temp1_input` first, the `cpu_thermal`
 //!   thermal-zone fallback; every failure class → `f64::NAN`, std
 //!   `fs` only, poller-thread — plan D6).
+//! - [`window_samples`] — the `[w]` time-window filter: the
+//!   samples with `t ≥ newest_t − window_min·60` (the GUI presets
+//!   1/5/15/60 min; the newest stamp is the ring's last — `t` is
+//!   non-decreasing).
+//! - [`render_graphs_panel`] — the `[g]` graphs overlay (TUI-16
+//!   draws it last, topmost, over the whole zone area — the
+//!   C21-36 modal idiom): a titled block on the slate background,
+//!   one block-bar sparkline row per series in the GUI's fixed
+//!   order (CPU FREQ MHz, VDDCR_CPU mV, VDDCR_SOC mV, CPU TEMP °C,
+//!   MEM BW GB/s — a dim label + a `▁…█` bar plot quantized to the
+//!   row's finite min/max span, NaN = a gap, + a dim min/max; a
+//!   series with no finite sample in the window draws label + the
+//!   N/A note only), a bottom sample-count line; zero-area /
+//!   empty / one-sample never panics.
 //!
 //! **Poller-only writer:** the background updater (TUI-17/18) is
 //! the only caller of [`record_graph_sample`]; the render path is
@@ -48,6 +61,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ramsleuth_telemetry::SystemMemoryTelemetry;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Frame;
 
 use crate::ring::RingBuffer;
 
@@ -361,10 +379,248 @@ fn parse_millidegrees(raw: &str) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------
+// The window filter + the graphs overlay panel (TUI-07 — part 3:
+// the `[w]` window cycle + the `[g]` topmost block sparkline
+// panel; TUI-16 composes it over the zones).
+// ---------------------------------------------------------------------
+
+/// The semantic palette (Grand Design §3.2, the exact values — the
+/// ui.rs palette mirror, only the members this panel uses).
+///
+/// Cyan: the plotted bar values.
+const CYAN: Color = Color::Rgb(0x00, 0xD4, 0xFF);
+/// Crimson: the N/A notes (0 ≠ N/A — an absent value is never a
+/// zero bar).
+const CRIMSON: Color = Color::Rgb(0xFF, 0x3B, 0x30);
+/// Slate: the panel background.
+const SLATE: Color = Color::Rgb(0x1E, 0x1E, 0x24);
+/// Dim grey: the labels, the min/max, the sample-count line.
+const DIM: Color = Color::Rgb(0x8A, 0x8A, 0x96);
+
+/// The window filter (the `[w]` action's pure core): the samples
+/// with `t ≥ newest_t − window_min·60`, oldest → newest.
+///
+/// The newest stamp is the last element of the source — `t` is
+/// non-decreasing (TUI-05) and the ring iterates oldest → newest.
+/// The filter works over any sample iterator (not just the ring);
+/// an empty source yields an empty window, and a 0-minute window
+/// collapses to the newest stamp's equal-stamp run — never a
+/// panic.
+pub fn window_samples<'a>(
+    samples: impl Iterator<Item = &'a GraphSample>,
+    window_min: u32,
+) -> Vec<&'a GraphSample> {
+    let samples: Vec<&'a GraphSample> = samples.collect();
+    let Some(newest) = samples.last().copied() else {
+        return Vec::new(); // no samples: an empty window.
+    };
+    let cutoff = newest.t - f64::from(window_min) * 60.0;
+    samples
+        .into_iter()
+        .filter(|sample| sample.t >= cutoff)
+        .collect()
+}
+
+/// One plotted series: its display label + its field projection
+/// off the sample.
+type Series = (&'static str, fn(&GraphSample) -> f64);
+
+/// The row's label cell: a leading space + the 13-char padded
+/// label (all five series labels are ≤ 12 chars).
+const LABEL_CELL: usize = 14;
+
+/// Render the graphs overlay panel (the `[g]` toggle — TUI-16
+/// draws it last, topmost, over the whole zone area, the C21-36
+/// modal idiom): a titled block on the slate background, one
+/// block-bar sparkline row per series in the GUI's fixed order,
+/// then a sample-count line.
+///
+/// The rows (the plan's frozen order): CPU FREQ MHz, VDDCR_CPU
+/// mV, VDDCR_SOC mV, CPU TEMP °C, MEM BW GB/s. Each row is a dim
+/// label (left) + an ASCII bar plot (one column per windowed
+/// sample, right-aligned — newest right, the time axis; a
+/// bucketed max per column when the samples outnumber the
+/// columns; each finite value quantized to the row's finite
+/// min/max span over the 8 block elements, a NaN sample = a gap)
+/// and a dim min/max (right). A series with no finite sample in
+/// the window draws its label + an N/A note only (the GUI's
+/// 0 ≠ N/A rule).
+///
+/// No-panic contract: every division is span-guarded (a flat
+/// series quantizes to a full bar, not a NaN level), a zero /
+/// too-small `area` renders nothing, and the empty + one-sample
+/// states render without any special-case panic path.
+pub fn render_graphs_panel(
+    frame: &mut Frame,
+    graph: &GraphState,
+    window_min: u32,
+    area: Rect,
+) {
+    // A zero / too-small rect cannot host the borders + a row:
+    // draw nothing (the no-panic contract).
+    if area.is_empty() || area.width < 3 || area.height < 3 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN))
+        .title(format!(
+            "GRAPHS (last {window_min} min — [w] window · [g] close)"
+        ))
+        .style(Style::default().bg(SLATE));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return; // the borders consumed the rect: nothing to plot.
+    }
+
+    let windowed = window_samples(graph.samples.iter(), window_min);
+    // The GUI's fixed series order (plan §2.3).
+    let series: [Series; 5] = [
+        ("CPU FREQ MHz", |s: &GraphSample| s.cpu_freq_mhz),
+        ("VDDCR_CPU mV", |s: &GraphSample| s.vddcr_cpu_mv),
+        ("VDDCR_SOC mV", |s: &GraphSample| s.vddcr_soc_mv),
+        ("CPU TEMP °C", |s: &GraphSample| s.cpu_temp_c),
+        ("MEM BW GB/s", |s: &GraphSample| s.bandwidth_gbps),
+    ];
+    let mut constraints = vec![Constraint::Length(1); series.len()];
+    constraints.push(Constraint::Length(1)); // the sample-count line
+    constraints.push(Constraint::Fill(1)); // slack (clipped, never scrolled)
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+    for (i, (label, field)) in series.iter().enumerate() {
+        render_series_row(frame, label, *field, &windowed, rows[i]);
+    }
+    let count = windowed.len();
+    let unit = if count == 1 { "sample" } else { "samples" };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{count} {unit} in window"),
+            Style::default().fg(DIM),
+        ))),
+        rows[series.len()],
+    );
+}
+
+/// One series row: the dim label, the cyan bar plot, the dim
+/// min/max — or the label + the crimson N/A note when the window
+/// carries no finite sample (the 0 ≠ N/A rule — no bar, no
+/// min/max).
+fn render_series_row(
+    frame: &mut Frame,
+    label: &str,
+    field: fn(&GraphSample) -> f64,
+    windowed: &[&GraphSample],
+    area: Rect,
+) {
+    if area.is_empty() {
+        return; // a clipped row: nothing to draw.
+    }
+    let label_span = Span::styled(format!(" {label:<13}"), Style::default().fg(DIM));
+    let line = {
+        let values: Vec<f64> = windowed
+            .iter()
+            .map(|s| field(s))
+            .filter(|v| v.is_finite())
+            .collect();
+        if values.is_empty() {
+            // No finite sample in the window: label + the honest
+            // N/A note only (0 ≠ N/A).
+            Line::from(vec![
+                label_span,
+                Span::styled(" N/A", Style::default().fg(CRIMSON)),
+            ])
+        } else {
+            let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let right = format!(" {min:.1} / {max:.1}");
+            // The plot takes what the row has left after the label
+            // column + the right min/max (zero width = no bars).
+            let plot_width = usize::from(area.width)
+                .saturating_sub(LABEL_CELL)
+                .saturating_sub(right.len());
+            let plot_values: Vec<f64> = windowed.iter().map(|s| field(s)).collect();
+            Line::from(vec![
+                label_span,
+                Span::styled(
+                    sparkline(&plot_values, plot_width, min, max),
+                    Style::default().fg(CYAN),
+                ),
+                Span::styled(right, Style::default().fg(DIM)),
+            ])
+        }
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// The 8 block elements, shortest → tallest: a one-row bar plot
+/// quantizes each column's value to these 8 levels over the row's
+/// finite min/max span.
+const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// One series' bar plot as a single row of block elements.
+///
+/// The columns: one per sample (right-aligned — newest right, the
+/// time axis) when the samples fit in `width`, else a bucketed max
+/// per column (the peaks survive the downsize). A NaN sample (or a
+/// NaN-only bucket) is a gap. Each finite value quantizes to the 8
+/// [`BLOCKS`] levels over `min` / `max` (the row's finite span); a
+/// flat span (min == max) quantizes to a full bar — the guarded
+/// division, never NaN.
+fn sparkline(values: &[f64], width: usize, min: f64, max: f64) -> String {
+    let mut plot = String::with_capacity(width);
+    if width == 0 {
+        return plot;
+    }
+    if values.len() <= width {
+        for _ in 0..(width - values.len()) {
+            plot.push(' ');
+        }
+        for value in values {
+            plot.push(if value.is_finite() {
+                BLOCKS[quantize(*value, min, max)]
+            } else {
+                ' ' // a NaN sample: a gap, never a zero bar.
+            });
+        }
+    } else {
+        for column in 0..width {
+            let lo = column * values.len() / width;
+            let hi = (column + 1) * values.len() / width;
+            let peak = values[lo..hi]
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(f64::NEG_INFINITY, f64::max);
+            plot.push(if peak.is_finite() {
+                BLOCKS[quantize(peak, min, max)]
+            } else {
+                ' '
+            });
+        }
+    }
+    plot
+}
+
+/// Quantize a finite `value` to a 0..=7 [`BLOCKS`] level over the
+/// row's finite min/max span (guarded: a flat span maps to a full
+/// bar, not a division by zero).
+fn quantize(value: f64, min: f64, max: f64) -> usize {
+    if max == min {
+        return BLOCKS.len() - 1; // a flat series: a full bar.
+    }
+    let ratio = (value - min) / (max - min); // value in [min, max]: [0, 1]
+    (ratio * 7.0).round().clamp(0.0, 7.0) as usize
+}
+
+// ---------------------------------------------------------------------
 // Tests (headless: no TTY — the record fixtures are synthetic
-// snapshots, the record core is pure; the scan helpers are pure;
-// the two full-scan tests are host-dependent and assert no-panic +
-// a sane reading, never a fixed value).
+// snapshots, the record core is pure; the scan helpers are pure,
+// the two full-scan tests host-dependent (no-panic + a sane
+// reading, never a fixed value); the window filter + panel tests
+// use ratatui's in-memory TestBackend).
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
@@ -696,5 +952,212 @@ mod tests {
         let missing = Path::new("/nonexistent/ramsleuth_tui_06");
         assert!(read_hwmon_temp1_c(missing).is_nan(), "a missing hwmon device: NaN");
         assert!(read_zone_temp_c(missing).is_nan(), "a missing thermal zone: NaN");
+    }
+
+    // ------------------------------------------------------------------
+    // window_samples + render_graphs_panel — the window filter and
+    // the graphs overlay panel (TUI-07 part 3 — the render tests
+    // use ratatui's in-memory TestBackend, no TTY).
+    // ------------------------------------------------------------------
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// One all-finite sample (the panel tests' base case; the
+    /// frequency is the distinguishing value).
+    fn sample(t: f64, freq_mhz: f64) -> GraphSample {
+        GraphSample {
+            t,
+            cpu_freq_mhz: freq_mhz,
+            vddcr_cpu_mv: 1150.0,
+            vddcr_soc_mv: 1100.0,
+            cpu_temp_c: 45.0,
+            bandwidth_gbps: 26.0,
+        }
+    }
+
+    /// Draw `graph` at `window_min` into an in-memory terminal of
+    /// the given size and return the buffer as text (one line per
+    /// row, trailing spaces trimmed) — the ui.rs draw pattern.
+    fn draw_panel(graph: &GraphState, window_min: u32, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal must init");
+        let completed = terminal
+            .draw(|f| render_graphs_panel(f, graph, window_min, Rect::new(0, 0, width, height)))
+            .expect("render must not panic");
+        let buffer = completed.buffer;
+        let width = usize::from(buffer.area().width);
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .map(|line| line.trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// (l) The window filter keeps only the samples with
+    /// `t ≥ newest − window_min·60` (oldest → newest), keeps
+    /// everything for a wide window, collapses to the newest stamp
+    /// alone for a 0-minute window, and yields an empty window for
+    /// an empty source (never a panic).
+    #[test]
+    fn window_samples_filters_to_the_window() {
+        let mut ring = RingBuffer::<GraphSample>::with_capacity(10);
+        ring.push(sample(1000.0, 100.0));
+        ring.push(sample(1030.0, 200.0));
+        ring.push(sample(1060.0, 300.0));
+        ring.push(sample(1100.0, 400.0));
+        let state = GraphState { samples: ring };
+
+        // 1 min = 60 s: newest 1100, cutoff 1040 → the last two,
+        // oldest → newest.
+        let windowed = window_samples(state.samples.iter(), 1);
+        assert_eq!(
+            windowed.iter().map(|s| s.t).collect::<Vec<_>>(),
+            vec![1060.0, 1100.0]
+        );
+        // A wide window keeps everything.
+        let windowed = window_samples(state.samples.iter(), 10);
+        assert_eq!(windowed.len(), 4);
+        // A 0-minute window collapses to the newest stamp alone.
+        let windowed = window_samples(state.samples.iter(), 0);
+        assert_eq!(
+            windowed.iter().map(|s| s.t).collect::<Vec<_>>(),
+            vec![1100.0]
+        );
+        // An empty source: an empty window (no panic).
+        let empty = GraphState::default();
+        assert!(window_samples(empty.samples.iter(), 5).is_empty());
+    }
+
+    /// (m) An empty state renders the titled panel with every
+    /// series label + the honest N/A note (0 ≠ N/A) and the zero
+    /// sample-count line — no bars, no panic.
+    #[test]
+    fn render_empty_state() {
+        let state = GraphState::default();
+        let text = draw_panel(&state, 5, 100, 12);
+
+        // the panel title: the window minutes + the key hints
+        assert!(text.contains("GRAPHS (last 5 min"), "{text}");
+        assert!(text.contains("[w] window"), "{text}");
+        assert!(text.contains("[g] close"), "{text}");
+        // every series label + the honest N/A note (0 ≠ N/A)
+        for label in [
+            "CPU FREQ MHz",
+            "VDDCR_CPU mV",
+            "VDDCR_SOC mV",
+            "CPU TEMP °C",
+            "MEM BW GB/s",
+        ] {
+            assert!(text.contains(label), "missing {label}:\n{text}");
+        }
+        assert_eq!(text.matches("N/A").count(), 5, "{text}");
+        // the bottom sample-count line
+        assert!(text.contains("0 samples in window"), "{text}");
+    }
+
+    /// (n) One all-finite sample renders every series as its flat
+    /// full bar (min == max → the quantize guard) with the
+    /// identical min/max — no N/A anywhere.
+    #[test]
+    fn render_one_sample() {
+        let mut state = GraphState::default();
+        state.samples.push(sample(1000.0, 1800.0));
+        let text = draw_panel(&state, 5, 100, 12);
+
+        assert!(text.contains("1 sample in window"), "{text}");
+        assert!(text.contains("1800.0 / 1800.0"), "{text}");
+        assert!(text.contains("1150.0 / 1150.0"), "{text}");
+        assert!(text.contains("1100.0 / 1100.0"), "{text}");
+        assert!(text.contains("45.0 / 45.0"), "{text}");
+        assert!(text.contains("26.0 / 26.0"), "{text}");
+        // the flat span quantizes to a full block
+        assert!(text.contains('█'), "{text}");
+        assert_eq!(text.matches("N/A").count(), 0, "{text}");
+    }
+
+    /// (o) The full 1800-deep ring renders without panicking: the
+    /// 60-min window keeps everything, the bucketed plot survives
+    /// the downsize, and the newest (max) column is a full block.
+    #[test]
+    fn render_full_ring() {
+        let mut state = GraphState::default();
+        for i in 0..GRAPH_CAPACITY {
+            state.samples.push(sample(i as f64 * 2.0, 1000.0 + i as f64));
+        }
+        assert!(state.samples.is_full());
+        let text = draw_panel(&state, 60, 100, 12);
+
+        assert!(text.contains("GRAPHS (last 60 min"), "{text}");
+        assert!(text.contains("1800 samples in window"), "{text}");
+        // the freq span 1000.0 → 2799.0 (the newest sample's value)
+        assert!(text.contains("1000.0 / 2799.0"), "{text}");
+        // the newest (max) column quantizes to a full block
+        assert!(text.contains('█'), "{text}");
+    }
+
+    /// (p) A series with no finite sample in the window draws its
+    /// label + the N/A note only (the 0 ≠ N/A rule) while the
+    /// finite series plots its bars.
+    #[test]
+    fn render_all_nan_series() {
+        let mut state = GraphState::default();
+        // Only the frequency is finite; the other four series are
+        // all-NaN in the window.
+        for i in 0..3 {
+            state.samples.push(GraphSample {
+                t: 1000.0 + i as f64 * 2.0,
+                cpu_freq_mhz: 1800.0 + i as f64 * 100.0,
+                vddcr_cpu_mv: f64::NAN,
+                vddcr_soc_mv: f64::NAN,
+                cpu_temp_c: f64::NAN,
+                bandwidth_gbps: f64::NAN,
+            });
+        }
+        let text = draw_panel(&state, 5, 100, 12);
+
+        // the finite series plots its bars with its min/max...
+        assert!(text.contains("1800.0 / 2000.0"), "{text}");
+        assert!(text.contains('█'), "{text}");
+        // ...the four all-NaN series draw label + N/A note only
+        assert_eq!(text.matches("N/A").count(), 4, "{text}");
+    }
+
+    /// (q) The window clips: of two samples 200 s apart, a 1-min
+    /// window plots only the newest — the clipped sample's value
+    /// appears nowhere.
+    #[test]
+    fn render_window_clipping() {
+        let mut state = GraphState::default();
+        state.samples.push(sample(1000.0, 123.4));
+        state.samples.push(sample(1200.0, 678.9));
+        let text = draw_panel(&state, 1, 100, 12);
+
+        assert!(text.contains("1 sample in window"), "{text}");
+        // only the newest value plots (min == max = the newest)
+        assert!(text.contains("678.9 / 678.9"), "{text}");
+        assert!(
+            !text.contains("123.4"),
+            "the clipped sample's value must appear nowhere:\n{text}"
+        );
+    }
+
+    /// (r) A zero rect (and a rect too small for the borders) draws
+    /// nothing, never panics.
+    #[test]
+    fn render_zero_area_never_panics() {
+        let mut state = GraphState::default();
+        state.samples.push(sample(1000.0, 1800.0));
+        let backend = TestBackend::new(1, 1);
+        let mut terminal = Terminal::new(backend).expect("test terminal must init");
+        terminal
+            .draw(|f| {
+                // a zero rect + a rect too small for the borders
+                render_graphs_panel(f, &state, 5, Rect::new(0, 0, 0, 0));
+                render_graphs_panel(f, &state, 5, Rect::new(0, 0, 2, 2));
+            })
+            .expect("render must not panic");
     }
 }
