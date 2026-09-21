@@ -17,7 +17,8 @@
 #   scripts/install-ryzen-smu-dkms.sh — the shared pinned DKMS helper
 #   install.sh                    — the self-contained transparency entrypoint
 #   LICENSE                       — MIT (AUR license-compliance install path)
-#   ramsleuth.desktop             — the application-menu entry
+#   RamSleuth.desktop             — the application-menu entry (the filename
+#                                   matches the GUI's Wayland app_id, C21-45)
 #   ramsleuth-setup.sh            — the one-click setup helper (top-level; C21-17,
 #                                   lands with the v2.2.0 re-cut)
 #   90-ramsleuth-setup.policy     — the shared polkit policy (top-level; C21-17,
@@ -92,9 +93,12 @@ package() {
     # (6) the MIT license — the AUR license-compliance install path
     install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/ramsleuth-bin/LICENSE"
 
-    # (7) the application-menu entry — at the tarball top level
-    install -Dm644 "ramsleuth.desktop" \
-        "$pkgdir/usr/share/applications/ramsleuth.desktop"
+    # (7) the application-menu entry — at the tarball top level (staged as
+    # RamSleuth.desktop by the release workflow; the filename matches the
+    # GUI's Wayland app_id "RamSleuth" so KWin's app_id -> desktop-file match
+    # resolves the taskbar icon, C21-45)
+    install -Dm644 "RamSleuth.desktop" \
+        "$pkgdir/usr/share/applications/RamSleuth.desktop"
 
     # (8) the one-click setup helper -> /usr/bin/ramsleuth-setup (0755), at the
     # tarball top level (the C21-17 contract: scripts/ramsleuth-setup.sh staged
@@ -122,7 +126,10 @@ package() {
     # the menu, C21-42) + the 48px legacy /usr/share/pixmaps/ramsleuth.png
     # fallback (the Icon=ramsleuth resolution; plan C21-25, C21-42), at the
     # tarball top level (the C21-27 contract: assets/icons/ staged
-    # preserving the hicolor layout).
+    # preserving the hicolor layout). Every icon is ALSO installed under the
+    # name RamSleuth.png (bare + NxN + pixmaps) — KWin's direct icon-name
+    # fallback when the Wayland app_id "RamSleuth" is used verbatim as the
+    # icon name (C21-45).
     # GUARDED exactly as (8)/(9) for the same old-tarball reason: the
     # pre-C21-24 v2.1.1 tarball predates this member (the v2.2.0 re-cut
     # carries it), so a build against the old tarball skips it
@@ -134,11 +141,18 @@ package() {
                 "$pkgdir/usr/share/icons/hicolor/$size/apps/ramsleuth.png"
             install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" \
                 "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/ramsleuth.png"
+            # The app_id-named fallback (C21-45)
+            install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" \
+                "$pkgdir/usr/share/icons/hicolor/$size/apps/RamSleuth.png"
+            install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" \
+                "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/RamSleuth.png"
         fi
     done
     if [ -f "assets/icons/hicolor/48/apps/ramsleuth.png" ]; then
         install -Dm644 "assets/icons/hicolor/48/apps/ramsleuth.png" \
             "$pkgdir/usr/share/pixmaps/ramsleuth.png"
+        install -Dm644 "assets/icons/hicolor/48/apps/ramsleuth.png" \
+            "$pkgdir/usr/share/pixmaps/RamSleuth.png"
     fi
 
     # NOTE: the ramsleuth group is created on the TARGET system by the .install

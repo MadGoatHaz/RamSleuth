@@ -129,9 +129,10 @@ transparency_block() {
   done
   step "frozen unit   → /usr/lib/systemd/system/ramsleuth.service"
   step "systemd preset → /usr/lib/systemd/system-preset/ramsleuth.preset"
-  step "app-menu entry → /usr/share/applications/ramsleuth.desktop"
+  step "app-menu entry → /usr/share/applications/RamSleuth.desktop  (the filename matches the GUI's Wayland app_id; C21-45)"
   step "hicolor icons  → /usr/share/icons/hicolor/<size>/apps/ + <size>x<size>/apps/ramsleuth.png  (bare + NxN)"
   step "pixmaps icon   → /usr/share/pixmaps/ramsleuth.png  (the 48px legacy fallback)"
+  step "icon name      → RamSleuth.png in the same hicolor + pixmaps dirs  (the app_id direct-icon-name fallback; C21-45)"
   step "system group   → 'ramsleuth'  (groupadd -r; the unit runs as Group=ramsleuth)"
   step "shared helper  → /usr/bin/ramsleuth-install-ryzen-smu-dkms"
   step "setup helper   → /usr/bin/ramsleuth-setup   (one-click privileged setup; pkexec-able)"
@@ -175,14 +176,18 @@ do_install() {
   ok "/usr/lib/systemd/system/ramsleuth.service  (frozen unit, verbatim)"
   install -Dm644 "packaging/ramsleuth-git/ramsleuth.preset" "/usr/lib/systemd/system-preset/ramsleuth.preset"
   ok "/usr/lib/systemd/system-preset/ramsleuth.preset"
-  install -Dm644 "packaging/ramsleuth-git/ramsleuth.desktop" "/usr/share/applications/ramsleuth.desktop"
-  ok "/usr/share/applications/ramsleuth.desktop  (app-menu entry)"
+  install -Dm644 "packaging/ramsleuth-git/RamSleuth.desktop" "/usr/share/applications/RamSleuth.desktop"
+  ok "/usr/share/applications/RamSleuth.desktop  (app-menu entry; the filename matches the Wayland app_id, C21-45)"
   # The 8 hicolor icons (AUR-parity: the same sizes every AUR package installs,
   # C21-27) — installed to BOTH the bare <size>/apps/ and the <size>x<size>/
   # apps/ dirs: freedesktop index.theme files that declare only the NxN dirs
   # make KIconLoader skip the bare dirs, so a bare-only install shows a
   # missing-icon placeholder in the menu (C21-42) — they back the app-menu
-  # entry Icon=ramsleuth (the hicolor theme lookup).
+  # entry Icon=ramsleuth (the hicolor theme lookup). Every icon is ALSO
+  # installed under the name RamSleuth.png (bare + NxN + pixmaps): on Wayland
+  # KWin matches the window to a desktop file by app_id (eframe/winit 0.29
+  # sets app_id = window title "RamSleuth"), and its direct icon-name fallback
+  # uses the app_id verbatim as the icon name (C21-45).
   local size
   for size in 16 24 32 48 64 128 256 512; do
     [[ -f "assets/icons/hicolor/$size/apps/ramsleuth.png" ]] || die "Missing assets/icons/hicolor/$size/apps/ramsleuth.png — incomplete checkout; the hicolor icons cannot be installed." 1
@@ -190,11 +195,18 @@ do_install() {
     ok "/usr/share/icons/hicolor/$size/apps/ramsleuth.png"
     install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" "/usr/share/icons/hicolor/${size}x${size}/apps/ramsleuth.png"
     ok "/usr/share/icons/hicolor/${size}x${size}/apps/ramsleuth.png"
+    install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" "/usr/share/icons/hicolor/$size/apps/RamSleuth.png"
+    ok "/usr/share/icons/hicolor/$size/apps/RamSleuth.png"
+    install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" "/usr/share/icons/hicolor/${size}x${size}/apps/RamSleuth.png"
+    ok "/usr/share/icons/hicolor/${size}x${size}/apps/RamSleuth.png"
   done
   # The 48px legacy pixmaps fallback (the X11 legacy icon lookup path;
-  # C21-42) — the source file was die-guarded by the loop above (48).
+  # C21-42) — the source file was die-guarded by the loop above (48) — plus
+  # the RamSleuth.png app_id-named counterpart (C21-45).
   install -Dm644 "assets/icons/hicolor/48/apps/ramsleuth.png" "/usr/share/pixmaps/ramsleuth.png"
   ok "/usr/share/pixmaps/ramsleuth.png"
+  install -Dm644 "assets/icons/hicolor/48/apps/ramsleuth.png" "/usr/share/pixmaps/RamSleuth.png"
+  ok "/usr/share/pixmaps/RamSleuth.png"
   # The system group (idempotent getent guard).
   if getent group ramsleuth >/dev/null 2>&1; then
     ok "group 'ramsleuth' already present"
