@@ -3,8 +3,10 @@
 //! [`AppState`] is the TUI's presentation state and wraps the wire types
 //! **verbatim** (D2 — no duplication): a [`SystemMemoryTelemetry`] snapshot,
 //! the benchmark [`BenchState`], the daemon status line, a last-update
-//! timestamp, and an optional error. [`render`] draws the dense,
-//! non-scrolling dark dashboard into one `ratatui::Frame`:
+//! timestamp, an optional error, the five-series graphs ring
+//! ([`GraphState`]), and the in-memory settings knobs
+//! ([`TuiSettings`]). [`render`] draws the dense, non-scrolling dark
+//! dashboard into one `ratatui::Frame`:
 //!
 //! - **Zone 1 — live memory controller & subtimings:** every cell of the
 //!   AMD (and Intel, if present) readout as `key: value` or `key: N/A
@@ -17,6 +19,13 @@
 //! - **Zone 3 — hardware & SPD telemetry:** per-slot module lines (maker /
 //!   part / rank / density / speed + XMP/EXPO profiles), the daemon status
 //!   line, and the error line when present.
+//!
+//! The frozen state shapes also carry the parity surfaces the render
+//! chain adds over these zones (TUI-10…16): the 3-line header, the
+//! settings strip (`settings.settings_open`), the requirements strip
+//! (`settings.requirements_open` — driven by the TUI-08 diagnose
+//! presence rule), and the graphs overlay (`settings.graphs_open`,
+//! drawn over the zone area from `graph`).
 //!
 //! The semantic palette (Grand Design §3.2) is exact: values in cyan
 //! `#00D4FF`, warnings in amber `#FFB300`, N/A/alarms in crimson
@@ -44,6 +53,8 @@ use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 
+use crate::graphs::GraphState;
+
 // ---------------------------------------------------------------------------
 // Semantic palette (Grand Design §3.2, exact values).
 // ---------------------------------------------------------------------------
@@ -65,27 +76,126 @@ const DIM: Color = Color::Rgb(0x8A, 0x8A, 0x96);
 
 /// The benchmark engine presentation state (zone 2).
 ///
-/// `Default` is the not-yet-run state: idle, no progress events, no grid —
-/// the dashboard renders a full `N/A` grid + an `idle` line for it.
+/// `Default` is the not-yet-run state: idle, no run id, no progress
+/// events, no grid, no burn-in — the dashboard renders a full `N/A`
+/// grid + an `idle` line for it.
 #[derive(Debug, Clone, Default)]
 pub struct BenchState {
     /// A run is in flight (progress events are streaming).
     pub running: bool,
+    /// The in-flight run's daemon-assigned id (`None` between runs —
+    /// the cancel action addresses the run with it).
+    pub run_id: Option<u64>,
     /// The streamed progress events (latest last; `cell_index` /
     /// `total_cells` count within the run's cell list).
     pub progress: Vec<StreamProgress>,
     /// The terminal grid (`Some` after a completed run; unmeasured cells
     /// carry `0.0` on the wire and render as `N/A`).
     pub grid: Option<BenchmarkGrid>,
+    /// The live burn-in state: a burn-in in flight, the newest tick's
+    /// iteration / elapsed, and the newest per-cell values.
+    pub burn_in: BurnInState,
 }
 
-/// The TUI's presentation state: the reused wire types verbatim (D2) plus
-/// the daemon status line.
+/// The live burn-in state (the zone-2 burn-in row): a burn-in run in
+/// flight, the newest tick's iteration / elapsed, and the newest
+/// per-cell values seen this burn-in.
+///
+/// `latest` accumulates each streamed `BurnInProgress` tick the same
+/// way the live grid accumulates progress events (the newest value per
+/// cell wins; a non-finite / non-positive reading never counts). The
+/// 4×4 table keeps showing the terminal grid
+/// ([`BenchState::grid`]) during a run; the burn-in row shows `latest`.
+///
+/// Hand-written `Default` (the GUI `update.rs` precedent): no run,
+/// iteration 0, zero elapsed, and a zero grid — `BenchmarkGrid` derives
+/// no `Default`, so the unmeasured cells stay `0.0` (they render `N/A`).
+#[derive(Debug, Clone)]
+pub struct BurnInState {
+    /// A burn-in run is in flight.
+    pub running: bool,
+    /// The 1-based iteration of the newest tick seen this run (0
+    /// before the first tick).
+    pub iteration: u32,
+    /// The run elapsed, in seconds, from the newest tick (0.0 before
+    /// the first tick).
+    pub elapsed_secs: f64,
+    /// The newest per-cell values seen this burn-in.
+    pub latest: BenchmarkGrid,
+}
+
+impl Default for BurnInState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            iteration: 0,
+            elapsed_secs: 0.0,
+            // A zero grid: unmeasured cells stay 0.0 (they render N/A).
+            latest: BenchmarkGrid {
+                read_gbps: [0.0; 4],
+                write_gbps: [0.0; 4],
+                copy_gbps: [0.0; 4],
+                latency_ns: [0.0; 4],
+            },
+        }
+    }
+}
+
+/// The TUI's in-memory settings knobs (the GUI `update.rs` settings
+/// precedent — no persistence; the `[t]` strip + the cycle keys mutate
+/// them on the main thread, the poller re-reads them each tick).
+///
+/// `Default` is the current TUI behavior: the 2 s live poll, refresh
+/// on (the TUI-specific inversion of the GUI's off default — the
+/// existing live poll is kept), GiB capacity, MHz clocks, all panels
+/// closed, and the 5-min graphs window.
+#[derive(Debug, Clone)]
+pub struct TuiSettings {
+    /// The telemetry poll interval in milliseconds (default 2000;
+    /// floor 100, max 60 000 — the clamp is applied at the read site).
+    pub poll_interval_ms: u64,
+    /// Periodic polling is on (`false` freezes the view; `[R]` and the
+    /// reconnect baseline fetch still run).
+    pub refresh: bool,
+    /// Capacity displays in GiB (`false` = GB).
+    pub capacity_gib: bool,
+    /// Clocks display in MHz (`false` = GHz).
+    pub clock_mhz: bool,
+    /// The graphs overlay panel is open (`[g]`).
+    pub graphs_open: bool,
+    /// The settings strip is open (`[t]`).
+    pub settings_open: bool,
+    /// The requirements strip is open (`[d]` — the renderer keeps it
+    /// force-true while diagnose is non-empty, until explicitly
+    /// closed).
+    pub requirements_open: bool,
+    /// The graphs window in minutes (default 5; presets 1 / 5 / 15 /
+    /// 60).
+    pub graph_window_min: u32,
+}
+
+impl Default for TuiSettings {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: 2_000,
+            refresh: true,
+            capacity_gib: true,
+            clock_mhz: true,
+            graphs_open: false,
+            settings_open: false,
+            requirements_open: false,
+            graph_window_min: 5,
+        }
+    }
+}
+
+/// The TUI's presentation state: the reused wire types verbatim (D2),
+/// the daemon status line, the graphs ring, and the settings knobs.
 ///
 /// P3-24's main loop builds it from `GetTelemetry` / benchmark frames
 /// behind an `Arc<RwLock<_>>` and calls [`render`] each tick; `Default` is
-/// the not-yet-connected state (no telemetry, idle bench, no error) and
-/// renders pure placeholders.
+/// the not-yet-connected state (no telemetry, idle bench, empty ring,
+/// default settings, no error) and renders pure placeholders.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
     /// The latest telemetry snapshot (`None` before the first successful
@@ -102,6 +212,11 @@ pub struct AppState {
     /// The latest structured error (daemon down, protocol violation);
     /// `None` when healthy.
     pub error: Option<String>,
+    /// The five-series graphs ring (1800 samples = 60 min at the 2 s
+    /// cadence — the `[g]` overlay's data source).
+    pub graph: GraphState,
+    /// The in-memory settings knobs (the `[t]` strip + the cycle keys).
+    pub settings: TuiSettings,
 }
 
 // ---------------------------------------------------------------------------
@@ -842,10 +957,9 @@ mod tests {
                 total_capacity: Section::Value(16.0),
                 dimm_sizes: vec![Section::Value(16.0)],
             }),
-            bench: BenchState::default(),
             daemon_status: "up · /tmp/ramsleuth.sock".to_owned(),
             last_update: Some(Instant::now()),
-            error: None,
+            ..Default::default()
         }
     }
 
@@ -911,6 +1025,7 @@ mod tests {
                 copy_gbps: [0.0; 4],
                 latency_ns: [0.0, 1.1, 0.0, 0.0],
             }),
+            ..Default::default()
         };
         let text = draw(&state);
 
@@ -936,6 +1051,7 @@ mod tests {
                     copy_gbps: [0.0; 4],
                     latency_ns: [86.8, 0.0, 0.0, 0.0],
                 }),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -951,11 +1067,8 @@ mod tests {
     #[test]
     fn error_state_renders_error_line() {
         let state = AppState {
-            telemetry: None,
-            bench: BenchState::default(),
-            daemon_status: String::new(),
-            last_update: None,
             error: Some("daemon down: cannot connect to /tmp/x.sock".to_owned()),
+            ..Default::default()
         };
         let text = draw(&state);
 
@@ -1000,10 +1113,8 @@ mod tests {
                 total_capacity: Section::na(NaReason::NotApplicable),
                 dimm_sizes: Vec::new(),
             }),
-            bench: BenchState::default(),
             daemon_status: "up".to_owned(),
-            last_update: None,
-            error: None,
+            ..Default::default()
         };
         // 100×60: zone 1's 27-row surface would clip the second channel
         // block; a taller terminal reaches it.
