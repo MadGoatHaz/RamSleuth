@@ -58,6 +58,7 @@
 //! The kernels never realign internally: each public fn `debug_assert`s
 //! the precondition, and violating it in a release build is undefined
 //! behavior. Tests allocate via `Layout::from_size_align(len, 64)`.
+//! **C21-35 feature gate:** the `#[target_feature(enable = "avx512f")]` bodies and the AVX-512 `core::arch` imports compile only behind the non-default `avx512` cargo feature (unstable on stable rustc — E0658); with the feature off the three public fns keep their API and run the AVX2 fallback.
 
 // The AVX-512F `core::arch` intrinsics used by the 512-bit bodies below
 // stabilized in Rust 1.89, which is newer than this crate's declared
@@ -67,13 +68,14 @@
 // module docs' MSRV note. Compiling this module on x86_64 needs rustc
 // >= 1.89 (aligning the workspace MSRV is a follow-up decision, outside
 // this chunk's file scope).
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 use core::arch::x86_64::{
     _mm512_add_epi64, _mm512_castsi512_si256, _mm512_extracti64x4_epi64, _mm512_load_si512,
     _mm512_set_epi64, _mm512_setzero_si512, _mm512_stream_si512, _mm_add_epi64, _mm256_castsi256_si128,
     _mm_cvtsi128_si64, _mm256_extracti128_si256, _mm_sfence, _mm_unpackhi_epi64, __m512i,
 };
 
+#[cfg(feature = "avx512")]
 use crate::features::CpuFeatures;
 use crate::kernel_copy::avx2_copy;
 use crate::kernel_read::avx2_read;
@@ -100,7 +102,7 @@ pub fn avx512_read(src: &[u8]) -> u64 {
         src.len() % 64 == 0,
         "avx512_read: src.len() must be a multiple of 64",
     );
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
     {
         if CpuFeatures::detect().avx512f {
             // SAFETY: the debug_asserts above (and the documented
@@ -137,7 +139,7 @@ pub fn avx512_write(dst: &mut [u8], pattern: u64) -> u64 {
         dst.len() % 64 == 0,
         "avx512_write: dst.len() must be a multiple of 64",
     );
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
     {
         if CpuFeatures::detect().avx512f {
             // SAFETY: the debug_asserts above (and the documented
@@ -186,7 +188,7 @@ pub fn avx512_copy(src: &[u8], dst: &mut [u8]) -> u64 {
             || dst.as_ptr() as usize + dst.len() <= src.as_ptr() as usize,
         "avx512_copy: src and dst must not alias",
     );
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
     {
         if CpuFeatures::detect().avx512f {
             // SAFETY: the debug_asserts above (and the documented
@@ -215,7 +217,7 @@ pub fn avx512_copy(src: &[u8], dst: &mut [u8]) -> u64 {
 /// `len` a multiple of 64 (enforced by [`avx512_read`]'s debug asserts
 /// and documented precondition); every load reads strictly inside that
 /// span.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 #[clippy::msrv = "1.89"]
 #[target_feature(enable = "avx512f")]
 unsafe fn avx512_read_simd(ptr: *const u8, len: usize) -> u64 {
@@ -273,7 +275,7 @@ unsafe fn avx512_read_simd(ptr: *const u8, len: usize) -> u64 {
 /// `len` a multiple of 64 (enforced by [`avx512_write`]'s debug asserts
 /// and documented precondition); every store writes strictly inside
 /// that span.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 #[clippy::msrv = "1.89"]
 #[target_feature(enable = "avx512f")]
 unsafe fn avx512_write_simd(ptr: *mut u8, len: usize, pattern: u64) -> u64 {
@@ -317,7 +319,7 @@ unsafe fn avx512_write_simd(ptr: *mut u8, len: usize, pattern: u64) -> u64 {
 /// `len` a multiple of 64; and the two spans must not alias (enforced
 /// by [`avx512_copy`]'s debug asserts and documented precondition).
 /// Every load/store touches one 64-byte chunk strictly inside its span.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 #[clippy::msrv = "1.89"]
 #[target_feature(enable = "avx512f")]
 unsafe fn avx512_copy_simd(src: *const u8, dst: *mut u8, len: usize) {
@@ -518,6 +520,7 @@ mod tests {
     /// bodies are called directly to prove they compile and run without
     /// panicking; otherwise the dispatch is verified to have fallen back
     /// to the AVX2 kernels, with results equal to the AVX2 fns.
+    #[cfg(feature = "avx512")]
     #[test]
     fn direct_512_bodies_or_verified_avx2_fallback() {
         const LEN: usize = 8 * 1024;
