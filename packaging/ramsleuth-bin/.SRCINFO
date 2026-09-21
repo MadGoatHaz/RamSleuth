@@ -16,6 +16,6 @@ pkgbase = ramsleuth-bin
 	depends = mesa
 	conflicts = ramsleuth
 	source = https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.2.0/ramsleuth-2.2.0-x86_64.tar.zst
-	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+	sha256sums = 1938e56f669a5b33be7b8890092de561f19f8a0536b07bdc1fa682bc37a2434a
 
 pkgname = ramsleuth-bin
