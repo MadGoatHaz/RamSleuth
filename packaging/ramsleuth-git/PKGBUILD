@@ -51,6 +51,7 @@ arch=(x86_64)
 url="https://github.com/MadGoatHaz/RamSleuth"
 license=(MIT)
 source=("$pkgname::git+https://github.com/MadGoatHaz/RamSleuth.git#branch=v2-development")
+install=ramsleuth-git.install
 makedepends=(rust cargo pkgconf libx11 libxkbcommon wayland wayland-protocols libxrandr libxi libxcursor libxinerama mesa)
 depends=(libx11 libxkbcommon wayland libxrandr libxi libxcursor libxinerama mesa)
 
