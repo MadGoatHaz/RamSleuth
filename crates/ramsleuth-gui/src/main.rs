@@ -1698,7 +1698,8 @@ fn show_graphs_viewport(
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("RamSleuth — Graphs")
         .with_inner_size(GRAPHS_WINDOW_SIZE)
-        .with_min_inner_size(GRAPHS_WINDOW_MIN_SIZE);
+        .with_min_inner_size(GRAPHS_WINDOW_MIN_SIZE)
+        .with_app_id("RamSleuth");
     // The same decoded icon as the root (C21-26 — one decode at
     // startup); `None` (a decode failure) stays legal — eframe's
     // default icon (no-panic, D5).
@@ -1843,7 +1844,8 @@ fn main() -> ExitCode {
         viewport: {
             let mut viewport = egui::ViewportBuilder::default()
                 .with_inner_size(DEFAULT_WINDOW_SIZE)
-                .with_min_inner_size(MIN_WINDOW_SIZE);
+                .with_min_inner_size(MIN_WINDOW_SIZE)
+                .with_app_id("RamSleuth");
             viewport.icon = icon.clone();
             viewport
         },
