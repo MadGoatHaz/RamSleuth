@@ -1279,9 +1279,9 @@ mod tests {
 
     /// (f) The 3-line header (TUI-10): line 1 the title + platform tag
     /// + daemon status, line 2 the CPU/platform identity (the
-    /// representative's Zen 3 / 3500 MHz / Test Board / BIOS 1.0 /
-    /// all-Na AGESA+SMU shape), line 3 the RAM summary slot (the
-    /// TUI-11 placeholder).
+    ///   representative's Zen 3 / 3500 MHz / Test Board / BIOS 1.0 /
+    ///   all-Na AGESA+SMU shape), line 3 the RAM summary slot (the
+    ///   TUI-11 placeholder).
     #[test]
     fn header_is_three_lines_with_values() {
         let text = draw(&representative());
