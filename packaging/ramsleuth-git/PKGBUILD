@@ -29,9 +29,11 @@
 #     C20 parity gap: ramsleuth-git was the only install path missing it;
 #     plan C21-27)
 #   - the hicolor icon tree assets/icons/hicolor/<size>/apps/ramsleuth.png
-#     (the 8 sizes 16/24/32/48/64/128/256/512) ->
-#     /usr/share/icons/hicolor/<size>/apps/ (the Icon=ramsleuth resolution;
-#     plan C21-25)
+#     (the 8 sizes 16/24/32/48/64/128/256/512) -> /usr/share/icons/hicolor/
+#     <size>/apps/ AND <size>x<size>/apps/ (dual bare+NxN: freedesktop
+#     index.theme files that declare only the NxN dirs make KIconLoader skip
+#     the bare dirs; C21-42) + the 48px legacy /usr/share/pixmaps/ramsleuth.png
+#     fallback (the Icon=ramsleuth resolution; plan C21-25, C21-42)
 #
 # No-panic contract (plan D7): installation never fails on the absence of
 # the ryzen_smu module, AVX-512, or a display; after a bare install the
@@ -116,13 +118,20 @@ package() {
     install -Dm644 "packaging/ramsleuth-git/ramsleuth.desktop" \
         "$pkgdir/usr/share/applications/ramsleuth.desktop"
 
-    # (9) the hicolor icon tree — the 8 sizes of
-    # /usr/share/icons/hicolor/<size>/apps/ramsleuth.png (the Icon=ramsleuth
-    # resolution, freedesktop hicolor search path; plan C21-25)
+    # (9) the hicolor icon tree — the 8 sizes, installed to BOTH the bare
+    # <size>/apps/ and the <size>x<size>/apps/ hicolor dirs (freedesktop
+    # index.theme files that declare only the NxN dirs make KIconLoader skip
+    # the bare dirs; a bare-only install shows a missing-icon placeholder in
+    # the menu, C21-42) + the 48px legacy /usr/share/pixmaps/ramsleuth.png
+    # fallback (the Icon=ramsleuth resolution; plan C21-25, C21-42)
     for size in 16 24 32 48 64 128 256 512; do
         install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" \
             "$pkgdir/usr/share/icons/hicolor/$size/apps/ramsleuth.png"
+        install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" \
+            "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/ramsleuth.png"
     done
+    install -Dm644 "assets/icons/hicolor/48/apps/ramsleuth.png" \
+        "$pkgdir/usr/share/pixmaps/ramsleuth.png"
 
     # NOTE: the ramsleuth group is created on the TARGET system by the .install
     # pre_install/pre_upgrade hooks (package() runs in the build env, not the target).

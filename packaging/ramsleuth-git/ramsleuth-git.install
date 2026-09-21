@@ -22,6 +22,9 @@ pre_upgrade() {
 }
 
 post_install() {
+    # Refresh the freedesktop hicolor icon cache (GTK-based consumers; KDE
+    # rebuilds its own cache on file change) — harmless if the tool is absent.
+    gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
     if ! systemctl enable --now ramsleuth.service 2>/dev/null; then
         echo "ramsleuth-git: ramsleuth.service not started (non-fatal);" \
@@ -80,6 +83,9 @@ post_install() {
 
 post_upgrade() {
     systemctl daemon-reload 2>/dev/null || true
+    # Icon cache refresh on upgrade too (the icon tree is reinstalled bare
+    # + NxN with every package version, C21-42).
+    gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
 }
 
 pre_remove() {

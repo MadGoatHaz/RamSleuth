@@ -22,8 +22,9 @@
 #                                   lands with the v2.2.0 re-cut)
 #   90-ramsleuth-setup.policy     — the shared polkit policy (top-level; C21-17,
 #                                   lands with the v2.2.0 re-cut)
-#   assets/icons/                 — the hicolor icon tree (8 sizes; top-level;
-#                                   C21-27, lands with the v2.2.0 re-cut)
+#   assets/icons/                 — the hicolor icon tree (8 sizes, installed
+#                                   bare + NxN; top-level; C21-27, lands
+#                                   with the v2.2.0 re-cut; C21-42)
 #
 # sha256sums pins that exact asset. AUR requires a real sha256 (no SKIP):
 # the pin below is a ZERO placeholder — the v2.2.0 release tarball does not
@@ -114,10 +115,14 @@ package() {
             "$pkgdir/usr/share/polkit-1/actions/90-ramsleuth-setup.policy"
     fi
 
-    # (10) the hicolor icon tree — the 8 sizes of
-    # /usr/share/icons/hicolor/<size>/apps/ramsleuth.png (the Icon=ramsleuth
-    # resolution; plan C21-25), at the tarball top level (the C21-27
-    # contract: assets/icons/ staged preserving the hicolor layout).
+    # (10) the hicolor icon tree — the 8 sizes, installed to BOTH the bare
+    # <size>/apps/ and the <size>x<size>/apps/ hicolor dirs (freedesktop
+    # index.theme files that declare only the NxN dirs make KIconLoader skip
+    # the bare dirs; a bare-only install shows a missing-icon placeholder in
+    # the menu, C21-42) + the 48px legacy /usr/share/pixmaps/ramsleuth.png
+    # fallback (the Icon=ramsleuth resolution; plan C21-25, C21-42), at the
+    # tarball top level (the C21-27 contract: assets/icons/ staged
+    # preserving the hicolor layout).
     # GUARDED exactly as (8)/(9) for the same old-tarball reason: the
     # pre-C21-24 v2.1.1 tarball predates this member (the v2.2.0 re-cut
     # carries it), so a build against the old tarball skips it
@@ -127,8 +132,14 @@ package() {
         if [ -f "assets/icons/hicolor/$size/apps/ramsleuth.png" ]; then
             install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" \
                 "$pkgdir/usr/share/icons/hicolor/$size/apps/ramsleuth.png"
+            install -Dm644 "assets/icons/hicolor/$size/apps/ramsleuth.png" \
+                "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/ramsleuth.png"
         fi
     done
+    if [ -f "assets/icons/hicolor/48/apps/ramsleuth.png" ]; then
+        install -Dm644 "assets/icons/hicolor/48/apps/ramsleuth.png" \
+            "$pkgdir/usr/share/pixmaps/ramsleuth.png"
+    fi
 
     # NOTE: the ramsleuth group is created on the TARGET system by the .install
     # pre_install/pre_upgrade hooks (package() runs in the build env, not the target).
