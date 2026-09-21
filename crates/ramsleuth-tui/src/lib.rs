@@ -17,11 +17,21 @@
 //!   mapping (`crossterm::event::KeyEvent` -> `Action`, testable without a
 //!   terminal) + `poll_event` (the single crossterm raw-mode poll/read
 //!   wrapper — every other part of the crate stays I/O-free).
+//! - `graphs` — TUI-05..07 — the graphs core: the five-series
+//!   `GraphSample` + the 1800-deep `GraphState` ring (TUI-03
+//!   `RingBuffer` backing) + the Na-guarded `record_graph_sample`
+//!   poller hook (part 1 of the module; parts 2/3 land in
+//!   TUI-06/07).
+//! - `ring` — TUI-03 — the TUI-local bounded FIFO ring buffer (the
+//!   GUI `history.rs` core re-implemented std-only — the graphs
+//!   module backing store).
 //! - `ui` — P3-23 — the three-zone dashboard renderer over `AppState`.
 //! - `main` (bin) — P3-24 — raw mode + alternate screen (Drop-safe
 //!   restore), the background 2 s telemetry updater, the draw/poll loop.
 
 pub mod events;
+pub mod graphs;
+pub mod ring;
 pub mod ui;
 
 // P3-22: the frozen input contract, re-exported at the root (workspace
