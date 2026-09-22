@@ -27,7 +27,7 @@ policy, version-bump process, CI) see `packaging/README.md`.
 1. [What you can do with RamSleuth](#1-what-you-can-do-with-ramsleuth)
 2. [Installation](#2-installation)
    - [2.1 One-command install from GitHub (`install.sh`)](#21-one-command-install-from-github-installsh)
-   - [2.2 Arch User Repository — the three published packages](#22-arch-user-repository-the-three-published-packages)
+   - [2.2 Arch User Repository — the two published packages](#22-arch-user-repository-the-two-published-packages)
    - [2.3 Manual install from a source checkout (`makepkg`)](#23-manual-install-from-a-source-checkout-makepkg)
    - [2.4 Build from source (`cargo`)](#24-build-from-source-cargo)
    - [2.5 Optional extra: `ryzen-smu-dkms` (AMD live subtimings)](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings)
@@ -107,7 +107,7 @@ fields simply show a structured `N/A (<reason>)` and every process exits 0.
 
 RamSleuth is a pure-Rust Cargo workspace (8 crates: 7 product crates + the
 `tools/gen-icon` dev tool), MIT-licensed, for x86_64 Linux. It is packaged for
-Arch Linux: an AUR three-tier model, a self-contained one-command installer,
+Arch Linux: a two-package AUR model, a self-contained one-command installer,
 and a plain `makepkg`/`cargo` path for building it yourself.
 
 Whichever method you pick, the install lands the same six binaries
@@ -188,7 +188,7 @@ GUI with `ramsleuth` (one click on *Set up RamSleuth*), use
 `sudo ramsleuth-setup` as the terminal equivalent, and for day-2,
 `systemctl status ramsleuth` and `journalctl -u ramsleuth -f`.
 
-### 2.2 Arch User Repository — the three published packages
+### 2.2 Arch User Repository — the two published packages
 
 Arch users can install from the AUR with any assistant (`yay` shown; `paru`
 works identically):
@@ -196,10 +196,9 @@ works identically):
 ```sh
 yay -S ramsleuth       # STABLE — the default recommendation
 yay -S ramsleuth-bin   # PRECOMPILED — the fastest install
-yay -S ramsleuth-git   # BLEEDING-EDGE — development/testing only
 ```
 
-The three tiers are deliberately distinct:
+The two packages are deliberately distinct:
 
 - **`ramsleuth` — STABLE source.** Builds the workspace from the official
   git tag `v$pkgver` (currently `v2.2.1`). A tag is a reproducible,
@@ -210,23 +209,17 @@ The three tiers are deliberately distinct:
   `ramsleuth-2.2.1-x86_64.tar.zst` from the official GitHub Release (pinned
   by its `sha256sums`) and installs it as-is — **no build, no makedepends**.
   This is the **fastest install path**.
-- **`ramsleuth-git` — BLEEDING-EDGE.** Tracks the *moving* `v2-development`
-  branch (`pkgver()` recomputes from `git describe` on every fetch). For
-  testing unreleased work only — not a stable install, and its version number
-  moves.
 
-Two of these three install the **identical file set**, so `ramsleuth` and
-`ramsleuth-bin` declare each other in `conflicts=` — **pick exactly one**;
-pacman will refuse to install both. `ramsleuth-git` is a separate package and
-coexists fine (it is the branch-tracking variant).
+Both install the **identical file set**, so `ramsleuth` and `ramsleuth-bin`
+declare each other in `conflicts=` — **pick exactly one**; pacman will refuse
+to install both.
 
 Package pages:
 
 - <https://aur.archlinux.org/packages/ramsleuth>
 - <https://aur.archlinux.org/packages/ramsleuth-bin>
-- <https://aur.archlinux.org/packages/ramsleuth-git>
 
-All three packages create the `ramsleuth` system group (via their `.install`
+Both packages create the `ramsleuth` system group (via their `.install`
 hooks), install the daemon unit + preset, the one-click setup helper + polkit
 policy, and the pinned DKMS helper, then `systemctl enable --now ramsleuth`.
 When the install is invoked under `sudo`, the hooks additionally grant the
@@ -242,19 +235,18 @@ The optional AMD driver extra lives in the AUR as its own package — see
 
 If you already have a checkout (e.g. from the [install.sh
 path](#21-one-command-install-from-github-installsh) or your own clone), you
-can build and install any of the three packages directly from the `packaging/`
+can build and install either package directly from the `packaging/`
 directories:
 
 ```sh
 cd packaging/ramsleuth      # STABLE source (builds from the v2.2.1 tag)
 # cd packaging/ramsleuth-bin   # PRECOMPILED (downloads the release tarball)
-# cd packaging/ramsleuth-git   # BLEEDING-EDGE (builds from v2-development)
 makepkg -si
 ```
 
 `makepkg -si` builds the package and installs it, running the `.install`
 hooks (group creation, daemon enable/start) exactly like the AUR path. The
-source packages (`ramsleuth`, `ramsleuth-git`) need build dependencies:
+source package (`ramsleuth`) needs build dependencies:
 `rust`, `cargo`, `pkgconf`, and the X11/Wayland/GL library set
 (`libx11`, `libxkbcommon`, `wayland`, `wayland-protocols`, `libxrandr`,
 `libxi`, `libxcursor`, `libxinerama`, `mesa`) — the usual suspects for the
@@ -1114,7 +1106,7 @@ icons, desktop entry, helper scripts, and polkit policy, and runs the
 `.install` hooks' cleanup:
 
 ```sh
-yay -Rns ramsleuth        # or: ramsleuth-bin / ramsleuth-git (whichever you have)
+yay -Rns ramsleuth        # or: ramsleuth-bin (whichever you have)
 yay -Rns ryzen-smu-dkms   # only if you installed the AMD extra
 ```
 
