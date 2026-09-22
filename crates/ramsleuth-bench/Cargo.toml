@@ -12,7 +12,7 @@ rust-version.workspace = true
 # C21-35: the AVX-512F kernel bodies in src/kernel_512.rs
 # (`#[target_feature(enable = "avx512f")]` + the AVX-512 `core::arch`
 # intrinsics) are unstable on stable rustc (E0658 — the AUR
-# `ramsleuth-git` build fails with 39x E0658 in that file) and compile
+# `ramsleuth` build fails with 39x E0658 in that file) and compile
 # only behind this NON-DEFAULT feature. Default builds keep the module's
 # public API intact: the three fns stay callable and run the AVX2
 # fallback dispatch (no kernel code deleted).

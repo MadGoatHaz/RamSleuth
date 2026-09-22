@@ -3,7 +3,7 @@
 # install.sh — RamSleuth v2 self-contained GitHub installer (AUR-parity).
 # Plan: PLAN-CYCLE18.md chunk C18-08, design D-18.2.
 #
-# Lands RamSleuth in the EXACT state of the AUR (ramsleuth-git): the 6 binaries +
+# Lands RamSleuth in the EXACT state of the AUR (ramsleuth): the 6 binaries +
 # the frozen unit + the preset + the `ramsleuth` group + the one-click setup
 # helper (ramsleuth-setup) + its polkit policy into /usr via sudo, built
 # with `cargo build --release --workspace --locked`. Interactive, visually
@@ -92,7 +92,7 @@ preflight() {
   [[ -n "$REPO_ROOT" ]] || die "Not run from a git checkout (git rev-parse --show-toplevel failed)." 2
   [[ "$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null)" == "$REPO_ROOT" ]] || die "'$SCRIPT_DIR' is not the root of a git checkout." 2
   [[ -f "$REPO_ROOT/Cargo.toml" ]] || die "No Cargo.toml — not a RamSleuth checkout." 2
-  [[ -d "$REPO_ROOT/packaging/ramsleuth-git" ]] || die "No packaging/ramsleuth-git/ — not a RamSleuth checkout." 2
+  [[ -d "$REPO_ROOT/packaging/ramsleuth" ]] || die "No packaging/ramsleuth/ — not a RamSleuth checkout." 2
   # Arch-based (the Arch/AUR-parity path; no partial install on other distros).
   if ! command -v pacman >/dev/null 2>&1; then
     die "Non-Arch host (no pacman) — this installer is the Arch/AUR-parity path.
@@ -174,9 +174,9 @@ do_install() {
   done
   install -Dm644 "systemd/ramsleuth.service" "/usr/lib/systemd/system/ramsleuth.service"
   ok "/usr/lib/systemd/system/ramsleuth.service  (frozen unit, verbatim)"
-  install -Dm644 "packaging/ramsleuth-git/ramsleuth.preset" "/usr/lib/systemd/system-preset/ramsleuth.preset"
+  install -Dm644 "packaging/shared/ramsleuth.preset" "/usr/lib/systemd/system-preset/ramsleuth.preset"
   ok "/usr/lib/systemd/system-preset/ramsleuth.preset"
-  install -Dm644 "packaging/ramsleuth-git/RamSleuth.desktop" "/usr/share/applications/RamSleuth.desktop"
+  install -Dm644 "packaging/shared/RamSleuth.desktop" "/usr/share/applications/RamSleuth.desktop"
   ok "/usr/share/applications/RamSleuth.desktop  (app-menu entry; the filename matches the Wayland app_id, C21-45)"
   # The 8 hicolor icons (AUR-parity: the same sizes every AUR package installs,
   # C21-27) — installed to BOTH the bare <size>/apps/ and the <size>x<size>/
