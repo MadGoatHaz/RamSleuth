@@ -26,7 +26,15 @@
 //!   is not dead on arrival) is exactly one connection. With the
 //!   `refresh` gate on the poller runs the continuous cadence (the
 //!   current 2 s live poll); off, only the baselines run and the
-//!   snapshot stays frozen. It stops on the quit flag and is joined
+//!   snapshot stays frozen. Each successful `GetTelemetry` also
+//!   records one Na-guarded graphs sample into the shared graphs ring
+//!   (the five-series `[g]` overlay data — the poller is the only
+//!   writer, plan D6: the bandwidth is the latest `Memory · Read`
+//!   figure — the newest streamed progress event, else the terminal
+//!   grid row 0, else NaN — and the CPU-temp source scan runs on this
+//!   thread) and clears the ring on a disconnected→connected
+//!   reconnect transition (the stale pre-outage samples would
+//!   straddle the gap). It stops on the quit flag and is joined
 //!   (bounded) before exit.
 //! - **Main loop** — each tick: `terminal.draw(render)` (the P3-23
 //!   three-zone dashboard over the shared state) +
@@ -84,10 +92,11 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ramsleuth_bench::{BenchOp, Tier};
 use ramsleuth_client::Client;
 use ramsleuth_protocol::{Request, Response, DEFAULT_SOCKET_PATH};
 use ramsleuth_tui::events;
-use ramsleuth_tui::{key_to_action, render, Action, AppState};
+use ramsleuth_tui::{key_to_action, render, Action, AppState, BenchState};
 
 /// The poll interval's sane lower bound in milliseconds (the GUI
 /// `update.rs` `MIN_POLL_INTERVAL_MS` rule, re-stated locally): a
@@ -230,13 +239,34 @@ pub fn poll_once(socket: &Path, state: &mut AppState) -> Result<(), String> {
 /// D5). Split out so the poller's one connect per tick can carry the
 /// request — a baseline / reconnect / cadence fetch is exactly one
 /// connection, never a probe connect plus a fetch connect.
+///
+/// TUI-18: a successful `Telemetry` arm also records one Na-guarded
+/// graphs sample for the just-landed snapshot ([`record_graph_sample`]
+/// — the poller is the only writer, plan D6) and clears the graphs
+/// ring on a disconnected→connected reconnect transition (the
+/// previous status was the `disconnected` marker — the GUI C6-25
+/// reconnect-prime precedent, TUI-adapted to the TUI's status
+/// vocabulary so the `[S]`napshot's transient `snapshot: …` status
+/// never reads as a reconnect).
 fn poll_with_client(client: &mut Client, socket: &Path, state: &mut AppState) {
     match client.request(&Request::GetTelemetry) {
         Ok(Response::Telemetry(telemetry)) => {
+            // Reconnect prime (TUI-18, the GUI C6-25 precedent): the
+            // previous cycle recorded the `disconnected` marker (the
+            // daemon came back after an outage — the first poll has an
+            // empty status, the `[S]`napshot transient a `snapshot: …`
+            // one, neither a reconnect) — clear the stale ring so the
+            // sparkline restarts flat instead of straddling the outage
+            // with a gap.
+            let reconnected = state.daemon_status == "disconnected";
             state.telemetry = Some(telemetry);
             state.last_update = Some(Instant::now());
             state.daemon_status = format!("connected: {}", socket.display());
             state.error = None;
+            if reconnected {
+                state.graph.samples.clear();
+            }
+            record_graph_sample(state);
         }
         Ok(Response::Error(message)) => {
             // The daemon was reachable but rejected the request
@@ -262,6 +292,64 @@ fn poll_with_client(client: &mut Client, socket: &Path, state: &mut AppState) {
             state.daemon_status = "disconnected".to_owned();
         }
     }
+}
+
+/// Append one graphs-panel sample (TUI-18) for the just-landed
+/// snapshot — the TUI-local mirror of the GUI `update.rs` D-4 / D-5
+/// source map:
+///
+/// - the CPU core frequency + the VDDCR rails ride inside
+///   [`ramsleuth_tui::graphs::record_graph_sample`]'s Na guard (an
+///   absent / non-finite source degrades its own field to NaN —
+///   0 ≠ N/A);
+/// - the CPU temperature (°C) comes from the runtime
+///   [`ramsleuth_tui::graphs::read_cpu_temp_c`] source scan — the
+///   caller runs the I/O on its own thread (the poller; plan D6:
+///   never the render thread);
+/// - the memory-read bandwidth (GB/s) comes from
+///   [`latest_memory_read_bw`] — its `0.0` no-figure sentinel maps to
+///   NaN here, so the row stays its no-source note until the first
+///   bench / burn-in sample (D-4: a flat 0 line would be a lie).
+///
+/// The Na guard (the no-panic contract, D5): a sample lands only when
+/// ≥ 1 field is finite — an all-NaN poll appends nothing (the
+/// graphs.rs `record_graph_sample` precedent).
+fn record_graph_sample(state: &mut AppState) {
+    let bandwidth = latest_memory_read_bw(&state.bench);
+    let bandwidth_gbps = if bandwidth > 0.0 { bandwidth } else { f64::NAN };
+    ramsleuth_tui::graphs::record_graph_sample(
+        &mut state.graph,
+        &state.telemetry,
+        ramsleuth_tui::graphs::read_cpu_temp_c(),
+        bandwidth_gbps,
+    );
+}
+
+/// The latest memory-read bandwidth figure (GB/s) for the graphs
+/// bandwidth series (TUI-18 — the TUI-local mirror of the GUI
+/// `update.rs` D-5 rule over the frozen [`BenchState`]): the newest
+/// streamed `Memory · Read` progress event when it carries a finite,
+/// positive value (a live run), else the terminal grid's memory-read
+/// cell (row 0 — the [`Tier::Memory`] slot), else `0.0` (the no-figure
+/// sentinel — [`record_graph_sample`] maps it to NaN; a flat 0 line
+/// would be a lie, D-4: 0 ≠ N/A). Non-finite / non-positive values
+/// never count as a figure (the bench zone's live-cell rule).
+fn latest_memory_read_bw(bench: &BenchState) -> f64 {
+    if let Some(event) = bench
+        .progress
+        .iter()
+        .rev()
+        .find(|e| e.tier == Tier::Memory && e.op == BenchOp::Read && e.value.is_finite() && e.value > 0.0)
+    {
+        return event.value;
+    }
+    if let Some(grid) = &bench.grid {
+        let value = grid.read_gbps[0];
+        if value.is_finite() && value > 0.0 {
+            return value;
+        }
+    }
+    0.0
 }
 
 /// A `Drop` guard around the initialized terminal.
@@ -580,8 +668,11 @@ mod tests {
     use std::thread;
     use std::sync::atomic::AtomicUsize;
 
+    use ramsleuth_bench::{BenchmarkGrid, StreamProgress};
     use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message};
-    use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
+    use ramsleuth_telemetry::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
+    use ramsleuth_telemetry::amd_readout::map_amd;
+    use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::SystemMemoryTelemetry;
     use ramsleuth_telemetry::SystemPlatform;
@@ -640,6 +731,90 @@ mod tests {
         }
     }
 
+    /// A host-independent snapshot with finite AMD rails (the TUI-18
+    /// record fixture — mirrors the GUI `update.rs`
+    /// `populated_snapshot`): the `u16` voltages map in-band →
+    /// `Value` (a present cell is always finite), the platform clock
+    /// stays Na (the freq series keeps its no-source note — the
+    /// sample lands via the rails). One such poll appends a graph
+    /// sample on every host, no temp scan required.
+    fn populated_snapshot() -> SystemMemoryTelemetry {
+        let readout = map_amd(&AmdPmSnapshot {
+            version: 0x0007_0B02,
+            mclk_mhz: 1800,
+            uclk_mhz: 1600,
+            fclk_mhz: 1600,
+            div_mode: 0,
+            gdm: 1,
+            pdm: 0,
+            command_rate: 0,
+            timings: AmdPmTimings {
+                cl: 16,
+                rcwdwr: 16,
+                rcdrd: 16,
+                rp: 16,
+                ras: 32,
+                rc: 48,
+                rrds: 4,
+                rrld: 4,
+                faw: 16,
+                wtrs: 8,
+                wtrl: 8,
+                wr: 8,
+                rfc1: 160,
+                rfc2: 160,
+                rfcsb: 160,
+                cwl: 16,
+                rtp: 8,
+                rdwr: 8,
+                wrrd: 4,
+                rdrd_sd: 100,
+                rdrd_dd: 101,
+                rdrd_scl: 102,
+                rdrd_sc: 103,
+                wrwr_sd: 104,
+                wrwr_dd: 105,
+                wrwr_scl: 106,
+                wrwr_sc: 107,
+            },
+            cad_bus: AmdPmCadBus {
+                proc_odt: 5,
+                rtt_nom: 2,
+                rtt_wr: 0,
+                rtt_park: 4,
+                clk_drv: 6,
+                addr_cmd_drv: 8,
+                cs_odt_drv: 10,
+                cke_drv: 12,
+            },
+            voltages: AmdPmVoltages {
+                vddcr_soc_mv: 1050,
+                vddio_mem_mv: 1350,
+                vdd_misc_mv: 1000,
+                vpp_mv: 1800,
+                vcore_mv: 1150,
+            },
+        });
+        SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Amd(AmdZen::Zen3),
+                brand: "Ryzen 9 5950X".to_owned(),
+            },
+            amd: Section::Value(readout),
+            intel: Section::na(NaReason::NotApplicable),
+            spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
+        }
+    }
+
     /// Server-side incremental frame reader (the P3-11 contract on the
     /// other end): append every received byte and decode until one frame
     /// is complete (`None` on a clean EOF before a frame).
@@ -673,6 +848,28 @@ mod tests {
             let handle = thread::spawn(move || {
                 if let Ok((stream, _)) = listener.accept() {
                     handler(stream);
+                }
+            });
+            Self { handle }
+        }
+
+        /// A multi-connection stand-in (the GUI `update.rs`
+        /// precedent): binds `sock` and accepts up to `max_conns`
+        /// connections in a spawned thread (one per poll — the
+        /// fresh-connection-per-cycle contract), handing each to
+        /// `handler` with its 1-based index. `join` reaps the thread
+        /// (a handler panic fails the test instead of hanging it).
+        fn spawn_multi(
+            sock: &TempSocket,
+            max_conns: usize,
+            mut handler: impl FnMut(usize, UnixStream) + Send + 'static,
+        ) -> Self {
+            let listener = UnixListener::bind(sock.path()).expect("test socket must bind");
+            let handle = thread::spawn(move || {
+                for index in 1..=max_conns {
+                    if let Ok((stream, _)) = listener.accept() {
+                        handler(index, stream);
+                    }
                 }
             });
             Self { handle }
@@ -1008,5 +1205,289 @@ mod tests {
         updater_stop.store(true, Ordering::Relaxed);
         stop_stand_in(stand_in, &stop, sock.path());
         updater.join().expect("updater thread must not panic");
+    }
+
+    // --- TUI-18: per-poll graph sample recording + ring clear ---
+
+    /// (k) Two continuous successful polls append two Na-guarded
+    /// graph samples (one per poll — the poller stays the only
+    /// writer, D6; no clear — the status stays `connected`): the
+    /// fixture's finite AMD rails land on every sample, and the
+    /// terminal grid's memory-read cell (row 0) feeds the bandwidth
+    /// series (D-5).
+    #[test]
+    fn two_continuous_polls_record_two_graph_samples() {
+        let sock = TempSocket::new("graph-two");
+        let stand_in = DaemonStandIn::spawn_multi(&sock, 2, |_index, mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetTelemetry)) => {}
+                other => panic!("stand-in expected GetTelemetry, got {other:?}"),
+            }
+            let bytes =
+                encode_frame(&Message::Response(Response::Telemetry(populated_snapshot())))
+                    .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+
+        let mut state = AppState::default();
+        // A terminal grid from an earlier run: the memory-read cell
+        // (row 0) feeds the bandwidth series (D-5).
+        state.bench.grid = Some(BenchmarkGrid {
+            read_gbps: [26.35, 0.0, 0.0, 0.0],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [0.0; 4],
+        });
+        poll_once(sock.path(), &mut state).expect("first poll must not error");
+        poll_once(sock.path(), &mut state).expect("second poll must not error");
+        stand_in.join();
+
+        assert_eq!(
+            state.graph.len(),
+            2,
+            "two continuous successful polls append two samples (no clear)"
+        );
+        for sample in state.graph.samples.iter() {
+            assert!(
+                sample.t.is_finite() && sample.t > 0.0,
+                "the sample is stamped with unix seconds"
+            );
+            assert_eq!(
+                sample.vddcr_soc_mv,
+                1050.0,
+                "the fixture's SOC rail lands in mV on every sample"
+            );
+            assert_eq!(
+                sample.vddcr_cpu_mv,
+                1150.0,
+                "the fixture's vcore rail lands in mV on every sample"
+            );
+            assert!(
+                sample.cpu_freq_mhz.is_nan(),
+                "the all-Na platform keeps the freq series no-source (D-4)"
+            );
+            assert_eq!(
+                sample.bandwidth_gbps,
+                26.35,
+                "the bandwidth is the terminal grid's memory-read cell (D-5)"
+            );
+        }
+    }
+
+    /// (l) An all-Na poll appends no hole (the no-panic contract,
+    /// D5): the all-Na snapshot carries no finite field, so the only
+    /// possible finite source is this host's temp scan (host-
+    /// dependent — the graphs.rs (g) precedent: NaN on a sensor-less
+    /// host, a sane reading here). With the scan finite, exactly one
+    /// temp-only sample lands (every snapshot-derived field NaN, no
+    /// fake 0.0); with the scan NaN, the ring stays empty.
+    #[test]
+    fn all_na_poll_records_no_hole() {
+        let sock = TempSocket::new("graph-allna");
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetTelemetry)) => {}
+                other => panic!("stand-in expected GetTelemetry, got {other:?}"),
+            }
+            let bytes =
+                encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                    .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+        let mut state = AppState::default();
+        poll_once(sock.path(), &mut state).expect("poll_once must not error");
+        stand_in.join();
+
+        // This host's temp scan (the same I/O the poll ran — the
+        // sensor state is stable across the two reads): it decides
+        // the sample's shape.
+        let temp = ramsleuth_tui::graphs::read_cpu_temp_c();
+        if temp.is_finite() {
+            assert_eq!(
+                state.graph.len(),
+                1,
+                "a finite temp scan lands exactly one sample"
+            );
+            let sample = state.graph.samples.last().expect("the sample");
+            assert!(
+                sample.cpu_freq_mhz.is_nan(),
+                "an Na clock stays NaN, not a fake 0.0"
+            );
+            assert!(sample.vddcr_cpu_mv.is_nan(), "an Na vcore stays NaN");
+            assert!(sample.vddcr_soc_mv.is_nan(), "an Na SOC rail stays NaN");
+            assert!(
+                sample.cpu_temp_c.is_finite()
+                    && sample.cpu_temp_c > -50.0
+                    && sample.cpu_temp_c < 150.0,
+                "the sample's only finite field is a sane temp reading"
+            );
+            assert!(
+                sample.bandwidth_gbps.is_nan(),
+                "no bench data: the no-figure sentinel maps to NaN (0 ≠ N/A)"
+            );
+        } else {
+            assert!(
+                state.graph.is_empty(),
+                "an all-NaN sample is a hole, never a point"
+            );
+        }
+    }
+
+    /// (m) Reconnect prime (the GUI C6-25 precedent, the TUI-18
+    /// plan): two continuous successful polls append two samples
+    /// (no clear — the status stays `connected`); the daemon drop
+    /// records `disconnected` (a failed poll appends nothing,
+    /// clears nothing); the next successful poll — the
+    /// disconnected→connected transition — clears the stale ring
+    /// before appending one fresh sample.
+    #[test]
+    fn graph_ring_clears_on_reconnect_not_on_continuous_polls() {
+        // Phase 1: two continuous successful polls (a fresh
+        // connection each) → two samples, no clear.
+        let sock = TempSocket::new("graph-reconnect");
+        let stand_in = DaemonStandIn::spawn_multi(&sock, 2, |_index, mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetTelemetry)) => {}
+                other => panic!("stand-in expected GetTelemetry, got {other:?}"),
+            }
+            let bytes =
+                encode_frame(&Message::Response(Response::Telemetry(populated_snapshot())))
+                    .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+        let mut state = AppState::default();
+        poll_once(sock.path(), &mut state).expect("first poll must not error");
+        poll_once(sock.path(), &mut state).expect("second poll must not error");
+        stand_in.join();
+        assert_eq!(
+            state.graph.len(),
+            2,
+            "two continuous polls append two samples (no clear)"
+        );
+
+        // Phase 2: the daemon drops (a missing socket records
+        // `disconnected`) — a failed poll appends nothing, clears
+        // nothing.
+        let down_sock = TempSocket::new("graph-reconnect-down");
+        poll_once(down_sock.path(), &mut state).expect("the down poll must not error");
+        assert_eq!(state.daemon_status, "disconnected");
+        assert_eq!(
+            state.graph.len(),
+            2,
+            "a failed poll appends nothing (no clear)"
+        );
+
+        // Phase 3: the daemon comes back → the stale ring is cleared
+        // and the reconnect poll appends exactly one fresh sample.
+        let back_sock = TempSocket::new("graph-reconnect-back");
+        let stand_in = DaemonStandIn::spawn(&back_sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetTelemetry)) => {}
+                other => panic!("stand-in expected GetTelemetry, got {other:?}"),
+            }
+            let bytes =
+                encode_frame(&Message::Response(Response::Telemetry(populated_snapshot())))
+                    .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+        poll_once(back_sock.path(), &mut state).expect("the reconnect poll must not error");
+        stand_in.join();
+        assert_eq!(
+            state.graph.len(),
+            1,
+            "the reconnect clears the stale ring before the fresh sample"
+        );
+        assert_eq!(
+            state.daemon_status,
+            format!("connected: {}", back_sock.path().display()),
+            "the reconnect reports the new connection"
+        );
+    }
+
+    /// (n) The bandwidth source priority (the GUI `update.rs`
+    /// `latest_memory_read_bw` 4-case matrix, the TUI-local mirror
+    /// over the frozen [`BenchState`]): (1) no progress, no grid →
+    /// the `0.0` no-figure sentinel (mapped to NaN at the record
+    /// site — the row keeps its no-source note, D-4: 0 ≠ N/A);
+    /// (2) the terminal grid's memory-read cell (row 0); (3) the
+    /// newest streamed `Memory · Read` event beats the (older)
+    /// grid, a newer non-Memory / non-Read event is ignored; (4) a
+    /// non-finite `Memory · Read` + a `Memory · Write` event are
+    /// both ignored → the figure falls back to the grid.
+    #[test]
+    fn latest_memory_read_bw_source_priority() {
+        let grid = BenchmarkGrid {
+            read_gbps: [26.35, 0.0, 0.0, 0.0],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [0.0; 4],
+        };
+        // (1) Neither: no progress, no grid → the no-figure sentinel.
+        let idle = BenchState::default();
+        assert_eq!(latest_memory_read_bw(&idle), 0.0, "no bench data at all → 0.0");
+
+        // (2) Terminal grid only (row 0 = the Memory read cell).
+        let grid_only = BenchState { grid: Some(grid.clone()), ..Default::default() };
+        assert_eq!(latest_memory_read_bw(&grid_only), 26.35, "the terminal grid cell");
+
+        // (3) A live `Memory · Read` event beats the (older) terminal
+        // grid; a newer non-Memory / non-Read event is ignored.
+        let live = BenchState {
+            progress: vec![
+                StreamProgress {
+                    cell_index: 1,
+                    total_cells: 3,
+                    tier: Tier::L1,
+                    op: BenchOp::Read,
+                    value: 99.0,
+                    label: "L1 · Read (GB/s)".to_owned(),
+                },
+                StreamProgress {
+                    cell_index: 0,
+                    total_cells: 3,
+                    tier: Tier::Memory,
+                    op: BenchOp::Read,
+                    value: 42.0,
+                    label: "Memory · Read (GB/s)".to_owned(),
+                },
+            ],
+            grid: Some(grid.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            latest_memory_read_bw(&live),
+            42.0,
+            "the newest Memory · Read event wins over the grid"
+        );
+
+        // (4) A non-finite `Memory · Read` value + a `Memory · Write`
+        // event are both ignored: the figure falls back to the grid.
+        let bad_live = BenchState {
+            progress: vec![
+                StreamProgress {
+                    cell_index: 0,
+                    total_cells: 3,
+                    tier: Tier::Memory,
+                    op: BenchOp::Read,
+                    value: f64::NAN,
+                    label: "Memory · Read (GB/s)".to_owned(),
+                },
+                StreamProgress {
+                    cell_index: 0,
+                    total_cells: 3,
+                    tier: Tier::Memory,
+                    op: BenchOp::Write,
+                    value: 42.0,
+                    label: "Memory · Write (GB/s)".to_owned(),
+                },
+            ],
+            grid: Some(grid),
+            ..Default::default()
+        };
+        assert_eq!(
+            latest_memory_read_bw(&bad_live),
+            26.35,
+            "a NaN read event + a write event fall back to the grid"
+        );
     }
 }
