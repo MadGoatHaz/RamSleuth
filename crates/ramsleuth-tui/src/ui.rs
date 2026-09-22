@@ -25,7 +25,13 @@
 //!   `Status: Running… <m:ss>` / `Status: Running… (burn-in <m:ss>,
 //!   iter <n>)` / `Status: Done`) — it replaces the pre-parity `bench:`
 //!   progress line (the parity goal's intentional re-render of that
-//!   line).
+//!   line). Below the status line, the controls line (`[B] Full` /
+//!   `[M] Mem` / `[X] Burn-in(5m)` — the run keys dimmed while any run
+//!   is in flight, the GUI single-flight rule — plus `[C] Cancel`,
+//!   shown only while a run is in flight) and the live burn-in row
+//!   (`Burn-in: iteration <n> · <m:ss> elapsed · Memory Read <…> ·
+//!   <latency>`, present only while a burn-in runs — the GUI
+//!   `burn_in_row` form).
 //! - **Zone 3 — hardware & SPD telemetry:** per-slot module lines (maker /
 //!   part / rank / density / speed + XMP/EXPO profiles), the daemon status
 //!   line, and the error line when present.
@@ -891,8 +897,12 @@ fn tick_rows(items: &mut Vec<ListItem<'static>>, pairs: &[(&str, &Section<u16>)]
 /// the status colors are zone-local, not a palette entry).
 const STATUS_DONE: Color = Color::Rgb(0x2E, 0x9E, 0x5B);
 
-/// Zone 2: the 4×4 grid (five rows: header + four tiers) + one flat
-/// status line + slack (clipped, never scrolled).
+/// Zone 2: the 4×4 grid (five rows: header + four tiers) + the flat
+/// status line + the controls line + the burn-in row (blank when no
+/// burn-in runs) + slack — clipped, never scrolled. The fixed
+/// 5 + 1 + 1 + 1 row slots keep the zone's layout stable as the rows
+/// appear (the GUI's no-layout-shift rule, the terminal adaptation:
+/// an absent row leaves its slot blank, the rows below it never move).
 fn render_zone2(frame: &mut Frame, state: &AppState, area: Rect) {
     let block = zone_block("2 · BENCH (GB/s)");
     let inner = block.inner(area);
@@ -902,6 +912,8 @@ fn render_zone2(frame: &mut Frame, state: &AppState, area: Rect) {
         .constraints([
             Constraint::Length(5), // the grid (header + four tier rows)
             Constraint::Length(1), // the flat status line (C7-17)
+            Constraint::Length(1), // the controls line (TUI-14)
+            Constraint::Length(1), // the burn-in row (TUI-14, blank when absent)
             Constraint::Fill(1),   // slack
         ])
         .split(inner);
@@ -911,6 +923,10 @@ fn render_zone2(frame: &mut Frame, state: &AppState, area: Rect) {
         Paragraph::new(Line::from(Span::styled(&text, Style::default().fg(color)))),
         parts[1],
     );
+    frame.render_widget(Paragraph::new(controls_line(&state.bench)), parts[2]);
+    if let Some(row) = burn_in_row_line(&state.bench.burn_in) {
+        frame.render_widget(Paragraph::new(row), parts[3]);
+    }
 }
 
 /// The live in-flight grid for a **normal** bench (the GUI
@@ -1224,6 +1240,112 @@ fn bench_status(bench: &BenchState) -> (String, Color) {
         burn_in.iteration,
     );
     (status_text(state), status_color(state))
+}
+
+/// The controls line's flat text (the GUI `render_controls` terminal
+/// form, TUI-14): the three run keys — `[B] Full` (a full-scope
+/// bench), `[M] Mem` (a memory-only bench), `[X] Burn-in(5m)` (the
+/// GUI's 5-minute burn-in preset) — always present, plus `[C] Cancel`
+/// shown only while a run (a normal bench or a burn-in) is in flight
+/// (the GUI single-flight rule: the run keys disable while one is in
+/// flight, and `Cancel` stops it).
+///
+/// Test-only: [`controls_line`] builds its per-segment-coloured spans
+/// directly; this flat-text form exists so the composed line is
+/// assertable string-for-string (the TUI-11 `ram_line_prefix`
+/// precedent).
+#[cfg(test)]
+fn controls_text(bench: &BenchState) -> String {
+    const RUN_KEYS: &str = "[B] Full  [M] Mem  [X] Burn-in(5m)";
+    if bench.running || bench.burn_in.running {
+        format!("{RUN_KEYS}  [C] Cancel")
+    } else {
+        RUN_KEYS.to_owned()
+    }
+}
+
+/// The controls line as a rendered line (TUI-14): each run key is
+/// CYAN (the actionable part) with its label dim when the run keys
+/// are enabled; while any run is in flight (a normal bench or a
+/// burn-in) the run key spans dim (the GUI disabled-button form) and
+/// the CYAN `[C] Cancel` entry appears to stop it.
+fn controls_line(bench: &BenchState) -> Line<'static> {
+    let in_flight = bench.running || bench.burn_in.running;
+    let run_key = if in_flight { DIM } else { CYAN };
+    let mut spans = vec![
+        Span::styled("[B]", Style::default().fg(run_key)),
+        Span::styled(" Full  ", Style::default().fg(DIM)),
+        Span::styled("[M]", Style::default().fg(run_key)),
+        Span::styled(" Mem  ", Style::default().fg(DIM)),
+        Span::styled("[X]", Style::default().fg(run_key)),
+        Span::styled(" Burn-in(5m)", Style::default().fg(DIM)),
+    ];
+    if in_flight {
+        spans.push(Span::styled("  [C]", Style::default().fg(CYAN)));
+        spans.push(Span::styled(" Cancel", Style::default().fg(DIM)));
+    }
+    Line::from(spans)
+}
+
+/// The live burn-in row's flat text (the GUI `burn_in_row` mirror,
+/// C7-18 / TUI-14): the newest tick's bookkeeping + the headline
+/// `latest` values — `Burn-in: iteration <n> · <m:ss> elapsed ·
+/// Memory Read <…> · <latency>`; the cells in the plain grid form
+/// (the [`bench_cell_text`] Terminal arm — unit-less, the zone title
+/// carries the GB/s unit and the `ns/hop` column header the ns one),
+/// a cell not yet streamed (0.0 on the wire) or a non-finite reading
+/// reads `N/A`. `None` when no burn-in is in flight (the row is
+/// absent — its fixed layout slot stays blank, the no-layout-shift
+/// rule).
+///
+/// Test-only: [`burn_in_row_line`] builds its per-segment-coloured
+/// spans from the same pieces; this flat-text form exists so the
+/// composed line is assertable string-for-string (the TUI-11
+/// `ram_line_prefix` precedent).
+#[cfg(test)]
+fn burn_in_row_text(burn_in: &BurnInState) -> Option<String> {
+    if !burn_in.running {
+        return None;
+    }
+    let grid = &burn_in.latest;
+    let read = bench_cell_text(CellPhase::Terminal, grid, grid, Tier::Memory, Metric::Read).0;
+    let latency =
+        bench_cell_text(CellPhase::Terminal, grid, grid, Tier::Memory, Metric::Latency).0;
+    Some(format!(
+        "Burn-in: iteration {} · {} elapsed · Memory Read {} · {}",
+        burn_in.iteration,
+        format_elapsed(burn_in.elapsed_secs),
+        read,
+        latency
+    ))
+}
+
+/// The live burn-in row as a rendered line (TUI-14): the dim
+/// `Burn-in: iteration <n> · <m:ss> elapsed · Memory Read` prefix,
+/// then the two `latest` headline cells in their own measured /
+/// `N/A` colors (the [`bench_cell_text`] Terminal arm).
+fn burn_in_row_line(burn_in: &BurnInState) -> Option<Line<'static>> {
+    if !burn_in.running {
+        return None;
+    }
+    let grid = &burn_in.latest;
+    let (read, read_color) =
+        bench_cell_text(CellPhase::Terminal, grid, grid, Tier::Memory, Metric::Read);
+    let (latency, latency_color) =
+        bench_cell_text(CellPhase::Terminal, grid, grid, Tier::Memory, Metric::Latency);
+    Some(Line::from(vec![
+        Span::styled(
+            format!(
+                "Burn-in: iteration {} · {} elapsed · Memory Read ",
+                burn_in.iteration,
+                format_elapsed(burn_in.elapsed_secs)
+            ),
+            Style::default().fg(DIM),
+        ),
+        Span::styled(read, Style::default().fg(read_color)),
+        Span::styled(" · ", Style::default().fg(DIM)),
+        Span::styled(latency, Style::default().fg(latency_color)),
+    ]))
 }
 
 // ---------------------------------------------------------------------------
@@ -2888,5 +3010,242 @@ mod tests {
         let bench = BenchState::default();
         let live = table_live_grid(&bench);
         assert_eq!(live.cell(Tier::Memory, Metric::Read), 0.0);
+    }
+
+    // -----------------------------------------------------------------
+    // TUI-14 — the zone-2 render wiring: the controls line + the live
+    // burn-in row (the GUI C7-17/18 controls / burn-in-row mirror).
+    // Headless — no TTY, no I/O.
+    // -----------------------------------------------------------------
+
+    /// The rendered text of a line (its spans concatenated — the test's
+    /// flat-text surface for the styled line builders).
+    fn line_text(line: &Line<'_>) -> String {
+        line.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    /// One span's fg color (the test's style surface for the controls
+    /// line's enabled / dimmed entries).
+    fn span_fg(line: &Line<'_>, index: usize) -> Color {
+        line.iter()
+            .nth(index)
+            .expect("the span index must exist")
+            .style
+            .fg
+            .expect("every controls span is explicitly styled")
+    }
+
+    /// (af) The controls line visibility matrix (the GUI single-flight
+    /// rule, TUI-14): the three run keys (`[B] Full`, `[M] Mem`,
+    /// `[X] Burn-in(5m)`) are always present; `Cancel` appears only
+    /// while a run (a normal bench or a burn-in) is in flight; the run
+    /// key spans are CYAN when enabled and DIM while a run is in
+    /// flight (the GUI disabled-button form), the `Cancel` key CYAN
+    /// whenever it appears.
+    #[test]
+    fn controls_line_visibility_matrix() {
+        // Not in flight: the run keys, no Cancel.
+        let idle = BenchState::default();
+        assert_eq!(controls_text(&idle), "[B] Full  [M] Mem  [X] Burn-in(5m)");
+        assert_eq!(line_text(&controls_line(&idle)), controls_text(&idle));
+        assert_eq!(span_fg(&controls_line(&idle), 0), CYAN, "the enabled [B] key is cyan");
+
+        // A normal bench in flight: Cancel appears, the run keys dim.
+        let running = BenchState {
+            running: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            controls_text(&running),
+            "[B] Full  [M] Mem  [X] Burn-in(5m)  [C] Cancel"
+        );
+        let line = controls_line(&running);
+        assert_eq!(line_text(&line), controls_text(&running));
+        assert_eq!(span_fg(&line, 0), DIM, "the in-flight [B] key dims");
+        assert_eq!(span_fg(&line, 6), CYAN, "the in-flight [C] key is cyan");
+
+        // A burn-in in flight: the identical shape (the two run
+        // classes share the single-flight rule).
+        let burn = BenchState {
+            burn_in: BurnInState {
+                running: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(controls_text(&burn), controls_text(&running));
+
+        // Over the rendered buffer: the run keys render in the zone;
+        // the `Cancel` text appears only while a run is in flight
+        // (a wide surface — the in-flight line is 45 columns, beyond
+        // the 100-col zone-2 inner width of 30).
+        let mut state = AppState::default();
+        let text = draw(&state);
+        assert!(text.contains("[B] Full"), "{text}");
+        assert!(!text.contains("Cancel"), "{text}");
+        state.bench = running;
+        let text = draw_at(&state, 200, 30);
+        assert!(text.contains("[C] Cancel"), "{text}");
+    }
+
+    /// (ag) The burn-in row text (the GUI `burn_in_row` mirror,
+    /// C7-18 / TUI-14): the newest tick's bookkeeping + the headline
+    /// `latest` cells in the plain grid form (the [`bench_cell_text`]
+    /// Terminal arm — unit-less, the zone title carries GB/s and the
+    /// `ns/hop` header the ns); a cell not yet streamed (0.0 on the
+    /// wire) or a non-finite reading reads `N/A`.
+    #[test]
+    fn burn_in_row_text_and_na_cells() {
+        // A burn-in in flight with measured headline cells: the exact
+        // GUI form.
+        let burn = BurnInState {
+            running: true,
+            iteration: 2,
+            elapsed_secs: 90.0,
+            latest: BenchmarkGrid {
+                read_gbps: [26.35, 35.10, 0.0, 0.0],
+                write_gbps: [0.0; 4],
+                copy_gbps: [0.0; 4],
+                latency_ns: [86.84, 0.0, 0.0, 0.0],
+            },
+        };
+        assert_eq!(
+            burn_in_row_text(&burn),
+            Some("Burn-in: iteration 2 · 1:30 elapsed · Memory Read 26.35 · 86.84".to_owned())
+        );
+        // The rendered line carries the same flat text.
+        assert_eq!(
+            burn_in_row_line(&burn).map(|line| line_text(&line)),
+            burn_in_row_text(&burn)
+        );
+
+        // A fresh tick (no `latest` cells yet): both headline cells
+        // read N/A — the row is present (the burn-in is in flight).
+        let fresh = BurnInState {
+            running: true,
+            iteration: 1,
+            elapsed_secs: 5.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            burn_in_row_text(&fresh),
+            Some("Burn-in: iteration 1 · 0:05 elapsed · Memory Read N/A · N/A".to_owned())
+        );
+
+        // A non-finite reading degrades to N/A too (the plain cell
+        // form's guard).
+        let broken = BurnInState {
+            running: true,
+            latest: BenchmarkGrid {
+                read_gbps: [f64::NAN, 0.0, 0.0, 0.0],
+                write_gbps: [0.0; 4],
+                copy_gbps: [0.0; 4],
+                latency_ns: [0.0; 4],
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            burn_in_row_text(&broken),
+            Some("Burn-in: iteration 0 · 0:00 elapsed · Memory Read N/A · N/A".to_owned())
+        );
+    }
+
+    /// (ah) The burn-in row's absence (the GUI `burn_in_row` rule,
+    /// TUI-14): `None` before a burn-in starts and after it ends (the
+    /// row is present only while a burn-in is in flight — the fixed
+    /// layout slot stays blank, no shift), and the rendered zone
+    /// carries no burn-in text in the idle state.
+    #[test]
+    fn burn_in_row_absent_without_burn_in() {
+        // No burn-in ever: absent.
+        assert_eq!(burn_in_row_text(&BurnInState::default()), None);
+        assert_eq!(burn_in_row_line(&BurnInState::default()), None);
+        // A finished burn-in (the newest tick kept, the run ended):
+        // absent too (the row is not a result summary).
+        let finished = BurnInState {
+            running: false,
+            iteration: 12,
+            elapsed_secs: 300.0,
+            ..Default::default()
+        };
+        assert_eq!(burn_in_row_text(&finished), None);
+
+        // Over the rendered buffer: the idle zone carries no burn-in
+        // text.
+        let text = draw(&AppState::default());
+        assert!(!text.contains("Burn-in:"), "{text}");
+    }
+
+    /// (ai) Clipping at a small height (TUI-14 — the zone-2
+    /// constraint grows 5 + 1 + 1 + 1 + slack): the dashboard never
+    /// panics as the terminal shrinks. The layout solver keeps the
+    /// three line rows (status / controls / burn-in) and trims the
+    /// grid's tier rows first (the table keeps its header, the tier
+    /// rows drop one by one, the controls line is the last of the
+    /// lines to go at the smallest inner); at the full surface all
+    /// four zone-2 lines render with the full 5-row grid.
+    #[test]
+    fn zone2_clips_at_small_height() {
+        // An in-flight burn-in (the full zone-2 content: the live
+        // grid + the status line + the controls line + the burn-in
+        // row) on shrinking surfaces (inner = total - 3 header - 2
+        // zone borders).
+        let state = AppState {
+            bench: BenchState {
+                burn_in: BurnInState {
+                    running: true,
+                    iteration: 3,
+                    elapsed_secs: 90.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // 200×8 (3 inner rows): the grid keeps its header row only
+        // (no tier rows — the L1/L2/L3 tier names are absent); the
+        // status + burn-in lines render; the controls line is
+        // clipped out.
+        let text = draw_at(&state, 200, 8);
+        assert!(text.contains("2 · BENCH (GB/s)"), "{text}");
+        assert!(text.contains("Status: Running…"), "{text}");
+        assert!(text.contains("Burn-in: iteration 3"), "{text}");
+        assert!(!text.contains("L1"), "{text}");
+        assert!(!text.contains("L2"), "{text}");
+        assert!(!text.contains("L3"), "{text}");
+        assert!(!text.contains("[B] Full"), "{text}");
+        // 200×10 (5 inner rows): the grid's first tier row (the
+        // Memory tier) renders, the second (L1) clips out; all three
+        // lines render.
+        let text = draw_at(&state, 200, 10);
+        assert!(!text.contains("L1"), "{text}");
+        assert!(text.contains("Status: Running…"), "{text}");
+        assert!(text.contains("[B] Full"), "{text}");
+        assert!(text.contains("Burn-in: iteration 3"), "{text}");
+        // 200×13 (8 inner rows): the full 5-row grid + all three
+        // lines — the exact 5 + 1 + 1 + 1 fit, every line whole.
+        let text = draw_at(&state, 200, 13);
+        for tier in ["L1", "L2", "L3"] {
+            assert!(text.contains(tier), "{text}");
+        }
+        assert!(
+            text.contains("Status: Running… (burn-in 1:30, iter 3)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[B] Full  [M] Mem  [X] Burn-in(5m)  [C] Cancel"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Burn-in: iteration 3 · 1:30 elapsed · Memory Read N/A · N/A"),
+            "{text}"
+        );
+        // The 100-col default surface (30-col zone-2 inner): the
+        // lines render width-clipped at the budget (the no-panic clip
+        // contract) — the burn-in line's prefix + the controls
+        // prefix survive.
+        let text = draw(&state);
+        assert!(text.contains("Burn-in: iteration 3"), "{text}");
+        assert!(text.contains("[B] Full"), "{text}");
     }
 }
