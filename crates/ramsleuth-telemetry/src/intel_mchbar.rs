@@ -19,8 +19,10 @@
 //! 3. **BAR5 decode:** [`decode_bar5`] parses the 8-byte field at config
 //!    offset `0x48..0x50` (the 64-bit MCHBAR base register) and
 //!    [`mchbar_base`] strips the low type/status bits to the page-aligned
-//!    physical base. A short config, an I/O-space BAR, or a zero base is
-//!    [`TelemetryError::Parse`].
+//!    physical base. A short config or an I/O-space BAR is
+//!    [`TelemetryError::Parse`]; a zero (unpopulated) base — typical of
+//!    virtualized Intel hosts — is [`TelemetryError::UnsupportedHardware`]
+//!    (a clean `N/A (unsupported hardware)`, not a confusing parse detail).
 //! 4. **Read-only map:** open `/dev/mem` (fallback `/dev/fmem`) and
 //!    `mmap(PROT_READ, MAP_PRIVATE)` the 1 MiB MCHBAR window at the decoded
 //!    base, owned by the RAII [`MchBar`] guard.
@@ -177,13 +179,15 @@ impl Drop for MchBar {
 /// # Errors
 ///
 /// - [`TelemetryError::UnsupportedHardware`] — non-Intel vendor (gate fires
-///   before any file access), or a non-Linux platform.
+///   before any file access), a non-Linux platform, or a zero (unpopulated)
+///   MCHBAR base — typical of virtualized Intel hosts, where BAR5 decodes
+///   to 0 and the readout degrades to a clean `N/A (unsupported hardware)`.
 /// - [`TelemetryError::DriverMissing`] — the host-bridge PCI config device
 ///   or both `/dev/mem` and `/dev/fmem` are absent.
 /// - [`TelemetryError::InsufficientPrivilege`] — devmem open/map permission
 ///   denial (EACCES/EPERM) or a STRICT_DEVMEM range rejection.
-/// - [`TelemetryError::Parse`] — config space too short, I/O-space BAR5, or
-///   a zero (unpopulated) MCHBAR base.
+/// - [`TelemetryError::Parse`] — config space too short or an I/O-space
+///   BAR5.
 /// - [`TelemetryError::Io`] — any other raw I/O failure.
 pub fn acquire() -> TelemetryResult<MchBar> {
     // 1. Vendor gate: pure, so non-Intel hardware is rejected before any
@@ -304,8 +308,8 @@ fn acquire_linux() -> TelemetryResult<MchBar> {
     let raw = decode_bar5(&config)?;
     let base = mchbar_base(raw);
     if base == 0 {
-        return Err(TelemetryError::Parse {
-            detail: "MCHBAR base decodes to zero (unpopulated/invalid BAR5)".to_owned(),
+        return Err(TelemetryError::UnsupportedHardware {
+            vendor: "Intel host bridge with unpopulated MCHBAR (BAR5=0, virtualized or unsupported)".to_owned(),
         });
     }
     let fd = open_devmem()?;
@@ -544,6 +548,27 @@ mod tests {
         assert_eq!(mchbar_base(0x0), 0x0);
     }
 
+    /// (f) A raw BAR5 that decodes to a zero base (unpopulated — as on
+    /// virtualized Intel hosts) strips to base 0 through the pure
+    /// helpers; `acquire_linux` maps that `base == 0` to
+    /// `UnsupportedHardware` (not `Parse`), so the readout degrades to a
+    /// clean `N/A (unsupported hardware)` instead of a confusing parse
+    /// detail.
+    #[test]
+    fn zero_bar5_decodes_to_zero_base_for_unsupported_hardware() {
+        // Status-only BAR encodings (no address bits set) all strip to
+        // base 0.
+        for raw in [0x0u64, 0x4, 0xF] {
+            assert_eq!(mchbar_base(raw), 0, "raw {raw:#x} must decode to base 0");
+        }
+        // The decode stage of the `acquire_linux` flow for an unpopulated
+        // BAR5: the field decodes to 0 and the base stays 0, which
+        // `acquire_linux` then maps to `UnsupportedHardware`.
+        let cfg = config_with_bar5(0, 0);
+        assert_eq!(decode_bar5(&cfg), Ok(0));
+        assert_eq!(mchbar_base(0), 0);
+    }
+
     /// (d) The pure Intel vendor gate: non-Intel vendors (AMD / unknown)
     /// yield `UnsupportedHardware`; Intel passes. No I/O involved.
     #[test]
@@ -566,16 +591,28 @@ mod tests {
         );
     }
 
-    /// (c) `acquire()` on the AMD reference host trips the Intel vendor gate:
-    /// specifically `UnsupportedHardware`, before any PCI config read or
-    /// `/dev/mem` access, without panicking.
+    /// (c) `acquire()` respects the vendor gate on the running host:
+    /// on a non-Intel host (the AMD reference host) it is specifically
+    /// `UnsupportedHardware`, before any PCI config read or `/dev/mem`
+    /// access, without panicking. On an Intel host the gate passes and
+    /// the real-path outcome depends on root, `/dev/mem`, and BAR5 state
+    /// (a virtualized CI runner degrades to `UnsupportedHardware` via
+    /// the unpopulated-BAR5 path, physical hardware may map the window),
+    /// so the Intel arm is shape-only: it must not panic.
     #[test]
-    fn acquire_on_this_amd_host_is_unsupported_hardware() {
+    fn acquire_respects_vendor_gate() {
+        let is_intel = matches!(CpuInfo::detect().vendor, CpuVendor::Intel(_));
         let res = acquire();
-        assert!(
-            matches!(res, Err(TelemetryError::UnsupportedHardware { .. })),
-            "the Intel gate must reject the AMD host before any I/O, got: {res:?}"
-        );
+        if is_intel {
+            // Shape-only: any frozen outcome (including a live mapping)
+            // is acceptable on Intel silicon; a panic is not.
+            let _ = res;
+        } else {
+            assert!(
+                matches!(res, Err(TelemetryError::UnsupportedHardware { .. })),
+                "the Intel gate must reject the non-Intel host before any I/O, got: {res:?}"
+            );
+        }
     }
 
     /// (e) The `read_u32` bounds check is pure: `offset + 4 > len` (or a
