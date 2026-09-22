@@ -21,9 +21,9 @@
 //! for reuse (no reallocation).
 //!
 //! **Pure core:** no I/O, no TTY, no external crate — the unit tests
-//! below run headless. The module is not yet declared in `lib.rs`
-//! (TUI-23 wires + re-exports it); TUI-05 (`graphs.rs`) is the first
-//! consumer.
+//! below run headless. The module is declared in `lib.rs` and its
+//! `RingBuffer` re-exported at the crate root (TUI-23); TUI-05
+//! (`graphs.rs`) is the first consumer.
 
 /// Default ring depth: 300 samples = 10 minutes at the 2 s poll
 /// cadence (the GUI `HISTORY_CAPACITY` value — bounded memory, no
