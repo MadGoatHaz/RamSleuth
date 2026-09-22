@@ -3525,7 +3525,7 @@ mod tests {
             })
             .collect();
         assert!(
-            !texts.iter().any(|t| *t == "Setup complete"),
+            !texts.contains(&"Setup complete"),
             "a dismissed prompt must not repaint the dialog: {texts:?}"
         );
 
