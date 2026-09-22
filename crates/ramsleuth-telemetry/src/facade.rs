@@ -431,34 +431,49 @@ mod tests {
         );
     }
 
-    /// (b) `collect()` on this host (AMD Ryzen 9 5950X) never panics
-    /// and has the frozen structure: `cpu.vendor` is `Amd(..)`, the AMD
-    /// branch is `Na(DriverMissing)` (the `ryzen_smu` module is absent
-    /// on this host) or `Value` (if the module happens to be loaded),
-    /// the Intel branch is `Na(UnsupportedHardware)` (this host is AMD,
-    /// not Intel), and `spd` is a `Vec` (this host has two DDR4 DIMMs —
-    /// the count is host-dependent and is not asserted).
+    /// (b) `collect()` on this host never panics and has the frozen
+    /// structure: `cpu.vendor` is the detected vendor (AMD on the
+    /// reference host, Intel on CI runners — asserted against a fresh
+    /// `detect()`, vendor-neutral), the AMD branch is `Value` /
+    /// `Na(DriverMissing)` on AMD silicon (module loaded or absent) and
+    /// `Na(UnsupportedHardware)` on non-AMD silicon (vendor gate), the
+    /// Intel branch is `Na(UnsupportedHardware)` on both (AMD: vendor
+    /// gate; virtualized Intel: the unpopulated BAR5=0 degradation), and
+    /// `spd` is a `Vec` (the count is host-dependent and is not
+    /// asserted).
     #[test]
     fn collect_on_this_host_is_structural_and_panic_free() {
         // Running this to completion is itself the no-panic check.
         let t = collect();
 
-        // cpu: this host is AMD.
-        assert!(
-            matches!(t.cpu.vendor, CpuVendor::Amd(_)),
-            "this host must detect as AMD, got {:?}",
-            t.cpu.vendor
+        // cpu: the detected vendor matches the host silicon (AMD on the
+        // reference host, Intel on CI runners) — vendor-neutral.
+        assert_eq!(
+            t.cpu.vendor,
+            CpuInfo::detect().vendor,
+            "the facade must carry the detected vendor"
         );
 
-        // amd: Na(DriverMissing) (module absent) or Value (module loaded).
-        assert!(
-            matches!(t.amd, Section::Value(_))
-                || matches!(t.amd, Section::Na(NaReason::DriverMissing)),
-            "AMD branch must be Value or Na(DriverMissing), got {:?}",
-            t.amd
-        );
+        // amd: on AMD silicon, Value (module loaded) or Na(DriverMissing)
+        // (module absent); on non-AMD silicon the vendor gate degrades the
+        // branch to Na(UnsupportedHardware) before any provider call.
+        match t.cpu.vendor {
+            CpuVendor::Amd(_) => assert!(
+                matches!(t.amd, Section::Value(_))
+                    || matches!(t.amd, Section::Na(NaReason::DriverMissing)),
+                "AMD branch must be Value or Na(DriverMissing), got {:?}",
+                t.amd
+            ),
+            _ => assert_eq!(
+                t.amd,
+                Section::Na(NaReason::UnsupportedHardware),
+                "non-AMD host: the AMD vendor gate must degrade the branch"
+            ),
+        }
 
-        // intel: this host is not Intel → Na(UnsupportedHardware).
+        // intel: Na(UnsupportedHardware) on both vendors: the AMD host via
+        // the vendor gate, the virtualized Intel CI runner via the
+        // unpopulated-BAR5 (BAR5=0) degradation.
         assert_eq!(t.intel, Section::Na(NaReason::UnsupportedHardware));
 
         // spd: structurally a Vec<SpdModule> (possibly non-empty); each
@@ -990,14 +1005,15 @@ mod tests {
         assert_eq!(ro.timings.rfc1, Section::Value(160));
     }
 
-    /// (e4) The full `amd_branch` wiring on this host (AMD silicon):
-    /// acquire -> parse -> apply_smn -> map runs end to end without a
-    /// panic, and the branch error semantics are unchanged — a failure
-    /// is still one of the frozen `TelemetryError` variants (only
-    /// acquire / parse can fail the branch now that the overlay is
-    /// infallible), and a success carries PM clocks + the overlay
-    /// gdm/timings through the frozen P2-05 gates (in-band values or
-    /// honest `Na`, never garbage).
+    /// (e4) The full `amd_branch` wiring runs end to end without a
+    /// panic: a synthetic AMD `CpuInfo` passes the branch vendor
+    /// gate, then `acquire -> parse -> apply_smn -> map` executes
+    /// against the real host — on AMD silicon the `ryzen_smu`
+    /// provider runs (a success carries PM clocks + the overlay
+    /// gdm/timings through the frozen P2-05 gates, a failure is a
+    /// frozen acquire / parse error), and on non-AMD silicon (the
+    /// Intel CI runners) the vendor gate inside the SMU provider
+    /// fails the branch with `UnsupportedHardware`.
     #[test]
     fn amd_branch_smn_wiring_is_structural_and_panic_free() {
         let cpu = CpuInfo {
@@ -1007,18 +1023,21 @@ mod tests {
 
         // Running this to completion is itself the no-panic check.
         match amd_branch(&cpu) {
-            // The overlay adds no failure mode: on AMD silicon a branch
-            // failure is still a frozen acquire / parse error.
+            // The overlay adds no failure mode: a branch failure is
+            // still one of the frozen TelemetryError variants (on
+            // non-AMD silicon the vendor gate inside the SMU provider
+            // adds UnsupportedHardware).
             Err(e) => assert!(
                 matches!(
                     e,
                     TelemetryError::DriverMissing { .. }
                         | TelemetryError::InsufficientPrivilege { .. }
+                        | TelemetryError::UnsupportedHardware { .. }
                         | TelemetryError::UnknownPmTableVersion { .. }
                         | TelemetryError::Io(_)
                         | TelemetryError::Parse { .. }
                 ),
-                "AMD branch failure must be a frozen acquire/parse error: {e:?}"
+                "AMD branch failure must be a frozen TelemetryError variant: {e:?}"
             ),
             Ok(ro) => {
                 // GDM crosses the frozen mode-flag gate: a single bit

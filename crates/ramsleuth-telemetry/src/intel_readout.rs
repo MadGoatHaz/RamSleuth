@@ -716,16 +716,27 @@ mod tests {
         ));
     }
 
-    /// (e) On this fixed AMD reference host (plan test-host reality) the
-    /// gate rejects before any register could be read.
+    /// (e) The live gate behavior is vendor-consistent: on a non-Intel
+    /// host (the AMD reference host) it rejects with
+    /// `UnsupportedHardware` before any register could be read, and on
+    /// an Intel host it passes with the detected generation
+    /// (`intel_gen_gate(Intel(_)) -> Ok`). Vendor-neutral, so the test
+    /// passes on both the AMD reference host and the Intel CI runners
+    /// (CI portability).
     #[test]
-    fn intel_gen_gate_short_circuits_on_this_amd_host() {
+    fn intel_gen_gate_behavior_is_vendor_consistent() {
         let detected = CpuInfo::detect();
-        assert_eq!(detected.vendor, CpuVendor::Amd(AmdZen::Zen3));
-        assert!(matches!(
-            intel_gen_gate(&detected),
-            Err(TelemetryError::UnsupportedHardware { .. })
-        ));
+        match detected.vendor {
+            CpuVendor::Intel(gen) => {
+                assert_eq!(intel_gen_gate(&detected), Ok(gen));
+            }
+            _ => {
+                assert!(matches!(
+                    intel_gen_gate(&detected),
+                    Err(TelemetryError::UnsupportedHardware { .. })
+                ));
+            }
+        }
     }
 
     /// (a) + (d) A fully-populated synthetic channel: every decoded field is
