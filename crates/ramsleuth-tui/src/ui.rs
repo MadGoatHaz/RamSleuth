@@ -44,8 +44,8 @@
 //! drawn over the zone area from `graph`).
 //!
 //! The semantic palette (Grand Design §3.2) is exact: values in cyan
-//! `#00D4FF`, warnings in amber `#FFB300`, N/A/alarms in crimson
-//! `#FF3B30`, background slate `#1E1E24`.
+//! `#00D4FF`, warnings in amber `#FFB300`, N/A in grey `#8A8A94`,
+//! alarms in crimson `#FF3B30`, background slate `#1E1E24`.
 //!
 //! **No-panic contract:** absent, degraded, or empty data always renders
 //! a placeholder (`N/A`, `Status: Idle`, `not connected`); an all-`Na`
@@ -80,12 +80,17 @@ use crate::graphs::GraphState;
 const CYAN: Color = Color::Rgb(0x00, 0xD4, 0xFF);
 /// Amber: warnings (1:2 desync, out-of-spec voltages, not connected).
 const AMBER: Color = Color::Rgb(0xFF, 0xB3, 0x00);
-/// Crimson: N/A cells, alarms, errors.
+/// Crimson: alarms, errors.
 const CRIMSON: Color = Color::Rgb(0xFF, 0x3B, 0x30);
+/// Grey: the N/A cells (a degradation, never an alarm — the GUI
+/// NA_GRAY mirror).
+const NA_GRAY: Color = Color::Rgb(0x8A, 0x8A, 0x94);
 /// Slate: the zone backgrounds.
 const SLATE: Color = Color::Rgb(0x1E, 0x1E, 0x24);
-/// Dim grey: key labels, subheaders, static text.
+/// Dim grey: key labels, static text.
 const DIM: Color = Color::Rgb(0x8A, 0x8A, 0x96);
+/// Light grey: zone + section titles/labels.
+const LIGHT_GREY: Color = Color::Rgb(0xC0, 0xC0, 0xCC);
 
 // ---------------------------------------------------------------------------
 // Presentation state.
@@ -340,12 +345,14 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     }
 }
 
-/// The shared zone decoration: a titled border on a slate background.
+/// The shared zone decoration: a light-grey titled border on a slate
+/// background.
 fn zone_block(title: &'static str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(CYAN))
         .title(title)
+        .title_style(Style::default().fg(LIGHT_GREY))
         .style(Style::default().bg(SLATE))
 }
 
@@ -863,7 +870,7 @@ fn render_zone1(frame: &mut Frame, state: &AppState, area: Rect) {
 /// `key: value` or `key: N/A (<reason>)` in the canonical dump order.
 ///
 /// A section that degraded whole renders a single `N/A (<reason>)` line;
-/// no telemetry at all renders a single crimson placeholder — never a
+/// no telemetry at all renders a single grey placeholder — never a
 /// panic, never an omitted section.
 fn zone1_items(telemetry: Option<&SystemMemoryTelemetry>) -> Vec<ListItem<'static>> {
     let Some(telemetry) = telemetry else {
@@ -1006,7 +1013,7 @@ fn readout_items(
     items
 }
 
-/// Append one cyan `key: <ticks>` row per pair (crimson `N/A` when the
+/// Append one cyan `key: <ticks>` row per pair (grey `N/A` when the
 /// cell degraded).
 fn tick_rows(items: &mut Vec<ListItem<'static>>, pairs: &[(&str, &Section<u16>)]) {
     for (key, section) in pairs {
@@ -1137,7 +1144,7 @@ fn cell_phase(in_flight: bool, live: &BenchmarkGrid, tier: Tier, metric: Metric)
 /// One cell's display for its render [`CellPhase`] (the bare
 /// terminal-width form): the terminal value in the existing two-decimal
 /// shape — cyan for a measured reading (a non-finite / unmeasured cell
-/// degrades to the crimson `N/A`, the GUI's guard), the live in-flight
+/// degrades to the grey `N/A`, the GUI's guard), the live in-flight
 /// value with a `…` suffix (dimmed — the terminal adaptation of the
 /// GUI's dimmed-cyan fill), or the `N/A` placeholder.
 fn bench_cell_text(
@@ -1153,14 +1160,14 @@ fn bench_cell_text(
             if value.is_finite() && value > 0.0 {
                 (format!("{value:.2}"), CYAN)
             } else {
-                ("N/A".to_owned(), CRIMSON)
+                ("N/A".to_owned(), NA_GRAY)
             }
         }
         CellPhase::Live => {
             let value = live.cell(tier, metric);
             (format!("{value:.2}…"), DIM)
         }
-        CellPhase::NotStarted => ("N/A".to_owned(), CRIMSON),
+        CellPhase::NotStarted => ("N/A".to_owned(), NA_GRAY),
     }
 }
 
@@ -1545,7 +1552,7 @@ fn spd_module_items(module: &SpdModule) -> Vec<ListItem<'static>> {
     items.push(cell_row("maker", &module.maker, CYAN, |s| s.clone()));
     // The die row (the GUI `status_zone` "dram die" cell): the composed
     // `<die_maker> (<die_type>, <density>Gb)` value — cyan when the die
-    // maker is present, a bare crimson `N/A` when it degrades whole.
+    // maker is present, a bare grey `N/A` when it degrades whole.
     let die = dram_die_line(module);
     items.push(row(
         "dram die",
@@ -1553,7 +1560,7 @@ fn spd_module_items(module: &SpdModule) -> Vec<ListItem<'static>> {
         if matches!(&module.die_maker, Section::Value(_)) {
             CYAN
         } else {
-            CRIMSON
+            NA_GRAY
         },
     ));
     items.push(cell_row("part", &module.part, CYAN, |s| s.clone()));
@@ -1650,16 +1657,16 @@ fn row(key: &str, value: &str, color: Color) -> ListItem<'static> {
     ListItem::new(line)
 }
 
-/// A formatted cell: the value in `color`, or a crimson `N/A (<reason>)`.
+/// A formatted cell: the value in `color`, or a grey `N/A (<reason>)`.
 fn cell_row<T>(key: &str, section: &Section<T>, color: Color, fmt: impl Fn(&T) -> String) -> ListItem<'static> {
     match section {
         Section::Value(value) => row(key, &fmt(value), color),
-        Section::Na(reason) => row(key, &na_text(reason), CRIMSON),
+        Section::Na(reason) => row(key, &na_text(reason), NA_GRAY),
     }
 }
 
 /// A cell row in the GUI's bare-`N/A` form (D-4): the value in `color`,
-/// or a bare crimson `N/A` (the reason stays on the wire, never a
+/// or a bare grey `N/A` (the reason stays on the wire, never a
 /// parenthetical). The zone-1 `GEAR_DOWN` / `CR` / `VDDCR_VDD` rows
 /// mirror the GUI's per-row degradation exactly.
 fn bare_na_row<T>(
@@ -1670,7 +1677,7 @@ fn bare_na_row<T>(
 ) -> ListItem<'static> {
     match section {
         Section::Value(value) => row(key, &fmt(value), color),
-        Section::Na(_) => row(key, "N/A", CRIMSON),
+        Section::Na(_) => row(key, "N/A", NA_GRAY),
     }
 }
 
@@ -1679,23 +1686,24 @@ fn text_item(text: &str, color: Color) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(text.to_owned(), Style::default().fg(color))))
 }
 
-/// One dim subheader line.
+/// One light-grey subheader line.
 fn sub_item(title: &str) -> ListItem<'static> {
-    text_item(&format!("--- {title} ---"), DIM)
+    text_item(&format!("--- {title} ---"), LIGHT_GREY)
 }
 
-/// One crimson N/A placeholder line.
+/// One grey N/A placeholder line.
 fn na_item(text: &str) -> ListItem<'static> {
-    text_item(text, CRIMSON)
+    text_item(text, NA_GRAY)
 }
 
-/// A section that degraded whole: one crimson `N/A (<reason>)` line.
+/// A section that degraded whole: one grey `N/A (<reason>)` line.
 fn section_na(section: &str, reason: &NaReason) -> ListItem<'static> {
-    text_item(&format!("{section}: {}", na_text(reason)), CRIMSON)
+    text_item(&format!("{section}: {}", na_text(reason)), NA_GRAY)
 }
 
-/// The human text of an N/A cell (mirrors the dump renderer's form;
-/// [`NaReason`] carries no `Display`).
+/// The human text of an N/A cell (the dump renderer's form, except
+/// `ParseError` — the bare `N/A`, the GUI's D-4 convention; the detail
+/// stays on the wire; [`NaReason`] carries no `Display`).
 fn na_text(reason: &NaReason) -> String {
     match reason {
         NaReason::UnsupportedHardware => "N/A (unsupported hardware)".to_owned(),
@@ -1703,7 +1711,7 @@ fn na_text(reason: &NaReason) -> String {
         NaReason::InsufficientPrivilege => "N/A (insufficient privilege)".to_owned(),
         NaReason::UnknownPmTableVersion => "N/A (unknown PM table version)".to_owned(),
         NaReason::NotApplicable => "N/A (not applicable)".to_owned(),
-        NaReason::ParseError(detail) => format!("N/A (parse error: {detail})"),
+        NaReason::ParseError(_) => "N/A".to_owned(),
     }
 }
 
@@ -2984,7 +2992,7 @@ mod tests {
         );
         assert_eq!(
             bench_cell_text(CellPhase::Terminal, &terminal, &live, Tier::L2, Metric::Write),
-            ("N/A".to_owned(), CRIMSON)
+            ("N/A".to_owned(), NA_GRAY)
         );
         // A non-finite terminal reading degrades to N/A (the GUI's
         // guard — no "NaN" text).
@@ -2996,7 +3004,7 @@ mod tests {
         };
         assert_eq!(
             bench_cell_text(CellPhase::Terminal, &broken, &live, Tier::Memory, Metric::Read),
-            ("N/A".to_owned(), CRIMSON)
+            ("N/A".to_owned(), NA_GRAY)
         );
 
         // Live: the in-flight value + the `…` suffix, dimmed.
@@ -3020,7 +3028,7 @@ mod tests {
         // NotStarted: the `N/A` placeholder.
         assert_eq!(
             bench_cell_text(CellPhase::NotStarted, &terminal, &live, Tier::L3, Metric::Read),
-            ("N/A".to_owned(), CRIMSON)
+            ("N/A".to_owned(), NA_GRAY)
         );
     }
 

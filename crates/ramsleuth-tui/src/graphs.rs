@@ -389,9 +389,9 @@ fn parse_millidegrees(raw: &str) -> Option<f64> {
 ///
 /// Cyan: the plotted bar values.
 const CYAN: Color = Color::Rgb(0x00, 0xD4, 0xFF);
-/// Crimson: the N/A notes (0 ≠ N/A — an absent value is never a
-/// zero bar).
-const CRIMSON: Color = Color::Rgb(0xFF, 0x3B, 0x30);
+/// Grey: the N/A notes (0 ≠ N/A — an absent value is never a zero
+/// bar; a degradation, never an alarm).
+const NA_GRAY: Color = Color::Rgb(0x8A, 0x8A, 0x94);
 /// Slate: the panel background.
 const SLATE: Color = Color::Rgb(0x1E, 0x1E, 0x24);
 /// Dim grey: the labels, the min/max, the sample-count line.
@@ -505,7 +505,7 @@ pub fn render_graphs_panel(
 }
 
 /// One series row: the dim label, the cyan bar plot, the dim
-/// min/max — or the label + the crimson N/A note when the window
+/// min/max — or the label + the grey N/A note when the window
 /// carries no finite sample (the 0 ≠ N/A rule — no bar, no
 /// min/max).
 fn render_series_row(
@@ -530,7 +530,7 @@ fn render_series_row(
             // N/A note only (0 ≠ N/A).
             Line::from(vec![
                 label_span,
-                Span::styled(" N/A", Style::default().fg(CRIMSON)),
+                Span::styled(" N/A", Style::default().fg(NA_GRAY)),
             ])
         } else {
             let min = values.iter().copied().fold(f64::INFINITY, f64::min);
