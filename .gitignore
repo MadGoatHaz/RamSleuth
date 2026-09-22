@@ -8,8 +8,8 @@
 *.swp
 .DS_Store
 
-# Local working docs (cycle plans, checklists, research notes, handover) — stay local
-Docs/
+# Development documentation (cycle plans, research notes, handovers, AUR ops reference) — local dev-doc storage, NOT repo-facing
+Work/
 plans/
 
 # Agent state (carries a full origin/master checkout) — never committable
