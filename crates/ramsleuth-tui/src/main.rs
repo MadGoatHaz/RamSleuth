@@ -34,8 +34,25 @@
 //!   grid row 0, else NaN — and the CPU-temp source scan runs on this
 //!   thread) and clears the ring on a disconnected→connected
 //!   reconnect transition (the stale pre-outage samples would
-//!   straddle the gap). It stops on the quit flag and is joined
-//!   (bounded) before exit.
+//!   straddle the gap). It also services at most one bench command
+//!   per tick from the key handler's `mpsc` channel (a queued
+//!   [`TuiBenchCmd`] takes priority over this tick's telemetry
+//!   step — the run streams to its terminal before the next poll,
+//!   the GUI poller's exact structure; telemetry polling pauses
+//!   for the run's duration): [`run_bench`] opens a fresh
+//!   connection, sends the `StartBenchmark`, and drains the stream
+//!   into `state.bench` — the `BenchStarted` ack's run id, the
+//!   `BenchProgress` events (cleared at run start), and exactly one
+//!   terminal (`BenchResult` → the grid, `BenchCancelled`, or the
+//!   daemon's structured `Error` — including the single-flight
+//!   `Error` for a second start while a run is in flight) — with
+//!   the C14-03 brief-lock discipline (a write lock per mutation,
+//!   always released before the next `recv`, so the render
+//!   thread's reads never park across the drain) and the 120 s
+//!   stream read timeout (C7-16: a run's frame gaps far exceed the
+//!   client's 5 s transport default). It stops on the quit flag (or
+//!   the channel disconnecting — the session is ending) and is
+//!   joined (bounded) before exit.
 //! - **Main loop** — each tick: `terminal.draw(render)` (the P3-23
 //!   three-zone dashboard over the shared state) +
 //!   `events::poll_event(250 ms)` → the frozen `key_to_action` table
@@ -43,7 +60,10 @@
 //!   thread (one fast RPC), `[S]`napshot writes the dashboard text (the
 //!   client's pure `render`, P3-19) to a timestamped file in the CWD and
 //!   records the path in `daemon_status` (transient — the next poll
-//!   overwrites it), `[Q]`uit breaks the loop.
+//!   overwrites it), `[b]` / `[m]` send a `TuiBenchCmd` into the
+//!   updater's bench channel (TUI-19 — the run itself streams on the
+//!   updater thread; the send is skipped while a run is in flight),
+//!   `[Q]`uit breaks the loop.
 //!
 //! **No-panic contract (plan D5):** errors never end the TUI — a daemon
 //! down, a timeout, a protocol violation, a draw failure, or an event
@@ -80,6 +100,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -92,9 +113,9 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use ramsleuth_bench::{BenchOp, Tier};
+use ramsleuth_bench::{BenchOp, StreamTarget, Tier};
 use ramsleuth_client::Client;
-use ramsleuth_protocol::{Request, Response, DEFAULT_SOCKET_PATH};
+use ramsleuth_protocol::{BenchMode, Request, Response, DEFAULT_SOCKET_PATH};
 use ramsleuth_tui::events;
 use ramsleuth_tui::{key_to_action, render, Action, AppState, BenchState};
 
@@ -133,6 +154,14 @@ const JOIN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The sleep granularity while waiting for the updater to finish.
 const JOIN_POLL: Duration = Duration::from_millis(50);
+
+/// The bench / burn-in stream read timeout (the GUI `update.rs`
+/// `BENCH_READ_TIMEOUT` mirror, C7-16): 120 s *between frames* —
+/// a run streams its progress over minutes, so a legitimate gap
+/// between frames can far exceed the client's 5 s transport default
+/// (the CLI precedent); the deadline only bounds a silently wedged
+/// daemon.
+const BENCH_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Usage text printed on parse errors (exit 2) — the ramsleuth-daemon
 /// P3-17 / ramsleuth-client P3-21 precedent. The default socket path is
@@ -205,6 +234,24 @@ where
         }
     }
     Ok(parsed)
+}
+
+/// One benchmark request from the key handler to the background
+/// updater (the TUI-local mirror of the GUI `update.rs` `BenchCmd`):
+/// the cell target + the scope + the run-class discriminator —
+/// `None` = a normal single-pass benchmark ([`run_bench`]);
+/// `Some(n)` = a burn-in with a duration of `n` minutes (its
+/// `run_burn_in` worker lands in TUI-20).
+#[derive(Debug, Clone, Copy)]
+struct TuiBenchCmd {
+    /// Which cells run (`Full` / one `Tier` / one `Cell`).
+    target: StreamTarget,
+    /// The run scope (the daemon clamps it onto the target, P3-15).
+    mode: BenchMode,
+    /// The run-class discriminator: `None` = a normal run
+    /// ([`run_bench`]); `Some(n)` = a burn-in with a duration of
+    /// `n` minutes.
+    duration_minutes: Option<u32>,
 }
 
 /// One telemetry poll cycle: connect to the daemon at `socket`, request
@@ -352,6 +399,164 @@ fn latest_memory_read_bw(bench: &BenchState) -> f64 {
     0.0
 }
 
+/// One benchmark run (TUI-19 — the GUI `update.rs` `run_bench`
+/// mirror): connect to the daemon at `socket`, send the
+/// `StartBenchmark` for `cmd`, and drain the reply stream — a
+/// `BenchStarted` ack, the `BenchProgress` events, and exactly one
+/// terminal — into `state.bench`.
+///
+/// Testable, no thread: it takes the shared `&RwLock<AppState>` and
+/// locks it only briefly, per mutation — the guard is always
+/// released before the next stream `recv()` (C14-03: the render
+/// thread's reads never park across the drain, so the dashboard
+/// stays responsive during a long run). The run starts with
+/// `running = true`, the progress list cleared, and a stale `run_id`
+/// dropped (a stale run's events never mix into a new one); the
+/// terminal frame (`BenchResult` → the grid, `BenchCancelled`, or
+/// the daemon's `Error`) sets `running = false`; a transport failure
+/// (a closed stream, a timeout, …) or a contract-violating frame (a
+/// `Telemetry` or `BurnInProgress` frame in this stream) records
+/// `state.error` and the same. Always returns `Ok(())` (the
+/// no-panic contract, as in [`poll_once`]) — the updater loop must
+/// survive every failure.
+///
+/// **Cancel (TUI-20):** `cancel` is the shared flag the Cancel key
+/// sets (wired in TUI-20, along with the `CancelBenchmark` send on
+/// the run's own connection — a pre-ack cancel only sets the flag).
+/// It is reset to `false` at the start of every run (a stale cancel
+/// never kills a new one) and checked before each `recv()`: once
+/// set, the run is stopped daemon-side with a best-effort
+/// `CancelBenchmark` for the current `run_id` (only once the
+/// `BenchStarted` ack has landed — the daemon's reply is never read)
+/// and the loop breaks with `running = false` (the clean stop, plan
+/// D6: the in-flight pass finishes, the run ends at the next gate).
+fn run_bench(
+    socket: &Path,
+    cmd: TuiBenchCmd,
+    state: &RwLock<AppState>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    // The shared cancel flag is reset per run: a stale `true` from a
+    // cancelled run must not abort this one before its first frame.
+    cancel.store(false, Ordering::Relaxed);
+    let mut client = match Client::connect(socket) {
+        Ok(client) => client,
+        Err(error) => {
+            // A brief per-mutation lock scope (C14-03) — never held
+            // across the stream drain.
+            let mut s = state.write().unwrap();
+            s.bench.running = false;
+            s.error = Some(error.to_string());
+            return Ok(());
+        }
+    };
+    // The stream read timeout (C7-16): the client's 5 s default would
+    // kill a long run's frame gap mid-stream (the 120 s CLI
+    // precedent).
+    if let Err(error) = client.set_read_timeout(BENCH_READ_TIMEOUT) {
+        let mut s = state.write().unwrap();
+        s.bench.running = false;
+        s.error = Some(error.to_string());
+        return Ok(());
+    }
+    {
+        // The run starts: `running = true`, the progress list cleared,
+        // and a stale `run_id` dropped (a stale run's events never
+        // mix into a new one) — one brief scope.
+        let mut s = state.write().unwrap();
+        s.bench.running = true;
+        s.bench.progress.clear();
+        // The new run's id arrives with the `BenchStarted` ack.
+        s.bench.run_id = None;
+    }
+    if let Err(error) = client.send(&Request::StartBenchmark {
+        target: cmd.target,
+        mode: cmd.mode,
+    }) {
+        let mut s = state.write().unwrap();
+        s.bench.running = false;
+        s.error = Some(error.to_string());
+        return Ok(());
+    }
+    loop {
+        // The shared flag is set (the `[C]` wiring lands in TUI-20):
+        // ask the daemon for a clean stop (best-effort — the reply is
+        // never read) and break before the next frame.
+        if cancel.load(Ordering::Relaxed) {
+            // The run id is read under a brief scope; the
+            // `CancelBenchmark` itself goes out with no lock held.
+            let run_id = state.read().unwrap().bench.run_id;
+            if let Some(run_id) = run_id {
+                let _ = client.send(&Request::CancelBenchmark { run_id });
+            }
+            state.write().unwrap().bench.running = false;
+            break;
+        }
+        match client.recv() {
+            Ok(Response::BenchStarted { run_id }) => {
+                // The run's id lands (the Cancel key addresses the
+                // run with it, TUI-20) — a brief scope.
+                state.write().unwrap().bench.run_id = Some(run_id);
+            }
+            Ok(Response::BenchProgress(progress)) => {
+                // One streamed progress event (latest last) — a
+                // brief scope.
+                state.write().unwrap().bench.progress.push(progress);
+            }
+            Ok(Response::BenchResult { grid, .. }) => {
+                // The terminal frame: the grid + the clean stop in
+                // one brief scope.
+                let mut s = state.write().unwrap();
+                s.bench.grid = Some(grid);
+                s.bench.running = false;
+                break;
+            }
+            Ok(Response::BenchCancelled { .. }) => {
+                // The clean-stop ack (the run ended at its cancel
+                // gate) — a brief scope.
+                state.write().unwrap().bench.running = false;
+                break;
+            }
+            Ok(Response::Error(message)) => {
+                // A structured daemon reply — including the
+                // single-flight `Error` for a second start while a
+                // run is in flight (P3-15/D-6): record + end, never
+                // a panic (D5).
+                let mut s = state.write().unwrap();
+                s.error = Some(message);
+                s.bench.running = false;
+                break;
+            }
+            Ok(Response::Telemetry(_)) => {
+                // A telemetry frame in the bench stream violates the
+                // wire contract (`GetTelemetry` is served on its own
+                // connection, P3-16): stop the run and record it.
+                let mut s = state.write().unwrap();
+                s.error = Some("unexpected response during benchmark".to_owned());
+                s.bench.running = false;
+                break;
+            }
+            Ok(Response::BurnInProgress(_)) => {
+                // A burn-in frame in a normal-bench stream violates
+                // the wire contract (burn-in ticks stream only on the
+                // owning `StartBurnIn` connection, D-1/D-2): stop
+                // the run and record it (the GUI `run_bench` mirror).
+                let mut s = state.write().unwrap();
+                s.error = Some("unexpected burn-in frame during benchmark".to_owned());
+                s.bench.running = false;
+                break;
+            }
+            Err(error) => {
+                let mut s = state.write().unwrap();
+                s.error = Some(error.to_string());
+                s.bench.running = false;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A `Drop` guard around the initialized terminal.
 ///
 /// Owns the `Terminal<CrosstermBackend>` after raw mode + the alternate
@@ -420,13 +625,26 @@ impl Drop for TerminalGuard {
 /// off and the daemon steadily up, the probe connect is dropped without
 /// a fetch — the snapshot stays frozen (the `…s ago` stamp advances).
 ///
-/// The thread runs until `stop` is set (quit); one tick is bounded
-/// (the connect-retry window ~300 ms + the transport's 5 s read
-/// timeout), so a wedged daemon cannot hold it forever.
+/// TUI-19: the loop first services at most one bench command from
+/// `bench_rx` per tick (a queued command takes priority over this
+/// tick's telemetry step, and a run streams to its terminal before the
+/// next poll — the GUI poller's exact structure; telemetry polling
+/// pauses for the run's duration; runs are single-flight daemon-side
+/// anyway, P3-15), handing the shared `cancel` flag to [`run_bench`]
+/// (each run resets it and checks it between frames).
+///
+/// The thread runs until `stop` is set (quit) or the bench command
+/// channel disconnects (the sender dropped — the session is ending):
+/// a telemetry tick is bounded (the connect-retry window ~300 ms +
+/// the transport's 5 s read timeout), and a bench tick by the run's
+/// stream (the 120 s frame-gap deadline — C7-16), so a wedged daemon
+/// cannot hold it forever.
 fn spawn_updater(
     state: Arc<RwLock<AppState>>,
     stop: Arc<AtomicBool>,
     socket: PathBuf,
+    bench_rx: mpsc::Receiver<TuiBenchCmd>,
+    cancel: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         // Was the daemon connected at the end of the last tick: `false`
@@ -451,34 +669,68 @@ fn spawn_updater(
                     clamp_poll_interval(app.settings.poll_interval_ms),
                 )
             };
-            match Client::connect(&socket) {
-                Err(error) => {
-                    // Daemon down: the friendly disconnected state (the
-                    // no-panic contract, D5); the next tick re-probes.
-                    let mut snapshot = state.write().unwrap();
-                    snapshot.error = Some(error.to_string());
-                    snapshot.daemon_status = "disconnected".to_owned();
-                    prev_connected = false;
-                }
-                Ok(mut client) => {
-                    // The disconnected→connected transition (the first
-                    // tick is one): the one-shot baseline — startup or
-                    // reconnect — runs regardless of the `refresh` gate
-                    // (D-8, the C7-08/09 mechanism).
-                    let reconnected = !prev_connected;
-                    let due = reconnected || (refresh && last_poll.elapsed() >= interval);
-                    if due {
-                        // Baseline / reconnect / cadence: send
-                        // `GetTelemetry` on this connection (one
-                        // connection total) and update the state.
-                        poll_with_client(&mut client, &socket, &mut state.write().unwrap());
-                        last_poll = Instant::now();
+            // TUI-19: a queued bench command takes priority over this
+            // tick's telemetry step — at most one per tick, and a run
+            // streams to its terminal before the next poll (the GUI
+            // poller's exact structure; telemetry polling pauses for
+            // the run's duration).
+            match bench_rx.try_recv() {
+                Ok(cmd) => {
+                    if cmd.duration_minutes.is_some() {
+                        // TUI-20: the burn-in worker — not wired until
+                        // that chunk; a burn-in command landing before
+                        // it is recorded, never a panic (D5) (the key
+                        // that sends one — `[x]` — lands with
+                        // TUI-20/22).
+                        state.write().unwrap().error =
+                            Some("burn-in is not available in this build".to_owned());
+                    } else {
+                        // A normal run: `run_bench` locks `state` only
+                        // briefly, per mutation — never across its
+                        // stream drain (C14-03: the render thread's
+                        // reads stay responsive for the whole run).
+                        let _ = run_bench(&socket, cmd, &state, &cancel);
                     }
-                    // Not due (refresh off, steady state): drop the
-                    // probe connection without a fetch — the snapshot
-                    // stays frozen, no periodic data poll.
-                    prev_connected = true;
                 }
+                Err(TryRecvError::Empty) => {
+                    match Client::connect(&socket) {
+                        Err(error) => {
+                            // Daemon down: the friendly disconnected
+                            // state (the no-panic contract, D5); the
+                            // next tick re-probes.
+                            let mut snapshot = state.write().unwrap();
+                            snapshot.error = Some(error.to_string());
+                            snapshot.daemon_status = "disconnected".to_owned();
+                            prev_connected = false;
+                        }
+                        Ok(mut client) => {
+                            // The disconnected→connected transition
+                            // (the first tick is one): the one-shot
+                            // baseline — startup or reconnect — runs
+                            // regardless of the `refresh` gate (D-8,
+                            // the C7-08/09 mechanism).
+                            let reconnected = !prev_connected;
+                            let due = reconnected || (refresh && last_poll.elapsed() >= interval);
+                            if due {
+                                // Baseline / reconnect / cadence: send
+                                // `GetTelemetry` on this connection (one
+                                // connection total) and update the state.
+                                poll_with_client(&mut client, &socket, &mut state.write().unwrap());
+                                last_poll = Instant::now();
+                            }
+                            // Not due (refresh off, steady state): drop
+                            // the probe connection without a fetch —
+                            // the snapshot stays frozen, no periodic
+                            // data poll.
+                            prev_connected = true;
+                        }
+                    }
+                }
+                // The sender dropped: the session is ending (`run`
+                // keeps it alive until the updater is joined) — no
+                // more bench commands, the loop ends (the GUI
+                // `spawn_poller` precedent).
+                Err(TryRecvError::Disconnected) => break,
             }
             // Sleep the live value: the next tick re-reads the knobs.
             thread::sleep(interval);
@@ -573,8 +825,23 @@ fn run(args: TuiArgs) -> ExitCode {
     // The quit flag: set on `[Q]` (and again on loop exit), read by the
     // updater between cycles.
     let stop = Arc::new(AtomicBool::new(false));
+    // The bench command channel (TUI-19): the key handler sends a
+    // `TuiBenchCmd` into it; the updater services at most one per tick.
+    // The sender's binding lives for the whole session — dropping it
+    // would disconnect the updater's receiver (and end its loop).
+    let (bench_tx, bench_rx) = mpsc::channel();
+    // The shared cancel flag (TUI-19/20): each run resets it and
+    // checks it between frames; the `[C]` key's wiring lands in
+    // TUI-20.
+    let cancel = Arc::new(AtomicBool::new(false));
 
-    let updater = spawn_updater(Arc::clone(&state), Arc::clone(&stop), args.socket.clone());
+    let updater = spawn_updater(
+        Arc::clone(&state),
+        Arc::clone(&stop),
+        args.socket.clone(),
+        bench_rx,
+        Arc::clone(&cancel),
+    );
 
     while let Some(terminal) = guard.terminal.as_mut() {
         // One draw per tick (250 ms cadence): the read lock is held only
@@ -608,10 +875,38 @@ fn run(args: TuiArgs) -> ExitCode {
                             stop.store(true, Ordering::Relaxed);
                             break;
                         }
-                        // TUI-19/20/22: wire real dispatch (bench class);
+                        // `[b]`: a full benchmark run (TUI-19) — the
+                        // command goes to the updater (a channel send,
+                        // no I/O — the key handler's one permitted
+                        // main-thread mutation). The send is skipped
+                        // while a run is in flight (the GUI
+                        // single-flight UX; the daemon would answer a
+                        // second start with its structured `Error`
+                        // anyway — TUI-22 refines the skip with a
+                        // status note).
+                        Action::BenchFull => {
+                            if !state.read().unwrap().bench.running {
+                                let _ = bench_tx.send(TuiBenchCmd {
+                                    target: StreamTarget::Full,
+                                    mode: BenchMode::Full,
+                                    duration_minutes: None,
+                                });
+                            }
+                        }
+                        // `[m]`: a memory-only benchmark run (TUI-19) —
+                        // the single-flight skip as above.
+                        Action::BenchMemory => {
+                            if !state.read().unwrap().bench.running {
+                                let _ = bench_tx.send(TuiBenchCmd {
+                                    target: StreamTarget::Full,
+                                    mode: BenchMode::MemoryOnly,
+                                    duration_minutes: None,
+                                });
+                            }
+                        }
+                        // TUI-20: wire the burn-in + cancel class;
                         // TUI-22: wire the view class
-                        Action::BenchFull | Action::BenchMemory | Action::BurnIn
-                            | Action::Cancel | Action::ToggleGraphs
+                        Action::BurnIn | Action::Cancel | Action::ToggleGraphs
                             | Action::ToggleSettings | Action::ToggleRequirements
                             | Action::ExportJson | Action::CyclePoll
                             | Action::ToggleCapacity | Action::ToggleClock
@@ -1110,8 +1405,19 @@ mod tests {
         app.settings.refresh = false;
         let state = Arc::new(RwLock::new(app));
         let updater_stop = Arc::new(AtomicBool::new(false));
-        let updater =
-            spawn_updater(Arc::clone(&state), Arc::clone(&updater_stop), sock.path().to_path_buf());
+        // TUI-19: the new `spawn_updater` parameters — a fresh bench
+        // command channel (no commands are sent in this test; the
+        // sender stays alive for the test's duration) + the shared
+        // cancel flag.
+        let (_bench_tx, bench_rx) = mpsc::channel::<TuiBenchCmd>();
+        let bench_cancel = Arc::new(AtomicBool::new(false));
+        let updater = spawn_updater(
+            Arc::clone(&state),
+            Arc::clone(&updater_stop),
+            sock.path().to_path_buf(),
+            bench_rx,
+            Arc::clone(&bench_cancel),
+        );
 
         // Exactly one connection for the startup baseline (checked
         // immediately — the next probe tick is ~200 ms away). The
@@ -1175,8 +1481,19 @@ mod tests {
         app.settings.refresh = true;
         let state = Arc::new(RwLock::new(app));
         let updater_stop = Arc::new(AtomicBool::new(false));
-        let updater =
-            spawn_updater(Arc::clone(&state), Arc::clone(&updater_stop), sock.path().to_path_buf());
+        // TUI-19: the new `spawn_updater` parameters — a fresh bench
+        // command channel (no commands are sent in this test; the
+        // sender stays alive for the test's duration) + the shared
+        // cancel flag.
+        let (_bench_tx, bench_rx) = mpsc::channel::<TuiBenchCmd>();
+        let bench_cancel = Arc::new(AtomicBool::new(false));
+        let updater = spawn_updater(
+            Arc::clone(&state),
+            Arc::clone(&updater_stop),
+            sock.path().to_path_buf(),
+            bench_rx,
+            Arc::clone(&bench_cancel),
+        );
 
         // Phase A: let the 400 ms cadence run over a 1 s window.
         wait_for_status(&state, "connected:");
@@ -1489,5 +1806,389 @@ mod tests {
             26.35,
             "a NaN read event + a write event fall back to the grid"
         );
+    }
+    // ------------------------------------------------------------------
+    // TUI-19: the bench worker (normal runs) — `run_bench` against an
+    // in-process daemon stand-in (the GUI `update.rs` `run_bench`
+    // stand-in suite, adapted to the TUI state / command types).
+    // ------------------------------------------------------------------
+
+    /// (o) `run_bench` against a stand-in (a `StartBenchmark` answered
+    /// with `BenchStarted` + two `BenchProgress` + the terminal
+    /// `BenchResult`) streams into `state.bench`: the cmd's target /
+    /// mode ride the wire, exactly the two progress events (a stale
+    /// pre-run entry is cleared at run start), the ack's `run_id` is
+    /// recorded, the terminal grid lands, `running = false` on the
+    /// terminal — with no transport error.
+    #[test]
+    fn run_bench_streams_started_progress_result() {
+        let sock = TempSocket::new("bench");
+        let progress_a = StreamProgress {
+            cell_index: 0,
+            total_cells: 3,
+            tier: Tier::Memory,
+            op: BenchOp::Read,
+            value: 26.35,
+            label: "Memory · Read (GB/s)".to_owned(),
+        };
+        let progress_b = StreamProgress {
+            cell_index: 1,
+            total_cells: 3,
+            tier: Tier::Memory,
+            op: BenchOp::Write,
+            value: 43.63,
+            label: "Memory · Write (GB/s)".to_owned(),
+        };
+        let grid = BenchmarkGrid {
+            read_gbps: [26.35, 0.0, 0.0, 0.0],
+            write_gbps: [43.63, 0.0, 0.0, 0.0],
+            copy_gbps: [12.11, 0.0, 0.0, 0.0],
+            latency_ns: [86.84, 0.0, 0.0, 0.0],
+        };
+        let expected_progress = vec![progress_a.clone(), progress_b.clone()];
+        let expected_grid = grid.clone();
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::StartBenchmark { target, mode })) => {
+                    assert_eq!(
+                        target,
+                        StreamTarget::Full,
+                        "the cmd's target must ride the wire"
+                    );
+                    assert_eq!(mode, BenchMode::Full, "the cmd's mode must ride the wire");
+                }
+                other => panic!("stand-in expected StartBenchmark, got {other:?}"),
+            }
+            for response in [
+                Response::BenchStarted { run_id: 1 },
+                Response::BenchProgress(progress_a),
+                Response::BenchProgress(progress_b),
+                Response::BenchResult { run_id: 1, grid },
+            ] {
+                let bytes = encode_frame(&Message::Response(response)).expect("must encode");
+                stream.write_all(&bytes).expect("stand-in write must not fail");
+            }
+        });
+
+        let cmd = TuiBenchCmd {
+            target: StreamTarget::Full,
+            mode: BenchMode::Full,
+            duration_minutes: None,
+        };
+        // A false cancel flag: this run is never cancelled (it is
+        // reset per run anyway).
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(RwLock::new(AppState::default()));
+        {
+            let mut s = state.write().expect("the updater must not poison the lock");
+            // A stale pre-run progress entry must be cleared at run
+            // start.
+            s.bench.progress.push(StreamProgress {
+                cell_index: 9,
+                total_cells: 12,
+                tier: Tier::L3,
+                op: BenchOp::Copy,
+                value: 1.0,
+                label: "stale".to_owned(),
+            });
+            // A stale pre-run id must be dropped at run start.
+            s.bench.run_id = Some(99);
+        }
+        run_bench(sock.path(), cmd, &state, &cancel).expect("run_bench must not error");
+
+        let state = state.read().expect("the updater must not poison the lock");
+        assert!(!state.bench.running, "the terminal result must clear running");
+        assert_eq!(state.bench.run_id, Some(1), "the ack's run_id must be recorded");
+        assert_eq!(
+            state.bench.progress, expected_progress,
+            "exactly the streamed events; the stale entry is cleared"
+        );
+        assert_eq!(
+            state.bench.grid,
+            Some(expected_grid),
+            "the terminal grid must land in the state"
+        );
+        assert!(state.error.is_none(), "a clean run must not record an error");
+        stand_in.join();
+    }
+
+    /// (p) CANCEL (the shared flag the `[C]` key sets — its wiring
+    /// lands in TUI-20; `run_bench` already checks it between frames,
+    /// as in the GUI P3-28): after the `BenchStarted` ack lands in
+    /// the state, the shared `cancel` flag is set — `run_bench` ends
+    /// the run with `running = false` (sending the daemon a
+    /// best-effort `CancelBenchmark` when the run has an id) — no
+    /// hang, no panic, no error recorded.
+    #[test]
+    fn run_bench_cancel_flag_stops_the_run() {
+        let sock = TempSocket::new("bench-cancel");
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::StartBenchmark { .. })) => {}
+                other => panic!("stand-in expected StartBenchmark, got {other:?}"),
+            }
+            let started =
+                encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
+                    .expect("must encode");
+            stream.write_all(&started).expect("stand-in write must not fail");
+            // Mimic the daemon: end the run after a beat — the worker
+            // either sees the cancel flag before the terminal frame
+            // (sends a `CancelBenchmark` and breaks) or receives the
+            // terminal `BenchCancelled` while blocked in `recv`.
+            thread::sleep(Duration::from_millis(200));
+            let _ = stream.write_all(
+                &encode_frame(&Message::Response(Response::BenchCancelled { run_id: 42 }))
+                    .expect("must encode"),
+            );
+            let _ = read_one_message(&mut stream); // drain the cancel (best-effort)
+        });
+
+        let socket = sock.path().to_path_buf();
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let state = Arc::clone(&state);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                let cmd = TuiBenchCmd {
+                    target: StreamTarget::Full,
+                    mode: BenchMode::Full,
+                    duration_minutes: None,
+                };
+                // The function locks the shared state only per
+                // mutation — never across the stream drain (C14-03).
+                run_bench(&socket, cmd, &state, &cancel)
+                    .expect("run_bench must not error");
+            })
+        };
+
+        // Wait for the run to start (the ack's run_id lands in the
+        // state), then set the shared cancel flag.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if state.read().expect("the updater must not poison the lock").bench.run_id.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the run never started (no BenchStarted within 5 s)"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        cancel.store(true, Ordering::Relaxed);
+        worker.join().expect("run_bench must return on cancel (no hang)");
+
+        let state = state.read().expect("the updater must not poison the lock");
+        assert!(!state.bench.running, "the cancel must clear running");
+        assert_eq!(state.bench.run_id, Some(42), "the run id must stay recorded");
+        assert!(state.error.is_none(), "a clean cancel must not record an error");
+        stand_in.join();
+    }
+
+    /// (q) A structured daemon `Error` in the bench stream — including
+    /// the single-flight `Error` for a second start while a run is in
+    /// flight (P3-15/D-6) — is recorded in `state.error` and ends the
+    /// run (`running = false`) — never a panic (the no-panic contract,
+    /// D5); an errored run lands no terminal grid.
+    #[test]
+    fn run_bench_records_structured_error() {
+        let sock = TempSocket::new("bench-error");
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::StartBenchmark { .. })) => {}
+                other => panic!("stand-in expected StartBenchmark, got {other:?}"),
+            }
+            // The daemon's single-flight reply for a second start
+            // while a run is active: a structured `Error`.
+            let bytes = encode_frame(&Message::Response(Response::Error(
+                "a benchmark is already running".to_owned(),
+            )))
+            .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+
+        let cmd = TuiBenchCmd {
+            target: StreamTarget::Full,
+            mode: BenchMode::Full,
+            duration_minutes: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(RwLock::new(AppState::default()));
+        run_bench(sock.path(), cmd, &state, &cancel).expect("run_bench must not error");
+
+        let state = state.read().expect("the updater must not poison the lock");
+        assert!(!state.bench.running, "a structured error must end the run");
+        assert_eq!(
+            state.error.as_deref(),
+            Some("a benchmark is already running"),
+            "the daemon's structured message must be recorded"
+        );
+        assert!(state.bench.grid.is_none(), "an errored run lands no terminal grid");
+        stand_in.join();
+    }
+
+    /// (r) `run_bench` against a **non-existent** socket records the
+    /// friendly `DaemonDown` text, leaves `running = false`, and never
+    /// panics (the no-panic contract, D5) — the run's connect failure
+    /// is a transport failure reported through the state.
+    #[test]
+    fn run_bench_missing_socket_is_friendly() {
+        let sock = TempSocket::new("bench-missing");
+        let cmd = TuiBenchCmd {
+            target: StreamTarget::Full,
+            mode: BenchMode::Full,
+            duration_minutes: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(RwLock::new(AppState::default()));
+        run_bench(sock.path(), cmd, &state, &cancel).expect("run_bench must not error");
+
+        let state = state.read().expect("the updater must not poison the lock");
+        assert!(!state.bench.running, "a failed connect must not leave a run in flight");
+        assert!(state.bench.progress.is_empty(), "no progress without a run");
+        let error = state.error.clone().expect("a friendly error must be recorded");
+        assert!(
+            error.contains("daemon not running"),
+            "the error must carry the DaemonDown hint, got: {error}"
+        );
+    }
+
+    /// (s) The bench stream read timeout is the raised 120 s value
+    /// (the GUI C7-16 / the CLI precedent): a long frame gap can no
+    /// longer trip the client's 5 s transport default mid-stream — a
+    /// wedged daemon is bounded by the 120 s deadline, not a hang.
+    #[test]
+    fn bench_stream_read_timeout_is_the_raised_cli_value() {
+        assert_eq!(
+            BENCH_READ_TIMEOUT,
+            Duration::from_secs(120),
+            "the stream read timeout must be the 120 s CLI precedent"
+        );
+    }
+
+    /// (t) C14-03: a long, in-flight bench run keeps the shared
+    /// state's lock brief for readers. The stand-in streams
+    /// `BenchStarted`, then 15 steady `BenchProgress` ticks at 100 ms
+    /// intervals, then the terminal grid — the stream stays open for
+    /// the whole run, so under a pre-fix lock scope (the write guard
+    /// held across the whole drain) every `state.read()` on this
+    /// thread would park for the entire run: here, every read taken
+    /// every ~10 ms must complete promptly (no blocking), the mid-run
+    /// reads must observe the live progress growing, and the run must
+    /// end at its terminal (the grid recorded, no error).
+    #[test]
+    fn run_in_flight_bench_keeps_the_lock_brief_for_readers() {
+        let sock = TempSocket::new("bench-inflight");
+        let grid = BenchmarkGrid {
+            read_gbps: [10.5, 0.0, 0.0, 0.0],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [0.0; 4],
+        };
+        let expected_grid = grid.clone();
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::StartBenchmark { .. })) => {}
+                other => panic!("stand-in expected StartBenchmark, got {other:?}"),
+            }
+            let started =
+                encode_frame(&Message::Response(Response::BenchStarted { run_id: 7 }))
+                    .expect("must encode");
+            stream.write_all(&started).expect("stand-in write must not fail");
+            for cell_index in 0u32..15 {
+                let tick = encode_frame(&Message::Response(Response::BenchProgress(
+                    StreamProgress {
+                        cell_index,
+                        total_cells: 15,
+                        tier: Tier::Memory,
+                        op: BenchOp::Read,
+                        value: f64::from(cell_index + 1),
+                        label: "Memory · Read (GB/s)".to_owned(),
+                    },
+                )))
+                .expect("must encode");
+                stream.write_all(&tick).expect("stand-in write must not fail");
+                thread::sleep(Duration::from_millis(100));
+            }
+            let result = encode_frame(&Message::Response(Response::BenchResult {
+                run_id: 7,
+                grid,
+            }))
+            .expect("must encode");
+            stream.write_all(&result).expect("stand-in write must not fail");
+        });
+
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let socket = sock.path().to_path_buf();
+        let worker = {
+            let state = Arc::clone(&state);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                let cmd = TuiBenchCmd {
+                    target: StreamTarget::Full,
+                    mode: BenchMode::Full,
+                    duration_minutes: None,
+                };
+                run_bench(&socket, cmd, &state, &cancel)
+                    .expect("run_bench must not error");
+            })
+        };
+
+        // The main test thread (a stand-in for the render thread):
+        // read continuously every ~10 ms during the run — every read
+        // must complete promptly (the writer's critical section is
+        // per-frame, µs — C14-03), and the mid-run reads must observe
+        // the live progress.
+        let mut max_mid_run_progress = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let read_started = Instant::now();
+            let (running, progress_len, done) = {
+                let s = state.read().expect("the updater must not poison the lock");
+                (
+                    s.bench.running,
+                    s.bench.progress.len(),
+                    s.bench.grid.is_some() && !s.bench.running,
+                )
+            };
+            let read_elapsed = read_started.elapsed();
+            assert!(
+                read_elapsed < Duration::from_millis(50),
+                "a mid-run read must not block on the writer (took {read_elapsed:?})"
+            );
+            if running {
+                max_mid_run_progress = max_mid_run_progress.max(progress_len);
+            }
+            if done {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the in-flight bench never reached its terminal"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        worker.join().expect("run_bench must return at its terminal (no hang)");
+        stand_in.join();
+
+        // The terminal assertions take one brief, fully-scoped read
+        // (the guard must not outlive this block — a long-lived
+        // reader starves the next run's writer, C14-03).
+        assert!(
+            max_mid_run_progress >= 2,
+            "a mid-run read must observe at least two streamed progress events, saw {max_mid_run_progress}"
+        );
+        {
+            let s = state.read().expect("the updater must not poison the lock");
+            assert!(!s.bench.running, "the terminal must clear running");
+            assert_eq!(s.bench.run_id, Some(7), "the ack's run id must be recorded");
+            assert_eq!(
+                s.bench.grid,
+                Some(expected_grid),
+                "the terminal grid must land in the state"
+            );
+            assert!(s.error.is_none(), "a clean run must not record an error");
+        }
     }
 }
