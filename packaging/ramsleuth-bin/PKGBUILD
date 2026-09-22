@@ -46,7 +46,7 @@
 # daemon starts and serves N/A (DriverMissing) sections with exit 0.
 
 pkgname=ramsleuth-bin
-pkgver=2.2.0   # FIXED — the tarball is downloaded from the GitHub Release for this exact version
+pkgver=2.2.1   # FIXED — the tarball is downloaded from the GitHub Release for this exact version
 pkgrel=1
 pkgdesc="Pure-Rust RAM latency/bandwidth telemetry: privileged daemon + unprivileged CLI/TUI/GUI clients (precompiled binary)"
 arch=(x86_64)
@@ -57,7 +57,7 @@ source=("https://github.com/MadGoatHaz/RamSleuth/releases/download/v$pkgver/rams
 # asset, independently verified by download + sha256sum (the all-zeros
 # fail-loud placeholder is gone — the pin is the asset hash itself).
 #
-sha256sums=('1938e56f669a5b33be7b8890092de561f19f8a0536b07bdc1fa682bc37a2434a')
+sha256sums=('3b7449639d46ffd78b2fa0b149fec225326889c80bdf4044d19321201eb0746c')
 install=ramsleuth-bin.install
 conflicts=('ramsleuth')
 depends=(libx11 libxkbcommon wayland libxrandr libxi libxcursor libxinerama mesa)
