@@ -1336,7 +1336,7 @@ rather than the client's 5 s transport default.
 The self-contained GitHub installer (repo root; also installed to
 `/usr/share/ramsleuth/install.sh` for post-install re-runs and auditing).
 `git clone … && ./install.sh` lands the system in **exactly the state of the
-AUR `ramsleuth-git` package**: the 6 binaries (built with
+AUR `ramsleuth` package**: the 6 binaries (built with
 `cargo build --release --workspace --locked` — RamSleuth compiles only this
 repo), the frozen unit, the preset, the `ramsleuth` group, the one-click setup
 helper, and its polkit policy. Properties:
@@ -1356,21 +1356,20 @@ Exit codes: **0** installed *or* declined (no change), **1** hard failure,
 **2** bad usage / preflight refusal (not a checkout, non-Arch, no Rust
 toolchain).
 
-### 12.2 The AUR three-tier model
+### 12.2 The AUR packages
 
 | Package | What it is | When to use it |
 |---------|------------|----------------|
 | **`ramsleuth`** | STABLE source — builds the workspace from the official **`v$pkgver` git tag** (reproducible, auditable snapshot) | the default recommendation for production installs |
 | **`ramsleuth-bin`** | PRECOMPILED — downloads the release tarball `ramsleuth-$pkgver-x86_64.tar.zst` from the official GitHub Release, pinned by `sha256sums` (no build, no makedepends) | the fastest install path |
-| **`ramsleuth-git`** | BLEEDING-EDGE — builds from the moving **`v2-development`** branch (its `pkgver()` recomputes from `git describe`) | testing unreleased work; not a stable install |
 
-`ramsleuth` and `ramsleuth-bin` install the identical file set and **mutually
-conflict** — the user picks exactly one; `ramsleuth-git` is the separate
-dev entry. All three install the one-click artifacts (helper + polkit policy —
-`-bin` takes them from the release tarball) and their `post_install` hooks
-perform a **zero-touch grant** when run under `sudo`: group membership
-(persistent, next login) + the `authorized-users` seed (current-session socket
-access) + a daemon restart so the ACL applies immediately.
+Both install the identical file set and **mutually conflict** — the user
+picks exactly one. Both install the one-click artifacts (helper + polkit
+policy — `ramsleuth-bin` takes them from the release tarball), and their
+`post_install` hooks perform a **zero-touch grant** when run under `sudo`:
+group membership (persistent, next login) + the `authorized-users` seed
+(current-session socket access) + a daemon restart so the ACL applies
+immediately.
 
 The full install file set (see `packaging/README.md` for the operator
 reference): 6 binaries → `/usr/bin/`; the unit → `/usr/lib/systemd/system/`
@@ -1507,6 +1506,6 @@ source** — the AUR package pins it by `sha256sums`.
 - [`README.md`](../README.md) — what RamSleuth is, installation, quickstart;
 - [`Docs/User_Guide.md`](User_Guide.md) — running the GUI / TUI / CLI /
   standalone tools, reading the data, N/A reasons, day-2 operations;
-- [`packaging/README.md`](../packaging/README.md) — the three-tier AUR model,
+- [`packaging/README.md`](../packaging/README.md) — the two-package AUR model,
   the version-bump standing policy, the `ryzen-smu-dkms` extra, and the
   CI/release artifact contracts.

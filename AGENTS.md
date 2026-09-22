@@ -16,7 +16,7 @@ GUI), with CLI and standalone tools.
   benchmark engine, install/deployment, and testing/CI.
 - `Docs/User_Guide.md` — how to install, run, and read the data (GUI, TUI, CLI,
   standalone tools, N/A reasons, troubleshooting, uninstall).
-- `packaging/README.md` — the packaging / AUR / operator guide: the 3-tier AUR
+- `packaging/README.md` — the packaging / AUR / operator guide: the two-package AUR
   model, the version-bump standing policy, the `ryzen-smu-dkms` extra, and the
   CI/release artifact contracts.
 

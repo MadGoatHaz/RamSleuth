@@ -41,12 +41,11 @@ git clone https://github.com/MadGoatHaz/RamSleuth && cd RamSleuth && ./install.s
 
 Self-contained and idempotent: it prints every source it uses and the exact commit it installs before doing anything, and a re-run after any failure is safe.
 
-**AUR (Arch) — pick exactly one of the first two:**
+**AUR (Arch) — pick exactly one:**
 
 ```sh
 yay -S ramsleuth      # STABLE — builds from the official release tag
 yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest install)
-yay -S ramsleuth-git  # BLEEDING-EDGE — tracks the moving v2-development branch (dev/testing)
 ```
 
 (`paru -S …` works in place of `yay`.)
@@ -57,7 +56,7 @@ yay -S ramsleuth-git  # BLEEDING-EDGE — tracks the moving v2-development branc
 
 ## Quickstart
 
-1. **Install** — the `install.sh` one-liner above, or any of the three AUR packages.
+1. **Install** — the `install.sh` one-liner above, or either AUR package.
 2. **Open the app** — run `ramsleuth` (the GUI, or its desktop-menu entry); `ramsleuth-tui` is the terminal equivalent.
 3. **One click** — on first launch the `SETUP` strip offers **Set up RamSleuth** (on AMD hosts: **Set up RamSleuth + AMD driver**): one polkit password prompt enables + starts the daemon, joins your user to the `ramsleuth` group, and grants a current-session socket ACL — no re-login, no reboot. No desktop? The same one step from a terminal is `sudo ramsleuth-setup` (add `--with-dkms` on AMD).
 4. **Read and run** — the dashboard is live from the first second: telemetry matrix, benchmark grid, and hardware/SPD status; start a benchmark from either frontend, or run the standalone tools.
@@ -68,7 +67,7 @@ The full walkthrough — every zone, key, flag, N/A reason, and day-2 troublesho
 
 - [Architecture](Docs/Architecture.md) — the deep technical design: the two-layer model, the daemon and wire protocol, the 8-crate workspace map, every telemetry source, the benchmark engine, deployment, and testing/CI.
 - [User Guide](Docs/User_Guide.md) — installation, first run, running the GUI / TUI / CLI / standalone tools, reading the data (clocks, subtimings, SPD/XMP/EXPO, N/A reasons), and day-2 troubleshooting.
-- [Packaging & AUR](packaging/README.md) — the 3-tier AUR model, the unified version-bump flow, the `ryzen-smu-dkms` extra, and the CI/release artifact contracts.
+- [Packaging & AUR](packaging/README.md) — the two-package AUR model, the unified version-bump flow, the `ryzen-smu-dkms` extra, and the CI/release artifact contracts.
 - [Changelog](CHANGELOG.md) — release history.
 
 **Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.2.1**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
