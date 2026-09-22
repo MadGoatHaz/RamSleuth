@@ -39,20 +39,33 @@
 //!   [`TuiBenchCmd`] takes priority over this tick's telemetry
 //!   step — the run streams to its terminal before the next poll,
 //!   the GUI poller's exact structure; telemetry polling pauses
-//!   for the run's duration): [`run_bench`] opens a fresh
-//!   connection, sends the `StartBenchmark`, and drains the stream
-//!   into `state.bench` — the `BenchStarted` ack's run id, the
-//!   `BenchProgress` events (cleared at run start), and exactly one
-//!   terminal (`BenchResult` → the grid, `BenchCancelled`, or the
-//!   daemon's structured `Error` — including the single-flight
-//!   `Error` for a second start while a run is in flight) — with
-//!   the C14-03 brief-lock discipline (a write lock per mutation,
-//!   always released before the next `recv`, so the render
-//!   thread's reads never park across the drain) and the 120 s
-//!   stream read timeout (C7-16: a run's frame gaps far exceed the
-//!   client's 5 s transport default). It stops on the quit flag (or
-//!   the channel disconnecting — the session is ending) and is
-//!   joined (bounded) before exit.
+//!   for the run's duration), dispatching on the cmd's
+//!   `duration_minutes` discriminator (the GUI C7-16 rule):
+//!   `None` → [`run_bench`] (a normal run: a fresh connection,
+//!   the `StartBenchmark`, and the stream drained into
+//!   `state.bench` — the `BenchStarted` ack's run id, the
+//!   `BenchProgress` events (cleared at run start), and exactly
+//!   one terminal (`BenchResult` → the grid, `BenchCancelled`,
+//!   or the daemon's structured `Error` — including the
+//!   single-flight `Error` for a second start while a run is in
+//!   flight)); `Some(n)` → [`run_burn_in`] (a burn-in: the
+//!   `StartBurnIn`, the `BurnInProgress` ticks into
+//!   `state.bench.burn_in` — the newest iteration / elapsed +
+//!   the per-cell `latest` — and the same terminal shapes, the
+//!   `BenchResult` grid also landing in `state.bench.grid`). The
+//!   two run classes share only the `run_id` + the shared `cancel`
+//!   flag (the GUI invariant): each run resets the flag at its
+//!   start and checks it between frames; once set (the `[C]` key,
+//!   TUI-20), the run stops daemon-side with a best-effort
+//!   `CancelBenchmark` on its own connection (sent only once the
+//!   `BenchStarted` ack has landed — a pre-ack cancel only sets
+//!   the flag) and ends with `running` / `burn_in.running =
+//!   false`. Both workers lock `state` only briefly, per mutation
+//!   (C14-03 — the render thread's reads never park across the
+//!   drain) and run the 120 s stream read timeout (C7-16: a run's
+//!   frame gaps far exceed the client's 5 s transport default). It
+//!   stops on the quit flag (or the channel disconnecting — the
+//!   session is ending) and is joined (bounded) before exit.
 //! - **Main loop** — each tick: `terminal.draw(render)` (the P3-23
 //!   three-zone dashboard over the shared state) +
 //!   `events::poll_event(250 ms)` → the frozen `key_to_action` table
@@ -60,9 +73,13 @@
 //!   thread (one fast RPC), `[S]`napshot writes the dashboard text (the
 //!   client's pure `render`, P3-19) to a timestamped file in the CWD and
 //!   records the path in `daemon_status` (transient — the next poll
-//!   overwrites it), `[b]` / `[m]` send a `TuiBenchCmd` into the
-//!   updater's bench channel (TUI-19 — the run itself streams on the
-//!   updater thread; the send is skipped while a run is in flight),
+//!   overwrites it), `[b]` / `[m]` / `[x]` send a `TuiBenchCmd`
+//!   into the updater's bench channel (TUI-19/20 — the run itself
+//!   streams on the updater thread; the send is skipped while any
+//!   run — a normal bench or a burn-in — is in flight, the
+//!   compound single-flight guard), `[C]`ancel sets the shared
+//!   cancel flag (no I/O on the key — the in-flight run's worker
+//!   sends the `CancelBenchmark` on its own connection),
 //!   `[Q]`uit breaks the loop.
 //!
 //! **No-panic contract (plan D5):** errors never end the TUI — a daemon
@@ -113,7 +130,7 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use ramsleuth_bench::{BenchOp, StreamTarget, Tier};
+use ramsleuth_bench::{BenchOp, BurnInTick, StreamTarget, Tier};
 use ramsleuth_client::Client;
 use ramsleuth_protocol::{BenchMode, Request, Response, DEFAULT_SOCKET_PATH};
 use ramsleuth_tui::events;
@@ -240,8 +257,8 @@ where
 /// updater (the TUI-local mirror of the GUI `update.rs` `BenchCmd`):
 /// the cell target + the scope + the run-class discriminator —
 /// `None` = a normal single-pass benchmark ([`run_bench`]);
-/// `Some(n)` = a burn-in with a duration of `n` minutes (its
-/// `run_burn_in` worker lands in TUI-20).
+/// `Some(n)` = a burn-in with a duration of `n` minutes
+/// ([`run_burn_in`]).
 #[derive(Debug, Clone, Copy)]
 struct TuiBenchCmd {
     /// Which cells run (`Full` / one `Tier` / one `Cell`).
@@ -399,6 +416,18 @@ fn latest_memory_read_bw(bench: &BenchState) -> f64 {
     0.0
 }
 
+/// The compound single-flight guard for the run keys (TUI-20):
+/// true while **any** run class is in flight — a normal bench
+/// (`running`) or a burn-in (`burn_in.running`). The two classes
+/// never touch each other's flag (the GUI invariant: they share
+/// only the `run_id` + the cancel flag), so the `[b]` / `[m]` /
+/// `[x]` send-skip must consider both — the daemon is
+/// single-flight (a second start gets its structured `Error`), and
+/// the guard keeps the skip UX-side (TUI-22 adds the status note).
+fn run_in_flight(bench: &BenchState) -> bool {
+    bench.running || bench.burn_in.running
+}
+
 /// One benchmark run (TUI-19 — the GUI `update.rs` `run_bench`
 /// mirror): connect to the daemon at `socket`, send the
 /// `StartBenchmark` for `cmd`, and drain the reply stream — a
@@ -420,16 +449,17 @@ fn latest_memory_read_bw(bench: &BenchState) -> f64 {
 /// no-panic contract, as in [`poll_once`]) — the updater loop must
 /// survive every failure.
 ///
-/// **Cancel (TUI-20):** `cancel` is the shared flag the Cancel key
-/// sets (wired in TUI-20, along with the `CancelBenchmark` send on
-/// the run's own connection — a pre-ack cancel only sets the flag).
-/// It is reset to `false` at the start of every run (a stale cancel
-/// never kills a new one) and checked before each `recv()`: once
-/// set, the run is stopped daemon-side with a best-effort
-/// `CancelBenchmark` for the current `run_id` (only once the
-/// `BenchStarted` ack has landed — the daemon's reply is never read)
-/// and the loop breaks with `running = false` (the clean stop, plan
-/// D6: the in-flight pass finishes, the run ends at the next gate).
+/// **Cancel (the `[C]` key, TUI-20):** `cancel` is the shared flag
+/// the Cancel key sets from the main thread — the
+/// `CancelBenchmark` itself goes out on the run's own connection
+/// (a pre-ack cancel only sets the flag). It is reset to `false`
+/// at the start of every run (a stale cancel never kills a new
+/// one) and checked before each `recv()`: once set, the run is
+/// stopped daemon-side with a best-effort `CancelBenchmark` for
+/// the current `run_id` (only once the `BenchStarted` ack has
+/// landed — the daemon's reply is never read) and the loop breaks
+/// with `running = false` (the clean stop, plan D6: the in-flight
+/// pass finishes, the run ends at the next gate).
 fn run_bench(
     socket: &Path,
     cmd: TuiBenchCmd,
@@ -557,6 +587,237 @@ fn run_bench(
     Ok(())
 }
 
+/// One burn-in run (TUI-20 — the GUI `update.rs` `run_burn_in`
+/// mirror): connect to the daemon at `socket`, send the
+/// `StartBurnIn` for `cmd`, and drain the reply stream — a
+/// `BenchStarted` ack, the `BurnInProgress` ticks, and exactly one
+/// terminal — into `state.bench` (the `burn_in` state + the
+/// terminal grid).
+///
+/// Testable, no thread: it takes the shared `&RwLock<AppState>` and
+/// locks it only briefly, per mutation — the guard is always
+/// released before the next stream `recv()` (C14-03: the render
+/// thread's reads never park across the drain, so the dashboard
+/// stays responsive during a long soak). The run starts with
+/// `burn_in.running = true`, a fresh zero `latest` grid + zeroed
+/// iteration / elapsed (a stale run's values never mix into a new
+/// one), and a stale `run_id` dropped (the new run's id arrives
+/// with the `BenchStarted` ack); each tick updates the newest
+/// iteration / elapsed and writes its cell / latency into `latest`
+/// (the newest value per cell wins — the bench zone's `live_grid`
+/// rule); the terminal frame (`BenchResult` → also the terminal
+/// grid, `BenchCancelled`, or the daemon's `Error`) sets
+/// `burn_in.running = false`. The run never touches
+/// `BenchState::running` / `progress` (those are the normal-bench
+/// state; the two run classes share only the `run_id` + the cancel
+/// flag, the GUI invariant).
+///
+/// **Cancel (the `[C]` key, TUI-20):** the shared `cancel` flag is
+/// reset to `false` at the start of every run (a stale cancel never
+/// kills a new one) and checked before each `recv()`: once set, the
+/// run is stopped daemon-side with a best-effort
+/// `CancelBenchmark` for the current `run_id` (only once the
+/// `BenchStarted` ack has landed — a pre-ack cancel only sets the
+/// flag; the daemon's reply is never read) and the loop breaks with
+/// `burn_in.running = false` (the clean stop, plan D6: the
+/// in-flight pass finishes, the run ends at the next gate).
+///
+/// A contract-violating frame (a `BenchProgress` or `Telemetry`
+/// frame in this stream) or a transport failure (a closed stream,
+/// a timeout, …) records `state.error` and ends the run the same
+/// way. Always returns `Ok(())` (the no-panic contract, as in
+/// [`run_bench`]) — the updater loop must survive every failure.
+fn run_burn_in(
+    socket: &Path,
+    cmd: TuiBenchCmd,
+    state: &RwLock<AppState>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    // The shared cancel flag is reset per run: a stale `true` from a
+    // cancelled run must not abort this one before its first frame.
+    cancel.store(false, Ordering::Relaxed);
+    let mut client = match Client::connect(socket) {
+        Ok(client) => client,
+        Err(error) => {
+            // A brief per-mutation lock scope (C14-03) — never held
+            // across the stream drain.
+            let mut s = state.write().unwrap();
+            s.bench.burn_in.running = false;
+            s.error = Some(error.to_string());
+            return Ok(());
+        }
+    };
+    // The stream read timeout (C7-16): the client's 5 s default
+    // would kill a long soak's frame gap mid-stream (the 120 s CLI
+    // precedent).
+    if let Err(error) = client.set_read_timeout(BENCH_READ_TIMEOUT) {
+        let mut s = state.write().unwrap();
+        s.bench.burn_in.running = false;
+        s.error = Some(error.to_string());
+        return Ok(());
+    }
+    {
+        // A fresh run starts from the idle burn-in state: a stale
+        // run's tick bookkeeping (iteration / elapsed / `latest`)
+        // never mixes into a new one — one brief scope.
+        let mut s = state.write().unwrap();
+        s.bench.burn_in = ramsleuth_tui::ui::BurnInState::default();
+        s.bench.burn_in.running = true;
+        // The new run's id arrives with the `BenchStarted` ack.
+        s.bench.run_id = None;
+    }
+    // The updater dispatches `duration_minutes.is_some()` to this
+    // path; a `None` cmd reaching it is a dispatch contract
+    // violation (never a normal-bench run): record it and stop —
+    // no panic (D5).
+    let Some(duration_minutes) = cmd.duration_minutes else {
+        let mut s = state.write().unwrap();
+        s.bench.burn_in.running = false;
+        s.error =
+            Some("burn-in command without a duration_minutes discriminator".to_owned());
+        return Ok(());
+    };
+    if let Err(error) = client.send(&Request::StartBurnIn {
+        target: cmd.target,
+        duration_minutes,
+    }) {
+        let mut s = state.write().unwrap();
+        s.bench.burn_in.running = false;
+        s.error = Some(error.to_string());
+        return Ok(());
+    }
+    loop {
+        // The `[C]` key set the shared flag: ask the daemon for a
+        // clean stop (best-effort — the reply is never read) and
+        // break before the next frame. A pre-ack cancel (no
+        // `run_id` yet) only sets the flag: the run ends at this
+        // gate with no request sent.
+        if cancel.load(Ordering::Relaxed) {
+            // The run id is read under a brief scope; the
+            // `CancelBenchmark` itself goes out with no lock held.
+            let run_id = state.read().unwrap().bench.run_id;
+            if let Some(run_id) = run_id {
+                let _ = client.send(&Request::CancelBenchmark { run_id });
+            }
+            state.write().unwrap().bench.burn_in.running = false;
+            break;
+        }
+        match client.recv() {
+            Ok(Response::BenchStarted { run_id }) => {
+                // The shared run id lands (the `[C]` key addresses
+                // the run with it) — a brief scope.
+                state.write().unwrap().bench.run_id = Some(run_id);
+            }
+            Ok(Response::BurnInProgress(tick)) => {
+                // The tick's bookkeeping lands in the burn-in state
+                // under one brief write scope: the newest iteration /
+                // elapsed, and its cell / latency written into
+                // `latest` (the newest value per cell wins — the
+                // bench zone's `live_grid` rule; a non-finite /
+                // non-positive reading never renders as data).
+                let BurnInTick {
+                    iteration,
+                    elapsed_secs,
+                    tier,
+                    bandwidth,
+                    latency_ns,
+                } = tick;
+                let mut s = state.write().unwrap();
+                s.bench.burn_in.iteration = iteration;
+                s.bench.burn_in.elapsed_secs = elapsed_secs;
+                let slot = tier as usize;
+                match (bandwidth, latency_ns) {
+                    (Some((op, value)), _) => {
+                        if value.is_finite() && value > 0.0 {
+                            match op {
+                                BenchOp::Read => {
+                                    s.bench.burn_in.latest.read_gbps[slot] = value;
+                                }
+                                BenchOp::Write => {
+                                    s.bench.burn_in.latest.write_gbps[slot] = value;
+                                }
+                                BenchOp::Copy => {
+                                    s.bench.burn_in.latest.copy_gbps[slot] = value;
+                                }
+                            }
+                        }
+                    }
+                    (None, Some(ns)) => {
+                        if ns.is_finite() && ns > 0.0 {
+                            s.bench.burn_in.latest.latency_ns[slot] = ns;
+                        }
+                    }
+                    (None, None) => {
+                        // A tick with neither a cell nor a latency is
+                        // off-contract (exactly one of the two is
+                        // `Some`, the `BurnInTick` contract): stop
+                        // the run and record it.
+                        s.error =
+                            Some("burn-in tick carried neither a cell nor a latency".to_owned());
+                        s.bench.burn_in.running = false;
+                        break;
+                    }
+                }
+            }
+            Ok(Response::BenchProgress(_)) => {
+                // A normal-bench progress frame in a burn-in stream
+                // violates the wire contract (`BenchProgress`
+                // streams only on the owning `StartBenchmark`
+                // connection, D-1/D-2): record the structured
+                // error and stop the run — the permanent mirror of
+                // `run_bench`'s `BurnInProgress` contract guard.
+                let mut s = state.write().unwrap();
+                s.error = Some("unexpected benchmark frame during burn-in".to_owned());
+                s.bench.burn_in.running = false;
+                break;
+            }
+            Ok(Response::BenchResult { grid, .. }) => {
+                // The terminal grid is the last completed pass: it
+                // lands in the shared terminal grid (the zone-2
+                // table + the later F3 export pick it up for free)
+                // + the clean stop in one brief scope.
+                let mut s = state.write().unwrap();
+                s.bench.grid = Some(grid);
+                s.bench.burn_in.running = false;
+                break;
+            }
+            Ok(Response::BenchCancelled { .. }) => {
+                // The clean-stop ack (the run ended at its cancel
+                // gate) — a brief scope.
+                state.write().unwrap().bench.burn_in.running = false;
+                break;
+            }
+            Ok(Response::Error(message)) => {
+                // A structured daemon reply — including the
+                // single-flight `Error` for a second start while a
+                // run is in flight (P3-15/D-6): record + end, never
+                // a panic (D5).
+                let mut s = state.write().unwrap();
+                s.error = Some(message);
+                s.bench.burn_in.running = false;
+                break;
+            }
+            Ok(Response::Telemetry(_)) => {
+                // A telemetry frame in the burn-in stream violates
+                // the wire contract (`GetTelemetry` is served on its
+                // own connection, P3-16): stop the run and record
+                // it.
+                let mut s = state.write().unwrap();
+                s.error = Some("unexpected response during burn-in".to_owned());
+                s.bench.burn_in.running = false;
+                break;
+            }
+            Err(error) => {
+                let mut s = state.write().unwrap();
+                s.error = Some(error.to_string());
+                s.bench.burn_in.running = false;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A `Drop` guard around the initialized terminal.
 ///
 /// Owns the `Terminal<CrosstermBackend>` after raw mode + the alternate
@@ -625,13 +886,19 @@ impl Drop for TerminalGuard {
 /// off and the daemon steadily up, the probe connect is dropped without
 /// a fetch — the snapshot stays frozen (the `…s ago` stamp advances).
 ///
-/// TUI-19: the loop first services at most one bench command from
-/// `bench_rx` per tick (a queued command takes priority over this
-/// tick's telemetry step, and a run streams to its terminal before the
-/// next poll — the GUI poller's exact structure; telemetry polling
-/// pauses for the run's duration; runs are single-flight daemon-side
-/// anyway, P3-15), handing the shared `cancel` flag to [`run_bench`]
-/// (each run resets it and checks it between frames).
+/// TUI-19/20: the loop first services at most one bench command
+/// from `bench_rx` per tick (a queued command takes priority over
+/// this tick's telemetry step, and a run streams to its terminal
+/// before the next poll — the GUI poller's exact structure;
+/// telemetry polling pauses for the run's duration; runs are
+/// single-flight daemon-side anyway, P3-15), dispatching on the
+/// cmd's `duration_minutes` discriminator to [`run_bench`] (a
+/// normal run) or [`run_burn_in`] (a burn-in), and handing the
+/// shared `cancel` flag to the run (each run resets it and checks
+/// it between frames; once set by the `[C]` key, the run stops
+/// daemon-side with a best-effort `CancelBenchmark` on its own
+/// connection — sent only after the `BenchStarted` ack has landed;
+/// a pre-ack cancel only sets the flag).
 ///
 /// The thread runs until `stop` is set (quit) or the bench command
 /// channel disconnects (the sender dropped — the session is ending):
@@ -676,19 +943,19 @@ fn spawn_updater(
             // the run's duration).
             match bench_rx.try_recv() {
                 Ok(cmd) => {
+                    // The run-class dispatch (the GUI C7-16 rule):
+                    // the cmd's `duration_minutes` is the
+                    // discriminator — `Some` routes to
+                    // `run_burn_in` (a burn-in), `None` to
+                    // `run_bench` (a normal run); both lock `state`
+                    // only briefly, per mutation — never across
+                    // their stream drain (C14-03: the render
+                    // thread's reads stay responsive for the whole
+                    // run), and both take the shared `cancel` flag
+                    // (reset per run, checked between frames).
                     if cmd.duration_minutes.is_some() {
-                        // TUI-20: the burn-in worker — not wired until
-                        // that chunk; a burn-in command landing before
-                        // it is recorded, never a panic (D5) (the key
-                        // that sends one — `[x]` — lands with
-                        // TUI-20/22).
-                        state.write().unwrap().error =
-                            Some("burn-in is not available in this build".to_owned());
+                        let _ = run_burn_in(&socket, cmd, &state, &cancel);
                     } else {
-                        // A normal run: `run_bench` locks `state` only
-                        // briefly, per mutation — never across its
-                        // stream drain (C14-03: the render thread's
-                        // reads stay responsive for the whole run).
                         let _ = run_bench(&socket, cmd, &state, &cancel);
                     }
                 }
@@ -830,9 +1097,11 @@ fn run(args: TuiArgs) -> ExitCode {
     // The sender's binding lives for the whole session — dropping it
     // would disconnect the updater's receiver (and end its loop).
     let (bench_tx, bench_rx) = mpsc::channel();
-    // The shared cancel flag (TUI-19/20): each run resets it and
-    // checks it between frames; the `[C]` key's wiring lands in
-    // TUI-20.
+    // The shared cancel flag (TUI-19/20): each run (a normal
+    // bench or a burn-in) resets it at its start and checks it
+    // between frames; the `[C]` key sets it (the run's worker then
+    // sends the `CancelBenchmark` on its own connection — the key
+    // does no I/O).
     let cancel = Arc::new(AtomicBool::new(false));
 
     let updater = spawn_updater(
@@ -879,13 +1148,18 @@ fn run(args: TuiArgs) -> ExitCode {
                         // command goes to the updater (a channel send,
                         // no I/O — the key handler's one permitted
                         // main-thread mutation). The send is skipped
-                        // while a run is in flight (the GUI
-                        // single-flight UX; the daemon would answer a
+                        // while any run — a normal bench or a burn-in
+                        // — is in flight (the compound single-flight
+                        // guard, TUI-20; the daemon would answer a
                         // second start with its structured `Error`
                         // anyway — TUI-22 refines the skip with a
                         // status note).
                         Action::BenchFull => {
-                            if !state.read().unwrap().bench.running {
+                            let in_flight = {
+                                let s = state.read().unwrap();
+                                run_in_flight(&s.bench)
+                            };
+                            if !in_flight {
                                 let _ = bench_tx.send(TuiBenchCmd {
                                     target: StreamTarget::Full,
                                     mode: BenchMode::Full,
@@ -894,9 +1168,13 @@ fn run(args: TuiArgs) -> ExitCode {
                             }
                         }
                         // `[m]`: a memory-only benchmark run (TUI-19) —
-                        // the single-flight skip as above.
+                        // the compound single-flight skip as above.
                         Action::BenchMemory => {
-                            if !state.read().unwrap().bench.running {
+                            let in_flight = {
+                                let s = state.read().unwrap();
+                                run_in_flight(&s.bench)
+                            };
+                            if !in_flight {
                                 let _ = bench_tx.send(TuiBenchCmd {
                                     target: StreamTarget::Full,
                                     mode: BenchMode::MemoryOnly,
@@ -904,13 +1182,44 @@ fn run(args: TuiArgs) -> ExitCode {
                                 });
                             }
                         }
-                        // TUI-20: wire the burn-in + cancel class;
+                        // `[x]`: a 5-minute burn-in soak (TUI-20 —
+                        // the GUI default duration, plan §5.6:
+                        // `0` = infinite is not reachable from a
+                        // key): the command goes to the updater (a
+                        // channel send, no I/O); the run streams on
+                        // the updater thread. The compound
+                        // single-flight skip as above.
+                        Action::BurnIn => {
+                            let in_flight = {
+                                let s = state.read().unwrap();
+                                run_in_flight(&s.bench)
+                            };
+                            if !in_flight {
+                                let _ = bench_tx.send(TuiBenchCmd {
+                                    target: StreamTarget::Full,
+                                    mode: BenchMode::Full,
+                                    duration_minutes: Some(5),
+                                });
+                            }
+                        }
+                        // `[C]`: set the shared cancel flag (TUI-20):
+                        // the in-flight run's worker (either class)
+                        // checks it between frames and stops the run
+                        // daemon-side with a best-effort
+                        // `CancelBenchmark` on its own connection
+                        // (sent only once the `BenchStarted` ack has
+                        // landed — a pre-ack cancel only sets the
+                        // flag). The key does no I/O — the one
+                        // permitted main-thread mutation.
+                        Action::Cancel => {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
                         // TUI-22: wire the view class
-                        Action::BurnIn | Action::Cancel | Action::ToggleGraphs
-                            | Action::ToggleSettings | Action::ToggleRequirements
-                            | Action::ExportJson | Action::CyclePoll
-                            | Action::ToggleCapacity | Action::ToggleClock
-                            | Action::ToggleRefresh | Action::CycleWindow => {}
+                        Action::ToggleGraphs | Action::ToggleSettings
+                            | Action::ToggleRequirements | Action::ExportJson
+                            | Action::CyclePoll | Action::ToggleCapacity
+                            | Action::ToggleClock | Action::ToggleRefresh
+                            | Action::CycleWindow => {}
                     }
                 }
             }
@@ -2190,5 +2499,621 @@ mod tests {
             );
             assert!(s.error.is_none(), "a clean run must not record an error");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // TUI-20: the burn-in worker — `run_burn_in` against an in-process
+    // daemon stand-in (the GUI `update.rs` C7-16 stand-in suite,
+    // adapted to the TUI state / command types), the `[C]` / `[x]`
+    // key wiring, and the compound single-flight guard.
+    // ------------------------------------------------------------------
+
+    /// (u) `run_burn_in` against a stand-in (a `StartBurnIn` answered
+    /// with `BenchStarted` + `BurnInProgress` ticks — one bandwidth
+    /// kind and one latency kind — + the terminal `BenchResult`)
+    /// consumes the stream into `state.bench`: the request rides the
+    /// wire with the cmd's target / duration, the `BenchStarted`
+    /// ack's `run_id` is recorded, each tick updates `burn_in` (the
+    /// newest `iteration` / `elapsed_secs`, and the `latest` grid —
+    /// the newest value per cell wins, the `live_grid` rule), and
+    /// the terminal lands its grid in `state.bench.grid` + clears
+    /// `burn_in.running` — with no transport error, a stale pre-run
+    /// burn-in state reset at run start, and the normal-bench
+    /// `running` flag / `progress` untouched (the two run classes
+    /// share only the `run_id` + the cancel flag).
+    #[test]
+    fn run_burn_in_streams_ticks_and_the_terminal_grid() {
+        let sock = TempSocket::new("burnin");
+        let grid = BenchmarkGrid {
+            read_gbps: [51.2, 901.4, 612.7, 240.3],
+            write_gbps: [47.8, 870.2, 590.1, 221.9],
+            copy_gbps: [28.4, 455.6, 310.8, 130.4],
+            latency_ns: [91.2, 1.3, 3.9, 14.1],
+        };
+        let expected_grid = grid.clone();
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
+                    assert_eq!(
+                        target,
+                        StreamTarget::Full,
+                        "the cmd's target must ride the wire"
+                    );
+                    assert_eq!(duration_minutes, 5, "the cmd's duration must ride the wire");
+                }
+                other => panic!("stand-in expected StartBurnIn, got {other:?}"),
+            }
+            for response in [
+                Response::BenchStarted { run_id: 9 },
+                Response::BurnInProgress(BurnInTick {
+                    iteration: 1,
+                    elapsed_secs: 1.5,
+                    tier: Tier::Memory,
+                    bandwidth: Some((BenchOp::Read, 50.0)),
+                    latency_ns: None,
+                }),
+                Response::BurnInProgress(BurnInTick {
+                    iteration: 1,
+                    elapsed_secs: 2.0,
+                    tier: Tier::L1,
+                    bandwidth: None,
+                    latency_ns: Some(1.2),
+                }),
+                // A later tick over the same cell: the newest value
+                // wins in `latest` (the `live_grid` rule).
+                Response::BurnInProgress(BurnInTick {
+                    iteration: 2,
+                    elapsed_secs: 3.5,
+                    tier: Tier::Memory,
+                    bandwidth: Some((BenchOp::Read, 52.5)),
+                    latency_ns: None,
+                }),
+                Response::BenchResult { run_id: 9, grid },
+            ] {
+                let bytes = encode_frame(&Message::Response(response)).expect("must encode");
+                stream.write_all(&bytes).expect("stand-in write must not fail");
+            }
+        });
+
+        let cmd = TuiBenchCmd {
+            target: StreamTarget::Full,
+            mode: BenchMode::Full,
+            duration_minutes: Some(5),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut state = AppState::default();
+        // A stale pre-run burn-in state must be reset at run start
+        // (iteration / elapsed / `latest`).
+        state.bench.burn_in.running = true;
+        state.bench.burn_in.iteration = 7;
+        state.bench.burn_in.elapsed_secs = 99.0;
+        state.bench.burn_in.latest.read_gbps[0] = 7.0;
+        // A stale pre-run id must be dropped at run start.
+        state.bench.run_id = Some(99);
+        // The normal-bench flag / progress must stay untouched by a
+        // burn-in run.
+        state.bench.running = true;
+        state.bench.progress.push(StreamProgress {
+            cell_index: 9,
+            total_cells: 12,
+            tier: Tier::L3,
+            op: BenchOp::Copy,
+            value: 1.0,
+            label: "stale".to_owned(),
+        });
+        let state = Arc::new(RwLock::new(state));
+        run_burn_in(sock.path(), cmd, &state, &cancel).expect("run_burn_in must not error");
+
+        let state = state.read().expect("the updater must not poison the lock");
+        assert!(!state.bench.burn_in.running, "the terminal must clear burn_in.running");
+        assert!(
+            state.bench.running,
+            "a burn-in run must not touch the normal-bench running flag"
+        );
+        assert_eq!(
+            state.bench.progress,
+            vec![StreamProgress {
+                cell_index: 9,
+                total_cells: 12,
+                tier: Tier::L3,
+                op: BenchOp::Copy,
+                value: 1.0,
+                label: "stale".to_owned(),
+            }],
+            "a burn-in run must not touch the normal-bench progress"
+        );
+        assert_eq!(state.bench.run_id, Some(9), "the ack's run_id must be recorded");
+        assert_eq!(state.bench.burn_in.iteration, 2, "the newest tick's iteration");
+        assert_eq!(state.bench.burn_in.elapsed_secs, 3.5, "the newest tick's elapsed");
+        assert_eq!(
+            state.bench.burn_in.latest.read_gbps[0],
+            52.5,
+            "the newest value per cell wins (the stale 7.0 is reset)"
+        );
+        assert_eq!(
+            state.bench.burn_in.latest.latency_ns[1],
+            1.2,
+            "the latency tick lands in the tier's latency cell (L1 = slot 1)"
+        );
+        assert_eq!(
+            state.bench.burn_in.latest.write_gbps,
+            [0.0; 4],
+            "an unticked column stays zero"
+        );
+        assert_eq!(
+            state.bench.burn_in.latest.copy_gbps,
+            [0.0; 4],
+            "an unticked column stays zero"
+        );
+        assert_eq!(
+            state.bench.grid,
+            Some(expected_grid),
+            "the terminal grid must land in the state"
+        );
+        assert!(state.error.is_none(), "a clean run must not record an error");
+        stand_in.join();
+    }
+
+    /// (v) CANCEL post-ack (the `[C]` key's shared flag, TUI-20 —
+    /// the GUI C7-16 (k2) mirror): after the burn-in's
+    /// `BenchStarted` ack lands in the state, the shared `cancel`
+    /// flag is set — `run_burn_in` ends the run with
+    /// `burn_in.running = false` (sending the daemon a best-effort
+    /// `CancelBenchmark` for the recorded run id — the stand-in
+    /// drains it) — no hang, no panic, no error recorded.
+    #[test]
+    fn run_burn_in_cancel_flag_stops_the_run() {
+        let sock = TempSocket::new("burnin-cancel");
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
+                    assert_eq!(target, StreamTarget::Full, "the cmd's target must ride the wire");
+                    assert_eq!(
+                        duration_minutes,
+                        0,
+                        "the infinite (0) duration must ride the wire"
+                    );
+                }
+                other => panic!("stand-in expected StartBurnIn, got {other:?}"),
+            }
+            let started =
+                encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
+                    .expect("must encode");
+            stream.write_all(&started).expect("stand-in write must not fail");
+            // Mimic the daemon: end the run after a beat — the worker
+            // either sees the cancel flag before the terminal frame
+            // (sends a `CancelBenchmark` and breaks) or receives the
+            // terminal `BenchCancelled` while blocked in `recv`.
+            thread::sleep(Duration::from_millis(200));
+            let _ = stream.write_all(
+                &encode_frame(&Message::Response(Response::BenchCancelled { run_id: 42 }))
+                    .expect("must encode"),
+            );
+            let _ = read_one_message(&mut stream); // drain the cancel (best-effort)
+        });
+
+        let socket = sock.path().to_path_buf();
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let state = Arc::clone(&state);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                let cmd = TuiBenchCmd {
+                    target: StreamTarget::Full,
+                    mode: BenchMode::Full,
+                    duration_minutes: Some(0),
+                };
+                // The function locks the shared state only per
+                // mutation — never across the stream drain (C14-03).
+                run_burn_in(&socket, cmd, &state, &cancel)
+                    .expect("run_burn_in must not error");
+            })
+        };
+
+        // Wait for the run to start (the ack's run_id lands in the
+        // state), then set the shared cancel flag.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if state.read().expect("the updater must not poison the lock").bench.run_id.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the run never started (no BenchStarted within 5 s)"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        cancel.store(true, Ordering::Relaxed);
+        worker.join().expect("run_burn_in must return on cancel (no hang)");
+
+        let state = state.read().expect("the updater must not poison the lock");
+        assert!(!state.bench.burn_in.running, "the cancel must clear burn_in.running");
+        assert_eq!(state.bench.run_id, Some(42), "the run id must stay recorded");
+        assert!(state.error.is_none(), "a clean cancel must not record an error");
+        stand_in.join();
+    }
+
+    /// (w) CANCEL pre-ack (TUI-20 — the plan's "a pre-ack cancel
+    /// only sets the flag"): the shared `cancel` flag is set before
+    /// the `BenchStarted` ack has landed (`run_id` is still `None`)
+    /// — `run_burn_in` ends the run at its cancel gate with
+    /// `burn_in.running = false` and **no** `CancelBenchmark` sent
+    /// (the stand-in observes only the stream's EOF, no request),
+    /// no error recorded.
+    #[test]
+    fn run_burn_in_pre_ack_cancel_sends_no_request() {
+        let sock = TempSocket::new("burnin-preack-cancel");
+        let seen_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stand_in = {
+            let cancel = Arc::clone(&cancel);
+            let seen_cancel = Arc::clone(&seen_cancel);
+            DaemonStandIn::spawn(&sock, move |mut stream| {
+                match read_one_message(&mut stream) {
+                    Some(Message::Request(Request::StartBurnIn { .. })) => {}
+                    other => panic!("stand-in expected StartBurnIn, got {other:?}"),
+                }
+                // The worker is blocked in `recv()` with no ack
+                // sent: wait for the pre-ack cancel flag, then push
+                // one tick so the worker's loop returns to its
+                // cancel gate (the `run_id` is still `None` — the
+                // break must send no request). The write is
+                // best-effort: if the worker breaks before reading
+                // it (the flag was set before its first gate check),
+                // the client is already dropped — the drain below
+                // sees the EOF either way.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !cancel.load(Ordering::Relaxed) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the cancel flag was never set"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let tick = encode_frame(&Message::Response(Response::BurnInProgress(BurnInTick {
+                    iteration: 1,
+                    elapsed_secs: 0.1,
+                    tier: Tier::Memory,
+                    bandwidth: Some((BenchOp::Read, 5.0)),
+                    latency_ns: None,
+                })))
+                .expect("must encode");
+                let _ = stream.write_all(&tick);
+                // Drain the rest of the stream: a pre-ack cancel
+                // must send no `CancelBenchmark`, so the only
+                // thing left is the client drop's EOF.
+                loop {
+                    match read_one_message(&mut stream) {
+                        Some(Message::Request(Request::CancelBenchmark { .. })) => {
+                            seen_cancel.store(true, Ordering::Relaxed);
+                        }
+                        Some(other) => panic!("stand-in saw an unexpected frame: {other:?}"),
+                        None => break, // the client dropped
+                    }
+                }
+            })
+        };
+
+        let socket = sock.path().to_path_buf();
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let worker = {
+            let state = Arc::clone(&state);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                let cmd = TuiBenchCmd {
+                    target: StreamTarget::Full,
+                    mode: BenchMode::Full,
+                    duration_minutes: Some(0),
+                };
+                run_burn_in(&socket, cmd, &state, &cancel)
+                    .expect("run_burn_in must not error");
+            })
+        };
+
+        // Wait for the run to start (its start-scope sets
+        // `burn_in.running` before the `StartBurnIn` send — the ack
+        // has not landed), then set the shared cancel flag.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if state
+                .read()
+                .expect("the updater must not poison the lock")
+                .bench
+                .burn_in
+                .running
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the run never started within 5 s"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        cancel.store(true, Ordering::Relaxed);
+        worker.join().expect("run_burn_in must return on the pre-ack cancel (no hang)");
+        stand_in.join();
+
+        assert!(
+            !seen_cancel.load(Ordering::Relaxed),
+            "a pre-ack cancel must send no CancelBenchmark (no run id yet)"
+        );
+        let state = state.read().expect("the updater must not poison the lock");
+        assert!(!state.bench.burn_in.running, "the cancel must clear burn_in.running");
+        assert_eq!(state.bench.run_id, None, "the ack never landed — no run id");
+        assert!(state.error.is_none(), "a clean cancel must not record an error");
+    }
+
+    /// (x) A `BenchProgress` frame in a burn-in stream violates the
+    /// wire contract (normal-bench progress streams only on the
+    /// owning `StartBenchmark` connection, D-1/D-2): `run_burn_in`
+    /// records the structured error and ends the run with
+    /// `burn_in.running = false` — the permanent mirror of
+    /// `run_bench`'s `BurnInProgress` guard.
+    #[test]
+    fn run_burn_in_rejects_a_bench_progress_frame() {
+        let sock = TempSocket::new("burnin-contract");
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::StartBurnIn { .. })) => {}
+                other => panic!("stand-in expected StartBurnIn, got {other:?}"),
+            }
+            let started =
+                encode_frame(&Message::Response(Response::BenchStarted { run_id: 3 }))
+                    .expect("must encode");
+            stream.write_all(&started).expect("stand-in write must not fail");
+            let progress = encode_frame(&Message::Response(Response::BenchProgress(
+                StreamProgress {
+                    cell_index: 0,
+                    total_cells: 3,
+                    tier: Tier::Memory,
+                    op: BenchOp::Read,
+                    value: 26.35,
+                    label: "Memory · Read (GB/s)".to_owned(),
+                },
+            )))
+            .expect("must encode");
+            stream.write_all(&progress).expect("stand-in write must not fail");
+        });
+
+        let cmd = TuiBenchCmd {
+            target: StreamTarget::Full,
+            mode: BenchMode::Full,
+            duration_minutes: Some(2),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(RwLock::new(AppState::default()));
+        run_burn_in(sock.path(), cmd, &state, &cancel).expect("run_burn_in must not error");
+
+        let state = state.read().expect("the updater must not poison the lock");
+        assert!(!state.bench.burn_in.running, "the violation must clear burn_in.running");
+        let error = state.error.as_ref().expect("the violation must record a structured error");
+        assert!(
+            error.contains("unexpected benchmark frame during burn-in"),
+            "the error must name the violation, got: {error}"
+        );
+        stand_in.join();
+    }
+
+    /// (y) `run_burn_in` against a **non-existent** socket records
+    /// the friendly `DaemonDown` text, leaves `burn_in.running =
+    /// false`, and never panics (the no-panic contract, D5) — the
+    /// run's connect failure is a transport failure reported
+    /// through the state.
+    #[test]
+    fn run_burn_in_missing_socket_is_friendly() {
+        let sock = TempSocket::new("burnin-missing");
+        let cmd = TuiBenchCmd {
+            target: StreamTarget::Full,
+            mode: BenchMode::Full,
+            duration_minutes: Some(5),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(RwLock::new(AppState::default()));
+        run_burn_in(sock.path(), cmd, &state, &cancel).expect("run_burn_in must not error");
+
+        let state = state.read().expect("the updater must not poison the lock");
+        assert!(!state.bench.burn_in.running, "a failed connect must not leave a burn-in in flight");
+        assert_eq!(
+            state.bench.burn_in.latest,
+            BenchmarkGrid {
+                read_gbps: [0.0; 4],
+                write_gbps: [0.0; 4],
+                copy_gbps: [0.0; 4],
+                latency_ns: [0.0; 4],
+            },
+            "no tick landed — the latest grid stays zero"
+        );
+        let error = state.error.clone().expect("a friendly error must be recorded");
+        assert!(
+            error.contains("daemon not running"),
+            "the error must carry the DaemonDown hint, got: {error}"
+        );
+    }
+
+    /// (z) The compound single-flight guard (TUI-20): true while
+    /// **any** run class is in flight — a normal bench only, a
+    /// burn-in only, both, and false when neither (the `[b]` /
+    /// `[m]` / `[x]` send-skip must consider both classes, since
+    /// they never touch each other's flag).
+    #[test]
+    fn run_in_flight_tracks_both_run_classes() {
+        assert!(!run_in_flight(&BenchState::default()), "idle: no run in flight");
+        let bench = BenchState { running: true, ..Default::default() };
+        assert!(run_in_flight(&bench), "a normal bench in flight");
+        let burn = BenchState {
+            burn_in: ramsleuth_tui::ui::BurnInState { running: true, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(run_in_flight(&burn), "a burn-in in flight");
+        let both = BenchState {
+            running: true,
+            burn_in: ramsleuth_tui::ui::BurnInState { running: true, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(run_in_flight(&both), "both classes in flight");
+    }
+
+    /// (aa) The updater's run-class dispatch (TUI-20 — the GUI
+    /// (k4) mirror, the TUI `spawn_updater` form): a default
+    /// (`duration_minutes = None`) cmd routes to `run_bench` (a
+    /// `StartBenchmark` on the wire) and a burn-in (`Some(7)`) cmd
+    /// routes to `run_burn_in` (a `StartBurnIn` on the wire — the
+    /// pre-TUI-20 placeholder recorded "not available in this
+    /// build" instead) — both runs stream to their terminal cleanly
+    /// (the one-shot baseline may interleave; the stand-in serves
+    /// every request arm it sees).
+    #[test]
+    fn spawn_updater_dispatches_burn_in_cmds_by_the_duration_discriminator() {
+        let sock = TempSocket::new("burnin-dispatch");
+        let stop = Arc::new(AtomicBool::new(false));
+        // Bit 0 = a `StartBenchmark` observed, bit 1 = a
+        // `StartBurnIn` observed.
+        let seen = Arc::new(AtomicUsize::new(0));
+        let listener = UnixListener::bind(sock.path()).expect("test socket must bind");
+        let stand_in = {
+            let stop = Arc::clone(&stop);
+            let seen = Arc::clone(&seen);
+            thread::spawn(move || {
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    if stop.load(Ordering::Relaxed) {
+                        break; // the waker (stop was set first)
+                    }
+                    match read_one_message(&mut stream) {
+                        Some(Message::Request(Request::StartBenchmark { .. })) => {
+                            seen.fetch_or(1, Ordering::Relaxed);
+                            let started = encode_frame(&Message::Response(
+                                Response::BenchStarted { run_id: 1 },
+                            ))
+                            .expect("must encode");
+                            stream.write_all(&started).expect("stand-in write must not fail");
+                            let result = encode_frame(&Message::Response(Response::BenchResult {
+                                run_id: 1,
+                                grid: BenchmarkGrid {
+                                    read_gbps: [1.0, 0.0, 0.0, 0.0],
+                                    write_gbps: [0.0; 4],
+                                    copy_gbps: [0.0; 4],
+                                    latency_ns: [0.0; 4],
+                                },
+                            }))
+                            .expect("must encode");
+                            stream.write_all(&result).expect("stand-in write must not fail");
+                        }
+                        Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
+                            assert_eq!(
+                                target,
+                                StreamTarget::Full,
+                                "the burn-in cmd's target must ride the wire"
+                            );
+                            assert_eq!(
+                                duration_minutes,
+                                7,
+                                "the burn-in cmd's duration must ride the wire"
+                            );
+                            seen.fetch_or(2, Ordering::Relaxed);
+                            let started = encode_frame(&Message::Response(
+                                Response::BenchStarted { run_id: 2 },
+                            ))
+                            .expect("must encode");
+                            stream.write_all(&started).expect("stand-in write must not fail");
+                            let cancelled = encode_frame(&Message::Response(
+                                Response::BenchCancelled { run_id: 2 },
+                            ))
+                            .expect("must encode");
+                            stream.write_all(&cancelled).expect("stand-in write must not fail");
+                        }
+                        Some(Message::Request(Request::GetTelemetry)) => {
+                            let bytes = encode_frame(&Message::Response(Response::Telemetry(
+                                mock_snapshot(),
+                            )))
+                            .expect("must encode");
+                            stream.write_all(&bytes).expect("stand-in write must not fail");
+                        }
+                        Some(other) => {
+                            panic!("stand-in saw an unexpected frame: {other:?}")
+                        }
+                        None => break, // the waker (an EOF before a frame)
+                    }
+                }
+            })
+        };
+
+        // Refresh explicitly off + the 100 ms clamp floor: only the
+        // dispatched runs + the one-shot baseline may fetch, and
+        // the 100 ms tick services the queued cmds promptly.
+        let mut app = AppState::default();
+        app.settings.refresh = false;
+        app.settings.poll_interval_ms = 100;
+        let state = Arc::new(RwLock::new(app));
+        let (bench_tx, bench_rx) = mpsc::channel::<TuiBenchCmd>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let updater = spawn_updater(
+            Arc::clone(&state),
+            Arc::clone(&stop),
+            sock.path().to_path_buf(),
+            bench_rx,
+            cancel,
+        );
+
+        // Phase A: the default (`duration_minutes = None`) cmd — the
+        // dispatch must route it to `run_bench` (a `StartBenchmark`
+        // on the wire).
+        bench_tx
+            .send(TuiBenchCmd {
+                target: StreamTarget::Full,
+                mode: BenchMode::Full,
+                duration_minutes: None,
+            })
+            .expect("the channel must accept the cmd");
+        // Phase B: the burn-in (`duration_minutes = Some(7)`) cmd —
+        // the dispatch must route it to `run_burn_in` (a
+        // `StartBurnIn` on the wire).
+        bench_tx
+            .send(TuiBenchCmd {
+                target: StreamTarget::Full,
+                mode: BenchMode::Full,
+                duration_minutes: Some(7),
+            })
+            .expect("the channel must accept the cmd");
+
+        // Wait until both request arms were observed (bounded by a 10
+        // s deadline: the test fails with the current bits instead of
+        // hanging).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let bits = seen.load(Ordering::Relaxed);
+            if bits == 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the dispatch never served both arms, saw {bits:#b}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Stop: drop the bench sender (the updater's channel
+        // disconnects), set the shared flag, and wake the stand-in's
+        // final accept with a throwaway connect (immediate EOF; a
+        // failed connect means the stand-in is already out).
+        drop(bench_tx);
+        stop.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(sock.path());
+        stand_in.join().expect("the stand-in must not panic");
+        updater.join().expect("the updater thread must not panic");
+
+        // Both runs ended cleanly: nothing left in flight (either
+        // class), no error recorded.
+        let state = state.read().expect("the updater must not poison the lock");
+        assert!(!state.bench.running, "the normal run must end at its terminal");
+        assert!(!state.bench.burn_in.running, "the burn-in must end at its terminal");
+        assert!(state.error.is_none(), "clean runs must not record an error");
     }
 }
