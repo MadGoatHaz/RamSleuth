@@ -14,8 +14,18 @@
 //!   secondary / tertiary + turnaround timings, CAD drive/termination
 //!   (Ω), voltages (the VDDCR_VDD primary rail first).
 //! - **Zone 2 — AIDA-style benchmark engine:** the 4×4 grid (tier rows ×
-//!   Read/Write/Copy/Latency columns) with metric values or `N/A`, plus a
-//!   progress line (`idle` / `running` / `[i/total] …` / `done`).
+//!   Read/Write/Copy/Latency columns) — live during a run: a normal
+//!   bench's [`live_grid`] accumulates the streamed progress events
+//!   (the newest value per cell wins; a non-finite / non-positive
+//!   reading never counts) and a burn-in shows `burn_in.latest` (its
+//!   newest per-cell values), the measured cells dimmed with a `…`
+//!   suffix (the GUI C7-17/18 convention), the unstarted cells `N/A`;
+//!   not in flight, the terminal grid of the last completed run. Below
+//!   the grid, the flat C7-17 status line (`Status: Idle` /
+//!   `Status: Running… <m:ss>` / `Status: Running… (burn-in <m:ss>,
+//!   iter <n>)` / `Status: Done`) — it replaces the pre-parity `bench:`
+//!   progress line (the parity goal's intentional re-render of that
+//!   line).
 //! - **Zone 3 — hardware & SPD telemetry:** per-slot module lines (maker /
 //!   part / rank / density / speed + XMP/EXPO profiles), the daemon status
 //!   line, and the error line when present.
@@ -32,10 +42,11 @@
 //! `#FF3B30`, background slate `#1E1E24`.
 //!
 //! **No-panic contract:** absent, degraded, or empty data always renders
-//! a placeholder (`N/A`, `idle`, `not connected`); an all-`Na` snapshot
+//! a placeholder (`N/A`, `Status: Idle`, `not connected`); an all-`Na`
 //! or the default [`AppState`] draws without panicking (the tests assert
 //! through ratatui's in-memory `TestBackend`).
 
+use std::sync::Mutex;
 use std::time::Instant;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -44,7 +55,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use ramsleuth_bench::{BenchmarkGrid, Metric, StreamProgress, Tier};
+use ramsleuth_bench::{BenchOp, BenchmarkGrid, Metric, StreamProgress, Tier};
 use ramsleuth_telemetry::amd_readout::{
     CadBus, ClockReadout, CommandRate, DivMode, RttValue, TimingSet, VoltageSet,
 };
@@ -78,7 +89,7 @@ const DIM: Color = Color::Rgb(0x8A, 0x8A, 0x96);
 ///
 /// `Default` is the not-yet-run state: idle, no run id, no progress
 /// events, no grid, no burn-in — the dashboard renders a full `N/A`
-/// grid + an `idle` line for it.
+/// grid + the `Status: Idle` line for it.
 #[derive(Debug, Clone, Default)]
 pub struct BenchState {
     /// A run is in flight (progress events are streaming).
@@ -875,8 +886,13 @@ fn tick_rows(items: &mut Vec<ListItem<'static>>, pairs: &[(&str, &Section<u16>)]
 // Zone 2 — AIDA-style benchmark engine.
 // ---------------------------------------------------------------------------
 
-/// Zone 2: the 4×4 grid (five rows: header + four tiers) + one progress
-/// line + slack (clipped, never scrolled).
+/// The `Status: Done` line's green (the GUI `bench_zone` C7-17 zone-local
+/// const — a dark-slate-compatible green; the §3.2 palette stays frozen:
+/// the status colors are zone-local, not a palette entry).
+const STATUS_DONE: Color = Color::Rgb(0x2E, 0x9E, 0x5B);
+
+/// Zone 2: the 4×4 grid (five rows: header + four tiers) + one flat
+/// status line + slack (clipped, never scrolled).
 fn render_zone2(frame: &mut Frame, state: &AppState, area: Rect) {
     let block = zone_block("2 · BENCH (GB/s)");
     let inner = block.inner(area);
@@ -885,27 +901,154 @@ fn render_zone2(frame: &mut Frame, state: &AppState, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5), // the grid (header + four tier rows)
-            Constraint::Length(1), // the progress line
+            Constraint::Length(1), // the flat status line (C7-17)
             Constraint::Fill(1),   // slack
         ])
         .split(inner);
-    frame.render_widget(bench_table(state.bench.grid.as_ref()), parts[0]);
-    let (text, color) = progress_line(&state.bench);
+    frame.render_widget(bench_table(&state.bench), parts[0]);
+    let (text, color) = bench_status(&state.bench);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(&text, Style::default().fg(color)))),
         parts[1],
     );
 }
 
-/// The 4×4 grid: tier rows × Read/Write/Copy/Latency columns.
-///
-/// The cells are bare two-decimal numbers: the Read/Write/Copy columns are
-/// GB/s (named in the zone title) and the last column is ns/hop (named in
-/// its header), the AIDA64 grid convention at terminal width. An
-/// unmeasured cell (`0.0` on the wire — the grid carries no `Na` arm) and
-/// a missing grid (no run yet) render `N/A` (crimson); measured cells are
-/// cyan.
-fn bench_table(grid: Option<&BenchmarkGrid>) -> Table<'static> {
+/// The live in-flight grid for a **normal** bench (the GUI
+/// `bench_zone::live_grid` rule): accumulate each streamed
+/// [`StreamProgress`] event's (tier, op, value) into a zero grid — the
+/// latest event per cell wins. The row is the tier (its discriminant is
+/// the grid-array slot: `Memory = 0, L1 = 1, L2 = 2, L3 = 3`) and the
+/// column is the op (`Read` / `Write` / `Copy`); the stream carries
+/// bandwidth ops only (no latency events — the streamed contract), so
+/// the `latency_ns` column stays 0.0. A non-finite or non-positive value
+/// is ignored (never renders as data), and unmeasured cells stay 0.0
+/// (which renders `N/A`). A burn-in's live grid is `burn_in.latest`
+/// instead (C7-18 — see [`table_live_grid`]).
+fn live_grid(progress: &[StreamProgress]) -> BenchmarkGrid {
+    let mut grid = BenchmarkGrid {
+        read_gbps: [0.0; 4],
+        write_gbps: [0.0; 4],
+        copy_gbps: [0.0; 4],
+        latency_ns: [0.0; 4],
+    };
+    for event in progress {
+        if !event.value.is_finite() || event.value <= 0.0 {
+            continue; // a malformed reading never renders as data
+        }
+        let slot = event.tier as usize;
+        match event.op {
+            BenchOp::Read => grid.read_gbps[slot] = event.value,
+            BenchOp::Write => grid.write_gbps[slot] = event.value,
+            BenchOp::Copy => grid.copy_gbps[slot] = event.value,
+        }
+    }
+    grid
+}
+
+/// The 4×4 grid's live in-flight grid for the current run (the GUI
+/// `table_live_grid`, C7-18): a burn-in in flight shows `burn_in.latest`
+/// (the newest per-cell values seen this burn-in — the cells update per
+/// iteration), a normal bench in flight the accumulated
+/// [`live_grid`]; neither in flight → the (unused) progress
+/// accumulation is returned harmlessly (the terminal grid renders).
+fn table_live_grid(bench: &BenchState) -> BenchmarkGrid {
+    if bench.burn_in.running {
+        bench.burn_in.latest.clone()
+    } else {
+        live_grid(&bench.progress)
+    }
+}
+
+/// One grid cell's render phase within the zone's current run state (the
+/// GUI `bench_zone` C7-17/18 mirror).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellPhase {
+    /// The run is not in flight: the cell shows its terminal value from
+    /// the result grid (or the `N/A` placeholder when unmeasured).
+    Terminal,
+    /// A run is in flight and the cell has a live value: the dimmed
+    /// in-flight fill + a `…` suffix.
+    Live,
+    /// A run is in flight and the cell has no live value yet — not
+    /// started, or a latency cell of a normal bench (no progress
+    /// events): the `N/A` placeholder.
+    NotStarted,
+}
+
+/// One cell's render [`CellPhase`]: not in flight → `Terminal` (the
+/// result grid); in flight → `Live` when the live grid carries a
+/// (finite, positive) value for the cell, else `NotStarted` (a cell not
+/// started yet, or a normal-bench latency cell — the stream carries no
+/// latency events).
+fn cell_phase(in_flight: bool, live: &BenchmarkGrid, tier: Tier, metric: Metric) -> CellPhase {
+    if !in_flight {
+        return CellPhase::Terminal;
+    }
+    let value = live.cell(tier, metric);
+    if value.is_finite() && value > 0.0 {
+        CellPhase::Live
+    } else {
+        CellPhase::NotStarted
+    }
+}
+
+/// One cell's display for its render [`CellPhase`] (the bare
+/// terminal-width form): the terminal value in the existing two-decimal
+/// shape — cyan for a measured reading (a non-finite / unmeasured cell
+/// degrades to the crimson `N/A`, the GUI's guard), the live in-flight
+/// value with a `…` suffix (dimmed — the terminal adaptation of the
+/// GUI's dimmed-cyan fill), or the `N/A` placeholder.
+fn bench_cell_text(
+    phase: CellPhase,
+    terminal: &BenchmarkGrid,
+    live: &BenchmarkGrid,
+    tier: Tier,
+    metric: Metric,
+) -> (String, Color) {
+    match phase {
+        CellPhase::Terminal => {
+            let value = terminal.cell(tier, metric);
+            if value.is_finite() && value > 0.0 {
+                (format!("{value:.2}"), CYAN)
+            } else {
+                ("N/A".to_owned(), CRIMSON)
+            }
+        }
+        CellPhase::Live => {
+            let value = live.cell(tier, metric);
+            (format!("{value:.2}…"), DIM)
+        }
+        CellPhase::NotStarted => ("N/A".to_owned(), CRIMSON),
+    }
+}
+
+/// The 4×4 grid: tier rows × Read/Write/Copy/Latency columns, in its
+/// current run state (the GUI `render_grid_table` mirror, the bare
+/// terminal-width form: the Read/Write/Copy columns are GB/s — named in
+/// the zone title — and the last column is ns/hop, the AIDA64
+/// convention). **Not in flight** — the terminal result grid of the
+/// last completed run (or the all-`N/A` zero grid when none has landed
+/// yet — the layout never shifts when the result lands); **a run in
+/// flight** — the [`table_live_grid`] overlay: the live cells dimmed
+/// with a `…` suffix, the unstarted cells (and a normal bench's latency
+/// column — the stream carries no latency events) keep `N/A`, the
+/// terminal grid hidden until the run settles.
+fn bench_table(bench: &BenchState) -> Table<'static> {
+    // The terminal result grid of the last completed run, or the
+    // all-`N/A` zero grid when none has landed yet.
+    let terminal = match bench.grid.as_ref() {
+        Some(grid) => grid.clone(),
+        None => BenchmarkGrid {
+            read_gbps: [0.0; 4],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [0.0; 4],
+        },
+    };
+    // Any run in flight (a normal bench or a burn-in) → the live cells
+    // render the in-flight fill.
+    let in_flight = bench.running || bench.burn_in.running;
+    let live = table_live_grid(bench);
     let header = Row::new(
         ["", "Read", "Write", "Copy", "ns/hop"]
             .iter()
@@ -915,13 +1058,13 @@ fn bench_table(grid: Option<&BenchmarkGrid>) -> Table<'static> {
     for &tier in &[Tier::Memory, Tier::L1, Tier::L2, Tier::L3] {
         let mut cells = vec![Cell::from(tier_name(tier)).style(Style::default().fg(CYAN))];
         for &metric in &[Metric::Read, Metric::Write, Metric::Copy, Metric::Latency] {
-            let value = grid
-                .map(|g| g.cell(tier, metric))
-                .filter(|v| *v != 0.0);
-            let (text, color) = match value {
-                Some(v) => (format!("{v:.2}"), CYAN),
-                None => ("N/A".to_owned(), CRIMSON),
-            };
+            let (text, color) = bench_cell_text(
+                cell_phase(in_flight, &live, tier, metric),
+                &terminal,
+                &live,
+                tier,
+                metric,
+            );
             cells.push(Cell::from(text).style(Style::default().fg(color)));
         }
         rows.push(Row::new(cells));
@@ -938,29 +1081,149 @@ fn bench_table(grid: Option<&BenchmarkGrid>) -> Table<'static> {
     )
 }
 
-/// The one-line benchmark progress indicator: `[i/total] label value`
-/// while a run streams, `running` when one just started, `done` after a
-/// completed run, `idle` otherwise.
-fn progress_line(bench: &BenchState) -> (String, Color) {
-    if bench.running {
-        match bench.progress.last() {
-            Some(p) => (
-                format!(
-                    "bench: [{}/{}] {} {value:.2}",
-                    p.cell_index + 1,
-                    p.total_cells,
-                    p.label,
-                    value = p.value
-                ),
-                CYAN,
-            ),
-            None => ("bench: running...".to_owned(), AMBER),
+/// The bench zone's flat status line state (the GUI `bench_zone` C7-17
+/// mirror — the progress line's pill retired): the idle rest state, a
+/// run in flight (with the run's elapsed), and a finished run (a
+/// terminal grid or kept streamed progress present).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StatusState {
+    /// No run in flight and no run has finished: the dim `Status: Idle`
+    /// line.
+    Idle,
+    /// A run (a normal bench or a burn-in) is in flight: the CYAN
+    /// running line; `elapsed_secs` is the run's elapsed (the newest
+    /// tick's for a burn-in, the zone's start clock's for a normal
+    /// bench). `burn_in_iteration` is `Some(n)` for a burn-in (the
+    /// `Status: Running… (burn-in <m:ss>, iter <n>)` line) and `None`
+    /// for a normal bench (the `Status: Running… <m:ss>` line).
+    Running { elapsed_secs: f64, burn_in_iteration: Option<u32> },
+    /// A run finished (a terminal grid landed, or streamed progress is
+    /// kept): the green `Status: Done` line.
+    Done,
+}
+
+/// The status state of one run bookkeeping (the GUI `status_state`
+/// mirror): a burn-in in flight → `Running` (the newest tick's elapsed +
+/// iteration — the normal-bench flag stays false for a burn-in, C7-16),
+/// a normal bench in flight → `Running` (the zone's start clock's
+/// elapsed, no burn-in iteration), neither in flight but a terminal
+/// grid or kept streamed progress present → `Done`, the fresh state (no
+/// grid, no progress) → `Idle`. The `Done` corner deliberately includes
+/// the kept-progress-only shape (a cancelled normal bench with no
+/// terminal grid): a non-empty progress list with no run in flight is a
+/// finished run, not an idle one.
+fn status_state(
+    running: bool,
+    burn_in_running: bool,
+    grid_present: bool,
+    progress_present: bool,
+    running_elapsed_secs: f64,
+    burn_in_iteration: u32,
+) -> StatusState {
+    if burn_in_running {
+        StatusState::Running {
+            elapsed_secs: running_elapsed_secs,
+            burn_in_iteration: Some(burn_in_iteration),
         }
-    } else if bench.grid.is_some() {
-        ("bench: done".to_owned(), DIM)
+    } else if running {
+        StatusState::Running {
+            elapsed_secs: running_elapsed_secs,
+            burn_in_iteration: None,
+        }
+    } else if grid_present || progress_present {
+        StatusState::Done
     } else {
-        ("bench: idle".to_owned(), DIM)
+        StatusState::Idle
     }
+}
+
+/// One run's elapsed in the status line's `m:ss` form (the GUI
+/// `format_elapsed` mirror — the plan's `0:42`): the minutes un-padded,
+/// the seconds two-digit; a non-finite / non-positive reading renders
+/// `0:00` (a bad elapsed never panics the line, the no-panic contract).
+fn format_elapsed(secs: f64) -> String {
+    let total = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+/// The flat status line's text (the GUI `status_text` mirror):
+/// `Status: Idle`, `Status: Running… <m:ss>` (a normal bench — the `…`
+/// kept static, the repaint animates the elapsed), `Status: Running…
+/// (burn-in <m:ss>, iter <n>)` (a burn-in, C7-18), `Status: Done`.
+fn status_text(state: StatusState) -> String {
+    match state {
+        StatusState::Idle => "Status: Idle".to_owned(),
+        StatusState::Running {
+            elapsed_secs,
+            burn_in_iteration,
+        } => match burn_in_iteration {
+            Some(iter) => format!(
+                "Status: Running… (burn-in {}, iter {})",
+                format_elapsed(elapsed_secs),
+                iter
+            ),
+            None => format!("Status: Running… {}", format_elapsed(elapsed_secs)),
+        },
+        StatusState::Done => "Status: Done".to_owned(),
+    }
+}
+
+/// The flat status line's color (the GUI `status_color` mirror, the
+/// terminal palette): the idle line is dim, the running line CYAN (a
+/// normal bench or a burn-in), the done line the zone-local green
+/// [`STATUS_DONE`].
+fn status_color(state: StatusState) -> Color {
+    match state {
+        StatusState::Idle => DIM,
+        StatusState::Running { .. } => CYAN,
+        StatusState::Done => STATUS_DONE,
+    }
+}
+
+/// The zone-local start clock for a normal bench run (the GUI
+/// `bench_zone` C7-17 precedent): the moment the zone first saw a normal
+/// bench in flight (a repaint within one frame of the run's start). The
+/// burn-in needs no clock — its newest tick carries the elapsed
+/// (`burn_in.elapsed_secs`). Stamped on the first in-flight frame,
+/// cleared on the terminal; a poisoned lock is recovered in place (the
+/// render thread is the sole user — the no-panic contract).
+static NORMAL_RUN_START: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Stamp / clear the zone-local normal-run start clock for this frame's
+/// run state, returning the start instant while a normal bench is in
+/// flight (`None` outside one — the terminal cleared it).
+fn track_run_start(running: bool) -> Option<Instant> {
+    let mut guard = NORMAL_RUN_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if running {
+        Some(*guard.get_or_insert_with(Instant::now))
+    } else {
+        *guard = None;
+        None
+    }
+}
+
+/// The bench zone's flat status line (the GUI C7-17 mirror): a single
+/// text line below the grid — `Status: Idle` dim, `Status: Running…
+/// <m:ss>` CYAN (a normal bench — elapsed from the zone's start clock),
+/// `Status: Running… (burn-in <m:ss>, iter <n>)` CYAN (a burn-in — the
+/// newest tick's elapsed + iteration), `Status: Done` in the
+/// zone-local green.
+fn bench_status(bench: &BenchState) -> (String, Color) {
+    let burn_in = &bench.burn_in;
+    let running_elapsed = if burn_in.running {
+        burn_in.elapsed_secs
+    } else {
+        track_run_start(bench.running).map_or(0.0, |start| start.elapsed().as_secs_f64())
+    };
+    let state = status_state(
+        bench.running,
+        burn_in.running,
+        bench.grid.is_some(),
+        !bench.progress.is_empty(),
+        running_elapsed,
+        burn_in.iteration,
+    );
+    (status_text(state), status_color(state))
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,8 +1670,9 @@ mod tests {
         assert!(text.contains("1600.00 MHz"), "{text}");
         assert!(text.contains("1:2"), "{text}");
         assert!(text.contains("tCL: 16"), "{text}");
-        // zone 2: the grid renders (idle, no run yet -> N/A cells)
-        assert!(text.contains("bench: idle"), "{text}");
+        // zone 2: the grid renders (idle, no run yet -> N/A cells) +
+        // the flat status line (the TUI-13 re-render of the progress line)
+        assert!(text.contains("Status: Idle"), "{text}");
         // zone 3: the SPD module + profile + daemon line
         assert!(text.contains("Samsung"), "{text}");
         assert!(text.contains("3200 MT/s"), "{text}");
@@ -1421,7 +1685,7 @@ mod tests {
 
     /// (b) The default state (all-Na, no telemetry, no run) renders
     /// placeholders without panicking: `N/A` in every zone, the full
-    /// `N/A` grid, and the `idle` progress line.
+    /// `N/A` grid, and the `Status: Idle` line.
     #[test]
     fn default_state_renders_placeholders_without_panic() {
         let text = draw(&AppState::default());
@@ -1431,15 +1695,21 @@ mod tests {
             text.matches("N/A").count() >= 18,
             "expected >= 18 N/A placeholders, got:\n{text}"
         );
-        assert!(text.contains("idle"), "{text}");
+        assert!(text.contains("Status: Idle"), "{text}");
         assert!(text.contains("not connected"), "{text}");
         assert!(text.contains("no telemetry"), "{text}");
     }
 
-    /// (c) A running bench renders the grid with its measured cells and a
-    /// live `[i/total]` progress line.
+    /// (c) A running bench renders the grid's live overlay — the
+    /// streamed cell dimmed with a `…` suffix, the terminal grid
+    /// hidden until the run settles (the unstarted cells — including
+    /// the terminal L1 latency, which a normal bench's stream never
+    /// carries — stay `N/A`) — and the flat `Status: Running… <m:ss>`
+    /// line (the TUI-13 re-render of the pre-parity `bench:` progress
+    /// line; the run-start clock is stamped within this one frame, so
+    /// the elapsed renders `0:00`).
     #[test]
-    fn running_bench_renders_grid_and_progress() {
+    fn running_bench_renders_live_grid_and_status() {
         let mut state = representative();
         state.bench = BenchState {
             running: true,
@@ -1459,19 +1729,23 @@ mod tests {
             }),
             ..Default::default()
         };
-        let text = draw(&state);
+        // 100×62: the full zone-1 surface (the 30-row default clips
+        // the rtt_park / VDDCR_VDD N/A rows out of the count).
+        let text = draw_at(&state, 100, 62);
 
-        assert!(text.contains("bench: [1/3]"), "{text}");
-        assert!(text.contains("42.50"), "{text}");
-        assert!(text.contains("1.10"), "{text}");
+        assert!(text.contains("Status: Running… 0:00"), "{text}");
+        // the streamed cell: its live value dimmed with the `…` suffix
+        assert!(text.contains("42.50…"), "{text}");
         assert!(text.contains("ns/hop"), "{text}");
-        // the unmeasured cells stay N/A (14 grid cells + the zone-1 Na
-        // cells: rfc2, rtt_park, the bare-N/A VDDCR_VDD)
-        assert!(text.matches("N/A").count() >= 13, "{text}");
+        // the unmeasured cells stay N/A (15 grid cells — the terminal
+        // L1 latency included, the live grid carries no latency — +
+        // the zone-1 Na cells: rfc2, rtt_park, the bare-N-A VDDCR_VDD)
+        assert!(text.matches("N/A").count() >= 18, "{text}");
     }
 
     /// (c′) A completed run (not running, grid present) renders the
-    /// `done` progress line.
+    /// flat `Status: Done` line (the TUI-13 re-render of the pre-parity
+    /// `bench: done`).
     #[test]
     fn completed_bench_renders_done() {
         let state = AppState {
@@ -1490,7 +1764,7 @@ mod tests {
         };
         let text = draw(&state);
 
-        assert!(text.contains("bench: done"), "{text}");
+        assert!(text.contains("Status: Done"), "{text}");
         assert!(text.contains("26.30"), "{text}");
         assert!(text.contains("86.80"), "{text}");
     }
@@ -2269,5 +2543,350 @@ mod tests {
         }
         let text = draw_at(&na, 100, 62);
         assert!(text.contains("GEAR_DOWN: N/A"), "{text}");
+    }
+
+    // -----------------------------------------------------------------
+    // TUI-13 — the zone-2 pure core (the GUI `bench_zone` C7-17/18
+    // mirror): `live_grid`, the cell phases, the flat status line,
+    // and the `m:ss` formatter. Headless — no TTY, no I/O.
+    // -----------------------------------------------------------------
+
+    /// One synthetic streamed progress event (the GUI `bench_zone`
+    /// test helper — the label is unused by the pure core).
+    fn progress_event(tier: Tier, op: BenchOp, value: f64) -> StreamProgress {
+        StreamProgress {
+            cell_index: 0,
+            total_cells: 12,
+            tier,
+            op,
+            value,
+            label: "test (GB/s)".to_owned(),
+        }
+    }
+
+    /// (x) `live_grid` (the GUI (i) mirror): each streamed event fills
+    /// its (tier, op) cell; the latest event per cell wins; the
+    /// latency column and the unmeasured cells stay 0.0.
+    #[test]
+    fn live_grid_fills_streamed_cells_latest_wins() {
+        let events = vec![
+            progress_event(Tier::Memory, BenchOp::Read, 26.0),
+            progress_event(Tier::Memory, BenchOp::Write, 43.0),
+            progress_event(Tier::L1, BenchOp::Read, 35.0),
+            progress_event(Tier::Memory, BenchOp::Read, 27.5), // latest wins
+        ];
+        let grid = live_grid(&events);
+        assert_eq!(grid.cell(Tier::Memory, Metric::Read), 27.5, "latest per cell wins");
+        assert_eq!(grid.cell(Tier::Memory, Metric::Write), 43.0);
+        assert_eq!(grid.cell(Tier::L1, Metric::Read), 35.0);
+        // Unmeasured cells — and the whole latency column (no progress
+        // events) — stay 0.0.
+        assert_eq!(grid.cell(Tier::Memory, Metric::Copy), 0.0);
+        assert_eq!(grid.cell(Tier::L2, Metric::Read), 0.0);
+        assert_eq!(grid.cell(Tier::L3, Metric::Copy), 0.0);
+        assert_eq!(grid.cell(Tier::L1, Metric::Latency), 0.0);
+        assert_eq!(grid.cell(Tier::L3, Metric::Latency), 0.0);
+    }
+
+    /// (y) `live_grid` (the GUI (j) mirror): an empty stream and a
+    /// stream of malformed (non-finite / non-positive) values never
+    /// panic and never render as data — every cell stays 0.0.
+    #[test]
+    fn live_grid_empty_and_malformed_streams_stay_zero() {
+        let empty = live_grid(&[]);
+        assert_eq!(empty.cell(Tier::Memory, Metric::Read), 0.0);
+        assert_eq!(empty.cell(Tier::L3, Metric::Latency), 0.0);
+
+        let broken = vec![
+            progress_event(Tier::L1, BenchOp::Read, f64::NAN),
+            progress_event(Tier::L2, BenchOp::Write, f64::INFINITY),
+            progress_event(Tier::L3, BenchOp::Copy, -4.0),
+        ];
+        let grid = live_grid(&broken);
+        assert_eq!(grid.cell(Tier::L1, Metric::Read), 0.0, "NaN never renders");
+        assert_eq!(grid.cell(Tier::L2, Metric::Write), 0.0, "+inf never renders");
+        assert_eq!(grid.cell(Tier::L3, Metric::Copy), 0.0, "negative never renders");
+    }
+
+    /// (z) `cell_phase` (the GUI (k) mirror): not in flight →
+    /// `Terminal` for every cell; in flight → `Live` only for the
+    /// cells the live grid carries a value for, `NotStarted`
+    /// otherwise (a cell not started yet, or a latency cell — no
+    /// progress events).
+    #[test]
+    fn cell_phase_tracks_running_and_streamed_values() {
+        let live = live_grid(&[
+            progress_event(Tier::Memory, BenchOp::Read, 26.0),
+            progress_event(Tier::L1, BenchOp::Copy, 31.8),
+        ]);
+        // Not in flight: every cell renders its terminal value.
+        for &tier in &[Tier::Memory, Tier::L1, Tier::L2, Tier::L3] {
+            for &metric in &[Metric::Read, Metric::Write, Metric::Copy, Metric::Latency] {
+                assert_eq!(cell_phase(false, &live, tier, metric), CellPhase::Terminal);
+            }
+        }
+        // In flight: the streamed cells are live, the rest not started.
+        assert_eq!(cell_phase(true, &live, Tier::Memory, Metric::Read), CellPhase::Live);
+        assert_eq!(cell_phase(true, &live, Tier::L1, Metric::Copy), CellPhase::Live);
+        assert_eq!(
+            cell_phase(true, &live, Tier::Memory, Metric::Write),
+            CellPhase::NotStarted
+        );
+        assert_eq!(cell_phase(true, &live, Tier::L2, Metric::Read), CellPhase::NotStarted);
+        assert_eq!(cell_phase(true, &live, Tier::L3, Metric::Latency), CellPhase::NotStarted);
+    }
+
+    /// (z′) The cell phases' text + color (the GUI (l) mirror, the
+    /// bare terminal-width form): terminal cells keep the existing
+    /// two-decimal / `N/A` semantics (a non-finite reading degrades to
+    /// `N/A` too — the GUI's guard), live cells show the in-flight
+    /// value + a `…` suffix dimmed, not-started cells keep `N/A`.
+    #[test]
+    fn phase_cell_text_renders_live_and_terminal_cells() {
+        let terminal = BenchmarkGrid {
+            read_gbps: [26.35, 35.10, 30.40, 0.0],
+            write_gbps: [43.63, 38.20, 0.0, 14.02],
+            copy_gbps: [12.11, 36.40, 31.80, 11.05],
+            latency_ns: [86.84, 1.12, 4.20, 13.90],
+        };
+        let live = live_grid(&[progress_event(Tier::Memory, BenchOp::Read, 26.0)]);
+
+        // Terminal: the existing semantics (a measured cell cyan, an
+        // unmeasured cell N/A).
+        assert_eq!(
+            bench_cell_text(CellPhase::Terminal, &terminal, &live, Tier::Memory, Metric::Read),
+            ("26.35".to_owned(), CYAN)
+        );
+        assert_eq!(
+            bench_cell_text(CellPhase::Terminal, &terminal, &live, Tier::Memory, Metric::Latency),
+            ("86.84".to_owned(), CYAN)
+        );
+        assert_eq!(
+            bench_cell_text(CellPhase::Terminal, &terminal, &live, Tier::L2, Metric::Write),
+            ("N/A".to_owned(), CRIMSON)
+        );
+        // A non-finite terminal reading degrades to N/A (the GUI's
+        // guard — no "NaN" text).
+        let broken = BenchmarkGrid {
+            read_gbps: [f64::NAN; 4],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [0.0; 4],
+        };
+        assert_eq!(
+            bench_cell_text(CellPhase::Terminal, &broken, &live, Tier::Memory, Metric::Read),
+            ("N/A".to_owned(), CRIMSON)
+        );
+
+        // Live: the in-flight value + the `…` suffix, dimmed.
+        assert_eq!(
+            bench_cell_text(CellPhase::Live, &terminal, &live, Tier::Memory, Metric::Read),
+            ("26.00…".to_owned(), DIM)
+        );
+        // A burn-in's `latest` also carries per-tier latency ticks →
+        // the live latency cell shows the `…` suffix too.
+        let live_lat = BenchmarkGrid {
+            read_gbps: [0.0; 4],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [86.84, 0.0, 0.0, 0.0],
+        };
+        assert_eq!(
+            bench_cell_text(CellPhase::Live, &terminal, &live_lat, Tier::Memory, Metric::Latency),
+            ("86.84…".to_owned(), DIM)
+        );
+
+        // NotStarted: the `N/A` placeholder.
+        assert_eq!(
+            bench_cell_text(CellPhase::NotStarted, &terminal, &live, Tier::L3, Metric::Read),
+            ("N/A".to_owned(), CRIMSON)
+        );
+    }
+
+    /// (aa) `status_state` (the GUI (e) mirror): a burn-in in flight →
+    /// `Running` (the newest tick's elapsed + iteration — the
+    /// normal-bench flag stays false for a burn-in, C7-16), a normal
+    /// bench in flight → `Running` (the zone's start clock's elapsed,
+    /// no iteration), a finished run (a terminal grid or kept
+    /// streamed progress) → `Done`, the fresh state → `Idle`.
+    #[test]
+    fn status_state_matrix() {
+        // The fresh state: no run in flight, no grid, no progress.
+        assert_eq!(
+            status_state(false, false, false, false, 0.0, 0),
+            StatusState::Idle
+        );
+        // A normal bench in flight (progress streaming): `Running`
+        // with the start clock's elapsed — 42 s renders `0:42` (no
+        // burn-in iteration).
+        assert_eq!(
+            status_state(true, false, false, true, 42.0, 0),
+            StatusState::Running {
+                elapsed_secs: 42.0,
+                burn_in_iteration: None
+            }
+        );
+        // A burn-in in flight: `Running` with the newest tick's
+        // elapsed (125 s) + iteration (the normal-bench flag stays
+        // false, C7-16).
+        assert_eq!(
+            status_state(false, true, false, false, 125.0, 3),
+            StatusState::Running {
+                elapsed_secs: 125.0,
+                burn_in_iteration: Some(3)
+            }
+        );
+        // A burn-in still in flight wins over the kept terminal grid
+        // of an earlier run.
+        assert_eq!(
+            status_state(false, true, true, false, 9.0, 2),
+            StatusState::Running {
+                elapsed_secs: 9.0,
+                burn_in_iteration: Some(2)
+            }
+        );
+        // A finished run: the terminal grid landed (the burn-in
+        // terminal leaves the progress empty — C7-16) → `Done`.
+        assert_eq!(status_state(false, false, true, false, 0.0, 0), StatusState::Done);
+        // A finished run: the streamed progress is kept with no grid
+        // (a cancelled normal bench) → `Done`.
+        assert_eq!(status_state(false, false, false, true, 0.0, 0), StatusState::Done);
+    }
+
+    /// (ab) `status_text` (the GUI (f) mirror): the flat line's exact
+    /// strings — `Status: Idle`, `Status: Running… <m:ss>` (a normal
+    /// bench), `Status: Running… (burn-in <m:ss>, iter <n>)` (a
+    /// burn-in, C7-18), `Status: Done`.
+    #[test]
+    fn status_text_renders_the_flat_lines() {
+        assert_eq!(status_text(StatusState::Idle), "Status: Idle");
+        assert_eq!(
+            status_text(StatusState::Running {
+                elapsed_secs: 42.0,
+                burn_in_iteration: None,
+            }),
+            "Status: Running… 0:42"
+        );
+        assert_eq!(
+            status_text(StatusState::Running {
+                elapsed_secs: 125.0,
+                burn_in_iteration: None,
+            }),
+            "Status: Running… 2:05"
+        );
+        assert_eq!(
+            status_text(StatusState::Running {
+                elapsed_secs: 0.0,
+                burn_in_iteration: None,
+            }),
+            "Status: Running… 0:00"
+        );
+        // A burn-in in flight: the `(burn-in <m:ss>, iter <n>)`
+        // phrasing (C7-18).
+        assert_eq!(
+            status_text(StatusState::Running {
+                elapsed_secs: 125.0,
+                burn_in_iteration: Some(3),
+            }),
+            "Status: Running… (burn-in 2:05, iter 3)"
+        );
+        assert_eq!(
+            status_text(StatusState::Running {
+                elapsed_secs: 0.0,
+                burn_in_iteration: Some(0),
+            }),
+            "Status: Running… (burn-in 0:00, iter 0)"
+        );
+        assert_eq!(status_text(StatusState::Done), "Status: Done");
+    }
+
+    /// (ac) `status_color` (the GUI (g) mirror, the terminal palette):
+    /// the idle line is dim, the running line CYAN (a normal bench or
+    /// a burn-in), the done line the zone-local green (the §3.2
+    /// palette stays frozen).
+    #[test]
+    fn status_color_tracks_the_state() {
+        assert_eq!(status_color(StatusState::Idle), DIM, "the idle line is dim");
+        assert_eq!(
+            status_color(StatusState::Running {
+                elapsed_secs: 42.0,
+                burn_in_iteration: None,
+            }),
+            CYAN
+        );
+        assert_eq!(
+            status_color(StatusState::Running {
+                elapsed_secs: 125.0,
+                burn_in_iteration: Some(3),
+            }),
+            CYAN
+        );
+        assert_eq!(status_color(StatusState::Done), STATUS_DONE);
+        assert_eq!(
+            STATUS_DONE,
+            Color::Rgb(0x2E, 0x9E, 0x5B),
+            "the done green is the zone-local const"
+        );
+    }
+
+    /// (ad) `format_elapsed` (the GUI (d) mirror): the `m:ss` form
+    /// (the plan's `0:42`) — the minutes un-padded, the seconds
+    /// two-digit; a non-finite / non-positive reading renders `0:00`
+    /// (a bad elapsed never panics the line).
+    #[test]
+    fn format_elapsed_renders_minutes_and_seconds() {
+        assert_eq!(format_elapsed(0.0), "0:00");
+        assert_eq!(format_elapsed(59.9), "0:59");
+        assert_eq!(format_elapsed(60.0), "1:00");
+        assert_eq!(format_elapsed(125.0), "2:05");
+        assert_eq!(format_elapsed(3661.0), "61:01");
+        assert_eq!(format_elapsed(f64::NAN), "0:00", "NaN never panics");
+        assert_eq!(format_elapsed(-4.0), "0:00", "a negative elapsed renders zero");
+        assert_eq!(format_elapsed(f64::INFINITY), "0:00", "+inf never panics");
+    }
+
+    /// (ae) `table_live_grid` (the GUI (q) mirror): a burn-in in
+    /// flight shows `burn_in.latest` (the cells update per
+    /// iteration), a normal bench in flight shows the accumulated
+    /// `StreamProgress` events, neither shows the (unused) progress
+    /// accumulation.
+    #[test]
+    fn table_live_grid_selects_the_source() {
+        // A burn-in in flight: the live grid is `burn_in.latest`.
+        let latest = BenchmarkGrid {
+            read_gbps: [26.35, 35.10, 0.0, 0.0],
+            write_gbps: [43.63, 0.0, 0.0, 0.0],
+            copy_gbps: [0.0; 4],
+            latency_ns: [86.84, 1.12, 0.0, 0.0],
+        };
+        let bench = BenchState {
+            running: false,
+            burn_in: BurnInState {
+                running: true,
+                iteration: 2,
+                elapsed_secs: 90.0,
+                latest: latest.clone(),
+            },
+            ..Default::default()
+        };
+        assert_eq!(table_live_grid(&bench), latest, "a burn-in shows `latest`");
+
+        // A normal bench in flight: the live grid is the accumulated
+        // `StreamProgress` events.
+        let bench = BenchState {
+            running: true,
+            burn_in: BurnInState::default(),
+            progress: vec![progress_event(Tier::Memory, BenchOp::Read, 26.0)],
+            ..Default::default()
+        };
+        let live = table_live_grid(&bench);
+        assert_eq!(live.cell(Tier::Memory, Metric::Read), 26.0);
+        assert_eq!(live.cell(Tier::L1, Metric::Read), 0.0, "unmeasured cells stay 0.0");
+
+        // Neither in flight: the progress accumulation (harmless —
+        // the terminal grid renders).
+        let bench = BenchState::default();
+        let live = table_live_grid(&bench);
+        assert_eq!(live.cell(Tier::Memory, Metric::Read), 0.0);
     }
 }
