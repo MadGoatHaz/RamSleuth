@@ -10,15 +10,31 @@
 //!
 //! - **Zone 1 — live memory controller & subtimings:** every cell of the
 //!   AMD (and Intel, if present) readout as `key: value` or `key: N/A
-//!   (<reason>)` — clocks/ratios (MCLK/UCLK/FCLK), gear/GDM, primary /
+//!   (<reason>)` — clocks/ratios (MCLK/UCLK/FCLK), GEAR_DOWN/CR, primary /
 //!   secondary / tertiary + turnaround timings, CAD drive/termination
-//!   (Ω), voltages.
+//!   (Ω), voltages (the VDDCR_VDD primary rail first).
 //! - **Zone 2 — AIDA-style benchmark engine:** the 4×4 grid (tier rows ×
-//!   Read/Write/Copy/Latency columns) with metric values or `N/A`, plus a
-//!   progress line (`idle` / `running` / `[i/total] …` / `done`).
+//!   Read/Write/Copy/Latency columns) — live during a run: a normal
+//!   bench's [`live_grid`] accumulates the streamed progress events
+//!   (the newest value per cell wins; a non-finite / non-positive
+//!   reading never counts) and a burn-in shows `burn_in.latest` (its
+//!   newest per-cell values), the measured cells dimmed with a `…`
+//!   suffix (the GUI C7-17/18 convention), the unstarted cells `N/A`;
+//!   not in flight, the terminal grid of the last completed run. Below
+//!   the grid, the flat C7-17 status line (`Status: Idle` /
+//!   `Status: Running… <m:ss>` / `Status: Running… (burn-in <m:ss>,
+//!   iter <n>)` / `Status: Done`) — it replaces the pre-parity `bench:`
+//!   progress line (the parity goal's intentional re-render of that
+//!   line). Below the status line, the controls line (`[B] Full` /
+//!   `[M] Mem` / `[X] Burn-in(5m)` — the run keys dimmed while any run
+//!   is in flight, the GUI single-flight rule — plus `[C] Cancel`,
+//!   shown only while a run is in flight) and the live burn-in row
+//!   (`Burn-in: iteration <n> · <m:ss> elapsed · Memory Read <…> ·
+//!   <latency>`, present only while a burn-in runs — the GUI
+//!   `burn_in_row` form).
 //! - **Zone 3 — hardware & SPD telemetry:** per-slot module lines (maker /
-//!   part / rank / density / speed + XMP/EXPO profiles), the daemon status
-//!   line, and the error line when present.
+//!   dram die / part / rank / density / speed + XMP/EXPO profiles), the
+//!   daemon status line, and the error line when present.
 //!
 //! The frozen state shapes also carry the parity surfaces the render
 //! chain adds over these zones (TUI-10…16): the 3-line header, the
@@ -32,10 +48,11 @@
 //! `#FF3B30`, background slate `#1E1E24`.
 //!
 //! **No-panic contract:** absent, degraded, or empty data always renders
-//! a placeholder (`N/A`, `idle`, `not connected`); an all-`Na` snapshot
+//! a placeholder (`N/A`, `Status: Idle`, `not connected`); an all-`Na`
 //! or the default [`AppState`] draws without panicking (the tests assert
 //! through ratatui's in-memory `TestBackend`).
 
+use std::sync::Mutex;
 use std::time::Instant;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -44,14 +61,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use ramsleuth_bench::{BenchmarkGrid, Metric, StreamProgress, Tier};
+use ramsleuth_bench::{BenchOp, BenchmarkGrid, Metric, StreamProgress, Tier};
 use ramsleuth_telemetry::amd_readout::{
-    CadBus, ClockReadout, DivMode, GearMode, RttValue, TimingSet, VoltageSet,
+    CadBus, ClockReadout, CommandRate, DivMode, RttValue, TimingSet, VoltageSet,
 };
-use ramsleuth_telemetry::cpuid::CpuVendor;
+use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
-use ramsleuth_telemetry::SystemMemoryTelemetry;
+use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
 
 use crate::graphs::GraphState;
 
@@ -78,7 +95,7 @@ const DIM: Color = Color::Rgb(0x8A, 0x8A, 0x96);
 ///
 /// `Default` is the not-yet-run state: idle, no run id, no progress
 /// events, no grid, no burn-in — the dashboard renders a full `N/A`
-/// grid + an `idle` line for it.
+/// grid + the `Status: Idle` line for it.
 #[derive(Debug, Clone, Default)]
 pub struct BenchState {
     /// A run is in flight (progress events are streaming).
@@ -103,9 +120,10 @@ pub struct BenchState {
 ///
 /// `latest` accumulates each streamed `BurnInProgress` tick the same
 /// way the live grid accumulates progress events (the newest value per
-/// cell wins; a non-finite / non-positive reading never counts). The
-/// 4×4 table keeps showing the terminal grid
-/// ([`BenchState::grid`]) during a run; the burn-in row shows `latest`.
+/// cell wins; a non-finite / non-positive reading never counts). While
+/// a burn-in is in flight the 4×4 table renders `latest` as the live
+/// overlay (the dimmed `…` cells — the module-doc zone-2 rule); the
+/// burn-in row also shows `latest`.
 ///
 /// Hand-written `Default` (the GUI `update.rs` precedent): no run,
 /// iteration 0, zero elapsed, and a zero grid — `BenchmarkGrid` derives
@@ -223,23 +241,79 @@ pub struct AppState {
 // Rendering.
 // ---------------------------------------------------------------------------
 
-/// Render the three-zone dashboard into `frame` from `state`.
+/// Render the dashboard into `frame` from `state`.
 ///
-/// The screen splits vertically into a one-row header strip (title + CPU +
-/// daemon + key legend) and the three zones side by side. Every zone is a
+/// The screen splits vertically into the three-row header strip (line
+/// 1 the title + platform tag + daemon status + key legend, line 2 the
+/// CPU/platform identity, line 3 the RAM summary — the capacity,
+/// per-DIMM breakdown, SPD speed, channel mode, and UCLK:MCLK sync
+/// mode), then the optional **settings strip** (one line while
+/// `settings.settings_open` — [`settings_strip_line`]), then the
+/// optional **requirements strip** (while
+/// [`crate::requirements::diagnose`] is non-empty and
+/// `settings.requirements_open` — the presence-driven auto-vanish; its
+/// fixed height is the border + one 3-line block per requirement + the
+/// footer, drawn by
+/// [`crate::requirements::render_requirements_strip`]), then the three
+/// zones side by side in the `Fill(1)` remainder. Every zone is a
 /// titled `Block` on a slate background; content that does not fit is
-/// clipped, never wrapped or scrolled. Safe at any terminal size — the
-/// all-`Na`, empty-SPD, daemon-down, and default states all render without
-/// panicking.
+/// clipped, never wrapped or scrolled. While `settings.graphs_open`,
+/// [`crate::graphs::render_graphs_panel`] is drawn **last** over the
+/// whole zone area (topmost — the C21-36 modal idiom: the zones render
+/// underneath first, the overlay wins the paint; `[g]` close restores
+/// them). Safe at any terminal size — the all-`Na`, empty-SPD,
+/// daemon-down, and default states (any combination of the strips /
+/// the overlay open) all render without panicking.
 pub fn render(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
+
+    // The requirements' presence (the TUI-08 pure `diagnose` — the
+    // strip's auto-vanish rule): it occupies its row only while a
+    // requirement is present and the `[d]` toggle is open.
+    let requirements = crate::requirements::diagnose(state);
+    let requirements_open = !requirements.is_empty() && state.settings.requirements_open;
+
+    // The top region's rows, in paint order: the header (3 lines), the
+    // settings strip (1 line while open), the requirements strip (its
+    // border + 3 lines per requirement + the footer, while open +
+    // present), the zones (the `Fill(1)` remainder).
+    let mut constraints = vec![Constraint::Length(3)];
+    if state.settings.settings_open {
+        constraints.push(Constraint::Length(1));
+    }
+    if requirements_open {
+        constraints.push(Constraint::Length(3 * requirements.len() as u16 + 3));
+    }
+    constraints.push(Constraint::Fill(1));
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Fill(1)])
+        .constraints(constraints)
         .split(area);
 
-    frame.render_widget(Paragraph::new(header_line(state)), outer[0]);
+    let width = usize::from(outer[0].width);
+    frame.render_widget(
+        Paragraph::new(vec![
+            header_line1(state, width),
+            header_line2(state),
+            header_line3(state),
+        ]),
+        outer[0],
+    );
 
+    // The optional strips, in the same order (a closed / absent strip
+    // is simply missing from the layout — the header stays the top
+    // three rows, the zones take the remainder).
+    let mut row = 1;
+    if state.settings.settings_open {
+        frame.render_widget(Paragraph::new(settings_strip_line(state)), outer[row]);
+        row += 1;
+    }
+    if requirements_open {
+        crate::requirements::render_requirements_strip(frame, &requirements, outer[row]);
+        row += 1;
+    }
+
+    let zone_area = outer[row];
     let zones = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -247,11 +321,23 @@ pub fn render(frame: &mut Frame, state: &AppState) {
             Constraint::Percentage(32),
             Constraint::Percentage(28),
         ])
-        .split(outer[1]);
+        .split(zone_area);
 
     render_zone1(frame, state, zones[0]);
     render_zone2(frame, state, zones[1]);
     render_zone3(frame, state, zones[2]);
+
+    // The graphs overlay: drawn last over the whole zone area (the
+    // topmost surface — the zones underneath are painted first, the
+    // panel wins; `[g]` close restores them).
+    if state.settings.graphs_open {
+        crate::graphs::render_graphs_panel(
+            frame,
+            &state.graph,
+            state.settings.graph_window_min,
+            zone_area,
+        );
+    }
 }
 
 /// The shared zone decoration: a titled border on a slate background.
@@ -263,36 +349,501 @@ fn zone_block(title: &'static str) -> Block<'static> {
         .style(Style::default().bg(SLATE))
 }
 
-/// The header strip: `RamSleuth` + the CPU identity + the daemon state +
-/// the key legend (one line, no wrap).
-fn header_line(state: &AppState) -> Line<'static> {
-    let cpu = match &state.telemetry {
-        Some(telemetry) => format!(
-            "{} · {}",
-            vendor_text(&telemetry.cpu.vendor),
-            telemetry.cpu.brand
-        ),
-        None => "cpu: --".to_owned(),
-    };
-    let (daemon, daemon_color) = if state.error.is_some() {
-        let status = if state.daemon_status.is_empty() {
+/// Header line 1 (Grand Design §3.1, TUI-10 — the GUI's line-1 mirror):
+/// `RamSleuth v<version> [<platform tag>] · daemon: <status> · <key
+/// legend>`. The title is bold cyan; the bracketed platform tag
+/// ([`platform_tag`]) is dim (the honest bare `Platform` without
+/// telemetry); the daemon status keeps the existing color rule (crimson
+/// on error, dim otherwise — the empty-status states degrade to `down`
+/// on error, `—` without); the full §2.2 key legend is dim and truncated
+/// to the `width` budget on entry boundaries ([`key_legend`]).
+fn header_line1(state: &AppState, width: usize) -> Line<'static> {
+    let title = format!("RamSleuth v{}", env!("CARGO_PKG_VERSION"));
+    let tag = platform_tag(state.telemetry.as_ref().map(|t| &t.cpu.vendor));
+    let status = if state.daemon_status.is_empty() {
+        if state.error.is_some() {
             "down"
         } else {
-            state.daemon_status.as_str()
-        };
-        (format!("daemon: {status}"), CRIMSON)
-    } else if state.daemon_status.is_empty() {
-        ("daemon: --".to_owned(), DIM)
+            "—"
+        }
     } else {
-        (format!("daemon: {}", state.daemon_status), DIM)
+        state.daemon_status.as_str()
     };
+    let status_color = if state.error.is_some() { CRIMSON } else { DIM };
+    // The legend budget: the fixed prefix measured in columns (the em
+    // dash is the only non-ASCII cell; `chars()` counts it as one) plus
+    // the ` · ` separator that precedes the legend.
+    let fixed = title.chars().count()
+        + format!(" [{tag}]").chars().count()
+        + format!(" · daemon: {status}").chars().count();
+    let budget = width.saturating_sub(fixed + 3);
+    let legend = key_legend(budget);
+    let mut spans = vec![
+        Span::styled(title, Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" [{tag}]"), Style::default().fg(DIM)),
+        Span::styled(format!(" · daemon: {status}"), Style::default().fg(status_color)),
+    ];
+    if !legend.is_empty() {
+        spans.push(Span::styled(format!(" · {legend}"), Style::default().fg(DIM)));
+    }
+    Line::from(spans)
+}
+
+/// Header line 2 (the GUI `cpu_line_text` mirror, C6-20): `CPU: <brand>
+/// <clock> | <motherboard> | BIOS <bios> | <AGESA|SMU>` — the CPUID
+/// brand + the platform clock in the selected unit (the `clock_mhz`
+/// setting, [`format_clock`]), the DMI motherboard / BIOS cells (each
+/// `Na` degrades to its `N/A` text), and the AGESA/SMU provenance
+/// fragment ([`age_fragment`] — the true-AGESA-suppresses-SMU
+/// precedence, C8-11/D-1). No telemetry degrades the cells to `—`
+/// placeholders (the fragment stays the honest `AGESA N/A`) — never a
+/// panic.
+fn header_line2(state: &AppState) -> Line<'static> {
+    let Some(telemetry) = &state.telemetry else {
+        return Line::from(Span::styled(
+            "CPU: — | — | BIOS — | AGESA N/A",
+            Style::default().fg(DIM),
+        ));
+    };
+    let platform = &telemetry.platform;
+    let clock = match &platform.cpu_clock_mhz {
+        Section::Value(mhz) => format_clock(*mhz, state.settings.clock_mhz),
+        Section::Na(_) => "N/A".to_owned(),
+    };
+    let age = age_fragment(platform);
+    let age_style = if age == "AGESA N/A" {
+        Style::default().fg(DIM)
+    } else {
+        Style::default().fg(CYAN)
+    };
+    let value = Style::default().fg(CYAN);
+    let label = Style::default().fg(DIM);
     Line::from(vec![
-        Span::styled("RamSleuth", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled(" live memory dashboard", Style::default().fg(DIM)),
-        Span::styled(format!("  [{cpu}]"), Style::default().fg(DIM)),
-        Span::styled(format!("  [{daemon}]"), Style::default().fg(daemon_color)),
-        Span::styled("  [R]efresh [S]napshot [Q]uit", Style::default().fg(DIM)),
+        Span::styled("CPU: ", label),
+        Span::styled(format!("{} {}", telemetry.cpu.brand, clock), value),
+        Span::styled(" | ", label),
+        Span::styled(cell_text(&platform.motherboard), value),
+        Span::styled(" | BIOS ", label),
+        Span::styled(cell_text(&platform.bios), value),
+        Span::styled(" | ", label),
+        Span::styled(age, age_style),
     ])
+}
+
+/// Header line 3 (TUI-11 — the RAM summary, the GUI C6-20/C9-01
+/// line-3 mirror): `RAM: <total> (<summary>) <max SPD MT/s> |
+/// <channel> | <note> | Mode: <sync>` — the total capacity in the
+/// selected capacity unit (`settings.capacity_gib`), the per-DIMM
+/// breakdown ([`dimm_summary`], with the rank word), the max SPD speed
+/// (omitted when no module carries one), the channel mode
+/// ([`channel_mode`]), the total-vs-breakdown slot note
+/// ([`slot_note`], when the OS total strictly exceeds the SPD sum),
+/// and the UCLK:MCLK sync mode ([`sync_mode`] — `Synchronous 1:1`
+/// amber, `Asynchronous 1:2` crimson, `N/A` dim). The capacity + clock
+/// segments honor the frozen unit knobs. No telemetry degrades to the
+/// dim `RAM: —` placeholder (never a panic).
+fn header_line3(state: &AppState) -> Line<'static> {
+    let Some(telemetry) = &state.telemetry else {
+        return Line::from(Span::styled("RAM: —", Style::default().fg(DIM)));
+    };
+    let (total, summary, speed, channel, note, (mode, mode_color)) = ram_line3_parts(
+        telemetry,
+        state.settings.capacity_gib,
+        state.settings.clock_mhz,
+    );
+    let value = Style::default().fg(CYAN);
+    let label = Style::default().fg(DIM);
+    let mut spans = vec![
+        Span::styled("RAM: ", label),
+        Span::styled(total, value),
+        Span::styled(format!(" ({summary})"), value),
+    ];
+    if let Some(speed) = speed {
+        spans.push(Span::styled(format!(" {speed}"), value));
+    }
+    spans.push(Span::styled(" | ", label));
+    spans.push(Span::styled(channel, value));
+    if let Some(note) = note {
+        spans.push(Span::styled(" | ", label));
+        spans.push(Span::styled(note, Style::default().fg(AMBER)));
+    }
+    spans.push(Span::styled(" | Mode: ", label));
+    spans.push(Span::styled(mode, Style::default().fg(mode_color)));
+    Line::from(spans)
+}
+
+/// The binary → decimal capacity conversion factor (1 GiB =
+/// 1.073741824 GB; the GUI `GIB_TO_GB` mirror).
+const GIB_TO_GB: f64 = 1.073741824;
+
+/// One capacity readout (the carried GiB wire value) as display text in
+/// the selected capacity unit (the GUI `format_capacity`/`trim` mirror,
+/// C7-11): the GiB arm keeps the value (`16 GiB`), the GB arm converts
+/// × [`GIB_TO_GB`] (`17.2 GB`); a whole number renders without
+/// decimals, one decimal otherwise; a non-finite value degrades to the
+/// honest `N/A`.
+fn format_capacity(gib: f64, capacity_gib: bool) -> String {
+    if !gib.is_finite() {
+        return "N/A".to_owned();
+    }
+    let trim = |v: f64| {
+        if (v - v.round()).abs() < 0.05 {
+            format!("{v:.0}")
+        } else {
+            format!("{v:.1}")
+        }
+    };
+    if capacity_gib {
+        format!("{} GiB", trim(gib))
+    } else {
+        format!("{} GB", trim(gib * GIB_TO_GB))
+    }
+}
+
+/// The rank word for the header breakdown (the GUI `rank_word` mirror,
+/// C9-01/D-1): `1` → `Single-Rank`, `2` → `Dual-Rank`, `n > 0` →
+/// `<n>-Rank`; a `Na`/`0` rank yields `None` (the word is omitted from
+/// the group, never printed as `N/A`).
+fn rank_word(rank: &Section<u8>) -> Option<String> {
+    match rank {
+        Section::Value(0) | Section::Na(_) => None,
+        Section::Value(1) => Some("Single-Rank".to_owned()),
+        Section::Value(2) => Some("Dual-Rank".to_owned()),
+        Section::Value(other) => Some(format!("{other}-Rank")),
+    }
+}
+
+/// The per-DIMM capacity summary (the GUI `dimm_summary` mirror,
+/// C9-01/D-1): one `<count>x<size>` group per distinct carried
+/// `(size, rank word)` (first-seen order, ` + `-joined, the size in the
+/// selected capacity unit — [`format_capacity`]); the rank word from
+/// the parallel `spd` slice (positionally aligned with `sizes`, the
+/// facade contract) is appended when present (`2x16 GiB Single-Rank`);
+/// a `Na` size contributes nothing; an all-`Na` / empty list degrades
+/// to `N/A`.
+fn dimm_summary(sizes: &[Section<f64>], spd: &[SpdModule], capacity_gib: bool) -> String {
+    let mut groups: Vec<(f64, Option<String>, usize)> = Vec::new();
+    for (slot, cell) in sizes.iter().enumerate() {
+        if let Some(gib) = cell.value() {
+            let rank = spd.get(slot).and_then(|module| rank_word(&module.rank));
+            match groups
+                .iter_mut()
+                .find(|(value, word, _)| (value - gib).abs() < 0.05 && *word == rank)
+            {
+                Some(group) => group.2 += 1,
+                None => groups.push((*gib, rank, 1)),
+            }
+        }
+    }
+    if groups.is_empty() {
+        "N/A".to_owned()
+    } else {
+        groups
+            .iter()
+            .map(|(gib, rank, count)| match rank {
+                Some(word) => format!("{count}x{} {word}", format_capacity(*gib, capacity_gib)),
+                None => format!("{count}x{}", format_capacity(*gib, capacity_gib)),
+            })
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+}
+
+/// The channel mode from the DIMM count (the GUI `channel_mode` mirror,
+/// D-C8): 1 / 2 / 4 → Single- / Dual- / Quad-Channel; any other count
+/// (0, odd) degrades to `N/A`.
+fn channel_mode(dimm_count: usize) -> String {
+    match dimm_count {
+        1 => "Single-Channel".to_owned(),
+        2 => "Dual-Channel".to_owned(),
+        4 => "Quad-Channel".to_owned(),
+        _ => "N/A".to_owned(),
+    }
+}
+
+/// The total-vs-breakdown slot note (the GUI `slot_note` mirror,
+/// C9-01/D-1): the OS total can strictly exceed the SPD-visible sum
+/// when the host installs more DIMMs than the SPD bus binds (the live
+/// host: 4×16 GiB installed, 2 bound). A uniform per-module size whose
+/// quotient `total / u` lands within a tenth of a module of an integer
+/// `n` above the visible count → `<visible> of <n> slots SPD-visible`
+/// (the OS reserves a fraction of the installed capacity, so the
+/// quotient sits just below the integer); any other excess → `SPD sees
+/// <visible> of the installed capacity`. A `Na` / non-finite total, no
+/// visible modules, or `total ≤ sum` → `None` (no false alarm).
+/// Unit-agnostic: counts, not GiB.
+fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String> {
+    let total = total.value().copied().filter(|value| value.is_finite())?;
+    let visible: Vec<f64> = sizes.iter().filter_map(|cell| cell.value().copied()).collect();
+    if visible.is_empty() {
+        return None;
+    }
+    let sum = visible.iter().sum::<f64>();
+    if total <= sum {
+        return None;
+    }
+    let uniform = visible.iter().all(|value| (value - visible[0]).abs() < 0.05);
+    if uniform {
+        let unit = visible[0];
+        if unit > 0.0 {
+            let quotient = total / unit;
+            let slots = quotient.round();
+            if (quotient - slots).abs() <= 0.1 && slots > visible.len() as f64 {
+                return Some(format!("{} of {slots:.0} slots SPD-visible", visible.len()));
+            }
+        }
+    }
+    Some(format!("SPD sees {} of the installed capacity", visible.len()))
+}
+
+/// Line 3's mode segment over one clock readout (the GUI
+/// `sync_mode_from_clocks` mirror, D-C8): the UCLK:MCLK ratio + its
+/// semantic color — AMBER for `Synchronous 1:1` (with the MCLK in the
+/// selected clock unit when it carries one — [`format_clock`]),
+/// CRIMSON for `Asynchronous 1:2`, and DIM for the honest `N/A`.
+fn sync_mode_from_clocks(clocks: &ClockReadout, clock_mhz: bool) -> (String, Color) {
+    match clocks.div_mode.value() {
+        Some(DivMode::OneToOne) => {
+            let text = match clocks.mclk_mhz.value() {
+                Some(mhz) => {
+                    format!("Synchronous 1:1 (UCLK = MCLK = {})", format_clock(*mhz, clock_mhz))
+                }
+                None => "Synchronous 1:1".to_owned(),
+            };
+            (text, AMBER)
+        }
+        Some(DivMode::OneToTwo) => ("Asynchronous 1:2".to_owned(), CRIMSON),
+        None => ("N/A".to_owned(), DIM),
+    }
+}
+
+/// Line 3's mode segment over a whole snapshot (the GUI `sync_mode`
+/// mirror): the AMD branch must carry a value whose `div_mode` is
+/// usable, else the honest `N/A` (DIM) — the Intel / driver-missing /
+/// degraded states all degrade here (never a panic).
+fn sync_mode(t: &SystemMemoryTelemetry, clock_mhz: bool) -> (String, Color) {
+    match t.amd.value() {
+        Some(readout) => sync_mode_from_clocks(&readout.clocks, clock_mhz),
+        None => ("N/A".to_owned(), DIM),
+    }
+}
+
+/// The line-3 pieces — the single source of truth for the flat
+/// [`ram_line_prefix`] text and the per-segment-coloured
+/// [`header_line3`]: the total (selected capacity unit), the
+/// breakdown, the optional max-SPD speed, the channel mode, the
+/// optional slot note, and the mode segment (text + color).
+fn ram_line3_parts(
+    t: &SystemMemoryTelemetry,
+    capacity_gib: bool,
+    clock_mhz: bool,
+) -> (
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    (String, Color),
+) {
+    let total = match t.total_capacity.value() {
+        Some(gib) => format_capacity(*gib, capacity_gib),
+        None => "N/A".to_owned(),
+    };
+    let summary = dimm_summary(&t.dimm_sizes, &t.spd, capacity_gib);
+    let speed = t
+        .spd
+        .iter()
+        .filter_map(|m| m.speed_mts.value().copied())
+        .max()
+        .map(|mts| format!("{mts} MT/s"));
+    let channel = channel_mode(t.dimm_sizes.len());
+    let note = slot_note(&t.total_capacity, &t.dimm_sizes);
+    let mode = sync_mode(t, clock_mhz);
+    (total, summary, speed, channel, note, mode)
+}
+
+/// Line 3's non-mode part (the GUI `ram_line_prefix` mirror, C6-20/
+/// C9-01): the total capacity in the selected capacity unit, the
+/// per-DIMM breakdown (with the rank word), the max SPD speed (omitted
+/// when no module carries one), the channel mode, the slot note when
+/// the OS total strictly exceeds the SPD sum, and the `Mode: ` lead-in
+/// the mode segment completes.
+///
+/// Test-only: [`header_line3`] builds its per-segment-coloured spans
+/// from [`ram_line3_parts`] directly; this flat-text form exists so the
+/// composed line is assertable string-for-string (the GUI mirror).
+#[cfg(test)]
+fn ram_line_prefix(t: &SystemMemoryTelemetry, capacity_gib: bool) -> String {
+    let (total, summary, speed, channel, note, _) = ram_line3_parts(t, capacity_gib, true);
+    let mut line = format!("RAM: {total} ({summary})");
+    if let Some(speed) = speed {
+        line.push_str(&format!(" {speed}"));
+    }
+    line.push_str(&format!(" | {channel}"));
+    if let Some(note) = note {
+        line.push_str(&format!(" | {note}"));
+    }
+    line.push_str(" | Mode: ");
+    line
+}
+
+/// Line 1's platform tag (the GUI's line-1 tag mirror, C6-20): the CPU
+/// vendor + a best-effort socket family — the Zen 1–3 map to `AM4`,
+/// Zen 4/5 to `AM5`, Intel to the generic `LGA` family (a generation
+/// does not identify a socket number unambiguously — mobile and desktop
+/// share generations), and no telemetry (or an unrecognized vendor)
+/// carries the honest bare `Platform`.
+fn platform_tag(vendor: Option<&CpuVendor>) -> String {
+    match vendor {
+        Some(CpuVendor::Amd(AmdZen::Zen1 | AmdZen::Zen2 | AmdZen::Zen3)) => {
+            "AMD AM4 Platform".to_owned()
+        }
+        Some(CpuVendor::Amd(AmdZen::Zen4 | AmdZen::Zen5)) => "AMD AM5 Platform".to_owned(),
+        Some(CpuVendor::Intel(_)) => "Intel LGA Platform".to_owned(),
+        _ => "Platform".to_owned(),
+    }
+}
+
+/// The §2.2 frozen key map (canonical R/S/Q-first order) as the compact
+/// dim legend line 1 carries: the longest prefix of entries that fits
+/// `budget` columns (`" · "` between entries) — an entry that does not
+/// fit is dropped whole, never cut mid-token (the width-truncation
+/// rule); a zero budget yields the empty legend.
+fn key_legend(budget: usize) -> String {
+    const ENTRIES: &[&str] = &[
+        "R refresh", "S snapshot", "Q quit", "B bench", "M memory", "X burn-in",
+        "C cancel", "E export", "G graphs", "T settings", "D reqs", "P poll",
+        "U cap", "K clock", "A auto", "W window",
+    ];
+    let mut text = String::new();
+    for entry in ENTRIES {
+        let candidate = if text.is_empty() {
+            entry.to_string()
+        } else {
+            format!("{text} · {entry}")
+        };
+        if candidate.chars().count() > budget {
+            break;
+        }
+        text = candidate;
+    }
+    text
+}
+
+/// One clock readout (the carried MHz wire value) as display text in
+/// the selected clock unit (the GUI `format_clock`/`trim` mirror,
+/// C7-11): the MHz arm keeps the value (`3500 MHz`), the GHz arm ÷1000
+/// (`3.5 GHz`); a whole number renders without decimals, one decimal
+/// otherwise; a non-finite value degrades to the honest `N/A`.
+fn format_clock(mhz: f64, clock_mhz: bool) -> String {
+    if !mhz.is_finite() {
+        return "N/A".to_owned();
+    }
+    let trim = |v: f64| {
+        if (v - v.round()).abs() < 0.05 {
+            format!("{v:.0}")
+        } else {
+            format!("{v:.1}")
+        }
+    };
+    if clock_mhz {
+        format!("{} MHz", trim(mhz))
+    } else {
+        format!("{} GHz", trim(mhz / 1000.0))
+    }
+}
+
+/// One `Section<String>` cell as display text (the header's honest
+/// degradation rule): the contained value, or `N/A`.
+fn cell_text(cell: &Section<String>) -> String {
+    match cell {
+        Section::Value(v) => v.clone(),
+        Section::Na(_) => "N/A".to_owned(),
+    }
+}
+
+/// Line 2's AGESA/SMU provenance fragment (the GUI `age_fragment`
+/// mirror, C8-11/D-1): the header labels the value by where it came
+/// from — a true AGESA token (the DMI BIOS string scan) renders
+/// `AGESA <v>` and suppresses the SMU value (the D-1 precedence); else
+/// a shape-checked `ryzen_smu` firmware version renders under its own
+/// `SMU` label (never the reported `AGESA <smu value>` mislabel); else
+/// the honest `AGESA N/A`. One value, one true label — no hybrid, never
+/// fabricated.
+fn age_fragment(platform: &SystemPlatform) -> String {
+    match (&platform.agesa, &platform.smu_version) {
+        (Section::Value(v), _) => format!("AGESA {v}"),
+        (Section::Na(_), Section::Value(v)) => format!("SMU {v}"),
+        (Section::Na(_), Section::Na(_)) => "AGESA N/A".to_owned(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top strips (TUI-16 — the composition chunk): the settings strip line
+// (the requirements strip's presence / height + the graphs overlay are
+// composed directly in [`render`]).
+// ---------------------------------------------------------------------------
+
+/// The settings strip's poll-interval segment (the `[p]` knob): a
+/// whole-second value renders in seconds (`2 s`, `60 s`), a
+/// sub-second value in milliseconds (`100 ms`, `500 ms`) — the
+/// TUI-22 preset cycle's display form (a non-preset value keeps its
+/// raw `ms` form — deterministic, never a panic).
+fn poll_interval_text(ms: u64) -> String {
+    if ms % 1000 == 0 {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{ms} ms")
+    }
+}
+
+/// The settings strip's socket segment: the frozen state carries no
+/// socket field (TUI-09's shape freeze — the `--socket` CLI flag is
+/// the one source), so the live path is read off the `connected:
+/// <path>` daemon status; every other status (`disconnected`, the
+/// transient `snapshot: …`, empty) degrades to the `—` placeholder.
+fn socket_path_text(state: &AppState) -> String {
+    state
+        .daemon_status
+        .strip_prefix("connected: ")
+        .map(str::to_owned)
+        .unwrap_or_else(|| "—".to_owned())
+}
+
+/// The settings strip's one-line body (the plan's frozen form): `Poll
+/// <interval> [p] · Capacity <GiB|GB> [u] · Clock <MHz|GHz> [k] ·
+/// Refresh <on|off> [a] · Socket <path> (--socket)` — every knob
+/// reads the frozen `settings` fields, the key hints inline (the
+/// header legend stays the canonical key map, TUI-10).
+fn settings_strip_body(state: &AppState) -> String {
+    let settings = &state.settings;
+    format!(
+        "Poll {} [p] · Capacity {} [u] · Clock {} [k] · Refresh {} [a] · Socket {} (--socket)",
+        poll_interval_text(settings.poll_interval_ms),
+        if settings.capacity_gib { "GiB" } else { "GB" },
+        if settings.clock_mhz { "MHz" } else { "GHz" },
+        if settings.refresh { "on" } else { "off" },
+        socket_path_text(state),
+    )
+}
+
+/// The settings strip as a rendered line (shown by [`render`] as one
+/// row under the header while `settings.settings_open`): the cyan
+/// `Settings: ` lead (the GUI strip's strong-cyan label precedent) +
+/// the dim body ([`settings_strip_body`]).
+fn settings_strip_line(state: &AppState) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("Settings: ", Style::default().fg(CYAN)),
+        Span::styled(settings_strip_body(state), Style::default().fg(DIM)),
+    ])
+}
+
+/// The settings strip line's flat text (the composed spans'
+/// string-for-string form — the test's assertion surface, the TUI-11
+/// `ram_line_prefix` precedent).
+#[cfg(test)]
+fn settings_strip_text(state: &AppState) -> String {
+    format!("Settings: {}", settings_strip_body(state))
 }
 
 // ---------------------------------------------------------------------------
@@ -376,8 +927,11 @@ fn readout_items(
         _ => CYAN,
     };
     items.push(cell_row("UCLK:MCLK", &clocks.div_mode, div_color, fmt_div));
-    items.push(cell_row("gear", &clocks.gear_mode, CYAN, fmt_gear));
-    items.push(cell_row("GDM", &clocks.gdm, CYAN, fmt_flag));
+    // The `GDM / CR` split (the GUI's D-6 form): the gear-down mode and
+    // the DRAM command rate each own a bare-value row; an absent cell
+    // degrades its row to the GUI's bare `N/A` (D-4).
+    items.push(bare_na_row("GEAR_DOWN", &clocks.gdm, CYAN, fmt_gear_down));
+    items.push(bare_na_row("CR", &clocks.command_rate, CYAN, fmt_cr));
     items.push(cell_row("PDM", &clocks.pdm, CYAN, fmt_flag));
 
     let primary: &[(&str, &Section<u16>)] = &[
@@ -433,6 +987,9 @@ fn readout_items(
     items.push(cell_row("CKE drive", &cad_bus.cke_drv, CYAN, fmt_ohms));
 
     items.push(sub_item("voltages"));
+    // The Vcore primary rail (the C12 frozen wire field) leads the
+    // section exactly as the GUI; on Intel it degrades to a bare N/A.
+    items.push(bare_na_row("VDDCR_VDD", &voltages.vcore_mv, CYAN, fmt_volts));
     // A SOC rail above 1.30 V is out of spec on AM5 -> amber warning.
     let soc_color = match &voltages.vddcr_soc_mv {
         Section::Value(mv) if f64::from(*mv) > 1300.0 => AMBER,
@@ -461,8 +1018,17 @@ fn tick_rows(items: &mut Vec<ListItem<'static>>, pairs: &[(&str, &Section<u16>)]
 // Zone 2 — AIDA-style benchmark engine.
 // ---------------------------------------------------------------------------
 
-/// Zone 2: the 4×4 grid (five rows: header + four tiers) + one progress
-/// line + slack (clipped, never scrolled).
+/// The `Status: Done` line's green (the GUI `bench_zone` C7-17 zone-local
+/// const — a dark-slate-compatible green; the §3.2 palette stays frozen:
+/// the status colors are zone-local, not a palette entry).
+const STATUS_DONE: Color = Color::Rgb(0x2E, 0x9E, 0x5B);
+
+/// Zone 2: the 4×4 grid (five rows: header + four tiers) + the flat
+/// status line + the controls line + the burn-in row (blank when no
+/// burn-in runs) + slack — clipped, never scrolled. The fixed
+/// 5 + 1 + 1 + 1 row slots keep the zone's layout stable as the rows
+/// appear (the GUI's no-layout-shift rule, the terminal adaptation:
+/// an absent row leaves its slot blank, the rows below it never move).
 fn render_zone2(frame: &mut Frame, state: &AppState, area: Rect) {
     let block = zone_block("2 · BENCH (GB/s)");
     let inner = block.inner(area);
@@ -471,27 +1037,160 @@ fn render_zone2(frame: &mut Frame, state: &AppState, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5), // the grid (header + four tier rows)
-            Constraint::Length(1), // the progress line
+            Constraint::Length(1), // the flat status line (C7-17)
+            Constraint::Length(1), // the controls line (TUI-14)
+            Constraint::Length(1), // the burn-in row (TUI-14, blank when absent)
             Constraint::Fill(1),   // slack
         ])
         .split(inner);
-    frame.render_widget(bench_table(state.bench.grid.as_ref()), parts[0]);
-    let (text, color) = progress_line(&state.bench);
+    frame.render_widget(bench_table(&state.bench), parts[0]);
+    let (text, color) = bench_status(&state.bench);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(&text, Style::default().fg(color)))),
         parts[1],
     );
+    frame.render_widget(Paragraph::new(controls_line(&state.bench)), parts[2]);
+    if let Some(row) = burn_in_row_line(&state.bench.burn_in) {
+        frame.render_widget(Paragraph::new(row), parts[3]);
+    }
 }
 
-/// The 4×4 grid: tier rows × Read/Write/Copy/Latency columns.
-///
-/// The cells are bare two-decimal numbers: the Read/Write/Copy columns are
-/// GB/s (named in the zone title) and the last column is ns/hop (named in
-/// its header), the AIDA64 grid convention at terminal width. An
-/// unmeasured cell (`0.0` on the wire — the grid carries no `Na` arm) and
-/// a missing grid (no run yet) render `N/A` (crimson); measured cells are
-/// cyan.
-fn bench_table(grid: Option<&BenchmarkGrid>) -> Table<'static> {
+/// The live in-flight grid for a **normal** bench (the GUI
+/// `bench_zone::live_grid` rule): accumulate each streamed
+/// [`StreamProgress`] event's (tier, op, value) into a zero grid — the
+/// latest event per cell wins. The row is the tier (its discriminant is
+/// the grid-array slot: `Memory = 0, L1 = 1, L2 = 2, L3 = 3`) and the
+/// column is the op (`Read` / `Write` / `Copy`); the stream carries
+/// bandwidth ops only (no latency events — the streamed contract), so
+/// the `latency_ns` column stays 0.0. A non-finite or non-positive value
+/// is ignored (never renders as data), and unmeasured cells stay 0.0
+/// (which renders `N/A`). A burn-in's live grid is `burn_in.latest`
+/// instead (C7-18 — see [`table_live_grid`]).
+fn live_grid(progress: &[StreamProgress]) -> BenchmarkGrid {
+    let mut grid = BenchmarkGrid {
+        read_gbps: [0.0; 4],
+        write_gbps: [0.0; 4],
+        copy_gbps: [0.0; 4],
+        latency_ns: [0.0; 4],
+    };
+    for event in progress {
+        if !event.value.is_finite() || event.value <= 0.0 {
+            continue; // a malformed reading never renders as data
+        }
+        let slot = event.tier as usize;
+        match event.op {
+            BenchOp::Read => grid.read_gbps[slot] = event.value,
+            BenchOp::Write => grid.write_gbps[slot] = event.value,
+            BenchOp::Copy => grid.copy_gbps[slot] = event.value,
+        }
+    }
+    grid
+}
+
+/// The 4×4 grid's live in-flight grid for the current run (the GUI
+/// `table_live_grid`, C7-18): a burn-in in flight shows `burn_in.latest`
+/// (the newest per-cell values seen this burn-in — the cells update per
+/// iteration), a normal bench in flight the accumulated
+/// [`live_grid`]; neither in flight → the (unused) progress
+/// accumulation is returned harmlessly (the terminal grid renders).
+fn table_live_grid(bench: &BenchState) -> BenchmarkGrid {
+    if bench.burn_in.running {
+        bench.burn_in.latest.clone()
+    } else {
+        live_grid(&bench.progress)
+    }
+}
+
+/// One grid cell's render phase within the zone's current run state (the
+/// GUI `bench_zone` C7-17/18 mirror).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellPhase {
+    /// The run is not in flight: the cell shows its terminal value from
+    /// the result grid (or the `N/A` placeholder when unmeasured).
+    Terminal,
+    /// A run is in flight and the cell has a live value: the dimmed
+    /// in-flight fill + a `…` suffix.
+    Live,
+    /// A run is in flight and the cell has no live value yet — not
+    /// started, or a latency cell of a normal bench (no progress
+    /// events): the `N/A` placeholder.
+    NotStarted,
+}
+
+/// One cell's render [`CellPhase`]: not in flight → `Terminal` (the
+/// result grid); in flight → `Live` when the live grid carries a
+/// (finite, positive) value for the cell, else `NotStarted` (a cell not
+/// started yet, or a normal-bench latency cell — the stream carries no
+/// latency events).
+fn cell_phase(in_flight: bool, live: &BenchmarkGrid, tier: Tier, metric: Metric) -> CellPhase {
+    if !in_flight {
+        return CellPhase::Terminal;
+    }
+    let value = live.cell(tier, metric);
+    if value.is_finite() && value > 0.0 {
+        CellPhase::Live
+    } else {
+        CellPhase::NotStarted
+    }
+}
+
+/// One cell's display for its render [`CellPhase`] (the bare
+/// terminal-width form): the terminal value in the existing two-decimal
+/// shape — cyan for a measured reading (a non-finite / unmeasured cell
+/// degrades to the crimson `N/A`, the GUI's guard), the live in-flight
+/// value with a `…` suffix (dimmed — the terminal adaptation of the
+/// GUI's dimmed-cyan fill), or the `N/A` placeholder.
+fn bench_cell_text(
+    phase: CellPhase,
+    terminal: &BenchmarkGrid,
+    live: &BenchmarkGrid,
+    tier: Tier,
+    metric: Metric,
+) -> (String, Color) {
+    match phase {
+        CellPhase::Terminal => {
+            let value = terminal.cell(tier, metric);
+            if value.is_finite() && value > 0.0 {
+                (format!("{value:.2}"), CYAN)
+            } else {
+                ("N/A".to_owned(), CRIMSON)
+            }
+        }
+        CellPhase::Live => {
+            let value = live.cell(tier, metric);
+            (format!("{value:.2}…"), DIM)
+        }
+        CellPhase::NotStarted => ("N/A".to_owned(), CRIMSON),
+    }
+}
+
+/// The 4×4 grid: tier rows × Read/Write/Copy/Latency columns, in its
+/// current run state (the GUI `render_grid_table` mirror, the bare
+/// terminal-width form: the Read/Write/Copy columns are GB/s — named in
+/// the zone title — and the last column is ns/hop, the AIDA64
+/// convention). **Not in flight** — the terminal result grid of the
+/// last completed run (or the all-`N/A` zero grid when none has landed
+/// yet — the layout never shifts when the result lands); **a run in
+/// flight** — the [`table_live_grid`] overlay: the live cells dimmed
+/// with a `…` suffix, the unstarted cells (and a normal bench's latency
+/// column — the stream carries no latency events) keep `N/A`, the
+/// terminal grid hidden until the run settles.
+fn bench_table(bench: &BenchState) -> Table<'static> {
+    // The terminal result grid of the last completed run, or the
+    // all-`N/A` zero grid when none has landed yet.
+    let terminal = match bench.grid.as_ref() {
+        Some(grid) => grid.clone(),
+        None => BenchmarkGrid {
+            read_gbps: [0.0; 4],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [0.0; 4],
+        },
+    };
+    // Any run in flight (a normal bench or a burn-in) → the live cells
+    // render the in-flight fill.
+    let in_flight = bench.running || bench.burn_in.running;
+    let live = table_live_grid(bench);
     let header = Row::new(
         ["", "Read", "Write", "Copy", "ns/hop"]
             .iter()
@@ -501,13 +1200,13 @@ fn bench_table(grid: Option<&BenchmarkGrid>) -> Table<'static> {
     for &tier in &[Tier::Memory, Tier::L1, Tier::L2, Tier::L3] {
         let mut cells = vec![Cell::from(tier_name(tier)).style(Style::default().fg(CYAN))];
         for &metric in &[Metric::Read, Metric::Write, Metric::Copy, Metric::Latency] {
-            let value = grid
-                .map(|g| g.cell(tier, metric))
-                .filter(|v| *v != 0.0);
-            let (text, color) = match value {
-                Some(v) => (format!("{v:.2}"), CYAN),
-                None => ("N/A".to_owned(), CRIMSON),
-            };
+            let (text, color) = bench_cell_text(
+                cell_phase(in_flight, &live, tier, metric),
+                &terminal,
+                &live,
+                tier,
+                metric,
+            );
             cells.push(Cell::from(text).style(Style::default().fg(color)));
         }
         rows.push(Row::new(cells));
@@ -524,29 +1223,255 @@ fn bench_table(grid: Option<&BenchmarkGrid>) -> Table<'static> {
     )
 }
 
-/// The one-line benchmark progress indicator: `[i/total] label value`
-/// while a run streams, `running` when one just started, `done` after a
-/// completed run, `idle` otherwise.
-fn progress_line(bench: &BenchState) -> (String, Color) {
-    if bench.running {
-        match bench.progress.last() {
-            Some(p) => (
-                format!(
-                    "bench: [{}/{}] {} {value:.2}",
-                    p.cell_index + 1,
-                    p.total_cells,
-                    p.label,
-                    value = p.value
-                ),
-                CYAN,
-            ),
-            None => ("bench: running...".to_owned(), AMBER),
+/// The bench zone's flat status line state (the GUI `bench_zone` C7-17
+/// mirror — the progress line's pill retired): the idle rest state, a
+/// run in flight (with the run's elapsed), and a finished run (a
+/// terminal grid or kept streamed progress present).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StatusState {
+    /// No run in flight and no run has finished: the dim `Status: Idle`
+    /// line.
+    Idle,
+    /// A run (a normal bench or a burn-in) is in flight: the CYAN
+    /// running line; `elapsed_secs` is the run's elapsed (the newest
+    /// tick's for a burn-in, the zone's start clock's for a normal
+    /// bench). `burn_in_iteration` is `Some(n)` for a burn-in (the
+    /// `Status: Running… (burn-in <m:ss>, iter <n>)` line) and `None`
+    /// for a normal bench (the `Status: Running… <m:ss>` line).
+    Running { elapsed_secs: f64, burn_in_iteration: Option<u32> },
+    /// A run finished (a terminal grid landed, or streamed progress is
+    /// kept): the green `Status: Done` line.
+    Done,
+}
+
+/// The status state of one run bookkeeping (the GUI `status_state`
+/// mirror): a burn-in in flight → `Running` (the newest tick's elapsed +
+/// iteration — the normal-bench flag stays false for a burn-in, C7-16),
+/// a normal bench in flight → `Running` (the zone's start clock's
+/// elapsed, no burn-in iteration), neither in flight but a terminal
+/// grid or kept streamed progress present → `Done`, the fresh state (no
+/// grid, no progress) → `Idle`. The `Done` corner deliberately includes
+/// the kept-progress-only shape (a cancelled normal bench with no
+/// terminal grid): a non-empty progress list with no run in flight is a
+/// finished run, not an idle one.
+fn status_state(
+    running: bool,
+    burn_in_running: bool,
+    grid_present: bool,
+    progress_present: bool,
+    running_elapsed_secs: f64,
+    burn_in_iteration: u32,
+) -> StatusState {
+    if burn_in_running {
+        StatusState::Running {
+            elapsed_secs: running_elapsed_secs,
+            burn_in_iteration: Some(burn_in_iteration),
         }
-    } else if bench.grid.is_some() {
-        ("bench: done".to_owned(), DIM)
+    } else if running {
+        StatusState::Running {
+            elapsed_secs: running_elapsed_secs,
+            burn_in_iteration: None,
+        }
+    } else if grid_present || progress_present {
+        StatusState::Done
     } else {
-        ("bench: idle".to_owned(), DIM)
+        StatusState::Idle
     }
+}
+
+/// One run's elapsed in the status line's `m:ss` form (the GUI
+/// `format_elapsed` mirror — the plan's `0:42`): the minutes un-padded,
+/// the seconds two-digit; a non-finite / non-positive reading renders
+/// `0:00` (a bad elapsed never panics the line, the no-panic contract).
+fn format_elapsed(secs: f64) -> String {
+    let total = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+/// The flat status line's text (the GUI `status_text` mirror):
+/// `Status: Idle`, `Status: Running… <m:ss>` (a normal bench — the `…`
+/// kept static, the repaint animates the elapsed), `Status: Running…
+/// (burn-in <m:ss>, iter <n>)` (a burn-in, C7-18), `Status: Done`.
+fn status_text(state: StatusState) -> String {
+    match state {
+        StatusState::Idle => "Status: Idle".to_owned(),
+        StatusState::Running {
+            elapsed_secs,
+            burn_in_iteration,
+        } => match burn_in_iteration {
+            Some(iter) => format!(
+                "Status: Running… (burn-in {}, iter {})",
+                format_elapsed(elapsed_secs),
+                iter
+            ),
+            None => format!("Status: Running… {}", format_elapsed(elapsed_secs)),
+        },
+        StatusState::Done => "Status: Done".to_owned(),
+    }
+}
+
+/// The flat status line's color (the GUI `status_color` mirror, the
+/// terminal palette): the idle line is dim, the running line CYAN (a
+/// normal bench or a burn-in), the done line the zone-local green
+/// [`STATUS_DONE`].
+fn status_color(state: StatusState) -> Color {
+    match state {
+        StatusState::Idle => DIM,
+        StatusState::Running { .. } => CYAN,
+        StatusState::Done => STATUS_DONE,
+    }
+}
+
+/// The zone-local start clock for a normal bench run (the GUI
+/// `bench_zone` C7-17 precedent): the moment the zone first saw a normal
+/// bench in flight (a repaint within one frame of the run's start). The
+/// burn-in needs no clock — its newest tick carries the elapsed
+/// (`burn_in.elapsed_secs`). Stamped on the first in-flight frame,
+/// cleared on the terminal; a poisoned lock is recovered in place (the
+/// render thread is the sole user — the no-panic contract).
+static NORMAL_RUN_START: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Stamp / clear the zone-local normal-run start clock for this frame's
+/// run state, returning the start instant while a normal bench is in
+/// flight (`None` outside one — the terminal cleared it).
+fn track_run_start(running: bool) -> Option<Instant> {
+    let mut guard = NORMAL_RUN_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if running {
+        Some(*guard.get_or_insert_with(Instant::now))
+    } else {
+        *guard = None;
+        None
+    }
+}
+
+/// The bench zone's flat status line (the GUI C7-17 mirror): a single
+/// text line below the grid — `Status: Idle` dim, `Status: Running…
+/// <m:ss>` CYAN (a normal bench — elapsed from the zone's start clock),
+/// `Status: Running… (burn-in <m:ss>, iter <n>)` CYAN (a burn-in — the
+/// newest tick's elapsed + iteration), `Status: Done` in the
+/// zone-local green.
+fn bench_status(bench: &BenchState) -> (String, Color) {
+    let burn_in = &bench.burn_in;
+    let running_elapsed = if burn_in.running {
+        burn_in.elapsed_secs
+    } else {
+        track_run_start(bench.running).map_or(0.0, |start| start.elapsed().as_secs_f64())
+    };
+    let state = status_state(
+        bench.running,
+        burn_in.running,
+        bench.grid.is_some(),
+        !bench.progress.is_empty(),
+        running_elapsed,
+        burn_in.iteration,
+    );
+    (status_text(state), status_color(state))
+}
+
+/// The controls line's flat text (the GUI `render_controls` terminal
+/// form, TUI-14): the three run keys — `[B] Full` (a full-scope
+/// bench), `[M] Mem` (a memory-only bench), `[X] Burn-in(5m)` (the
+/// GUI's 5-minute burn-in preset) — always present, plus `[C] Cancel`
+/// shown only while a run (a normal bench or a burn-in) is in flight
+/// (the GUI single-flight rule: the run keys disable while one is in
+/// flight, and `Cancel` stops it).
+///
+/// Test-only: [`controls_line`] builds its per-segment-coloured spans
+/// directly; this flat-text form exists so the composed line is
+/// assertable string-for-string (the TUI-11 `ram_line_prefix`
+/// precedent).
+#[cfg(test)]
+fn controls_text(bench: &BenchState) -> String {
+    const RUN_KEYS: &str = "[B] Full  [M] Mem  [X] Burn-in(5m)";
+    if bench.running || bench.burn_in.running {
+        format!("{RUN_KEYS}  [C] Cancel")
+    } else {
+        RUN_KEYS.to_owned()
+    }
+}
+
+/// The controls line as a rendered line (TUI-14): each run key is
+/// CYAN (the actionable part) with its label dim when the run keys
+/// are enabled; while any run is in flight (a normal bench or a
+/// burn-in) the run key spans dim (the GUI disabled-button form) and
+/// the CYAN `[C] Cancel` entry appears to stop it.
+fn controls_line(bench: &BenchState) -> Line<'static> {
+    let in_flight = bench.running || bench.burn_in.running;
+    let run_key = if in_flight { DIM } else { CYAN };
+    let mut spans = vec![
+        Span::styled("[B]", Style::default().fg(run_key)),
+        Span::styled(" Full  ", Style::default().fg(DIM)),
+        Span::styled("[M]", Style::default().fg(run_key)),
+        Span::styled(" Mem  ", Style::default().fg(DIM)),
+        Span::styled("[X]", Style::default().fg(run_key)),
+        Span::styled(" Burn-in(5m)", Style::default().fg(DIM)),
+    ];
+    if in_flight {
+        spans.push(Span::styled("  [C]", Style::default().fg(CYAN)));
+        spans.push(Span::styled(" Cancel", Style::default().fg(DIM)));
+    }
+    Line::from(spans)
+}
+
+/// The live burn-in row's flat text (the GUI `burn_in_row` mirror,
+/// C7-18 / TUI-14): the newest tick's bookkeeping + the headline
+/// `latest` values — `Burn-in: iteration <n> · <m:ss> elapsed ·
+/// Memory Read <…> · <latency>`; the cells in the plain grid form
+/// (the [`bench_cell_text`] Terminal arm — unit-less, the zone title
+/// carries the GB/s unit and the `ns/hop` column header the ns one),
+/// a cell not yet streamed (0.0 on the wire) or a non-finite reading
+/// reads `N/A`. `None` when no burn-in is in flight (the row is
+/// absent — its fixed layout slot stays blank, the no-layout-shift
+/// rule).
+///
+/// Test-only: [`burn_in_row_line`] builds its per-segment-coloured
+/// spans from the same pieces; this flat-text form exists so the
+/// composed line is assertable string-for-string (the TUI-11
+/// `ram_line_prefix` precedent).
+#[cfg(test)]
+fn burn_in_row_text(burn_in: &BurnInState) -> Option<String> {
+    if !burn_in.running {
+        return None;
+    }
+    let grid = &burn_in.latest;
+    let read = bench_cell_text(CellPhase::Terminal, grid, grid, Tier::Memory, Metric::Read).0;
+    let latency =
+        bench_cell_text(CellPhase::Terminal, grid, grid, Tier::Memory, Metric::Latency).0;
+    Some(format!(
+        "Burn-in: iteration {} · {} elapsed · Memory Read {} · {}",
+        burn_in.iteration,
+        format_elapsed(burn_in.elapsed_secs),
+        read,
+        latency
+    ))
+}
+
+/// The live burn-in row as a rendered line (TUI-14): the dim
+/// `Burn-in: iteration <n> · <m:ss> elapsed · Memory Read` prefix,
+/// then the two `latest` headline cells in their own measured /
+/// `N/A` colors (the [`bench_cell_text`] Terminal arm).
+fn burn_in_row_line(burn_in: &BurnInState) -> Option<Line<'static>> {
+    if !burn_in.running {
+        return None;
+    }
+    let grid = &burn_in.latest;
+    let (read, read_color) =
+        bench_cell_text(CellPhase::Terminal, grid, grid, Tier::Memory, Metric::Read);
+    let (latency, latency_color) =
+        bench_cell_text(CellPhase::Terminal, grid, grid, Tier::Memory, Metric::Latency);
+    Some(Line::from(vec![
+        Span::styled(
+            format!(
+                "Burn-in: iteration {} · {} elapsed · Memory Read ",
+                burn_in.iteration,
+                format_elapsed(burn_in.elapsed_secs)
+            ),
+            Style::default().fg(DIM),
+        ),
+        Span::styled(read, Style::default().fg(read_color)),
+        Span::styled(" · ", Style::default().fg(DIM)),
+        Span::styled(latency, Style::default().fg(latency_color)),
+    ]))
 }
 
 // ---------------------------------------------------------------------------
@@ -608,8 +1533,9 @@ fn zone3_items(state: &AppState) -> Vec<ListItem<'static>> {
     items
 }
 
-/// One SPD slot: a subheader + maker / part / rank / density / speed
-/// cells + one line per XMP/EXPO profile (or a `none` placeholder).
+/// One SPD slot: a subheader + maker / dram die / part / rank / density
+/// / speed cells + one line per XMP/EXPO profile (or a `none`
+/// placeholder).
 fn spd_module_items(module: &SpdModule) -> Vec<ListItem<'static>> {
     let gen = if module.is_ddr5 { "DDR5" } else { "DDR4" };
     let mut items = vec![sub_item(&format!(
@@ -617,6 +1543,19 @@ fn spd_module_items(module: &SpdModule) -> Vec<ListItem<'static>> {
         module.index
     ))];
     items.push(cell_row("maker", &module.maker, CYAN, |s| s.clone()));
+    // The die row (the GUI `status_zone` "dram die" cell): the composed
+    // `<die_maker> (<die_type>, <density>Gb)` value — cyan when the die
+    // maker is present, a bare crimson `N/A` when it degrades whole.
+    let die = dram_die_line(module);
+    items.push(row(
+        "dram die",
+        &die,
+        if matches!(&module.die_maker, Section::Value(_)) {
+            CYAN
+        } else {
+            CRIMSON
+        },
+    ));
     items.push(cell_row("part", &module.part, CYAN, |s| s.clone()));
     items.push(cell_row("rank", &module.rank, CYAN, |v: &u8| v.to_string()));
     items.push(cell_row("density", &module.density_mbit, CYAN, fmt_density));
@@ -660,6 +1599,44 @@ fn spd_profile_item(is_ddr5: bool, profile: &SpdProfile) -> ListItem<'static> {
     )
 }
 
+/// The DRAM-die row's value (the GUI `status_zone::dram_die_line`
+/// mirror): `<die_maker> (<die_type>, <density>Gb)` with each
+/// parenthetical part dropped when absent — a `Na` die type yields
+/// `<die_maker> (<density>Gb)`, a `Na` density omits the density, and
+/// both absent shows the die maker bare. A `Na` die maker degrades the
+/// whole value to a bare `N/A` (D-4 — the reason stays on the wire).
+/// Never a panic.
+fn dram_die_line(module: &SpdModule) -> String {
+    match &module.die_maker {
+        Section::Na(_) => "N/A".to_owned(),
+        Section::Value(die_maker) => {
+            let mut parts = Vec::new();
+            if let Section::Value(die_type) = &module.die_type {
+                parts.push(die_type.clone());
+            }
+            if let Section::Value(mbit) = &module.density_mbit {
+                parts.push(density_gib(*mbit));
+            }
+            if parts.is_empty() {
+                die_maker.clone()
+            } else {
+                format!("{die_maker} ({})", parts.join(", "))
+            }
+        }
+    }
+}
+
+/// A die density in Gb (the GUI `density_gib` mirror): `Mbit ÷ 1024`
+/// (16384 → `16Gb`); a non-integer conversion (not a real-world
+/// density) keeps the raw `Mbit` form — deterministic, never a panic.
+fn density_gib(mbit: u16) -> String {
+    if mbit % 1024 == 0 {
+        format!("{}Gb", mbit / 1024)
+    } else {
+        format!("{mbit} Mbit")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cell formatters + line primitives.
 // ---------------------------------------------------------------------------
@@ -678,6 +1655,22 @@ fn cell_row<T>(key: &str, section: &Section<T>, color: Color, fmt: impl Fn(&T) -
     match section {
         Section::Value(value) => row(key, &fmt(value), color),
         Section::Na(reason) => row(key, &na_text(reason), CRIMSON),
+    }
+}
+
+/// A cell row in the GUI's bare-`N/A` form (D-4): the value in `color`,
+/// or a bare crimson `N/A` (the reason stays on the wire, never a
+/// parenthetical). The zone-1 `GEAR_DOWN` / `CR` / `VDDCR_VDD` rows
+/// mirror the GUI's per-row degradation exactly.
+fn bare_na_row<T>(
+    key: &str,
+    section: &Section<T>,
+    color: Color,
+    fmt: impl Fn(&T) -> String,
+) -> ListItem<'static> {
+    match section {
+        Section::Value(value) => row(key, &fmt(value), color),
+        Section::Na(_) => row(key, "N/A", CRIMSON),
     }
 }
 
@@ -711,16 +1704,6 @@ fn na_text(reason: &NaReason) -> String {
         NaReason::UnknownPmTableVersion => "N/A (unknown PM table version)".to_owned(),
         NaReason::NotApplicable => "N/A (not applicable)".to_owned(),
         NaReason::ParseError(detail) => format!("N/A (parse error: {detail})"),
-    }
-}
-
-/// The CPU vendor as a display string (the snapshot carries vendor +
-/// brand only — no family / stepping / feature flags).
-fn vendor_text(vendor: &CpuVendor) -> String {
-    match vendor {
-        CpuVendor::Amd(zen) => format!("AMD {zen:?}"),
-        CpuVendor::Intel(gen) => format!("Intel {gen:?}"),
-        CpuVendor::Unknown => "unknown".to_owned(),
     }
 }
 
@@ -765,12 +1748,22 @@ fn fmt_div(v: &DivMode) -> String {
     }
 }
 
-/// The SA:MEM gear multiplier: `1x` / `2x` / `4x`.
-fn fmt_gear(v: &GearMode) -> String {
+/// The `GEAR_DOWN` row value (the GUI's D-6 form): the gear-down
+/// mode's bare `Enabled` / `Disabled`.
+fn fmt_gear_down(v: &bool) -> String {
+    if *v {
+        "Enabled".to_owned()
+    } else {
+        "Disabled".to_owned()
+    }
+}
+
+/// The `CR` row value (the GUI's D-6 form): the DRAM command rate's
+/// bare `1T` / `2T`.
+fn fmt_cr(v: &CommandRate) -> String {
     match v {
-        GearMode::One => "1x".to_owned(),
-        GearMode::Two => "2x".to_owned(),
-        GearMode::Four => "4x".to_owned(),
+        CommandRate::OneT => "1T".to_owned(),
+        CommandRate::TwoT => "2T".to_owned(),
     }
 }
 
@@ -815,7 +1808,7 @@ mod tests {
     use ratatui::Terminal;
     use ramsleuth_bench::BenchOp;
     use ramsleuth_telemetry::amd_readout::{AmdReadout, CommandRate};
-    use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo};
+    use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, IntelGen};
     use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
     use ramsleuth_telemetry::SystemPlatform;
 
@@ -977,19 +1970,23 @@ mod tests {
         assert!(text.contains("1600.00 MHz"), "{text}");
         assert!(text.contains("1:2"), "{text}");
         assert!(text.contains("tCL: 16"), "{text}");
-        // zone 2: the grid renders (idle, no run yet -> N/A cells)
-        assert!(text.contains("bench: idle"), "{text}");
-        // zone 3: the SPD module + profile + daemon line
+        // zone 2: the grid renders (idle, no run yet -> N/A cells) +
+        // the flat status line (the TUI-13 re-render of the progress line)
+        assert!(text.contains("Status: Idle"), "{text}");
+        // zone 3: the SPD module + die row + profile + daemon line
         assert!(text.contains("Samsung"), "{text}");
+        assert!(text.contains("SK hynix (16Gb)"), "{text}");
         assert!(text.contains("3200 MT/s"), "{text}");
         assert!(text.contains("16384 Mbit"), "{text}");
         assert!(text.contains("XMP 1"), "{text}");
+        // header line 2 (TUI-10): the CPU/platform identity
+        assert!(text.contains("CPU: Ryzen 9 5950X"), "{text}");
         assert!(text.contains("daemon: up"), "{text}");
     }
 
     /// (b) The default state (all-Na, no telemetry, no run) renders
     /// placeholders without panicking: `N/A` in every zone, the full
-    /// `N/A` grid, and the `idle` progress line.
+    /// `N/A` grid, and the `Status: Idle` line.
     #[test]
     fn default_state_renders_placeholders_without_panic() {
         let text = draw(&AppState::default());
@@ -999,15 +1996,41 @@ mod tests {
             text.matches("N/A").count() >= 18,
             "expected >= 18 N/A placeholders, got:\n{text}"
         );
-        assert!(text.contains("idle"), "{text}");
+        assert!(text.contains("Status: Idle"), "{text}");
         assert!(text.contains("not connected"), "{text}");
         assert!(text.contains("no telemetry"), "{text}");
+
+        // TUI-16: every new surface open at once over the default
+        // state — the settings strip, the presence-driven
+        // requirements strip (the daemon-less default yields the
+        // single daemon requirement), and the graphs overlay (the
+        // empty ring) — renders without panicking.
+        let open = AppState {
+            settings: TuiSettings {
+                settings_open: true,
+                requirements_open: true,
+                graphs_open: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = draw(&open);
+        assert!(text.contains("Settings: Poll 2 s [p]"), "{text}");
+        assert!(text.contains("SETUP — requirements"), "{text}");
+        assert!(text.contains("GRAPHS (last 5 min"), "{text}");
+        assert!(text.contains("Status: Idle"), "{text}");
     }
 
-    /// (c) A running bench renders the grid with its measured cells and a
-    /// live `[i/total]` progress line.
+    /// (c) A running bench renders the grid's live overlay — the
+    /// streamed cell dimmed with a `…` suffix, the terminal grid
+    /// hidden until the run settles (the unstarted cells — including
+    /// the terminal L1 latency, which a normal bench's stream never
+    /// carries — stay `N/A`) — and the flat `Status: Running… <m:ss>`
+    /// line (the TUI-13 re-render of the pre-parity `bench:` progress
+    /// line; the run-start clock is stamped within this one frame, so
+    /// the elapsed renders `0:00`).
     #[test]
-    fn running_bench_renders_grid_and_progress() {
+    fn running_bench_renders_live_grid_and_status() {
         let mut state = representative();
         state.bench = BenchState {
             running: true,
@@ -1027,18 +2050,23 @@ mod tests {
             }),
             ..Default::default()
         };
-        let text = draw(&state);
+        // 100×62: the full zone-1 surface (the 30-row default clips
+        // the rtt_park / VDDCR_VDD N/A rows out of the count).
+        let text = draw_at(&state, 100, 62);
 
-        assert!(text.contains("bench: [1/3]"), "{text}");
-        assert!(text.contains("42.50"), "{text}");
-        assert!(text.contains("1.10"), "{text}");
+        assert!(text.contains("Status: Running… 0:00"), "{text}");
+        // the streamed cell: its live value dimmed with the `…` suffix
+        assert!(text.contains("42.50…"), "{text}");
         assert!(text.contains("ns/hop"), "{text}");
-        // the unmeasured cells stay N/A (14 grid cells + the gear cell)
-        assert!(text.matches("N/A").count() >= 13, "{text}");
+        // the unmeasured cells stay N/A (15 grid cells — the terminal
+        // L1 latency included, the live grid carries no latency — +
+        // the zone-1 Na cells: rfc2, rtt_park, the bare-N-A VDDCR_VDD)
+        assert!(text.matches("N/A").count() >= 18, "{text}");
     }
 
     /// (c′) A completed run (not running, grid present) renders the
-    /// `done` progress line.
+    /// flat `Status: Done` line (the TUI-13 re-render of the pre-parity
+    /// `bench: done`).
     #[test]
     fn completed_bench_renders_done() {
         let state = AppState {
@@ -1057,7 +2085,7 @@ mod tests {
         };
         let text = draw(&state);
 
-        assert!(text.contains("bench: done"), "{text}");
+        assert!(text.contains("Status: Done"), "{text}");
         assert!(text.contains("26.30"), "{text}");
         assert!(text.contains("86.80"), "{text}");
     }
@@ -1116,13 +2144,1490 @@ mod tests {
             daemon_status: "up".to_owned(),
             ..Default::default()
         };
-        // 100×60: zone 1's 27-row surface would clip the second channel
-        // block; a taller terminal reaches it.
-        let text = draw_at(&state, 100, 60);
+        // 100×62: the 3-row header leaves a 57-row inner zone surface
+        // (channel 0 is 55 rows), just enough to reach the second
+        // channel's label; a shorter terminal clips it.
+        let text = draw_at(&state, 100, 62);
 
         assert!(text.contains("Intel ch 0"), "{text}");
         assert!(text.contains("Intel ch 1"), "{text}");
         assert!(text.contains("1600.00 MHz"), "{text}");
         assert!(text.contains("SPD: N/A"), "{text}");
+    }
+
+    /// (f) The 3-line header — line 1 the title + platform tag + daemon
+    /// status, line 2 the CPU/platform identity (the representative's
+    /// Zen 3 / 3500 MHz / Test Board / BIOS 1.0 / all-Na AGESA+SMU
+    /// shape), line 3 the composed RAM summary (the TUI-11 capacity /
+    /// breakdown / SPD speed / channel / sync mode).
+    #[test]
+    fn header_is_three_lines_with_values() {
+        let text = draw(&representative());
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "the header occupies the top three rows");
+        let l1 = &lines[0];
+        assert!(
+            l1.contains(&format!("RamSleuth v{}", env!("CARGO_PKG_VERSION"))),
+            "{l1}"
+        );
+        assert!(l1.contains("[AMD AM4 Platform]"), "{l1}");
+        assert!(l1.contains("daemon: up · /tmp/ramsleuth.sock"), "{l1}");
+        assert_eq!(
+            lines[1],
+            "CPU: Ryzen 9 5950X 3500 MHz | Test Board | BIOS 1.0 | AGESA N/A",
+            "{}",
+            lines[1]
+        );
+        // Line 3 (TUI-11): the composed RAM summary — the 16 GiB total,
+        // the single Dual-Rank 16 GiB DIMM, the 3200 MT/s SPD speed, the
+        // Single-Channel mode (one bound module), and the Asynchronous
+        // 1:2 UCLK:MCLK (the fixture's div mode).
+        assert_eq!(
+            lines[2],
+            "RAM: 16 GiB (1x16 GiB Dual-Rank) 3200 MT/s | Single-Channel | Mode: Asynchronous 1:2",
+            "{}",
+            lines[2]
+        );
+    }
+
+    /// (g) The no-telemetry header degrades to the `—` / `N/A`
+    /// placeholders (TUI-10): line 1 the honest bare `Platform` tag +
+    /// `daemon: —`, line 2 the full placeholder line, line 3 the RAM
+    /// placeholder — never a panic.
+    #[test]
+    fn header_no_telemetry_placeholders() {
+        let text = draw(&AppState::default());
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        let l1 = &lines[0];
+        assert!(l1.contains("[Platform]"), "{l1}");
+        assert!(l1.contains("daemon: —"), "{l1}");
+        assert_eq!(lines[1], "CPU: — | — | BIOS — | AGESA N/A", "{}", lines[1]);
+        assert_eq!(lines[2], "RAM: —", "{}", lines[2]);
+    }
+
+    /// (h) The AGESA/SMU precedence matrix (the GUI `age_fragment`
+    /// mirror, C8-11/D-1): a true AGESA wins and suppresses the SMU
+    /// value; else the shape-checked `ryzen_smu` firmware version
+    /// renders under its own `SMU` label; else the honest `AGESA N/A`.
+    /// No hybrid, never fabricated.
+    #[test]
+    fn age_fragment_by_provenance() {
+        let base = SystemPlatform {
+            cpu_clock_mhz: Section::Value(3600.0),
+            motherboard: Section::Value("ProArt X570-CREATOR".to_owned()),
+            bios: Section::Value("5601".to_owned()),
+            agesa: Section::na(NaReason::NotApplicable),
+            smu_version: Section::na(NaReason::NotApplicable),
+        };
+        assert_eq!(age_fragment(&base), "AGESA N/A");
+
+        let smu = SystemPlatform {
+            smu_version: Section::Value("56.78.0".to_owned()),
+            ..base.clone()
+        };
+        assert_eq!(age_fragment(&smu), "SMU 56.78.0");
+
+        let agesa = SystemPlatform {
+            agesa: Section::Value("ComboAm4v2 PI 1.2.0.12".to_owned()),
+            ..base.clone()
+        };
+        assert_eq!(age_fragment(&agesa), "AGESA ComboAm4v2 PI 1.2.0.12");
+
+        // The precedence (D-1): a true AGESA suppresses the SMU value.
+        let both = SystemPlatform {
+            agesa: Section::Value("ComboAm4v2 PI 1.2.0.12".to_owned()),
+            smu_version: Section::Value("56.78.0".to_owned()),
+            ..base.clone()
+        };
+        assert_eq!(age_fragment(&both), "AGESA ComboAm4v2 PI 1.2.0.12");
+    }
+
+    /// (i) The platform-tag matrix (the GUI's line-1 tag mirror): Zen
+    /// 1–3 → `AM4`, Zen 4/5 → `AM5`, Intel → the generic `LGA` family;
+    /// no telemetry (`None`) and the unrecognized vendor carry the
+    /// honest bare `Platform`.
+    #[test]
+    fn platform_tag_matrix() {
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Amd(AmdZen::Zen1))),
+            "AMD AM4 Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Amd(AmdZen::Zen2))),
+            "AMD AM4 Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Amd(AmdZen::Zen3))),
+            "AMD AM4 Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Amd(AmdZen::Zen4))),
+            "AMD AM5 Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Amd(AmdZen::Zen5))),
+            "AMD AM5 Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Intel(IntelGen::Skylake))),
+            "Intel LGA Platform"
+        );
+        assert_eq!(
+            platform_tag(Some(&CpuVendor::Intel(IntelGen::Unrecognized))),
+            "Intel LGA Platform"
+        );
+        assert_eq!(platform_tag(Some(&CpuVendor::Unknown)), "Platform");
+        assert_eq!(platform_tag(None), "Platform");
+    }
+
+    /// (j) The line-2 clock unit knob (the GUI `format_clock`/`trim`
+    /// mirror, C7-11): MHz keeps the carried wire value (`3500 MHz`),
+    /// GHz ÷1000 (`3.5 GHz`); the trim arms (whole → no decimals,
+    /// else one) and the non-finite → `N/A` degradation.
+    #[test]
+    fn header_line2_clock_unit_knob() {
+        let mut state = representative();
+        state.settings.clock_mhz = false;
+        let text = draw(&state);
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        assert_eq!(
+            lines[1],
+            "CPU: Ryzen 9 5950X 3.5 GHz | Test Board | BIOS 1.0 | AGESA N/A",
+            "{}",
+            lines[1]
+        );
+        assert_eq!(format_clock(3600.0, true), "3600 MHz");
+        assert_eq!(format_clock(1800.0, true), "1800 MHz");
+        assert_eq!(format_clock(3600.0, false), "3.6 GHz");
+        assert_eq!(format_clock(1800.0, false), "1.8 GHz");
+        assert_eq!(format_clock(f64::NAN, true), "N/A");
+        assert_eq!(format_clock(f64::INFINITY, false), "N/A");
+    }
+
+    /// (k) The key legend truncates by width on entry boundaries
+    /// (TUI-10): at a wide terminal the full §2.2 map fits (the last
+    /// entry `W window` present); at the 100-col test surface a
+    /// prefix of it (the entries that no longer fit are dropped
+    /// whole, never cut mid-token, and the line stays in budget); at a
+    /// narrow surface with a short daemon status only the first entry
+    /// survives (the measured truncation points: 250 cols → all 16
+    /// entries, 100 cols → `R refresh · S snapshot`, 60 cols →
+    /// `R refresh`).
+    #[test]
+    fn header_legend_truncated_by_width() {
+        // Wide (250 cols): the full legend fits.
+        let text = draw_at(&representative(), 250, 30);
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        assert!(lines[0].contains("R refresh"), "{}", lines[0]);
+        assert!(lines[0].contains("W window"), "{}", lines[0]);
+
+        // 100 cols: the prefix ends before the third entry.
+        let text = draw(&representative());
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        let l1 = &lines[0];
+        assert!(l1.contains("S snapshot"), "{l1}");
+        assert!(!l1.contains("Q quit"), "{l1}");
+        assert!(!l1.contains("B bench"), "{l1}");
+        assert!(l1.chars().count() <= 100, "{}", l1.chars().count());
+
+        // 60 cols with a short daemon status: only the first entry.
+        let mut state = representative();
+        state.daemon_status = "up".to_owned();
+        let text = draw_at(&state, 60, 30);
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        let l1 = &lines[0];
+        assert!(l1.contains("R refresh"), "{l1}");
+        assert!(!l1.contains("S snapshot"), "{l1}");
+        assert!(l1.chars().count() <= 60, "{}", l1.chars().count());
+    }
+
+    // ------------------------------------------------------------------
+    // TUI-11 — the header line-3 (RAM summary) pure helpers.
+    // ------------------------------------------------------------------
+
+    /// A minimal SPD module fixture for the line-3 tests (every cell
+    /// `Na` except the `rank` / `speed_mts` the helpers consume).
+    fn module(rank: Section<u8>, speed: Option<u16>) -> SpdModule {
+        SpdModule {
+            index: 0x52,
+            is_ddr5: false,
+            maker: Section::na(NaReason::NotApplicable),
+            die_maker: Section::na(NaReason::NotApplicable),
+            die_type: Section::na(NaReason::NotApplicable),
+            devices: Section::na(NaReason::NotApplicable),
+            part: Section::na(NaReason::NotApplicable),
+            serial: Section::na(NaReason::NotApplicable),
+            rank,
+            density_mbit: Section::na(NaReason::NotApplicable),
+            speed_mts: match speed {
+                Some(value) => Section::Value(value),
+                None => Section::na(NaReason::NotApplicable),
+            },
+            profiles: Vec::new(),
+        }
+    }
+
+    /// A line-3 test snapshot: the configurable capacity tail + SPD
+    /// list over an Na AMD / Intel branch (the mode segment degrades;
+    /// the helpers under test here do not read it).
+    fn telemetry(
+        total_capacity: Section<f64>,
+        dimm_sizes: Vec<Section<f64>>,
+        spd: Vec<SpdModule>,
+    ) -> SystemMemoryTelemetry {
+        SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Unknown,
+                brand: "synthetic".to_owned(),
+            },
+            amd: Section::na(NaReason::NotApplicable),
+            intel: Section::na(NaReason::UnsupportedHardware),
+            spd,
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3600.0),
+                motherboard: Section::Value("Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity,
+            dimm_sizes,
+        }
+    }
+
+    /// A clock-readout fixture (every cell `Na` except the two the
+    /// mode segment consumes).
+    fn clocks_with(div_mode: Section<DivMode>, mclk_mhz: Section<f64>) -> ClockReadout {
+        ClockReadout {
+            mclk_mhz,
+            uclk_mhz: Section::na(NaReason::NotApplicable),
+            fclk_mhz: Section::na(NaReason::NotApplicable),
+            div_mode,
+            gear_mode: Section::na(NaReason::NotApplicable),
+            gdm: Section::na(NaReason::NotApplicable),
+            pdm: Section::na(NaReason::NotApplicable),
+            command_rate: Section::na(NaReason::NotApplicable),
+        }
+    }
+
+    /// (l) `format_capacity`: the GiB arm keeps the wire value, the GB
+    /// arm converts × [`GIB_TO_GB`]; a whole number renders without
+    /// decimals, one decimal otherwise; non-finite → `N/A`.
+    #[test]
+    fn format_capacity_arms() {
+        assert_eq!(format_capacity(16.0, true), "16 GiB");
+        assert_eq!(format_capacity(32.0, true), "32 GiB");
+        assert_eq!(format_capacity(4.5, true), "4.5 GiB");
+        assert_eq!(format_capacity(16.0, false), "17.2 GB");
+        assert_eq!(format_capacity(32.0, false), "34.4 GB");
+        assert_eq!(format_capacity(f64::NAN, true), "N/A");
+        assert_eq!(format_capacity(f64::INFINITY, false), "N/A");
+    }
+
+    /// (m) `rank_word` (the GUI C9-01/D-1 mirror): `1` → Single-Rank,
+    /// `2` → Dual-Rank, `n > 0` → `<n>-Rank`; a `Na`/`0` rank yields
+    /// `None` (the word is omitted, never `N/A`).
+    #[test]
+    fn rank_word_arms() {
+        assert_eq!(rank_word(&Section::Value(1)), Some("Single-Rank".to_owned()));
+        assert_eq!(rank_word(&Section::Value(2)), Some("Dual-Rank".to_owned()));
+        assert_eq!(rank_word(&Section::Value(4)), Some("4-Rank".to_owned()));
+        assert_eq!(rank_word(&Section::Value(0)), None);
+        assert_eq!(rank_word(&Section::na(NaReason::NotApplicable)), None);
+    }
+
+    /// (n) `dimm_summary`: distinct-size grouping in the selected
+    /// capacity unit (the GB knob converts × [`GIB_TO_GB`]), the Na
+    /// entry contributes nothing, all-Na / empty → `N/A`, and the rank
+    /// word from the parallel SPD slice groups with the size (same-size
+    /// same-rank stays one group with the word, same-size different-rank
+    /// splits, a `Na` rank omits the word).
+    #[test]
+    fn dimm_summary_groups_and_degrades() {
+        // No rank words (the empty SPD list): grouped by size alone.
+        assert_eq!(
+            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &[], true),
+            "2x16 GiB"
+        );
+        // A Na entry contributes nothing; the mixed kit → two groups.
+        assert_eq!(
+            dimm_summary(
+                &[
+                    Section::Value(16.0),
+                    Section::na(NaReason::NotApplicable),
+                    Section::Value(32.0),
+                ],
+                &[],
+                true,
+            ),
+            "1x16 GiB + 1x32 GiB"
+        );
+        // All-Na / empty → N/A; a non-whole size keeps one decimal.
+        assert_eq!(dimm_summary(&[Section::na(NaReason::NotApplicable)], &[], true), "N/A");
+        assert_eq!(dimm_summary(&[], &[], true), "N/A");
+        assert_eq!(dimm_summary(&[Section::Value(4.5)], &[], true), "1x4.5 GiB");
+        // The GB knob: 16 GiB → 17.2 GB per group.
+        assert_eq!(
+            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &[], false),
+            "2x17.2 GB"
+        );
+        // The rank word groups with the size.
+        let single = module(Section::Value(1), Some(3200));
+        let dual = module(Section::Value(2), Some(3200));
+        assert_eq!(
+            dimm_summary(
+                &[Section::Value(16.0), Section::Value(16.0)],
+                &[single.clone(), single.clone()],
+                true,
+            ),
+            "2x16 GiB Single-Rank"
+        );
+        assert_eq!(
+            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &[single, dual], true),
+            "1x16 GiB Single-Rank + 1x16 GiB Dual-Rank"
+        );
+        // A `Na` rank omits the word: the ranked + unranked pair splits
+        // into two groups (first-seen order).
+        let na_rank = module(Section::na(NaReason::NotApplicable), Some(3200));
+        assert_eq!(
+            dimm_summary(
+                &[Section::Value(16.0), Section::Value(16.0)],
+                &[module(Section::Value(1), Some(3200)), na_rank],
+                true,
+            ),
+            "1x16 GiB Single-Rank + 1x16 GiB"
+        );
+    }
+
+    /// (o) `channel_mode`: 1 / 2 / 4 → Single / Dual / Quad, every
+    /// other count (0, odd) → `N/A`.
+    #[test]
+    fn channel_mode_from_dimm_count() {
+        assert_eq!(channel_mode(1), "Single-Channel");
+        assert_eq!(channel_mode(2), "Dual-Channel");
+        assert_eq!(channel_mode(4), "Quad-Channel");
+        assert_eq!(channel_mode(0), "N/A");
+        assert_eq!(channel_mode(3), "N/A");
+    }
+
+    /// (p) `slot_note`: the total-vs-breakdown note — total > SPD sum
+    /// with a uniform module size near-dividing the total → `<visible>
+    /// of <n> slots SPD-visible`; a non-integer quotient → the generic
+    /// note; total ≤ sum, a `Na` total, or no visible modules → `None`
+    /// (no false alarm).
+    #[test]
+    fn slot_note_arms() {
+        // The live-host shape: 4×16 GiB installed (62.68 GiB OS total),
+        // 2 bound to the SPD bus (32 GiB sum).
+        assert_eq!(
+            slot_note(&Section::Value(62.68), &[Section::Value(16.0), Section::Value(16.0)]),
+            Some("2 of 4 slots SPD-visible".to_owned())
+        );
+        // An exact multiple (no reserved fraction): 3 slots, 2 visible.
+        assert_eq!(
+            slot_note(&Section::Value(48.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            Some("2 of 3 slots SPD-visible".to_owned())
+        );
+        // A non-integer quotient (50/16 = 3.125) → the generic note.
+        assert_eq!(
+            slot_note(&Section::Value(50.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            Some("SPD sees 2 of the installed capacity".to_owned())
+        );
+        // total ≤ sum → no note.
+        assert_eq!(
+            slot_note(&Section::Value(32.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            None
+        );
+        assert_eq!(
+            slot_note(&Section::Value(16.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            None
+        );
+        // A `Na` total → no note; no visible modules → no note.
+        assert_eq!(
+            slot_note(&Section::na(NaReason::NotApplicable), &[Section::Value(16.0)]),
+            None
+        );
+        assert_eq!(
+            slot_note(&Section::Value(62.68), &[Section::na(NaReason::NotApplicable)]),
+            None
+        );
+    }
+
+    /// (q) line 3's composed non-mode text ([`ram_line_prefix`]):
+    /// populated (the total + breakdown + speed + channel + the
+    /// `Mode: ` lead-in), the speed omitted when no module carries
+    /// one, the single-Na-DIMM and all-Na degradations, the GB knob,
+    /// and the live-host shape (the rank word + the slot note).
+    #[test]
+    fn ram_line_prefix_populated_and_degraded() {
+        let t = telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![module(Section::na(NaReason::NotApplicable), Some(3200))],
+        );
+        assert_eq!(
+            ram_line_prefix(&t, true),
+            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | Mode: "
+        );
+        // No module carries a speed: the segment is omitted entirely.
+        let no_speed = telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![module(Section::na(NaReason::NotApplicable), None)],
+        );
+        assert_eq!(
+            ram_line_prefix(&no_speed, true),
+            "RAM: 32 GiB (2x16 GiB) | Dual-Channel | Mode: "
+        );
+        // A single Na DIMM still counts as one bound module (the
+        // channel is the count, not the sizes): Single-Channel.
+        let degraded = telemetry(
+            Section::na(NaReason::NotApplicable),
+            vec![Section::na(NaReason::NotApplicable)],
+            Vec::new(),
+        );
+        assert_eq!(
+            ram_line_prefix(&degraded, true),
+            "RAM: N/A (N/A) | Single-Channel | Mode: "
+        );
+        // No bound modules at all: every segment degrades to N/A.
+        let empty = telemetry(Section::na(NaReason::NotApplicable), Vec::new(), Vec::new());
+        assert_eq!(
+            ram_line_prefix(&empty, true),
+            "RAM: N/A (N/A) | N/A | Mode: "
+        );
+        // The GB knob: 32 GiB → 34.4 GB total, 16 GiB → 17.2 GB per
+        // group.
+        assert_eq!(
+            ram_line_prefix(&t, false),
+            "RAM: 34.4 GB (2x17.2 GB) 3200 MT/s | Dual-Channel | Mode: "
+        );
+        // The live-host shape: single-rank modules + the OS total
+        // (62.68 GiB) above the SPD sum (32 GiB) → the rank word in
+        // the breakdown + the slot-note segment.
+        let single = module(Section::Value(1), Some(3200));
+        let ranked = telemetry(
+            Section::Value(62.68),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![single.clone(), single],
+        );
+        assert_eq!(
+            ram_line_prefix(&ranked, true),
+            "RAM: 62.7 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | 2 of 4 slots SPD-visible | Mode: "
+        );
+        // The rank word with total ≤ the SPD sum: no note (no false
+        // alarm).
+        let single2 = module(Section::Value(1), Some(3200));
+        let balanced = telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![single2.clone(), single2],
+        );
+        assert_eq!(
+            ram_line_prefix(&balanced, true),
+            "RAM: 32 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | Mode: "
+        );
+    }
+
+    /// (r) the sync-mode segment matrix: 1:1 with an MCLK (AMBER; the
+    /// MCLK in the selected clock unit — the GHz knob ÷1000), 1:1
+    /// without (AMBER, the bare text), 1:2 (CRIMSON), a Na ratio (the
+    /// honest N/A, DIM), and the Na-AMD-branch degradation (independent
+    /// of the clock unit).
+    #[test]
+    fn sync_mode_matrix() {
+        assert_eq!(
+            sync_mode_from_clocks(
+                &clocks_with(Section::Value(DivMode::OneToOne), Section::Value(1800.0)),
+                true,
+            ),
+            ("Synchronous 1:1 (UCLK = MCLK = 1800 MHz)".to_owned(), AMBER)
+        );
+        assert_eq!(
+            sync_mode_from_clocks(
+                &clocks_with(Section::Value(DivMode::OneToOne), Section::na(NaReason::NotApplicable)),
+                true,
+            ),
+            ("Synchronous 1:1".to_owned(), AMBER)
+        );
+        assert_eq!(
+            sync_mode_from_clocks(
+                &clocks_with(Section::Value(DivMode::OneToTwo), Section::Value(1800.0)),
+                true,
+            ),
+            ("Asynchronous 1:2".to_owned(), CRIMSON)
+        );
+        assert_eq!(
+            sync_mode_from_clocks(
+                &clocks_with(Section::na(NaReason::NotApplicable), Section::Value(1800.0)),
+                true,
+            ),
+            ("N/A".to_owned(), DIM)
+        );
+        // The GHz knob: 1800 MHz → 1.8 GHz.
+        assert_eq!(
+            sync_mode_from_clocks(
+                &clocks_with(Section::Value(DivMode::OneToOne), Section::Value(1800.0)),
+                false,
+            ),
+            ("Synchronous 1:1 (UCLK = MCLK = 1.8 GHz)".to_owned(), AMBER)
+        );
+        // A Na AMD branch (Intel silicon / the driver missing) degrades
+        // the whole segment (independent of the clock unit).
+        let t = telemetry(Section::Value(32.0), Vec::new(), Vec::new());
+        assert_eq!(sync_mode(&t, true), ("N/A".to_owned(), DIM));
+        assert_eq!(sync_mode(&t, false), ("N/A".to_owned(), DIM));
+    }
+
+    /// (s) line 3 end-to-end over the composed spans: the unit knobs
+    /// apply (the GB capacity + the GHz clock unit) and the mode
+    /// segment colors (the 1:1 amber, the 1:2 crimson) — asserted
+    /// through the rendered buffer text of a 1:1 synchronous snapshot.
+    #[test]
+    fn line3_unit_knobs_and_mode_text() {
+        // A 1:1 synchronous AMD readout (the mode segment's MCLK in
+        // the selected clock unit).
+        let mut state = representative();
+        if let Some(ref mut t) = state.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.clocks.div_mode = Section::Value(DivMode::OneToOne);
+                readout.clocks.mclk_mhz = Section::Value(1800.0);
+            }
+        }
+        // A wide surface — the composed 1:1 line with the MCLK is
+        // ~108 columns, beyond the 100-col default.
+        let text = draw_at(&state, 130, 30);
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        assert_eq!(
+            lines[2],
+            "RAM: 16 GiB (1x16 GiB Dual-Rank) 3200 MT/s | Single-Channel | Mode: Synchronous 1:1 (UCLK = MCLK = 1800 MHz)",
+            "{}",
+            lines[2]
+        );
+        // The GB capacity knob + the GHz clock knob.
+        state.settings.capacity_gib = false;
+        state.settings.clock_mhz = false;
+        let text = draw_at(&state, 130, 30);
+        let lines = text.split('\n').take(3).collect::<Vec<_>>();
+        assert_eq!(
+            lines[2],
+            "RAM: 17.2 GB (1x17.2 GB Dual-Rank) 3200 MT/s | Single-Channel | Mode: Synchronous 1:1 (UCLK = MCLK = 1.8 GHz)",
+            "{}",
+            lines[2]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TUI-12 — the zone-1 VDDCR_VDD + GEAR_DOWN/CR rows.
+    // ------------------------------------------------------------------
+
+    /// (t) The zone-1 clocks section is the GUI's 7-row shape (D-6):
+    /// MCLK / UCLK / FCLK / UCLK:MCLK / GEAR_DOWN / CR / PDM (the old
+    /// `gear` row and the combined `GDM` row gone), and the voltages
+    /// section is the GUI's 5-row shape with the VDDCR_VDD primary rail
+    /// first (C12).
+    #[test]
+    fn zone1_clocks_and_voltages_row_shape() {
+        // 100×62: the 55-line AMD readout (incl. the voltages section)
+        // needs the taller surface — the 30-row default clips it.
+        let text = draw_at(&representative(), 100, 62);
+        // Zone 1 occupies the leftmost screen columns: extract its
+        // inner segment per row (the text between the first two
+        // vertical borders), skipping the frame corners.
+        let z1: Vec<String> = text
+            .split('\n')
+            .filter_map(|line| {
+                line.split('│')
+                    .nth(1)
+                    .map(|segment| segment.trim_end().to_owned())
+            })
+            .collect();
+
+        let rows_between = |from: &str, to: &str| -> Vec<&str> {
+            let start = z1
+                .iter()
+                .position(|line| line == from)
+                .expect("the start subheader must render");
+            let end = z1
+                .iter()
+                .position(|line| line == to)
+                .expect("the end marker must render");
+            z1[start + 1..end].iter().map(|line| line.as_str()).collect()
+        };
+
+        let clocks = rows_between("--- clocks & ratios ---", "--- primary timings ---");
+        assert_eq!(
+            clocks,
+            vec![
+                "MCLK: 1600.00 MHz",
+                "UCLK: 1600.00 MHz",
+                "FCLK: 1800.00 MHz",
+                "UCLK:MCLK: 1:2",
+                "GEAR_DOWN: Enabled",
+                "CR: 1T",
+                "PDM: off",
+            ],
+            "the 7 clocks rows (the GUI's AMD shape, D-6)"
+        );
+
+        let voltages = rows_between("--- voltages ---", "Intel: N/A (unsupported hardware)");
+        assert_eq!(
+            voltages,
+            vec![
+                "VDDCR_VDD: N/A",
+                "VDDCR_SOC: 1.150 V",
+                "VDDIO_MEM: 1.350 V",
+                "VDD_MISC: 1.100 V",
+                "VPP: 1.800 V",
+            ],
+            "the 5 voltages rows (VDDCR_VDD first, C12)"
+        );
+
+        // The old rows are gone entirely (no `gear` label, no `GDM`
+        // row — the combined form is split, D-6).
+        assert!(!z1.iter().any(|line| line.starts_with("gear:")));
+        assert!(!z1.iter().any(|line| line.starts_with("GDM:")));
+    }
+
+    /// (u) The VDDCR_VDD row (the C12 frozen wire field — the Vcore
+    /// primary rail): a measured value renders in volts (the mV→V
+    /// display rule); the Na cell (the Intel-shape cell) degrades to
+    /// the GUI's bare `N/A`.
+    #[test]
+    fn vddcr_vdd_value_and_na() {
+        // The fixture's vcore is Na (the Intel-shape cell) -> bare N/A.
+        let text = draw_at(&representative(), 100, 62);
+        assert!(text.contains("VDDCR_VDD: N/A"), "{text}");
+
+        // A measured Vcore rail: 1150 mV -> 1.150 V.
+        let mut state = representative();
+        if let Some(ref mut t) = state.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.voltages.vcore_mv = Section::Value(1150);
+            }
+        }
+        let text = draw_at(&state, 100, 62);
+        assert!(text.contains("VDDCR_VDD: 1.150 V"), "{text}");
+    }
+
+    /// (v) The CR row (the GUI's D-6 form): the command rate's bare
+    /// `1T` / `2T`; the Na cell degrades to the bare `N/A`.
+    #[test]
+    fn cr_value_and_na() {
+        // The fixture's command rate is 1T.
+        let text = draw_at(&representative(), 100, 62);
+        assert!(text.contains("CR: 1T"), "{text}");
+
+        let mut state = representative();
+        if let Some(ref mut t) = state.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.clocks.command_rate = Section::Value(CommandRate::TwoT);
+            }
+        }
+        let text = draw_at(&state, 100, 62);
+        assert!(text.contains("CR: 2T"), "{text}");
+
+        // The Na degradation (a driver-missing command rate).
+        let mut na = representative();
+        if let Some(ref mut t) = na.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.clocks.command_rate = Section::na(NaReason::DriverMissing);
+            }
+        }
+        let text = draw_at(&na, 100, 62);
+        assert!(text.contains("CR: N/A"), "{text}");
+    }
+
+    /// (w) The GEAR_DOWN row (the GUI's D-6 form): the gear-down flag's
+    /// bare `Enabled` / `Disabled`; the Na cell degrades to the bare
+    /// `N/A` (the value semantics — the `gdm` flag — unchanged).
+    #[test]
+    fn gear_down_text_matrix() {
+        // The fixture carries gdm = true.
+        let text = draw_at(&representative(), 100, 62);
+        assert!(text.contains("GEAR_DOWN: Enabled"), "{text}");
+
+        let mut off = representative();
+        if let Some(ref mut t) = off.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.clocks.gdm = Section::Value(false);
+            }
+        }
+        let text = draw_at(&off, 100, 62);
+        assert!(text.contains("GEAR_DOWN: Disabled"), "{text}");
+
+        let mut na = representative();
+        if let Some(ref mut t) = na.telemetry {
+            if let Section::Value(ref mut readout) = t.amd {
+                readout.clocks.gdm = Section::na(NaReason::NotApplicable);
+            }
+        }
+        let text = draw_at(&na, 100, 62);
+        assert!(text.contains("GEAR_DOWN: N/A"), "{text}");
+    }
+
+    // -----------------------------------------------------------------
+    // TUI-13 — the zone-2 pure core (the GUI `bench_zone` C7-17/18
+    // mirror): `live_grid`, the cell phases, the flat status line,
+    // and the `m:ss` formatter. Headless — no TTY, no I/O.
+    // -----------------------------------------------------------------
+
+    /// One synthetic streamed progress event (the GUI `bench_zone`
+    /// test helper — the label is unused by the pure core).
+    fn progress_event(tier: Tier, op: BenchOp, value: f64) -> StreamProgress {
+        StreamProgress {
+            cell_index: 0,
+            total_cells: 12,
+            tier,
+            op,
+            value,
+            label: "test (GB/s)".to_owned(),
+        }
+    }
+
+    /// (x) `live_grid` (the GUI (i) mirror): each streamed event fills
+    /// its (tier, op) cell; the latest event per cell wins; the
+    /// latency column and the unmeasured cells stay 0.0.
+    #[test]
+    fn live_grid_fills_streamed_cells_latest_wins() {
+        let events = vec![
+            progress_event(Tier::Memory, BenchOp::Read, 26.0),
+            progress_event(Tier::Memory, BenchOp::Write, 43.0),
+            progress_event(Tier::L1, BenchOp::Read, 35.0),
+            progress_event(Tier::Memory, BenchOp::Read, 27.5), // latest wins
+        ];
+        let grid = live_grid(&events);
+        assert_eq!(grid.cell(Tier::Memory, Metric::Read), 27.5, "latest per cell wins");
+        assert_eq!(grid.cell(Tier::Memory, Metric::Write), 43.0);
+        assert_eq!(grid.cell(Tier::L1, Metric::Read), 35.0);
+        // Unmeasured cells — and the whole latency column (no progress
+        // events) — stay 0.0.
+        assert_eq!(grid.cell(Tier::Memory, Metric::Copy), 0.0);
+        assert_eq!(grid.cell(Tier::L2, Metric::Read), 0.0);
+        assert_eq!(grid.cell(Tier::L3, Metric::Copy), 0.0);
+        assert_eq!(grid.cell(Tier::L1, Metric::Latency), 0.0);
+        assert_eq!(grid.cell(Tier::L3, Metric::Latency), 0.0);
+    }
+
+    /// (y) `live_grid` (the GUI (j) mirror): an empty stream and a
+    /// stream of malformed (non-finite / non-positive) values never
+    /// panic and never render as data — every cell stays 0.0.
+    #[test]
+    fn live_grid_empty_and_malformed_streams_stay_zero() {
+        let empty = live_grid(&[]);
+        assert_eq!(empty.cell(Tier::Memory, Metric::Read), 0.0);
+        assert_eq!(empty.cell(Tier::L3, Metric::Latency), 0.0);
+
+        let broken = vec![
+            progress_event(Tier::L1, BenchOp::Read, f64::NAN),
+            progress_event(Tier::L2, BenchOp::Write, f64::INFINITY),
+            progress_event(Tier::L3, BenchOp::Copy, -4.0),
+        ];
+        let grid = live_grid(&broken);
+        assert_eq!(grid.cell(Tier::L1, Metric::Read), 0.0, "NaN never renders");
+        assert_eq!(grid.cell(Tier::L2, Metric::Write), 0.0, "+inf never renders");
+        assert_eq!(grid.cell(Tier::L3, Metric::Copy), 0.0, "negative never renders");
+    }
+
+    /// (z) `cell_phase` (the GUI (k) mirror): not in flight →
+    /// `Terminal` for every cell; in flight → `Live` only for the
+    /// cells the live grid carries a value for, `NotStarted`
+    /// otherwise (a cell not started yet, or a latency cell — no
+    /// progress events).
+    #[test]
+    fn cell_phase_tracks_running_and_streamed_values() {
+        let live = live_grid(&[
+            progress_event(Tier::Memory, BenchOp::Read, 26.0),
+            progress_event(Tier::L1, BenchOp::Copy, 31.8),
+        ]);
+        // Not in flight: every cell renders its terminal value.
+        for &tier in &[Tier::Memory, Tier::L1, Tier::L2, Tier::L3] {
+            for &metric in &[Metric::Read, Metric::Write, Metric::Copy, Metric::Latency] {
+                assert_eq!(cell_phase(false, &live, tier, metric), CellPhase::Terminal);
+            }
+        }
+        // In flight: the streamed cells are live, the rest not started.
+        assert_eq!(cell_phase(true, &live, Tier::Memory, Metric::Read), CellPhase::Live);
+        assert_eq!(cell_phase(true, &live, Tier::L1, Metric::Copy), CellPhase::Live);
+        assert_eq!(
+            cell_phase(true, &live, Tier::Memory, Metric::Write),
+            CellPhase::NotStarted
+        );
+        assert_eq!(cell_phase(true, &live, Tier::L2, Metric::Read), CellPhase::NotStarted);
+        assert_eq!(cell_phase(true, &live, Tier::L3, Metric::Latency), CellPhase::NotStarted);
+    }
+
+    /// (z′) The cell phases' text + color (the GUI (l) mirror, the
+    /// bare terminal-width form): terminal cells keep the existing
+    /// two-decimal / `N/A` semantics (a non-finite reading degrades to
+    /// `N/A` too — the GUI's guard), live cells show the in-flight
+    /// value + a `…` suffix dimmed, not-started cells keep `N/A`.
+    #[test]
+    fn phase_cell_text_renders_live_and_terminal_cells() {
+        let terminal = BenchmarkGrid {
+            read_gbps: [26.35, 35.10, 30.40, 0.0],
+            write_gbps: [43.63, 38.20, 0.0, 14.02],
+            copy_gbps: [12.11, 36.40, 31.80, 11.05],
+            latency_ns: [86.84, 1.12, 4.20, 13.90],
+        };
+        let live = live_grid(&[progress_event(Tier::Memory, BenchOp::Read, 26.0)]);
+
+        // Terminal: the existing semantics (a measured cell cyan, an
+        // unmeasured cell N/A).
+        assert_eq!(
+            bench_cell_text(CellPhase::Terminal, &terminal, &live, Tier::Memory, Metric::Read),
+            ("26.35".to_owned(), CYAN)
+        );
+        assert_eq!(
+            bench_cell_text(CellPhase::Terminal, &terminal, &live, Tier::Memory, Metric::Latency),
+            ("86.84".to_owned(), CYAN)
+        );
+        assert_eq!(
+            bench_cell_text(CellPhase::Terminal, &terminal, &live, Tier::L2, Metric::Write),
+            ("N/A".to_owned(), CRIMSON)
+        );
+        // A non-finite terminal reading degrades to N/A (the GUI's
+        // guard — no "NaN" text).
+        let broken = BenchmarkGrid {
+            read_gbps: [f64::NAN; 4],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [0.0; 4],
+        };
+        assert_eq!(
+            bench_cell_text(CellPhase::Terminal, &broken, &live, Tier::Memory, Metric::Read),
+            ("N/A".to_owned(), CRIMSON)
+        );
+
+        // Live: the in-flight value + the `…` suffix, dimmed.
+        assert_eq!(
+            bench_cell_text(CellPhase::Live, &terminal, &live, Tier::Memory, Metric::Read),
+            ("26.00…".to_owned(), DIM)
+        );
+        // A burn-in's `latest` also carries per-tier latency ticks →
+        // the live latency cell shows the `…` suffix too.
+        let live_lat = BenchmarkGrid {
+            read_gbps: [0.0; 4],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [86.84, 0.0, 0.0, 0.0],
+        };
+        assert_eq!(
+            bench_cell_text(CellPhase::Live, &terminal, &live_lat, Tier::Memory, Metric::Latency),
+            ("86.84…".to_owned(), DIM)
+        );
+
+        // NotStarted: the `N/A` placeholder.
+        assert_eq!(
+            bench_cell_text(CellPhase::NotStarted, &terminal, &live, Tier::L3, Metric::Read),
+            ("N/A".to_owned(), CRIMSON)
+        );
+    }
+
+    /// (aa) `status_state` (the GUI (e) mirror): a burn-in in flight →
+    /// `Running` (the newest tick's elapsed + iteration — the
+    /// normal-bench flag stays false for a burn-in, C7-16), a normal
+    /// bench in flight → `Running` (the zone's start clock's elapsed,
+    /// no iteration), a finished run (a terminal grid or kept
+    /// streamed progress) → `Done`, the fresh state → `Idle`.
+    #[test]
+    fn status_state_matrix() {
+        // The fresh state: no run in flight, no grid, no progress.
+        assert_eq!(
+            status_state(false, false, false, false, 0.0, 0),
+            StatusState::Idle
+        );
+        // A normal bench in flight (progress streaming): `Running`
+        // with the start clock's elapsed — 42 s renders `0:42` (no
+        // burn-in iteration).
+        assert_eq!(
+            status_state(true, false, false, true, 42.0, 0),
+            StatusState::Running {
+                elapsed_secs: 42.0,
+                burn_in_iteration: None
+            }
+        );
+        // A burn-in in flight: `Running` with the newest tick's
+        // elapsed (125 s) + iteration (the normal-bench flag stays
+        // false, C7-16).
+        assert_eq!(
+            status_state(false, true, false, false, 125.0, 3),
+            StatusState::Running {
+                elapsed_secs: 125.0,
+                burn_in_iteration: Some(3)
+            }
+        );
+        // A burn-in still in flight wins over the kept terminal grid
+        // of an earlier run.
+        assert_eq!(
+            status_state(false, true, true, false, 9.0, 2),
+            StatusState::Running {
+                elapsed_secs: 9.0,
+                burn_in_iteration: Some(2)
+            }
+        );
+        // A finished run: the terminal grid landed (the burn-in
+        // terminal leaves the progress empty — C7-16) → `Done`.
+        assert_eq!(status_state(false, false, true, false, 0.0, 0), StatusState::Done);
+        // A finished run: the streamed progress is kept with no grid
+        // (a cancelled normal bench) → `Done`.
+        assert_eq!(status_state(false, false, false, true, 0.0, 0), StatusState::Done);
+    }
+
+    /// (ab) `status_text` (the GUI (f) mirror): the flat line's exact
+    /// strings — `Status: Idle`, `Status: Running… <m:ss>` (a normal
+    /// bench), `Status: Running… (burn-in <m:ss>, iter <n>)` (a
+    /// burn-in, C7-18), `Status: Done`.
+    #[test]
+    fn status_text_renders_the_flat_lines() {
+        assert_eq!(status_text(StatusState::Idle), "Status: Idle");
+        assert_eq!(
+            status_text(StatusState::Running {
+                elapsed_secs: 42.0,
+                burn_in_iteration: None,
+            }),
+            "Status: Running… 0:42"
+        );
+        assert_eq!(
+            status_text(StatusState::Running {
+                elapsed_secs: 125.0,
+                burn_in_iteration: None,
+            }),
+            "Status: Running… 2:05"
+        );
+        assert_eq!(
+            status_text(StatusState::Running {
+                elapsed_secs: 0.0,
+                burn_in_iteration: None,
+            }),
+            "Status: Running… 0:00"
+        );
+        // A burn-in in flight: the `(burn-in <m:ss>, iter <n>)`
+        // phrasing (C7-18).
+        assert_eq!(
+            status_text(StatusState::Running {
+                elapsed_secs: 125.0,
+                burn_in_iteration: Some(3),
+            }),
+            "Status: Running… (burn-in 2:05, iter 3)"
+        );
+        assert_eq!(
+            status_text(StatusState::Running {
+                elapsed_secs: 0.0,
+                burn_in_iteration: Some(0),
+            }),
+            "Status: Running… (burn-in 0:00, iter 0)"
+        );
+        assert_eq!(status_text(StatusState::Done), "Status: Done");
+    }
+
+    /// (ac) `status_color` (the GUI (g) mirror, the terminal palette):
+    /// the idle line is dim, the running line CYAN (a normal bench or
+    /// a burn-in), the done line the zone-local green (the §3.2
+    /// palette stays frozen).
+    #[test]
+    fn status_color_tracks_the_state() {
+        assert_eq!(status_color(StatusState::Idle), DIM, "the idle line is dim");
+        assert_eq!(
+            status_color(StatusState::Running {
+                elapsed_secs: 42.0,
+                burn_in_iteration: None,
+            }),
+            CYAN
+        );
+        assert_eq!(
+            status_color(StatusState::Running {
+                elapsed_secs: 125.0,
+                burn_in_iteration: Some(3),
+            }),
+            CYAN
+        );
+        assert_eq!(status_color(StatusState::Done), STATUS_DONE);
+        assert_eq!(
+            STATUS_DONE,
+            Color::Rgb(0x2E, 0x9E, 0x5B),
+            "the done green is the zone-local const"
+        );
+    }
+
+    /// (ad) `format_elapsed` (the GUI (d) mirror): the `m:ss` form
+    /// (the plan's `0:42`) — the minutes un-padded, the seconds
+    /// two-digit; a non-finite / non-positive reading renders `0:00`
+    /// (a bad elapsed never panics the line).
+    #[test]
+    fn format_elapsed_renders_minutes_and_seconds() {
+        assert_eq!(format_elapsed(0.0), "0:00");
+        assert_eq!(format_elapsed(59.9), "0:59");
+        assert_eq!(format_elapsed(60.0), "1:00");
+        assert_eq!(format_elapsed(125.0), "2:05");
+        assert_eq!(format_elapsed(3661.0), "61:01");
+        assert_eq!(format_elapsed(f64::NAN), "0:00", "NaN never panics");
+        assert_eq!(format_elapsed(-4.0), "0:00", "a negative elapsed renders zero");
+        assert_eq!(format_elapsed(f64::INFINITY), "0:00", "+inf never panics");
+    }
+
+    /// (ae) `table_live_grid` (the GUI (q) mirror): a burn-in in
+    /// flight shows `burn_in.latest` (the cells update per
+    /// iteration), a normal bench in flight shows the accumulated
+    /// `StreamProgress` events, neither shows the (unused) progress
+    /// accumulation.
+    #[test]
+    fn table_live_grid_selects_the_source() {
+        // A burn-in in flight: the live grid is `burn_in.latest`.
+        let latest = BenchmarkGrid {
+            read_gbps: [26.35, 35.10, 0.0, 0.0],
+            write_gbps: [43.63, 0.0, 0.0, 0.0],
+            copy_gbps: [0.0; 4],
+            latency_ns: [86.84, 1.12, 0.0, 0.0],
+        };
+        let bench = BenchState {
+            running: false,
+            burn_in: BurnInState {
+                running: true,
+                iteration: 2,
+                elapsed_secs: 90.0,
+                latest: latest.clone(),
+            },
+            ..Default::default()
+        };
+        assert_eq!(table_live_grid(&bench), latest, "a burn-in shows `latest`");
+
+        // A normal bench in flight: the live grid is the accumulated
+        // `StreamProgress` events.
+        let bench = BenchState {
+            running: true,
+            burn_in: BurnInState::default(),
+            progress: vec![progress_event(Tier::Memory, BenchOp::Read, 26.0)],
+            ..Default::default()
+        };
+        let live = table_live_grid(&bench);
+        assert_eq!(live.cell(Tier::Memory, Metric::Read), 26.0);
+        assert_eq!(live.cell(Tier::L1, Metric::Read), 0.0, "unmeasured cells stay 0.0");
+
+        // Neither in flight: the progress accumulation (harmless —
+        // the terminal grid renders).
+        let bench = BenchState::default();
+        let live = table_live_grid(&bench);
+        assert_eq!(live.cell(Tier::Memory, Metric::Read), 0.0);
+    }
+
+    // -----------------------------------------------------------------
+    // TUI-14 — the zone-2 render wiring: the controls line + the live
+    // burn-in row (the GUI C7-17/18 controls / burn-in-row mirror).
+    // Headless — no TTY, no I/O.
+    // -----------------------------------------------------------------
+
+    /// The rendered text of a line (its spans concatenated — the test's
+    /// flat-text surface for the styled line builders).
+    fn line_text(line: &Line<'_>) -> String {
+        line.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    /// One span's fg color (the test's style surface for the controls
+    /// line's enabled / dimmed entries).
+    fn span_fg(line: &Line<'_>, index: usize) -> Color {
+        line.iter()
+            .nth(index)
+            .expect("the span index must exist")
+            .style
+            .fg
+            .expect("every controls span is explicitly styled")
+    }
+
+    /// (af) The controls line visibility matrix (the GUI single-flight
+    /// rule, TUI-14): the three run keys (`[B] Full`, `[M] Mem`,
+    /// `[X] Burn-in(5m)`) are always present; `Cancel` appears only
+    /// while a run (a normal bench or a burn-in) is in flight; the run
+    /// key spans are CYAN when enabled and DIM while a run is in
+    /// flight (the GUI disabled-button form), the `Cancel` key CYAN
+    /// whenever it appears.
+    #[test]
+    fn controls_line_visibility_matrix() {
+        // Not in flight: the run keys, no Cancel.
+        let idle = BenchState::default();
+        assert_eq!(controls_text(&idle), "[B] Full  [M] Mem  [X] Burn-in(5m)");
+        assert_eq!(line_text(&controls_line(&idle)), controls_text(&idle));
+        assert_eq!(span_fg(&controls_line(&idle), 0), CYAN, "the enabled [B] key is cyan");
+
+        // A normal bench in flight: Cancel appears, the run keys dim.
+        let running = BenchState {
+            running: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            controls_text(&running),
+            "[B] Full  [M] Mem  [X] Burn-in(5m)  [C] Cancel"
+        );
+        let line = controls_line(&running);
+        assert_eq!(line_text(&line), controls_text(&running));
+        assert_eq!(span_fg(&line, 0), DIM, "the in-flight [B] key dims");
+        assert_eq!(span_fg(&line, 6), CYAN, "the in-flight [C] key is cyan");
+
+        // A burn-in in flight: the identical shape (the two run
+        // classes share the single-flight rule).
+        let burn = BenchState {
+            burn_in: BurnInState {
+                running: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(controls_text(&burn), controls_text(&running));
+
+        // Over the rendered buffer: the run keys render in the zone;
+        // the `Cancel` text appears only while a run is in flight
+        // (a wide surface — the in-flight line is 45 columns, beyond
+        // the 100-col zone-2 inner width of 30).
+        let mut state = AppState::default();
+        let text = draw(&state);
+        assert!(text.contains("[B] Full"), "{text}");
+        assert!(!text.contains("Cancel"), "{text}");
+        state.bench = running;
+        let text = draw_at(&state, 200, 30);
+        assert!(text.contains("[C] Cancel"), "{text}");
+    }
+
+    /// (ag) The burn-in row text (the GUI `burn_in_row` mirror,
+    /// C7-18 / TUI-14): the newest tick's bookkeeping + the headline
+    /// `latest` cells in the plain grid form (the [`bench_cell_text`]
+    /// Terminal arm — unit-less, the zone title carries GB/s and the
+    /// `ns/hop` header the ns); a cell not yet streamed (0.0 on the
+    /// wire) or a non-finite reading reads `N/A`.
+    #[test]
+    fn burn_in_row_text_and_na_cells() {
+        // A burn-in in flight with measured headline cells: the exact
+        // GUI form.
+        let burn = BurnInState {
+            running: true,
+            iteration: 2,
+            elapsed_secs: 90.0,
+            latest: BenchmarkGrid {
+                read_gbps: [26.35, 35.10, 0.0, 0.0],
+                write_gbps: [0.0; 4],
+                copy_gbps: [0.0; 4],
+                latency_ns: [86.84, 0.0, 0.0, 0.0],
+            },
+        };
+        assert_eq!(
+            burn_in_row_text(&burn),
+            Some("Burn-in: iteration 2 · 1:30 elapsed · Memory Read 26.35 · 86.84".to_owned())
+        );
+        // The rendered line carries the same flat text.
+        assert_eq!(
+            burn_in_row_line(&burn).map(|line| line_text(&line)),
+            burn_in_row_text(&burn)
+        );
+
+        // A fresh tick (no `latest` cells yet): both headline cells
+        // read N/A — the row is present (the burn-in is in flight).
+        let fresh = BurnInState {
+            running: true,
+            iteration: 1,
+            elapsed_secs: 5.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            burn_in_row_text(&fresh),
+            Some("Burn-in: iteration 1 · 0:05 elapsed · Memory Read N/A · N/A".to_owned())
+        );
+
+        // A non-finite reading degrades to N/A too (the plain cell
+        // form's guard).
+        let broken = BurnInState {
+            running: true,
+            latest: BenchmarkGrid {
+                read_gbps: [f64::NAN, 0.0, 0.0, 0.0],
+                write_gbps: [0.0; 4],
+                copy_gbps: [0.0; 4],
+                latency_ns: [0.0; 4],
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            burn_in_row_text(&broken),
+            Some("Burn-in: iteration 0 · 0:00 elapsed · Memory Read N/A · N/A".to_owned())
+        );
+    }
+
+    /// (ah) The burn-in row's absence (the GUI `burn_in_row` rule,
+    /// TUI-14): `None` before a burn-in starts and after it ends (the
+    /// row is present only while a burn-in is in flight — the fixed
+    /// layout slot stays blank, no shift), and the rendered zone
+    /// carries no burn-in text in the idle state.
+    #[test]
+    fn burn_in_row_absent_without_burn_in() {
+        // No burn-in ever: absent.
+        assert_eq!(burn_in_row_text(&BurnInState::default()), None);
+        assert_eq!(burn_in_row_line(&BurnInState::default()), None);
+        // A finished burn-in (the newest tick kept, the run ended):
+        // absent too (the row is not a result summary).
+        let finished = BurnInState {
+            running: false,
+            iteration: 12,
+            elapsed_secs: 300.0,
+            ..Default::default()
+        };
+        assert_eq!(burn_in_row_text(&finished), None);
+
+        // Over the rendered buffer: the idle zone carries no burn-in
+        // text.
+        let text = draw(&AppState::default());
+        assert!(!text.contains("Burn-in:"), "{text}");
+    }
+
+    /// (ai) Clipping at a small height (TUI-14 — the zone-2
+    /// constraint grows 5 + 1 + 1 + 1 + slack): the dashboard never
+    /// panics as the terminal shrinks. The layout solver keeps the
+    /// three line rows (status / controls / burn-in) and trims the
+    /// grid's tier rows first (the table keeps its header, the tier
+    /// rows drop one by one, the controls line is the last of the
+    /// lines to go at the smallest inner); at the full surface all
+    /// four zone-2 lines render with the full 5-row grid.
+    #[test]
+    fn zone2_clips_at_small_height() {
+        // An in-flight burn-in (the full zone-2 content: the live
+        // grid + the status line + the controls line + the burn-in
+        // row) on shrinking surfaces (inner = total - 3 header - 2
+        // zone borders).
+        let state = AppState {
+            bench: BenchState {
+                burn_in: BurnInState {
+                    running: true,
+                    iteration: 3,
+                    elapsed_secs: 90.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // 200×8 (3 inner rows): the grid keeps its header row only
+        // (no tier rows — the L1/L2/L3 tier names are absent); the
+        // status + burn-in lines render; the controls line is
+        // clipped out.
+        let text = draw_at(&state, 200, 8);
+        assert!(text.contains("2 · BENCH (GB/s)"), "{text}");
+        assert!(text.contains("Status: Running…"), "{text}");
+        assert!(text.contains("Burn-in: iteration 3"), "{text}");
+        assert!(!text.contains("L1"), "{text}");
+        assert!(!text.contains("L2"), "{text}");
+        assert!(!text.contains("L3"), "{text}");
+        assert!(!text.contains("[B] Full"), "{text}");
+        // 200×10 (5 inner rows): the grid's first tier row (the
+        // Memory tier) renders, the second (L1) clips out; all three
+        // lines render.
+        let text = draw_at(&state, 200, 10);
+        assert!(!text.contains("L1"), "{text}");
+        assert!(text.contains("Status: Running…"), "{text}");
+        assert!(text.contains("[B] Full"), "{text}");
+        assert!(text.contains("Burn-in: iteration 3"), "{text}");
+        // 200×13 (8 inner rows): the full 5-row grid + all three
+        // lines — the exact 5 + 1 + 1 + 1 fit, every line whole.
+        let text = draw_at(&state, 200, 13);
+        for tier in ["L1", "L2", "L3"] {
+            assert!(text.contains(tier), "{text}");
+        }
+        assert!(
+            text.contains("Status: Running… (burn-in 1:30, iter 3)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[B] Full  [M] Mem  [X] Burn-in(5m)  [C] Cancel"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Burn-in: iteration 3 · 1:30 elapsed · Memory Read N/A · N/A"),
+            "{text}"
+        );
+        // The 100-col default surface (30-col zone-2 inner): the
+        // lines render width-clipped at the budget (the no-panic clip
+        // contract) — the burn-in line's prefix + the controls
+        // prefix survive.
+        let text = draw(&state);
+        assert!(text.contains("Burn-in: iteration 3"), "{text}");
+        assert!(text.contains("[B] Full"), "{text}");
+    }
+
+    /// (aj) The DRAM-die row value (the GUI `dram_die_line` 5-case
+    /// mirror): each absent parenthetical part is dropped — the full
+    /// form, a `Na` die type, a `Na` density, both missing (the bare
+    /// maker), and a `Na` die maker (the whole value degrades to the
+    /// bare `N/A`).
+    #[test]
+    fn dram_die_line_matrix() {
+        let full = SpdModule {
+            die_type: Section::Value("A-Die".to_owned()),
+            ..fixture_module()
+        };
+        assert_eq!(dram_die_line(&full), "SK hynix (A-Die, 16Gb)");
+        assert_eq!(dram_die_line(&fixture_module()), "SK hynix (16Gb)");
+        assert_eq!(
+            dram_die_line(&SpdModule {
+                die_type: Section::Value("A-Die".to_owned()),
+                density_mbit: Section::na(NaReason::NotApplicable),
+                ..fixture_module()
+            }),
+            "SK hynix (A-Die)"
+        );
+        assert_eq!(
+            dram_die_line(&SpdModule {
+                density_mbit: Section::na(NaReason::NotApplicable),
+                ..fixture_module()
+            }),
+            "SK hynix"
+        );
+        assert_eq!(
+            dram_die_line(&SpdModule {
+                die_maker: Section::na(NaReason::DriverMissing),
+                ..fixture_module()
+            }),
+            "N/A"
+        );
+    }
+
+    /// (ak) The die-density conversion (the GUI `density_gib` mirror):
+    /// `Mbit ÷ 1024` keeps the `Gb` form for real-world densities, a
+    /// non-integer conversion keeps the raw `Mbit` form.
+    #[test]
+    fn density_gib_conversion() {
+        assert_eq!(density_gib(16_384), "16Gb");
+        assert_eq!(density_gib(8_192), "8Gb");
+        assert_eq!(density_gib(2_000), "2000 Mbit");
+    }
+
+    // ------------------------------------------------------------------
+    // TUI-16 — the composition (the final ui.rs chunk): the settings
+    // strip, the requirements strip, and the graphs overlay.
+    // ------------------------------------------------------------------
+
+    /// (al) `poll_interval_text`: the whole-second presets render in
+    /// seconds, the sub-second presets in milliseconds (the TUI-22
+    /// cycle's display form).
+    #[test]
+    fn poll_interval_text_arms() {
+        assert_eq!(poll_interval_text(100), "100 ms");
+        assert_eq!(poll_interval_text(500), "500 ms");
+        assert_eq!(poll_interval_text(1000), "1 s");
+        assert_eq!(poll_interval_text(2000), "2 s");
+        assert_eq!(poll_interval_text(60000), "60 s");
+    }
+
+    /// (am) The settings strip body (the plan's frozen form): the
+    /// default knobs + a connected path, the fully-toggled knobs +
+    /// the degraded socket placeholder (a non-`connected` status),
+    /// and the exact composed line of each.
+    #[test]
+    fn settings_strip_body_matrix() {
+        let state = AppState {
+            daemon_status: "connected: /tmp/ramsleuth.sock".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings_strip_text(&state),
+            "Settings: Poll 2 s [p] · Capacity GiB [u] · Clock MHz [k] · Refresh on [a] · Socket /tmp/ramsleuth.sock (--socket)"
+        );
+
+        let state = AppState {
+            settings: TuiSettings {
+                poll_interval_ms: 100,
+                refresh: false,
+                capacity_gib: false,
+                clock_mhz: false,
+                ..Default::default()
+            },
+            daemon_status: "disconnected".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings_strip_text(&state),
+            "Settings: Poll 100 ms [p] · Capacity GB [u] · Clock GHz [k] · Refresh off [a] · Socket — (--socket)"
+        );
+    }
+
+    /// (an) The settings strip appears / disappears with
+    /// `settings_open` (over the rendered buffer: the line is row 3,
+    /// right under the 3-line header — the full 114-column line on
+    /// the 140-column surface).
+    #[test]
+    fn settings_strip_appears_and_disappears_per_flag() {
+        let mut state = AppState {
+            daemon_status: "connected: /tmp/ramsleuth.sock".to_owned(),
+            ..Default::default()
+        };
+
+        assert!(!draw_at(&state, 140, 30).contains("Settings:"));
+        state.settings.settings_open = true;
+        let text = draw_at(&state, 140, 30);
+        let lines = text.split('\n').collect::<Vec<_>>();
+        assert_eq!(
+            lines[3],
+            "Settings: Poll 2 s [p] · Capacity GiB [u] · Clock MHz [k] · Refresh on [a] · Socket /tmp/ramsleuth.sock (--socket)",
+            "{lines:?}"
+        );
+    }
+
+    /// (ao) The requirements strip is presence-driven: shown while
+    /// `diagnose` is non-empty and `requirements_open` (the
+    /// daemon-less default yields the single daemon requirement),
+    /// absent when the toggle is closed, and absent on its own for a
+    /// connected, clean state (the auto-vanish).
+    #[test]
+    fn requirements_strip_presence_driven() {
+        // The daemon-less default: one requirement (the daemon
+        // start). The closed toggle hides the strip.
+        let mut state = AppState::default();
+        assert!(!draw(&state).contains("SETUP — requirements"));
+        state.settings.requirements_open = true;
+        let text = draw(&state);
+        assert!(text.contains("SETUP — requirements"), "{text}");
+        assert!(text.contains("Start the ramsleuth daemon"), "{text}");
+        assert!(text.contains("$ sudo systemctl enable --now ramsleuth"), "{text}");
+
+        // A connected, clean state: `diagnose` is empty — the strip
+        // vanishes on its own (the toggle stays open, the presence
+        // rule drives it).
+        let mut clean = AppState {
+            daemon_status: "connected: /tmp/ramsleuth.sock".to_owned(),
+            ..Default::default()
+        };
+        clean.settings.requirements_open = true;
+        assert!(!draw(&clean).contains("SETUP — requirements"));
+    }
+
+    /// (ap) The graphs overlay paints over the zones: with
+    /// `graphs_open` the panel's title wins the zone area's top row
+    /// (the zone titles are covered underneath) and the window knob
+    /// reaches the title (`last 15 min`); on a surface whose zone
+    /// area is too small for the panel (fewer than 3 rows — the
+    /// "panel shorter" case) the panel draws nothing and the zone
+    /// titles render whole.
+    #[test]
+    fn graphs_overlay_paints_over_zones() {
+        let mut state = representative();
+        state.settings.graphs_open = true;
+
+        // The normal surface: the panel over the whole zone area.
+        let text = draw(&state);
+        assert!(text.contains("GRAPHS (last 5 min"), "{text}");
+        assert!(text.contains("[w] window"), "{text}");
+        assert!(text.contains("[g] close"), "{text}");
+        // The panel's border + title win the zones' title row.
+        assert!(!text.contains("MEMORY CONTROLLER"), "{text}");
+        assert!(!text.contains("BENCH (GB/s)"), "{text}");
+        assert!(!text.contains("HARDWARE & SPD"), "{text}");
+
+        // The window knob reaches the panel title.
+        state.settings.graph_window_min = 15;
+        let text = draw(&state);
+        assert!(text.contains("GRAPHS (last 15 min"), "{text}");
+
+        // A 5-row surface: the 3-line header leaves a 2-row zone
+        // area — too small for the panel (< 3 rows), which draws
+        // nothing; the zone titles render whole underneath.
+        let text = draw_at(&state, 100, 5);
+        assert!(!text.contains("GRAPHS"), "{text}");
+        assert!(text.contains("1 · MEMORY CONTROLLER"), "{text}");
+        assert!(text.contains("2 · BENCH (GB/s)"), "{text}");
+        assert!(text.contains("3 · HARDWARE & SPD"), "{text}");
     }
 }
