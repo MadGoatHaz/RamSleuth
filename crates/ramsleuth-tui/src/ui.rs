@@ -241,22 +241,53 @@ pub struct AppState {
 // Rendering.
 // ---------------------------------------------------------------------------
 
-/// Render the three-zone dashboard into `frame` from `state`.
+/// Render the dashboard into `frame` from `state`.
 ///
-/// The screen splits vertically into a three-row header strip (line 1
-/// the title + platform tag + daemon status + key legend, line 2 the
+/// The screen splits vertically into the three-row header strip (line
+/// 1 the title + platform tag + daemon status + key legend, line 2 the
 /// CPU/platform identity, line 3 the RAM summary — the capacity,
 /// per-DIMM breakdown, SPD speed, channel mode, and UCLK:MCLK sync
-/// mode) and the three zones side by side. Every zone is a
+/// mode), then the optional **settings strip** (one line while
+/// `settings.settings_open` — [`settings_strip_line`]), then the
+/// optional **requirements strip** (while
+/// [`crate::requirements::diagnose`] is non-empty and
+/// `settings.requirements_open` — the presence-driven auto-vanish; its
+/// fixed height is the border + one 3-line block per requirement + the
+/// footer, drawn by
+/// [`crate::requirements::render_requirements_strip`]), then the three
+/// zones side by side in the `Fill(1)` remainder. Every zone is a
 /// titled `Block` on a slate background; content that does not fit is
-/// clipped, never wrapped or scrolled. Safe at any terminal size — the
-/// all-`Na`, empty-SPD, daemon-down, and default states all render without
-/// panicking.
+/// clipped, never wrapped or scrolled. While `settings.graphs_open`,
+/// [`crate::graphs::render_graphs_panel`] is drawn **last** over the
+/// whole zone area (topmost — the C21-36 modal idiom: the zones render
+/// underneath first, the overlay wins the paint; `[g]` close restores
+/// them). Safe at any terminal size — the all-`Na`, empty-SPD,
+/// daemon-down, and default states (any combination of the strips /
+/// the overlay open) all render without panicking.
 pub fn render(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
+
+    // The requirements' presence (the TUI-08 pure `diagnose` — the
+    // strip's auto-vanish rule): it occupies its row only while a
+    // requirement is present and the `[d]` toggle is open.
+    let requirements = crate::requirements::diagnose(state);
+    let requirements_open = !requirements.is_empty() && state.settings.requirements_open;
+
+    // The top region's rows, in paint order: the header (3 lines), the
+    // settings strip (1 line while open), the requirements strip (its
+    // border + 3 lines per requirement + the footer, while open +
+    // present), the zones (the `Fill(1)` remainder).
+    let mut constraints = vec![Constraint::Length(3)];
+    if state.settings.settings_open {
+        constraints.push(Constraint::Length(1));
+    }
+    if requirements_open {
+        constraints.push(Constraint::Length(3 * requirements.len() as u16 + 3));
+    }
+    constraints.push(Constraint::Fill(1));
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Fill(1)])
+        .constraints(constraints)
         .split(area);
 
     let width = usize::from(outer[0].width);
@@ -269,6 +300,20 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         outer[0],
     );
 
+    // The optional strips, in the same order (a closed / absent strip
+    // is simply missing from the layout — the header stays the top
+    // three rows, the zones take the remainder).
+    let mut row = 1;
+    if state.settings.settings_open {
+        frame.render_widget(Paragraph::new(settings_strip_line(state)), outer[row]);
+        row += 1;
+    }
+    if requirements_open {
+        crate::requirements::render_requirements_strip(frame, &requirements, outer[row]);
+        row += 1;
+    }
+
+    let zone_area = outer[row];
     let zones = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -276,11 +321,23 @@ pub fn render(frame: &mut Frame, state: &AppState) {
             Constraint::Percentage(32),
             Constraint::Percentage(28),
         ])
-        .split(outer[1]);
+        .split(zone_area);
 
     render_zone1(frame, state, zones[0]);
     render_zone2(frame, state, zones[1]);
     render_zone3(frame, state, zones[2]);
+
+    // The graphs overlay: drawn last over the whole zone area (the
+    // topmost surface — the zones underneath are painted first, the
+    // panel wins; `[g]` close restores them).
+    if state.settings.graphs_open {
+        crate::graphs::render_graphs_panel(
+            frame,
+            &state.graph,
+            state.settings.graph_window_min,
+            zone_area,
+        );
+    }
 }
 
 /// The shared zone decoration: a titled border on a slate background.
@@ -719,6 +776,74 @@ fn age_fragment(platform: &SystemPlatform) -> String {
         (Section::Na(_), Section::Value(v)) => format!("SMU {v}"),
         (Section::Na(_), Section::Na(_)) => "AGESA N/A".to_owned(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Top strips (TUI-16 — the composition chunk): the settings strip line
+// (the requirements strip's presence / height + the graphs overlay are
+// composed directly in [`render`]).
+// ---------------------------------------------------------------------------
+
+/// The settings strip's poll-interval segment (the `[p]` knob): a
+/// whole-second value renders in seconds (`2 s`, `60 s`), a
+/// sub-second value in milliseconds (`100 ms`, `500 ms`) — the
+/// TUI-22 preset cycle's display form (a non-preset value keeps its
+/// raw `ms` form — deterministic, never a panic).
+fn poll_interval_text(ms: u64) -> String {
+    if ms % 1000 == 0 {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{ms} ms")
+    }
+}
+
+/// The settings strip's socket segment: the frozen state carries no
+/// socket field (TUI-09's shape freeze — the `--socket` CLI flag is
+/// the one source), so the live path is read off the `connected:
+/// <path>` daemon status; every other status (`disconnected`, the
+/// transient `snapshot: …`, empty) degrades to the `—` placeholder.
+fn socket_path_text(state: &AppState) -> String {
+    state
+        .daemon_status
+        .strip_prefix("connected: ")
+        .map(str::to_owned)
+        .unwrap_or_else(|| "—".to_owned())
+}
+
+/// The settings strip's one-line body (the plan's frozen form): `Poll
+/// <interval> [p] · Capacity <GiB|GB> [u] · Clock <MHz|GHz> [k] ·
+/// Refresh <on|off> [a] · Socket <path> (--socket)` — every knob
+/// reads the frozen `settings` fields, the key hints inline (the
+/// header legend stays the canonical key map, TUI-10).
+fn settings_strip_body(state: &AppState) -> String {
+    let settings = &state.settings;
+    format!(
+        "Poll {} [p] · Capacity {} [u] · Clock {} [k] · Refresh {} [a] · Socket {} (--socket)",
+        poll_interval_text(settings.poll_interval_ms),
+        if settings.capacity_gib { "GiB" } else { "GB" },
+        if settings.clock_mhz { "MHz" } else { "GHz" },
+        if settings.refresh { "on" } else { "off" },
+        socket_path_text(state),
+    )
+}
+
+/// The settings strip as a rendered line (shown by [`render`] as one
+/// row under the header while `settings.settings_open`): the cyan
+/// `Settings: ` lead (the GUI strip's strong-cyan label precedent) +
+/// the dim body ([`settings_strip_body`]).
+fn settings_strip_line(state: &AppState) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("Settings: ", Style::default().fg(CYAN)),
+        Span::styled(settings_strip_body(state), Style::default().fg(DIM)),
+    ])
+}
+
+/// The settings strip line's flat text (the composed spans'
+/// string-for-string form — the test's assertion surface, the TUI-11
+/// `ram_line_prefix` precedent).
+#[cfg(test)]
+fn settings_strip_text(state: &AppState) -> String {
+    format!("Settings: {}", settings_strip_body(state))
 }
 
 // ---------------------------------------------------------------------------
@@ -1874,6 +1999,26 @@ mod tests {
         assert!(text.contains("Status: Idle"), "{text}");
         assert!(text.contains("not connected"), "{text}");
         assert!(text.contains("no telemetry"), "{text}");
+
+        // TUI-16: every new surface open at once over the default
+        // state — the settings strip, the presence-driven
+        // requirements strip (the daemon-less default yields the
+        // single daemon requirement), and the graphs overlay (the
+        // empty ring) — renders without panicking.
+        let open = AppState {
+            settings: TuiSettings {
+                settings_open: true,
+                requirements_open: true,
+                graphs_open: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = draw(&open);
+        assert!(text.contains("Settings: Poll 2 s [p]"), "{text}");
+        assert!(text.contains("SETUP — requirements"), "{text}");
+        assert!(text.contains("GRAPHS (last 5 min"), "{text}");
+        assert!(text.contains("Status: Idle"), "{text}");
     }
 
     /// (c) A running bench renders the grid's live overlay — the
@@ -3348,5 +3493,141 @@ mod tests {
         assert_eq!(density_gib(16_384), "16Gb");
         assert_eq!(density_gib(8_192), "8Gb");
         assert_eq!(density_gib(2_000), "2000 Mbit");
+    }
+
+    // ------------------------------------------------------------------
+    // TUI-16 — the composition (the final ui.rs chunk): the settings
+    // strip, the requirements strip, and the graphs overlay.
+    // ------------------------------------------------------------------
+
+    /// (al) `poll_interval_text`: the whole-second presets render in
+    /// seconds, the sub-second presets in milliseconds (the TUI-22
+    /// cycle's display form).
+    #[test]
+    fn poll_interval_text_arms() {
+        assert_eq!(poll_interval_text(100), "100 ms");
+        assert_eq!(poll_interval_text(500), "500 ms");
+        assert_eq!(poll_interval_text(1000), "1 s");
+        assert_eq!(poll_interval_text(2000), "2 s");
+        assert_eq!(poll_interval_text(60000), "60 s");
+    }
+
+    /// (am) The settings strip body (the plan's frozen form): the
+    /// default knobs + a connected path, the fully-toggled knobs +
+    /// the degraded socket placeholder (a non-`connected` status),
+    /// and the exact composed line of each.
+    #[test]
+    fn settings_strip_body_matrix() {
+        let state = AppState {
+            daemon_status: "connected: /tmp/ramsleuth.sock".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings_strip_text(&state),
+            "Settings: Poll 2 s [p] · Capacity GiB [u] · Clock MHz [k] · Refresh on [a] · Socket /tmp/ramsleuth.sock (--socket)"
+        );
+
+        let state = AppState {
+            settings: TuiSettings {
+                poll_interval_ms: 100,
+                refresh: false,
+                capacity_gib: false,
+                clock_mhz: false,
+                ..Default::default()
+            },
+            daemon_status: "disconnected".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings_strip_text(&state),
+            "Settings: Poll 100 ms [p] · Capacity GB [u] · Clock GHz [k] · Refresh off [a] · Socket — (--socket)"
+        );
+    }
+
+    /// (an) The settings strip appears / disappears with
+    /// `settings_open` (over the rendered buffer: the line is row 3,
+    /// right under the 3-line header — the full 114-column line on
+    /// the 140-column surface).
+    #[test]
+    fn settings_strip_appears_and_disappears_per_flag() {
+        let mut state = AppState {
+            daemon_status: "connected: /tmp/ramsleuth.sock".to_owned(),
+            ..Default::default()
+        };
+
+        assert!(!draw_at(&state, 140, 30).contains("Settings:"));
+        state.settings.settings_open = true;
+        let text = draw_at(&state, 140, 30);
+        let lines = text.split('\n').collect::<Vec<_>>();
+        assert_eq!(
+            lines[3],
+            "Settings: Poll 2 s [p] · Capacity GiB [u] · Clock MHz [k] · Refresh on [a] · Socket /tmp/ramsleuth.sock (--socket)",
+            "{lines:?}"
+        );
+    }
+
+    /// (ao) The requirements strip is presence-driven: shown while
+    /// `diagnose` is non-empty and `requirements_open` (the
+    /// daemon-less default yields the single daemon requirement),
+    /// absent when the toggle is closed, and absent on its own for a
+    /// connected, clean state (the auto-vanish).
+    #[test]
+    fn requirements_strip_presence_driven() {
+        // The daemon-less default: one requirement (the daemon
+        // start). The closed toggle hides the strip.
+        let mut state = AppState::default();
+        assert!(!draw(&state).contains("SETUP — requirements"));
+        state.settings.requirements_open = true;
+        let text = draw(&state);
+        assert!(text.contains("SETUP — requirements"), "{text}");
+        assert!(text.contains("Start the ramsleuth daemon"), "{text}");
+        assert!(text.contains("$ sudo systemctl enable --now ramsleuth"), "{text}");
+
+        // A connected, clean state: `diagnose` is empty — the strip
+        // vanishes on its own (the toggle stays open, the presence
+        // rule drives it).
+        let mut clean = AppState {
+            daemon_status: "connected: /tmp/ramsleuth.sock".to_owned(),
+            ..Default::default()
+        };
+        clean.settings.requirements_open = true;
+        assert!(!draw(&clean).contains("SETUP — requirements"));
+    }
+
+    /// (ap) The graphs overlay paints over the zones: with
+    /// `graphs_open` the panel's title wins the zone area's top row
+    /// (the zone titles are covered underneath) and the window knob
+    /// reaches the title (`last 15 min`); on a surface whose zone
+    /// area is too small for the panel (fewer than 3 rows — the
+    /// "panel shorter" case) the panel draws nothing and the zone
+    /// titles render whole.
+    #[test]
+    fn graphs_overlay_paints_over_zones() {
+        let mut state = representative();
+        state.settings.graphs_open = true;
+
+        // The normal surface: the panel over the whole zone area.
+        let text = draw(&state);
+        assert!(text.contains("GRAPHS (last 5 min"), "{text}");
+        assert!(text.contains("[w] window"), "{text}");
+        assert!(text.contains("[g] close"), "{text}");
+        // The panel's border + title win the zones' title row.
+        assert!(!text.contains("MEMORY CONTROLLER"), "{text}");
+        assert!(!text.contains("BENCH (GB/s)"), "{text}");
+        assert!(!text.contains("HARDWARE & SPD"), "{text}");
+
+        // The window knob reaches the panel title.
+        state.settings.graph_window_min = 15;
+        let text = draw(&state);
+        assert!(text.contains("GRAPHS (last 15 min"), "{text}");
+
+        // A 5-row surface: the 3-line header leaves a 2-row zone
+        // area — too small for the panel (< 3 rows), which draws
+        // nothing; the zone titles render whole underneath.
+        let text = draw_at(&state, 100, 5);
+        assert!(!text.contains("GRAPHS"), "{text}");
+        assert!(text.contains("1 · MEMORY CONTROLLER"), "{text}");
+        assert!(text.contains("2 · BENCH (GB/s)"), "{text}");
+        assert!(text.contains("3 · HARDWARE & SPD"), "{text}");
     }
 }

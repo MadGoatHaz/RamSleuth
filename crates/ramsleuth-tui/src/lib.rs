@@ -31,6 +31,10 @@
 
 pub mod events;
 pub mod graphs;
+// TUI-16: declared for its first consumer — the ui.rs render chain
+// (the pure `diagnose` + `render_requirements_strip`). The module-doc
+// inventory update + the root re-exports stay TUI-23's scope.
+pub mod requirements;
 pub mod ring;
 pub mod ui;
 
