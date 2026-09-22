@@ -33,8 +33,8 @@
 //!   <latency>`, present only while a burn-in runs — the GUI
 //!   `burn_in_row` form).
 //! - **Zone 3 — hardware & SPD telemetry:** per-slot module lines (maker /
-//!   part / rank / density / speed + XMP/EXPO profiles), the daemon status
-//!   line, and the error line when present.
+//!   dram die / part / rank / density / speed + XMP/EXPO profiles), the
+//!   daemon status line, and the error line when present.
 //!
 //! The frozen state shapes also carry the parity surfaces the render
 //! chain adds over these zones (TUI-10…16): the 3-line header, the
@@ -120,9 +120,10 @@ pub struct BenchState {
 ///
 /// `latest` accumulates each streamed `BurnInProgress` tick the same
 /// way the live grid accumulates progress events (the newest value per
-/// cell wins; a non-finite / non-positive reading never counts). The
-/// 4×4 table keeps showing the terminal grid
-/// ([`BenchState::grid`]) during a run; the burn-in row shows `latest`.
+/// cell wins; a non-finite / non-positive reading never counts). While
+/// a burn-in is in flight the 4×4 table renders `latest` as the live
+/// overlay (the dimmed `…` cells — the module-doc zone-2 rule); the
+/// burn-in row also shows `latest`.
 ///
 /// Hand-written `Default` (the GUI `update.rs` precedent): no run,
 /// iteration 0, zero elapsed, and a zero grid — `BenchmarkGrid` derives
@@ -1407,8 +1408,9 @@ fn zone3_items(state: &AppState) -> Vec<ListItem<'static>> {
     items
 }
 
-/// One SPD slot: a subheader + maker / part / rank / density / speed
-/// cells + one line per XMP/EXPO profile (or a `none` placeholder).
+/// One SPD slot: a subheader + maker / dram die / part / rank / density
+/// / speed cells + one line per XMP/EXPO profile (or a `none`
+/// placeholder).
 fn spd_module_items(module: &SpdModule) -> Vec<ListItem<'static>> {
     let gen = if module.is_ddr5 { "DDR5" } else { "DDR4" };
     let mut items = vec![sub_item(&format!(
@@ -1416,6 +1418,19 @@ fn spd_module_items(module: &SpdModule) -> Vec<ListItem<'static>> {
         module.index
     ))];
     items.push(cell_row("maker", &module.maker, CYAN, |s| s.clone()));
+    // The die row (the GUI `status_zone` "dram die" cell): the composed
+    // `<die_maker> (<die_type>, <density>Gb)` value — cyan when the die
+    // maker is present, a bare crimson `N/A` when it degrades whole.
+    let die = dram_die_line(module);
+    items.push(row(
+        "dram die",
+        &die,
+        if matches!(&module.die_maker, Section::Value(_)) {
+            CYAN
+        } else {
+            CRIMSON
+        },
+    ));
     items.push(cell_row("part", &module.part, CYAN, |s| s.clone()));
     items.push(cell_row("rank", &module.rank, CYAN, |v: &u8| v.to_string()));
     items.push(cell_row("density", &module.density_mbit, CYAN, fmt_density));
@@ -1457,6 +1472,44 @@ fn spd_profile_item(is_ddr5: bool, profile: &SpdProfile) -> ListItem<'static> {
         ),
         CYAN,
     )
+}
+
+/// The DRAM-die row's value (the GUI `status_zone::dram_die_line`
+/// mirror): `<die_maker> (<die_type>, <density>Gb)` with each
+/// parenthetical part dropped when absent — a `Na` die type yields
+/// `<die_maker> (<density>Gb)`, a `Na` density omits the density, and
+/// both absent shows the die maker bare. A `Na` die maker degrades the
+/// whole value to a bare `N/A` (D-4 — the reason stays on the wire).
+/// Never a panic.
+fn dram_die_line(module: &SpdModule) -> String {
+    match &module.die_maker {
+        Section::Na(_) => "N/A".to_owned(),
+        Section::Value(die_maker) => {
+            let mut parts = Vec::new();
+            if let Section::Value(die_type) = &module.die_type {
+                parts.push(die_type.clone());
+            }
+            if let Section::Value(mbit) = &module.density_mbit {
+                parts.push(density_gib(*mbit));
+            }
+            if parts.is_empty() {
+                die_maker.clone()
+            } else {
+                format!("{die_maker} ({})", parts.join(", "))
+            }
+        }
+    }
+}
+
+/// A die density in Gb (the GUI `density_gib` mirror): `Mbit ÷ 1024`
+/// (16384 → `16Gb`); a non-integer conversion (not a real-world
+/// density) keeps the raw `Mbit` form — deterministic, never a panic.
+fn density_gib(mbit: u16) -> String {
+    if mbit % 1024 == 0 {
+        format!("{}Gb", mbit / 1024)
+    } else {
+        format!("{mbit} Mbit")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1795,8 +1848,9 @@ mod tests {
         // zone 2: the grid renders (idle, no run yet -> N/A cells) +
         // the flat status line (the TUI-13 re-render of the progress line)
         assert!(text.contains("Status: Idle"), "{text}");
-        // zone 3: the SPD module + profile + daemon line
+        // zone 3: the SPD module + die row + profile + daemon line
         assert!(text.contains("Samsung"), "{text}");
+        assert!(text.contains("SK hynix (16Gb)"), "{text}");
         assert!(text.contains("3200 MT/s"), "{text}");
         assert!(text.contains("16384 Mbit"), "{text}");
         assert!(text.contains("XMP 1"), "{text}");
@@ -3247,5 +3301,52 @@ mod tests {
         let text = draw(&state);
         assert!(text.contains("Burn-in: iteration 3"), "{text}");
         assert!(text.contains("[B] Full"), "{text}");
+    }
+
+    /// (aj) The DRAM-die row value (the GUI `dram_die_line` 5-case
+    /// mirror): each absent parenthetical part is dropped — the full
+    /// form, a `Na` die type, a `Na` density, both missing (the bare
+    /// maker), and a `Na` die maker (the whole value degrades to the
+    /// bare `N/A`).
+    #[test]
+    fn dram_die_line_matrix() {
+        let full = SpdModule {
+            die_type: Section::Value("A-Die".to_owned()),
+            ..fixture_module()
+        };
+        assert_eq!(dram_die_line(&full), "SK hynix (A-Die, 16Gb)");
+        assert_eq!(dram_die_line(&fixture_module()), "SK hynix (16Gb)");
+        assert_eq!(
+            dram_die_line(&SpdModule {
+                die_type: Section::Value("A-Die".to_owned()),
+                density_mbit: Section::na(NaReason::NotApplicable),
+                ..fixture_module()
+            }),
+            "SK hynix (A-Die)"
+        );
+        assert_eq!(
+            dram_die_line(&SpdModule {
+                density_mbit: Section::na(NaReason::NotApplicable),
+                ..fixture_module()
+            }),
+            "SK hynix"
+        );
+        assert_eq!(
+            dram_die_line(&SpdModule {
+                die_maker: Section::na(NaReason::DriverMissing),
+                ..fixture_module()
+            }),
+            "N/A"
+        );
+    }
+
+    /// (ak) The die-density conversion (the GUI `density_gib` mirror):
+    /// `Mbit ÷ 1024` keeps the `Gb` form for real-world densities, a
+    /// non-integer conversion keeps the raw `Mbit` form.
+    #[test]
+    fn density_gib_conversion() {
+        assert_eq!(density_gib(16_384), "16Gb");
+        assert_eq!(density_gib(8_192), "8Gb");
+        assert_eq!(density_gib(2_000), "2000 Mbit");
     }
 }
