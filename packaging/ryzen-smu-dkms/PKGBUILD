@@ -9,7 +9,7 @@
 # configuration (packaging/ryzen-smu-dkms/dkms.conf), (2) the
 # operator-run install helper (scripts/install-ryzen-smu-dkms.sh, as
 # /usr/bin/ryzen-smu-dkms-install — the D-18.4 name distinct from
-# ramsleuth-git's /usr/bin/ramsleuth-install-ryzen-smu-dkms, so the
+# ramsleuth's /usr/bin/ramsleuth-install-ryzen-smu-dkms, so the
 # packages coexist without a pacman file conflict), (3) the VENDED
 # pinned ryzen_smu source (packaging/ryzen-smu-dkms/vendor/: the 6
 # files frozen at upstream commit d298366 + SUMS.sha256 + NOTICE.md)
@@ -27,7 +27,7 @@
 #
 # AUTOINSTALL=yes in the bundled dkms.conf: DKMS auto-rebuilds the
 # module on kernel updates. The ramsleuth systemd unit never loads the
-# module. source: the RamSleuth repo (sibling of ramsleuth-git).
+# module. source: the RamSleuth repo (sibling of ramsleuth).
 #
 # License: the package content is the MIT helper + the GPL-2.0 vendored
 # module source (a separate work — vendor/NOTICE.md); license= lists

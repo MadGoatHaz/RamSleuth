@@ -94,8 +94,8 @@ jobs:
             target/release/ramsleuth-bench \
             target/release/ramsleuth-telemetry \
             systemd/ramsleuth.service \
-            packaging/ramsleuth-git/ramsleuth.preset \
-            packaging/ramsleuth-git/RamSleuth.desktop \
+            packaging/shared/ramsleuth.preset \
+            packaging/shared/RamSleuth.desktop \
             scripts/install-ryzen-smu-dkms.sh \
             install.sh \
             LICENSE \
@@ -126,11 +126,11 @@ jobs:
             cp "target/release/$b" "$S/bin/$b"
           done
           cp systemd/ramsleuth.service "$S/systemd/"
-          cp packaging/ramsleuth-git/ramsleuth.preset "$S/systemd/"
+          cp packaging/shared/ramsleuth.preset "$S/systemd/"
           cp scripts/install-ryzen-smu-dkms.sh "$S/scripts/"
           cp install.sh "$S/"
           cp LICENSE "$S/"
-          cp packaging/ramsleuth-git/RamSleuth.desktop "$S/"
+          cp packaging/shared/RamSleuth.desktop "$S/"
           cp -r assets/icons "$S/"
           cp scripts/ramsleuth-setup.sh "$S/"
           cp packaging/polkit/90-ramsleuth-setup.policy "$S/"

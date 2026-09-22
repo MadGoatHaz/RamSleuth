@@ -6,7 +6,7 @@
 # the official GitHub Release (cut by the release workflow when the v$pkgver
 # tag is cut) and installs it as-is — NO build, NO makedepends. This is the
 # counterpart to ramsleuth (the stable SOURCE package that builds from the
-# git tag) and ramsleuth-git (the bleeding-edge, branch-tracking dev package).
+# git tag).
 #
 # The release asset (contract, fixed by the release workflow):
 #   https://github.com/MadGoatHaz/RamSleuth/releases/download/v$pkgver/ramsleuth-$pkgver-x86_64.tar.zst

@@ -18,7 +18,6 @@
 
     Installation: NOT installed here. The packaging chunks copy this file to
     /usr/share/polkit-1/actions/90-ramsleuth-setup.policy:
-      - C21-10  packaging/ramsleuth-git/PKGBUILD
       - C21-12  packaging/ramsleuth/PKGBUILD
       - C21-14  packaging/ramsleuth-bin/PKGBUILD (from the release tarball)
       - C21-16  install.sh (the self-contained manual installer)

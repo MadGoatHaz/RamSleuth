@@ -5,7 +5,7 @@
 # community install path. It builds from the OFFICIAL TAGGED source
 # (the git tag v$pkgver) — NOT the moving branch — so a release is a
 # reproducible, auditable snapshot. This is the counterpart to
-# ramsleuth-git (the bleeding-edge, branch-tracking dev package).
+# ramsleuth-bin (the prebuilt binary package).
 #
 # Why a git-tag source (no release tarball, no sha256sums):
 #   The AUR community package must build from source that EXISTS at
@@ -20,7 +20,7 @@
 # (the pkgname) — NOT the release-tarball layout RamSleuth-$pkgver. So
 # build()/package() cd into "$srcdir/ramsleuth".
 #
-# Ships (identical surface to ramsleuth-git):
+# Ships:
 #   - 6 binaries -> /usr/bin: ramsleuth-daemon (the daemon-unit ExecStart),
 #     ramsleuth-client, ramsleuth-tui, ramsleuth, ramsleuth-bench,
 #     ramsleuth-telemetry (ramsleuth-protocol is lib-only — never installed)
@@ -58,7 +58,7 @@
 # plus the eframe 0.27 / winit dlopen + fallback runtime surface.
 
 pkgname=ramsleuth
-pkgver=2.2.1   # FIXED — taken from the git tag v$pkgver (no pkgver() — that belongs to ramsleuth-git)
+pkgver=2.2.1   # FIXED — taken from the git tag v$pkgver (no pkgver())
 pkgrel=1
 pkgdesc="Pure-Rust RAM latency/bandwidth telemetry: privileged daemon + unprivileged CLI/TUI/GUI clients"
 arch=(x86_64)
@@ -95,7 +95,7 @@ package() {
 
     # (3) the systemd preset — enables ramsleuth.service by default
     # (the single package-agnostic preset in the repo, shipped verbatim)
-    install -Dm644 "packaging/ramsleuth-git/ramsleuth.preset" \
+    install -Dm644 "packaging/shared/ramsleuth.preset" \
         "$pkgdir/usr/lib/systemd/system-preset/ramsleuth.preset"
 
     # (4) the ramsleuth-owned copy of the pinned ryzen_smu DKMS helper
@@ -112,7 +112,7 @@ package() {
     # The FILENAME matches the GUI's Wayland app_id ("RamSleuth" — eframe/winit
     # 0.29 sets app_id = window title), so KWin's app_id -> desktop-file match
     # resolves the taskbar icon (C21-45).
-    install -Dm644 "packaging/ramsleuth-git/RamSleuth.desktop" \
+    install -Dm644 "packaging/shared/RamSleuth.desktop" \
         "$pkgdir/usr/share/applications/RamSleuth.desktop"
 
     # (8) the one-click setup helper — the pkexec-able root helper (plan C21-01);
