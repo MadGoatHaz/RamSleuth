@@ -73,7 +73,14 @@
 //!   thread (one fast RPC), `[S]`napshot writes the dashboard text (the
 //!   client's pure `render`, P3-19) to a timestamped file in the CWD and
 //!   records the path in `daemon_status` (transient — the next poll
-//!   overwrites it), `[b]` / `[m]` / `[x]` send a `TuiBenchCmd`
+//!   overwrites it), `[E]`xport writes the current telemetry snapshot +
+//!   the terminal bench grid (the `bench` key — the JSON `null`
+//!   before the first completed run) as pretty JSON to
+//!   `$HOME/ramsleuth-export-<unix-ts>.json` (the CWD fallback when
+//!   `HOME` is unset, the GUI F3 rule) — one file write on the main
+//!   thread — and records the written path (or the failure, or the
+//!   no-telemetry hint) in the state the same transient way, `[b]` /
+//!   `[m]` / `[x]` send a `TuiBenchCmd`
 //!   into the updater's bench channel (TUI-19/20 — the run itself
 //!   streams on the updater thread; the send is skipped while any
 //!   run — a normal bench or a burn-in — is in flight, the
@@ -98,7 +105,9 @@
 //! `cargo run -p ramsleuth-tui -- --socket /tmp/ramsleuth.sock` renders
 //! the three zones from the live snapshot (values update every ~2 s,
 //! `[R]` forces one now, `[S]` writes `ramsleuth-tui-<unix-ts>.txt` in
-//! the CWD, `[Q]` restores the terminal + exit 0); with no daemon the
+//! the CWD, `[E]` writes `ramsleuth-export-<unix-ts>.json` in `$HOME`
+//! (the CWD when `HOME` is unset), `[Q]` restores the terminal + exit
+//! 0); with no daemon the
 //! dashboard stays responsive and shows `disconnected` + the
 //! daemon-start hint.
 //!
@@ -113,6 +122,7 @@
 //! Exit codes: 0 quit, 1 terminal init failure, 2 usage error
 //! ```
 
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -130,9 +140,10 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use ramsleuth_bench::{BenchOp, BurnInTick, StreamTarget, Tier};
+use ramsleuth_bench::{BenchmarkGrid, BenchOp, BurnInTick, StreamTarget, Tier};
 use ramsleuth_client::Client;
 use ramsleuth_protocol::{BenchMode, Request, Response, DEFAULT_SOCKET_PATH};
+use ramsleuth_telemetry::SystemMemoryTelemetry;
 use ramsleuth_tui::events;
 use ramsleuth_tui::{key_to_action, render, Action, AppState, BenchState};
 
@@ -1072,6 +1083,127 @@ fn write_snapshot(state: &Arc<RwLock<AppState>>) {
     }
 }
 
+/// The F3 wire snapshot (TUI-21 — the GUI `style.rs` C6-29 mirror):
+/// the frozen [`SystemMemoryTelemetry`] root flattened into the top
+/// level (its seven wire keys, unchanged — no type duplication, D2)
+/// plus the `bench` key.
+#[derive(serde::Serialize)]
+struct ExportSnapshot<'a> {
+    /// The telemetry snapshot, flattened into the top level of the
+    /// file (the seven wire keys: `cpu` / `amd` / `intel` / `spd` /
+    /// `platform` / `total_capacity` / `dimm_sizes`).
+    #[serde(flatten)]
+    telemetry: &'a SystemMemoryTelemetry,
+    /// The terminal 4×4 benchmark grid (the wire unmeasured `N/A`
+    /// cells are the honest `0.0`); `null` before the first completed
+    /// run.
+    bench: Option<&'a BenchmarkGrid>,
+}
+
+/// The wall-clock unix timestamp (seconds) for the export file name
+/// (the GUI F2/F3 `unix_timestamp` mirror). A pre-epoch clock
+/// (impossible on Linux) degrades to 0 — never a panic.
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// The `$HOME` → CWD-fallback rule in its pure form (the GUI rule,
+/// testable without env access): a set `HOME` is the export
+/// destination; an unset `HOME` degrades to the CWD (`.`) — never a
+/// panic.
+fn out_dir_from_home(home: Option<&OsStr>) -> PathBuf {
+    home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The export destination dir (the GUI F2/F3 rule): `$HOME`, falling
+/// back to the CWD when `HOME` is unset — the one env read the
+/// `[E]`xport handler makes (the GUI F3 side-effect precedent).
+fn export_out_dir() -> PathBuf {
+    out_dir_from_home(std::env::var_os("HOME").as_deref())
+}
+
+/// F3: write one telemetry + benchmark snapshot to `path` as pretty
+/// JSON (the GUI `style.rs::export_json` mirror, TUI-local — there is
+/// no `GuiError` in the TUI crate: a JSON failure and a file write
+/// map to a `String` the caller records in `state.error`).
+///
+/// The wire root ([`SystemMemoryTelemetry`], serde-derived since
+/// P3-06) serializes under its own seven wire keys, and the terminal
+/// [`BenchmarkGrid`] rides alongside it under the `bench` key (C6-29,
+/// item 8b): the grid object when a run has completed, the JSON
+/// `null` before the first run. Both absent-grid shapes — no run yet
+/// (`None`) and the all-`0.0`/`N/A` grid — export as-is, never a
+/// panic (D5).
+fn export_json(
+    telemetry: &SystemMemoryTelemetry,
+    bench: Option<&BenchmarkGrid>,
+    path: &Path,
+) -> Result<(), String> {
+    let snapshot = ExportSnapshot { telemetry, bench };
+    let json = serde_json::to_string_pretty(&snapshot)
+        .map_err(|err| format!("export JSON serialization failed: {err}"))?;
+    std::fs::write(path, json).map_err(|err| format!("export file write failed: {err}"))?;
+    Ok(())
+}
+
+/// The `[E]`xport action (TUI-21 — the GUI `main.rs` `perform_export`
+/// `ExportJson` arm, TUI-local): write the current telemetry
+/// snapshot + the terminal bench grid (the `bench` key — the JSON
+/// `null` before the first completed run) to
+/// `ramsleuth-export-<unix-ts>.json` in `out_dir`, returning the
+/// written path. No telemetry yet → `Ok(None)` (no file — the GUI
+/// rule). The only I/O is the one file write (no socket, no daemon,
+/// no window) — testable against a temp `out_dir`.
+fn perform_export(state: &AppState, out_dir: &Path) -> Result<Option<PathBuf>, String> {
+    match &state.telemetry {
+        Some(telemetry) => {
+            let ts = unix_timestamp();
+            let path = out_dir.join(format!("ramsleuth-export-{ts}.json"));
+            export_json(telemetry, state.bench.grid.as_ref(), &path)?;
+            Ok(Some(path))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Record one `[E]`xport outcome in the state (the GUI transient
+/// notice, the `[S]`napshot mechanism): the written path lands in
+/// `daemon_status` (transient — the next poll overwrites it, as the
+/// snapshot path does), the no-telemetry hint lands there too, and a
+/// write failure (a missing dir, a read-only `$HOME`, …) lands in
+/// `error` — the TUI never dies on an export (the no-panic contract,
+/// D5).
+fn record_export_result(state: &mut AppState, result: Result<Option<PathBuf>, String>) {
+    match result {
+        Ok(Some(path)) => {
+            state.daemon_status = format!("export: {}", path.display());
+        }
+        Ok(None) => {
+            state.daemon_status = "nothing to export yet (no telemetry)".to_owned();
+        }
+        Err(message) => {
+            state.error = Some(format!("export failed: {message}"));
+        }
+    }
+}
+
+/// The `[E]`xport key handler (TUI-21 — the GUI F3 side-effect
+/// precedent): the one file write of the key, on the main thread —
+/// the brief read scope takes the snapshot data (the file write runs
+/// with no lock held, C14-03), into the `$HOME`/CWD-fallback out dir
+/// (the GUI rule), and the outcome is recorded via
+/// [`record_export_result`].
+fn write_export(state: &Arc<RwLock<AppState>>) {
+    let result = {
+        let snapshot = state.read().unwrap();
+        perform_export(&snapshot, &export_out_dir())
+    };
+    record_export_result(&mut state.write().unwrap(), result);
+}
+
 /// The terminal event loop (P3-24): initialize the terminal (the
 /// [`TerminalGuard`] restores it on the way out of this function), spawn
 /// the background updater, then tick — draw the dashboard, poll events
@@ -1214,9 +1346,16 @@ fn run(args: TuiArgs) -> ExitCode {
                         Action::Cancel => {
                             cancel.store(true, Ordering::Relaxed);
                         }
-                        // TUI-22: wire the view class
+                        // `[E]`: write the JSON export (TUI-21 — the
+                        // F3 parity): one file write on the main
+                        // thread (the GUI F3 side-effect precedent);
+                        // the written path / the failure / the
+                        // no-telemetry hint is recorded in the state
+                        // (transient, as the `[S]`napshot path).
+                        Action::ExportJson => write_export(&state),
+                        // TUI-22: wire the remaining view class
                         Action::ToggleGraphs | Action::ToggleSettings
-                            | Action::ToggleRequirements | Action::ExportJson
+                            | Action::ToggleRequirements
                             | Action::CyclePoll | Action::ToggleCapacity
                             | Action::ToggleClock | Action::ToggleRefresh
                             | Action::CycleWindow => {}
@@ -3115,5 +3254,302 @@ mod tests {
         assert!(!state.bench.running, "the normal run must end at its terminal");
         assert!(!state.bench.burn_in.running, "the burn-in must end at its terminal");
         assert!(state.error.is_none(), "clean runs must not record an error");
+    }
+
+    // ------------------------------------------------------------------
+    // TUI-21: the JSON export (F3 parity) — the GUI `style.rs` /
+    // `main.rs` export suite, adapted to the TUI state, the
+    // `String`-mapped failure class, and the `$HOME`/CWD-fallback
+    // rule. Every file lands in a temp out dir, never `$HOME`.
+    // ------------------------------------------------------------------
+
+    /// A unique temp out dir per test (pid-scoped — the GUI
+    /// `temp_out_dir` precedent); created now, removed on drop.
+    struct TempOutDir {
+        path: PathBuf,
+    }
+
+    impl TempOutDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("ramsleuth-tui-{name}-{}", process::id()));
+            std::fs::create_dir_all(&path).expect("the test out dir must be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempOutDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// The fixture grid (the GUI `fixture_grid` shape): the Memory row
+    /// populated, the L1/L2/L3 rows unmeasured (`0.0` = the honest
+    /// `N/A`).
+    fn fixture_grid() -> BenchmarkGrid {
+        BenchmarkGrid {
+            read_gbps: [26.35, 0.0, 0.0, 0.0],
+            write_gbps: [43.63, 0.0, 0.0, 0.0],
+            copy_gbps: [12.11, 0.0, 0.0, 0.0],
+            latency_ns: [86.84, 0.0, 0.0, 0.0],
+        }
+    }
+
+    /// (bb) `export_json` on a live snapshot + terminal grid writes a
+    /// file that parses back as a JSON object with the eight wire
+    /// keys (the seven telemetry keys: `cpu` / `amd` / `intel` /
+    /// `spd` / `platform` / `total_capacity` / `dimm_sizes` — plus
+    /// the `bench` key), the telemetry sub-object byte-compatible
+    /// with the plain wire serialization, and the `bench` key
+    /// round-tripping into an equal `BenchmarkGrid`; the whole file
+    /// re-parses into an equal `SystemMemoryTelemetry` (the wire
+    /// root ignores the extra `bench` key — the GUI `style.rs` (b)
+    /// mirror).
+    #[test]
+    fn export_json_writes_parseable_snapshot() {
+        let dir = TempOutDir::new("export");
+        let telemetry = mock_snapshot();
+        let grid = fixture_grid();
+        let path = dir.path().join("export.json");
+        export_json(&telemetry, Some(&grid), &path)
+            .expect("export_json must not fail for a writable temp path");
+
+        let text = std::fs::read_to_string(&path).expect("the exported file must exist");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("export must be valid JSON");
+        assert!(value.is_object(), "a snapshot must serialize to a JSON object");
+        let keys = value
+            .as_object()
+            .expect("checked is_object")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected: std::collections::BTreeSet<String> = [
+            "amd", "bench", "cpu", "intel", "spd", "platform", "total_capacity", "dimm_sizes",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(
+            keys, expected,
+            "the seven telemetry wire keys + the bench key"
+        );
+
+        // The C6-29 `bench` key carries the grid verbatim.
+        let back_grid: BenchmarkGrid = serde_json::from_value(value["bench"].clone())
+            .expect("bench must re-parse into the grid");
+        assert_eq!(back_grid, grid, "the grid round-trips");
+
+        // The flattened telemetry sub-object is byte-compatible:
+        // every one of the seven wire keys matches the plain wire
+        // root serialization.
+        let base = serde_json::to_value(&telemetry).expect("the wire root must serialize");
+        for key in ["cpu", "amd", "intel", "spd", "platform", "total_capacity", "dimm_sizes"] {
+            assert_eq!(value[key], base[key], "the {key} key must stay byte-compatible");
+        }
+
+        // The wire root is serde round-trip safe (P3-06); the extra
+        // `bench` key is ignored on the way back.
+        let back: SystemMemoryTelemetry =
+            serde_json::from_str(&text).expect("the file must re-parse into the wire root");
+        assert_eq!(back, telemetry, "the telemetry round-trips");
+    }
+
+    /// (bc) `bench` is `None` (no run has completed yet) → the
+    /// `bench` key is the JSON `null`: the snapshot shape stays
+    /// stable and parseable, the telemetry sub-object is untouched,
+    /// never a panic (the GUI `style.rs` (b2) mirror).
+    #[test]
+    fn export_json_bench_none_is_null() {
+        let dir = TempOutDir::new("export-nobench");
+        let telemetry = mock_snapshot();
+        let path = dir.path().join("export-nobench.json");
+        export_json(&telemetry, None, &path)
+            .expect("export_json must not fail for a writable temp path");
+
+        let text = std::fs::read_to_string(&path).expect("the exported file must exist");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("export must be valid JSON");
+        assert!(value.is_object(), "a snapshot must serialize to a JSON object");
+        assert!(value["bench"].is_null(), "no run yet: the bench key is the JSON null");
+        let base = serde_json::to_value(&telemetry).expect("the wire root must serialize");
+        for key in ["cpu", "amd", "intel", "spd", "platform", "total_capacity", "dimm_sizes"] {
+            assert_eq!(value[key], base[key], "the {key} key must stay byte-compatible");
+        }
+    }
+
+    /// (bd) The all-`N/A` grid (every cell `0.0` — the wire
+    /// unmeasured marker) exports as-is: the `bench` object
+    /// round-trips into the same zero grid, never a panic (the GUI
+    /// `style.rs` (b3) mirror).
+    #[test]
+    fn export_json_all_na_grid_exports_as_is() {
+        let dir = TempOutDir::new("export-nagrid");
+        let telemetry = mock_snapshot();
+        let grid = BenchmarkGrid {
+            read_gbps: [0.0; 4],
+            write_gbps: [0.0; 4],
+            copy_gbps: [0.0; 4],
+            latency_ns: [0.0; 4],
+        };
+        let path = dir.path().join("export-nagrid.json");
+        export_json(&telemetry, Some(&grid), &path)
+            .expect("export_json must not fail for a writable temp path");
+
+        let text = std::fs::read_to_string(&path).expect("the exported file must exist");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("export must be valid JSON");
+        let back_grid: BenchmarkGrid = serde_json::from_value(value["bench"].clone())
+            .expect("bench must re-parse into the grid");
+        assert_eq!(back_grid, grid, "the all-Na grid exports as-is");
+    }
+
+    /// (be) `export_json` maps a write failure to a `String` (the
+    /// `GuiError::Io` class without the GUI error enum — the
+    /// no-panic contract: a missing parent dir is an error, not a
+    /// panic; the GUI `style.rs` (c) mirror).
+    #[test]
+    fn export_json_maps_write_failure_to_a_string() {
+        let dir = TempOutDir::new("export-fail");
+        let telemetry = mock_snapshot();
+        // A nested path whose parent dir does not exist: `fs::write`
+        // fails with a missing-dir I/O error.
+        let path = dir.path().join("no-such-dir").join("missing-dir.json");
+        let err =
+            export_json(&telemetry, None, &path).expect_err("a missing parent dir must fail");
+        assert!(
+            err.starts_with("export file write failed:"),
+            "the write failure must carry the I/O class, got: {err}"
+        );
+        assert!(!path.exists(), "a failed write must leave no file");
+    }
+
+    /// (bf) `perform_export` with telemetry set → a JSON file is
+    /// written to the out dir, `Ok(Some(path))`, the file exists +
+    /// parses as a JSON object carrying the terminal grid under the
+    /// `bench` key (the GUI `main.rs` (b) mirror).
+    #[test]
+    fn perform_export_with_telemetry_writes_and_parses() {
+        let dir = TempOutDir::new("perform-export");
+        let grid = fixture_grid();
+        let state = AppState {
+            telemetry: Some(mock_snapshot()),
+            bench: BenchState { grid: Some(grid.clone()), ..Default::default() },
+            ..Default::default()
+        };
+
+        let path = perform_export(&state, dir.path())
+            .expect("the export must not fail")
+            .expect("telemetry set must produce a file");
+        assert!(
+            path.starts_with(dir.path()),
+            "the file must land in the out dir: {path:?}"
+        );
+        let name = path.file_name().and_then(|s| s.to_str()).expect("the file must be named");
+        assert!(
+            name.starts_with("ramsleuth-export-"),
+            "the file must carry the export name prefix, got: {name}"
+        );
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("json"),
+            "the file must be a .json"
+        );
+
+        let text = std::fs::read_to_string(&path).expect("the exported file must be readable");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("the export must be valid JSON");
+        assert!(value.is_object(), "a snapshot must serialize to a JSON object");
+        let back_grid: BenchmarkGrid = serde_json::from_value(value["bench"].clone())
+            .expect("bench must re-parse into the grid");
+        assert_eq!(back_grid, grid, "the terminal grid is exported");
+    }
+
+    /// (bg) `perform_export` with no telemetry → `Ok(None)` and no
+    /// file is written (the GUI `main.rs` (d) mirror).
+    #[test]
+    fn perform_export_without_telemetry_is_none() {
+        let dir = TempOutDir::new("perform-export-none");
+        let state = AppState::default(); // no snapshot yet
+
+        let result =
+            perform_export(&state, dir.path()).expect("no telemetry must not fail");
+        assert!(result.is_none(), "no telemetry: no file (the GUI rule)");
+        let count = std::fs::read_dir(dir.path()).expect("the dir must be readable").count();
+        assert_eq!(count, 0, "no telemetry: nothing was written to the out dir");
+    }
+
+    /// (bh) `perform_export` maps a write failure to a `String` (a
+    /// missing parent dir under the out dir): `Err`, no file, no
+    /// panic — the `GuiError::Io` class without the enum.
+    #[test]
+    fn perform_export_maps_write_failure_to_a_string() {
+        let dir = TempOutDir::new("perform-export-fail");
+        let state = AppState { telemetry: Some(mock_snapshot()), ..Default::default() };
+        // Nest the out dir one level below the temp dir: the missing
+        // parent makes the write fail.
+        let nested = dir.path().join("no-such-dir");
+        let err =
+            perform_export(&state, &nested).expect_err("a missing parent dir must fail");
+        assert!(
+            err.starts_with("export file write failed:"),
+            "the write failure must carry the I/O class, got: {err}"
+        );
+    }
+
+    /// (bi) The `$HOME` → CWD-fallback rule (the GUI rule, its pure
+    /// form): a set `HOME` is the destination, an unset `HOME`
+    /// degrades to the CWD (`.`) — never a panic.
+    #[test]
+    fn out_dir_from_home_arms() {
+        assert_eq!(
+            out_dir_from_home(Some(OsStr::new("/home/x"))),
+            PathBuf::from("/home/x"),
+            "a set HOME is the destination"
+        );
+        assert_eq!(
+            out_dir_from_home(None),
+            PathBuf::from("."),
+            "an unset HOME degrades to the CWD"
+        );
+    }
+
+    /// (bj) The record arms (the GUI transient notice, the
+    /// `[S]`napshot mechanism): the written path lands in
+    /// `daemon_status` (transient), the no-telemetry hint lands
+    /// there too, and a write failure lands in `error` — never a
+    /// panic (the no-panic contract, D5).
+    #[test]
+    fn record_export_result_arms() {
+        let mut state = AppState::default();
+
+        let path = PathBuf::from("/tmp/ramsleuth-export-1.json");
+        record_export_result(&mut state, Ok(Some(path)));
+        assert_eq!(
+            state.daemon_status,
+            "export: /tmp/ramsleuth-export-1.json",
+            "the written path lands in daemon_status (transient)"
+        );
+        assert!(state.error.is_none(), "a written export must not record an error");
+
+        record_export_result(&mut state, Ok(None));
+        assert_eq!(
+            state.daemon_status,
+            "nothing to export yet (no telemetry)",
+            "the no-telemetry hint lands in daemon_status"
+        );
+        assert!(state.error.is_none(), "a hint must not record an error");
+
+        record_export_result(&mut state, Err("gone".to_owned()));
+        assert_eq!(
+            state.error.as_deref(),
+            Some("export failed: gone"),
+            "the write failure lands in error (the GuiError class text)"
+        );
     }
 }
