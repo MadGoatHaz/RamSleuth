@@ -1,4 +1,4 @@
-# RamSleuth v2.2.0
+# RamSleuth v2.2.1
 
 Live memory-controller telemetry and an AIDA64-style benchmark engine for PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
 
@@ -20,7 +20,28 @@ RamSleuth v2 is a Cargo workspace of 7 crates with two layers:
 - **SPD EEPROM, fully unprivileged:** the raw image of every DIMM the kernel's `ee1004` I2C driver has bound, read through a world-readable sysfs attribute — no root, no `CAP_SYS_RAWIO`, no `unsafe`, no new dependencies. Decodes module/die JEP106 makers, rank, density, base speed, and XMP 2.0 / XMP 3.0-EXPO profiles.
 - **Benchmark engine:** native AVX2 / AVX-512F SIMD kernels; `sched_setaffinity` pins one worker thread per physical core; the AIDA64-style 4×4 grid (copy/read/write across l1/l2/l3/full tiers); pointer-chase latency; optional burn-in loop.
 - **CLI (`ramsleuth-client`):** `dump` (the dashboard-style telemetry listing), `bench` (a streamed run: a progress line per completed cell, then the terminal 4×4 grid), `status` (the one-line-per-section health summary).
-- **TUI (`ramsleuth-tui`):** a live three-zone dashboard on ratatui, polling the daemon every 2 s; `[R]`efresh / `[S]`napshot / `[Q]`uit; the terminal is restored on every exit path — never left in raw mode.
+- **TUI (`ramsleuth-tui`):** the live **parity** dashboard on ratatui — the same three-zone layout as the GUI (live telemetry matrix, benchmark grid, hardware/SPD status), plus the settings strip, the requirements strip (a mirror of the GUI `SETUP`), and a graphs overlay (the 5-series sparkline view over a 1800-sample ring) — polling the daemon on a 100 ms→60 s interval (default 2 s). Its 16-key contract is case-insensitive (modifiers ignored; every other key is ignored):
+
+  | key | action |
+  | --- | --- |
+  | `r` | refresh — force a telemetry refresh now |
+  | `s` | snapshot — write a timestamped `.txt` to the CWD |
+  | `q` | quit — restore the terminal, exit 0 |
+  | `b` | full bench — start a full benchmark run |
+  | `m` | memory-only bench — start a memory-only run |
+  | `x` | burn-in — start a 5-min soak |
+  | `c` | cancel — cancel the in-flight run |
+  | `g` | graphs — toggle the 5-series graphs overlay |
+  | `t` | settings — toggle the settings strip |
+  | `d` | requirements — toggle the requirements strip (GUI `SETUP` mirror) |
+  | `e` | JSON export — write `{ telemetry, bench }` to `$HOME` (F3 parity) |
+  | `p` | poll — cycle the poll interval (100 ms → 60 s) |
+  | `u` | capacity — toggle GiB ↔ GB |
+  | `k` | clock — toggle MHz ↔ GHz |
+  | `a` | refresh — toggle auto-refresh on ↔ off |
+  | `w` | window — cycle the graphs window (1 → 60 min) |
+
+  The terminal is restored on every exit path — never left in raw mode.
 - **GUI (`ramsleuth` — the `ramsleuth-gui` crate):** an egui/eframe desktop dashboard — a three-zone 968×600 window (live telemetry matrix, benchmark grid, hardware/SPD status), a dedicated Graphs window, a Settings panel, an auto-shown `SETUP` requirements strip on first launch (daemon down / missing `ramsleuth` group / missing `ryzen_smu` on AMD — copy-only commands, a "Got it" close, no-panic; it disappears once the requirement clears), `[F2]` PNG snapshot / `[F3]` JSON export / `[Q]`uit, repainting at ~60 FPS.
 - **Graceful degradation:** absent driver, privilege, or hardware → structured `N/A (<reason>)` fields, exit 0, no panics.
 
@@ -42,7 +63,7 @@ RamSleuth v2 is a Cargo workspace of 7 crates with two layers:
 | --- | --- | --- |
 | `ramsleuth-daemon` | `--socket <path>` (default `/run/ramsleuth/ramsleuth.sock`), `--max-age <secs>` (cache TTL, default 2) | 0 clean signal shutdown · 1 fatal socket/signal setup · 2 CLI error |
 | `ramsleuth-client` | subcommands `dump` (default) / `bench` / `status`; `--socket <path>`; `--tier <memory\|l1\|l2\|l3\|full>` (default full); `--mode <full\|memory-only>` (default full) | 0 success · 1 daemon/client error · 2 usage |
-| `ramsleuth-tui` | `--socket <path>`; keys `[R]`efresh / `[S]`napshot / `[Q]`uit | 0 quit · 1 terminal init failure · 2 usage |
+| `ramsleuth-tui` | `--socket <path>` (the only flag); 16-key contract: `r` refresh · `s` snapshot · `q` quit · `b` bench · `m` mem-only bench · `x` burn-in · `c` cancel · `g` graphs · `t` settings · `d` requirements · `e` JSON export · `p` poll · `u` GiB↔GB · `k` MHz↔GHz · `a` refresh · `w` window | 0 quit · 1 terminal init failure · 2 usage |
 | `ramsleuth` | `--socket <path>`; keys `[F2]` PNG snapshot / `[F3]` JSON export / `[Q]`uit | 0 quit · 1 eframe/display failure · 2 usage |
 | `ramsleuth-bench` | `--avx512` (force the AVX-512 kernel path; falls back to AVX2 when AVX-512F is absent), `--json` (grid as a JSON object) | 0 success · 1 topology detection failure · 2 usage |
 | `ramsleuth-telemetry` | `--json` (the snapshot as a hand-rolled JSON block) | 0 snapshot rendered (even if every section is N/A) · 2 unknown flag |
@@ -86,14 +107,15 @@ git clone https://github.com/MadGoatHaz/RamSleuth && cd RamSleuth && ./install.s
 
 Interactive and visually sectioned; transparent — it prints every source, the exact commit being installed, and the pinned third-party source before doing anything; AUR-equivalent — the 6 binaries + the frozen daemon unit + the preset + the `ramsleuth` group to `/usr` via sudo; idempotent (a re-run after any failure is safe). It then **asks** about the `ryzen_smu` DKMS module (AMD hosts only) and walks you through the pinned shared helper; the app runs without it — the AMD section reads `N/A (DriverMissing)`.
 
-**AUR (Arch) — the two stable packages:**
+**AUR (Arch) — the three published packages:**
 
 ```sh
-yay -S ramsleuth      # stable — builds from the official git tag (source)
-yay -S ramsleuth-bin  # precompiled binary from the GitHub Release — the fastest install
+yay -S ramsleuth      # STABLE source — builds from the official git tag v$pkgver
+yay -S ramsleuth-bin  # PRECOMPILED — downloads the GitHub Release tarball (fastest install)
+yay -S ramsleuth-git  # BLEEDING-EDGE — tracks the moving v2-development branch (dev/testing)
 ```
 
-(or `paru -S ramsleuth` / `paru -S ramsleuth-bin` in place of `yay`). The two install the same file set and **mutually conflict** — pick exactly one. The bleeding-edge dev option (the moving `v2-development` branch, for testing unreleased work) is `yay -S ramsleuth-git`; the optional AMD telemetry driver is the separate extra `yay -S ryzen-smu-dkms` (then `sudo ryzen-smu-dkms-install` — AMD hosts only; without it the AMD subtimings read `N/A (DriverMissing)`).
+(or `paru -S ...` in place of `yay`). All three are published on the [AUR](https://aur.archlinux.org), track the GitHub release versioning, and are maintained at the same pace as the project (the unified version-bump flow — see [Versioning & releases](#versioning--releases)). `ramsleuth` and `ramsleuth-bin` install the same file set and **mutually conflict** — pick exactly one; `ramsleuth-git` is the separate bleeding-edge dev/testing entry. Package pages: [ramsleuth](https://aur.archlinux.org/packages/ramsleuth) · [ramsleuth-bin](https://aur.archlinux.org/packages/ramsleuth-bin) · [ramsleuth-git](https://aur.archlinux.org/packages/ramsleuth-git). The optional AMD telemetry driver is the separate extra `yay -S ryzen-smu-dkms` (then `sudo ryzen-smu-dkms-install` — AMD hosts only; without it the AMD subtimings read `N/A (DriverMissing)`).
 
 **Manual (from a source checkout):**
 
@@ -110,6 +132,17 @@ Day-2:
 systemctl status ramsleuth
 journalctl -u ramsleuth
 ```
+
+## Versioning & releases
+
+The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml` — every member crate inherits it, and the GUI window titles derive it at compile time (`env!("CARGO_PKG_VERSION")`), so a bump propagates automatically. A release is the unified flow:
+
+1. Bump `[workspace.package].version` (e.g. `2.2.0` → `2.2.1`).
+2. `cargo update -w` to sync `Cargo.lock`, then commit.
+3. Cut the git tag `v<ver>` — this fires `.github/workflows/release.yml`, which builds and publishes the GitHub Release with the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256` companion (the 15-artifact contract).
+4. The AUR packages follow in lockstep: `pkgver` in `ramsleuth` (the git-tag source) and `pkgver` + `sha256sums` in `ramsleuth-bin` (re-pinned to the published release hash) are bumped and pushed. `ramsleuth-git` needs no bump — it tracks the moving `v2-development` branch via `git describe`.
+
+All three AUR packages track this versioning and are maintained at the same pace as the project. The full packaging guide — the install matrix, one-click setup, the `ryzen-smu` DKMS extra, and CI — lives in [`packaging/README.md`](packaging/README.md).
 
 ## Quickstart
 
@@ -142,7 +175,7 @@ The install path is auditable end to end:
 
 ## Testing
 
-- **556/556 tests green** across the workspace, in debug **and** release.
+- **694/694 tests green** across the workspace, in debug **and** release.
 - `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings.
 - CI (GitHub Actions, on push/PR to `v2-development`): a test job on a `1.75` (MSRV) × `stable` matrix runs debug + release tests and clippy; a build job compiles the 6 release binaries and uploads them as an artifact.
 
@@ -189,4 +222,4 @@ Health: `systemctl status ramsleuth`, `journalctl -u ramsleuth`; confirm the ACL
 
 MIT — the workspace `Cargo.toml` declares `license = "MIT"`. Repository: <https://github.com/MadGoatHaz/RamSleuth>.
 
-This README describes **RamSleuth v2.2.0** (branch `v2-development`); the workspace package version is `2.2.0` (bumped in Cycle 21); the earlier release tags (`v2.1.1`, `v2.1.0`) remain in the git history.
+This README describes **RamSleuth v2.2.1** (branch `v2-development`); the workspace package version is `2.2.1`; the earlier release tags (`v2.2.0`, `v2.1.1`, `v2.1.0`, `v2.0.0`) remain in the git history.

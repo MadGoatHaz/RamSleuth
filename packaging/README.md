@@ -26,7 +26,7 @@ The AUR packages (or `makepkg -si` from any of `packaging/ramsleuth/`, `packagin
 | The shared polkit policy (`packaging/polkit/90-ramsleuth-setup.policy` — the `org.freedesktop.ramsleuth.setup` action) | `/usr/share/polkit-1/actions/90-ramsleuth-setup.policy` |
 | The self-contained installer (`install.sh` — the transparency artifact, re-runnable/auditable post-install) | `/usr/share/ramsleuth/install.sh` |
 
-`ramsleuth-protocol` is a library-only crate and is never installed. The two one-click artifacts are installed today by `ramsleuth` and `ramsleuth-git`; `ramsleuth-bin` installs them from the release tarball only when present — the pinned v2.1.1 tarball predates them, so its `package()` guard skips them cleanly until the v2.2.0 re-cut (see the AUR resubmit notes).
+`ramsleuth-protocol` is a library-only crate and is never installed. All three packages install the two one-click artifacts (the helper + polkit policy): `ramsleuth` and `ramsleuth-git` build them from source, and `ramsleuth-bin` takes them from the release tarball (which has carried them since the v2.2.0 re-cut).
 
 ## Installation
 
@@ -45,6 +45,8 @@ yay -S ramsleuth-git  # BLEEDING-EDGE — builds from the moving v2-development 
 - **`ramsleuth-git`** — the bleeding-edge dev package: tracks the moving `v2-development` branch (its `pkgver()` recomputes from `git describe`). For testing unreleased work; not a stable install.
 
 **Mutual conflict:** `ramsleuth` and `ramsleuth-bin` install the identical file set, so each declares the other in `conflicts=` — the user picks exactly one. (The optional `ryzen-smu-dkms` extra stays co-install-safe with all three — see below.)
+
+**Package pages:** [ramsleuth](https://aur.archlinux.org/packages/ramsleuth) · [ramsleuth-bin](https://aur.archlinux.org/packages/ramsleuth-bin) · [ramsleuth-git](https://aur.archlinux.org/packages/ramsleuth-git).
 
 **Zero-touch on a sudo-invoked install:** all three packages' `post_install` hooks, when run under `sudo`, additionally grant the invoking user group membership (persistent; effective at the next login) + seed `/etc/ramsleuth/authorized-users` (current-session socket access), then restart the daemon so the ACL applies immediately — every step guarded and never fatal. The hook then prints the next steps: start the GUI with `ramsleuth` (the TUI with `ramsleuth-tui`), one-click setup (the GUI's "Set up RamSleuth" button, or `sudo ramsleuth-setup` — see below), and on AMD hosts the optional `sudo ramsleuth-install-ryzen-smu-dkms` (the AUR-extra alternative is `yay -S ryzen-smu-dkms`), while Intel hosts get the note that the built-in MCHBAR decode needs no extra driver.
 
@@ -81,11 +83,11 @@ What each step does (all **idempotent** — a re-run is a no-op; any failure pri
 
 **polkit + the sudo floor:** the policy (action `org.freedesktop.ramsleuth.setup`, `auth_admin` for any/active/inactive/other) maps `pkexec` to `/usr/bin/ramsleuth-setup`; polkit is in Arch **base**, so the prompt machinery is present on every stock system (a graphical agent provides the visible prompt — standard on GNOME/KDE/X11). The helper never *requires* polkit: a bare invocation re-execs under `sudo`, which is the floor — headless boxes just use `sudo ramsleuth-setup`.
 
-**`ramsleuth-bin` interim note:** until the v2.2.0 re-cut, the pinned v2.1.1 tarball lacks the helper + policy, so a `-bin` machine has no one-click entrypoint and the GUI degrades to the manual copy-paste path; it self-heals at the re-cut (see the AUR resubmit notes).
+**`ramsleuth-bin`:** the v2.2.0 re-cut has landed, so the release tarball now carries the helper + policy — a `-bin` machine has the full one-click entrypoint (no more degraded copy-paste path).
 
-## Version bump (unified versioning)
+## Version bump (unified versioning — standing policy)
 
-The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml` — all member crates inherit it, and the GUI window titles derive it at compile time via `env!("CARGO_PKG_VERSION")`, so a bump updates the titles automatically (no manual edit). The full bump flow:
+This is the **standing** release policy: it applies to **every** release, not a one-time note. The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml` — all member crates inherit it, and the GUI window titles derive it at compile time via `env!("CARGO_PKG_VERSION")`, so a bump updates the titles automatically (no manual edit). The full bump flow:
 
 1. Bump `[workspace.package].version` in the root `Cargo.toml` (e.g. `2.1.1` → `2.2.0`).
 2. `cargo update -w` to sync `Cargo.lock` (the member lines).
@@ -191,12 +193,14 @@ Whichever path builds the module, the upstream source is **pinned, never branch-
 
 Build posture: the `ramsleuth` and `ramsleuth-git` packages compile **only this repository** (tag-/branch-pinned, `--locked`, no third-party code in the build chroot), and `ramsleuth-bin` compiles nothing — it downloads the release tarball pinned by `sha256sums`. None depends on **any third-party AUR package** — the `ryzen-smu-dkms` extra is optional and co-install-safe (it ships the same helper under a different name, so it never conflicts with the RamSleuth packages). The vendored GPL-2.0 driver source ships **only** via that extra — the `ramsleuth*` packages and the release tarball carry none of it. Every installed file is byte-identical to a file in this repository (auditable via `git show`), including the shipped helper and `install.sh` (`/usr/share/ramsleuth/install.sh`), so the whole flow can be re-run and audited post-install.
 
-### AUR resubmit notes (the v2.2.0 re-cut)
+### The release → AUR lockstep (standing process)
 
-- **`ryzen-smu-dkms`** — resubmit at **1.0-2** with a maintainer note covering the license change: `license=` is now `(MIT GPL-2.0-only)` (the package content is the MIT helper + the GPL-2.0 vendored driver, a separate work), the package now **ships the vendored source** (the build is network-free), and `git` was dropped from `depends` (the vendored path needs no clone; the git-clone fetch remains the manual `RYZEN_SMU_FORCE_REMOTE=1` fallback).
-- **`ramsleuth` (stable source)** — the new `package()` lines (the one-click helper + polkit policy) reference files **absent from the current `v2.1.1` tag**, so a 2.1.1 rebuild with them hard-fails: **do not resubmit until the version bump (2.1.1 → 2.2.0) and the v2.2.0 tag land**. At the re-cut the installed file set gains `/usr/bin/ramsleuth-setup` + `/usr/share/polkit-1/actions/90-ramsleuth-setup.policy`, and the zero-touch `post_install` grant (group + ACL seed + daemon restart) is active.
-- **`ramsleuth-bin`** — the same two artifacts land at the v2.2.0 tarball top level; until then the pinned v2.1.1 tarball lacks them and the `package()` guard skips them cleanly (interim: `-bin` machines have no one-click helper, the GUI degrades to the manual copy-paste path). At the re-cut, re-pin `sha256sums` to the **published** v2.2.0 release hash (a real sha256, no placeholder).
-- **`ramsleuth-git`** — branch-pinned: the helper, policy, and zero-touch hook are picked up by the next AUR build from `v2-development` — no resubmit needed (the entry is unchanged; content moves with the branch).
+The v2.2.0 re-cut is **done** (the one-click helper + polkit policy now ship in every tarball and source build), and v2.2.1 is the current cut (tag `v2.2.1` @ `c82a9ad`). The standing process for **each** release is:
+
+1. Cut the git tag `v<ver>` — the release workflow (`.github/workflows/release.yml`) publishes the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`.
+2. **`ramsleuth`** (stable source) — bump `pkgver` to `<ver>`; it builds from the `v<ver>` tag. Push.
+3. **`ramsleuth-bin`** (precompiled) — bump `pkgver` to `<ver>` and re-pin `sha256sums` to the **published** release `.sha256` (a real sha256, no placeholder). Push.
+4. **`ramsleuth-git`** (bleeding-edge) — needs no bump; its `pkgver()` recomputes from `git describe` on the moving `v2-development` branch, so content moves with the branch.
 
 ## CI
 
