@@ -66,27 +66,43 @@
 //!   frame gaps far exceed the client's 5 s transport default). It
 //!   stops on the quit flag (or the channel disconnecting — the
 //!   session is ending) and is joined (bounded) before exit.
-//! - **Main loop** — each tick: `terminal.draw(render)` (the P3-23
-//!   three-zone dashboard over the shared state) +
-//!   `events::poll_event(250 ms)` → the frozen `key_to_action` table
-//!   (P3-22): `[R]`efresh forces an immediate `poll_once` on the main
-//!   thread (one fast RPC), `[S]`napshot writes the dashboard text (the
-//!   client's pure `render`, P3-19) to a timestamped file in the CWD and
-//!   records the path in `daemon_status` (transient — the next poll
-//!   overwrites it), `[E]`xport writes the current telemetry snapshot +
-//!   the terminal bench grid (the `bench` key — the JSON `null`
-//!   before the first completed run) as pretty JSON to
+//! - **Main loop** — each tick: the requirements strip's
+//!   auto-open-until-closed rule (TUI-22: while `diagnose` reports a
+//!   requirement and the `[d]` key has not dismissed it, the
+//!   `requirements_open` flag is force-true — a new requirement
+//!   re-opens the strip on its own; a dismissed strip stays closed
+//!   until the user toggles it open again), then
+//!   `terminal.draw(render)` (the P3-23 three-zone dashboard over
+//!   the shared state) + `events::poll_event(250 ms)` → the frozen
+//!   `key_to_action` table (P3-22 + TUI-01/02) → [`dispatch_action`]:
+//!   the state-only actions mutate the shared state under one brief
+//!   write scope (no I/O while the lock is held, C14-03) — the
+//!   `[g]`/`[t]`/`[d]` toggles write the `settings.*_open` flags
+//!   (the `[d]` key also drives the `requirements_dismissed` latch —
+//!   closing the strip dismisses the auto-open, reopening clears
+//!   it), the `[p]` poll / `[w]` window cycles advance the presets
+//!   (the renderer reads `settings.graph_window_min` — the `[w]`
+//!   cycle is where that value is supplied), the `[u]`/`[k]` unit +
+//!   the `[a]` refresh toggles flip, the `[b]`/`[m]`/`[x]` run keys
+//!   queue a `TuiBenchCmd` into the updater's bench channel (the run
+//!   itself streams on the updater thread; the send is skipped + a
+//!   dim status note recorded while any run — a normal bench or a
+//!   burn-in — is in flight, the compound single-flight guard), and
+//!   `[C]`ancel sets the shared cancel flag (no I/O on the key —
+//!   the in-flight run's worker sends the `CancelBenchmark` on its
+//!   own connection) — and they return the I/O side effect the loop
+//!   performs with the lock released: `[R]`efresh forces an
+//!   immediate `poll_once` on the main thread (one fast RPC),
+//!   `[S]`napshot writes the dashboard text (the client's pure
+//!   `render`, P3-19) to a timestamped file in the CWD and records
+//!   the path in `daemon_status` (transient — the next poll
+//!   overwrites it), `[E]`xport writes the current telemetry
+//!   snapshot + the terminal bench grid (the `bench` key — the JSON
+//!   `null` before the first completed run) as pretty JSON to
 //!   `$HOME/ramsleuth-export-<unix-ts>.json` (the CWD fallback when
 //!   `HOME` is unset, the GUI F3 rule) — one file write on the main
 //!   thread — and records the written path (or the failure, or the
-//!   no-telemetry hint) in the state the same transient way, `[b]` /
-//!   `[m]` / `[x]` send a `TuiBenchCmd`
-//!   into the updater's bench channel (TUI-19/20 — the run itself
-//!   streams on the updater thread; the send is skipped while any
-//!   run — a normal bench or a burn-in — is in flight, the
-//!   compound single-flight guard), `[C]`ancel sets the shared
-//!   cancel flag (no I/O on the key — the in-flight run's worker
-//!   sends the `CancelBenchmark` on its own connection),
+//!   no-telemetry hint) in the state the same transient way, and
 //!   `[Q]`uit breaks the loop.
 //!
 //! **No-panic contract (plan D5):** errors never end the TUI — a daemon
@@ -118,7 +134,23 @@
 //!   --socket <path>   Daemon Unix socket
 //!                     (default: /run/ramsleuth/ramsleuth.sock)
 //!
-//! Keys: [R]efresh  [S]napshot  [Q]uit
+//! Keys:
+//!   [R]efresh        force one poll (works with refresh off)
+//!   [S]napshot       write a .txt dashboard snapshot to the CWD
+//!   [Q]uit           exit (exit code 0)
+//!   [B]ench (full)   start a full benchmark run
+//!   [M]emory         start a memory-only benchmark run
+//!   [X] burn-in      start a 5-minute burn-in soak
+//!   [C]ancel         cancel the in-flight run
+//!   [E]xport         write { telemetry, bench } JSON to $HOME
+//!   [G]raphs         toggle the graphs overlay panel
+//!   [T]settings      toggle the settings strip
+//!   [D]requirements  toggle the setup requirements strip
+//!   [P]oll           cycle the poll interval (100 ms → 60 s, wrap)
+//!   [U]nits          toggle the capacity units (GiB ↔ GB)
+//!   [K]lock          toggle the clock units (MHz ↔ GHz)
+//!   [A]uto refresh   toggle the periodic data poll (on ↔ off)
+//!   [W]indow         cycle the graphs window (1 → 5 → 15 → 60 min)
 //! Exit codes: 0 quit, 1 terminal init failure, 2 usage error
 //! ```
 
@@ -197,7 +229,7 @@ const BENCH_READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// literal: `concat!` only accepts literals, and the protocol freeze
 /// test pins the string.
 const USAGE: &str = concat!(
-    "ramsleuth-tui — the live terminal dashboard (R/S/Q)\n",
+    "ramsleuth-tui — the live terminal dashboard (16-key parity)\n",
     "\n",
     "Usage: ramsleuth-tui [OPTIONS]\n",
     "\n",
@@ -205,7 +237,23 @@ const USAGE: &str = concat!(
     "  --socket <path>   Daemon Unix socket\n",
     "                    (default: /run/ramsleuth/ramsleuth.sock)\n",
     "\n",
-    "Keys: [R]efresh  [S]napshot  [Q]uit\n",
+    "Keys:\n",
+    "  [R]efresh        force one poll (works with refresh off)\n",
+    "  [S]napshot       write a .txt dashboard snapshot to the CWD\n",
+    "  [Q]uit           exit (exit code 0)\n",
+    "  [B]ench (full)   start a full benchmark run\n",
+    "  [M]emory         start a memory-only benchmark run\n",
+    "  [X] burn-in      start a 5-minute burn-in soak\n",
+    "  [C]ancel         cancel the in-flight run\n",
+    "  [E]xport         write { telemetry, bench } JSON to $HOME\n",
+    "  [G]raphs         toggle the graphs overlay panel\n",
+    "  [T]settings      toggle the settings strip\n",
+    "  [D]requirements  toggle the setup requirements strip\n",
+    "  [P]oll           cycle the poll interval (100 ms → 60 s, wrap)\n",
+    "  [U]nits          toggle the capacity units (GiB ↔ GB)\n",
+    "  [K]lock          toggle the clock units (MHz ↔ GHz)\n",
+    "  [A]uto refresh   toggle the periodic data poll (on ↔ off)\n",
+    "  [W]indow         cycle the graphs window (1 → 5 → 15 → 60 min)\n",
     "Exit codes: 0 quit, 1 terminal init failure, 2 usage error\n",
 );
 
@@ -434,7 +482,8 @@ fn latest_memory_read_bw(bench: &BenchState) -> f64 {
 /// only the `run_id` + the cancel flag), so the `[b]` / `[m]` /
 /// `[x]` send-skip must consider both — the daemon is
 /// single-flight (a second start gets its structured `Error`), and
-/// the guard keeps the skip UX-side (TUI-22 adds the status note).
+/// the guard keeps the skip UX-side: a skipped send records a dim
+/// status note (TUI-22).
 fn run_in_flight(bench: &BenchState) -> bool {
     bench.running || bench.burn_in.running
 }
@@ -1204,6 +1253,228 @@ fn write_export(state: &Arc<RwLock<AppState>>) {
     record_export_result(&mut state.write().unwrap(), result);
 }
 
+// ------------------------------------------------------------------
+// TUI-22: the action dispatch — the frozen 16-key table (P3-22 +
+// TUI-01/02) over the shared state: the state-only actions (the
+// toggles, the cycles, the run keys, the cancel) mutate the state
+// and report no side effect; the I/O actions report the effect the
+// main loop performs with the lock released.
+// ------------------------------------------------------------------
+
+/// The I/O side effect one dispatched action asks the main loop to
+/// perform with the state lock released (TUI-22 — the dispatch
+/// split that makes the key `match` unit-testable without a TTY;
+/// the state-only actions report [`None`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SideEffect {
+    /// No side effect: the action mutated the state only (the
+    /// toggles, the cycles, the run keys, the cancel).
+    None,
+    /// `[R]`: force one immediate `poll_once` on the main thread.
+    Refresh,
+    /// `[S]`: write the timestamped text snapshot to the CWD.
+    Snapshot,
+    /// `[E]`: write the JSON export to `$HOME` (the CWD fallback).
+    Export,
+    /// `[Q]`: quit the TUI (exit 0).
+    Quit,
+}
+
+/// The poll-interval presets in cycle order (plan §2.2 `[p]`):
+/// 100 ms → 500 ms → 1 s → 2 s → 5 s → 10 s → 30 s → 60 s — the
+/// 2 s default sits mid-list (the current TUI behavior).
+const POLL_PRESETS_MS: [u64; 8] = [100, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
+
+/// The graphs window presets in cycle order (plan §2.2 `[w]`,
+/// minutes): 1 → 5 → 15 → 60 — the 5-min default (the current TUI
+/// behavior).
+const WINDOW_PRESETS_MIN: [u32; 4] = [1, 5, 15, 60];
+
+/// The dim status note a skipped run key records (TUI-22 — the GUI
+/// single-flight UX over the transient `daemon_status` mechanism):
+/// the next poll overwrites it, as the `[S]`napshot path does.
+const RUN_IN_FLIGHT_NOTE: &str = "a run is already in flight (one at a time)";
+
+/// The next poll-interval preset after `ms` (the `[p]` cycle, plan
+/// §2.2): the first preset strictly above the current value — an
+/// off-preset stored value (a hand-edited default) advances to the
+/// next preset above it, and past the last (60 s) the cycle wraps to
+/// the first (100 ms). Total — never panics (D5).
+fn cycle_poll(ms: u64) -> u64 {
+    POLL_PRESETS_MS
+        .iter()
+        .copied()
+        .find(|preset| *preset > ms)
+        .unwrap_or(POLL_PRESETS_MS[0])
+}
+
+/// The next graphs window preset after `min` (the `[w]` cycle, plan
+/// §2.2): the first preset strictly above the current value,
+/// wrapping past 60 min to 1 min — total (D5).
+fn cycle_window(min: u32) -> u32 {
+    WINDOW_PRESETS_MIN
+        .iter()
+        .copied()
+        .find(|preset| *preset > min)
+        .unwrap_or(WINDOW_PRESETS_MIN[0])
+}
+
+/// The `TuiBenchCmd` one run key starts (plan §2.2): the cell
+/// target + the scope + the run-class discriminator — `[b]` a full
+/// run, `[m]` a memory-only run, `[x]` a 5-minute burn-in (the GUI
+/// default duration; `0` = infinite is not key-reachable, plan
+/// §5.6). The non-run actions carry no command.
+fn bench_cmd(action: Action) -> Option<TuiBenchCmd> {
+    match action {
+        Action::BenchFull => Some(TuiBenchCmd {
+            target: StreamTarget::Full,
+            mode: BenchMode::Full,
+            duration_minutes: None,
+        }),
+        Action::BenchMemory => Some(TuiBenchCmd {
+            target: StreamTarget::Full,
+            mode: BenchMode::MemoryOnly,
+            duration_minutes: None,
+        }),
+        Action::BurnIn => Some(TuiBenchCmd {
+            target: StreamTarget::Full,
+            mode: BenchMode::Full,
+            duration_minutes: Some(5),
+        }),
+        _ => None,
+    }
+}
+
+/// The one-action dispatch over the shared state (TUI-22 — the
+/// main loop's key `match` split into this pure, unit-testable fn +
+/// the I/O arms the loop performs from its return value, so the
+/// dispatch is testable without a TTY): the state-only actions
+/// mutate `state` and return [`SideEffect::None`] — the `[g]`/`[t]`
+/// toggles flip the `settings.*_open` flags, the `[d]` key toggles
+/// the requirements strip *and* drives the `requirements_dismissed`
+/// latch (closing dismisses the auto-open — a new requirement stays
+/// hidden until the user toggles the strip open again; reopening
+/// clears the dismissal — the auto-open applies again), the `[p]`
+/// poll / `[w]` window cycles advance the presets (the renderer
+/// reads `settings.graph_window_min` — the `[w]` cycle is where
+/// that value is supplied), the `[u]`/`[k]`/`[a]` toggles flip the
+/// unit / refresh knobs, the `[b]`/`[m]`/`[x]` run keys queue a
+/// `TuiBenchCmd` into the updater's bench channel (a channel send —
+/// no I/O; skipped + a dim status note while any run is in flight,
+/// the compound single-flight guard), and `[c]` sets the shared
+/// cancel flag; the I/O actions return their effect for the loop to
+/// perform with the lock released: `[R]` → [`SideEffect::Refresh`],
+/// `[S]` → [`SideEffect::Snapshot`], `[E]` → [`SideEffect::Export`],
+/// `[Q]` → [`SideEffect::Quit`].
+fn dispatch_action(
+    action: Action,
+    state: &mut AppState,
+    requirements_dismissed: &mut bool,
+    bench_tx: &mpsc::Sender<TuiBenchCmd>,
+    cancel: &AtomicBool,
+) -> SideEffect {
+    match action {
+        Action::Refresh => SideEffect::Refresh,
+        Action::Snapshot => SideEffect::Snapshot,
+        Action::Quit => SideEffect::Quit,
+        Action::BenchFull | Action::BenchMemory | Action::BurnIn => {
+            if run_in_flight(&state.bench) {
+                // The compound single-flight guard (TUI-19/20): a
+                // second start is skipped (the daemon would answer
+                // with its structured `Error` anyway) + a dim
+                // status note recorded (the GUI single-flight UX,
+                // TUI-22 — the transient `daemon_status`
+                // mechanism, as the `[S]`napshot path).
+                state.daemon_status = RUN_IN_FLIGHT_NOTE.to_owned();
+            } else if let Some(cmd) = bench_cmd(action) {
+                // The command goes to the updater (a channel send —
+                // no I/O, the one permitted main-thread mutation);
+                // the run streams on the updater thread.
+                let _ = bench_tx.send(cmd);
+            }
+            SideEffect::None
+        }
+        Action::Cancel => {
+            // The shared flag (TUI-19/20): the in-flight run's
+            // worker checks it between frames and stops the run
+            // daemon-side. No I/O on the key.
+            cancel.store(true, Ordering::Relaxed);
+            SideEffect::None
+        }
+        Action::ExportJson => SideEffect::Export,
+        Action::ToggleGraphs => {
+            state.settings.graphs_open = !state.settings.graphs_open;
+            SideEffect::None
+        }
+        Action::ToggleSettings => {
+            state.settings.settings_open = !state.settings.settings_open;
+            SideEffect::None
+        }
+        Action::ToggleRequirements => {
+            // The auto-open-until-closed rule (the plan's
+            // `requirements_dismissed` latch): closing the strip
+            // dismisses the auto-open (a later requirement
+            // re-appearance stays hidden until the user toggles it
+            // open again); reopening clears the dismissal (the
+            // auto-open applies again while a requirement exists).
+            if state.settings.requirements_open {
+                state.settings.requirements_open = false;
+                *requirements_dismissed = true;
+            } else {
+                state.settings.requirements_open = true;
+                *requirements_dismissed = false;
+            }
+            SideEffect::None
+        }
+        Action::CyclePoll => {
+            state.settings.poll_interval_ms = cycle_poll(state.settings.poll_interval_ms);
+            SideEffect::None
+        }
+        Action::ToggleCapacity => {
+            state.settings.capacity_gib = !state.settings.capacity_gib;
+            SideEffect::None
+        }
+        Action::ToggleClock => {
+            state.settings.clock_mhz = !state.settings.clock_mhz;
+            SideEffect::None
+        }
+        Action::ToggleRefresh => {
+            state.settings.refresh = !state.settings.refresh;
+            SideEffect::None
+        }
+        Action::CycleWindow => {
+            // The renderer reads `settings.graph_window_min` (ui.rs
+            // `render` → `render_graphs_panel`): this cycle is where
+            // that value is supplied.
+            state.settings.graph_window_min = cycle_window(state.settings.graph_window_min);
+            SideEffect::None
+        }
+    }
+}
+
+/// The requirements strip's auto-open-until-closed rule (TUI-22 —
+/// the main-thread half of the plan's TUI-16 presence rule; the
+/// renderer only reads the flag): while
+/// [`ramsleuth_tui::requirements::diagnose`] reports a requirement
+/// and the user has not dismissed the strip (the `[d]` key closed
+/// it — the `requirements_dismissed` latch), the
+/// `requirements_open` flag is force-true — a new requirement
+/// re-opens the strip on its own; a dismissed strip stays closed
+/// until the user toggles it open again. The read scope decides,
+/// the (rare) write sets one field — never held long (C14-03).
+fn apply_requirements_auto_open(state: &RwLock<AppState>, dismissed: bool) {
+    if dismissed {
+        return;
+    }
+    let needs_open = {
+        let app = state.read().unwrap();
+        !app.settings.requirements_open && !ramsleuth_tui::requirements::diagnose(&app).is_empty()
+    };
+    if needs_open {
+        state.write().unwrap().settings.requirements_open = true;
+    }
+}
+
 /// The terminal event loop (P3-24): initialize the terminal (the
 /// [`TerminalGuard`] restores it on the way out of this function), spawn
 /// the background updater, then tick — draw the dashboard, poll events
@@ -1235,6 +1506,12 @@ fn run(args: TuiArgs) -> ExitCode {
     // sends the `CancelBenchmark` on its own connection — the key
     // does no I/O).
     let cancel = Arc::new(AtomicBool::new(false));
+    // The `[d]` auto-open latch (TUI-22): `true` once the user has
+    // closed the requirements strip — the auto-open rule stops
+    // force-opening it (a new requirement stays hidden until the
+    // user toggles the strip open again); `false` at startup and
+    // after an explicit reopen.
+    let mut requirements_dismissed = false;
 
     let updater = spawn_updater(
         Arc::clone(&state),
@@ -1245,6 +1522,12 @@ fn run(args: TuiArgs) -> ExitCode {
     );
 
     while let Some(terminal) = guard.terminal.as_mut() {
+        // The requirements strip's auto-open-until-closed rule
+        // (TUI-22): a new requirement re-opens the strip on its own
+        // until the `[d]` key dismisses it (a dismissed strip stays
+        // closed until the user toggles it open again).
+        apply_requirements_auto_open(&state, requirements_dismissed);
+
         // One draw per tick (250 ms cadence): the read lock is held only
         // for the frame render (pure over `&AppState`, P3-23).
         let draw_state = Arc::clone(&state);
@@ -1260,105 +1543,47 @@ fn run(args: TuiArgs) -> ExitCode {
         match events::poll_event(POLL_TIMEOUT) {
             Ok(Some(Event::Key(key))) => {
                 if let Some(action) = key_to_action(key) {
-                    match action {
+                    // The action's state mutations (the toggles, the
+                    // cycles, the run-key channel sends, the cancel
+                    // flag, the `[d]` latch) run under one brief
+                    // write scope — no I/O while the lock is held
+                    // (C14-03); the returned side effect (the `[R]`
+                    // poll, the `[S]`/`[E]` file writes, the `[Q]`
+                    // break) is performed with the lock released.
+                    let side = {
+                        let mut s = state.write().unwrap();
+                        dispatch_action(action, &mut s, &mut requirements_dismissed, &bench_tx, &cancel)
+                    };
+                    match side {
+                        // The state-only actions (the toggles, the
+                        // cycles, the run keys, the cancel): the
+                        // mutation is done, nothing else to do.
+                        SideEffect::None => {}
                         // `[R]`: force an immediate poll on the main
                         // thread (one fast RPC — bounded by the
-                        // connect-retry window + the 5 s read timeout).
-                        Action::Refresh => {
+                        // connect-retry window + the 5 s read
+                        // timeout).
+                        SideEffect::Refresh => {
                             let _ = poll_once(&args.socket, &mut state.write().unwrap());
                         }
-                        // `[S]`: write the timestamped text snapshot to
-                        // the CWD + record its path in daemon_status.
-                        Action::Snapshot => write_snapshot(&state),
-                        // `[Q]`: stop the updater, break, restore the
-                        // terminal (guard drop), exit 0.
-                        Action::Quit => {
+                        // `[S]`: write the timestamped text snapshot
+                        // to the CWD + record its path in
+                        // daemon_status (transient — the next poll
+                        // overwrites it).
+                        SideEffect::Snapshot => write_snapshot(&state),
+                        // `[E]`: write the JSON export (TUI-21 — the
+                        // F3 parity): one file write on the main
+                        // thread; the written path / the failure /
+                        // the no-telemetry hint is recorded in the
+                        // state (transient, as the `[S]`napshot
+                        // path).
+                        SideEffect::Export => write_export(&state),
+                        // `[Q]`: stop the updater, break, restore
+                        // the terminal (guard drop), exit 0.
+                        SideEffect::Quit => {
                             stop.store(true, Ordering::Relaxed);
                             break;
                         }
-                        // `[b]`: a full benchmark run (TUI-19) — the
-                        // command goes to the updater (a channel send,
-                        // no I/O — the key handler's one permitted
-                        // main-thread mutation). The send is skipped
-                        // while any run — a normal bench or a burn-in
-                        // — is in flight (the compound single-flight
-                        // guard, TUI-20; the daemon would answer a
-                        // second start with its structured `Error`
-                        // anyway — TUI-22 refines the skip with a
-                        // status note).
-                        Action::BenchFull => {
-                            let in_flight = {
-                                let s = state.read().unwrap();
-                                run_in_flight(&s.bench)
-                            };
-                            if !in_flight {
-                                let _ = bench_tx.send(TuiBenchCmd {
-                                    target: StreamTarget::Full,
-                                    mode: BenchMode::Full,
-                                    duration_minutes: None,
-                                });
-                            }
-                        }
-                        // `[m]`: a memory-only benchmark run (TUI-19) —
-                        // the compound single-flight skip as above.
-                        Action::BenchMemory => {
-                            let in_flight = {
-                                let s = state.read().unwrap();
-                                run_in_flight(&s.bench)
-                            };
-                            if !in_flight {
-                                let _ = bench_tx.send(TuiBenchCmd {
-                                    target: StreamTarget::Full,
-                                    mode: BenchMode::MemoryOnly,
-                                    duration_minutes: None,
-                                });
-                            }
-                        }
-                        // `[x]`: a 5-minute burn-in soak (TUI-20 —
-                        // the GUI default duration, plan §5.6:
-                        // `0` = infinite is not reachable from a
-                        // key): the command goes to the updater (a
-                        // channel send, no I/O); the run streams on
-                        // the updater thread. The compound
-                        // single-flight skip as above.
-                        Action::BurnIn => {
-                            let in_flight = {
-                                let s = state.read().unwrap();
-                                run_in_flight(&s.bench)
-                            };
-                            if !in_flight {
-                                let _ = bench_tx.send(TuiBenchCmd {
-                                    target: StreamTarget::Full,
-                                    mode: BenchMode::Full,
-                                    duration_minutes: Some(5),
-                                });
-                            }
-                        }
-                        // `[C]`: set the shared cancel flag (TUI-20):
-                        // the in-flight run's worker (either class)
-                        // checks it between frames and stops the run
-                        // daemon-side with a best-effort
-                        // `CancelBenchmark` on its own connection
-                        // (sent only once the `BenchStarted` ack has
-                        // landed — a pre-ack cancel only sets the
-                        // flag). The key does no I/O — the one
-                        // permitted main-thread mutation.
-                        Action::Cancel => {
-                            cancel.store(true, Ordering::Relaxed);
-                        }
-                        // `[E]`: write the JSON export (TUI-21 — the
-                        // F3 parity): one file write on the main
-                        // thread (the GUI F3 side-effect precedent);
-                        // the written path / the failure / the
-                        // no-telemetry hint is recorded in the state
-                        // (transient, as the `[S]`napshot path).
-                        Action::ExportJson => write_export(&state),
-                        // TUI-22: wire the remaining view class
-                        Action::ToggleGraphs | Action::ToggleSettings
-                            | Action::ToggleRequirements
-                            | Action::CyclePoll | Action::ToggleCapacity
-                            | Action::ToggleClock | Action::ToggleRefresh
-                            | Action::CycleWindow => {}
                     }
                 }
             }
@@ -3552,4 +3777,426 @@ mod tests {
             "the write failure lands in error (the GuiError class text)"
         );
     }
+    // ------------------------------------------------------------------
+    // TUI-22: the dispatch + settings cycles + the `[d]` auto-open
+    // latch — the dispatch split (`dispatch_action` + `SideEffect`)
+    // makes the whole key `match` unit-testable without a TTY.
+    // ------------------------------------------------------------------
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// (bk) The `[p]` poll cycle wraps the 8 presets in order (plan
+    /// §2.2): 100 ms → 500 ms → 1 s → 2 s → 5 s → 10 s → 30 s →
+    /// 60 s → wrap to 100 ms — the default 2 s is a preset (the
+    /// current TUI behavior), and an off-preset stored value
+    /// advances to the next preset above it (a past-the-last value
+    /// wraps).
+    #[test]
+    fn cycle_poll_wraps_the_eight_presets() {
+        let presets = [100u64, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
+        // The full loop from the first preset (the wrap is the
+        // final step back to the first).
+        let mut value = presets[0];
+        for expected in &presets[1..] {
+            value = cycle_poll(value);
+            assert_eq!(value, *expected, "the cycle advances in preset order");
+        }
+        assert_eq!(
+            cycle_poll(value),
+            presets[0],
+            "past the last preset the cycle wraps"
+        );
+        // Off-preset values advance to the next preset above them.
+        assert_eq!(cycle_poll(200), 500, "a sub-500 ms value lands on 500 ms");
+        assert_eq!(cycle_poll(400), 500, "a sub-500 ms value lands on 500 ms");
+        assert_eq!(cycle_poll(1_500), 2_000, "between 1 s and 2 s it lands on 2 s");
+        assert_eq!(cycle_poll(59_000), 60_000, "between 30 s and 60 s it lands on 60 s");
+        assert_eq!(cycle_poll(61_000), 100, "past the last preset it wraps");
+    }
+
+    /// (bl) The `[w]` window cycle wraps the 4 presets in order
+    /// (plan §2.2): 1 → 5 → 15 → 60 min → wrap — the default 5 min
+    /// is a preset, and an off-preset value advances to the next
+    /// preset above it.
+    #[test]
+    fn cycle_window_wraps_the_four_presets() {
+        assert_eq!(cycle_window(1), 5);
+        assert_eq!(cycle_window(5), 15);
+        assert_eq!(cycle_window(15), 60);
+        assert_eq!(cycle_window(60), 1, "past the last preset the cycle wraps");
+        assert_eq!(cycle_window(2), 5, "an off-preset value lands on the next preset above");
+        assert_eq!(cycle_window(7), 15);
+        assert_eq!(cycle_window(20), 60);
+        assert_eq!(cycle_window(90), 1, "past the last preset it wraps");
+    }
+
+    /// (bm) The unit / refresh toggles (the `[u]`/`[k]`/`[a]` keys)
+    /// flip their settings field and report no side effect (the
+    /// render-side key write — no I/O on the key): each toggle
+    /// round-trips to its starting value.
+    #[test]
+    fn unit_and_refresh_toggles_flip_the_settings() {
+        let (tx, _rx) = mpsc::channel::<TuiBenchCmd>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut dismissed = false;
+        let mut state = AppState::default();
+
+        assert!(state.settings.capacity_gib, "the GiB default");
+        assert_eq!(
+            dispatch_action(Action::ToggleCapacity, &mut state, &mut dismissed, &tx, &cancel),
+            SideEffect::None
+        );
+        assert!(!state.settings.capacity_gib, "GiB → GB");
+        assert_eq!(
+            dispatch_action(Action::ToggleCapacity, &mut state, &mut dismissed, &tx, &cancel),
+            SideEffect::None
+        );
+        assert!(state.settings.capacity_gib, "GB → GiB (round-trip)");
+
+        assert!(state.settings.clock_mhz, "the MHz default");
+        assert_eq!(
+            dispatch_action(Action::ToggleClock, &mut state, &mut dismissed, &tx, &cancel),
+            SideEffect::None
+        );
+        assert!(!state.settings.clock_mhz, "MHz → GHz");
+        assert_eq!(
+            dispatch_action(Action::ToggleClock, &mut state, &mut dismissed, &tx, &cancel),
+            SideEffect::None
+        );
+        assert!(state.settings.clock_mhz, "GHz → MHz (round-trip)");
+
+        assert!(state.settings.refresh, "the TUI's refresh-on default");
+        assert_eq!(
+            dispatch_action(Action::ToggleRefresh, &mut state, &mut dismissed, &tx, &cancel),
+            SideEffect::None
+        );
+        assert!(!state.settings.refresh, "refresh on → off (the poller freezes the cadence)");
+        assert_eq!(
+            dispatch_action(Action::ToggleRefresh, &mut state, &mut dismissed, &tx, &cancel),
+            SideEffect::None
+        );
+        assert!(state.settings.refresh, "off → on (round-trip)");
+    }
+
+    /// (bn) The `[d]` auto-open latch (the plan's
+    /// `requirements_dismissed`): with a requirement present (the
+    /// daemon-less default) and no dismissal, the auto-open
+    /// force-true opens the strip; `d` closes it + dismisses the
+    /// auto-open (it stays closed while the dismissal holds); `d`
+    /// again reopens it + clears the dismissal (the auto-open
+    /// applies again). A connected clean state (no requirement) is
+    /// never auto-opened — `d` is a plain toggle there.
+    #[test]
+    fn d_key_drives_the_requirements_auto_open_latch() {
+        let (tx, _rx) = mpsc::channel::<TuiBenchCmd>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut dismissed = false;
+        // The daemon-less default has one requirement (the TUI-08
+        // `diagnose` case 1).
+        let state = Arc::new(RwLock::new(AppState::default()));
+
+        apply_requirements_auto_open(&state, dismissed);
+        assert!(
+            state.read().unwrap().settings.requirements_open,
+            "the auto-open opens the strip while a requirement is present"
+        );
+
+        // `[d]` (the strip is open): close + dismiss.
+        {
+            let mut s = state.write().unwrap();
+            assert_eq!(
+                dispatch_action(Action::ToggleRequirements, &mut s, &mut dismissed, &tx, &cancel),
+                SideEffect::None
+            );
+        }
+        assert!(dismissed, "closing dismisses the auto-open (the latch)");
+        assert!(!state.read().unwrap().settings.requirements_open, "the strip is closed");
+        apply_requirements_auto_open(&state, dismissed);
+        assert!(
+            !state.read().unwrap().settings.requirements_open,
+            "a dismissed strip stays closed while the requirement persists"
+        );
+
+        // `[d]` again (the strip is closed): reopen + clear the
+        // dismissal (the auto-open applies again).
+        {
+            let mut s = state.write().unwrap();
+            assert_eq!(
+                dispatch_action(Action::ToggleRequirements, &mut s, &mut dismissed, &tx, &cancel),
+                SideEffect::None
+            );
+        }
+        assert!(!dismissed, "reopening clears the dismissal");
+        assert!(state.read().unwrap().settings.requirements_open, "the strip is open again");
+        apply_requirements_auto_open(&state, dismissed);
+        assert!(
+            state.read().unwrap().settings.requirements_open,
+            "the auto-open keeps an open strip open"
+        );
+
+        // A connected clean state has no requirement: the auto-open
+        // never touches the closed flag.
+        let clean = Arc::new(RwLock::new(AppState {
+            daemon_status: "connected: /run/ramsleuth/ramsleuth.sock".to_owned(),
+            ..Default::default()
+        }));
+        apply_requirements_auto_open(&clean, false);
+        assert!(
+            !clean.read().unwrap().settings.requirements_open,
+            "no requirement: no auto-open"
+        );
+    }
+
+    /// (bo) The run keys' in-flight send-skip (TUI-22 over the
+    /// TUI-19/20 compound guard): while a normal bench is in
+    /// flight, each of the three run keys is skipped (no channel
+    /// send) + the dim status note is recorded; the same while
+    /// only a burn-in is in flight (the guard's other class); with
+    /// no run in flight, each key queues its `TuiBenchCmd` (the
+    /// target / mode / duration ride the channel, in key order).
+    #[test]
+    fn run_keys_skip_the_send_while_a_run_is_in_flight() {
+        let (tx, rx) = mpsc::channel::<TuiBenchCmd>();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // A normal bench in flight: all three run keys skip + the
+        // note lands in `daemon_status`.
+        let mut state = AppState {
+            bench: BenchState { running: true, ..Default::default() },
+            ..Default::default()
+        };
+        for action in [Action::BenchFull, Action::BenchMemory, Action::BurnIn] {
+            assert_eq!(
+                dispatch_action(action, &mut state, &mut false, &tx, &cancel),
+                SideEffect::None
+            );
+        }
+        assert_eq!(
+            state.daemon_status, RUN_IN_FLIGHT_NOTE,
+            "a skipped send records the dim status note (the GUI single-flight UX)"
+        );
+        assert!(rx.try_recv().is_err(), "no command was queued while a run is in flight");
+
+        // A burn-in in flight (the compound guard's other class):
+        // the same skip.
+        let mut state = AppState {
+            bench: BenchState {
+                burn_in: ramsleuth_tui::ui::BurnInState { running: true, ..Default::default() },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            dispatch_action(Action::BenchFull, &mut state, &mut false, &tx, &cancel),
+            SideEffect::None
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a burn-in in flight skips the bench send too (the compound guard)"
+        );
+
+        // Idle: each run key queues its command (in key order) — the
+        // daemon-side single-flight is the worker's concern; the
+        // UX skip is this guard.
+        let mut state = AppState::default();
+        for action in [Action::BenchFull, Action::BenchMemory, Action::BurnIn] {
+            assert_eq!(
+                dispatch_action(action, &mut state, &mut false, &tx, &cancel),
+                SideEffect::None
+            );
+        }
+        let full = rx.try_recv().expect("the `[b]` full-bench cmd was queued");
+        assert_eq!(
+            (full.target, full.mode, full.duration_minutes),
+            (StreamTarget::Full, BenchMode::Full, None),
+            "`[b]` = a full run (no burn-in duration)"
+        );
+        let memory = rx.try_recv().expect("the `[m]` memory-bench cmd was queued");
+        assert_eq!(
+            (memory.target, memory.mode, memory.duration_minutes),
+            (StreamTarget::Full, BenchMode::MemoryOnly, None),
+            "`[m]` = a memory-only run"
+        );
+        let burn = rx.try_recv().expect("the `[x]` burn-in cmd was queued");
+        assert_eq!(
+            (burn.target, burn.mode, burn.duration_minutes),
+            (StreamTarget::Full, BenchMode::Full, Some(5)),
+            "`[x]` = the GUI default 5-minute burn-in"
+        );
+        assert!(rx.try_recv().is_err(), "exactly three commands were queued");
+    }
+
+    /// (bp) The dispatch over a scripted `KeyEvent` stream (the
+    /// plan's TUI-22 test — the pure `key_to_action` +
+    /// `dispatch_action` split makes the whole key `match`
+    /// unit-testable without a TTY): the 16-key sequence (the
+    /// frozen table order, `q` last) + one ignored char, mirroring
+    /// the main loop (the auto-open rule applies before each
+    /// dispatch) over a daemon-less default state — the side
+    /// effects come out in order (the state-only keys `None`, the
+    /// `[e]`/`[s]`/`[r]` keys their I/O effect, `[q]` the quit),
+    /// the settings land in their post-sequence state (one toggle /
+    /// one cycle of each knob), the three run keys queue exactly
+    /// their `TuiBenchCmd`s (the state stays idle — no run is in
+    /// flight in this test), the cancel flag ends set, and the
+    /// `[d]` key dismisses the auto-open (the strip had been
+    /// auto-opened before the key landed).
+    #[test]
+    fn dispatch_over_a_scripted_key_stream() {
+        let (tx, rx) = mpsc::channel::<TuiBenchCmd>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let mut dismissed = false;
+
+        /// One main-loop iteration over one key: the auto-open
+        /// rule, the dispatch under the write scope, the observed
+        /// side effect (`None` for an ignored char — it never
+        /// reaches the dispatch).
+        fn step(
+            state: &RwLock<AppState>,
+            key: char,
+            dismissed: &mut bool,
+            tx: &mpsc::Sender<TuiBenchCmd>,
+            cancel: &AtomicBool,
+        ) -> Option<SideEffect> {
+            let action =
+                key_to_action(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))?;
+            apply_requirements_auto_open(state, *dismissed);
+            Some({
+                let mut s = state.write().unwrap();
+                dispatch_action(action, &mut s, dismissed, tx, cancel)
+            })
+        }
+
+        let keys = ['g', 'p', 'u', 'k', 'a', 'w', 't', 'd', 'b', 'm', 'x', 'c', 'e', 's', 'r', 'z', 'q'];
+        let mut sides = Vec::new();
+        for key in keys {
+            sides.push(step(&state, key, &mut dismissed, &tx, &cancel));
+        }
+        assert_eq!(
+            sides,
+            vec![
+                // g p u k a w t d b m x c: the state-only keys
+                // (`Some(SideEffect::None)` — they dispatched, no I/O)
+                Some(SideEffect::None), Some(SideEffect::None), Some(SideEffect::None),
+                Some(SideEffect::None), Some(SideEffect::None), Some(SideEffect::None),
+                Some(SideEffect::None), Some(SideEffect::None),
+                Some(SideEffect::None), Some(SideEffect::None), Some(SideEffect::None),
+                Some(SideEffect::None),
+                // e s r: the I/O keys report their effect
+                Some(SideEffect::Export),
+                Some(SideEffect::Snapshot),
+                Some(SideEffect::Refresh),
+                // z: ignored — never dispatched
+                None,
+                // q: the quit
+                Some(SideEffect::Quit),
+            ],
+            "the side effects come out in the scripted order"
+        );
+
+        let s = state.read().unwrap();
+        assert!(s.settings.graphs_open, "one `[g]` opens the graphs overlay");
+        assert_eq!(s.settings.poll_interval_ms, 5_000, "one `[p]` advances 2 s → 5 s");
+        assert!(!s.settings.capacity_gib, "one `[u]` flips GiB → GB");
+        assert!(!s.settings.clock_mhz, "one `[k]` flips MHz → GHz");
+        assert!(!s.settings.refresh, "one `[a]` freezes the periodic poll");
+        assert_eq!(s.settings.graph_window_min, 15, "one `[w]` advances 5 → 15 min");
+        assert!(s.settings.settings_open, "one `[t]` opens the settings strip");
+        assert!(
+            !s.settings.requirements_open,
+            "the `[d]` closed the strip the auto-open had opened"
+        );
+        assert!(dismissed, "the `[d]` close dismissed the auto-open (the latch)");
+
+        // The three run keys queued exactly their commands (in
+        // order) — the state stayed idle, so none was skipped.
+        let full = rx.try_recv().expect("the `[b]` full-bench cmd was queued");
+        assert_eq!(
+            (full.target, full.mode, full.duration_minutes),
+            (StreamTarget::Full, BenchMode::Full, None)
+        );
+        let memory = rx.try_recv().expect("the `[m]` memory-bench cmd was queued");
+        assert_eq!(
+            (memory.target, memory.mode, memory.duration_minutes),
+            (StreamTarget::Full, BenchMode::MemoryOnly, None)
+        );
+        let burn = rx.try_recv().expect("the `[x]` burn-in cmd was queued");
+        assert_eq!(
+            (burn.target, burn.mode, burn.duration_minutes),
+            (StreamTarget::Full, BenchMode::Full, Some(5))
+        );
+        assert!(rx.try_recv().is_err(), "exactly three commands were queued");
+        assert!(cancel.load(Ordering::Relaxed), "the `[c]` key set the shared cancel flag");
+    }
+
+    /// (bq) Every one of the 16 actions dispatches a defined effect
+    /// (the no-op placeholder arms are gone — the plan's exit
+    /// criterion): the three I/O actions report their side effect,
+    /// `[Q]`uit reports the break, and the ten state-only actions
+    /// (the five toggles, the two cycles, the three run keys, the
+    /// cancel) mutate the state and report `SideEffect::None`.
+    #[test]
+    fn every_action_dispatches_a_defined_effect() {
+        let (tx, _rx) = mpsc::channel::<TuiBenchCmd>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut dismissed = false;
+        let mut state = AppState::default();
+
+        let expected = [
+            (Action::Refresh, SideEffect::Refresh),
+            (Action::Snapshot, SideEffect::Snapshot),
+            (Action::Quit, SideEffect::Quit),
+            (Action::BenchFull, SideEffect::None),
+            (Action::BenchMemory, SideEffect::None),
+            (Action::BurnIn, SideEffect::None),
+            (Action::Cancel, SideEffect::None),
+            (Action::ToggleGraphs, SideEffect::None),
+            (Action::ToggleSettings, SideEffect::None),
+            (Action::ToggleRequirements, SideEffect::None),
+            (Action::ExportJson, SideEffect::Export),
+            (Action::CyclePoll, SideEffect::None),
+            (Action::ToggleCapacity, SideEffect::None),
+            (Action::ToggleClock, SideEffect::None),
+            (Action::ToggleRefresh, SideEffect::None),
+            (Action::CycleWindow, SideEffect::None),
+        ];
+        assert_eq!(expected.len(), 16, "the full frozen table (P3-22 + TUI-01/02)");
+        for (action, side_effect) in expected {
+            let side = dispatch_action(action, &mut state, &mut dismissed, &tx, &cancel);
+            assert_eq!(side, side_effect, "{action:?} must dispatch its defined effect");
+        }
+    }
+
+    /// (br) The USAGE text carries the full 16-key table (plan
+    /// §2.2) + the unchanged exit-code note — the `--help`-style
+    /// surface of the parity dashboard.
+    #[test]
+    fn usage_text_carries_the_full_key_table() {
+        for entry in [
+            "[R]efresh",
+            "[S]napshot",
+            "[Q]uit",
+            "[B]ench (full)",
+            "[M]emory",
+            "[X] burn-in",
+            "[C]ancel",
+            "[E]xport",
+            "[G]raphs",
+            "[T]settings",
+            "[D]requirements",
+            "[P]oll",
+            "[U]nits",
+            "[K]lock",
+            "[A]uto refresh",
+            "[W]indow",
+        ] {
+            assert!(USAGE.contains(entry), "the USAGE must list {entry}");
+        }
+        assert!(
+            USAGE.contains("Exit codes: 0 quit, 1 terminal init failure, 2 usage error"),
+            "the exit-code note is unchanged"
+        );
+    }
+
 }
