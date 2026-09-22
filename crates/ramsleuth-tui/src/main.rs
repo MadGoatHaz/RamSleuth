@@ -9,10 +9,25 @@
 //!   raw mode, leave the alternate screen, show the cursor) on *every*
 //!   exit path: a normal `[Q]`uit, an early return, or an unwind — the
 //!   terminal is never left in raw mode.
-//! - **Background updater** — a `std::thread` that every 2 s runs
-//!   [`poll_once`] (a fresh `Client::connect` + `GetTelemetry` over
-//!   `ramsleuth-client`, P3-18) into the shared `Arc<RwLock<AppState>>`;
-//!   it stops on the quit flag and is joined (bounded) before exit.
+//! - **Background updater** — a `std::thread` poller loop (the GUI
+//!   `update.rs` `spawn_poller` precedent adapted to the TUI's fixed
+//!   socket): each tick it re-reads the live [`TuiSettings`] from the
+//!   shared `Arc<RwLock<AppState>>` (the render-side key writes are the
+//!   one permitted main-thread mutation — no I/O, the D6 settings-panel
+//!   precedent), clamps `poll_interval_ms` into the sane
+//!   [`MIN_POLL_INTERVAL_MS`]…[`MAX_POLL_INTERVAL_MS`] range, and
+//!   sleeps the live value — a changed knob takes effect on the next
+//!   tick, no restart. The one connect per tick is both the
+//!   connectivity probe (a fixed-socket TUI can only observe a daemon
+//!   restart by trying to connect) and, when this tick fetches, the
+//!   carrier of the `GetTelemetry` request (P3-18) — so a one-shot
+//!   **baseline** (the startup snapshot and the disconnected→connected
+//!   reconnect baseline — the C7-08/09 mechanism, so a refresh-off TUI
+//!   is not dead on arrival) is exactly one connection. With the
+//!   `refresh` gate on the poller runs the continuous cadence (the
+//!   current 2 s live poll); off, only the baselines run and the
+//!   snapshot stays frozen. It stops on the quit flag and is joined
+//!   (bounded) before exit.
 //! - **Main loop** — each tick: `terminal.draw(render)` (the P3-23
 //!   three-zone dashboard over the shared state) +
 //!   `events::poll_event(250 ms)` → the frozen `key_to_action` table
@@ -74,16 +89,35 @@ use ramsleuth_protocol::{Request, Response, DEFAULT_SOCKET_PATH};
 use ramsleuth_tui::events;
 use ramsleuth_tui::{key_to_action, render, Action, AppState};
 
-/// How often the background updater polls the daemon (plan P3-24: 2 s).
-const UPDATE_INTERVAL: Duration = Duration::from_millis(2000);
+/// The poll interval's sane lower bound in milliseconds (the GUI
+/// `update.rs` `MIN_POLL_INTERVAL_MS` rule, re-stated locally): a
+/// degenerate stored knob can never make the loop hot-spin — the
+/// no-panic contract (D5). The [`TuiSettings::poll_interval_ms`] field
+/// doc (TUI-09) pins the clamp to this read site.
+const MIN_POLL_INTERVAL_MS: u64 = 100;
+
+/// The poll interval's sane upper bound in milliseconds (the GUI
+/// `update.rs` `MAX_POLL_INTERVAL_MS` rule, re-stated locally): an
+/// absurd stored knob can never stall the loop (D5).
+const MAX_POLL_INTERVAL_MS: u64 = 60_000;
+
+/// Clamp a configured poll interval (milliseconds) to the sane range
+/// [`MIN_POLL_INTERVAL_MS`]…[`MAX_POLL_INTERVAL_MS`] (the GUI
+/// `update.rs` `clamp_poll_interval` mirror, re-applied defensively at
+/// the read site): a zero / absurd stored knob can never make the loop
+/// hot-spin or stall — the no-panic contract (D5).
+fn clamp_poll_interval(ms: u64) -> Duration {
+    Duration::from_millis(ms.clamp(MIN_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS))
+}
 
 /// The main loop's event-poll timeout (plan P3-24: a 250 ms tick — the
 /// redraw cadence, so the `…s ago` stamp and progress line advance live).
 const POLL_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// How long to wait for the updater after quit: it finishes within one
-/// update cycle (a 2 s `sleep` + at most one connect-retry window), so
-/// this deadline is generous; if it is exceeded the thread is detached
+/// update cycle (a live clamped-interval `sleep` + at most one
+/// connect-retry window), so this deadline is generous; if it is
+/// exceeded the thread is detached
 /// (the process is exiting — returning from `main` terminates it, and
 /// the terminal is already restored by then).
 const JOIN_DEADLINE: Duration = Duration::from_secs(5);
@@ -187,6 +221,16 @@ pub fn poll_once(socket: &Path, state: &mut AppState) -> Result<(), String> {
             return Ok(());
         }
     };
+    poll_with_client(&mut client, socket, state);
+    Ok(())
+}
+
+/// The shared `GetTelemetry` dispatch over an already-open `client`:
+/// the state updates [`poll_once`] documents (the no-panic contract,
+/// D5). Split out so the poller's one connect per tick can carry the
+/// request — a baseline / reconnect / cadence fetch is exactly one
+/// connection, never a probe connect plus a fetch connect.
+fn poll_with_client(client: &mut Client, socket: &Path, state: &mut AppState) {
     match client.request(&Request::GetTelemetry) {
         Ok(Response::Telemetry(telemetry)) => {
             state.telemetry = Some(telemetry);
@@ -218,7 +262,6 @@ pub fn poll_once(socket: &Path, state: &mut AppState) -> Result<(), String> {
             state.daemon_status = "disconnected".to_owned();
         }
     }
-    Ok(())
 }
 
 /// A `Drop` guard around the initialized terminal.
@@ -267,24 +310,90 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Spawn the background updater: every [`UPDATE_INTERVAL`] it runs
-/// [`poll_once`] against `socket`, storing the result into `state` (a
-/// fresh connect each cycle — survives daemon restarts). The thread runs
-/// until `stop` is set (quit); one cycle is bounded (the connect-retry
-/// window ~300 ms + the transport's 5 s read timeout), so a wedged
-/// daemon cannot hold it forever.
+/// Spawn the background updater: the GUI-style poller loop (the
+/// `update.rs` `spawn_poller` precedent adapted to the TUI's fixed
+/// socket). Each tick it re-reads the live [`TuiSettings`] from the
+/// shared state (the render-side key writes are the one permitted
+/// main-thread mutation — no I/O, the D6 settings-panel precedent),
+/// clamps `poll_interval_ms` to [`clamp_poll_interval`], and sleeps the
+/// live value — a changed knob takes effect on the next tick, no
+/// restart. The one connect per tick is both the connectivity probe
+/// (a fixed-socket TUI can only observe a daemon restart by trying to
+/// connect) and, when this tick fetches, the carrier of the
+/// `GetTelemetry` request — so a fetch is exactly one connection.
+///
+/// The fetch decision per tick (the C7-08/09 refresh gating): the
+/// one-shot **baseline** runs on the first tick (the startup snapshot)
+/// and on every disconnected→connected transition (the reconnect
+/// baseline) — always, refresh on or off, so a refresh-off TUI is not
+/// dead on arrival; the **cadence** (the continuous data poll, the
+/// current 2 s live poll) runs only while the `refresh` gate is on and
+/// the last fetch is at least the clamped interval old. With the gate
+/// off and the daemon steadily up, the probe connect is dropped without
+/// a fetch — the snapshot stays frozen (the `…s ago` stamp advances).
+///
+/// The thread runs until `stop` is set (quit); one tick is bounded
+/// (the connect-retry window ~300 ms + the transport's 5 s read
+/// timeout), so a wedged daemon cannot hold it forever.
 fn spawn_updater(
     state: Arc<RwLock<AppState>>,
     stop: Arc<AtomicBool>,
     socket: PathBuf,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        // Was the daemon connected at the end of the last tick: `false`
+        // before the first, so the first successful connect is the
+        // one-shot startup baseline (D-8); every later
+        // disconnected→connected transition is a reconnect baseline.
+        let mut prev_connected = false;
+        // When the last fetch ran: with the `refresh` gate on, the
+        // cadence polls once the live clamped interval has elapsed.
+        let mut last_poll = Instant::now();
         loop {
-            let _ = poll_once(&socket, &mut state.write().unwrap());
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            thread::sleep(UPDATE_INTERVAL);
+            // The live settings knobs (C6-27 / the D6 precedent):
+            // re-read every tick so a changed interval (clamped) or
+            // refresh gate takes effect without a restart.
+            let (refresh, interval) = {
+                let app = state.read().unwrap();
+                (
+                    app.settings.refresh,
+                    clamp_poll_interval(app.settings.poll_interval_ms),
+                )
+            };
+            match Client::connect(&socket) {
+                Err(error) => {
+                    // Daemon down: the friendly disconnected state (the
+                    // no-panic contract, D5); the next tick re-probes.
+                    let mut snapshot = state.write().unwrap();
+                    snapshot.error = Some(error.to_string());
+                    snapshot.daemon_status = "disconnected".to_owned();
+                    prev_connected = false;
+                }
+                Ok(mut client) => {
+                    // The disconnected→connected transition (the first
+                    // tick is one): the one-shot baseline — startup or
+                    // reconnect — runs regardless of the `refresh` gate
+                    // (D-8, the C7-08/09 mechanism).
+                    let reconnected = !prev_connected;
+                    let due = reconnected || (refresh && last_poll.elapsed() >= interval);
+                    if due {
+                        // Baseline / reconnect / cadence: send
+                        // `GetTelemetry` on this connection (one
+                        // connection total) and update the state.
+                        poll_with_client(&mut client, &socket, &mut state.write().unwrap());
+                        last_poll = Instant::now();
+                    }
+                    // Not due (refresh off, steady state): drop the
+                    // probe connection without a fetch — the snapshot
+                    // stays frozen, no periodic data poll.
+                    prev_connected = true;
+                }
+            }
+            // Sleep the live value: the next tick re-reads the knobs.
+            thread::sleep(interval);
         }
     })
 }
@@ -469,6 +578,7 @@ mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::process;
     use std::thread;
+    use std::sync::atomic::AtomicUsize;
 
     use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message};
     use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
@@ -692,5 +802,211 @@ mod tests {
             error.contains("daemon not running"),
             "the error must carry the DaemonDown hint, got: {error}"
         );
+    }
+
+    // --- TUI-17: the poller rework (live interval + refresh gating) ---
+
+    /// (h) The clamp (the TUI-local mirror of the GUI `update.rs`
+    /// `clamp_poll_interval`): below the floor → 100 ms; inside the
+    /// range → unchanged; above the ceiling → 60 000 ms.
+    #[test]
+    fn clamp_poll_interval_arms() {
+        assert_eq!(clamp_poll_interval(0), Duration::from_millis(100));
+        assert_eq!(clamp_poll_interval(50), Duration::from_millis(100));
+        assert_eq!(clamp_poll_interval(100), Duration::from_millis(100));
+        assert_eq!(clamp_poll_interval(2_000), Duration::from_millis(2_000));
+        assert_eq!(clamp_poll_interval(30_000), Duration::from_millis(30_000));
+        assert_eq!(clamp_poll_interval(60_000), Duration::from_millis(60_000));
+        assert_eq!(clamp_poll_interval(90_000), Duration::from_millis(60_000));
+        assert_eq!(clamp_poll_interval(u64::MAX), Duration::from_millis(60_000));
+    }
+
+    /// A persistent counting stand-in: binds `sock` (removing any stale
+    /// file first — the kill/restart phases re-bind the same path),
+    /// accepts until `stop`, and increments `count` per accepted
+    /// connection. A served `GetTelemetry` gets a canned snapshot; a
+    /// clean EOF before a frame (the poller's no-fetch probe connect —
+    /// refresh off, steady state) is tolerated and the loop keeps
+    /// accepting. The stop-waker's throwaway connect is never counted
+    /// (it is sent only after `stop` is set, and both stop checks pass
+    /// before a connection is counted).
+    fn tolerant_counting_stand_in(
+        sock: &TempSocket,
+        stop: &Arc<AtomicBool>,
+        count: &Arc<AtomicUsize>,
+    ) -> thread::JoinHandle<()> {
+        let _ = std::fs::remove_file(sock.path()); // stale file (re-bind phase)
+        let listener = UnixListener::bind(sock.path()).expect("test socket must bind");
+        let stop = Arc::clone(stop);
+        let count = Arc::clone(count);
+        thread::spawn(move || {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                if stop.load(Ordering::Relaxed) {
+                    break; // the waker (stop was set first)
+                }
+                count.fetch_add(1, Ordering::Relaxed);
+                match read_one_message(&mut stream) {
+                    Some(Message::Request(Request::GetTelemetry)) => {}
+                    Some(other) => panic!("stand-in expected GetTelemetry, got {other:?}"),
+                    None => continue, // a no-fetch probe connect (EOF)
+                }
+                let bytes =
+                    encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                        .expect("must encode");
+                stream.write_all(&bytes).expect("stand-in write must not fail");
+            }
+        })
+    }
+
+    /// Stop a stand-in cleanly: set its `stop` flag, wake a blocked
+    /// `accept` with a throwaway connect (immediate EOF; a failed
+    /// connect means the stand-in already left), and join it.
+    fn stop_stand_in(handle: thread::JoinHandle<()>, stop: &AtomicBool, sock: &Path) {
+        stop.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(sock);
+        handle.join().expect("stand-in thread must not panic");
+    }
+
+    /// Wait (bounded by a 10 s deadline) until `daemon_status` contains
+    /// `needle`; the test fails with the current status instead of
+    /// hanging (the GUI `update.rs` precedent).
+    fn wait_for_status(state: &Arc<RwLock<AppState>>, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status =
+                state.read().expect("the updater must not poison the lock").daemon_status.clone();
+            if status.contains(needle) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a status containing {needle:?}, got: {status}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// (i) Refresh gating (the C7-08/09 mechanism): with `refresh` off,
+    /// the updater performs exactly one baseline fetch at startup (one
+    /// connection), none while the daemon is down (several ticks pass —
+    /// the probes fail against the dead socket, no accepted
+    /// connections), and one reconnect baseline when the daemon comes
+    /// back (one connection — the probe connect is reused for the
+    /// fetch). The snapshot stays frozen (no periodic data poll).
+    #[test]
+    fn refresh_off_runs_only_the_startup_and_reconnect_baselines() {
+        let sock = TempSocket::new("refresh-off");
+        let count = Arc::new(AtomicUsize::new(0));
+
+        // Phase A: the daemon is up; the startup baseline fires (one
+        // connection). Refresh off, a 200 ms interval.
+        let stop_a = Arc::new(AtomicBool::new(false));
+        let stand_in_a = tolerant_counting_stand_in(&sock, &stop_a, &count);
+        let mut app = AppState::default();
+        app.settings.poll_interval_ms = 200;
+        app.settings.refresh = false;
+        let state = Arc::new(RwLock::new(app));
+        let updater_stop = Arc::new(AtomicBool::new(false));
+        let updater =
+            spawn_updater(Arc::clone(&state), Arc::clone(&updater_stop), sock.path().to_path_buf());
+
+        // Exactly one connection for the startup baseline (checked
+        // immediately — the next probe tick is ~200 ms away). The
+        // needle keeps the `:` so a `disconnected` status never
+        // matches as a substring.
+        wait_for_status(&state, "connected:");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "exactly one startup baseline connection (got {})",
+            count.load(Ordering::Relaxed)
+        );
+
+        // Phase B: the daemon goes down; several ticks pass with no
+        // accepted connections (the probes fail against the dead socket
+        // — no listener).
+        stop_stand_in(stand_in_a, &stop_a, sock.path());
+        let _ = std::fs::remove_file(sock.path()); // no listener, no file
+        thread::sleep(Duration::from_millis(800)); // several 200 ms ticks
+        wait_for_status(&state, "disconnected");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "no accepted connections while the daemon is down (got {})",
+            count.load(Ordering::Relaxed)
+        );
+
+        // Phase C: the daemon comes back; exactly one reconnect baseline
+        // (the probe connect is reused for the fetch — one connection).
+        let stop_c = Arc::new(AtomicBool::new(false));
+        let stand_in_c = tolerant_counting_stand_in(&sock, &stop_c, &count);
+        wait_for_status(&state, "connected:");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "exactly one reconnect baseline connection (got {})",
+            count.load(Ordering::Relaxed)
+        );
+
+        // Teardown: stop the updater + the stand-in.
+        updater_stop.store(true, Ordering::Relaxed);
+        stop_stand_in(stand_in_c, &stop_c, sock.path());
+        updater.join().expect("updater thread must not panic");
+    }
+
+    /// (j) The live interval (C6-27): with `refresh` on, the poller
+    /// sleeps the live clamped value — changing `poll_interval_ms` at
+    /// runtime (no restart) changes the cadence on the next tick. Over
+    /// the same wall window, the shorter interval produces more
+    /// connections than the longer one.
+    #[test]
+    fn live_poll_interval_change_takes_effect_without_restart() {
+        let sock = TempSocket::new("live-interval");
+        let count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stand_in = tolerant_counting_stand_in(&sock, &stop, &count);
+
+        // Refresh on, a long 400 ms interval.
+        let mut app = AppState::default();
+        app.settings.poll_interval_ms = 400;
+        app.settings.refresh = true;
+        let state = Arc::new(RwLock::new(app));
+        let updater_stop = Arc::new(AtomicBool::new(false));
+        let updater =
+            spawn_updater(Arc::clone(&state), Arc::clone(&updater_stop), sock.path().to_path_buf());
+
+        // Phase A: let the 400 ms cadence run over a 1 s window.
+        wait_for_status(&state, "connected:");
+        thread::sleep(Duration::from_millis(200)); // let the baseline settle
+        let a0 = count.load(Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(1_000));
+        let slow_delta = count.load(Ordering::Relaxed) - a0;
+
+        // Phase B: the panel shrinks the interval to the 100 ms floor;
+        // the same 1 s window yields more polls (no restart).
+        state
+            .write()
+            .expect("the panel write must not fail")
+            .settings
+            .poll_interval_ms = 100;
+        let b0 = count.load(Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(1_000));
+        let fast_delta = count.load(Ordering::Relaxed) - b0;
+
+        assert!(
+            fast_delta > slow_delta,
+            "the 100 ms interval must poll more often than 400 ms over the same window (slow={slow_delta}, fast={fast_delta})"
+        );
+
+        // Teardown.
+        updater_stop.store(true, Ordering::Relaxed);
+        stop_stand_in(stand_in, &stop, sock.path());
+        updater.join().expect("updater thread must not panic");
     }
 }
