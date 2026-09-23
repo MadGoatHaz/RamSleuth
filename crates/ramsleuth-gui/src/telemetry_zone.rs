@@ -775,6 +775,7 @@ mod tests {
                 decode_channel(0, Some(160), [Some(cmd0), Some(cmd1), Some(cmd2), Some(cmd3)]),
                 decode_channel(1, None, [None; 4]),
             ],
+            channel_mode: None,
         }
     }
 

@@ -435,6 +435,7 @@ mod tests {
                     Some(160),
                     [Some(cmd0), Some(cmd1), Some(cmd2), Some(cmd3)],
                 )],
+                channel_mode: None,
             }),
             spd: vec![SpdModule {
                 index: 0x50,

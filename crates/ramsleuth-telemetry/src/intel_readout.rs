@@ -781,21 +781,30 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 ///   registers are *not* decoded (never garbage from a mismatched map;
 ///   [`tier1_gate`] carries the rich detail for the branch-level error).
 ///
+/// The `channel_mode` slot decodes `MAD_INTER_CHANNEL[1:0]` from
+/// `mad_inter_channel` (`None` → `None`; reserved `11` → `None`); it is
+/// independent of the generation gate and populated whenever the raw
+/// value is present.
+///
 /// Never panics (D5): a `None` register degrades only its sourced fields.
-pub fn decode(regs: &IntelImcRegs, gen: IntelGen) -> IntelReadout {
+pub fn decode(regs: &IntelImcRegs, gen: IntelGen, mad_inter_channel: Option<u32>) -> IntelReadout {
     let count = channel_count(gen);
     if !tier1_supported(gen) {
         let mut channels = Vec::with_capacity(usize::from(count));
         for ch in 0..count {
             channels.push(unsupported_channel(ch));
         }
-        return IntelReadout { channels };
+        return IntelReadout {
+            channels,
+            channel_mode: None,
+        };
     }
     let mclk = decode_mclk(regs.mcbios_req);
     let ch0 = decode_tier1_channel(0, mclk.clone(), &regs.ch0);
     let ch1 = decode_tier1_channel(1, mclk, &regs.ch1);
     IntelReadout {
         channels: vec![ch0, ch1],
+        channel_mode: mad_inter_channel.and_then(ChannelMode::from_raw),
     }
 }
 
@@ -824,7 +833,7 @@ pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
     let info = CpuInfo::detect();
     let gen = intel_gen_gate(&info)?;
     let regs = IntelImcRegs::from_bar(bar);
-    Ok(decode(&regs, gen))
+    Ok(decode(&regs, gen, None))
 }
 
 /// Decode a raw register set produced by *any* source (the sysfs path
@@ -839,13 +848,16 @@ pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
 /// decode off-vendor hardware even if misused directly.
 pub fn read_regs(regs: &IntelImcRegs) -> IntelReadout {
     match intel_gen_gate(&CpuInfo::detect()) {
-        Ok(gen) => decode(regs, gen),
+        Ok(gen) => decode(regs, gen, None),
         Err(_) => {
             let mut channels = Vec::with_capacity(2);
             for ch in 0..2u8 {
                 channels.push(unsupported_channel(ch));
             }
-            IntelReadout { channels }
+            IntelReadout {
+                channels,
+                channel_mode: None,
+            }
         }
     }
 }
@@ -880,6 +892,58 @@ pub struct IntelChannel {
     pub rtl: Section<u16>,
 }
 
+/// The hardware channel / interleave mode, decoded from the global
+/// `MAD_INTER_CHANNEL` register (bits `[1:0]` CHAN_MODE).
+///
+/// Intel exposes the DRAM interleave configuration as a 2-bit field in the
+/// global MAD (memory array descriptor) register set — it is *not*
+/// derivable from the SPD-visible DIMM count. A Flex-Mode box (asymmetric
+/// DIMMs, e.g. 16 + 8 GB) may bind only a single SPD yet run in Dual-Flex,
+/// so the SPD-count label is authoritative only as a frontend fallback.
+///
+/// Wire-safe (serde + bincode); the reserved encoding `11` decodes to
+/// `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ChannelMode {
+    /// `00`: dual-channel, symmetric interleaving.
+    DualSymmetric,
+    /// `01`: dual-channel, flex mode (asymmetric DIMMs).
+    DualFlex,
+    /// `10`: single-channel.
+    Single,
+}
+
+impl ChannelMode {
+    /// Decode bits `[1:0]` of `MAD_INTER_CHANNEL`: `00` = Dual Symmetric,
+    /// `01` = Dual Flex, `10` = Single, `11` = reserved → `None`.
+    pub fn from_raw(raw: u32) -> Option<ChannelMode> {
+        match raw & 0x3 {
+            0 => Some(ChannelMode::DualSymmetric),
+            1 => Some(ChannelMode::DualFlex),
+            2 => Some(ChannelMode::Single),
+            _ => None,
+        }
+    }
+
+    /// The full human-readable channel label (the header channel slot).
+    pub fn label(&self) -> &'static str {
+        match self {
+            ChannelMode::DualSymmetric => "Dual-Channel (Symmetric)",
+            ChannelMode::DualFlex => "Dual-Channel (Flex)",
+            ChannelMode::Single => "Single-Channel",
+        }
+    }
+
+    /// Short string for the header "Mode:" slot.
+    pub fn mode_label(&self) -> &'static str {
+        match self {
+            ChannelMode::DualSymmetric => "Interleaved",
+            ChannelMode::DualFlex => "Flex",
+            ChannelMode::Single => "N/A",
+        }
+    }
+}
+
 /// The full Intel readout: one [`IntelChannel`] per detected channel.
 ///
 /// Wire-safe (serde + bincode); the struct shape is frozen — only which
@@ -888,6 +952,9 @@ pub struct IntelChannel {
 pub struct IntelReadout {
     /// Decoded channels (0-based indices, `channels.len() == channel_count`).
     pub channels: Vec<IntelChannel>,
+    /// Hardware channel mode from `MAD_INTER_CHANNEL[1:0]`; `None` on the
+    /// `/dev/mem` fallback or a pre-24-attr module.
+    pub channel_mode: Option<ChannelMode>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,8 +1305,13 @@ mod tests {
     /// not-applicable, the CAD bus / voltages not exposed.
     #[test]
     fn acceptance_skylake_readout_pins_the_section_numbers() {
-        let ro = decode(&acceptance_regs(), IntelGen::Skylake);
+        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0));
         assert_eq!(ro.channels.len(), 2, "Tier 1: two channels");
+        assert_eq!(
+            ro.channel_mode,
+            Some(ChannelMode::DualSymmetric),
+            "MAD_INTER_CHANNEL[1:0] = 00 = dual symmetric"
+        );
         let ch0 = &ro.channels[0];
 
         // --- clocks (v1: mclk only) ------------------------------------
@@ -1429,7 +1501,7 @@ mod tests {
     /// whole channel to honest `Na` — no panic, no garbage values.
     #[test]
     fn decode_all_absent_degrades_without_panic() {
-        let ro = decode(&IntelImcRegs::default(), IntelGen::Skylake);
+        let ro = decode(&IntelImcRegs::default(), IntelGen::Skylake, None);
         for ch in &ro.channels {
             assert!(ch.clocks.mclk_mhz.is_na(), "{:?}", ch.clocks.mclk_mhz);
             for s in [&ch.clocks.uclk_mhz, &ch.clocks.fclk_mhz] {
@@ -1507,7 +1579,7 @@ mod tests {
     fn decode_per_register_containment() {
         let mut regs = acceptance_regs();
         regs.ch0.tc_rap = None;
-        let ro = decode(&regs, IntelGen::Skylake);
+        let ro = decode(&regs, IntelGen::Skylake, None);
         let ch0 = &ro.channels[0];
 
         for s in [&ch0.timings.ras, &ch0.timings.rrds, &ch0.timings.rtp, &ch0.timings.faw] {
@@ -1544,7 +1616,7 @@ mod tests {
         regs.ch0.tc_dbp = Some(0);
         regs.ch0.tc_rfp = Some(0);
         regs.ch1.tc_rap = Some(0);
-        let ro = decode(&regs, IntelGen::Skylake);
+        let ro = decode(&regs, IntelGen::Skylake, None);
 
         let ch0 = &ro.channels[0];
         for s in [
@@ -1588,7 +1660,7 @@ mod tests {
             (IntelGen::ArrowLake, 4),
             (IntelGen::Unrecognized, 2),
         ] {
-            let ro = decode(&regs, gen);
+            let ro = decode(&regs, gen, None);
             assert_eq!(ro.channels.len(), usize::from(count), "{gen:?}");
             for (i, ch) in ro.channels.iter().enumerate() {
                 assert_eq!(ch.index, i as u8, "{gen:?}");
@@ -1755,9 +1827,9 @@ mod tests {
     #[test]
     fn decode_readout_bincode_round_trip() {
         for ro in [
-            decode(&acceptance_regs(), IntelGen::Skylake),
-            decode(&IntelImcRegs::default(), IntelGen::Skylake),
-            decode(&acceptance_regs(), IntelGen::AlderLake),
+            decode(&acceptance_regs(), IntelGen::Skylake, Some(1)),
+            decode(&IntelImcRegs::default(), IntelGen::Skylake, None),
+            decode(&acceptance_regs(), IntelGen::AlderLake, None),
         ] {
             let bytes = bincode::serialize(&ro)
                 .expect("IntelReadout must serialize (no-panic contract)");
@@ -2264,6 +2336,7 @@ mod tests {
 
         let ro = IntelReadout {
             channels: vec![a, b],
+            channel_mode: None,
         };
         assert_eq!(ro.channels.len(), 2);
         assert_eq!(ro.channels[0].index, 0);
@@ -2281,6 +2354,7 @@ mod tests {
                 decode_channel(0, Some(160), full_regs()),
                 decode_channel(1, None, [None; 4]), // all-Na channel
             ],
+            channel_mode: Some(ChannelMode::DualFlex),
         };
 
         let bytes = bincode::serialize(&ro)
@@ -2296,11 +2370,49 @@ mod tests {
                 decode_channel(0, None, [None; 4]),
                 decode_channel(1, None, [None; 4]),
             ],
+            channel_mode: None,
         };
         let bytes = bincode::serialize(&all_na)
             .expect("IntelReadout must serialize (no-panic contract)");
         let back: IntelReadout =
             bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
         assert_eq!(all_na, back);
+    }
+
+    // -----------------------------------------------------------------
+    // ChannelMode (MAD_INTER_CHANNEL[1:0]).
+    // -----------------------------------------------------------------
+
+    /// `from_raw` maps the 2-bit CHAN_MODE field to its variants; the
+    /// reserved encoding `11` degrades to `None`; high bits are masked.
+    #[test]
+    fn channel_mode_from_raw_maps_all_encodings() {
+        assert_eq!(ChannelMode::from_raw(0x0), Some(ChannelMode::DualSymmetric));
+        assert_eq!(ChannelMode::from_raw(0x1), Some(ChannelMode::DualFlex));
+        assert_eq!(ChannelMode::from_raw(0x2), Some(ChannelMode::Single));
+        assert_eq!(ChannelMode::from_raw(0x3), None, "11 is reserved");
+        // High bits must be masked away (only bits [1:0] are read).
+        assert_eq!(
+            ChannelMode::from_raw(0xFFFF_FFFE),
+            Some(ChannelMode::Single),
+            "bits [1:0] only"
+        );
+        assert_eq!(
+            ChannelMode::from_raw(0xFFFF_FFFF),
+            None,
+            "reserved, even with high bits set"
+        );
+    }
+
+    /// The full channel label + the short "Mode:" label.
+    #[test]
+    fn channel_mode_labels() {
+        assert_eq!(ChannelMode::DualSymmetric.label(), "Dual-Channel (Symmetric)");
+        assert_eq!(ChannelMode::DualFlex.label(), "Dual-Channel (Flex)");
+        assert_eq!(ChannelMode::Single.label(), "Single-Channel");
+
+        assert_eq!(ChannelMode::DualSymmetric.mode_label(), "Interleaved");
+        assert_eq!(ChannelMode::DualFlex.mode_label(), "Flex");
+        assert_eq!(ChannelMode::Single.mode_label(), "N/A");
     }
 }
