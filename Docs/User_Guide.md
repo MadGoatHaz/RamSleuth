@@ -462,7 +462,11 @@ Synchronous 1:1 (UCLK = MCLK = 3000 MHz)`. The UCLK:MCLK sync segment is
 colour-coded: **amber** for `Synchronous 1:1` (UCLK = MCLK — the healthy
 memory-clock configuration), **crimson** for `Asynchronous 1:2` (UCLK = MCLK/2
 — the fallback when the fabric cannot keep up), and plain text for an honest
-`N/A`. When the OS total exceeds what SPD can see (e.g. four DIMMs installed
+`N/A`. On **Intel**, both the `<channel mode>` label and the `Mode:`
+slot are overridden by the hardware `MAD_INTER_CHANNEL` register when the
+`ramsleuth_intel` module is loaded (a Flex-Mode box reads `Dual-Channel
+(Flex)` / `Mode: Flex`); see [Section 8.6](#86-channel-mode--the-ram-summary).
+When the OS total exceeds what SPD can see (e.g. four DIMMs installed
 but only two bound to the SPD bus), a slot note is appended —
 `2 of 4 slots SPD-visible`.
 
@@ -940,6 +944,14 @@ the theoretical interface width, which is why the summary also shows the
 per-DIMM breakdown (`2x16 GiB Single-Rank`) and, when the OS sees more
 capacity than the SPD bus binds, a slot note (`2 of 4 slots SPD-visible`).
 
+On **Intel** the DIMM count is only the fallback. When the
+`ramsleuth_intel` module is loaded, the channel label and the `Mode:`
+segment come from the memory controller's hardware `MAD_INTER_CHANNEL`
+register instead — so a Flex-Mode box with asymmetric DIMMs (e.g. `16 + 8
+GB`) reads `Dual-Channel (Flex)` / `Mode: Flex`, not the previously-wrong
+`Single-Channel` / `Mode: N/A`. Without the module (the `/dev/mem`
+fallback) the label degrades back to the DIMM count above.
+
 ---
 
 ## 9. N/A — what the structured reasons mean
@@ -1035,11 +1047,16 @@ exposes `/dev/mem` unblocked (no `STRICT_DEVMEM`, no integrity lockdown).
 The optional **`ramsleuth_intel`** DKMS module is the **preferred** source:
 it maps the same MCHBAR window in-kernel and publishes the raw registers as
 world-readable sysfs attributes under `/sys/kernel/ramsleuth_intel/`
-(19 read-only attributes — see `kernel/ramsleuth-intel/README.md`). The
+(24 read-only attributes — see `kernel/ramsleuth-intel/README.md`). The
 daemon uses it whenever it is loaded (the sysfs path needs no `/dev/mem` at
 all) and falls back to `/dev/mem` **only** when the module is absent —
 never the other way round: with the module loaded, a `/dev/mem` fault is
-reported as a real fault instead of being masked by a silent source switch.
+reported as a real fault instead of being masked by a silent source
+switch. The module's `mad_inter_channel` register is what feeds the
+header's hardware channel-mode label (see
+[Section 8.6](#86-channel-mode--the-ram-summary)); with it loaded, an Intel
+box reports its true `Single-` / `Dual-Channel (…)` mode and the `Mode:`
+slot (`Interleaved` / `Flex`), not just the SPD-visible DIMM count.
 
 Three ways to get it (all build the **same in-repo** source,
 `kernel/ramsleuth-intel/`, vendored with the package — no network, unlike
@@ -1161,7 +1178,21 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   MCHBAR window does not expose them the way the AMD SMU does.
 - **SPD sees only bound modules**: if the OS total exceeds the SPD-visible
   sum, the header's slot note (`2 of 4 slots SPD-visible`) tells you — that
-  is the platform, not a bug.
+  is the platform, not a bug. On **Intel** the daemon now *attempts* to
+  close the gap: when the kernel's `ee1004` driver has bound fewer SPD
+  EEPROMs than the platform's active channels (common on boards whose
+  ACPI/DSDT advertises only one DIMM slot), the daemon — as root — tries to
+  bind the missing standard addresses (`0x50`–`0x53`) via the sysfs
+  `new_device` mechanism so all installed DIMMs appear. This is on by
+  default, non-fatal (a missing EEPROM simply stays absent), never
+  unbinds, and can be disabled with the daemon flag `--no-spd-autobind`.
+  If the auto-bind cannot find an EEPROM, bind it manually: first see what
+  is bound with `ls /sys/bus/i2c/drivers/ee1004/`, then bind a specific
+  address with
+  `echo "ee1004 0051" | sudo tee /sys/bus/i2c/devices/i2c-0/new_device`
+  (substitute the correct bus number and the 7-bit address `0x50`–`0x53`;
+  verify the bus and address with `i2cdetect -l` / `i2cdetect -y <bus>`
+  first).
 - The GUI's **settings knobs are in-memory** — they do not persist across
   restarts (a documented follow-up); the daemon socket, poll interval, and
   units reset to defaults on each launch (the `--socket` flag is the
