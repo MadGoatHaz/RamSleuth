@@ -32,8 +32,8 @@
 //! | `+0x28` | `TC_WRRD` | same 4×6-bit layout |
 //! | `+0x2C` | `TC_WRWR` | same 4×6-bit layout |
 //!
-//! Every access is a 4-byte read well inside the 1 MiB MCHBAR window
-//! (compile-asserted below and re-checked at runtime by
+//! Every access is a 4-byte read well inside the 64 KiB Tier-1 MCHBAR
+//! window (compile-asserted below and re-checked at runtime by
 //! [`MchBar::read_u32`]). The timing unit is **integer DRAM clock cycles**
 //! (1 cycle = 2 UI).
 //!
@@ -141,11 +141,14 @@ use crate::intel_mchbar::MchBar;
 // Hardware-authoritative Tier-1 register table (MCHBAR-relative offsets).
 // ---------------------------------------------------------------------------
 
-/// Size of the MCHBAR MMIO window mapped by the `intel_mchbar` module
-/// (1 MiB). Mirrors `intel_mchbar::MCHBAR_WINDOW_SIZE` (private there) so
-/// the table below can be compile-checked against the actual mapped
-/// region.
-pub const MCHBAR_WINDOW: usize = 1 << 20;
+/// Tier-1 MCHBAR window is 64 KiB per datasheet; Tier-2 (Alder/Raptor)
+/// will require 256 KiB (0x40000).
+///
+/// Compile-check boundary for this module's register table (every Tier-1
+/// and legacy offset must fit it). The runtime `intel_mchbar` map is a 1
+/// MiB superset (its `MCHBAR_WINDOW_SIZE` is private there); shrinking
+/// that map is a follow-up in `intel_mchbar.rs`.
+pub const MCHBAR_WINDOW: usize = 1 << 16;
 
 /// Global register: the BIOS request word carrying the DRAM clock ratio
 /// (bits 7:0), the reference-clock select (bit 8), the gear ratio (bits
@@ -211,7 +214,7 @@ pub const LEGACY_MCS_MAX_OFFSET: usize =
 
 // Compile-time proof that every register read in this module (both the
 // hardware-authoritative Tier-1 table and the legacy skeleton table)
-// fits the 1 MiB MCHBAR window (each read is a 4-byte access).
+// fits the 64 KiB Tier-1 MCHBAR window (each read is a 4-byte access).
 const _ASSERT_IMC_READS_IN_WINDOW: () = assert!(
     MAX_IMC_OFFSET <= MCHBAR_WINDOW
         && MAX_CHANNEL_OFFSET <= MCHBAR_WINDOW
@@ -903,7 +906,7 @@ const FREQ_RATIO_STEP_MHZ: f64 = 10.0;
 
 /// The four per-channel legacy MCS command-register offsets for channel
 /// `ch`, in decode order (`COMMAND_0..3`). All values are 4-byte
-/// aligned and within the 1 MiB window (compile-asserted; re-checked
+/// aligned and within the MCHBAR window (compile-asserted; re-checked
 /// by `MchBar::read_u32`).
 pub fn channel_offsets(ch: u8) -> [usize; 4] {
     let base = LEGACY_MCS_CHANNEL_BASE + usize::from(ch) * LEGACY_MCS_CHANNEL_STRIDE;
@@ -1905,7 +1908,7 @@ mod tests {
         }
     }
 
-    /// The per-channel legacy offset table is 4-aligned, fits the 1 MiB
+    /// The per-channel legacy offset table is 4-aligned, fits the MCHBAR
     /// window, and the per-channel blocks never overlap.
     #[test]
     fn channel_offsets_within_window() {
@@ -1915,7 +1918,7 @@ mod tests {
                 assert_eq!(off % 4, 0, "offset {off:#x} must be 4-aligned");
                 assert!(
                     off + 4 <= MCHBAR_WINDOW,
-                    "offset {off:#x} must fit the 1 MiB window"
+                    "offset {off:#x} must fit the MCHBAR window"
                 );
             }
         }
@@ -1926,6 +1929,18 @@ mod tests {
         let o1 = channel_offsets(1).to_vec();
         for a in &o0 {
             assert!(!o1.contains(a), "channel blocks must not overlap: {a:#x}");
+        }
+    }
+
+    /// The `/dev/mem` fallback map size is the 64 KiB (0x10000) Tier-1
+    /// datasheet window, and the highest Tier-1 register reads
+    /// (`MC_BIOS_REQ` @ `0x5E00`, a 4-byte access ending at `0x5E04`,
+    /// and ch1's `TC_WRWR`) both sit inside it.
+    #[test]
+    fn devmem_fallback_map_is_64_kib() {
+        assert_eq!(MCHBAR_WINDOW, 0x10000, "Tier-1 MCHBAR window is 64 KiB");
+        for off in [MAX_IMC_OFFSET, MAX_CHANNEL_OFFSET] {
+            assert!(off <= MCHBAR_WINDOW, "offset {off:#x} must fit the 64 KiB window");
         }
     }
 
