@@ -18,6 +18,14 @@
 //! not the idle frequency; the in-TTL clone path never spikes (the
 //! collector is not called).
 //!
+//! The collector's first line is the guarded SPD EEPROM auto-bind
+//! fallback (`spd_bind`, disabled with `--no-spd-autobind`): on an
+//! Intel box where the kernel's `ee1004` driver bound fewer EEPROMs
+//! than the platform has active channels, the missing standard
+//! addresses are attempted via the sysfs `new_device` mechanism before
+//! the spike + settle + `collect()`, so a freshly bound EEPROM lands in
+//! the same snapshot.
+//!
 //! **The daemon never panics** (plan D5): missing root or
 //! `CAP_SYS_RAWIO` only warns — the daemon keeps serving with its
 //! privileged fields degraded to `N/A`. The only permitted exits are
@@ -38,6 +46,7 @@
 //! Usage: ramsleuth-daemon [OPTIONS]
 //!   --socket <path>    Unix socket to listen on (default: /run/ramsleuth/ramsleuth.sock)
 //!   --max-age <secs>   telemetry cache TTL in seconds (default: 2)
+//!   --no-spd-autobind  disable the guarded SPD EEPROM auto-bind fallback
 //!   -h, --help         print usage and exit
 //! ```
 
@@ -46,7 +55,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ramsleuth_daemon::{
-    handle_connection, probe, setup_listener, spike, BenchJobManager, DaemonContext, TelemetryCache,
+    ensure_spd_eeproms_bound, handle_connection, probe, setup_listener, spike, BenchJobManager,
+    DaemonContext, TelemetryCache,
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use tokio::signal::unix::SignalKind;
@@ -70,6 +80,13 @@ pub struct DaemonArgs {
     /// seconds); defaults to 2 s. Inside the TTL, `GetTelemetry`
     /// returns the cached snapshot instead of re-collecting (P3-14).
     pub max_age: Duration,
+    /// Whether the guarded SPD EEPROM auto-bind fallback is enabled
+    /// (default: `true`; the `--no-spd-autobind` flag turns it off).
+    /// When on, an Intel box where `ee1004` bound fewer EEPROMs than
+    /// active channels gets the missing standard addresses attempted
+    /// via sysfs `new_device` before each collect (root-only,
+    /// non-fatal — see `spd_bind`).
+    pub spd_autobind: bool,
 }
 
 impl Default for DaemonArgs {
@@ -77,6 +94,7 @@ impl Default for DaemonArgs {
         Self {
             socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
             max_age: Duration::from_secs(2),
+            spd_autobind: true,
         }
     }
 }
@@ -95,20 +113,24 @@ const USAGE: &str = concat!(
     "  --socket <path>    Unix socket to listen on (default: /run/ramsleuth/ramsleuth.sock)\n",
     "  --max-age <secs>   Telemetry cache TTL in seconds, a non-negative\n",
     "                     integer (default: 2)\n",
+    "  --no-spd-autobind  Disable the guarded SPD EEPROM auto-bind\n",
+    "                     fallback (default: enabled; Intel-only,\n",
+    "                     root-only, non-fatal)\n",
     "  -h, --help         Print this help and exit\n",
     "\n",
     "Signals: SIGTERM and SIGINT stop the daemon gracefully (stop\n",
     "accepting, remove the socket file, exit 0).\n",
 );
 
-/// Parse `--socket <path>` and `--max-age <secs>` from `args` (the
-/// program name already removed).
+/// Parse `--socket <path>`, `--max-age <secs>`, and
+/// `--no-spd-autobind` from `args` (the program name already removed).
 ///
-/// Pure and testable: no env access, no I/O, no panic. Both flags may
-/// repeat (the last value wins) and may appear in any order. A missing
-/// flag value, a non-numeric or negative `--max-age`, or any unknown
-/// argument is a `String` error naming the problem; a valid parse
-/// yields [`DaemonArgs`] with defaults for every absent flag.
+/// Pure and testable: no env access, no I/O, no panic. Both value-taking
+/// flags may repeat (the last value wins) and all flags may appear in
+/// any order. A missing flag value, a non-numeric or negative
+/// `--max-age`, or any unknown argument is a `String` error naming the
+/// problem; a valid parse yields [`DaemonArgs`] with defaults for every
+/// absent flag (the SPD auto-bind fallback defaults to enabled).
 pub fn parse_args<I, S>(args: I) -> Result<DaemonArgs, String>
 where
     I: IntoIterator<Item = S>,
@@ -145,9 +167,12 @@ where
                 }
                 parsed.max_age = Duration::from_secs(seconds);
             }
+            "--no-spd-autobind" => {
+                parsed.spd_autobind = false;
+            }
             other => {
                 return Err(format!(
-                    "unknown argument `{other}` (expected `--socket <path>`, `--max-age <secs>`, or `--help`)"
+                    "unknown argument `{other}` (expected `--socket <path>`, `--max-age <secs>`, `--no-spd-autobind`, or `--help`)"
                 ));
             }
         }
@@ -180,12 +205,24 @@ async fn main() {
         eprintln!("warning: {warning}");
     }
 
+    // The SPD auto-bind gate (default on; `--no-spd-autobind` off) —
+    // copied out of `args` before the closure captures it (`args` is
+    // still consumed by the listener setup and the graceful stop
+    // below; the `bool` is `Copy`).
+    let spd_autobind = args.spd_autobind;
+
     // The shared per-daemon state (P3-16): the P3-14 TTL telemetry
     // cache over the real no-panic collector (the `--max-age` is the
     // cache TTL) + the P3-15 single-flight benchmark job manager.
     let ctx = Arc::new(DaemonContext {
         cache: Arc::new(Mutex::new(TelemetryCache::new(
-            || {
+            move || {
+                // First line (before the spike + settle + collect): the
+                // guarded SPD auto-bind fallback — a freshly bound
+                // EEPROM lands in the same snapshot. (`move` only
+                // captures the `Copy` `spd_autobind` flag; `args.max_age`
+                // is a separate argument below.)
+                ensure_spd_eeproms_bound(spd_autobind);
                 spike();
                 std::thread::sleep(CLOCK_SETTLE);
                 ramsleuth_telemetry::collect()
@@ -345,6 +382,25 @@ mod tests {
             err.contains("--max-age"),
             "the error must name the flag: {err}"
         );
+    }
+
+    /// (h) The SPD auto-bind fallback defaults to enabled (absent
+    /// flag).
+    #[test]
+    fn spd_autobind_defaults_on() {
+        let args = parse_args(Vec::<&str>::new()).expect("no args must parse");
+        assert!(args.spd_autobind);
+    }
+
+    /// (i) `--no-spd-autobind` disables the SPD auto-bind fallback
+    /// (a flag-only argument; repeating it stays disabled).
+    #[test]
+    fn no_spd_autobind_flag_disables_autobind() {
+        let args = parse_args(["--no-spd-autobind"]).expect("the flag must parse");
+        assert!(!args.spd_autobind);
+        let args = parse_args(["--no-spd-autobind", "--no-spd-autobind"])
+            .expect("the repeated flag must parse");
+        assert!(!args.spd_autobind);
     }
 
     /// Repeated flags: the last value wins, in any order.

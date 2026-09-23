@@ -22,6 +22,11 @@
 //!   operating frequency, not the idle frequency).
 //! - `rpc` — P3-16 — per-connection frame dispatch + progress
 //!   forwarding.
+//! - `spd_bind` — the guarded SPD EEPROM auto-bind fallback
+//!   (root-only sysfs `new_device` writes; the frozen telemetry crate
+//!   stays read-only): on an Intel box where `ee1004` bound fewer
+//!   EEPROMs than active channels, the daemon attempts the missing
+//!   standard addresses before each collect.
 //!
 //! The binary entry (`src/main.rs`) is rewritten in P3-17.
 
@@ -31,6 +36,7 @@ pub mod cache;
 pub mod bench_job;
 pub mod dram_spike;
 pub mod rpc;
+pub mod spd_bind;
 
 // P3-12: the SOFT privilege probe, re-exported at the root (workspace
 // re-export style) — the daemon's "warn, keep serving" contract
@@ -73,3 +79,8 @@ pub use dram_spike::spike;
 // `CancelBenchmark`; protocol violations close the connection with
 // `RpcError::Protocol`.
 pub use rpc::{DaemonContext, handle_connection, RpcError};
+// The SPD auto-bind fallback, re-exported at the root (workspace
+// re-export style) — main calls `ensure_spd_eeproms_bound(enabled)` as
+// the first line of the collector closure (before the spike + settle +
+// `collect()`) so a freshly bound EEPROM lands in the same snapshot.
+pub use spd_bind::ensure_spd_eeproms_bound;
