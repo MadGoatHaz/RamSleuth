@@ -1,6 +1,6 @@
 # RamSleuth v2.2.1
 
-Live memory-controller telemetry and an AIDA64-style benchmark engine for PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
+Live memory-controller telemetry and an AIDA64-style benchmark engine for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
 
 ![RamSleuth — GUI and TUI](img/RamSleuth.png)
 
@@ -13,7 +13,7 @@ Every privileged read flows through a single root daemon that holds only `CAP_SY
 ## Why RamSleuth
 
 - **Live AMD memory-controller state** — SMU PM-table clocks (MCLK/UCLK/FCLK), 27 DRAM subtimings, GDM, and command rate via the `ryzen_smu` kernel driver.
-- **Intel MCHBAR decode** — the host-bridge MMIO window mapped read-only through `/dev/mem` for per-channel register decode.
+- **Live Intel memory-controller state** — trained DRAM subtimings + the DRAM core clock on Skylake through Comet Lake (DDR4) desktops, decoded from the IMC registers: the `ramsleuth_intel` kernel module's sysfs interface first, the host-bridge MCHBAR mapped read-only through `/dev/mem` as the fallback where the kernel permits.
 - **Unprivileged SPD** — every DIMM's EEPROM decoded without root: JEP106 makers, rank, density, base speed, XMP 2.0/3.0 + EXPO profiles.
 - **AIDA64-style 4×4 benchmark** — native AVX2/AVX-512F kernels, one worker pinned per physical core, pointer-chase latency, and an optional burn-in soak.
 - **Dual frontend, full CLI** — the same live three-zone dashboard in a 16-key ratatui terminal UI and an egui desktop app, with 5-series graphs and PNG/JSON export.
@@ -52,13 +52,15 @@ yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest i
 
 **AMD live subtimings (optional extra):** `yay -S ryzen-smu-dkms` installs the pinned `ryzen_smu` kernel driver; without it the AMD fields read `N/A (DriverMissing)` and everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
 
+**Intel live subtimings (optional extra):** `yay -S ramsleuth-intel-dkms` provides the `ramsleuth_intel` kernel module — DKMS-built for your running kernel, exposing the raw IMC registers over world-readable sysfs; every install also ships the helper directly (`sudo ramsleuth-install-intel-dkms`), and the one-click setup routes to it automatically on Intel hosts. Without it the daemon falls back to the read-only `/dev/mem` MCHBAR map where the kernel permits, and the Intel fields read `N/A (DriverMissing)` where it does not — everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
+
 **Build from source:** `cargo build --workspace --release` — Rust MSRV 1.75, producing the 6 binaries above; system-library and per-path details in the [User Guide](Docs/User_Guide.md).
 
 ## Quickstart
 
 1. **Install** — the `install.sh` one-liner above, or either AUR package.
 2. **Open the app** — run `ramsleuth` (the GUI, or its desktop-menu entry); `ramsleuth-tui` is the terminal equivalent.
-3. **One click** — on first launch the `SETUP` strip offers **Set up RamSleuth** (on AMD hosts: **Set up RamSleuth + AMD driver**): one polkit password prompt enables + starts the daemon, joins your user to the `ramsleuth` group, and grants a current-session socket ACL — no re-login, no reboot. No desktop? The same one step from a terminal is `sudo ramsleuth-setup` (add `--with-dkms` on AMD).
+3. **One click** — on first launch the `SETUP` strip offers **Set up RamSleuth** (on AMD hosts: **Set up RamSleuth + AMD driver**): one polkit password prompt enables + starts the daemon, joins your user to the `ramsleuth` group, and grants a current-session socket ACL — no re-login, no reboot. No desktop? The same one step from a terminal is `sudo ramsleuth-setup` (add `--with-dkms` — AMD: the `ryzen_smu` driver; Intel: the `ramsleuth_intel` module).
 4. **Read and run** — the dashboard is live from the first second: telemetry matrix, benchmark grid, and hardware/SPD status; start a benchmark from either frontend, or run the standalone tools.
 
 The full walkthrough — every zone, key, flag, N/A reason, and day-2 troubleshooting — is in the [User Guide](Docs/User_Guide.md).
