@@ -47,9 +47,10 @@
 //!
 //! # Mapping into the frozen display types (v1 Tier 1)
 //!
-//! - `mclk_mhz` ← `MC_BIOS_REQ`: `ratio × refclk / 2` (the DRAM core
-//!   clock — DDR4-2400 = 18 × 133.3333 / 2 = **1200 MHz**), sanity-gated
-//!   to [1, 4096] MHz; a ratio of 0 = unconfigured → `Na(ParseError)`.
+//! - `mclk_mhz` ← `MC_BIOS_REQ`: `ratio × refclk` (the analog DRAM
+//!   clock MCLK — DDR4-2400 = 18 × 133.3333 = **2400 MHz**; for DDR,
+//!   MT/s = MCLK × 2), sanity-gated to [1, 4096] MHz; a ratio of 0 =
+//!   unconfigured → `Na(ParseError)`.
 //! - `uclk_mhz`, `fclk_mhz`, `gdm`, `pdm` ← `Na(NotApplicable)`
 //!   (AMD-fabric concepts with no IMC analog).
 //! - `div_mode`, `gear_mode` ← `Na(NotApplicable)` in v1 (the gear ratio
@@ -123,8 +124,8 @@
 //! # Fixture tests (the CI stand-in for the hardware acceptance)
 //!
 //! The `tests` module pins the plan §6.1 Skylake DDR4-2400 acceptance
-//! numbers exactly (raw `mcbios_req = 0x00000012` → 1200 MHz core clock /
-//! 2400 MT/s; `ch0_tc_dbp = 0x11110F11` → 17-15-17-17;
+//! numbers exactly (raw `mcbios_req = 0x00000012` → 2400 MHz MCLK /
+//! 4800 MT/s; `ch0_tc_dbp = 0x11110F11` → 17-15-17-17;
 //! `ch0_tc_rap = 0x27180204` → tRRD_S 4 / tRTP 8 / tFAW 24 / tRAS 39;
 //! `ch0_tc_rfp = 0x000001A4` → tRFC 420; ch1 symmetric; rc = 56), plus
 //! all-absent degradation, per-register containment, zero-field /
@@ -478,9 +479,10 @@ pub fn turnaround_quartet(reg: u32) -> [u16; 4] {
     ]
 }
 
-/// The `MC_BIOS_REQ` DRAM core clock in MHz: `ratio × refclk / 2`
-/// (DDR — two transfers per DRAM clock; DDR4-2400 = 18 × 133.3333 / 2
-/// = 1200 MHz), sanity-gated to [1, 4096] MHz.
+/// The `MC_BIOS_REQ` analog DRAM clock (MCLK) in MHz: `ratio × refclk`
+/// (the DRAM clock is the ratio multiple of the reference clock —
+/// DDR4-2400 = 18 × 133.3333 = 2400 MHz; for DDR, MT/s = MCLK × 2),
+/// sanity-gated to [1, 4096] MHz.
 ///
 /// Containment: an absent register → `Na(ParseError)`; a ratio of 0 =
 /// unconfigured → `Na(ParseError)`; a reserved GEAR_RATIO encoding
@@ -502,7 +504,7 @@ fn decode_mclk(reg: Option<u32>) -> Section<f64> {
             } else {
                 REF_CLK_133_MHZ
             };
-            clock_section(f64::from(ratio) * refclk / 2.0)
+            clock_section(f64::from(ratio) * refclk)
         }
     }
 }
@@ -1192,7 +1194,7 @@ mod tests {
             tc_wrwr: Some(0x0040_C204), // sg 4, dg 8, dr 12, dd 16
         };
         IntelImcRegs {
-            // ratio 18, REF_CLK = 133.3333 MHz → 1200 MHz core clock.
+            // ratio 18, REF_CLK = 133.3333 MHz → 2400 MHz MCLK.
             mcbios_req: Some(0x0000_0012),
             ch1: ch0.clone(),
             ch0,
@@ -1200,17 +1202,29 @@ mod tests {
     }
 
     /// §6.1 step 4: `mcbios_req = 0x00000012` → ratio 18 × 133.3333 MHz
-    /// = **2400 MT/s** (DDR), DRAM core clock **1200 MHz** — pinned
-    /// exactly.
+    /// = **2400 MHz** MCLK, **4800 MT/s** (for DDR, MT/s = MCLK × 2) —
+    /// pinned exactly.
     #[test]
-    fn acceptance_mcbios_req_decodes_1200_mhz_2400_mts() {
+    fn acceptance_mcbios_req_decodes_2400_mhz_4800_mts() {
         let mclk = decode_mclk(Some(0x0000_0012));
-        assert_eq!(mclk, Section::Value(1200.0));
+        assert_eq!(mclk, Section::Value(2400.0));
         assert_eq!(
             mclk.value().copied().map(|v| v * 2.0),
-            Some(2400.0),
-            "DDR: two transfers per DRAM clock = 2400 MT/s"
+            Some(4800.0),
+            "DDR: two transfers per DRAM clock = 4800 MT/s"
         );
+    }
+
+    /// Live-hardware anchor (Skylake i5-6600T, DDR4-2133):
+    /// `mcbios_req = 0x08` → ratio 8 × 133.3333 MHz = **1066.67 MHz**
+    /// MCLK (the analog DRAM clock; MT/s = MCLK × 2 = 2133.33 MT/s =
+    /// DDR4-2133) — within 0.01 MHz of the decimal value.
+    #[test]
+    fn decode_mclk_live_ddr4_2133_anchor() {
+        let mclk = decode_mclk(Some(0x0000_0008));
+        assert_eq!(mclk, Section::Value(8.0 * REF_CLK_133_MHZ));
+        let mhz = mclk.value().copied().expect("ratio 8 decodes in-band");
+        assert!((mhz - 1066.67).abs() < 0.01, "MCLK ≈ 1066.67 MHz, got {mhz}");
     }
 
     /// The §6.1 acceptance decode, pinned end to end: ch0 every decoded
@@ -1224,7 +1238,7 @@ mod tests {
         let ch0 = &ro.channels[0];
 
         // --- clocks (v1: mclk only) ------------------------------------
-        assert_eq!(ch0.clocks.mclk_mhz, Section::Value(1200.0));
+        assert_eq!(ch0.clocks.mclk_mhz, Section::Value(2400.0));
         assert_eq!(ch0.clocks.uclk_mhz, Section::na(NaReason::NotApplicable));
         assert_eq!(ch0.clocks.fclk_mhz, Section::na(NaReason::NotApplicable));
         assert_eq!(ch0.clocks.div_mode, Section::na(NaReason::NotApplicable));
@@ -1306,12 +1320,12 @@ mod tests {
     // [1, 4096] MHz sanity gate.
     // -----------------------------------------------------------------
 
-    /// REF_CLK = 1 (100 MHz): ratio 18 × 100 / 2 = 900 MHz, exact.
+    /// REF_CLK = 1 (100 MHz): ratio 18 × 100 = 1800 MHz, exact.
     #[test]
     fn decode_mclk_refclk_100_mhz() {
-        assert_eq!(decode_mclk(Some(0x0112)), Section::Value(900.0));
-        // ratio 63 with the 100 MHz ref: 3150.0 MHz (in-band, exact).
-        assert_eq!(decode_mclk(Some(0x013F)), Section::Value(3150.0));
+        assert_eq!(decode_mclk(Some(0x0112)), Section::Value(1800.0));
+        // ratio 31 with the 100 MHz ref: 3100.0 MHz (in-band, exact).
+        assert_eq!(decode_mclk(Some(0x011F)), Section::Value(3100.0));
     }
 
     /// A ratio of 0 is unconfigured → `Na(ParseError)`, never a 0 MHz
@@ -1332,17 +1346,23 @@ mod tests {
     /// not affect the v1 mclk decode.
     #[test]
     fn decode_mclk_ignores_reserved_gear_bits_in_v1() {
-        assert_eq!(decode_mclk(Some(0x0003_0012)), Section::Value(1200.0));
+        assert_eq!(decode_mclk(Some(0x0003_0012)), Section::Value(2400.0));
     }
 
-    /// The [1, 4096] MHz sanity gate bounds the displayed mclk: ratio 62
-    /// (≈ 4133 MHz) / ratio 255 (17000 MHz at the 133 ref; 12750 MHz at
-    /// the 100 ref) degrade to `Na(ParseError)`; ratio 61
-    /// (≈ 4066 MHz) stays in-band.
+    /// The [1, 4096] MHz sanity gate bounds the displayed mclk: ratio 31
+    /// at the 133.3333 MHz ref (≈ 4133 MHz) / ratio 41 at the 100 MHz
+    /// ref (4100 MHz) / ratio 255 (≈ 34000 MHz at the 133 ref; 25500
+    /// MHz at the 100 ref) degrade to `Na(ParseError)`; ratio 30 at the
+    /// 133 ref (≈ 4000 MHz) and ratio 40 at the 100 ref (4000 MHz)
+    /// stay in-band.
     #[test]
     fn decode_mclk_sanity_gate() {
         assert!(matches!(
-            decode_mclk(Some(62)),
+            decode_mclk(Some(31)),
+            Section::Na(NaReason::ParseError(_))
+        ));
+        assert!(matches!(
+            decode_mclk(Some(0x0129)),
             Section::Na(NaReason::ParseError(_))
         ));
         assert!(matches!(
@@ -1353,7 +1373,8 @@ mod tests {
             decode_mclk(Some(0x01FF)),
             Section::Na(NaReason::ParseError(_))
         ));
-        assert!(matches!(decode_mclk(Some(61)), Section::Value(_)));
+        assert!(matches!(decode_mclk(Some(30)), Section::Value(_)));
+        assert!(matches!(decode_mclk(Some(0x0128)), Section::Value(_)));
     }
 
     // -----------------------------------------------------------------
@@ -1488,7 +1509,7 @@ mod tests {
             assert!(matches!(s, Section::Na(NaReason::ParseError(_))), "{s:?}");
         }
         assert_eq!(ch0.timings.rc, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch0.clocks.mclk_mhz, Section::Value(1200.0));
+        assert_eq!(ch0.clocks.mclk_mhz, Section::Value(2400.0));
         assert_eq!(ch0.timings.cl, Section::Value(17));
         assert_eq!(ch0.timings.cwl, Section::Value(15));
         assert_eq!(ch0.timings.rcdrd, Section::Value(17));
