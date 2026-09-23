@@ -16,13 +16,17 @@
 //! 2. **Host-bridge config space:** read
 //!    `/sys/bus/pci/devices/0000:00:00.0/config` via `std::fs`. A missing
 //!    device yields [`TelemetryError::DriverMissing`].
-//! 3. **BAR5 decode:** [`decode_bar5`] parses the 8-byte field at config
-//!    offset `0x48..0x50` (the 64-bit MCHBAR base register) and
-//!    [`mchbar_base`] strips the low type/status bits to the page-aligned
-//!    physical base. A short config or an I/O-space BAR is
-//!    [`TelemetryError::Parse`]; a zero (unpopulated) base — typical of
-//!    virtualized Intel hosts — is [`TelemetryError::UnsupportedHardware`]
-//!    (a clean `N/A (unsupported hardware)`, not a confusing parse detail).
+//! 3. **MCHBAR decode:** [`decode_bar5`] parses the 8-byte field at config
+//!    offset `0x48..0x50` (the 64-bit MCHBAR register; `0x48` is the
+//!    MCHBAR — `0x40` is the EPBAR, a known trap) and [`mchbar_base`]
+//!    keeps exactly bits 38:16, the 64 KiB-aligned physical base. Bit 0 is
+//!    **MCHBAR_EN** (window-enable), not a PCI I/O-space flag: a disabled
+//!    MCHBAR with no address bits decodes to base 0 — the unpopulated
+//!    state typical of virtualized Intel hosts — and is
+//!    [`TelemetryError::UnsupportedHardware`] (a clean `N/A (unsupported
+//!    hardware)`, not a confusing parse detail); a disabled MCHBAR that
+//!    carries address bits, or a short config image, is
+//!    [`TelemetryError::Parse`].
 //! 4. **Read-only map:** open `/dev/mem` (fallback `/dev/fmem`) and
 //!    `mmap(PROT_READ, MAP_PRIVATE)` the 1 MiB MCHBAR window at the decoded
 //!    base, owned by the RAII [`MchBar`] guard.
@@ -60,10 +64,27 @@ use std::os::unix::io::{BorrowedFd, RawFd};
 const HOST_BRIDGE_BDF: &str = "0000:00:00.0";
 
 /// Config-space offset of the 64-bit MCHBAR ("BAR5") field (`0x48..0x50`).
+///
+/// `0x48` is the MCHBAR and is deliberate, not an off-by-one: on the
+/// Tier-1 host bridge `0x40` is the EPBAR (Express Port BAR), a known
+/// trap, and the MCHBAR's low dword sits at `0x48` (high dword at `0x4C`).
 const BAR5_OFFSET: usize = 0x48;
 
 /// Length of the MCHBAR field in bytes (low + high dword).
 const BAR5_LEN: usize = 8;
+
+/// Address-bit mask of the raw MCHBAR value: bits 38:16 = `base[38:16]`.
+///
+/// The MCHBAR bit layout is not the generic PCI BAR encoding: bit 0 is
+/// MCHBAR_EN (window-enable), bits 15:1 are hardwired 0, bits 38:16 carry
+/// the base address bits, and bits 39+ are 0 on Tier-1 host bridges.
+/// Masking a raw MCHBAR value with this constant yields the physical base
+/// of the MMIO window: it keeps the address field (bits 38:16) plus the
+/// hardwired-zero bits 15:12 the frozen mask carries, and strips MCHBAR_EN
+/// (bit 0) with bits 11:1. On real hardware bits 15:0 read `0x0` (EN at
+/// most), so the base is 64 KiB-aligned (typical enabled Skylake: raw
+/// `0x0000_0000_FED1_0001` → base `0x0000_0000_FED1_0000`).
+const MCHBAR_BASE_MASK: u64 = 0x0000_007F_FFFF_F000;
 
 /// The devmem node mapped for the MCHBAR window.
 const DEV_MEM: &str = "/dev/mem";
@@ -186,8 +207,8 @@ impl Drop for MchBar {
 ///   or both `/dev/mem` and `/dev/fmem` are absent.
 /// - [`TelemetryError::InsufficientPrivilege`] — devmem open/map permission
 ///   denial (EACCES/EPERM) or a STRICT_DEVMEM range rejection.
-/// - [`TelemetryError::Parse`] — config space too short or an I/O-space
-///   BAR5.
+/// - [`TelemetryError::Parse`] — config space too short, or a disabled
+///   MCHBAR (MCHBAR_EN=0) that nonetheless carries address bits.
 /// - [`TelemetryError::Io`] — any other raw I/O failure.
 pub fn acquire() -> TelemetryResult<MchBar> {
     // 1. Vendor gate: pure, so non-Intel hardware is rejected before any
@@ -228,16 +249,25 @@ pub fn intel_vendor_gate(vendor: CpuVendor) -> TelemetryResult<()> {
 /// Decode the 64-bit MCHBAR ("BAR5") field from a PCI config-space image.
 ///
 /// Reads the 8 bytes at [`BAR5_OFFSET`] (`0x48..0x50`) as little-endian low +
-/// high dwords and combines them into the raw 64-bit BAR value. 32-bit and
-/// 64-bit BARs are handled uniformly: for a 32-bit BAR the high dword is
-/// zero, so `(high << 32) | low` is correct for either width. The low 4 bits
-/// (memory/I/O indicator, 32/64-bit type, prefetchable) are retained in the
-/// returned value and stripped by [`mchbar_base`].
+/// high dwords and combines them into the raw 64-bit register value:
+/// `raw = (high << 32) | low`. The MCHBAR is not a generic PCI BAR — its bit
+/// layout is: bit 0 = **MCHBAR_EN** (window-enable, set on any enabled
+/// MCHBAR), bits 15:1 = hardwired 0, bits 38:16 = the base address bits,
+/// bits 39+ = 0 on Tier-1 host bridges.
+///
+/// An enabled MCHBAR decodes to its raw value (MCHBAR_EN included);
+/// [`mchbar_base`] strips the non-address bits. A disabled MCHBAR
+/// (MCHBAR_EN=0) with no address bits — the unpopulated state typical of
+/// virtualized Intel hosts — decodes to `0`, which the acquisition flow
+/// maps to [`TelemetryError::UnsupportedHardware`] (a clean `N/A
+/// (unsupported hardware)`). A disabled MCHBAR that carries address bits is
+/// inconsistent (defensive; not observed in the wild) and is
+/// [`TelemetryError::Parse`].
 ///
 /// # Errors
 ///
-/// [`TelemetryError::Parse`] when the config image is shorter than the field
-/// or the BAR is an I/O-space register (bit 0 set).
+/// [`TelemetryError::Parse`] when the config image is shorter than the field,
+/// or when MCHBAR_EN=0 while address bits are non-zero.
 pub fn decode_bar5(config: &[u8]) -> TelemetryResult<u64> {
     let field = match config.get(BAR5_OFFSET..BAR5_OFFSET + BAR5_LEN) {
         Some(f) => f,
@@ -253,25 +283,37 @@ pub fn decode_bar5(config: &[u8]) -> TelemetryResult<u64> {
     };
     let low = u32::from_le_bytes([field[0], field[1], field[2], field[3]]);
     let high = u32::from_le_bytes([field[4], field[5], field[6], field[7]]);
-    // BAR bit 0: 0 = memory space, 1 = I/O space. MCHBAR must be memory.
-    if low & 0b1 != 0 {
-        return Err(TelemetryError::Parse {
-            detail: format!(
-                "MCHBAR field at 0x{BAR5_OFFSET:x} is an I/O-space BAR (bit 0 set); a memory BAR is required"
-            ),
-        });
+    let raw = ((high as u64) << 32) | (low as u64);
+    // MCHBAR bit 0 is MCHBAR_EN (window-enable), NOT a PCI I/O-space flag:
+    // it is set on any enabled MCHBAR.
+    if raw & 0b1 == 0 {
+        // Window disabled: unpopulated (no address bits → decode 0 → base
+        // 0 → `UnsupportedHardware` upstream), or inconsistent (address
+        // bits set → `Parse`).
+        if raw & MCHBAR_BASE_MASK != 0 {
+            return Err(TelemetryError::Parse {
+                detail: format!(
+                    "MCHBAR field at 0x{BAR5_OFFSET:x} is disabled (MCHBAR_EN=0) but carries address bits (raw {raw:#x}); an enabled MCHBAR is required"
+                ),
+            });
+        }
+        return Ok(0);
     }
-    Ok(((high as u64) << 32) | (low as u64))
+    Ok(raw)
 }
 
-/// Compute the page-aligned MCHBAR base address from a raw 64-bit BAR5 value.
+/// Compute the 64 KiB-aligned MCHBAR base address from a raw 64-bit MCHBAR
+/// value.
 ///
-/// Strips the low 4 bits (memory/I/O indicator, 32/64-bit type,
-/// prefetchable), which are never address bits; the high dword is pure
-/// address. The result is 4 KiB page-aligned by construction, as required by
-/// the devmem `mmap` offset.
+/// Keeps the address field with the frozen mask (`raw &
+/// [`MCHBAR_BASE_MASK`]`): bits 38:16 are the base address bits (plus the
+/// hardwired-zero bits 15:12 the frozen mask carries), while MCHBAR_EN
+/// (bit 0), bits 11:1, and bits 39+ (0 on Tier-1 host bridges) are
+/// stripped. On real hardware the low 16 bits read `0x0` (EN at most), so
+/// the result is the 64 KiB-aligned base — a page multiple on all supported
+/// page sizes — as required by the devmem `mmap` offset.
 pub fn mchbar_base(bar5: u64) -> u64 {
-    bar5 & !0xF
+    bar5 & MCHBAR_BASE_MASK
 }
 
 /// Bounds-check a 4-byte register read at `offset` against a window of
@@ -478,41 +520,63 @@ mod tests {
         cfg
     }
 
-    /// (a) A 32-bit memory BAR (type bits 00, high dword zero): the decoded
-    /// value carries the low-dword address and the base is page-aligned.
+    /// (a) An enabled Skylake MCHBAR (MCHBAR_EN set, low dword
+    /// `0xFED10001`): the decode keeps the raw value (EN bit included) and
+    /// the base is `0xFED10000` — bits 38:16 only, EN + hardwired bits
+    /// stripped.
     #[test]
-    fn decode_bar5_32bit_memory_bar() {
-        let cfg = config_with_bar5(0x1000_0000, 0x0000_0000);
-        assert_eq!(decode_bar5(&cfg), Ok(0x1000_0000));
-        assert_eq!(mchbar_base(0x1000_0000), 0x1000_0000);
+    fn decode_bar5_enabled_mchbar() {
+        let cfg = config_with_bar5(0xFED1_0001, 0x0000_0000);
+        assert_eq!(decode_bar5(&cfg), Ok(0x0000_0000_FED1_0001));
+        assert_eq!(mchbar_base(0x0000_0000_FED1_0001), 0x0000_0000_FED1_0000);
     }
 
-    /// (a) A 64-bit memory BAR (type bits 01, high dword populated): the
-    /// decoded value combines low + high and the base is the full 64-bit
-    /// address; the prefetchable bit (0x8) is stripped with the other low
-    /// status bits.
+    /// (a) The high dword combines with the low: `raw = (high << 32) | low`,
+    /// and the base keeps bits 38:16 (bit 32 lives in the address field;
+    /// bits 39+ are hardwired 0 on Tier-1 hardware).
     #[test]
-    fn decode_bar5_64bit_memory_bar() {
-        let cfg = config_with_bar5(0x1000_0002, 0x0000_1234);
-        assert_eq!(decode_bar5(&cfg), Ok(0x1234_1000_0002));
-        assert_eq!(mchbar_base(0x1234_1000_0002), 0x1234_1000_0000);
-
-        let cfg = config_with_bar5(0x1000_000A, 0x0000_5678); // + prefetch bit
-        assert_eq!(decode_bar5(&cfg), Ok(0x5678_1000_000A));
-        assert_eq!(mchbar_base(0x5678_1000_000A), 0x5678_1000_0000);
+    fn decode_bar5_high_dword_combination() {
+        let cfg = config_with_bar5(0xFED1_0001, 0x0000_0001);
+        assert_eq!(decode_bar5(&cfg), Ok(0x0000_0001_FED1_0001));
+        assert_eq!(
+            mchbar_base(0x0000_0001_FED1_0001),
+            0x0000_0001_FED1_0000
+        );
     }
 
-    /// (a) An I/O-space BAR (bit 0 set) is rejected with `Parse` — never a
-    /// mapped address, never a panic.
+    /// (a) A disabled MCHBAR (MCHBAR_EN=0) with no address bits is the
+    /// unpopulated state (virtualized / unsupported): it decodes to 0, so
+    /// the base is 0 and `acquire_linux`'s existing `base == 0` check maps
+    /// it to `UnsupportedHardware` (a clean `N/A (unsupported hardware)`).
+    /// An MCHBAR with MCHBAR_EN=1 but a zero address (raw `0b1`) also
+    /// strips to base 0 through the same check.
     #[test]
-    fn decode_bar5_io_space_bar_is_parse_error() {
-        for low in [0x1000_0001u32, 0x1000_0003, 0x1000_0005] {
+    fn decode_bar5_disabled_unpopulated_decodes_to_zero_base() {
+        let cfg = config_with_bar5(0x0000_0000, 0x0000_0000);
+        assert_eq!(decode_bar5(&cfg), Ok(0));
+        assert_eq!(mchbar_base(0), 0);
+
+        let cfg = config_with_bar5(0x0000_0001, 0x0000_0000);
+        assert_eq!(decode_bar5(&cfg), Ok(0x0000_0000_0000_0001));
+        assert_eq!(mchbar_base(0x1), 0);
+    }
+
+    /// (a) A disabled MCHBAR (MCHBAR_EN=0) that nonetheless carries address
+    /// bits is inconsistent (defensive; not observed in the wild) and is
+    /// rejected with `Parse` — never a mapped address, never a panic.
+    #[test]
+    fn decode_bar5_disabled_with_address_is_parse_error() {
+        for (low, high) in [
+            (0xFED1_0000u32, 0u32),       // typical base, EN clear
+            (0x0000_1000, 0),             // bit 16 (lowest address bit) only
+            (0x0000_0000, 0x0000_0001),   // bit 32 in the high dword
+        ] {
             assert!(
                 matches!(
-                    decode_bar5(&config_with_bar5(low, 0)),
+                    decode_bar5(&config_with_bar5(low, high)),
                     Err(TelemetryError::Parse { .. })
                 ),
-                "low {low:#x} must be rejected"
+                "low {low:#x}, high {high:#x} must be rejected"
             );
         }
     }
@@ -530,43 +594,25 @@ mod tests {
                 "len {len:#x} must be rejected"
             );
         }
-        // A 64-bit BAR with a zero address decodes but yields base 0, which
-        // the acquisition flow rejects (covered here via the pure helpers).
-        let cfg = config_with_bar5(0x0, 0x0);
-        assert_eq!(decode_bar5(&cfg), Ok(0));
-        assert_eq!(mchbar_base(0), 0);
     }
 
-    /// (b) [`mchbar_base`] strips exactly the four type/status bits; the
-    /// result is page-aligned.
+    /// (b) [`mchbar_base`] applies the frozen [`MCHBAR_BASE_MASK`]: the
+    /// address field (bits 38:16) survives, MCHBAR_EN (bit 0) and bits 11:1
+    /// strip, and bits 39+ (0 on Tier-1 hardware) strip too. The typical
+    /// Skylake result is 64 KiB-aligned.
     #[test]
-    fn mchbar_base_strips_type_bits() {
-        assert_eq!(mchbar_base(0x1234_1000_000F), 0x1234_1000_0000);
-        assert_eq!(mchbar_base(0x0000_0000_FFF0_0007), 0x0000_0000_FFF0_0000);
-        assert_eq!(mchbar_base(0x0000_0000_0000_1000), 0x0000_0000_0000_1000);
+    fn mchbar_base_keeps_only_address_bits() {
+        assert_eq!(mchbar_base(0x0000_0000_FED1_0001), 0x0000_0000_FED1_0000);
+        assert_eq!(mchbar_base(0x0000_0000_FED1_FFFF), 0x0000_0000_FED1_F000);
+        assert_eq!(
+            mchbar_base(MCHBAR_BASE_MASK),
+            MCHBAR_BASE_MASK
+        );
+        assert_eq!(mchbar_base(0x0000_0080_0000_0000), 0);
+        assert_eq!(mchbar_base(0x0000_0001_FED1_0000), 0x0000_0001_FED1_0000);
+        assert_eq!(mchbar_base(0x0000_0000_0000_F000), 0x0000_0000_0000_F000);
         assert_eq!(mchbar_base(0x2), 0x0);
         assert_eq!(mchbar_base(0x0), 0x0);
-    }
-
-    /// (f) A raw BAR5 that decodes to a zero base (unpopulated — as on
-    /// virtualized Intel hosts) strips to base 0 through the pure
-    /// helpers; `acquire_linux` maps that `base == 0` to
-    /// `UnsupportedHardware` (not `Parse`), so the readout degrades to a
-    /// clean `N/A (unsupported hardware)` instead of a confusing parse
-    /// detail.
-    #[test]
-    fn zero_bar5_decodes_to_zero_base_for_unsupported_hardware() {
-        // Status-only BAR encodings (no address bits set) all strip to
-        // base 0.
-        for raw in [0x0u64, 0x4, 0xF] {
-            assert_eq!(mchbar_base(raw), 0, "raw {raw:#x} must decode to base 0");
-        }
-        // The decode stage of the `acquire_linux` flow for an unpopulated
-        // BAR5: the field decodes to 0 and the base stays 0, which
-        // `acquire_linux` then maps to `UnsupportedHardware`.
-        let cfg = config_with_bar5(0, 0);
-        assert_eq!(decode_bar5(&cfg), Ok(0));
-        assert_eq!(mchbar_base(0), 0);
     }
 
     /// (d) The pure Intel vendor gate: non-Intel vendors (AMD / unknown)
