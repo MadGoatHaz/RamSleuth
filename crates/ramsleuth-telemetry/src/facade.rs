@@ -24,7 +24,8 @@
 //!
 //! ```text
 //! CpuInfo::detect() ──┬─ AMD:      amd_smu::acquire() → amd_pm::parse() → amd_smn::apply_smn (overlay) → amd_readout::map_amd()
-//!                     ├─ Intel:    intel_mchbar::acquire() → intel_readout::read_intel()
+//!                     ├─ Intel:    intel_sysfs::acquire() (primary, §3.5) → intel_readout::decode
+//!                     │           └─ on DriverMissing only: intel_mchbar::acquire() → read_intel (/dev/mem fallback)
 //!                     ├─ SPD:      spd_eeprom::acquire() → spd_decode::decode() (per image)
 //!                     ├─ Platform: platform::collect_platform() (C6-01) → dimm_sizes + total_capacity (D-C3)
 //!                     └─ Board VRM: board_vrm::read_board_vrm(&platform.motherboard) (C12-03) → fill-when-Na vddio_mem_mv overlay (D-5)
@@ -49,6 +50,7 @@ use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_mchbar;
 use crate::intel_readout::{self, IntelReadout};
+use crate::intel_sysfs;
 use crate::platform::{self, SystemPlatform};
 use crate::spd_decode::{self, SpdModule};
 use crate::spd_eeprom;
@@ -61,8 +63,10 @@ use crate::spd_eeprom;
 /// - `amd`: the AMD SMU readout; `Na` when not on AMD silicon or when
 ///   the `ryzen_smu` driver is missing / unreadable / of unknown PM
 ///   table version.
-/// - `intel`: the Intel MCHBAR readout; `Na` when not on Intel silicon
-///   or when the MCHBAR map is unavailable.
+/// - `intel`: the Intel IMC readout (the `ramsleuth_intel` sysfs
+///   kobject primary, the `/dev/mem` MCHBAR fallback); `Na` when not
+///   on Intel silicon, not a v1 Tier-1 generation, or when both raw
+///   sources are unavailable.
 /// - `spd`: the decoded SPD modules, one per bound `ee1004` device;
 ///   empty when the driver is absent or no device is bound.
 /// - `platform`: the vendor-neutral platform identity (C6-01, D-C1);
@@ -84,8 +88,8 @@ pub struct SystemMemoryTelemetry {
     /// AMD branch outcome: the mapped SMU readout, or a structured N/A
     /// reason.
     pub amd: Section<AmdReadout>,
-    /// Intel branch outcome: the mapped MCHBAR readout, or a structured
-    /// N/A reason.
+    /// Intel branch outcome: the mapped IMC readout (sysfs primary /
+    /// `/dev/mem` fallback), or a structured N/A reason.
     pub intel: Section<IntelReadout>,
     /// SPD branch outcome: one decoded module per bound device (empty
     /// when unavailable).
@@ -124,8 +128,11 @@ pub struct SystemMemoryTelemetry {
 /// 2. AMD branch (AMD silicon only): `amd_smu::acquire()` →
 ///    `amd_pm::parse()` → `amd_smn::apply_smn` (no-panic overlay) →
 ///    `amd_readout::map_amd()`.
-/// 3. Intel branch (Intel silicon only): `intel_mchbar::acquire()` →
-///    `intel_readout::read_intel()`.
+/// 3. Intel branch (Intel silicon only, v1 Tier-1 generations):
+///    `intel_sysfs::acquire()` → `intel_readout::decode` (primary);
+///    on `DriverMissing` (kobject absent) only:
+///    `intel_mchbar::acquire()` → `intel_readout::read_intel` (the
+///    `/dev/mem` fallback, plan §3.5).
 /// 4. SPD branch (all vendors, unprivileged): `spd_eeprom::acquire()` →
 ///    `spd_decode::decode()` per image.
 /// 5. Platform branch (all vendors, C6-01): `platform::collect_platform()`
@@ -223,20 +230,53 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
     Ok(amd_readout::map_amd(&snap))
 }
 
-/// Intel branch: `intel_mchbar::acquire()` → `intel_readout::read_intel()`.
+/// Intel branch: the two-source acquisition of plan §3.5 —
+/// `intel_sysfs::acquire()` (primary, the `ramsleuth_intel` kobject) →
+/// `intel_readout::decode`; on `DriverMissing` only (the kobject is
+/// absent — the module is not loaded) fall through to
+/// `intel_mchbar::acquire()` → `intel_readout::read_intel` (the `/dev/mem`
+/// MCHBAR fallback).
 ///
 /// Gated on the already-detected vendor: non-Intel silicon returns
 /// `Err(UnsupportedHardware)` before any provider call (zero I/O in
 /// this branch — the provider's own vendor gate is a second line of
-/// defense, never the first).
+/// defense, never the first). A non-Tier-1 Intel generation (v1 decodes
+/// Skylake / Kaby Lake / Coffee Lake / Comet Lake only) degrades the
+/// whole branch to `Err(UnsupportedHardware)` before either raw source
+/// is touched — never garbage data from a mismatched register map.
+///
+/// The fallback rule is frozen: only a sysfs `DriverMissing` takes the
+/// `/dev/mem` path; any other sysfs outcome (`Parse` /
+/// `InsufficientPrivilege` / `Io`) propagates as-is — the module being
+/// loaded means the hardware is reachable, and silently switching
+/// sources would mask a real fault. Both sources feed the same pure
+/// decode core (`decode` over `IntelImcRegs`), and a branch failure
+/// degrades only the Intel `Section` (via [`reason_from`]).
 fn intel_branch(cpu: &CpuInfo) -> TelemetryResult<IntelReadout> {
-    if !matches!(cpu.vendor, CpuVendor::Intel(_)) {
-        return Err(TelemetryError::UnsupportedHardware {
-            vendor: "Intel MCHBAR telemetry requires Intel silicon".to_owned(),
-        });
+    // 1. Pure vendor gate (zero I/O): non-Intel silicon is rejected
+    //    before any provider call (the branch's first line of defense).
+    intel_sysfs::vendor_gate(cpu)?;
+    // 2. The detected generation (pure; the vendor gate passed, so this
+    //    is `Ok` for Intel silicon — re-verified, zero I/O).
+    let gen = intel_readout::intel_gen_gate(cpu)?;
+    // 3. The v1 Tier-1 generation gate: any other Intel generation
+    //    degrades the whole branch before any raw source is touched
+    //    (never garbage from a mismatched register map).
+    intel_readout::tier1_gate(gen)?;
+
+    // 4. Primary: the `ramsleuth_intel` sysfs kobject (plan §3.5).
+    match intel_sysfs::acquire() {
+        // The raw set feeds the same pure decode core as the fallback.
+        Ok(sysfs) => Ok(intel_readout::decode(&sysfs.regs, gen)),
+        // The frozen fallthrough rule: the `/dev/mem` fallback is taken
+        // ONLY on `DriverMissing` (kobject absent — module not loaded).
+        // Any other sysfs outcome is reported as-is.
+        Err(TelemetryError::DriverMissing { .. }) => {
+            let bar = intel_mchbar::acquire()?;
+            intel_readout::read_intel(&bar)
+        }
+        Err(err) => Err(err),
     }
-    let bar = intel_mchbar::acquire()?;
-    intel_readout::read_intel(&bar)
 }
 
 /// SPD branch: `spd_eeprom::acquire()` → `spd_decode::decode()` per
@@ -437,10 +477,14 @@ mod tests {
     /// `detect()`, vendor-neutral), the AMD branch is `Value` /
     /// `Na(DriverMissing)` on AMD silicon (module loaded or absent) and
     /// `Na(UnsupportedHardware)` on non-AMD silicon (vendor gate), the
-    /// Intel branch is `Na(UnsupportedHardware)` on both (AMD: vendor
-    /// gate; virtualized Intel: the unpopulated BAR5=0 degradation), and
-    /// `spd` is a `Vec` (the count is host-dependent and is not
-    /// asserted).
+    /// Intel branch is `Na(UnsupportedHardware)` on non-Intel silicon
+    /// (vendor gate) and — vendor/hardware-conditional, plan §3.5 — a
+    /// `Value` or a hardware-access `Na` from the frozen set (the
+    /// virtualized BAR5=0 / non-Tier-1 `UnsupportedHardware`, the
+    /// absent-kobject `DriverMissing` the blocked `/dev/mem` fallback
+    /// still cannot clear, an `InsufficientPrivilege` / `ParseError`
+    /// access failure) on Intel silicon, and `spd` is a `Vec` (the count
+    /// is host-dependent and is not asserted).
     #[test]
     fn collect_on_this_host_is_structural_and_panic_free() {
         // Running this to completion is itself the no-panic check.
@@ -471,10 +515,31 @@ mod tests {
             ),
         }
 
-        // intel: Na(UnsupportedHardware) on both vendors: the AMD host via
-        // the vendor gate, the virtualized Intel CI runner via the
-        // unpopulated-BAR5 (BAR5=0) degradation.
-        assert_eq!(t.intel, Section::Na(NaReason::UnsupportedHardware));
+        // intel: vendor/hardware-conditional (plan §3.5). On a non-Intel
+        // host the vendor gate degrades the branch to
+        // Na(UnsupportedHardware) before any provider call. On Intel
+        // silicon the branch is a `Value` (either raw source decoded) or
+        // a hardware-access `Na` from the frozen set — the virtualized
+        // BAR5=0 / non-Tier-1 `UnsupportedHardware`, the absent-kobject
+        // `DriverMissing` that the blocked `/dev/mem` fallback still
+        // cannot clear, an `InsufficientPrivilege` / `ParseError` access
+        // failure — shape-only, never a panic.
+        match t.cpu.vendor {
+            CpuVendor::Intel(_) => assert!(
+                matches!(t.intel, Section::Value(_))
+                    || matches!(t.intel, Section::Na(NaReason::DriverMissing))
+                    || matches!(t.intel, Section::Na(NaReason::InsufficientPrivilege))
+                    || matches!(t.intel, Section::Na(NaReason::ParseError(_)))
+                    || matches!(t.intel, Section::Na(NaReason::UnsupportedHardware)),
+                "Intel host: the branch must be Value or a hardware-access Na, got {:?}",
+                t.intel
+            ),
+            _ => assert_eq!(
+                t.intel,
+                Section::Na(NaReason::UnsupportedHardware),
+                "non-Intel host: the Intel vendor gate must degrade the branch"
+            ),
+        }
 
         // spd: structurally a Vec<SpdModule> (possibly non-empty); each
         // carried module keeps a nonzero I2C index. Contents and count
@@ -1183,12 +1248,17 @@ mod tests {
         match platform::mem_total_gib() {
             // meminfo present → the OS ground truth wins over the sum
             // (the D-3 flip, pinned).
-            meminfo @ Section::Value(gib) => {
+            Section::Value(gib) => {
                 assert!(
                     gib.is_finite() && gib > 0.0,
                     "meminfo total must be positive: {gib}"
                 );
-                assert_eq!(total_capacity(&sizes), meminfo);
+                // `gib: f64` is `Copy`: reconstructing the section from
+                // the inner value is value-identical to binding the whole
+                // section — and it keeps the MSRV 1.75 test profile
+                // compiling (a by-value `@` binding of the non-`Copy`
+                // section plus a later use is E0382 there).
+                assert_eq!(total_capacity(&sizes), Section::Value(gib));
             }
             // meminfo absent → the total is exactly the SPD sum.
             Section::Na(_) => {
