@@ -132,6 +132,7 @@ use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
 use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::Section;
+use ramsleuth_telemetry::intel_readout::ChannelMode;
 use ramsleuth_telemetry::spd_decode::SpdModule;
 use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
 
@@ -815,9 +816,14 @@ fn dimm_summary(sizes: &[Section<f64>], spd: &[SpdModule], units: &Units) -> Str
     }
 }
 
-/// The channel mode from the DIMM count (D-C8): 1 / 2 / 4 →
-/// Single- / Dual- / Quad-Channel; any other count (0, odd) degrades
-/// to `N/A`.
+/// The channel mode from the SPD-visible DIMM count (D-C8): 1 / 2 /
+/// 4 → Single- / Dual- / Quad-Channel; any other count (0, odd)
+/// degrades to `N/A`.
+///
+/// This is the **fallback** label: on Intel the header prefers the
+/// hardware `MAD_INTER_CHANNEL` channel mode (an SPD count alone cannot
+/// tell a Flex-Mode box's `Dual-Channel (Flex)` from `Single-Channel`);
+/// AMD and the no-mode Intel states use this count-derived label.
 fn channel_mode(dimm_count: usize) -> String {
     match dimm_count {
         1 => "Single-Channel".to_owned(),
@@ -871,10 +877,11 @@ fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String> {
 /// × 1.073741824), the per-DIMM breakdown (C9-01, D-1: with the
 /// rank word from the parallel SPD list — `2x16 GiB Single-Rank`),
 /// the max SPD speed (omitted entirely when no module carries one),
-/// the channel mode, the total-vs-breakdown slot note when the OS
-/// total strictly exceeds the SPD sum (C9-01, D-1: `2 of 4 slots
-/// SPD-visible`), and the `Mode: ` lead-in the mode segment
-/// completes.
+/// the channel mode (hardware-preferred on Intel — the
+/// `MAD_INTER_CHANNEL` mode; the SPD-count [`channel_mode`] elsewhere),
+/// the total-vs-breakdown slot note when the OS total strictly exceeds
+/// the SPD sum (C9-01, D-1: `2 of 4 slots SPD-visible`), and the
+/// `Mode: ` lead-in the mode segment completes.
 fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
     let total = match t.total_capacity.value() {
         Some(gib) => format_capacity(*gib, units),
@@ -884,7 +891,16 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
     if let Some(mts) = t.spd.iter().filter_map(|m| m.speed_mts.value().copied()).max() {
         line.push_str(&format!(" {mts} MT/s"));
     }
-    line.push_str(&format!(" | {}", channel_mode(t.dimm_sizes.len())));
+    // Hardware-preferred channel label: the Intel `MAD_INTER_CHANNEL`
+    // mode (a Flex-Mode box can be Dual-Flex with one bound SPD), the
+    // SPD-count label elsewhere (AMD / no-mode Intel).
+    let channel = t
+        .intel
+        .value()
+        .and_then(|ro| ro.channel_mode)
+        .map(|m| m.label().to_owned())
+        .unwrap_or_else(|| channel_mode(t.dimm_sizes.len()));
+    line.push_str(&format!(" | {channel}"));
     if let Some(note) = slot_note(&t.total_capacity, &t.dimm_sizes) {
         line.push_str(&format!(" | {note}"));
     }
@@ -915,13 +931,31 @@ fn sync_mode_from_clocks(clocks: &ClockReadout, units: &Units) -> (String, Optio
 
 /// Line 3's mode segment over a whole snapshot: the AMD branch must
 /// carry a value whose `div_mode` is usable, else the honest `N/A` —
-/// the Intel / driver-missing / degraded states all degrade here
-/// (never a panic).
+/// the driver-missing / degraded AMD states degrade here (never a
+/// panic). The Intel hardware channel mode takes the slot over this
+/// ([`intel_mode`] runs first); on Intel this yields the `N/A`
+/// fallback only when no mode is present.
 fn sync_mode(t: &SystemMemoryTelemetry, units: &Units) -> (String, Option<egui::Color32>) {
     match t.amd.value() {
         Some(readout) => sync_mode_from_clocks(&readout.clocks, units),
         None => ("N/A".to_owned(), None),
     }
+}
+
+/// Line 3's mode segment over an Intel readout (the hardware-preferred
+/// `MAD_INTER_CHANNEL` channel mode): `DualSymmetric` → `Interleaved`
+/// (CYAN, the default), `DualFlex` → `Flex` (AMBER, the asymmetric
+/// configuration worth flagging), `Single` → `N/A` (the default color —
+/// a single channel has no interleave mode; the channel slot carries
+/// `Single-Channel`). A non-Intel / no-mode readout yields `None` and
+/// the caller falls back to the AMD sync mode (or the honest `N/A`).
+fn intel_mode(t: &SystemMemoryTelemetry) -> Option<(String, Option<egui::Color32>)> {
+    let mode = t.intel.value()?.channel_mode?;
+    Some(match mode {
+        ChannelMode::DualSymmetric => (mode.mode_label().to_owned(), Some(CYAN)),
+        ChannelMode::DualFlex => (mode.mode_label().to_owned(), Some(AMBER)),
+        ChannelMode::Single => (mode.mode_label().to_owned(), None),
+    })
 }
 
 impl RamSleuthApp {
@@ -962,7 +996,7 @@ impl RamSleuthApp {
         let (cpu_line, ram_prefix, ram_mode, ram_mode_color) = match &data.telemetry {
             Some(t) => {
                 let units = &data.settings.units;
-                let (mode, color) = sync_mode(t, units);
+                let (mode, color) = intel_mode(t).unwrap_or_else(|| sync_mode(t, units));
                 (cpu_line_text(t, units), ram_line_prefix(t, units), mode, color)
             }
             None => ("CPU: —".to_owned(), "RAM: —".to_owned(), String::new(), None),
@@ -1905,6 +1939,7 @@ mod tests {
     use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
+    use ramsleuth_telemetry::intel_readout::{ChannelMode, IntelReadout};
     use ramsleuth_telemetry::spd_decode::SpdModule;
     use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
 
@@ -2544,6 +2579,123 @@ mod tests {
         assert_eq!(channel_mode(4), "Quad-Channel");
         assert_eq!(channel_mode(0), "N/A");
         assert_eq!(channel_mode(3), "N/A");
+    }
+
+    /// (h5b) `intel_mode`: the hardware `MAD_INTER_CHANNEL` mode takes
+    /// the "Mode:" slot — DualSymmetric → `Interleaved` (CYAN),
+    /// DualFlex → `Flex` (AMBER), Single → `N/A` (the default color);
+    /// a non-Intel / no-mode readout → `None` (the caller falls back
+    /// to the AMD sync mode).
+    #[test]
+    fn intel_mode_matrix() {
+        // Helper: a telemetry with the given intel section (AMD Na).
+        fn intel_t(intel: Section<IntelReadout>) -> SystemMemoryTelemetry {
+            SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Intel(IntelGen::Skylake),
+                    brand: "synthetic".to_owned(),
+                },
+                amd: Section::na(NaReason::NotApplicable),
+                intel,
+                spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                    motherboard: Section::na(NaReason::NotApplicable),
+                    bios: Section::na(NaReason::NotApplicable),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::na(NaReason::NotApplicable),
+                dimm_sizes: vec![Section::Value(16.0)],
+            }
+        }
+        assert_eq!(
+            intel_mode(&intel_t(Section::Value(IntelReadout {
+                channels: Vec::new(),
+                channel_mode: Some(ChannelMode::DualSymmetric),
+            }))),
+            Some(("Interleaved".to_owned(), Some(CYAN)))
+        );
+        assert_eq!(
+            intel_mode(&intel_t(Section::Value(IntelReadout {
+                channels: Vec::new(),
+                channel_mode: Some(ChannelMode::DualFlex),
+            }))),
+            Some(("Flex".to_owned(), Some(AMBER)))
+        );
+        assert_eq!(
+            intel_mode(&intel_t(Section::Value(IntelReadout {
+                channels: Vec::new(),
+                channel_mode: Some(ChannelMode::Single),
+            }))),
+            Some(("N/A".to_owned(), None))
+        );
+        // No mode (the /dev/mem fallback / pre-24-attr module) → None.
+        assert_eq!(
+            intel_mode(&intel_t(Section::Value(IntelReadout {
+                channels: Vec::new(),
+                channel_mode: None,
+            }))),
+            None
+        );
+    }
+
+    /// (h5c) The header channel label is hardware-preferred: a Flex-Mode
+    /// box (one bound SPD, Dual-Flex) shows `Dual-Channel (Flex)` — not
+    /// the SPD-count `Single-Channel`; AMD / no-mode Intel keep the
+    /// SPD-count label.
+    #[test]
+    fn channel_label_hardware_preferred() {
+        // Helper: a telemetry with the given intel section + one bound
+        // 16 GiB DIMM (the Flex-Box shape the fix targets).
+        fn one_dimm(intel: Section<IntelReadout>) -> SystemMemoryTelemetry {
+            SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Intel(IntelGen::Skylake),
+                    brand: "synthetic".to_owned(),
+                },
+                amd: Section::na(NaReason::NotApplicable),
+                intel,
+                spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                    motherboard: Section::na(NaReason::NotApplicable),
+                    bios: Section::na(NaReason::NotApplicable),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::Value(16.0),
+                dimm_sizes: vec![Section::Value(16.0)],
+            }
+        }
+
+        // The Flex-Box: one bound DIMM, hardware Dual-Flex → the
+        // hardware label overrides the SPD-count "Single-Channel".
+        let flex = one_dimm(Section::Value(IntelReadout {
+            channels: Vec::new(),
+            channel_mode: Some(ChannelMode::DualFlex),
+        }));
+        assert_eq!(
+            ram_line_prefix(&flex, &Units::default()),
+            "RAM: 16 GiB (1x16 GiB) | Dual-Channel (Flex) | Mode: "
+        );
+
+        // No hardware mode (the /dev/mem fallback) → the SPD-count label.
+        let no_mode = one_dimm(Section::Value(IntelReadout {
+            channels: Vec::new(),
+            channel_mode: None,
+        }));
+        assert_eq!(
+            ram_line_prefix(&no_mode, &Units::default()),
+            "RAM: 16 GiB (1x16 GiB) | Single-Channel | Mode: "
+        );
+
+        // AMD (intel Na) → the SPD-count label, unchanged.
+        let amd = one_dimm(Section::na(NaReason::NotApplicable));
+        assert_eq!(
+            ram_line_prefix(&amd, &Units::default()),
+            "RAM: 16 GiB (1x16 GiB) | Single-Channel | Mode: "
+        );
     }
 
     /// (h6) `ram_line_prefix`: the spec's line 3 minus the mode —

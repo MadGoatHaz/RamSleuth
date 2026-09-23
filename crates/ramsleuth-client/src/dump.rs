@@ -315,10 +315,12 @@ fn amd_section(out: &mut String, section: &Section<AmdReadout>) {
     }
 }
 
-/// The `=== Intel ===` section: one `--- Channel n ---` block per decoded
-/// IMC channel (clocks + all 27 timings + CAD + voltages, then the
-/// channel-level RTL row group), or one `N/A (<reason>)` line when the
-/// branch degraded.
+/// The `=== Intel ===` section: a readout-level `channel mode` line (the
+/// hardware `MAD_INTER_CHANNEL` mode — `N/A` on the `/dev/mem` fallback
+/// where no mode is carried), then one `--- Channel n ---` block per
+/// decoded IMC channel (clocks + all 27 timings + CAD + voltages, then
+/// the channel-level RTL row group), or one `N/A (<reason>)` line when
+/// the branch degraded.
 fn intel_section(out: &mut String, section: &Section<IntelReadout>) {
     header(out, "Intel");
     match section {
@@ -327,6 +329,14 @@ fn intel_section(out: &mut String, section: &Section<IntelReadout>) {
             out.push('\n');
         }
         Section::Value(readout) => {
+            // The readout-level (global) channel mode from
+            // MAD_INTER_CHANNEL — an interleave property of the whole
+            // readout, not of any single channel.
+            let mode = readout
+                .channel_mode
+                .map(|m| m.label().to_owned())
+                .unwrap_or_else(|| "N/A".to_owned());
+            rows(out, "  ", &[("channel mode", mode)]);
             if readout.channels.is_empty() {
                 out.push_str("  (no channels decoded)\n\n");
                 return;
@@ -476,7 +486,7 @@ mod tests {
     use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message};
     use ramsleuth_telemetry::amd_readout::CommandRate;
     use ramsleuth_telemetry::cpuid::{AmdZen, IntelGen};
-    use ramsleuth_telemetry::intel_readout::decode_channel;
+    use ramsleuth_telemetry::intel_readout::{ChannelMode, decode_channel};
     use ramsleuth_telemetry::SystemPlatform;
 
     use super::*;
@@ -563,6 +573,7 @@ mod tests {
                 decode_channel(0, Some(160), [Some(cmd0), Some(cmd1), Some(cmd2), Some(cmd3)]),
                 decode_channel(1, None, [None, None, None, None]),
             ],
+            channel_mode: Some(ChannelMode::DualFlex),
         }
     }
 
@@ -761,6 +772,9 @@ mod tests {
         let text = render(&intel_populated());
 
         assert!(text.contains("Intel AlderLake"));
+        // The readout-level channel mode from MAD_INTER_CHANNEL (the
+        // fixture is Dual-Flex) leads the section.
+        assert!(text.contains("channel mode  Dual-Channel (Flex)"));
         assert!(text.contains("--- Channel 0 ---"));
         assert!(text.contains("--- Channel 1 ---"));
         // channel 0: decoded clocks (ratio 160 → 1600 MHz) + RTL ticks

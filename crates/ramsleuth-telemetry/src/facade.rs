@@ -267,7 +267,7 @@ fn intel_branch(cpu: &CpuInfo) -> TelemetryResult<IntelReadout> {
     // 4. Primary: the `ramsleuth_intel` sysfs kobject (plan §3.5).
     match intel_sysfs::acquire() {
         // The raw set feeds the same pure decode core as the fallback.
-        Ok(sysfs) => Ok(intel_readout::decode(&sysfs.regs, gen)),
+        Ok(sysfs) => Ok(intel_readout::decode(&sysfs.regs, gen, sysfs.mad_inter_channel)),
         // The frozen fallthrough rule: the `/dev/mem` fallback is taken
         // ONLY on `DriverMissing` (kobject absent — module not loaded).
         // Any other sysfs outcome is reported as-is.
