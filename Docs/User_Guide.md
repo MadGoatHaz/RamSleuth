@@ -39,6 +39,7 @@ policy, version-bump process, CI) see `packaging/README.md`.
 8. [Reading the data](#8-reading-the-data)
 9. [N/A — what the structured reasons mean](#9-na--what-the-structured-reasons-mean)
 10. [AMD live subtimings: the `ryzen_smu` requirement](#10-amd-live-subtimings-the-ryzen_smu-requirement)
+10.5. [Intel live subtimings: the `ramsleuth_intel` module (optional)](#105-intel-live-subtimings-the-ramsleuth_intel-module-optional)
 11. [Day-2 operations & troubleshooting](#11-day-2-operations--troubleshooting)
 12. [Uninstall](#12-uninstall)
 
@@ -166,10 +167,15 @@ What makes it worth using:
 - **AMD host?** After the install it asks one more question: *Install the
   `ryzen_smu` DKMS module now? [y/N]* — the optional kernel module that
   unlocks live AMD subtimings. The default is `N`; on `y` it hands off to the
-  pinned helper. On Intel hosts it prints a note that the built-in MCHBAR
-  decode needs no extra driver. You can always run
-  `sudo ramsleuth-install-ryzen-smu-dkms` later (or install the
+  pinned helper. You can always run `sudo ramsleuth-install-ryzen-smu-dkms`
+  later (or install the
   [ryzen-smu-dkms extra](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings)).
+  **Intel host?** It prints an optional next-step note: the built-in `/dev/mem`
+  MCHBAR decode already gives live Intel subtimings on a supported (Tier-1)
+  generation, and the `ramsleuth_intel` DKMS module is the preferred source
+  for them — `sudo ramsleuth-install-intel-dkms`, or one-click
+  `sudo ramsleuth-setup --with-dkms` (which routes by CPU vendor; Section
+  10.5).
 
 Prerequisites and exit codes:
 
@@ -951,8 +957,8 @@ listing and `ramsleuth-telemetry` show a human-readable phrase
 
 | Reason (as shown) | What it means | What to do |
 |---|---|---|
-| **`DriverMissing`** — *driver missing* | A required kernel driver is not loaded. On **AMD** this is the `ryzen_smu` module absent, so the live AMD subtimings cannot be read. On **Intel** it means the host-bridge PCI config device or `/dev/mem` is absent. | **AMD:** install the driver — `sudo ramsleuth-setup --with-dkms`, `sudo ramsleuth-install-ryzen-smu-dkms`, or the `ryzen-smu-dkms` AUR extra + `sudo ryzen-smu-dkms-install` (Section 10). **Intel:** check that `/dev/mem` exists and your kernel config exposes it. Everything else in RamSleuth works without it. |
-| **`UnsupportedHardware`** — *unsupported hardware* | The detected hardware is not supported by this telemetry source. The canonical case: a **virtualized Intel host** whose MCHBAR (BAR5) decodes to `0` — there is no physical memory controller to read. | Nothing — this is the expected, honest outcome in that environment (VMs, or silicon outside the supported set). The other sections of the snapshot remain fully live. |
+| **`DriverMissing`** — *driver missing* | A required kernel driver is not loaded. On **AMD** this is the `ryzen_smu` module absent, so the live AMD subtimings cannot be read. On **Intel** it means the `ramsleuth_intel` module is absent **and** the `/dev/mem` fallback is unavailable — neither `/dev/mem` nor `/dev/fmem` exists (or the host-bridge PCI config device is absent, so MCHBAR cannot even be decoded). | **AMD:** install the driver — `sudo ramsleuth-setup --with-dkms`, `sudo ramsleuth-install-ryzen-smu-dkms`, or the `ryzen-smu-dkms` AUR extra + `sudo ryzen-smu-dkms-install` (Section 10). **Intel:** install the module — `sudo ramsleuth-install-intel-dkms`, the vendor-aware `sudo ramsleuth-setup --with-dkms` (or the Intel-only fast path `sudo ramsleuth-setup --with-intel-dkms`), or the `ramsleuth-intel-dkms` AUR extra + `sudo ramsleuth-intel-dkms-install` (Section 10.5). Everything else in RamSleuth works without it. |
+| **`UnsupportedHardware`** — *unsupported hardware* | The detected hardware is not supported by this telemetry source. On Intel there are two canonical cases: a **virtualized** host whose MCHBAR (BAR5) is unpopulated (`0` — there is no physical memory controller in the VM), and a **non-Tier-1** Intel generation — v1 decodes Skylake through Comet Lake only, and any other generation degrades the whole Intel section before a register is read. A **physical** Intel system of a supported generation works (Section 10.5); non-Intel silicon is rejected by the other branch the same way. | Nothing — this is the expected, honest outcome in that environment (VMs, or silicon outside the supported set). The other sections of the snapshot remain fully live. |
 | **`InsufficientPrivilege`** — *insufficient privilege* | The operation needs more privilege than the caller has (e.g. a `/dev/mem` open/map permission denial, or a `STRICT_DEVMEM` range rejection). | Run the read through the **daemon** (it holds the one capability this needs) — i.e. use the GUI/TUI/`ramsleuth-client` against a running `ramsleuth.service` rather than a bare unprivileged read. |
 | **`UnknownPmTableVersion`** — *unknown PM table version* | The AMD SMU PM-table version the firmware reports is outside the layout set RamSleuth knows how to parse. | Update the **AGESA/firmware** (the table versions move with the SMU firmware) or the `ryzen_smu` driver, and retry. If it persists, it is a genuine "newer firmware than supported" case — report the version word upstream. |
 | **`NotApplicable`** — *not applicable* | This field does not apply to the detected platform by design — e.g. Intel does not expose the CAD bus or voltage rails through MCHBAR, AMD does not report gear mode, Intel voltages are out of the readout's scope. | Nothing — it is a *correct* blank, not a failure. |
@@ -1017,6 +1023,69 @@ stays sandboxed and the driver stays an explicit, audited opt-in.
 
 ---
 
+## 10.5 Intel live subtimings: the `ramsleuth_intel` module (optional)
+
+The Intel side mirrors the AMD side, with one important difference: **a
+physical Intel system needs no driver to work.** The built-in fallback reads
+the host-bridge MCHBAR window directly through `/dev/mem`, so a supported
+(Tier-1) Intel generation — Skylake, Kaby Lake, Coffee Lake, Comet Lake
+— gets live per-channel IMC subtimings out of the box, provided the kernel
+exposes `/dev/mem` unblocked (no `STRICT_DEVMEM`, no integrity lockdown).
+
+The optional **`ramsleuth_intel`** DKMS module is the **preferred** source:
+it maps the same MCHBAR window in-kernel and publishes the raw registers as
+world-readable sysfs attributes under `/sys/kernel/ramsleuth_intel/`
+(19 read-only attributes — see `kernel/ramsleuth-intel/README.md`). The
+daemon uses it whenever it is loaded (the sysfs path needs no `/dev/mem` at
+all) and falls back to `/dev/mem` **only** when the module is absent —
+never the other way round: with the module loaded, a `/dev/mem` fault is
+reported as a real fault instead of being masked by a silent source switch.
+
+Three ways to get it (all build the **same in-repo** source,
+`kernel/ramsleuth-intel/`, vendored with the package — no network, unlike
+the AMD extra’s pinned clone):
+
+1. **One-click, vendor-aware** — `sudo ramsleuth-setup --with-dkms` routes
+   by CPU vendor: on an Intel host it hands off to the Intel helper (on AMD,
+   to the AMD arm); `sudo ramsleuth-setup --with-intel-dkms` is the
+   Intel-only fast path (a hard failure on non-Intel silicon). The GUI’s
+   SETUP strip offers the same one-click.
+2. **The built-in helper** — every ramsleuth install ships
+   **`sudo ramsleuth-install-intel-dkms`** (at
+   `/usr/bin/ramsleuth-install-intel-dkms`): it verifies the matching kernel
+   headers, resolves the source from the in-repo tree
+   (`kernel/ramsleuth-intel/` in a dev checkout, the installed
+   `/usr/share/ramsleuth-intel-dkms/src/` copy from the AUR extra in a
+   package install), then `dkms add/build/install` + `modprobe` —
+   **immediate, no reboot** — and persists the module for boot.
+3. **The AUR extra** — `yay -S ramsleuth-intel-dkms && sudo
+   ramsleuth-intel-dkms-install`: the same helper, plus the module source
+   shipped verbatim with the package, so the build is fully network-free.
+   `AUTOINSTALL=yes` in the bundled `dkms.conf` rebuilds the module on
+   kernel updates automatically.
+
+Verify it is working:
+
+```sh
+ls /sys/kernel/ramsleuth_intel/mchbar_enabled   # 1 = the kobject is live
+systemctl status ramsleuth                       # daemon healthy
+ramsleuth-client status                          # Intel: ok
+```
+
+No daemon restart is needed — it re-reads on every telemetry pass, so the
+Intel section fills in on the next poll once the kobject appears (the
+`/dev/mem` fallback keeps working meanwhile). Two operational notes: the
+module is **Intel-only by design** (on an AMD host it loads, stays idle, and
+no kobject appears — the helper exits 0 with a note), and, like the
+`ryzen_smu` extra, it carries the **Secure Boot / lockdown limitation** —
+on a UEFI Secure Boot (integrity-lockdown) host the kernel blocks both
+`/dev/mem` *and* unsigned out-of-tree modules, so the only way to load it
+there is to MOK-enroll `ramsleuth_intel.ko` first
+(`mokutil --import ramsleuth_intel.ko`). When it cannot be loaded, the Intel
+section reads `N/A (DriverMissing)`, exit 0, no panic.
+
+---
+
 ## 11. Day-2 operations & troubleshooting
 
 ### 11.1 The daemon is down
@@ -1077,14 +1146,17 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   re-apply the group/ACL grants for the invoking user when run under `sudo`.
 - **install.sh:** `git pull && ./install.sh` — idempotent, same file set,
   the daemon is reloaded at the end.
-- The `ryzen_smu` module needs no manual action on kernel updates
-  (`AUTOINSTALL=yes` rebuilds it).
+- The `ryzen_smu` and `ramsleuth_intel` modules need no manual action on
+  kernel updates (`AUTOINSTALL=yes` rebuilds each).
 
 ### 11.5 A few honest limitations
 
-- **Virtualized Intel** (and similar non-physical environments) read
-  `N/A (unsupported hardware)` for the Intel section by design — the
-  MCHBAR register does not exist in the VM (Section 9).
+- **Intel now works on physical systems** — the `/dev/mem` MCHBAR fallback
+  runs out of the box, and the `ramsleuth_intel` module is the preferred
+  source (Section 10.5). The two honest `N/A (unsupported hardware)` cases
+  that remain (Section 9): **virtualized** Intel, where the MCHBAR window is
+  unpopulated (there is no physical memory controller in the VM), and
+  **non-Tier-1 generations** (v1 decodes Skylake through Comet Lake only).
 - **Intel voltages & CAD** are `N/A (not applicable)` by design — the
   MCHBAR window does not expose them the way the AMD SMU does.
 - **SPD sees only bound modules**: if the OS total exceeds the SPD-visible
