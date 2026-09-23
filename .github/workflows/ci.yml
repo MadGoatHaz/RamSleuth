@@ -73,3 +73,25 @@ jobs:
             target/release/ramsleuth
             target/release/ramsleuth-bench
             target/release/ramsleuth-telemetry
+
+  kernel-module:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kernel build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential linux-headers-generic
+
+      - name: Build ramsleuth_intel (fail on any warning)
+        run: |
+          set -euo pipefail
+          KVER=$(ls -d /lib/modules/*-generic | sort -V | tail -1 | xargs -n1 basename)
+          echo "Building ramsleuth_intel against kernel ${KVER}"
+          cd kernel/ramsleuth-intel
+          make KVER="${KVER}" 2>&1 | tee build.log
+          test -f ramsleuth_intel.ko
+          echo "Checking for compiler warnings in build.log..."
+          test -z "$(grep -E 'warning:' build.log)"
+          echo "OK: ramsleuth_intel.ko built with zero compiler warnings"
