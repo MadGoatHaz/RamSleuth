@@ -1226,8 +1226,9 @@ at `0x4000`, channel 1 at `0x4400`, stride `0x400`):
 The timing unit is **integer DRAM clock cycles** (1 cycle = 2 UI). This
 replaces the pre-v2.2.1 skeleton table, which mis-located the frequency
 word; the layout is hardware-verified and pinned in CI by the Skylake
-DDR4-2400 acceptance fixture (raw `mcbios_req = 0x00000012` → 18 ×
-133.3333 / 2 = **1200 MHz** core clock; `tc_dbp = 0x11110F11` →
+DDR4-2400 acceptance fixture (raw `mcbios_req = 0x00000009` → 9 ×
+133.3333 = **1200 MHz** MCLK → 2400 MT/s; alt. raw `0x0000010C` =
+ratio 12 @ 100 MHz; `tc_dbp = 0x11110F11` →
 17-15-17-17; `tc_rap = 0x27180204` → tRRD_S 4 / tRTP 8 / tFAW 24 / tRAS 39;
 `tc_rfp = 0x000001A4` → tRFC 420; synthesized tRC = 39 + 17 = 56; channel 1
 symmetric).
@@ -1235,8 +1236,9 @@ symmetric).
 **The decode (one pure core for both sources).** The 17 raw slots
 (`IntelImcRegs` — 1 global + 2×8 per-channel) feed `intel_readout::decode`:
 
-- `mclk_mhz` ← `MC_BIOS_REQ`: `ratio × refclk / 2`, sanity-gated to
-  [1, 4096] MHz; a ratio of 0 = unconfigured → `Na(ParseError)`;
+- `mclk_mhz` ← `MC_BIOS_REQ`: `ratio × refclk` (no ÷2; MT/s = 2 × MCLK),
+  sanity-gated to [1, 4096] MHz; a ratio of 0 = unconfigured →
+  `Na(ParseError)`;
 - **24 of the 27 AMD subtiming slots populated** — `cl`, `cwl`, the
   *unified symmetric* `tRCD` feeding both `rcdrd` and `rcwdwr`, `rp`, `ras`,
   **`rc` synthesized as `tRAS + tRP`** (Intel exposes no tRC register — the
