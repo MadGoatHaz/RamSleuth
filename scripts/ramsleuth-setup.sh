@@ -20,25 +20,40 @@
 #      daemon re-applies as socket ACLs on every (re)start (C21-03).
 #   4. Best-effort `setfacl -m u:<user>:rw` on the LIVE socket — immediate
 #      current-session access, no re-login (warn-only if acl is absent).
-#   5. `--with-dkms`: `exec` the installed ramsleuth-install-ryzen-smu-dkms
-#      helper (the offline AMD driver; its exit code is returned).
+#   5. DKMS delegation (vendor-aware, INTEL-08): `--with-dkms` routes by the
+#      CPU vendor (the /proc/cpuinfo `vendor_id`) — AMD: `exec` the installed
+#      ramsleuth-install-ryzen-smu-dkms helper (the offline AMD driver; its
+#      exit code is returned; unchanged behavior); Intel: `exec`
+#      ramsleuth-install-intel-dkms (the INTEL-06 ramsleuth_intel helper).
+#      `--with-intel-dkms` forces the Intel arm (Intel-only fast path).
+#      Other/unknown vendor: a clear error, no DKMS install.
 #
-# Usage:  ramsleuth-setup [--with-dkms] [--user <name>]
+# Usage:  ramsleuth-setup [--with-dkms] [--with-intel-dkms] [--user <name>]
 #
 #   --user <name>  user to authorize. Default: $SUDO_USER (the sudo path).
 #                  Under pkexec $SUDO_USER is unset, so the caller must pass
 #                  it explicitly (the GUI does: setup_argv, C21-04). An
 #                  unknown/nonexistent user is a usage error (exit 2).
-#   --with-dkms    also build + load the pinned ryzen_smu AMD module by
-#                  delegating to /usr/bin/ramsleuth-install-ryzen-smu-dkms
-#                  (never duplicated here).
+#   --with-dkms    also build + load the pinned vendor DKMS module,
+#                  auto-routed by the CPU vendor (AMD →
+#                  /usr/bin/ramsleuth-install-ryzen-smu-dkms; Intel →
+#                  /usr/bin/ramsleuth-install-intel-dkms; other/unknown → a
+#                  clear error, no install). Never duplicated here.
+#   --with-intel-dkms
+#                  force the Intel arm: build + load the ramsleuth_intel
+#                  module via /usr/bin/ramsleuth-install-intel-dkms
+#                  (Intel-only fast path; a hard failure on non-Intel
+#                  silicon).
 #
 # Exit codes:  0 = success (steps done, or idempotently skipped)
 #              1 = hard failure (structured message on stderr)
 #              2 = usage error (unknown flag / missing value / unknown user)
 #
 # FROZEN CONTRACT (C21-03/04/16 code against this — do not change):
-#   CLI:  ramsleuth-setup [--with-dkms] [--user <name>]   (any order)
+#   CLI:  ramsleuth-setup [--with-dkms] [--with-intel-dkms] [--user <name>]
+#         (any order; pre-INTEL-08 invocations keep their exact semantics —
+#         --with-dkms on AMD behaves byte-identically to before;
+#         --with-intel-dkms is an additive fast path)
 #   Exit: 0 success | 1 hard failure | 2 usage, as above.
 #   State file: /etc/ramsleuth/authorized-users — dir 0755, file 0644, one
 #   username per line (LF, no comments, no duplicates, order-insensitive).
@@ -51,20 +66,36 @@ STATE_DIR="/etc/ramsleuth"
 STATE_FILE="${STATE_DIR}/authorized-users"
 SOCKET="/run/ramsleuth/ramsleuth.sock"
 DKMS_HELPER="/usr/bin/ramsleuth-install-ryzen-smu-dkms"
+INTEL_DKMS_HELPER="/usr/bin/ramsleuth-install-intel-dkms"
 
 log() { printf '[ramsleuth-setup] %s\n' "$*"; }
 die() { local code="${2:-1}"; printf '[ramsleuth-setup] ERROR: %s\n' "$1" >&2; exit "${code}"; }
+
+# --- CPU vendor detection (the /proc/cpuinfo `vendor_id` line) ----------------
+# Prints GenuineIntel / AuthenticAMD / the raw vendor string, or nothing when
+# undetectable (no /proc/cpuinfo). INTEL-08: the key for the vendor-aware
+# DKMS routing.
+detect_cpu_vendor() {
+  [[ -r /proc/cpuinfo ]] || return 0
+  awk -F': *' '/^vendor_id/ { print $2; exit }' /proc/cpuinfo 2>/dev/null || true
+}
 
 usage() {
   cat <<'EOF'
 ramsleuth-setup — one-click privileged RamSleuth setup (root via pkexec/sudo)
 
-Usage: ramsleuth-setup [--with-dkms] [--user <name>]
+Usage: ramsleuth-setup [--with-dkms] [--with-intel-dkms] [--user <name>]
 
   --user <name>  user to authorize (default: $SUDO_USER; under pkexec the
                  caller must pass it explicitly). Must be an existing user.
-  --with-dkms    additionally build + load the pinned ryzen_smu AMD module
-                 (delegates to /usr/bin/ramsleuth-install-ryzen-smu-dkms).
+  --with-dkms    additionally build + load the pinned vendor DKMS module,
+                 auto-routed by the CPU vendor: AMD → ryzen_smu via
+                 /usr/bin/ramsleuth-install-ryzen-smu-dkms; Intel →
+                 ramsleuth_intel via /usr/bin/ramsleuth-install-intel-dkms
+                 (other/unknown vendor: a clear error, no install).
+  --with-intel-dkms
+                 force the Intel DKMS arm (Intel-only fast path; a hard
+                 failure on non-Intel silicon).
   -h, --help     show this help and exit.
 
 Exit codes: 0 = success (or idempotent no-op) | 1 = hard failure | 2 = usage
@@ -73,10 +104,12 @@ EOF
 
 # --- Argument parsing (the frozen CLI) ----------------------------------------
 WITH_DKMS=0
+WITH_INTEL_DKMS=0
 USER_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --with-dkms) WITH_DKMS=1 ;;
+    --with-intel-dkms) WITH_INTEL_DKMS=1 ;;
     --user)
       [[ $# -ge 2 ]] || die "--user requires a value (see --help)" 2
       USER_OVERRIDE="$2"
@@ -152,21 +185,57 @@ else
   log "WARN: setfacl on $SOCKET failed — the daemon re-applies the ACL on its next socket creation"
 fi
 
-# --- Summary + the optional DKMS delegation ------------------------------------
+# --- Summary + the optional DKMS delegation (vendor-aware: INTEL-08) ----------
 log "done: daemon running; $USER_NAME in group '$GROUP' + authorized for immediate access"
-if [[ "$WITH_DKMS" -ne 1 ]]; then
+if [[ "$WITH_DKMS" -ne 1 && "$WITH_INTEL_DKMS" -ne 1 ]]; then
   exit 0
 fi
-HELPER="$DKMS_HELPER"
-if [[ ! -x "$HELPER" ]]; then
-  HELPER="$(command -v ramsleuth-install-ryzen-smu-dkms 2>/dev/null || true)"
+
+# Intel arm: delegate to the ramsleuth_intel DKMS helper (INTEL-06), resolving
+# it with the same three-tier chain as the AMD arm (installed path → PATH →
+# dev checkout). The helper is never duplicated here.
+run_intel_dkms() {
+  local HELPER CANDIDATE
+  HELPER="$INTEL_DKMS_HELPER"
+  if [[ ! -x "$HELPER" ]]; then
+    HELPER="$(command -v ramsleuth-install-intel-dkms 2>/dev/null || true)"
+  fi
+  if [[ -z "$HELPER" ]]; then
+    # Dev-checkout fallback (this script lives in <repo>/scripts; uninstalled).
+    CANDIDATE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/install-intel-dkms.sh"
+    if [[ -x "$CANDIDATE" ]]; then HELPER="$CANDIDATE"; fi
+  fi
+  [[ -n "$HELPER" && -x "$HELPER" ]] \
+    || die "Intel: helper ramsleuth-install-intel-dkms not found ($INTEL_DKMS_HELPER) — install RamSleuth first" 1
+  log "Intel: delegating the ramsleuth_intel DKMS build to: $HELPER"
+  exec "$HELPER"
+}
+
+CPU_VENDOR="$(detect_cpu_vendor)"
+if [[ "$WITH_INTEL_DKMS" -eq 1 && "$CPU_VENDOR" != "GenuineIntel" ]]; then
+  die "--with-intel-dkms is an Intel-only fast path: this host's CPU vendor is '${CPU_VENDOR:-undetectable}', not GenuineIntel" 1
 fi
-if [[ -z "$HELPER" ]]; then
-  # Dev-checkout fallback (this script lives in <repo>/scripts; uninstalled).
-  CANDIDATE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/install-ryzen-smu-dkms.sh"
-  if [[ -x "$CANDIDATE" ]]; then HELPER="$CANDIDATE"; fi
-fi
-[[ -n "$HELPER" && -x "$HELPER" ]] \
-  || die "AMD: helper ramsleuth-install-ryzen-smu-dkms not found ($DKMS_HELPER) — install RamSleuth first" 1
-log "AMD: delegating the ryzen_smu DKMS build to: $HELPER"
-exec "$HELPER"
+
+case "$CPU_VENDOR" in
+  GenuineIntel)
+    run_intel_dkms
+    ;;
+  AuthenticAMD)
+    HELPER="$DKMS_HELPER"
+    if [[ ! -x "$HELPER" ]]; then
+      HELPER="$(command -v ramsleuth-install-ryzen-smu-dkms 2>/dev/null || true)"
+    fi
+    if [[ -z "$HELPER" ]]; then
+      # Dev-checkout fallback (this script lives in <repo>/scripts; uninstalled).
+      CANDIDATE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/install-ryzen-smu-dkms.sh"
+      if [[ -x "$CANDIDATE" ]]; then HELPER="$CANDIDATE"; fi
+    fi
+    [[ -n "$HELPER" && -x "$HELPER" ]] \
+      || die "AMD: helper ramsleuth-install-ryzen-smu-dkms not found ($DKMS_HELPER) — install RamSleuth first" 1
+    log "AMD: delegating the ryzen_smu DKMS build to: $HELPER"
+    exec "$HELPER"
+    ;;
+  *)
+    die "no RamSleuth DKMS module applies to CPU vendor '${CPU_VENDOR:-undetectable}' (AMD/Intel only) — re-run without the DKMS flag" 1
+    ;;
+esac
