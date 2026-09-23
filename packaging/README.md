@@ -1,6 +1,6 @@
 # RamSleuth v2 — Packaging
 
-Operator/end-user guide for installing and running RamSleuth v2: the two AUR packages (`ramsleuth` stable source, `ramsleuth-bin` precompiled), **one-click setup** (no re-login, no reboot), the `ramsleuth` group, the sandboxed systemd unit, the optional **offline** `ryzen_smu` DKMS extra, the unified version bump, and CI.
+Operator/end-user guide for installing and running RamSleuth v2: the two AUR packages (`ramsleuth` stable source, `ramsleuth-bin` precompiled), **one-click setup** (no re-login, no reboot), the `ramsleuth` group, the sandboxed systemd unit, the two optional DKMS extras — the **offline** `ryzen_smu` (AMD) and the in-repo `ramsleuth_intel` (Intel) — the unified version bump, and CI.
 
 ## Overview
 
@@ -22,19 +22,22 @@ The AUR packages (or `makepkg -si` from `packaging/ramsleuth/` or `packaging/ram
 | The systemd preset (`00 enable ramsleuth.service`) | `/usr/lib/systemd/system-preset/ramsleuth.preset` |
 | The `ramsleuth` system group | created on the target by the `.install` `pre_install`/`pre_upgrade` hooks (idempotent `groupadd -r`) |
 | The ramsleuth-owned copy of the pinned `ryzen_smu` DKMS helper (`scripts/install-ryzen-smu-dkms.sh`) | `/usr/bin/ramsleuth-install-ryzen-smu-dkms` |
+| The ramsleuth-owned copy of the in-repo `ramsleuth_intel` DKMS helper (`scripts/install-intel-dkms.sh`) | `/usr/bin/ramsleuth-install-intel-dkms` (guarded — the helper is not in the current v2.2.1 source tag or release tarball, so today's builds of both packages skip it cleanly; it lands with the v2.3.0 re-cut) |
 | The one-click setup helper (`scripts/ramsleuth-setup.sh` — the pkexec-able root helper) | `/usr/bin/ramsleuth-setup` |
 | The shared polkit policy (`packaging/polkit/90-ramsleuth-setup.policy` — the `org.freedesktop.ramsleuth.setup` action) | `/usr/share/polkit-1/actions/90-ramsleuth-setup.policy` |
 | The self-contained installer (`install.sh` — the transparency artifact, re-runnable/auditable post-install) | `/usr/share/ramsleuth/install.sh` |
 
-`ramsleuth-protocol` is a library-only crate and is never installed. Both packages install the two one-click artifacts (the helper + polkit policy): `ramsleuth` builds them from source, and `ramsleuth-bin` takes them from the release tarball (which has carried them since the v2.2.0 re-cut).
+`ramsleuth-protocol` is a library-only crate and is never installed. Both packages install the two one-click artifacts (the helper + polkit policy): `ramsleuth` builds them from source, and `ramsleuth-bin` takes them from the release tarball (which has carried them since the v2.2.0 re-cut). Both also install the ramsleuth-owned copies of the two DKMS helpers (the `/usr/bin/ramsleuth-install-ryzen-smu-dkms` / `/usr/bin/ramsleuth-install-intel-dkms` pair — see the name table in the AMD extra section below); the Intel helper is guarded in both, since the current v2.2.1 tag and tarball predate it (it lands with the v2.3.0 re-cut).
 
 ## Installation
 
-### AUR — the two-package model
+### AUR — two ramsleuth packages + two optional DKMS extras
 
 ```sh
-yay -S ramsleuth      # STABLE source — builds from the official git tag v$pkgver
-yay -S ramsleuth-bin  # PRECOMPILED — the binary from the GitHub Release (fastest install, no build)
+yay -S ramsleuth            # STABLE source — builds from the official git tag v$pkgver
+yay -S ramsleuth-bin        # PRECOMPILED — the binary from the GitHub Release (fastest install, no build)
+yay -S ryzen-smu-dkms       # OPTIONAL (AMD) — the pinned ryzen_smu DKMS module (live AMD subtimings)
+yay -S ramsleuth-intel-dkms # OPTIONAL (Intel) — the in-repo ramsleuth_intel DKMS module (live Intel subtimings)
 ```
 
 (or `paru -S ...` in place of `yay`.)
@@ -42,11 +45,13 @@ yay -S ramsleuth-bin  # PRECOMPILED — the binary from the GitHub Release (fast
 - **`ramsleuth`** — the stable source package: builds the workspace from the official `v$pkgver` git tag (a reproducible, auditable snapshot). The default recommendation for production installs.
 - **`ramsleuth-bin`** — the precompiled package: downloads the release binary tarball (`ramsleuth-$pkgver-x86_64.tar.zst`) from the official GitHub Release and installs it as-is — no build, no makedepends. The fastest install path.
 
-**Mutual conflict:** `ramsleuth` and `ramsleuth-bin` install the identical file set, so each declares the other in `conflicts=` — the user picks exactly one. (The optional `ryzen-smu-dkms` extra stays co-install-safe with both — see below.)
+- **The two vendor extras** — **`ryzen-smu-dkms`** (AMD) and **`ramsleuth-intel-dkms`** (Intel): optional, thin provisioning packages that build the matching DKMS module **on the target** (never in the build chroot) and install their own copy of the operator helper under a distinct name, so each stays **co-install-safe** with both ramsleuth packages (no pacman file conflict). Install the one that matches your silicon — the full name table lives in the AMD extra section below.
 
-**Package pages:** [ramsleuth](https://aur.archlinux.org/packages/ramsleuth) · [ramsleuth-bin](https://aur.archlinux.org/packages/ramsleuth-bin).
+**Mutual conflict:** `ramsleuth` and `ramsleuth-bin` install the identical file set, so each declares the other in `conflicts=` — the user picks exactly one. (The two optional DKMS extras — `ryzen-smu-dkms` and `ramsleuth-intel-dkms` — stay co-install-safe with both, each shipping its helper under a distinct name — see below.)
 
-**Zero-touch on a sudo-invoked install:** both packages' `post_install` hooks, when run under `sudo`, additionally grant the invoking user group membership (persistent; effective at the next login) + seed `/etc/ramsleuth/authorized-users` (current-session socket access), then restart the daemon so the ACL applies immediately — every step guarded and never fatal. The hook then prints the next steps: start the GUI with `ramsleuth` (the TUI with `ramsleuth-tui`), one-click setup (the GUI's "Set up RamSleuth" button, or `sudo ramsleuth-setup` — see below), and on AMD hosts the optional `sudo ramsleuth-install-ryzen-smu-dkms` (the AUR-extra alternative is `yay -S ryzen-smu-dkms`), while Intel hosts get the note that the built-in MCHBAR decode needs no extra driver.
+**Package pages:** [ramsleuth](https://aur.archlinux.org/packages/ramsleuth) · [ramsleuth-bin](https://aur.archlinux.org/packages/ramsleuth-bin) · [ryzen-smu-dkms](https://aur.archlinux.org/packages/ryzen-smu-dkms) · [ramsleuth-intel-dkms](https://aur.archlinux.org/packages/ramsleuth-intel-dkms).
+
+**Zero-touch on a sudo-invoked install:** both packages' `post_install` hooks, when run under `sudo`, additionally grant the invoking user group membership (persistent; effective at the next login) + seed `/etc/ramsleuth/authorized-users` (current-session socket access), then restart the daemon so the ACL applies immediately — every step guarded and never fatal. The hook then prints the next steps: start the GUI with `ramsleuth` (the TUI with `ramsleuth-tui`), one-click setup (the GUI's "Set up RamSleuth" button, or `sudo ramsleuth-setup` — see below), and on AMD hosts the optional `sudo ramsleuth-install-ryzen-smu-dkms` (the AUR-extra alternative is `yay -S ryzen-smu-dkms`), while Intel hosts get the optional `sudo ramsleuth-install-intel-dkms` for live Intel subtimings via the DKMS module (the built-in `/dev/mem` path remains the fallback; the AUR-extra alternative is `yay -S ramsleuth-intel-dkms`).
 
 ### Manual (from a source checkout)
 
@@ -55,18 +60,21 @@ cd packaging/ramsleuth   # or: packaging/ramsleuth-bin
 makepkg -si
 ```
 
-Build deps (the source package `ramsleuth`; `ramsleuth-bin` compiles nothing): `rust`, `cargo`, `pkgconf`, plus the X11/Wayland/GL library set in the PKGBUILD (`libxkbcommon` is the only strict build-time link dep). `./install.sh` from a fresh checkout does the same thing self-contained. The `post_install` hook runs `systemctl enable --now ramsleuth.service` — the daemon is started and enabled automatically, and the preset keeps it enabled on future `systemctl preset` runs. It performs the same zero-touch grant as the AUR path (group + ACL seed + daemon restart, guarded), and prints the next steps: start the GUI with `ramsleuth` (the TUI with `ramsleuth-tui`), one-click setup (the GUI's "Set up RamSleuth" button, or `sudo ramsleuth-setup` — see below), and on AMD hosts the optional `sudo ramsleuth-install-ryzen-smu-dkms` (offline vendored build, verified before any build; the AUR-extra alternative is `yay -S ryzen-smu-dkms`), while Intel hosts get the note that the built-in MCHBAR decode needs no extra driver.
+Build deps (the source package `ramsleuth`; `ramsleuth-bin` compiles nothing): `rust`, `cargo`, `pkgconf`, plus the X11/Wayland/GL library set in the PKGBUILD (`libxkbcommon` is the only strict build-time link dep). `./install.sh` from a fresh checkout does the same thing self-contained. The `post_install` hook runs `systemctl enable --now ramsleuth.service` — the daemon is started and enabled automatically, and the preset keeps it enabled on future `systemctl preset` runs. It performs the same zero-touch grant as the AUR path (group + ACL seed + daemon restart, guarded), and prints the next steps: start the GUI with `ramsleuth` (the TUI with `ramsleuth-tui`), one-click setup (the GUI's "Set up RamSleuth" button, or `sudo ramsleuth-setup` — see below), and on AMD hosts the optional `sudo ramsleuth-install-ryzen-smu-dkms` (offline vendored build, verified before any build; the AUR-extra alternative is `yay -S ryzen-smu-dkms`), while Intel hosts get the optional `sudo ramsleuth-install-intel-dkms` (the in-repo module; the AUR-extra alternative is `yay -S ramsleuth-intel-dkms`) — with the built-in `/dev/mem` path remaining the fallback where the module is absent.
 
 ## One-click setup
 
 After install (any path), the remaining privileged work is **one action** — no copy-paste, **no re-login, no reboot**:
 
-- **GUI** — the first-run SETUP strip's primary **"Set up RamSleuth"** button (labelled `… + AMD driver` when the AMD module is the missing piece). One click → **one polkit password prompt** (`auth_admin`, via the installed `90-ramsleuth-setup.policy`) → the helper performs every privileged step as root in a single session; the strip's status line then reads `done — full capabilities active` (on failure it prints the manual `sudo` pointer instead; the per-row Copy fallback is kept as the polkit-less grace path).
+- **GUI** — the first-run SETUP strip's primary **"Set up RamSleuth"** button (labelled `… + AMD driver` when the AMD module is the missing piece). One click → **one polkit password prompt** (`auth_admin`, via the installed `90-ramsleuth-setup.policy`) → the helper performs every privileged step as root in a single session; the strip's status line then reads `done — full capabilities active` (on failure it prints the manual `sudo` pointer instead; the per-row Copy fallback is kept as the polkit-less grace path). The GUI's DKMS arm is the AMD driver (the `+ AMD driver` label); on Intel hosts the button performs the same daemon + group + ACL pass, and the Intel driver is added from the terminal with `sudo ramsleuth-setup --with-dkms` (vendor-aware) or `--with-intel-dkms`.
 - **CLI** — the same entrypoint from a terminal:
 
   ```sh
-  sudo ramsleuth-setup              # daemon + group + current-session access
-  sudo ramsleuth-setup --with-dkms  # + build & load the AMD driver (offline vendor)
+  sudo ramsleuth-setup                  # daemon + group + current-session access
+  sudo ramsleuth-setup --with-dkms     # + build & load the vendor DKMS module — auto-routed by the
+                                       # CPU vendor (AMD → the offline ryzen_smu vendor;
+                                       # Intel → the in-repo ramsleuth_intel module)
+  sudo ramsleuth-setup --with-intel-dkms  # + force the Intel arm (Intel-only fast path)
   ```
 
   The GUI invokes the identical helper as `pkexec /usr/bin/ramsleuth-setup --user <you>` (under `pkexec` `$SUDO_USER` is unset, so the caller passes the user explicitly; from `sudo` the default is `$SUDO_USER`).
@@ -77,7 +85,7 @@ What each step does (all **idempotent** — a re-run is a no-op; any failure pri
 2. `usermod -aG ramsleuth <user>` — group membership, **persisted for future logins** (skipped when already a member).
 3. Append `<user>` to `/etc/ramsleuth/authorized-users` — the state file the daemon re-applies as a per-user socket ACL on **every** socket creation (the socket lives on tmpfs `/run`, so on every daemon (re)start and every boot).
 4. Best-effort `setfacl -m u:<user>:rw` on the **live** socket — the **current session** gets immediate access (warn-only if the `acl` package is absent: the daemon re-applies from the state file at its next (re)start; `acl` is in Arch base).
-5. With `--with-dkms`: `exec` the installed DKMS helper (`/usr/bin/ramsleuth-install-ryzen-smu-dkms`) — the offline vendored build + `modprobe` (immediate; the frozen unit never loads the module itself).
+5. With `--with-dkms` (**vendor-aware** — routed by the CPU `vendor_id`): `exec` the installed vendor DKMS helper — AMD: `/usr/bin/ramsleuth-install-ryzen-smu-dkms` (the offline vendored build); Intel: `/usr/bin/ramsleuth-install-intel-dkms` (the in-repo module build) — + `modprobe` (immediate; the frozen unit never loads either module itself). `--with-intel-dkms` forces the Intel arm (an Intel-only fast path; a hard failure on non-Intel silicon); any other/unknown vendor gets a clear error, no DKMS install.
 
 **polkit + the sudo floor:** the policy (action `org.freedesktop.ramsleuth.setup`, `auth_admin` for any/active/inactive/other) maps `pkexec` to `/usr/bin/ramsleuth-setup`; polkit is in Arch **base**, so the prompt machinery is present on every stock system (a graphical agent provides the visible prompt — standard on GNOME/KDE/X11). The helper never *requires* polkit: a bare invocation re-execs under `sudo`, which is the floor — headless boxes just use `sudo ramsleuth-setup`.
 
@@ -91,8 +99,8 @@ This is the **standing** release policy: it applies to **every** release, not a 
 2. `cargo update -w` to sync `Cargo.lock` (the member lines).
 3. Commit + push.
 4. Cut the git tag `v<ver>` — the release workflow (`.github/workflows/release.yml`) fires on the tag and auto-builds + publishes the GitHub Release with the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` and its `sha256` companion.
-5. Update the AUR packages: `pkgver` in `packaging/ramsleuth/PKGBUILD` (the git-tag source) and `pkgver` in `packaging/ramsleuth-bin/PKGBUILD` (the tarball download), then finalize the `ramsleuth-bin` `sha256sums` from the **published** release `.sha256` (AUR requires a real `sha256` — no SKIP; the value is a placeholder until the release exists).
-6. Push both AUR packages.
+5. Update the AUR packages: `pkgver` in `packaging/ramsleuth/PKGBUILD` (the git-tag source) and `pkgver` in `packaging/ramsleuth-bin/PKGBUILD` (the tarball download), the fixed `pkgver` in `packaging/intel-dkms/PKGBUILD` (the Intel extra — it tracks the workspace version, so it bumps with the others), then finalize the `ramsleuth-bin` `sha256sums` from the **published** release `.sha256` (AUR requires a real `sha256` — no SKIP; the value is a placeholder until the release exists).
+6. Push all three AUR packages.
 
 ## The `ramsleuth` group
 
@@ -125,7 +133,7 @@ systemctl status ramsleuth
 journalctl -u ramsleuth
 ```
 
-The unit never loads the `ryzen_smu` module.
+The unit never loads the `ryzen_smu` or `ramsleuth_intel` module.
 
 ## Optional: `ryzen_smu` DKMS extra (live AMD subtimings)
 
@@ -156,16 +164,18 @@ Licensing: the source is **GPL-2.0** — a **separate work** from the MIT RamSle
 
 2. The helper is idempotent and re-execs under `sudo`; it requires the matching kernel headers (build tree `/lib/modules/$(uname -r)/build` — for custom-kernel hosts it lists candidate packages and stops, never guessing), prints the provenance (the URL + full pin + short sha; after resolution, the `sha256` fingerprints of the six staged files) and pauses for confirmation before the first system mutation (a non-interactive run logs and continues; `n` skips cleanly, exit 0), then runs `dkms add/build/install`, `modprobe` (immediate — **no reboot**), and persists `/etc/modules-load.d/ryzen_smu.conf`. The staged source stays inspectable at `/usr/src/ryzen_smu-1.d298366` (vendor path) or `/usr/src/ryzen_smu-<revcount>.<short>` (git path).
 
-### The two DKMS helper names
+### The four DKMS helper names (two per vendor)
 
-The **same script** (`scripts/install-ryzen-smu-dkms.sh`) is installed under **two** names, depending on which package provides it:
+**Each vendor's script is installed under two names**, depending on which package provides it — four names in total:
 
-| Name | Provided by |
-| --- | --- |
-| `/usr/bin/ramsleuth-install-ryzen-smu-dkms` | `install.sh` and both ramsleuth AUR packages (`ramsleuth`, `ramsleuth-bin`) — this is the name `ramsleuth-setup --with-dkms` delegates to |
-| `/usr/bin/ryzen-smu-dkms-install` | the standalone `ryzen-smu-dkms` AUR extra only (plan D-18.4) |
+| Script (in-repo) | Installed name | Provided by |
+| --- | --- | --- |
+| `scripts/install-ryzen-smu-dkms.sh` (AMD) | `/usr/bin/ramsleuth-install-ryzen-smu-dkms` | `install.sh` and both ramsleuth AUR packages (`ramsleuth`, `ramsleuth-bin`) — this is the name `ramsleuth-setup --with-dkms` (the AMD arm) delegates to |
+| (same AMD script) | `/usr/bin/ryzen-smu-dkms-install` | the standalone `ryzen-smu-dkms` AUR extra only (plan D-18.4) |
+| `scripts/install-intel-dkms.sh` (Intel) | `/usr/bin/ramsleuth-install-intel-dkms` | `install.sh` and both ramsleuth AUR packages (guarded — absent from the current v2.2.1 tag/tarball; lands with the v2.3.0 re-cut) — this is the name `ramsleuth-setup --with-dkms` (the Intel arm) and `--with-intel-dkms` delegate to |
+| (same Intel script) | `/usr/bin/ramsleuth-intel-dkms-install` | the standalone `ramsleuth-intel-dkms` AUR extra only |
 
-The distinct names are deliberate: they keep the extra **co-install-safe** with any ramsleuth package (no pacman file conflict). Both behave identically — use the one your install provides.
+The distinct names are deliberate: they keep each extra **co-install-safe** with any ramsleuth package (no pacman file conflict). The two names of one script behave identically — use the one your install provides.
 
 ### Day-2
 
@@ -187,15 +197,61 @@ An AUR install gets the same scripting as the GitHub path (`./install.sh` from a
 
 Whichever path builds the module, the upstream source is **pinned, never branch-HEAD**: `amkillam/ryzen_smu` @ `d2983668300dd2a598e5a7dc40e71ce0678cc270` (verified 2026-08-15, the current `main` HEAD). The helper prints the URL, the full pin, and the short sha before any fetch, shows the `sha256` fingerprints of the six staged source files after resolution, hard-verifies the source (the vendor `SUMS.sha256` manifest on the vendor path; `HEAD == pin` on the git path — no silent branch-HEAD fallback), and pauses for a confirmation before the first system mutation (a non-interactive run logs and continues; `n` skips cleanly, exit 0). The staged source stays inspectable at `/usr/src/ryzen_smu-1.d298366` (vendor) or `/usr/src/ryzen_smu-<revcount>.<short>` (git).
 
-Build posture: the `ramsleuth` package compiles **only this repository** (tag-pinned, `--locked`, no third-party code in the build chroot), and `ramsleuth-bin` compiles nothing — it downloads the release tarball pinned by `sha256sums`. None depends on **any third-party AUR package** — the `ryzen-smu-dkms` extra is optional and co-install-safe (it ships the same helper under a different name, so it never conflicts with the RamSleuth packages). The vendored GPL-2.0 driver source ships **only** via that extra — the `ramsleuth*` packages and the release tarball carry none of it. Every installed file is byte-identical to a file in this repository (auditable via `git show`), including the shipped helper and `install.sh` (`/usr/share/ramsleuth/install.sh`), so the whole flow can be re-run and audited post-install.
+Build posture: the `ramsleuth` package compiles **only this repository** (tag-pinned, `--locked`, no third-party code in the build chroot), and `ramsleuth-bin` compiles nothing — it downloads the release tarball pinned by `sha256sums`. Neither ramsleuth package depends on **any third-party AUR package** — both vendor extras are optional and co-install-safe (each ships its helper under a distinct name, so neither ever conflicts with the RamSleuth packages). GPL-2.0 module source ships **only** via the matching extra — the vendored `ryzen_smu` via `ryzen-smu-dkms` (the release tarball deliberately excludes its vendor dir for size), the in-repo `ramsleuth_intel` tree via `ramsleuth-intel-dkms` — and the `ramsleuth*` packages install no module source at all (their `license=(MIT)` stays accurate). Every installed file is byte-identical to a file in this repository (auditable via `git show`), including the shipped helpers and `install.sh` (`/usr/share/ramsleuth/install.sh`), so the whole flow can be re-run and audited post-install.
 
 ### The release → AUR lockstep (standing process)
 
-The v2.2.0 re-cut is **done** (the one-click helper + polkit policy now ship in every tarball and source build), and v2.2.1 is the current cut (tag `v2.2.1` @ `c82a9ad`). The standing process for **each** release is:
+The v2.2.0 re-cut is **done** (the one-click helper + polkit policy now ship in every tarball and source build), and v2.2.1 is the current cut (tag `v2.2.1` @ `c82a9ad`). The **v2.3.0 re-cut extends the tarball with the Intel artifacts** (the `scripts/install-intel-dkms.sh` helper + the `kernel/ramsleuth-intel/` module tree); until then the current `v2.2.1` tarball carries only the AMD helper, and both ramsleuth packages **guard** the Intel helper install (a build against today's tag/tarball skips it cleanly; the `-bin` one-click Intel path self-heals at the re-cut). The standing process for **each** release is:
 
 1. Cut the git tag `v<ver>` — the release workflow (`.github/workflows/release.yml`) publishes the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`.
 2. **`ramsleuth`** (stable source) — bump `pkgver` to `<ver>`; it builds from the `v<ver>` tag. Push.
 3. **`ramsleuth-bin`** (precompiled) — bump `pkgver` to `<ver>` and re-pin `sha256sums` to the **published** release `.sha256` (a real sha256, no placeholder). Push.
+4. **`ramsleuth-intel-dkms`** (Intel extra) — bump its fixed `pkgver` to `<ver>` (it tracks the ramsleuth workspace version; it cannot tag-pin — the module first lands on the development branch, so the package builds from `v2-development`). Push.
+
+## Optional: `ramsleuth_intel` DKMS extra (live Intel subtimings)
+
+**Not a hard dependency.** Without the module, RamSleuth degrades gracefully: the Intel subtiming fields read `N/A (DriverMissing)`, exit 0, no panic — and the built-in `/dev/mem` MCHBAR decode remains the fallback where the kernel allows it. The module is the recommended path: the IMC window (`0xFED10000`) sits in a region modern kernels mark exclusive (`IO_STRICT_DEVMEM`), and UEFI Secure-Boot lockdown disables `/dev/mem` entirely.
+
+### Source: in-repo (no upstream pin, no network)
+
+Unlike the AMD extra (which vendors an *external* upstream, pinned `ryzen_smu`), the Intel module **lives in this repository**: the four-file tree `kernel/ramsleuth-intel/` (`dkms.conf`, `Makefile`, `ramsleuth_intel.c`, `README.md`) is the source of truth. The helper resolves it in this order:
+
+1. **Repo-relative** `kernel/ramsleuth-intel/` — the dev-checkout path (a symlinked invocation canonicalizes into the repo it points into).
+2. **Installed copy** `/usr/share/ramsleuth-intel-dkms/src/` — provided by the `ramsleuth-intel-dkms` extra (so the build is network-free).
+
+There is no pin, no clone, no vendor-SUMS manifest: there is no upstream to track (no `RYZEN_SMU_*`-class env overrides apply). The DKMS version is the ramsleuth workspace version (a fixed version — `2.2.1` today — which makes `dkms add` idempotent across kernel updates).
+
+Licensing: the module is **GPL-2.0** (SPDX header) — a **separate work** from the MIT RamSleuth code. It is built **only** by DKMS in `/usr/src/ramsleuth_intel-<version>` — never compiled into, linked with, or bundled as part of any RamSleuth binary. The `ramsleuth-intel-dkms` package lists `GPL-2.0-only`; the two `ramsleuth*` packages install **no** module source (their `license=(MIT)` stays accurate).
+
+### Enabling live subtimings on an Intel host
+
+1. One of:
+   - `sudo ramsleuth-setup --with-dkms` — the one-click path (vendor-aware: on Intel silicon it delegates to the installed Intel helper); `sudo ramsleuth-setup --with-intel-dkms` forces the Intel arm (the Intel-only fast path). On a current **v2.2.1** install the ramsleuth-owned Intel helper is not yet shipped (it lands with the v2.3.0 tree) — use the AUR extra below in the interim;
+   - `yay -S ramsleuth-intel-dkms` (or `paru -S ramsleuth-intel-dkms`) — the provisioning extra: bundles the DKMS config at `/usr/share/ramsleuth-intel-dkms/dkms.conf`, its helper (as `/usr/bin/ramsleuth-intel-dkms-install`), **the module source tree** (at `/usr/share/ramsleuth-intel-dkms/src/` — so the build is network-free), and docs. It is thin by design — no module build in the build chroot (it would build against the chroot's kernel, not the target's); the module is built on the **target** via:
+
+      ```sh
+      sudo ramsleuth-intel-dkms-install
+      ```
+
+   - or, from a source checkout (no package needed): `scripts/install-intel-dkms.sh`.
+
+2. The helper is idempotent (kobject present → nothing to do) and re-execs under `sudo`; it requires the matching kernel headers (build tree `/lib/modules/$(uname -r)/build` — for custom-kernel hosts it lists candidate packages and stops, never guessing), prints the `sha256` fingerprints of the four staged files, and pauses for confirmation before the first system mutation (a non-interactive run logs and continues; `n` skips cleanly, exit 0). It then runs `dkms add/build/install`, `modprobe` (immediate — **no reboot**), and persists `/etc/modules-load.d/ramsleuth_intel.conf` (an Intel success only — on a non-Intel host no at-boot entry is ever written). The staged source stays inspectable at `/usr/src/ramsleuth_intel-<version>`.
+
+**Non-Intel host (safe by design):** the module builds fine, the load rejects the non-Intel host bridge (a clean `-ENODEV` — no kobject), and the helper exits 0 with a clear note; the app keeps working off the `/dev/mem` fallback.
+
+### Day-2
+
+`AUTOINSTALL=yes` in the bundled `dkms.conf` auto-rebuilds the module on kernel updates. Verify:
+
+```sh
+ls /sys/kernel/ramsleuth_intel/
+```
+
+(the 19 frozen attributes — `mchbar_base`, `mchbar_enabled`, `mcbios_req`, and the per-channel `tc_*` table; `kernel/ramsleuth-intel/README.md` is the reference).
+
+### Secure Boot / lockdown (known limitation)
+
+On UEFI Secure Boot hosts (integrity lockdown), the kernel blocks **both** `/dev/mem` **and** unsigned out-of-tree modules: the only path is to MOK-enroll the module first (`mokutil --import ramsleuth_intel.ko`). This is the same class of limitation the AMD `ryzen_smu` extra carries. When the module cannot be loaded, RamSleuth degrades gracefully: `N/A (DriverMissing)`, exit 0, no panic.
 
 ## CI
 
@@ -203,6 +259,7 @@ GitHub Actions runs on push and pull requests to `v2-development`:
 
 - **test** — matrix `1.75` (MSRV) × `stable` on `ubuntu-latest` (`fail-fast: false`): `cargo test --workspace` (debug), `cargo test --workspace --release`, `cargo clippy --workspace --all-targets -- -D warnings`. The committed `Cargo.lock` is used as-is; the MSRV leg proves the 1.75 claim on a clean runner.
 - **build** — `cargo build --release --workspace` on stable, uploading the 6 release binaries as an artifact.
+- **kernel-module** — independent (a kernel failure never breaks the Rust jobs): builds `kernel/ramsleuth-intel` against the runner's `linux-headers-generic`, asserting a `.ko` is produced with **zero compiler warnings** (the job fails on any warning).
 
 ## No-panic contract
 
