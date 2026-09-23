@@ -4,14 +4,20 @@
 # Plan: PLAN-CYCLE18.md chunk C18-08, design D-18.2.
 #
 # Lands RamSleuth in the EXACT state of the AUR (ramsleuth): the 6 binaries +
-# the frozen unit + the preset + the `ramsleuth` group + the one-click setup
-# helper (ramsleuth-setup) + its polkit policy into /usr via sudo, built
+# the frozen unit + the preset + the `ramsleuth` group + the two DKMS helpers
+# (the AMD pinned ryzen_smu helper + the Intel vendored ramsleuth_intel helper,
+# the latter guarded) + the one-click setup helper (ramsleuth-setup) + its
+# polkit policy into /usr via sudo, built
 # with `cargo build --release --workspace --locked`. Interactive, visually
 # sectioned, and TRANSPARENT: before anything touches the system it shows the
 # host, the exact commit being installed, and every artifact + destination, then
 # asks "Proceed?" (a `n` aborts — exit 0, no change). On AMD hosts it then ASKS
 # about the optional ryzen_smu DKMS module and, on `y`, hands off to the shared
-# pinned helper (scripts/install-ryzen-smu-dkms.sh). The ONLY third-party code
+# pinned helper (scripts/install-ryzen-smu-dkms.sh). On Intel hosts it installs
+# the vendored ramsleuth_intel DKMS helper (scripts/install-intel-dkms.sh) as
+# /usr/bin/ramsleuth-install-intel-dkms (guarded: absent in a pre-Intel checkout
+# -> clean skip, never a hard fail) and the summary offers it as the optional
+# live-IMC next step. The ONLY third-party code
 # anywhere is that module, pinned to amkillam/ryzen_smu @ d298366 (shown +
 # checksummed + confirmed before any build); RamSleuth itself compiles only this
 # repo (--locked).
@@ -135,6 +141,7 @@ transparency_block() {
   step "icon name      → RamSleuth.png in the same hicolor + pixmaps dirs  (the app_id direct-icon-name fallback; C21-45)"
   step "system group   → 'ramsleuth'  (groupadd -r; the unit runs as Group=ramsleuth)"
   step "shared helper  → /usr/bin/ramsleuth-install-ryzen-smu-dkms"
+  step "Intel helper   → /usr/bin/ramsleuth-install-intel-dkms  (the shared Intel DKMS helper; guarded — skipped if absent in a pre-Intel checkout)"
   step "setup helper   → /usr/bin/ramsleuth-setup   (one-click privileged setup; pkexec-able)"
   step "polkit policy  → /usr/share/polkit-1/actions/90-ramsleuth-setup.policy"
   step "this installer → /usr/share/ramsleuth/install.sh   (kept for audit / re-run)"
@@ -236,6 +243,16 @@ do_install() {
   # The two shipped transparency artifacts (re-runnable + auditable post-install).
   install -Dm755 "scripts/install-ryzen-smu-dkms.sh" "/usr/bin/ramsleuth-install-ryzen-smu-dkms"
   ok "/usr/bin/ramsleuth-install-ryzen-smu-dkms  (the shared pinned helper)"
+  # The Intel DKMS helper (INTEL-11; INTEL-06 source scripts/install-intel-dkms.sh).
+  # GUARDED — the same no-panic contract the AUR mirrors (INTEL-09/10): absent in a
+  # pre-Intel checkout -> clean skip with a note, never a hard fail. install(1)
+  # overwrites in place -> idempotent on re-run.
+  if [[ -f "scripts/install-intel-dkms.sh" ]]; then
+    install -Dm755 "scripts/install-intel-dkms.sh" "/usr/bin/ramsleuth-install-intel-dkms"
+    ok "/usr/bin/ramsleuth-install-intel-dkms  (the shared Intel DKMS helper)"
+  else
+    warn "/usr/bin/ramsleuth-install-intel-dkms skipped — scripts/install-intel-dkms.sh absent in this checkout (pre-Intel); live Intel IMC subtimings unavailable"
+  fi
   # The one-click setup pair (AUR-parity: the same two artifacts every AUR package installs).
   [[ -f "scripts/ramsleuth-setup.sh" ]] || die "Missing scripts/ramsleuth-setup.sh — incomplete checkout; the one-click setup helper cannot be installed." 1
   [[ -f "packaging/polkit/90-ramsleuth-setup.policy" ]] || die "Missing packaging/polkit/90-ramsleuth-setup.policy — incomplete checkout; the polkit policy cannot be installed." 1
@@ -289,6 +306,13 @@ do_summary() {
     printf '\n  %sDegradation note:%s without the ryzen_smu module the AMD section reads\n' "${C_AMBER}" "${C_RESET}"
     printf '  N/A (DriverMissing), exit 0, no panic. Enable live AMD subtimings with:\n'
     printf '     %ssudo ramsleuth-setup --with-dkms%s  (or the helper: sudo ramsleuth-install-ryzen-smu-dkms)\n' "${C_CYAN}" "${C_RESET}"
+  fi
+  if [[ "$DKMS_STATE" == "intel" && "$CPU_VENDOR" == "GenuineIntel" ]]; then
+    printf '\n  %sIntel next step (optional):%s the ramsleuth_intel DKMS module (vendored in this\n' "${C_AMBER}" "${C_RESET}"
+    printf '  repo) gives live Intel IMC subtimings. Without it the Intel section reads\n'
+    printf '  N/A (DriverMissing) and the app uses the /dev/mem fallback where available\n'
+    printf '  (exit 0, no panic). Enable it with:\n'
+    printf '     %ssudo ramsleuth-install-intel-dkms%s  (or one-click: sudo ramsleuth-setup --with-dkms)\n' "${C_CYAN}" "${C_RESET}"
   fi
   printf '\n  %sTransparency footer:%s every installed file is byte-identical to a file in this\n' "${C_DIM}" "${C_RESET}"
   printf '  repo (audit with: git show). The build was --locked from commit %s. The only\n' "$COMMIT"
