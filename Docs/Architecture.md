@@ -56,8 +56,10 @@ The architecture is shaped by four standing goals:
 
 1. **Privilege separation.** The only process in the whole system that touches
    privileged hardware surfaces (the `ryzen_smu` driver interfaces and the
-   `/dev/mem` MCHBAR window) is the daemon. Every frontend, the CLI, the
-   standalone tools, and even the benchmark workers run unprivileged. A
+   `/dev/mem` MCHBAR fallback window — the `ramsleuth_intel` module's sysfs
+   attributes are world-readable and need no privilege) is the daemon. Every
+   frontend, the CLI, the standalone tools, and even the benchmark workers
+   run unprivileged. A
    compromised frontend cannot escalate: it can only speak RPC to a socket
    gated by group membership or a per-user ACL, and it can only ask for the
    daemon's three sanctioned operations (telemetry, benchmark, burn-in).
@@ -110,12 +112,19 @@ no direct MMIO from userspace* — the daemon reads:
 - **GDM** (global data-path mode) and the **DRAM command rate** (1T/2T), from
   the SMN `0x50200` word.
 
-**Intel.** Through a read-only `mmap` of the host-bridge **MCHBAR** window via
-`/dev/mem` (this is the operation that forces `CAP_SYS_RAWIO`), the daemon
-decodes the IMC register block per channel: DRAM clock ratio, command rate,
-gear, RTL, and the tCL/tRCD/tRP/tRAS/tCCD/tRDRD/tRDWR/tWRWR/tWRRD timing set.
-The decode is a documented model of the published client-IMC map; every read is
-bounds-checked inside the mapped 1 MiB window.
+**Intel.** Two raw sources feed one decode (§10.3). The **primary** is the
+`ramsleuth_intel` kernel module, which maps the host-bridge **MCHBAR** window
+in kernel space and publishes the raw IMC registers as 19 world-readable sysfs
+attributes under `/sys/kernel/ramsleuth_intel/` — no C-side decoding; all
+bit-field semantics live in Rust. The **fallback** is a read-only `mmap` of
+the same window via `/dev/mem` (the operation that forces `CAP_SYS_RAWIO`),
+taken only when the module's kobject is absent. The decode (the
+hardware-verified Tier-1 register map) yields the DRAM core clock from
+`MC_BIOS_REQ` plus the per-channel timing set — tCL, tCWL, the unified tRCD,
+tRP, tRAS, the synthesized tRC, tRRD_S/L, tRTP, tFAW, tWR, tRFC, and the four
+turnaround quartets: 24 of the 27 AMD subtiming slots; the rest of the Intel
+readout (uclk / fclk / gear / GDM / PDM, the CAD bus, the voltage rails) has
+no IMC analog and renders `NotApplicable`.
 
 **SPD (both vendors, fully unprivileged).** The kernel's `ee1004` I2C EEPROM
 driver exposes each DIMM's full raw image as a world-readable sysfs attribute.
@@ -185,9 +194,11 @@ hardware surfaces require:
 
 1. **AMD SMU reads** — the `ryzen_smu` driver's sysfs attributes and (on fork
    builds) its character device are gated behind elevated access;
-2. **Intel MCHBAR reads** — `mmap(PROT_READ, MAP_PRIVATE)` of physical memory
-   through `/dev/mem` is refused without `CAP_SYS_RAWIO` (or root with the
-   `STRICT_DEVMEM` restriction lifted).
+2. **Intel MCHBAR fallback reads** — when the `ramsleuth_intel` module is
+   absent, `mmap(PROT_READ, MAP_PRIVATE)` of the MCHBAR window through
+   `/dev/mem` is refused without `CAP_SYS_RAWIO` (or root with the
+   `STRICT_DEVMEM` restriction lifted). The module's primary path needs no
+   privilege at all: its sysfs attributes are world-readable.
 
 Everything else the daemon does — SPD decode, DMI, `/proc`, the benchmark
 itself — is unprivileged, which is precisely why the capability floor stays at
@@ -297,8 +308,9 @@ section is N/A, exit 2 on a bad flag).
 | `amd_pm.rs` | Version-guarded parse of the raw PM blob into clocks (MCLK/UCLK/FCLK) and voltages (VDDCR_VDD/VDDCR_SOC). |
 | `amd_smn.rs` | The `smn` accessor protocol plus the verified SMN register table (the 27 subtimings, GDM, command rate). |
 | `amd_readout.rs` | The four vendor-neutral display types (`ClockReadout`, `TimingSet`, `CadBus`, `VoltageSet`) and the AMD mapping onto them, with sanity gating. |
-| `intel_mchbar.rs` | MCHBAR location in PCI config space + the read-only `/dev/mem` RAII window (the one `unsafe` cluster in the crate). |
-| `intel_readout.rs` | Per-channel IMC register decode into the same display types. |
+| `intel_mchbar.rs` | MCHBAR location in PCI config space + the read-only `/dev/mem` RAII window — the fallback source (the one `unsafe` cluster in the crate). |
+| `intel_readout.rs` | The hardware-verified Tier-1 IMC register map (MCHBAR-relative) + the single pure decode core fed by both raw sources, into the same display types. |
+| `intel_sysfs.rs` | The primary raw reader: the `ramsleuth_intel` kobject's 19 attributes under `/sys/kernel/ramsleuth_intel/` → the raw `IntelImcRegs` set (per-attribute containment: absent / malformed → `None`). |
 | `spd_eeprom.rs` | Unprivileged enumeration + raw-image acquisition of every bound `ee1004` device. |
 | `spd_decode.rs` | Pure decode of the raw image: JEP106 makers, rank/density/speed, part/serial, XMP 2.0 / XMP 3.0-EXPO profiles. |
 | `platform.rs` | The vendor-neutral identity branch: DMI, `/proc/cpuinfo`, `/proc/meminfo`, the `ryzen_smu` version attribute. |
@@ -623,12 +635,17 @@ The GUI's one-click setup is a **thin client over a pkexec-able root helper**:
      daemon re-applies as socket ACLs on every bind;
   4. best-effort `setfacl -m u:<user>:rw` on the **live** socket — *current*
      session access, **no re-login, no reboot** (warn-only if `acl` is absent);
-  5. with `--with-dkms`: `exec` the installed
-     `/usr/bin/ramsleuth-install-ryzen-smu-dkms` helper (the offline AMD
-     driver build; its exit code is returned).
+  5. with `--with-dkms`: **vendor-aware** DKMS routing — `exec` the
+     installed vendor helper and return its exit code: AMD →
+     `/usr/bin/ramsleuth-install-ryzen-smu-dkms` (the offline pinned
+     `ryzen_smu` build), Intel → `/usr/bin/ramsleuth-install-intel-dkms`
+     (the in-repo `ramsleuth_intel` build); other / unknown vendor → a
+     clear error, no install. `--with-intel-dkms` forces the Intel arm
+     (an additive fast path; a hard failure on non-Intel silicon).
 
-  Usage: `ramsleuth-setup [--with-dkms] [--user <name>]`; exit **0** success
-  (or idempotent no-op), **1** hard failure, **2** usage error.
+  Usage: `ramsleuth-setup [--with-dkms] [--with-intel-dkms] [--user <name>]`;
+  exit **0** success (or idempotent no-op), **1** hard failure, **2**
+  usage error.
 
 ---
 
@@ -1019,7 +1036,8 @@ whole crate.
 
 ```text
 CpuInfo::detect() ──┬─ AMD:      amd_smu::acquire() → amd_pm::parse() → amd_smn::apply_smn (overlay) → amd_readout::map_amd()
-                    ├─ Intel:    intel_mchbar::acquire() → intel_readout::read_intel()
+                    ├─ Intel:    intel_sysfs::acquire() (primary: ramsleuth_intel kobject) → intel_readout::decode
+                    │           └─ on DriverMissing only: intel_mchbar::acquire() → intel_readout::read_intel (/dev/mem fallback)
                     ├─ SPD:      spd_eeprom::acquire() → spd_decode::decode() (per image)
                     ├─ Platform: platform::collect_platform() → dimm_sizes + total_capacity
                     └─ Board VRM: board_vrm::read_board_vrm(&platform.motherboard) → fill-when-Na vddio_mem_mv overlay
@@ -1028,8 +1046,13 @@ CpuInfo::detect() ──┬─ AMD:      amd_smu::acquire() → amd_pm::parse() 
 A vendor branch runs **only on matching silicon**: the AMD branch gates on
 `CpuVendor::Amd(_)` and the Intel branch on `CpuVendor::Intel(_)` *before any
 provider call*, so a non-matching vendor yields `Na(UnsupportedHardware)`
-with **zero I/O** in that branch. The SPD and platform branches run on every
-vendor (unprivileged sysfs / DMI + `/proc` reads).
+with **zero I/O** in that branch. The Intel branch additionally gates on the
+v1 Tier-1 generation set (`Skylake` / `KabyLake` / `CoffeeLake` /
+`CometLake`) before either raw source is touched: any other Intel generation
+(Tier 2 / Tier 3 / unrecognized) degrades the whole branch to
+`Na(UnsupportedHardware)` — never garbage from a mismatched register map.
+The SPD and platform branches run on every vendor (unprivileged sysfs / DMI
++ `/proc` reads).
 
 The snapshot's shape: `cpu` (vendor + brand — the dispatch key), `amd`
 (`Section<AmdReadout>`), `intel` (`Section<IntelReadout>`), `spd` (one decoded
@@ -1118,41 +1141,130 @@ ryzen_smu`, or the DKMS extra, §12.4); the frozen unit never loads it. Absent
 → the AMD branch's subtiming fields report `N/A (DriverMissing)` and the rest
 of the daemon keeps serving.
 
-### 10.3 The Intel path — MCHBAR via `/dev/mem`
+### 10.3 The Intel path — the `ramsleuth_intel` module, with the `/dev/mem` MCHBAR fallback
 
-**MCHBAR MMIO, not PECI.** The branch is vendor-gated on
-`CpuInfo::detect()` — **on AMD hosts this gate is the entire behavior: no PCI
-config is read and `/dev/mem` is never opened.** On Intel:
+**MCHBAR, raw-exposes / Rust-decodes, two sources.** The branch is
+vendor-gated on `CpuInfo::detect()` — **on AMD hosts this gate is the entire
+behavior: no PCI config is read, no kobject is probed, and `/dev/mem` is
+never opened.** On Intel, the raw IMC registers come from two sources that
+feed **one** pure decode core:
 
-1. read the host-bridge PCI config space at
-   `/sys/bus/pci/devices/0000:00:00.0/config` (missing device →
-   `DriverMissing`);
-2. decode the **64-bit MCHBAR (BAR5) field at config offset `0x48..0x50`**
-   and strip the low type/status bits to the page-aligned physical base —
-   short config or an I/O-space BAR → `Parse`; a **zero (unpopulated) base —
-   typical of virtualized Intel hosts → `UnsupportedHardware`** (a clean
-   `N/A (unsupported hardware)`);
-3. open **`/dev/mem`** (fallback `/dev/fmem`) and `mmap(PROT_READ,
-   MAP_PRIVATE)` the **1 MiB** MCHBAR window at that base, owned by an RAII
-   guard whose `Drop` calls `munmap` exactly once. This is the
-   **`CAP_SYS_RAWIO` requirement**: EACCES/EPERM, or a `STRICT_DEVMEM`
-   rejection surfaced as EIO/ENODATA, → `InsufficientPrivilege`.
+1. **primary — the `ramsleuth_intel` kernel module** (GPL-2.0, the in-repo
+   `kernel/ramsleuth-intel/` tree; provisioned by the `ramsleuth-intel-dkms`
+   extra, §12.5). It probes the host bridge at PCI `0000:00:00.0`, decodes
+   the MCHBAR from config space, `ioremap`s the 64 KiB window, and publishes
+   the raw IMC registers as **19 world-readable (`0444`) sysfs attributes**
+   under `/sys/kernel/ramsleuth_intel/` — each register attribute the raw
+   word, one line, `0x%08x` (the MCHBAR diagnostics as `%016llx` and a
+   constant `1`). **No C-side decoding**: the module exposes raw values and
+   Rust owns the bit-field semantics, so one module spans the supported
+   client generations. The kobject exists **only on a fully successful
+   probe** (Intel vendor, MCHBAR_EN set, non-zero masked base, `ioremap`
+   OK); any probe failure leaves no kobject behind, and on a non-Intel host
+   the load fails `-ENODEV` by design — the module is Intel-only. The Rust
+   reader (`intel_sysfs`) takes the 19 attributes with per-attribute
+   containment: an **absent** attribute and a **malformed** payload both
+   degrade to `None` for that register only; only a permission / other-I/O
+   failure on a present attribute is reported as a structured
+   `TelemetryError`. A missing kobject is the `DriverMissing` outcome that
+   triggers the fallback.
+2. **fallback — `/dev/mem` MCHBAR, taken ONLY when the kobject is absent.**
+   Any other sysfs outcome (`Parse` / `InsufficientPrivilege` / `Io`)
+   propagates as-is: the module being loaded means the hardware is
+   reachable, and silently switching sources would mask a real fault. The
+   fallback maps the window read-only:
+   - read the host-bridge PCI config space at
+     `/sys/bus/pci/devices/0000:00:00.0/config` (missing device →
+     `DriverMissing`);
+   - decode the **64-bit MCHBAR field at config offset `0x48..0x50`** —
+     `0x48` is the MCHBAR low dword (`0x40` is the EPBAR, a known trap),
+     `0x4C` the high dword: `raw = (high << 32) | low`. Bit 0 is
+     **MCHBAR_EN** (the window-enable — *not* a PCI I/O-space flag); bits
+     15:1 are hardwired 0; bits 38:16 carry the base address. The base is
+     `raw & 0x0000007FFFFFF000` — 64 KiB-aligned. A disabled MCHBAR with no
+     address bits decodes to base 0 (the unpopulated state typical of
+     virtualized Intel hosts) → `UnsupportedHardware` (a clean
+     `N/A (unsupported hardware)`); a disabled MCHBAR that carries
+     address bits, or a short config image → `Parse`;
+   - open **`/dev/mem`** (fallback `/dev/fmem`) and `mmap(PROT_READ, MAP_PRIVATE)`
+     the **1 MiB** MCHBAR window at that base, owned by an RAII guard whose
+     `Drop` calls `munmap` exactly once. This is the
+     **`CAP_SYS_RAWIO` requirement**: EACCES/EPERM, or a `STRICT_DEVMEM`
+     range rejection surfaced as EIO/ENODATA, → `InsufficientPrivilege`.
 
-The only `unsafe` in the telemetry crate is confined to this map/read/unmap
-path (each block carries a `// SAFETY:` justification): `PROT_READ` means the
-guard can never write to the device, `MAP_PRIVATE` means no copy-on-write
-page can reach the hardware, the region is page-aligned, and every register
-read is bounds-checked against the mapped window. The downstream decode
-(`intel_readout`) is a per-channel IMC register table (global `0x5058`
-`IMC_FREQ_RATIO` — DRAM clock ratio in 10 MHz units — plus the per-channel
-MCS block at `0x5400 + ch·0x100`: command-rate / gear / RTL and the
-tCL/tRCD/tRP/tRAS/tCCD/tRDRD/tRDWR/tWRWR/tWRRD timings; the highest
-per-channel offset is `0x570C`, proven at compile time to be inside the
-window). Channel count is a function of the detected generation: 2 for
-DDR4-class, 4 for DDR5-class client silicon. The table is a documented model
-of the published client-IMC map (the reference host is AMD, so it cannot be
-live-verified there) — which is why Intel voltages / FCLK / GDM render
-`NotApplicable` there.
+   **Why the module exists:** with `CONFIG_STRICT_DEVMEM` (the stock
+   setting on major distros) the kernel rejects the `mmap` of the
+   non-RAM, PCI-MMIO MCHBAR region (e.g. `0xFED10000`) through `/dev/mem`
+   outright, and on UEFI Secure-Boot / integrity-lockdown hosts lockdown
+   blocks `/dev/mem` too — and unsigned out-of-tree modules, so there the
+   module must be MOK-enrolled first (`mokutil --import ramsleuth_intel.ko`).
+   The kernel-space `ioremap` inside the module is the path that works in
+   every state the daemon can reach.
+
+The only `unsafe` in the telemetry crate is confined to the fallback's
+map/read/unmap path (each block carries a `// SAFETY:` justification):
+`PROT_READ` means the guard can never write to the device, `MAP_PRIVATE`
+means no copy-on-write page can reach the hardware, the region is
+page-aligned, and every register read is bounds-checked against the mapped
+window (the module's attributes need none of this: they are plain sysfs
+reads).
+
+**The hardware-authoritative Tier-1 register map (MCHBAR-relative).** Tier 1
+= Skylake / Kaby Lake / Coffee Lake / Comet Lake: one memory controller, two
+channels, DDR4. One global register plus two per-channel blocks (channel 0
+at `0x4000`, channel 1 at `0x4400`, stride `0x400`):
+
+| Offset | Register | Fields decoded (bits) |
+|--------|----------|-----------------------|
+| `0x5E00` | `MC_BIOS_REQ` | `[7:0]` CLK_RATIO · `[8]` REF_CLK (0 = 133.3333 MHz, 1 = 100 MHz) · `[17:16]` GEAR_RATIO (Rocket+ only — Tier 2) · `[31]` RUN_BUSY (status) |
+| `+0x00` | `TC_DBP` | `[5:0]` tCL · `[13:8]` tCWL · `[21:16]` tRCD · `[29:24]` tRP (6-bit each) |
+| `+0x04` | `TC_RAP` | `[5:0]` tRRD_S · `[11:6]` tRTP · `[15:12]` tCKE (**4-bit**, 1–15) · `[23:16]` tFAW (8-bit) · `[31:24]` tRAS (8-bit) |
+| `+0x08` | `TC_RFP` | `[10:0]` tRFC (11-bit, 1–2047) · `[27:16]` tREFI (12-bit) |
+| `+0x0C` | `TC_RAP2` | `[5:0]` tRRD_L · `[13:8]` tWR (6-bit each) |
+| `+0x20` / `+0x24` / `+0x28` / `+0x2C` | `TC_RDRD` / `TC_RDWR` / `TC_WRRD` / `TC_WRWR` | 4×6-bit `sg / dg / dr / dd` turnaround each |
+
+The timing unit is **integer DRAM clock cycles** (1 cycle = 2 UI). This
+replaces the pre-v2.2.1 skeleton table, which mis-located the frequency
+word; the layout is hardware-verified and pinned in CI by the Skylake
+DDR4-2400 acceptance fixture (raw `mcbios_req = 0x00000012` → 18 ×
+133.3333 / 2 = **1200 MHz** core clock; `tc_dbp = 0x11110F11` →
+17-15-17-17; `tc_rap = 0x27180204` → tRRD_S 4 / tRTP 8 / tFAW 24 / tRAS 39;
+`tc_rfp = 0x000001A4` → tRFC 420; synthesized tRC = 39 + 17 = 56; channel 1
+symmetric).
+
+**The decode (one pure core for both sources).** The 17 raw slots
+(`IntelImcRegs` — 1 global + 2×8 per-channel) feed `intel_readout::decode`:
+
+- `mclk_mhz` ← `MC_BIOS_REQ`: `ratio × refclk / 2`, sanity-gated to
+  [1, 4096] MHz; a ratio of 0 = unconfigured → `Na(ParseError)`;
+- **24 of the 27 AMD subtiming slots populated** — `cl`, `cwl`, the
+  *unified symmetric* `tRCD` feeding both `rcdrd` and `rcwdwr`, `rp`, `ras`,
+  **`rc` synthesized as `tRAS + tRP`** (Intel exposes no tRC register — the
+  JEDEC identity), `rrds`, `rrld`, `rtp`, `faw`, `wr`, `rfc1`, and the four
+  `TC_RDRD` / `TC_WRWR` quartets; `rdwr` takes `TC_RDWR`'s `dg` field (the
+  representative bank-group turnaround), and the coarse `wrrd` slot is
+  superseded by the finer `wtrs` / `wtrl` pair from `TC_WRRD` (dg / sg);
+  every decoded tick is sanity-gated to [1, 2048];
+- `rfc2`, `rfcsb`, `wrrd` → structural `Na(NotApplicable)` (Intel DDR4
+  client runs standard single-tRFC scheduling);
+- `tCKE` / `tREFI` are decoded by the core but have no frozen display slot
+  (the raw values stay available via the sysfs attributes);
+- `uclk` / `fclk` / `div_mode` / `gear_mode` / `gdm` / `pdm` /
+  `command_rate` → `Na(NotApplicable)` (AMD-fabric concepts with no IMC
+  analog; the gear ratio is Rocket+ / Tier 2), and the CAD bus + voltage
+  rails → all `Na(NotApplicable)` (the IMC window exposes neither);
+- **per-register containment**: an absent / failed register degrades only
+  the slots sourced from it to `Na(ParseError)` — never a silent zero,
+  never a panic.
+
+**The Tier-1 generation gate.** The decode runs only for
+`{Skylake, KabyLake, CoffeeLake, CometLake}`. Any other detected Intel
+generation (Alder / Raptor = Tier 2, dual-MC DDR4/DDR5; Meteor / Arrow =
+Tier 3, DDR5;
+unrecognized) degrades the **whole** readout to `Na(UnsupportedHardware)` —
+never garbage data from a mismatched register map. The channel count is a
+function of the detected generation: 2 for DDR4-class, 4 for DDR5-class
+client silicon.
 
 ### 10.4 The SPD path — fully unprivileged
 
@@ -1375,9 +1487,14 @@ The full install file set (see `packaging/README.md` for the operator
 reference): 6 binaries → `/usr/bin/`; the unit → `/usr/lib/systemd/system/`
 (+ preset); the `ramsleuth` group (idempotent `groupadd -r` in the `.install`
 hooks); the DKMS helper → `/usr/bin/ramsleuth-install-ryzen-smu-dkms`; the
-setup helper → `/usr/bin/ramsleuth-setup`; the polkit policy →
+Intel DKMS helper → `/usr/bin/ramsleuth-install-intel-dkms` (guarded —
+skipped with a note in a pre-Intel checkout); the setup helper →
+`/usr/bin/ramsleuth-setup`; the polkit policy →
 `/usr/share/polkit-1/actions/`; and `install.sh` → `/usr/share/ramsleuth/`.
-`ramsleuth-protocol` is library-only and is never installed.
+`ramsleuth-protocol` is library-only and is never installed. Two optional
+DKMS extras provision the vendor kernel drivers — `ryzen-smu-dkms` (§12.4)
+and `ramsleuth-intel-dkms` (§12.5); neither is a dependency of the two
+packages, and neither conflicts with them.
 
 ### 12.3 The `ramsleuth` group + ACL model
 
@@ -1424,13 +1541,57 @@ fallback.
   `install.sh`; the name `ramsleuth-setup --with-dkms` delegates to) and
   `/usr/bin/ryzen-smu-dkms-install` (the standalone extra only).
 
+### 12.5 The `ramsleuth-intel-dkms` extra (live Intel subtimings)
+
+**Not a hard dependency** — without the module, the Intel section degrades
+(`N/A (DriverMissing)`, exit 0, no panic), and the `/dev/mem` MCHBAR
+fallback remains available where unblocked. When present:
+
+- the **source is in-repo, never cloned**: the `kernel/ramsleuth-intel/`
+  tree (GPL-2.0 — a separate work from the MIT RamSleuth code, byte-verbatim,
+  never compiled into any RamSleuth binary) — unlike the AMD extra's pinned
+  `ryzen_smu` clone, there is no network and no upstream pin;
+- the AUR extra is a **thin provisioning package** (mirroring
+  `ryzen-smu-dkms`): it ships the DKMS config, the operator helper, and the
+  module source under `/usr/share/ramsleuth-intel-dkms/` — the module is
+  **never built in the build chroot** (no matching kernel headers, and it
+  would build against the chroot kernel, not the target's); the
+  `dkms add` / `build` / `install` run on the **target** via the helper, and
+  `AUTOINSTALL=yes` rebuilds the module on kernel updates;
+- the **helper is installed under two names** to stay co-install-safe:
+  `/usr/bin/ramsleuth-install-intel-dkms` (both `ramsleuth` packages +
+  `install.sh`; the name `ramsleuth-setup --with-dkms` /
+  `--with-intel-dkms` delegates to, §5.9) and
+  `/usr/bin/ramsleuth-intel-dkms-install` (the standalone
+  `ramsleuth-intel-dkms` extra only);
+- the helper is **vendor-aware and non-Intel-safe**: on a non-Intel host
+  (e.g. an AMD dev box) the module builds fine, `modprobe` leaves it idle
+  (the module's vendor gate rejects with `-ENODEV` by design — no kobject),
+  and the helper exits **0** with a clear note ("the `/dev/mem` fallback
+  will be used"); the at-boot load entry
+  (`/etc/modules-load.d/ramsleuth_intel.conf`) is written **only** on a
+  successful Intel load (a stale one is removed on the non-Intel path);
+- the **frozen kobject contract** is the 19 world-readable attributes under
+  `/sys/kernel/ramsleuth_intel/` (§10.3): the module creates the kobject
+  only on a fully successful probe, and any probe failure leaves no kobject
+  behind;
+- like the AMD unit contract, the **systemd unit never loads the module** —
+  the operator does, via the helper / `modprobe`;
+- **Secure Boot / integrity-lockdown limitation** (the same class the AMD
+  extra carries): on UEFI Secure-Boot hosts the kernel blocks both
+  `/dev/mem` and unsigned out-of-tree modules, so the module must be
+  MOK-enrolled first (`mokutil --import ramsleuth_intel.ko`); a host that
+  can neither load the module nor map the window degrades the Intel section
+  to the corresponding structured N/A (`DriverMissing`, or
+  `InsufficientPrivilege` when the fallback's map is the one blocked).
+
 ---
 
 ## 13. Testing & CI
 
 ### 13.1 The test suite
 
-**694/694 tests green** across the workspace, in debug **and** release, with
+**727/727 tests green** across the workspace, in debug **and** release, with
 `cargo clippy --workspace --all-targets -- -D warnings` reporting **zero
 warnings**. All tests are **in-crate unit tests** (there are no `tests/`
 integration dirs and no `benches/` dirs) — the crate interfaces are designed
