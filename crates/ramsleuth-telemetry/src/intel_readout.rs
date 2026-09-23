@@ -41,14 +41,15 @@
 //! (`IMC_FREQ_RATIO @ 0x5058`, `MCS_COMMAND_* @ 0x5400`), which was a
 //! mis-located skeleton: `0x5058` is a free-running performance counter,
 //! not a frequency ratio (Bug 2). The verified layout is pinned in CI by
-//! the Skylake DDR4-2400 acceptance fixture in the tests below (plan
-//! §6.1) and cross-referenced against coreboot NRI / Libre-FSP and the
+//! the Skylake §6.1 acceptance fixture (ratio 18 @ 133.3333 MHz →
+//! 2400 MHz MCLK / 4800 MT/s) in the tests below and cross-referenced
+//! against coreboot NRI / Libre-FSP and the
 //! kernel EDAC driver.
 //!
 //! # Mapping into the frozen display types (v1 Tier 1)
 //!
 //! - `mclk_mhz` ← `MC_BIOS_REQ`: `ratio × refclk` (the analog DRAM
-//!   clock MCLK — DDR4-2400 = 18 × 133.3333 = **2400 MHz**; for DDR,
+//!   clock MCLK — e.g. ratio 18 × 133.3333 = **2400 MHz**; for DDR,
 //!   MT/s = MCLK × 2), sanity-gated to [1, 4096] MHz; a ratio of 0 =
 //!   unconfigured → `Na(ParseError)`.
 //! - `uclk_mhz`, `fclk_mhz`, `gdm`, `pdm` ← `Na(NotApplicable)`
@@ -123,9 +124,9 @@
 //!
 //! # Fixture tests (the CI stand-in for the hardware acceptance)
 //!
-//! The `tests` module pins the plan §6.1 Skylake DDR4-2400 acceptance
-//! numbers exactly (raw `mcbios_req = 0x00000012` → 2400 MHz MCLK /
-//! 4800 MT/s; `ch0_tc_dbp = 0x11110F11` → 17-15-17-17;
+//! The `tests` module pins the plan §6.1 Skylake acceptance numbers
+//! exactly (raw `mcbios_req = 0x00000012` = ratio 18 @ 133.3333 MHz →
+//! 2400 MHz MCLK / 4800 MT/s; `ch0_tc_dbp = 0x11110F11` → 17-15-17-17;
 //! `ch0_tc_rap = 0x27180204` → tRRD_S 4 / tRTP 8 / tFAW 24 / tRAS 39;
 //! `ch0_tc_rfp = 0x000001A4` → tRFC 420; ch1 symmetric; rc = 56), plus
 //! all-absent degradation, per-register containment, zero-field /
@@ -141,13 +142,12 @@ use crate::intel_mchbar::MchBar;
 // Hardware-authoritative Tier-1 register table (MCHBAR-relative offsets).
 // ---------------------------------------------------------------------------
 
-/// Tier-1 MCHBAR window is 64 KiB per datasheet; Tier-2 (Alder/Raptor)
-/// will require 256 KiB (0x40000).
+/// Tier-1 MCHBAR window is 64 KiB (0x10000) per datasheet.
 ///
 /// Compile-check boundary for this module's register table (every Tier-1
-/// and legacy offset must fit it). The runtime `intel_mchbar` map is a 1
-/// MiB superset (its `MCHBAR_WINDOW_SIZE` is private there); shrinking
-/// that map is a follow-up in `intel_mchbar.rs`.
+/// and legacy offset must fit it). The runtime `/dev/mem` mmap in
+/// `intel_mchbar.rs` uses the same 64 KiB size. Tier-2 (Alder/Raptor)
+/// will require 256 KiB (0x40000).
 pub const MCHBAR_WINDOW: usize = 1 << 16;
 
 /// Global register: the BIOS request word carrying the DRAM clock ratio
@@ -484,7 +484,7 @@ pub fn turnaround_quartet(reg: u32) -> [u16; 4] {
 
 /// The `MC_BIOS_REQ` analog DRAM clock (MCLK) in MHz: `ratio × refclk`
 /// (the DRAM clock is the ratio multiple of the reference clock —
-/// DDR4-2400 = 18 × 133.3333 = 2400 MHz; for DDR, MT/s = MCLK × 2),
+/// e.g. ratio 18 × 133.3333 = 2400 MHz; for DDR, MT/s = MCLK × 2 = 4800),
 /// sanity-gated to [1, 4096] MHz.
 ///
 /// Containment: an absent register → `Na(ParseError)`; a ratio of 0 =
@@ -1163,8 +1163,9 @@ pub fn decode_channel(index: u8, mclk_reg: Option<u32>, regs: [Option<u32>; 4]) 
 #[cfg(test)]
 mod tests {
     //! Fixture tests — the CI stand-in for the hardware acceptance
-    //! (plan §6): the Skylake DDR4-2400 acceptance raws pin the decoded
-    //! numbers exactly, plus degradation / containment / gate /
+    //! (plan §6): the Skylake acceptance raws (`mcbios_req = 0x12` →
+    //! ratio 18 @ 133.3333 MHz = 2400 MHz MCLK / 4800 MT/s) pin the
+    //! decoded numbers exactly, plus degradation / containment / gate /
     //! wire-safety coverage, all without hardware, root, or I/O. The
     //! legacy-compat surface keeps its original fixture tests (they
     //! exercise the frozen compatibility core the downstream GUI / TUI /
@@ -1174,8 +1175,9 @@ mod tests {
     use crate::cpuid::AmdZen;
 
     // -----------------------------------------------------------------
-    // The §6.1 acceptance fixture (Skylake i5-6600T, DDR4-2400
-    // 17-17-17-39, dual-channel symmetric).
+    // The §6.1 acceptance fixture (Skylake i5-6600T, ratio 18 @
+    // 133.3333 MHz → 2400 MHz MCLK / 4800 MT/s, 17-17-17-39,
+    // dual-channel symmetric).
     // -----------------------------------------------------------------
 
     /// The plan §6.1 acceptance raws: `mcbios_req = 0x00000012`,
