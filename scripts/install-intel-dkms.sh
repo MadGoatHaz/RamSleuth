@@ -160,8 +160,7 @@ verify_kobject() {
 # Already loaded (re-run, or AUTOINSTALL=yes rebuilt after a kernel update).
 # On a non-Intel host the kobject never exists, so this never triggers there.
 if [[ -e "${KOBJ}/mchbar_enabled" ]]; then
-  log "${MODULE} already loaded (${KOBJ}/mchbar_enabled present) — nothing to do."
-  exit 0
+  log "${MODULE} already loaded — continuing to rebuild from current source so the loaded module matches."
 fi
 
 # --- Dry-run: read-only preview, stops BEFORE any privileged op ----------------
@@ -187,9 +186,11 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "DRY-RUN: host bridge vendor at 0000:00:00.0 unreadable — the real run would classify the modprobe outcome at load time"
   fi
   log "DRY-RUN: the real run would execute:"
+  log "  dkms remove ${MODULE}/${VERSION} -k ${KERNEL} --no-depmod   (safe no-op on a first run)"
   log "  dkms add ${MODULE}/${VERSION}"
   log "  dkms build ${MODULE}/${VERSION} -k ${KERNEL}"
   log "  dkms install ${MODULE}/${VERSION} -k ${KERNEL}"
+  log "  rmmod ${MODULE}   (safe no-op if the module is not loaded)"
   log "  modprobe ${MODULE}"
   log "  echo ${MODULE} > /etc/modules-load.d/${MODULE}.conf   (only on a successful Intel load)"
   exit 0
@@ -275,6 +276,10 @@ fi
 DKMS_STATUS="$(dkms status 2>/dev/null || true)"
 status_registered() { grep -qE "^${MODULE}/${VERSION}," <<<"${DKMS_STATUS}"; }
 status_installed()  { grep -qE "^${MODULE}/${VERSION},[[:space:]]*${KERNEL}.*:[[:space:]]*installed[[:space:]]*$" <<<"${DKMS_STATUS}"; }
+# Clear any prior registration first: on a re-run the version is already
+# registered, and without this `dkms build` below would be a no-op on the
+# freshly-staged source. `|| true` keeps first runs (nothing registered) safe.
+dkms remove "${MODULE}/${VERSION}" -k "${KERNEL}" --no-depmod 2>/dev/null || true
 if ! dkms add "${MODULE}/${VERSION}"; then
   if status_registered; then
     log "${MODULE}/${VERSION} already registered with DKMS — continuing"
@@ -298,6 +303,10 @@ fi
 # EXPECTED clean outcome (the module is idle; the /dev/mem fallback is used).
 # We discriminate that from a genuine Intel-side failure (Secure Boot, lockdown,
 # MCHBAR disabled) by the host-bridge vendor, and by whether the kobject appears.
+# Unload the resident .ko (if any) so modprobe loads the freshly-built one
+# (modprobe is a no-op on an already-loaded module). `|| true` keeps the
+# not-loaded case safe.
+rmmod "${MODULE}" 2>/dev/null || true
 if modprobe "${MODULE}"; then
   if verify_kobject; then
     install -d /etc/modules-load.d
