@@ -28,7 +28,7 @@
 //!    carries address bits, or a short config image, is
 //!    [`TelemetryError::Parse`].
 //! 4. **Read-only map:** open `/dev/mem` (fallback `/dev/fmem`) and
-//!    `mmap(PROT_READ, MAP_PRIVATE)` the 1 MiB MCHBAR window at the decoded
+//!    `mmap(PROT_READ, MAP_PRIVATE)` the 64 KiB MCHBAR window at the decoded
 //!    base, owned by the RAII [`MchBar`] guard.
 //!    - EACCES/EPERM, or a STRICT_DEVMEM range rejection surfaced by the
 //!      kernel as EIO/ENODATA, → [`TelemetryError::InsufficientPrivilege`].
@@ -95,12 +95,15 @@ const DEV_FMEM: &str = "/dev/fmem";
 /// Privilege hint carried by [`TelemetryError::InsufficientPrivilege`].
 const PRIV_HINT_DEVMEM: &str = "map /dev/mem read-only requires CAP_SYS_RAWIO or root";
 
-/// Size of the MCHBAR MMIO window mapped read-only (1 MiB).
+/// Size of the MCHBAR MMIO window mapped read-only (64 KiB).
 ///
-/// The host-bridge MCHBAR declares a 1 MiB register window; the memory
-/// controller registers P2-07 decodes live within it. It is a page multiple,
-/// so it is a valid `mmap` length.
-const MCHBAR_WINDOW_SIZE: usize = 1 << 20;
+/// The Tier-1 MCHBAR datasheet window is 64 KiB (`0x10000`); every
+/// Tier-1 memory-controller register P2-07 decodes (highest offset
+/// `0x5E04`) lives within it. It is a page multiple, so it is a valid
+/// `mmap` length. Tier-2 (Alder/Raptor Lake) host bridges expose a
+/// 256 KiB (`0x40000`) window and will need a wider map when they are
+/// implemented.
+const MCHBAR_WINDOW_SIZE: usize = 1 << 16;
 
 // ---------------------------------------------------------------------------
 // Frozen public API
@@ -430,7 +433,7 @@ fn mmap_devmem(fd: RawFd, base: u64) -> TelemetryResult<NonNull<u8>> {
     // it, so ownership and the close-on-drop stay with the guard.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     // SAFETY: `None` lets the kernel choose the mapping address; `length` is
-    // a non-zero page multiple (1 MiB); `PROT_READ` makes the region
+    // a non-zero page multiple (64 KiB); `PROT_READ` makes the region
     // read-only, so no write can reach the device; `MAP_PRIVATE` yields a
     // private mapping (copy-on-write pages never write back to hardware);
     // `borrowed` is the open devmem node; `offset` is the page-aligned
