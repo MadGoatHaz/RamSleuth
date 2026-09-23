@@ -10,6 +10,14 @@
 //! map, so both producers feed one decode (plan §3.5: module-first,
 //! devmem-fallback, single decode core).
 //!
+//! 24-attr module builds additionally expose 5 **global** MAD
+//! channel/geometry attributes (`mad_inter_channel`, `mad_intra_ch0/1`,
+//! `mad_dimm_ch0/1`) — outside the per-channel `ch0`/`ch1` stride, so
+//! they are NOT decode inputs: they ride as raw `Option<u32>` siblings on
+//! [`SysfsRegs`]. On a pre-24-attr build (19 attrs) those files are
+//! absent and the 5 fields simply read `None` — graceful degradation,
+//! not an error; the core 19 keep their existing semantics.
+//!
 //! # Design split (mirrors the AMD branch)
 //!
 //! **The module exposes raw values; the decode lives in Rust** (plan §2):
@@ -32,13 +40,15 @@
 //!    [`TelemetryError::Parse`] (broken install). Unreadable →
 //!    [`TelemetryError::InsufficientPrivilege`]; any other I/O →
 //!    [`TelemetryError::Io`].
-//! 3. **Per-attribute containment:** each of the 19 attributes is read
+//! 3. **Per-attribute containment:** each attribute (the core 19, plus
+//!    the 5 global MAD attributes on 24-attr builds) is read
 //!    independently. An **absent** attribute and a **malformed** payload
 //!    both degrade to `None` for that register only — the rest of the set
 //!    assembles normally, nothing panics, and one bad register never
-//!    fails the whole read (frozen parse rules, plan §3.2). Only a
-//!    *permission* or *other I/O* failure on a present attribute is
-//!    reported as a structured [`TelemetryError`].
+//!    fails the whole read (frozen parse rules, plan §3.2). A MAD
+//!    attribute absent on a pre-24-attr build is just `None` (graceful —
+//!    not an error). Only a *permission* or *other I/O* failure on a
+//!    present attribute is reported as a structured [`TelemetryError`].
 //!
 //! # Frozen parse rules (plan §3.2)
 //!
@@ -65,9 +75,9 @@
 //! Fixture tests build a synthetic kobject in a temp directory (the
 //! injectable root of [`read_from`]) — the plan §6.1 Skylake DDR4-2400
 //! acceptance values, the absent / not-a-directory kobject arms, the
-//! per-attribute malformed / absent containment arms, the parse
-//! strictness table, and the error-classification arms. No hardware, no
-//! root.
+//! per-attribute malformed / absent containment arms (incl. the 5 global
+//! MAD attributes on 24-attr vs 19-attr builds), the parse strictness
+//! table, and the error-classification arms. No hardware, no root.
 
 use std::path::Path;
 
@@ -103,8 +113,9 @@ pub struct MchBarInfo {
 }
 
 /// Raw acquisition result from the `ramsleuth_intel` kobject: the 17-slot
-/// raw IMC register set for the decode core, plus the MCHBAR diagnostics
-/// as a sibling.
+/// raw IMC register set for the decode core, the MCHBAR diagnostics as a
+/// sibling, and — on 24-attr module builds — the 5 global MAD
+/// channel/geometry registers as raw siblings (not decode inputs).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SysfsRegs {
     /// The raw register set (17 `Option<u32>` slots; `None` per register
@@ -112,6 +123,21 @@ pub struct SysfsRegs {
     pub regs: IntelImcRegs,
     /// MCHBAR diagnostics (`mchbar_base` / `mchbar_enabled`).
     pub mchbar: MchBarInfo,
+    /// Channel mode / interleave config (raw `mad_inter_channel`).
+    /// `None` on a pre-24-attr module build (absent) or a malformed read.
+    pub mad_inter_channel: Option<u32>,
+    /// Channel 0 rank/geometry (raw `mad_intra_ch0`). `None` on a
+    /// pre-24-attr module build (absent) or a malformed read.
+    pub mad_intra_ch0: Option<u32>,
+    /// Channel 1 rank/geometry (raw `mad_intra_ch1`). `None` on a
+    /// pre-24-attr module build (absent) or a malformed read.
+    pub mad_intra_ch1: Option<u32>,
+    /// Channel 0 DIMM capacity (raw `mad_dimm_ch0`). `None` on a
+    /// pre-24-attr module build (absent) or a malformed read.
+    pub mad_dimm_ch0: Option<u32>,
+    /// Channel 1 DIMM capacity (raw `mad_dimm_ch1`). `None` on a
+    /// pre-24-attr module build (absent) or a malformed read.
+    pub mad_dimm_ch1: Option<u32>,
 }
 
 /// Acquire the raw IMC register set from the `ramsleuth_intel` sysfs
@@ -122,8 +148,9 @@ pub struct SysfsRegs {
 ///    non-Intel hardware is rejected before any file access;
 /// 2. the kobject gate ([`kobject_gate`]) — absent →
 ///    [`TelemetryError::DriverMissing`];
-/// 3. the 19 per-attribute reads with per-register containment
-///    ([`read_from`]).
+/// 3. the per-attribute reads with per-register containment
+///    ([`read_from`]) — the core 19 plus the 5 global MAD attributes,
+///    which read `None` (graceful) on a pre-24-attr module build.
 ///
 /// # Errors
 ///
@@ -175,8 +202,11 @@ fn vendor_string(info: &CpuInfo) -> String {
     }
 }
 
-/// Read the 19 raw attributes from a `ramsleuth_intel`-shaped kobject
-/// directory and assemble the [`SysfsRegs`] result.
+/// Read the raw attributes from a `ramsleuth_intel`-shaped kobject
+/// directory and assemble the [`SysfsRegs`] result: the core 19 (MCHBAR
+/// diagnostics + the 17-slot register set) plus the 5 global MAD
+/// attributes, which are absent on a pre-24-attr module build and then
+/// read `None` (graceful degradation, not an error).
 ///
 /// The root is injectable (the public [`acquire`] passes
 /// [`KOBJECT_DIR`]); the fixture tests pass a temp directory.
@@ -213,6 +243,15 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
         tc_wrwr: read_u32_attr(root, "ch1_tc_wrwr")?,
     };
 
+    // The 5 global MAD channel/geometry attributes (24-attr module
+    // builds only): absent on a pre-24-attr build -> `None` (graceful),
+    // with the same per-attribute containment as the core 19.
+    let mad_inter_channel = read_u32_attr(root, "mad_inter_channel")?;
+    let mad_intra_ch0 = read_u32_attr(root, "mad_intra_ch0")?;
+    let mad_intra_ch1 = read_u32_attr(root, "mad_intra_ch1")?;
+    let mad_dimm_ch0 = read_u32_attr(root, "mad_dimm_ch0")?;
+    let mad_dimm_ch1 = read_u32_attr(root, "mad_dimm_ch1")?;
+
     Ok(SysfsRegs {
         regs: IntelImcRegs {
             mcbios_req: read_u32_attr(root, "mcbios_req")?,
@@ -220,6 +259,11 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
             ch1,
         },
         mchbar,
+        mad_inter_channel,
+        mad_intra_ch0,
+        mad_intra_ch1,
+        mad_dimm_ch0,
+        mad_dimm_ch1,
     })
 }
 
@@ -267,9 +311,9 @@ fn classify_io(e: &std::io::Error) -> TelemetryError {
 
 /// Read one raw attribute by name from the kobject directory.
 ///
-/// - absent → `Ok(None)` (per-register containment — a future module
-///   build that exposes a subset of the 19 attributes degrades only the
-///   missing registers);
+/// - absent → `Ok(None)` (per-register containment — a module build that
+///   exposes a subset degrades only the missing registers, e.g. a
+///   pre-24-attr build lacking the 5 MAD attributes);
 /// - present but not valid UTF-8 → `Ok(None)` (malformed payload);
 /// - unreadable → [`TelemetryError::InsufficientPrivilege`];
 /// - any other I/O → [`TelemetryError::Io`].
@@ -347,8 +391,9 @@ pub fn parse_enabled(payload: &str) -> Option<bool> {
 mod tests {
     //! Fixture tests — the CI stand-in for the kobject: a synthetic
     //! `ramsleuth_intel` directory in a temp root (no hardware, no
-    //! root), pinning the plan §6.1 Skylake DDR4-2400 acceptance values
-    //! and every containment / classification arm.
+    //! root), pinning the plan §6.1 Skylake DDR4-2400 acceptance values,
+    //! the 24-attr vs 19-attr MAD arms, and every containment /
+    //! classification arm.
 
     use super::*;
     use std::path::PathBuf;
@@ -427,6 +472,17 @@ mod tests {
         }
     }
 
+    /// The 5 global MAD attributes as frozen sysfs payloads (`0x%08x\n`)
+    /// — arbitrary raw fixture values (no decode in this chunk; the
+    /// decode lives in a later `intel_readout` chunk).
+    fn write_mad_attrs(k: &TempKobject) {
+        k.write("mad_inter_channel", "0x00000003\n");
+        k.write("mad_intra_ch0", "0x00000005\n");
+        k.write("mad_intra_ch1", "0x00000007\n");
+        k.write("mad_dimm_ch0", "0x00000008\n");
+        k.write("mad_dimm_ch1", "0x0000000C\n");
+    }
+
     // -----------------------------------------------------------------
     // (a) A fully-populated kobject.
     // -----------------------------------------------------------------
@@ -475,6 +531,73 @@ mod tests {
                 enabled: Some(true)
             }
         );
+    }
+
+    // -----------------------------------------------------------------
+    // (a2) The 5 global MAD attributes (24-attr module builds).
+    // -----------------------------------------------------------------
+
+    /// A 24-attr kobject (the core 19 + the 5 MAD attributes) assembles
+    /// the 5 raw MAD fields and keeps the core 19 intact.
+    #[test]
+    fn mad_attrs_populate_on_24_attr_kobject() {
+        let k = TempKobject::new("mad-24");
+        write_acceptance_kobject(&k);
+        write_mad_attrs(&k);
+        let out = read_from(&k.root).expect("kobject present -> Ok");
+        assert_eq!(out.regs, acceptance_regs());
+        assert_eq!(
+            out.mchbar,
+            MchBarInfo {
+                base: Some(0xFED1_0000),
+                enabled: Some(true)
+            }
+        );
+        assert_eq!(out.mad_inter_channel, Some(0x0000_0003));
+        assert_eq!(out.mad_intra_ch0, Some(0x0000_0005));
+        assert_eq!(out.mad_intra_ch1, Some(0x0000_0007));
+        assert_eq!(out.mad_dimm_ch0, Some(0x0000_0008));
+        assert_eq!(out.mad_dimm_ch1, Some(0x0000_000C));
+    }
+
+    /// A pre-24-attr kobject (the core 19 only, no MAD files) degrades
+    /// gracefully: all 5 MAD fields are `None`, the core 19 populate as
+    /// usual (no error, no `DriverMissing`).
+    #[test]
+    fn absent_mad_attrs_degrade_to_none_on_19_attr_kobject() {
+        let k = TempKobject::new("mad-absent");
+        write_acceptance_kobject(&k); // the 19 core attributes only
+        let out = read_from(&k.root).expect("containment -> Ok");
+        assert_eq!(out.regs, acceptance_regs());
+        assert_eq!(
+            out.mchbar,
+            MchBarInfo {
+                base: Some(0xFED1_0000),
+                enabled: Some(true)
+            }
+        );
+        assert_eq!(out.mad_inter_channel, None);
+        assert_eq!(out.mad_intra_ch0, None);
+        assert_eq!(out.mad_intra_ch1, None);
+        assert_eq!(out.mad_dimm_ch0, None);
+        assert_eq!(out.mad_dimm_ch1, None);
+    }
+
+    /// One malformed MAD attribute → `None` for that field only; the
+    /// other 4 MAD fields and the core 19 assemble (containment).
+    #[test]
+    fn malformed_mad_attr_degrades_to_none_only() {
+        let k = TempKobject::new("mad-malformed");
+        write_acceptance_kobject(&k);
+        write_mad_attrs(&k);
+        k.write("mad_intra_ch1", "not-a-register\n");
+        let out = read_from(&k.root).expect("containment -> Ok");
+        assert_eq!(out.regs, acceptance_regs());
+        assert_eq!(out.mad_inter_channel, Some(0x0000_0003));
+        assert_eq!(out.mad_intra_ch0, Some(0x0000_0005));
+        assert_eq!(out.mad_intra_ch1, None);
+        assert_eq!(out.mad_dimm_ch0, Some(0x0000_0008));
+        assert_eq!(out.mad_dimm_ch1, Some(0x0000_000C));
     }
 
     // -----------------------------------------------------------------
