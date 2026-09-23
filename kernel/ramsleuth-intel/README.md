@@ -53,7 +53,7 @@ kernel updates automatically. `dkms status` shows the bookkeeping.
 
 ## Frozen sysfs interface
 
-19 attributes, all read-only (`0444`), under `/sys/kernel/ramsleuth_intel/`.
+24 attributes, all read-only (`0444`), under `/sys/kernel/ramsleuth_intel/`.
 This list is the frozen contract the Rust reader (INTEL-03) parses:
 name, source, and line format are stable.
 
@@ -78,10 +78,19 @@ name, source, and line format are stable.
 | `ch1_tc_rdwr` | MCHBAR + `0x4424` | `0x%08x` |
 | `ch1_tc_wrrd` | MCHBAR + `0x4428` | `0x%08x` |
 | `ch1_tc_wrwr` | MCHBAR + `0x442C` | `0x%08x` |
+| `mad_inter_channel` | MCHBAR + `0x5000` | `0x%08x` |
+| `mad_intra_ch0` | MCHBAR + `0x5004` | `0x%08x` |
+| `mad_intra_ch1` | MCHBAR + `0x5008` | `0x%08x` |
+| `mad_dimm_ch0` | MCHBAR + `0x500C` | `0x%08x` |
+| `mad_dimm_ch1` | MCHBAR + `0x5010` | `0x%08x` |
 
 Channel 1 mirrors channel 0 across the `0x400` dual-controller stride;
 the turnaround quartet sits at `+0x20`…`+0x2C` inside each channel
-block.
+block. The five `mad_*` attributes are global (not per-channel)
+IMC registers: `mad_inter_channel` (channel mode / interleave
+configuration), `mad_intra_ch0`/`mad_intra_ch1` (channel 0/1
+rank/geometry), and `mad_dimm_ch0`/`mad_dimm_ch1` (channel 0/1 DIMM
+capacity).
 
 ## Known limitation: Secure Boot / lockdown
 
