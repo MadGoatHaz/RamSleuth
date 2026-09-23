@@ -36,7 +36,7 @@
 #define MCHBAR_LO_OFF	0x48
 #define MCHBAR_HI_OFF	0x4C
 #define MCHBAR_EN		BIT(0)		/* bit 0: MCHBAR enable */
-#define MCHBAR_ADDR_MASK	0x0000007FFFFF000ULL
+#define MCHBAR_ADDR_MASK	0x0000007FFFFFF000ULL	/* bits 12..38 */
 
 /* Tier 1: map the 64 KiB window covering every register we expose
  * (the highest exposed offset is MC_BIOS_REQ at 0x5E00). */
