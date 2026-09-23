@@ -63,6 +63,14 @@
 #define REG_TC_WRRD_CH1	0x4428
 #define REG_TC_WRWR_CH1	0x442C
 
+/* Global (not per-channel) IMC channel-mode / DIMM-geometry
+ * registers (raw only; the userspace reader decodes them). */
+#define REG_MAD_INTER_CHANNEL	0x5000
+#define REG_MAD_INTRA_CH0	0x5004
+#define REG_MAD_INTRA_CH1	0x5008
+#define REG_MAD_DIMM_CH0	0x500C
+#define REG_MAD_DIMM_CH1	0x5010
+
 static u64 mchbar_base;		/* masked MCHBAR physical base */
 static void __iomem *mchbar_mmio;
 static struct kobject *ramsleuth_kobj;
@@ -100,6 +108,11 @@ RAW_ATTR(ch1_tc_rdrd, REG_TC_RDRD_CH1)
 RAW_ATTR(ch1_tc_rdwr, REG_TC_RDWR_CH1)
 RAW_ATTR(ch1_tc_wrrd, REG_TC_WRRD_CH1)
 RAW_ATTR(ch1_tc_wrwr, REG_TC_WRWR_CH1)
+RAW_ATTR(mad_inter_channel, REG_MAD_INTER_CHANNEL)
+RAW_ATTR(mad_intra_ch0, REG_MAD_INTRA_CH0)
+RAW_ATTR(mad_intra_ch1, REG_MAD_INTRA_CH1)
+RAW_ATTR(mad_dimm_ch0, REG_MAD_DIMM_CH0)
+RAW_ATTR(mad_dimm_ch1, REG_MAD_DIMM_CH1)
 
 /*
  * MCHBAR physical base, 16 hex digits, no prefix
@@ -144,6 +157,11 @@ static struct attribute *ramsleuth_attrs[] = {
 	&dev_attr_ch1_tc_rdwr.attr,
 	&dev_attr_ch1_tc_wrrd.attr,
 	&dev_attr_ch1_tc_wrwr.attr,
+	&dev_attr_mad_inter_channel.attr,
+	&dev_attr_mad_intra_ch0.attr,
+	&dev_attr_mad_intra_ch1.attr,
+	&dev_attr_mad_dimm_ch0.attr,
+	&dev_attr_mad_dimm_ch1.attr,
 	NULL,
 };
 static struct attribute_group ramsleuth_group = {
