@@ -16,7 +16,10 @@ name: Release
 #       bin/ramsleuth, bin/ramsleuth-tui, bin/ramsleuth-client,
 #       bin/ramsleuth-daemon, bin/ramsleuth-bench, bin/ramsleuth-telemetry,
 #       systemd/ramsleuth.service, systemd/ramsleuth.preset,
-#       scripts/install-ryzen-smu-dkms.sh, install.sh, LICENSE, RamSleuth.desktop,
+#       scripts/install-ryzen-smu-dkms.sh, scripts/install-intel-dkms.sh,
+#       kernel/ramsleuth-intel/ (the 4 module source files; the Intel DKMS
+#       one-click path, INTEL-14),
+#       install.sh, LICENSE, RamSleuth.desktop,
 #       ramsleuth-setup.sh, 90-ramsleuth-setup.policy,
 #       assets/icons/ (the hicolor tree, 8 sizes — one artifact; C21-27)
 #
@@ -97,6 +100,11 @@ jobs:
             packaging/shared/ramsleuth.preset \
             packaging/shared/RamSleuth.desktop \
             scripts/install-ryzen-smu-dkms.sh \
+            scripts/install-intel-dkms.sh \
+            kernel/ramsleuth-intel/dkms.conf \
+            kernel/ramsleuth-intel/Makefile \
+            kernel/ramsleuth-intel/ramsleuth_intel.c \
+            kernel/ramsleuth-intel/README.md \
             install.sh \
             LICENSE \
             scripts/ramsleuth-setup.sh \
@@ -112,28 +120,35 @@ jobs:
             missing=1
           fi
           [ "$missing" -eq 0 ] || { echo "Refusing to publish: release artifacts missing"; exit 1; }
-          echo "All 15 release artifacts present (6 binaries + 9 auxiliary)"
-          # NOTE (C21-27): the assets/icons hicolor tree is staged into the
-          # tarball by the Stage step below; the release-artifact count is 15
-          # (6 binaries + 9 auxiliary — the tree counts as one artifact).
+          echo "All 19 release artifacts present (6 binaries + 13 auxiliary)"
+          # NOTE (C21-27 / INTEL-14): the assets/icons hicolor tree is
+          # staged into the tarball by the Stage step below; the
+          # release-artifact count is 19 (6 binaries + 13 auxiliary: the 8
+          # pre-Intel auxiliary files + the Intel DKMS helper + the 4
+          # kernel/ramsleuth-intel module source files; the hicolor tree
+          # ships as a bundle).
 
       - name: Stage artifacts
         run: |
           set -euo pipefail
           S="stage/ramsleuth-$VER"
-          mkdir -p "$S/bin" "$S/systemd" "$S/scripts"
+          mkdir -p "$S/bin" "$S/systemd" "$S/scripts" "$S/kernel/ramsleuth-intel"
           for b in ramsleuth ramsleuth-tui ramsleuth-client ramsleuth-daemon ramsleuth-bench ramsleuth-telemetry; do
             cp "target/release/$b" "$S/bin/$b"
           done
           cp systemd/ramsleuth.service "$S/systemd/"
           cp packaging/shared/ramsleuth.preset "$S/systemd/"
           cp scripts/install-ryzen-smu-dkms.sh "$S/scripts/"
+          cp scripts/install-intel-dkms.sh "$S/scripts/"
           cp install.sh "$S/"
           cp LICENSE "$S/"
           cp packaging/shared/RamSleuth.desktop "$S/"
           cp -r assets/icons "$S/"
           cp scripts/ramsleuth-setup.sh "$S/"
           cp packaging/polkit/90-ramsleuth-setup.policy "$S/"
+          for f in dkms.conf Makefile ramsleuth_intel.c README.md; do
+            cp "kernel/ramsleuth-intel/$f" "$S/kernel/ramsleuth-intel/"
+          done
           chmod +x "$S/bin/"* "$S/scripts/"*.sh "$S/install.sh" "$S/ramsleuth-setup.sh"
           find stage -type f | sort
 
