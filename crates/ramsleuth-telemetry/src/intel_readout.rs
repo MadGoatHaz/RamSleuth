@@ -226,12 +226,14 @@ pub const LEGACY_MCS_MAX_OFFSET: usize =
 // Compile-time proof that every register read in this module (both the
 // hardware-authoritative Tier-1 table and the legacy skeleton table)
 // fits the 64 KiB Tier-1 MCHBAR window (each read is a 4-byte access).
-const _ASSERT_IMC_READS_IN_WINDOW: () = assert!(
-    MAX_IMC_OFFSET <= MCHBAR_WINDOW
+// A violated bound fails const evaluation (division by zero).
+const _ASSERT_IMC_READS_IN_WINDOW: () = {
+    let in_window = MAX_IMC_OFFSET <= MCHBAR_WINDOW
         && MAX_CHANNEL_OFFSET <= MCHBAR_WINDOW
         && LEGACY_FREQ_RATIO_OFFSET + 4 <= MCHBAR_WINDOW
-        && LEGACY_MCS_MAX_OFFSET <= MCHBAR_WINDOW
-);
+        && LEGACY_MCS_MAX_OFFSET <= MCHBAR_WINDOW;
+    let _proof: usize = 1 / if in_window { 1 } else { 0 };
+};
 
 // ---------------------------------------------------------------------------
 // Sanity ranges (mirroring the AMD display gates: the same plausible

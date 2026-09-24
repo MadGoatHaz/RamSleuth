@@ -373,7 +373,7 @@ fn acquire_linux() -> TelemetryResult<MchBar> {
 #[cfg(target_os = "linux")]
 fn read_host_bridge_config() -> TelemetryResult<Vec<u8>> {
     let path = format!("/sys/bus/pci/devices/{HOST_BRIDGE_BDF}/config");
-    match std::fs::read(&path) {
+    match std::fs::read(path) {
         Ok(bytes) => Ok(bytes),
         // Host-bridge device absent from the PCI bus.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
