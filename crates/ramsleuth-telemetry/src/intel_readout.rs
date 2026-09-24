@@ -1477,7 +1477,7 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 ///   gear cells layer on from `MC_BIOS_REQ[17:16]` on the profile's
 ///   `GearCap::Gear4` (Breakdown §3D: gear 4 on Alder / Meteor /
 ///   Arrow for LPDDR5X and high-speed DDR5; Research line 145:
-///   >7200 MT/s). **OQ-11: confirm on hardware before shipping** —
+///   \>7200 MT/s). **OQ-11: confirm on hardware before shipping** —
 ///   the DDR5 condition is the working assumption.
 /// - **every remaining generation** — the unprofiled generations
 ///   (Ice Lake / Tiger Lake / `Unrecognized`): the whole readout
