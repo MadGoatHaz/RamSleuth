@@ -60,6 +60,13 @@ pub enum IntelGen {
     ArrowLake,
     /// Intel (family 6) with an unrecognized model.
     Unrecognized,
+    /// 11th gen (Rocket Lake, 2021, 10 nm) — DDR4.
+    ///
+    /// Appended after [`Self::Unrecognized`] so the existing variant
+    /// indices (and the frozen wire encoding) are preserved (OQ-10). No
+    /// CPUID model is bucketed to this variant yet —
+    /// `intel_gen_from_model` gains the Rocket Lake arm in IG-10.
+    RocketLake,
 }
 
 /// CPU vendor + generation. The frozen dispatch key for every provider.

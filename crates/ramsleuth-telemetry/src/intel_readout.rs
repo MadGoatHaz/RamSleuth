@@ -378,7 +378,8 @@ pub fn channel_count(gen: IntelGen) -> u8 {
         | IntelGen::IceLake
         | IntelGen::TigerLake
         | IntelGen::AlderLake
-        | IntelGen::RaptorLake => 2,
+        | IntelGen::RaptorLake
+        | IntelGen::RocketLake => 2,
         IntelGen::MeteorLake | IntelGen::ArrowLake => 4,
         IntelGen::Unrecognized => 2,
     }
@@ -1972,6 +1973,7 @@ mod tests {
             IntelGen::TigerLake,
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
+            IntelGen::RocketLake,
             IntelGen::Unrecognized,
         ];
         for g in two {

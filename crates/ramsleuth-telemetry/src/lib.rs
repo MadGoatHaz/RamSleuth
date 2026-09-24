@@ -21,6 +21,7 @@ pub mod amd_smn; // P6-02 — ryzen_smu `smn` sysfs accessor + verified SMN bitf
 pub mod intel_mchbar; // P2-06 — Intel MCHBAR PCI decode + read-only /dev/mem mmap guard.
 pub mod intel_readout; // P2-07 — Intel per-channel IMC register decode -> shared display types.
 pub mod intel_sysfs; // INTEL-03 — ramsleuth_intel sysfs raw reader (IntelImcRegs producer; per-register containment).
+pub mod intel_gen; // IG-01 — per-generation MCHBAR decode profiles (Tier 1 + Rocket Lake; CRITICAL-PATH foundation).
 pub mod spd_eeprom; // P2-08 — ee1004 raw SPD image acquisition (sysfs, unprivileged).
 pub mod spd_decode; // P2-09 — pure SPD decode: JEP106 / rank / density / speed + XMP 2.0 / EXPO profiles.
 pub mod facade; // P2-10 — SystemMemoryTelemetry facade + collect() (per-branch containment).
