@@ -283,7 +283,7 @@ pub fn render_status_zone(ui: &mut egui::Ui, data: &TelemetryData) -> GuiAction 
         render_spd_cards(ui, data);
         ui.add_space(4.0);
         let status = daemon_status_line(data);
-        ui.label(egui::RichText::new(&status).color(daemon_status_color(data)));
+        ui.label(egui::RichText::new(status).color(daemon_status_color(data)));
         if let Some(error) = &data.error {
             ui.label(egui::RichText::new(format!("! {error}")).color(CRIMSON));
         }

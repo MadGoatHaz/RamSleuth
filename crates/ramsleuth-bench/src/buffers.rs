@@ -129,7 +129,7 @@ fn size_of(bytes: u64) -> usize {
 fn read_tier_size(level: u32, type_name: Option<&str>) -> Option<u64> {
     let cache_dir = Path::new(SYSFS_CPU_ROOT).join("cpu0").join("cache");
     let mut candidates: Vec<(usize, PathBuf)> = Vec::new();
-    for entry in fs::read_dir(&cache_dir).ok()?.flatten() {
+    for entry in fs::read_dir(cache_dir).ok()?.flatten() {
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
             continue;
