@@ -9,7 +9,8 @@
 //! - Vendor string from leaf 0 (EBX ‖ EDX ‖ ECX) → "AuthenticAMD" /
 //!   "GenuineIntel" / unknown.
 //! - AMD extended family from leaf `0x80000001` → [`AmdZen`].
-//! - Intel family/model from leaf 1 → [`IntelGen`].
+//! - Intel family/model from leaf 1 → [`IntelGen`] (the brand string
+//!   disambiguates the shared `0xA5` Comet/Rocket model, OQ-10).
 //! - Brand string from leaves `0x80000002`–`0x80000004`.
 //!
 //! Non-`x86_64` targets compile to [`CpuVendor::Unknown`] (brand
@@ -63,11 +64,12 @@ pub enum IntelGen {
     /// 11th gen (Rocket Lake, 2021, 10 nm) — DDR4.
     ///
     /// Appended after [`Self::Unrecognized`] so the existing variant
-    /// indices (and the frozen wire encoding) are preserved (OQ-10). Not
-    /// yet emitted by `detect()`: every Rocket Lake SKU reports CPUID
-    /// model `0xA5`, shared with Comet Lake, and
-    /// `intel_gen_from_model` sees the model number only (no
-    /// stepping/microcode) — see its OQ note (IG-10).
+    /// indices (and the frozen wire encoding) are preserved (OQ-10).
+    /// Emitted by `detect()` (IG-15) when the CPUID model is the shared
+    /// `0xA5` (Comet Lake / Rocket Lake — the model number alone cannot
+    /// split them, OQ-10) and the brand string's marketing generation
+    /// is 11th gen ([`intel_gen_from_brand`]); a `0xA5` CPU without an
+    /// 11th-gen brand hint stays the conservative Comet Lake bucket.
     RocketLake,
 }
 
@@ -132,6 +134,9 @@ fn detect_x86() -> CpuInfo {
     let leaf0 = unsafe { __cpuid(0) };
     let kind = vendor_kind_from_words(leaf0.ebx, leaf0.ecx, leaf0.edx);
     let max_ext = unsafe { __cpuid(0x80000000).eax };
+    // Read the brand up front: the Intel generation resolution consults
+    // it to disambiguate the shared `0xA5` Comet/Rocket model (OQ-10).
+    let brand = read_brand(max_ext);
 
     let vendor = match kind {
         VendorKind::Amd => {
@@ -158,7 +163,16 @@ fn detect_x86() -> CpuInfo {
             };
             let model = ((eax >> 16) & 0xF) * 16 + ((eax >> 4) & 0xF);
             let gen = if full_family == 0x6 {
-                intel_gen_from_model(model).unwrap_or(IntelGen::Unrecognized)
+                // IG-15: resolve via the brand string, not the model
+                // number alone. The CPUID model field cannot split the
+                // shared `0xA5` (Comet Lake 10th gen vs Rocket Lake
+                // 11th gen — OQ-10); [`intel_gen_from_brand`] returns
+                // the model's bucket unchanged for every unambiguous
+                // model and consults the brand's marketing generation
+                // only for the shared `0xA5` (11th-gen → Rocket Lake;
+                // absent or non-11th-gen hint → the conservative Comet
+                // Lake default).
+                intel_gen_from_brand(&brand, model).unwrap_or(IntelGen::Unrecognized)
             } else {
                 IntelGen::Unrecognized
             };
@@ -169,7 +183,7 @@ fn detect_x86() -> CpuInfo {
 
     CpuInfo {
         vendor,
-        brand: read_brand(max_ext),
+        brand,
     }
 }
 
@@ -552,7 +566,10 @@ mod tests {
     /// (model-only input), so it is deliberately NOT guessed: `0xA5`
     /// keeps its pre-existing Comet Lake bucket, and `0x9A` (genuine
     /// Coffee Lake, 8th/9th-gen desktop) is not re-bucketed to Rocket
-    /// Lake (Director, OQ-1 option (a)).
+    /// Lake (Director, OQ-1 option (a)). Since IG-15 the split IS
+    /// resolved — via `intel_gen_from_brand` (the brand string's
+    /// 11th-gen marketing generation, now plumbed into `detect()`), not
+    /// via this model-only function, which stays unchanged below.
     #[test]
     fn rocket_lake_oq_0xa5_split_unresolvable_from_model() {
         // Conservative: the shared model keeps its pre-existing bucket.
@@ -561,8 +578,10 @@ mod tests {
         assert_eq!(intel_gen_from_model(0x9A), Some(IntelGen::CoffeeLake));
         // No model number is unambiguously Rocket Lake, so no 8-bit CPUID
         // model value maps to [`IntelGen::RocketLake`] (exhaustive over
-        // the model field); the variant stays reachable only via the wire
-        // until stepping (and/or the brand string) is plumbed in.
+        // the model field); the variant stays unreachable through this
+        // model-only function — since IG-15 `detect()` resolves the
+        // shared `0xA5` via `intel_gen_from_brand` (the brand string),
+        // not via this one.
         for m in 0..=0xFFu32 {
             assert_ne!(intel_gen_from_model(m), Some(IntelGen::RocketLake));
         }
