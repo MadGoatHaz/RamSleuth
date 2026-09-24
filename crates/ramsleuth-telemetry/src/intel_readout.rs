@@ -136,6 +136,7 @@
 use crate::amd_readout::{CadBus, ClockReadout, DivMode, GearMode, TimingSet, VoltageSet};
 use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
+use crate::intel_gen::GearCap;
 use crate::intel_mchbar::MchBar;
 
 // ---------------------------------------------------------------------------
@@ -517,6 +518,54 @@ fn decode_mclk(reg: Option<u32>) -> Section<f64> {
 /// `false` = 133.3333 MHz.
 fn mcbios_refclk_100(raw: u32) -> bool {
     raw & 0x0100 != 0
+}
+
+/// The `MC_BIOS_REQ` gear-ratio field (bits [17:16] — Rocket+ only)
+/// decoded to a [`GearMode`], verbatim per Breakdown §3D:
+///
+/// - bit 16 = 0b → [`GearMode::One`] (1:1, the synchronous default —
+///   valid on every gear cap);
+/// - bit 16 = 1b → [`GearMode::Two`] (the `Gear2` and `Gear4` caps);
+/// - bit 17 = 1b (with bit 16 = 0b) → [`GearMode::Four`], allowed ONLY
+///   when `cap == GearCap::Gear4` (Alder Lake and later); on a `Gear2`
+///   cap (Rocket Lake) a set bit 17 is over-cap → `None` (documented);
+/// - any other reserved / over-cap encoding (notably gear bits set on a
+///   `GearCap::None` Tier-1 platform, which has no gear register) →
+///   `None`.
+///
+/// A `11b` field follows the bit-16 rule (gear 2) — the pinned
+/// Breakdown §4 example D reading. Pure and cap-parameterized
+/// (IG-11, ISOLATED): no live path calls this until IG-12 wires it
+/// into [`decode`].
+pub fn mcbios_gear(raw: u32, cap: GearCap) -> Option<GearMode> {
+    if raw & 0x0001_0000 != 0 {
+        // Gear 2 (bit 16 = 1b): every 2×-gear-capable platform.
+        matches!(cap, GearCap::Gear2 | GearCap::Gear4).then_some(GearMode::Two)
+    } else if raw & 0x0002_0000 != 0 {
+        // Gear 4 (bit 17 = 1b, bit 16 = 0b): only the 4× cap (Alder+).
+        (cap == GearCap::Gear4).then_some(GearMode::Four)
+    } else {
+        // Gear 1 (bits [17:16] = 00b): 1:1 — every cap.
+        Some(GearMode::One)
+    }
+}
+
+/// The internal controller clock (f_UCLK) for the decoded gear, per
+/// Breakdown §3D (f_UCLK = MCLK, MCLK/2, MCLK/4 for gears 1, 2, 4):
+/// `uclk = mclk / gear_divisor(gear)`, sanity-gated to the [1, 4096]
+/// MHz clock band via [`clock_section`].
+///
+/// Containment mirrors the legacy uclk rule: an `Na` gear cell (a
+/// failed register read, a reserved, or an over-cap encoding) →
+/// `Na(ParseError)` — never a bogus clock. Pure (IG-11, ISOLATED);
+/// wired into [`decode`] by IG-12.
+pub fn decode_uclk(mclk: f64, gear: &Section<GearMode>) -> Section<f64> {
+    match gear.value().copied() {
+        Some(g) => clock_section(mclk / gear_divisor(g)),
+        None => Section::na(NaReason::ParseError(
+            "uclk = mclk / gear: gear unavailable or reserved encoding".to_owned(),
+        )),
+    }
 }
 
 /// Decode one displayed tick field from an optionally-failed register
@@ -1453,6 +1502,164 @@ mod tests {
         ));
         assert!(matches!(decode_mclk(Some(30)), Section::Value(_)));
         assert!(matches!(decode_mclk(Some(0x0128)), Section::Value(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Gear + UCLK decoders (IG-11): the Breakdown §3D gear map and the
+    // §4 worked examples A–D pinned end to end (raw word → gear → uclk).
+    // -----------------------------------------------------------------
+
+    /// The §3D gear map over all three caps: 00b → One everywhere;
+    /// 01b → Two (Gear2/Gear4); 10b → Four (Gear4 only — over-cap on
+    /// the Rocket Gear2 cap and on Tier-1 no-gear, documented); 11b →
+    /// Two (the bit-16 rule — the pinned example D reading). Junk in
+    /// the other bits never affects the decode.
+    #[test]
+    fn mcbios_gear_maps_the_3d_field() {
+        for cap in [GearCap::None, GearCap::Gear2, GearCap::Gear4] {
+            assert_eq!(mcbios_gear(0x0000_0000, cap), Some(GearMode::One), "00b, {cap:?}");
+            assert_eq!(
+                mcbios_gear(0x0112, cap),
+                Some(GearMode::One),
+                "00b + junk bits, {cap:?}"
+            );
+        }
+        assert_eq!(mcbios_gear(0x0001_0000, GearCap::None), None, "01b over-cap (Tier 1)");
+        assert_eq!(mcbios_gear(0x0001_0000, GearCap::Gear2), Some(GearMode::Two));
+        assert_eq!(mcbios_gear(0x0001_0000, GearCap::Gear4), Some(GearMode::Two));
+        assert_eq!(mcbios_gear(0x0002_0000, GearCap::None), None, "10b over-cap (Tier 1)");
+        assert_eq!(
+            mcbios_gear(0x0002_0000, GearCap::Gear2),
+            None,
+            "10b over-cap (Rocket, documented)"
+        );
+        assert_eq!(mcbios_gear(0x0002_0000, GearCap::Gear4), Some(GearMode::Four));
+        assert_eq!(mcbios_gear(0x0003_0000, GearCap::None), None, "11b over-cap (Tier 1)");
+        assert_eq!(mcbios_gear(0x0003_0000, GearCap::Gear2), Some(GearMode::Two), "11b (Gear2)");
+        assert_eq!(mcbios_gear(0x0003_0000, GearCap::Gear4), Some(GearMode::Two), "11b (Gear4)");
+    }
+
+    /// Breakdown §4 example A: DDR4-3200, gear 1 on a 100 MHz base —
+    /// `mcbios_req = 0x00000110` (ratio 16, REF_CLK = 100 MHz, bits
+    /// [17:16] = 00b) → gear One; mclk = 16 × 100 = 1600 MHz; uclk =
+    /// mclk (the 1:1 synchronous clock).
+    #[test]
+    fn breakdown_example_a_gear1_100_mhz_base() {
+        let raw = 0x0000_0110;
+        assert_eq!(mcbios_gear(raw, GearCap::Gear2), Some(GearMode::One));
+        let mclk = decode_mclk(Some(raw)).value().copied().expect("ratio 16 @ 100 MHz in-band");
+        let uclk = decode_uclk(mclk, &Section::Value(GearMode::One));
+        assert!((mclk - 1600.0).abs() < 0.01, "mclk = 1600 MHz, got {mclk}");
+        assert!(
+            (uclk.value().copied().unwrap_or(0.0) - 1600.0).abs() < 0.01,
+            "uclk = mclk"
+        );
+    }
+
+    /// Breakdown §4 example B: DDR4-3200, gear 1 on a 133.3333 MHz base
+    /// — `mcbios_req = 0x0000000C` (ratio 12, REF_CLK = 133.3333 MHz) →
+    /// gear One; mclk = 12 × 133.3333 = 1600 MHz; uclk = mclk.
+    #[test]
+    fn breakdown_example_b_gear1_133_mhz_base() {
+        let raw = 0x0000_000C;
+        assert_eq!(mcbios_gear(raw, GearCap::Gear2), Some(GearMode::One));
+        let mclk = decode_mclk(Some(raw))
+            .value()
+            .copied()
+            .expect("ratio 12 @ 133.3333 in-band");
+        let uclk = decode_uclk(mclk, &Section::Value(GearMode::One));
+        assert!((mclk - 1600.0).abs() < 0.01, "mclk = 1600 MHz, got {mclk}");
+        assert!(
+            (uclk.value().copied().unwrap_or(0.0) - 1600.0).abs() < 0.01,
+            "uclk = mclk"
+        );
+    }
+
+    /// Breakdown §4 example C: DDR5-4800, gear 2 on a 133.3333 MHz base
+    /// — `mcbios_req = 0x00010012` (ratio 18, REF_CLK = 133.3333 MHz,
+    /// bit 16 = 1b) → gear Two; mclk = 18 × 133.3333 = 2400 MHz;
+    /// uclk = 2400 / 2 = 1200 MHz.
+    #[test]
+    fn breakdown_example_c_gear2_133_mhz_base() {
+        let raw = 0x0001_0012;
+        assert_eq!(mcbios_gear(raw, GearCap::Gear4), Some(GearMode::Two));
+        let mclk = decode_mclk(Some(raw))
+            .value()
+            .copied()
+            .expect("ratio 18 @ 133.3333 in-band");
+        let uclk = decode_uclk(mclk, &Section::Value(GearMode::Two));
+        assert!((mclk - 2400.0).abs() < 0.01, "mclk = 2400 MHz, got {mclk}");
+        assert!(
+            (uclk.value().copied().unwrap_or(0.0) - 1200.0).abs() < 0.01,
+            "uclk = mclk / 2"
+        );
+    }
+
+    /// Breakdown §4 example D, pinned raw word `mcbios_req = 0x0003001E`:
+    /// bits [17:16] = 11b → the bit-16 rule = gear **Two** (not Four);
+    /// ratio 30, REF_CLK = 133.3333 MHz → mclk = 30 × 133.3333 = 4000
+    /// MHz; uclk = mclk / 2 = 2000 MHz.
+    #[test]
+    fn breakdown_example_d_gear2_11b_field() {
+        let raw = 0x0003_001E;
+        assert_eq!(mcbios_gear(raw, GearCap::Gear4), Some(GearMode::Two), "11b → gear 2");
+        let mclk = decode_mclk(Some(raw))
+            .value()
+            .copied()
+            .expect("ratio 30 @ 133.3333 in-band");
+        let uclk = decode_uclk(mclk, &Section::Value(GearMode::Two));
+        assert!((mclk - 4000.0).abs() < 0.01, "mclk = 4000 MHz, got {mclk}");
+        assert!(
+            (mclk / 2.0 - uclk.value().copied().unwrap_or(0.0)).abs() < 0.01,
+            "uclk = mclk / 2"
+        );
+        assert!(
+            (uclk.value().copied().unwrap_or(0.0) - 2000.0).abs() < 0.01,
+            "uclk = 2000 MHz"
+        );
+    }
+
+    /// Breakdown §4 example D narrative register settings (DDR5-6000,
+    /// gear 2 on a 100 MHz base): `mcbios_req = 0x0003011E` (ratio 30,
+    /// REF_CLK = 100 MHz, bits [17:16] = 11b → gear Two) → mclk = 30 ×
+    /// 100 = 3000 MHz; uclk = 3000 / 2 = 1500 MHz.
+    #[test]
+    fn breakdown_example_d_narrative_100_mhz_base() {
+        let raw = 0x0003_011E;
+        assert_eq!(mcbios_gear(raw, GearCap::Gear4), Some(GearMode::Two));
+        let mclk = decode_mclk(Some(raw)).value().copied().expect("ratio 30 @ 100 MHz in-band");
+        let uclk = decode_uclk(mclk, &Section::Value(GearMode::Two));
+        assert!((mclk - 3000.0).abs() < 0.01, "mclk = 3000 MHz, got {mclk}");
+        assert!(
+            (uclk.value().copied().unwrap_or(0.0) - 1500.0).abs() < 0.01,
+            "uclk = mclk / 2 = 1500 MHz"
+        );
+    }
+
+    /// `decode_uclk` containment + the gear-divisor semantics: an `Na`
+    /// gear cell degrades uclk to `Na(ParseError)` (never a bogus
+    /// clock); gears 1/2/4 divide mclk by 1/2/4; the [1, 4096] MHz
+    /// sanity gate bounds the displayed value.
+    #[test]
+    fn decode_uclk_divides_and_degrades() {
+        assert_eq!(
+            decode_uclk(2400.0, &Section::Value(GearMode::One)),
+            Section::Value(2400.0)
+        );
+        assert_eq!(
+            decode_uclk(2400.0, &Section::Value(GearMode::Two)),
+            Section::Value(1200.0)
+        );
+        assert_eq!(
+            decode_uclk(2400.0, &Section::Value(GearMode::Four)),
+            Section::Value(600.0)
+        );
+        let na = Section::na(NaReason::ParseError("reserved gear encoding".to_owned()));
+        let uclk = decode_uclk(2400.0, &na);
+        assert!(matches!(uclk, Section::Na(NaReason::ParseError(_))));
+        // 1.0 / 4 = 0.25 MHz is outside the [1, 4096] band.
+        let uclk = decode_uclk(1.0, &Section::Value(GearMode::Four));
+        assert!(matches!(uclk, Section::Na(NaReason::ParseError(_))));
     }
 
     // -----------------------------------------------------------------
