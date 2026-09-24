@@ -6,9 +6,11 @@
 //! unsafe, no CPUID — the module is unit-tested in isolation and is the
 //! foundation every later generational-expansion chunk dispatches on.
 //!
-//! IG-01 lands the Tier-1 (Skylake–Comet Lake) and Rocket Lake profiles
-//! only; the `Alder`, `Sandy`, and `Haswell` `GenMap` families exist now
-//! and gain their profile entries in later chunks (IG-03+).
+//! IG-01 lands the Tier-1 (Skylake–Comet Lake) and Rocket Lake profiles;
+//! IG-03 adds the Tier-3 `Alder` family entries (Alder/Raptor Lake at the
+//! DDR4-default 2-channel count, Meteor/Arrow Lake at 4 channels). The
+//! `Sandy` and `Haswell` `GenMap` families exist now and gain their
+//! profile entries in later chunks once their `IntelGen` variants land.
 //!
 //! The `mchbar_mask` values here are **diagnostic-only** for the
 //! dispatcher (OQ-8): they document the alignment contract each profile
@@ -34,19 +36,20 @@ pub enum GearCap {
 /// The register-map family a generation's MCHBAR offsets belong to.
 ///
 /// The families the generational expansion knows about. IG-01 populates
-/// `Tier1` and `Rocket`; the `Alder`, `Sandy`, and `Haswell` entries land
-/// in later chunks (IG-03+).
+/// `Tier1` and `Rocket`; IG-03 populates `Alder`; the `Sandy` and
+/// `Haswell` entries land in later chunks once their `IntelGen` variants
+/// exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenMap {
     /// Skylake–Comet Lake (64 KiB window, no gear register).
     Tier1,
     /// Rocket Lake (64 KiB window, 2× gear).
     Rocket,
-    /// Alder/Raptor/Meteor/Arrow Lake (256 KiB window, 4× gear) — IG-03+.
+    /// Alder/Raptor/Meteor/Arrow Lake (256 KiB window, 4× gear) — IG-03.
     Alder,
-    /// Sandy/Ivy Bridge (32 KiB window) — IG-03+.
+    /// Sandy/Ivy Bridge (32 KiB window) — later chunk (variants pending).
     Sandy,
-    /// Haswell/Broadwell (64 KiB window) — IG-03+.
+    /// Haswell/Broadwell (64 KiB window) — later chunk (variants pending).
     Haswell,
 }
 
@@ -57,7 +60,8 @@ pub enum GenMap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenProfile {
     /// The MCHBAR register window size in bytes the profile's register
-    /// table is compile-checked against (Tier 1/Rocket: 64 KiB).
+    /// table is compile-checked against (Tier 1/Rocket: 64 KiB; the
+    /// Alder family: 256 KiB).
     pub window_size: usize,
     /// The MCHBAR base-address alignment mask (diagnostic-only, OQ-8).
     pub mchbar_mask: u64,
@@ -90,12 +94,39 @@ const ROCKET: GenProfile = GenProfile {
     map: GenMap::Rocket,
 };
 
+/// The Alder/Raptor Lake profile: the 256 KiB window with the 4×-gear
+/// register set (Breakdown §2; Research line 19). `channel_count` = 2
+/// documents the DDR4 default — OQ-11's DDR5 detection (IG-26) flips the
+/// decode-time count to 4; the profile field itself is untouched.
+const ALDER_2CH: GenProfile = GenProfile {
+    window_size: 0x40000,
+    mchbar_mask: 0x0000007FFFFFC0000,
+    channel_count: 2,
+    gear: GearCap::Gear4,
+    map: GenMap::Alder,
+};
+
+/// The Meteor/Arrow Lake profile: the 256 KiB window with the 4×-gear
+/// register set and the native 4-channel DDR5 count (Breakdown §2;
+/// Research lines 20–21; the tile-routing caveat OQ-5 is handled in
+/// IG-28).
+const ALDER_4CH: GenProfile = GenProfile {
+    window_size: 0x40000,
+    mchbar_mask: 0x0000007FFFFFC0000,
+    channel_count: 4,
+    gear: GearCap::Gear4,
+    map: GenMap::Alder,
+};
+
 /// Resolve the static decode profile for a generation.
 ///
-/// Returns the shared Tier-1 profile for the four Tier-1 generations and
-/// the Rocket Lake profile for [`IntelGen::RocketLake`]; every other
-/// generation (including [`IntelGen::Unrecognized`]) resolves to `None`
-/// until its family gains a profile entry in a later chunk (IG-03+).
+/// Returns the shared Tier-1 profile for the four Tier-1 generations,
+/// the Rocket Lake profile for [`IntelGen::RocketLake`], the 2-channel
+/// Alder profile for [`IntelGen::AlderLake`] / [`IntelGen::RaptorLake`]
+/// and the 4-channel profile for [`IntelGen::MeteorLake`] /
+/// [`IntelGen::ArrowLake`] (IG-03); every other generation (Ice Lake,
+/// Tiger Lake, and [`IntelGen::Unrecognized`]) resolves to `None` until
+/// its family gains a profile entry in a later chunk.
 pub fn profile_for(gen: IntelGen) -> Option<&'static GenProfile> {
     match gen {
         IntelGen::Skylake
@@ -103,6 +134,8 @@ pub fn profile_for(gen: IntelGen) -> Option<&'static GenProfile> {
         | IntelGen::CoffeeLake
         | IntelGen::CometLake => Some(&TIER1),
         IntelGen::RocketLake => Some(&ROCKET),
+        IntelGen::AlderLake | IntelGen::RaptorLake => Some(&ALDER_2CH),
+        IntelGen::MeteorLake | IntelGen::ArrowLake => Some(&ALDER_4CH),
         _ => None,
     }
 }
@@ -148,11 +181,49 @@ mod tests {
         assert_eq!(p.map, GenMap::Rocket);
     }
 
-    /// Non-profiled generations resolve to `None` in IG-01: a
-    /// non-Tier-1/2 generation (Alder Lake) and `Unrecognized`.
+    /// Non-profiled generations resolve to `None` in IG-03: Ice Lake
+    /// and Tiger Lake (no family entry yet) and `Unrecognized`.
     #[test]
     fn non_profiled_generations_resolve_to_none() {
-        assert_eq!(profile_for(IntelGen::AlderLake), None);
+        assert_eq!(profile_for(IntelGen::IceLake), None);
+        assert_eq!(profile_for(IntelGen::TigerLake), None);
         assert_eq!(profile_for(IntelGen::Unrecognized), None);
+    }
+
+    /// Alder Lake and Raptor Lake resolve to the shared 2-channel
+    /// Tier-3 profile (IG-03): 256 KiB window, the 256 KiB alignment
+    /// mask, the DDR4-default channel count, the 4×-gear register set,
+    /// the Alder map (Breakdown §2; Research line 19).
+    #[test]
+    fn tier3_dual_channel_generations_resolve_to_alder_profile() {
+        for gen in [IntelGen::AlderLake, IntelGen::RaptorLake] {
+            let p = profile_for(gen)
+                .unwrap_or_else(|| panic!("{gen:?} must resolve to the 2-channel Alder profile"));
+            assert_eq!(p, &ALDER_2CH, "{gen:?}");
+            assert_eq!(p.window_size, 0x40000, "{gen:?}");
+            assert_eq!(p.mchbar_mask, 0x0000007FFFFFC0000, "{gen:?}");
+            assert_eq!(p.channel_count, 2, "{gen:?}");
+            assert_eq!(p.gear, GearCap::Gear4, "{gen:?}");
+            assert_eq!(p.map, GenMap::Alder, "{gen:?}");
+        }
+    }
+
+    /// Meteor Lake and Arrow Lake resolve to the 4-channel Tier-3
+    /// profile (IG-03): the same 256 KiB window, mask, 4×-gear
+    /// register set, and Alder map as the dual-channel profile, with
+    /// the native 4-channel DDR5 count (Breakdown §2; Research lines
+    /// 20–21).
+    #[test]
+    fn tier3_quadruple_channel_generations_resolve_to_alder_profile() {
+        for gen in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
+            let p = profile_for(gen)
+                .unwrap_or_else(|| panic!("{gen:?} must resolve to the 4-channel Alder profile"));
+            assert_eq!(p, &ALDER_4CH, "{gen:?}");
+            assert_eq!(p.window_size, 0x40000, "{gen:?}");
+            assert_eq!(p.mchbar_mask, 0x0000007FFFFFC0000, "{gen:?}");
+            assert_eq!(p.channel_count, 4, "{gen:?}");
+            assert_eq!(p.gear, GearCap::Gear4, "{gen:?}");
+            assert_eq!(p.map, GenMap::Alder, "{gen:?}");
+        }
     }
 }
