@@ -1,4 +1,4 @@
-# RamSleuth v2.2.1
+# RamSleuth v2.4.0
 
 Live memory-controller telemetry and an AIDA64-style benchmark engine for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
 
@@ -13,8 +13,8 @@ Every privileged read flows through a single root daemon that holds only `CAP_SY
 ## Why RamSleuth
 
 - **Live AMD memory-controller state** — SMU PM-table clocks (MCLK/UCLK/FCLK), 27 DRAM subtimings, GDM, and command rate via the `ryzen_smu` kernel driver.
-- **Live Intel memory-controller state** — trained DRAM subtimings + the DRAM core clock on Skylake through Comet Lake (DDR4) desktops, decoded from the IMC registers: the `ramsleuth_intel` kernel module's sysfs interface first, the host-bridge MCHBAR mapped read-only through `/dev/mem` as the fallback where the kernel permits.
-- **Unprivileged SPD** — every DIMM's EEPROM decoded without root: JEP106 makers, rank, density, base speed, XMP 2.0/3.0 + EXPO profiles.
+- **Live Intel memory-controller state** — trained DRAM subtimings + the DRAM core clock, decoded from the IMC registers: the `ramsleuth_intel` kernel module's 24 sysfs attributes first (IMC subtimings + the 5 MAD channel/geometry registers), the host-bridge MCHBAR — a 64 KiB window — mapped read-only through `/dev/mem` as the fallback where the kernel permits. The Tier-1 decode targets the Skylake–Comet Lake DDR4 desktop line and is validated on Skylake; the channel-mode label is hardware-derived from `MAD_INTER_CHANNEL`, falling back to the installed-DIMM count when the module is absent.
+- **Unprivileged SPD** — every DIMM's EEPROM decoded without root: JEP106 makers, rank, density, base speed, XMP 2.0/3.0 + EXPO profiles; the root daemon additionally attempts to bind any EEPROM the kernel's `ee1004` driver missed (SPD auto-bind, on by default — `--no-spd-autobind` to disable, non-fatal, never unbinds).
 - **AIDA64-style 4×4 benchmark** — native AVX2/AVX-512F kernels, one worker pinned per physical core, pointer-chase latency, and an optional burn-in soak.
 - **Dual frontend, full CLI** — the same live three-zone dashboard in a 16-key ratatui terminal UI and an egui desktop app, with 5-series graphs and PNG/JSON export.
 - **Minimal privilege** — one daemon, `CAP_SYS_RAWIO` only, on a group-owned Unix socket.
@@ -52,7 +52,7 @@ yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest i
 
 **AMD live subtimings (optional extra):** `yay -S ryzen-smu-dkms` installs the pinned `ryzen_smu` kernel driver; without it the AMD fields read `N/A (DriverMissing)` and everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
 
-**Intel live subtimings (optional extra):** `yay -S ramsleuth-intel-dkms` provides the `ramsleuth_intel` kernel module — DKMS-built for your running kernel, exposing the raw IMC registers over world-readable sysfs; every install also ships the helper directly (`sudo ramsleuth-install-intel-dkms`), and the one-click setup routes to it automatically on Intel hosts. Without it the daemon falls back to the read-only `/dev/mem` MCHBAR map where the kernel permits, and the Intel fields read `N/A (DriverMissing)` where it does not — everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
+**Intel live subtimings (optional extra):** `yay -S ramsleuth-intel-dkms` provides the `ramsleuth_intel` kernel module — DKMS-built for your running kernel, exposing the raw IMC registers over world-readable sysfs; source and dev-branch installs ship the helper directly (`sudo ramsleuth-install-intel-dkms`), and the one-click setup routes to it automatically on Intel hosts (the published `ramsleuth-bin` binary carries the helper once the v2.4.0 re-cut is published). Without it the daemon falls back to the read-only `/dev/mem` MCHBAR map where the kernel permits, and the Intel fields read `N/A (DriverMissing)` where it does not — everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
 
 **Build from source:** `cargo build --workspace --release` — Rust MSRV 1.75, producing the 6 binaries above; system-library and per-path details in the [User Guide](Docs/User_Guide.md).
 
@@ -72,10 +72,10 @@ The full walkthrough — every zone, key, flag, N/A reason, and day-2 troublesho
 - [Packaging & AUR](packaging/README.md) — the two-package AUR model, the unified version-bump flow, the `ryzen-smu-dkms` extra, and the CI/release artifact contracts.
 - [Changelog](CHANGELOG.md) — release history.
 
-**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.2.1**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
+**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.0**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
 
 ## License
 
 MIT — the workspace `Cargo.toml` declares `license = "MIT"`. Repository: <https://github.com/MadGoatHaz/RamSleuth>.
 
-RamSleuth v2.2.1 · branch `v2-development`
+RamSleuth v2.4.0 · branch `v2-development`
