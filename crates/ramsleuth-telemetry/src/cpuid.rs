@@ -63,9 +63,11 @@ pub enum IntelGen {
     /// 11th gen (Rocket Lake, 2021, 10 nm) — DDR4.
     ///
     /// Appended after [`Self::Unrecognized`] so the existing variant
-    /// indices (and the frozen wire encoding) are preserved (OQ-10). No
-    /// CPUID model is bucketed to this variant yet —
-    /// `intel_gen_from_model` gains the Rocket Lake arm in IG-10.
+    /// indices (and the frozen wire encoding) are preserved (OQ-10). Not
+    /// yet emitted by `detect()`: every Rocket Lake SKU reports CPUID
+    /// model `0xA5`, shared with Comet Lake, and
+    /// `intel_gen_from_model` sees the model number only (no
+    /// stepping/microcode) — see its OQ note (IG-10).
     RocketLake,
 }
 
@@ -251,11 +253,26 @@ fn amd_zen_from_family(family: u32, ext_family: u32) -> Option<AmdZen> {
 ///
 /// Best-effort table covering Skylake through Arrow Lake; P2-07 refines the
 /// per-generation IMC register offset tables. `None` → [`IntelGen::Unrecognized`].
+///
+/// **OQ (IG-10): the `0xA5` Comet Lake / Rocket Lake split is unresolved
+/// with this helper's model-only input.** Every Rocket Lake (11th-gen
+/// desktop) SKU reports model `0xA5` — the same as Comet Lake — and the
+/// hardware distinguishes the two by stepping/microcode, neither of which
+/// reaches this function (the steppings overlap, e.g. `0x2`/`0x4`; the
+/// microcode revision is an MSR, not a CPUID field). No model number is
+/// unambiguously Rocket Lake, so per the Director decision (OQ-1, option
+/// (a)) this is NOT guessed: `0xA5` keeps its pre-existing
+/// [`IntelGen::CometLake`] bucket and [`IntelGen::RocketLake`] gains no
+/// arm. Disambiguation would require plumbing stepping (and/or the CPUID
+/// brand string) into this helper — a follow-up OQ, not an IG-10 change.
 fn intel_gen_from_model(model: u32) -> Option<IntelGen> {
     match model {
         0x4F | 0x56 | 0x5E => Some(IntelGen::Skylake),
         0x52 | 0x8E | 0x9E => Some(IntelGen::KabyLake),
         0x8F | 0x9A | 0x9F | 0xCA | 0xCB | 0xCF | 0xD0 => Some(IntelGen::CoffeeLake),
+        // OQ (IG-10): `0xA5` is shared by Comet Lake and Rocket Lake; the
+        // split needs stepping/microcode, which this model-only helper
+        // does not receive — it keeps the conservative Comet Lake bucket.
         0xA5 | 0xAD | 0xAF | 0xB7 | 0xC2 | 0xC5 => Some(IntelGen::CometLake),
         0x8C | 0x92 | 0x9B | 0x9C => Some(IntelGen::IceLake),
         0x88 | 0x97 | 0xA8 => Some(IntelGen::TigerLake),
@@ -360,5 +377,120 @@ mod tests {
         let back: CpuInfo =
             bincode::deserialize(&bytes).expect("CpuInfo must deserialize");
         assert_eq!(info, back);
+    }
+
+    /// (e) OQ-10 wire pinning (IG-10): appending [`IntelGen::RocketLake`]
+    /// after [`IntelGen::Unrecognized`] (IG-01) must not shift any
+    /// pre-existing variant's bincode encoding. bincode 1.x encodes a
+    /// unit-variant enum as its u32 discriminant, little-endian (4
+    /// bytes); each pre-existing variant serializes to exactly its
+    /// original discriminant (Skylake=0 … ArrowLake=9,
+    /// Unrecognized=10) and the appended Rocket Lake lands at 11 — the
+    /// append-only OQ-10 rule, byte-for-byte.
+    #[test]
+    fn intel_gen_bincode_byte_pinning_oq10() {
+        let pre_existing: [(IntelGen, u32); 11] = [
+            (IntelGen::Skylake, 0),
+            (IntelGen::KabyLake, 1),
+            (IntelGen::CoffeeLake, 2),
+            (IntelGen::CometLake, 3),
+            (IntelGen::IceLake, 4),
+            (IntelGen::TigerLake, 5),
+            (IntelGen::AlderLake, 6),
+            (IntelGen::RaptorLake, 7),
+            (IntelGen::MeteorLake, 8),
+            (IntelGen::ArrowLake, 9),
+            (IntelGen::Unrecognized, 10),
+        ];
+        for (gen, expected) in pre_existing {
+            let bytes =
+                bincode::serialize(&gen).expect("IntelGen must serialize (OQ-10 pin)");
+            assert_eq!(
+                bytes,
+                expected.to_le_bytes().to_vec(),
+                "{gen:?} wire encoding must be unchanged (OQ-10)"
+            );
+        }
+        // The appended variant occupies the next discriminant only.
+        let bytes = bincode::serialize(&IntelGen::RocketLake)
+            .expect("IntelGen::RocketLake must serialize (OQ-10 pin)");
+        assert_eq!(bytes, 11u32.to_le_bytes().to_vec());
+    }
+
+    /// (f) The pre-existing model → generation table is pinned
+    /// bucket-by-bucket: IG-10 moves no model out of any existing bucket
+    /// (and widens no bucket — unlisted models stay `None`).
+    #[test]
+    fn intel_gen_from_model_full_table() {
+        let table: &[(u32, IntelGen)] = &[
+            (0x4F, IntelGen::Skylake),
+            (0x56, IntelGen::Skylake),
+            (0x5E, IntelGen::Skylake),
+            (0x52, IntelGen::KabyLake),
+            (0x8E, IntelGen::KabyLake),
+            (0x9E, IntelGen::KabyLake),
+            (0x8F, IntelGen::CoffeeLake),
+            (0x9A, IntelGen::CoffeeLake),
+            (0x9F, IntelGen::CoffeeLake),
+            (0xCA, IntelGen::CoffeeLake),
+            (0xCB, IntelGen::CoffeeLake),
+            (0xCF, IntelGen::CoffeeLake),
+            (0xD0, IntelGen::CoffeeLake),
+            (0xA5, IntelGen::CometLake),
+            (0xAD, IntelGen::CometLake),
+            (0xAF, IntelGen::CometLake),
+            (0xB7, IntelGen::CometLake),
+            (0xC2, IntelGen::CometLake),
+            (0xC5, IntelGen::CometLake),
+            (0x8C, IntelGen::IceLake),
+            (0x92, IntelGen::IceLake),
+            (0x9B, IntelGen::IceLake),
+            (0x9C, IntelGen::IceLake),
+            (0x88, IntelGen::TigerLake),
+            (0x97, IntelGen::TigerLake),
+            (0xA8, IntelGen::TigerLake),
+            (0xA6, IntelGen::AlderLake),
+            (0xBF, IntelGen::AlderLake),
+            (0xC0, IntelGen::AlderLake),
+            (0xA7, IntelGen::RaptorLake),
+            (0xD4, IntelGen::RaptorLake),
+            (0xD5, IntelGen::RaptorLake),
+            (0xAC, IntelGen::MeteorLake),
+            (0xAA, IntelGen::MeteorLake),
+            (0xB6, IntelGen::MeteorLake),
+            (0x8A, IntelGen::ArrowLake),
+        ];
+        for &(model, gen) in table {
+            assert_eq!(
+                intel_gen_from_model(model),
+                Some(gen),
+                "model {model:#04x} bucket moved"
+            );
+        }
+        // No widening: unlisted models stay unrecognized.
+        assert_eq!(intel_gen_from_model(0x00), None);
+        assert_eq!(intel_gen_from_model(0xFF), None);
+    }
+
+    /// (g) OQ (IG-10): the `0xA5` Comet Lake / Rocket Lake split. `0xA5`
+    /// is reported by BOTH generations; the hardware split is by
+    /// stepping/microcode, which `intel_gen_from_model` does not receive
+    /// (model-only input), so it is deliberately NOT guessed: `0xA5`
+    /// keeps its pre-existing Comet Lake bucket, and `0x9A` (genuine
+    /// Coffee Lake, 8th/9th-gen desktop) is not re-bucketed to Rocket
+    /// Lake (Director, OQ-1 option (a)).
+    #[test]
+    fn rocket_lake_oq_0xa5_split_unresolvable_from_model() {
+        // Conservative: the shared model keeps its pre-existing bucket.
+        assert_eq!(intel_gen_from_model(0xA5), Some(IntelGen::CometLake));
+        // Coffee Lake is never mislabeled Rocket Lake.
+        assert_eq!(intel_gen_from_model(0x9A), Some(IntelGen::CoffeeLake));
+        // No model number is unambiguously Rocket Lake, so no 8-bit CPUID
+        // model value maps to [`IntelGen::RocketLake`] (exhaustive over
+        // the model field); the variant stays reachable only via the wire
+        // until stepping (and/or the brand string) is plumbed in.
+        for m in 0..=0xFFu32 {
+            assert_ne!(intel_gen_from_model(m), Some(IntelGen::RocketLake));
+        }
     }
 }
