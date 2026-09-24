@@ -28,8 +28,9 @@
 //!    carries address bits, or a short config image, is
 //!    [`TelemetryError::Parse`].
 //! 4. **Read-only map:** open `/dev/mem` (fallback `/dev/fmem`) and
-//!    `mmap(PROT_READ, MAP_PRIVATE)` the 64 KiB MCHBAR window at the decoded
-//!    base, owned by the RAII [`MchBar`] guard.
+//!    `mmap(PROT_READ, MAP_PRIVATE)` the profile-sized MCHBAR window at
+//!    the decoded base (64 KiB Tier 1/2, 256 KiB Tier 3 —
+//!    [`window_size_for`], IG-25), owned by the RAII [`MchBar`] guard.
 //!    - EACCES/EPERM, or a STRICT_DEVMEM range rejection surfaced by the
 //!      kernel as EIO/ENODATA, → [`TelemetryError::InsufficientPrivilege`].
 //!    - Neither node present → [`TelemetryError::DriverMissing`].
@@ -56,6 +57,7 @@ use std::ptr::NonNull;
 
 use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{TelemetryError, TelemetryResult};
+use crate::intel_gen::profile_for;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{BorrowedFd, RawFd};
@@ -95,15 +97,23 @@ const DEV_FMEM: &str = "/dev/fmem";
 /// Privilege hint carried by [`TelemetryError::InsufficientPrivilege`].
 const PRIV_HINT_DEVMEM: &str = "map /dev/mem read-only requires CAP_SYS_RAWIO or root";
 
-/// Size of the MCHBAR MMIO window mapped read-only (64 KiB).
+/// Size of the MCHBAR MMIO window mapped read-only for Tier 1/2
+/// (64 KiB).
 ///
 /// The Tier-1 MCHBAR datasheet window is 64 KiB (`0x10000`); every
 /// Tier-1 memory-controller register P2-07 decodes (highest offset
 /// `0x5E04`) lives within it. It is a page multiple, so it is a valid
-/// `mmap` length. Tier-2 (Alder/Raptor Lake) host bridges expose a
-/// 256 KiB (`0x40000`) window and will need a wider map when they are
-/// implemented.
+/// `mmap` length. The wider 256 KiB Tier-3 window is
+/// [`MCHBAR_WINDOW_SIZE_TIER3`], selected per generation by
+/// [`window_size_for`] (IG-25).
 const MCHBAR_WINDOW_SIZE: usize = 1 << 16;
+
+/// Size of the MCHBAR MMIO window mapped read-only for the Tier-3 Alder
+/// family (256 KiB, IG-25): the profiled window of
+/// `AlderLake` / `RaptorLake` / `MeteorLake` / `ArrowLake`
+/// (IG-03; Research roadmap Tier 3 — "Expand window to 256 KiB").
+/// A page multiple, so it is a valid `mmap` length.
+const MCHBAR_WINDOW_SIZE_TIER3: usize = 1 << 18;
 
 // ---------------------------------------------------------------------------
 // Frozen public API
@@ -124,7 +134,10 @@ pub struct MchBar {
     base: u64,
     /// Start of the read-only mapped window.
     region: NonNull<u8>,
-    /// Length of the mapped window in bytes ([`MCHBAR_WINDOW_SIZE`]).
+    /// Length of the mapped window in bytes (profile-selected:
+    /// [`MCHBAR_WINDOW_SIZE`] 64 KiB for Tier 1/2,
+    /// [`MCHBAR_WINDOW_SIZE_TIER3`] 256 KiB for the Tier-3 Alder
+    /// family — [`window_size_for`], IG-25).
     len: usize,
 }
 
@@ -222,7 +235,7 @@ pub fn acquire() -> TelemetryResult<MchBar> {
     // 2. Platform gate: the devmem map is Linux-only.
     #[cfg(target_os = "linux")]
     {
-        acquire_linux()
+        acquire_linux(info.vendor)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -319,6 +332,31 @@ pub fn mchbar_base(bar5: u64) -> u64 {
     bar5 & MCHBAR_BASE_MASK
 }
 
+/// The mapped MCHBAR window size for a detected vendor (IG-25): the
+/// profiled generation's `window_size` from
+/// [`intel_gen::profile_for`] (Tier 1 and Rocket Lake: 64 KiB; the
+/// Tier-3 Alder family: 256 KiB), the 64 KiB [`MCHBAR_WINDOW_SIZE`]
+/// default for a non-profiled generation, and the same default for
+/// non-Intel vendors (the vendor gate rejects them before any map;
+/// the default keeps this fn pure and total).
+pub fn window_size_for(vendor: CpuVendor) -> usize {
+    match vendor {
+        CpuVendor::Intel(gen) => profile_for(gen)
+            .map(|p| {
+                // The profile window normalizes to one of the two known
+                // page-multiple map sizes (IG-25); the test pins the
+                // equality against `GenProfile::window_size`.
+                if p.window_size == MCHBAR_WINDOW_SIZE_TIER3 {
+                    MCHBAR_WINDOW_SIZE_TIER3
+                } else {
+                    MCHBAR_WINDOW_SIZE
+                }
+            })
+            .unwrap_or(MCHBAR_WINDOW_SIZE),
+        CpuVendor::Amd(_) | CpuVendor::Unknown => MCHBAR_WINDOW_SIZE,
+    }
+}
+
 /// Bounds-check a 4-byte register read at `offset` against a window of
 /// `len` bytes.
 ///
@@ -348,7 +386,7 @@ fn check_read_bounds(offset: usize, len: usize) -> Result<(), TelemetryError> {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-fn acquire_linux() -> TelemetryResult<MchBar> {
+fn acquire_linux(vendor: CpuVendor) -> TelemetryResult<MchBar> {
     let config = read_host_bridge_config()?;
     let raw = decode_bar5(&config)?;
     let base = mchbar_base(raw);
@@ -357,15 +395,18 @@ fn acquire_linux() -> TelemetryResult<MchBar> {
             vendor: "Intel host bridge with unpopulated MCHBAR (BAR5=0, virtualized or unsupported)".to_owned(),
         });
     }
+    // The window size is profile-driven (IG-25): 256 KiB for the
+    // Tier-3 Alder family, 64 KiB otherwise.
+    let length = window_size_for(vendor);
     let fd = open_devmem()?;
     let guard = FdGuard(fd);
-    let region = mmap_devmem(guard.fd(), base)?;
+    let region = mmap_devmem(guard.fd(), base, length)?;
     // `guard` closes the fd when it drops at scope exit; the mapping is
     // independent of the fd and is owned by the returned `MchBar`.
     Ok(MchBar {
         base,
         region,
-        len: MCHBAR_WINDOW_SIZE,
+        len: length,
     })
 }
 
@@ -408,9 +449,10 @@ fn open_devmem() -> TelemetryResult<RawFd> {
     }
 }
 
-/// `mmap` the MCHBAR window at `base` read-only and return the mapped region.
+/// `mmap` the `length`-byte MCHBAR window at `base` read-only and
+/// return the mapped region.
 #[cfg(target_os = "linux")]
-fn mmap_devmem(fd: RawFd, base: u64) -> TelemetryResult<NonNull<u8>> {
+fn mmap_devmem(fd: RawFd, base: u64, length: usize) -> TelemetryResult<NonNull<u8>> {
     use nix::libc::off_t;
     use nix::sys::mman::{mmap, MapFlags, ProtFlags};
     use std::num::NonZeroUsize;
@@ -425,15 +467,17 @@ fn mmap_devmem(fd: RawFd, base: u64) -> TelemetryResult<NonNull<u8>> {
             })
         }
     };
-    // The window size is a non-zero constant; the `MIN` fallback keeps this
+    // The window size is a non-zero page multiple (64 KiB Tier 1/2,
+    // 256 KiB Tier 3 — `window_size_for`); the `MIN` fallback keeps this
     // total without `expect` (no-panic contract).
-    let length = NonZeroUsize::new(MCHBAR_WINDOW_SIZE).unwrap_or(NonZeroUsize::MIN);
+    let length = NonZeroUsize::new(length).unwrap_or(NonZeroUsize::MIN);
     // SAFETY: `fd` is a valid, open devmem descriptor for the duration of
     // this call (the caller holds the `FdGuard`); `borrow_raw` only borrows
     // it, so ownership and the close-on-drop stay with the guard.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     // SAFETY: `None` lets the kernel choose the mapping address; `length` is
-    // a non-zero page multiple (64 KiB); `PROT_READ` makes the region
+    // a non-zero page multiple (64 KiB Tier 1/2, 256 KiB Tier 3);
+    // `PROT_READ` makes the region
     // read-only, so no write can reach the device; `MAP_PRIVATE` yields a
     // private mapping (copy-on-write pages never write back to hardware);
     // `borrowed` is the open devmem node; `offset` is the page-aligned
@@ -708,5 +752,41 @@ mod tests {
                 "raw OS code {code} (STRICT_DEVMEM rejection) must classify as InsufficientPrivilege, not Io"
             );
         }
+    }
+
+    /// (f) The profile-selected window size (IG-25): Tier 1 + Rocket
+    /// Lake map the 64 KiB datasheet window, the Tier-3 Alder family
+    /// maps the 256 KiB window, non-profiled generations keep the 64
+    /// KiB default, and non-Intel vendors never map (the gate rejects
+    /// them first; the default keeps this fn pure).
+    #[test]
+    fn window_size_for_selects_the_profile_window() {
+        for gen in [
+            IntelGen::Skylake,
+            IntelGen::KabyLake,
+            IntelGen::CoffeeLake,
+            IntelGen::CometLake,
+            IntelGen::RocketLake,
+            IntelGen::IceLake,
+            IntelGen::TigerLake,
+            IntelGen::Unrecognized,
+        ] {
+            let expected = profile_for(gen).map_or(MCHBAR_WINDOW_SIZE, |p| p.window_size);
+            assert_eq!(window_size_for(CpuVendor::Intel(gen)), expected, "{gen:?}");
+        }
+        for gen in [
+            IntelGen::AlderLake,
+            IntelGen::RaptorLake,
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
+        ] {
+            assert_eq!(
+                window_size_for(CpuVendor::Intel(gen)),
+                MCHBAR_WINDOW_SIZE_TIER3,
+                "{gen:?}"
+            );
+        }
+        assert_eq!(window_size_for(CpuVendor::Amd(AmdZen::Zen3)), MCHBAR_WINDOW_SIZE);
+        assert_eq!(window_size_for(CpuVendor::Unknown), MCHBAR_WINDOW_SIZE);
     }
 }
