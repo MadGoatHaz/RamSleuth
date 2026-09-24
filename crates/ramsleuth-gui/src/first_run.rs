@@ -15,8 +15,12 @@
 //! [`CpuInfo::detect()`] as the unprivileged fallback that needs no
 //! daemon) → `sudo ramsleuth-install-ryzen-smu-dkms` (the detail names
 //! the pinned upstream, [`RYZEN_SMU_PIN_SHORT`] — D-18.6 transparency
-//! inside the app). Intel (the built-in MCHBAR decode) and healthy AMD
-//! → no requirements at all.
+//! inside the app); (4) Intel silicon with the daemon connected and
+//! the Intel branch `Na(DriverMissing)` (the module is absent and the
+//! `/dev/mem` fallback is blocked) → `sudo ramsleuth-install-intel-dkms`
+//! (the same pure-CPUID vendor check — the mirror of the AMD case).
+//! Healthy AMD / Intel (the built-in MCHBAR decode) → no requirements
+//! at all.
 //!
 //! [`render_requirements_strip_with_setup`] paints that list as the
 //! `SETUP` strip the app shell shows on launch (the C18-02
@@ -76,6 +80,11 @@ pub const RYZEN_SMU_PIN_SHORT: &str = "d298366";
 /// requirement's command — the secondary polkit-less path, D-18.5).
 pub const DKMS_INSTALL_CMD: &str = "sudo ramsleuth-install-ryzen-smu-dkms";
 
+/// The manual/CLI fallback command for the Intel driver (the command
+/// for the Intel DKMS requirement — the secondary polkit-less path,
+/// mirror of the AMD [`DKMS_INSTALL_CMD`]).
+pub const DKMS_INSTALL_CMD_INTEL: &str = "sudo ramsleuth-install-intel-dkms";
+
 /// One actionable first-run requirement: the one-line summary (the
 /// bold row text), the dim detail, and the exact command to run
 /// (rendered with a **Copy** button — the clipboard is the "run it"
@@ -124,6 +133,17 @@ fn dkms_requirement() -> Requirement {
     }
 }
 
+/// Case 4 — the Intel `ramsleuth_intel` driver is missing: install the
+/// DKMS module (mirror of the AMD [`dkms_requirement`]; the helper
+/// builds the bundled `ramsleuth_intel` source).
+fn intel_dkms_requirement() -> Requirement {
+    Requirement {
+        summary: "Install the `ramsleuth_intel` kernel module (live Intel subtimings)".to_owned(),
+        detail: "the helper builds the bundled `ramsleuth_intel` DKMS module — shown + confirmed before any build; RamSleuth runs without it".to_owned(),
+        command: Some(DKMS_INSTALL_CMD_INTEL.to_owned()),
+    }
+}
+
 /// The host's CPU vendor for the AMD-branch check (D-18.5: pure CPUID,
 /// no daemon needed): the snapshot's `cpu.vendor` is the daemon's own
 /// CPUID detection (the same host) and is authoritative when it names
@@ -169,12 +189,21 @@ pub fn diagnose(data: &TelemetryData) -> Vec<Requirement> {
 
     // Case 3: AMD silicon with the daemon connected and the `ryzen_smu`
     // driver missing (the AMD branch is `Na(DriverMissing)`).
+    // Case 4: Intel silicon with the daemon connected and the
+    // `ramsleuth_intel` driver missing (the Intel branch is
+    // `Na(DriverMissing)` — the module is absent and the `/dev/mem`
+    // fallback is blocked); the mirror of the AMD case.
     if data.daemon_status.starts_with("connected") {
         if let Some(telemetry) = &data.telemetry {
             if matches!(telemetry.amd, Section::Na(NaReason::DriverMissing))
                 && matches!(host_vendor(telemetry), CpuVendor::Amd(_))
             {
                 requirements.push(dkms_requirement());
+            }
+            if matches!(telemetry.intel, Section::Na(NaReason::DriverMissing))
+                && matches!(host_vendor(telemetry), CpuVendor::Intel(_))
+            {
+                requirements.push(intel_dkms_requirement());
             }
         }
     }
@@ -188,6 +217,9 @@ pub fn diagnose(data: &TelemetryData) -> Vec<Requirement> {
 /// never spawns anything (D6) — the setup worker wired in C21-06 runs
 /// this under `pkexec`. Under `pkexec` the caller must pass `--user`
 /// with the current user's name (`SUDO_USER` may be unset).
+/// `--with-dkms` is the vendor-aware flag (the helper routes it by CPU
+/// vendor: AMD → `ryzen_smu`, Intel → `ramsleuth_intel`) and is passed
+/// for both the AMD and the Intel `DriverMissing` variants.
 pub fn setup_argv(with_dkms: bool, user: &str) -> Vec<String> {
     let mut argv = vec![
         "/usr/bin/ramsleuth-setup".to_owned(),
@@ -235,20 +267,26 @@ pub struct SetupOutcome {
 }
 
 /// Decide the `--with-dkms` flag from the diagnosed requirements:
-/// true iff the AMD `DriverMissing` case (case 3 — the reused GUI AMD
-/// detection: the `cpuid` vendor + the `Na(DriverMissing)` reason) is
-/// present. On AMD the one click also builds + `modprobe`s the
-/// offline driver; otherwise daemon/group/ACL only.
+/// true iff the AMD `DriverMissing` case (case 3) or the Intel
+/// `DriverMissing` case (case 4) is present (the reused GUI detection:
+/// the `cpuid` vendor + the `Na(DriverMissing)` reason). The one click
+/// then also builds + `modprobe`s the offline vendor driver (the
+/// helper routes `--with-dkms` by CPU vendor); otherwise
+/// daemon/group/ACL only.
 pub fn setup_with_dkms(requirements: &[Requirement]) -> bool {
-    requirements
-        .iter()
-        .any(|r| r.command.as_deref() == Some(DKMS_INSTALL_CMD))
+    requirements.iter().any(|r| {
+        matches!(
+            r.command.as_deref(),
+            Some(DKMS_INSTALL_CMD) | Some(DKMS_INSTALL_CMD_INTEL)
+        )
+    })
 }
 
 /// Render the `SETUP` requirements strip with the one-click setup
 /// wizard into `ui` (the C18-02 panel body + the C21-04 wizard): the
 /// bold-CYAN title, the primary CYAN **`Set up RamSleuth`** button
-/// (the AMD `DriverMissing` case labels it `+ AMD driver` —
+/// (the AMD `DriverMissing` case labels it `+ AMD driver` and the
+/// Intel `DriverMissing` case `+ Intel driver` —
 /// [`setup_with_dkms`]), its dim live status line (idle / `running…`
 /// / `done — restart RamSleuth to activate` / `failed: <msg>`), one row
 /// per requirement (an AMBER `!`, the summary, the dim detail, the
@@ -287,7 +325,14 @@ pub fn render_requirements_strip_with_setup(
         // degradation).
         if !requirements.is_empty() {
             let label = if setup_with_dkms(requirements) {
-                "Set up RamSleuth + AMD driver"
+                if requirements
+                    .iter()
+                    .any(|r| r.command.as_deref() == Some(DKMS_INSTALL_CMD_INTEL))
+                {
+                    "Set up RamSleuth + Intel driver"
+                } else {
+                    "Set up RamSleuth + AMD driver"
+                }
             } else {
                 "Set up RamSleuth"
             };
@@ -531,6 +576,46 @@ mod tests {
         );
     }
 
+    /// (c') Intel silicon, the daemon connected, the Intel branch
+    /// `Na(DriverMissing)` (the module is absent and the `/dev/mem`
+    /// fallback is blocked) → exactly the Intel-DKMS requirement;
+    /// non-`DriverMissing` Intel → none (the healthy case is covered
+    /// by `diagnose_intel_healthy`).
+    #[test]
+    fn diagnose_intel_driver_missing() {
+        let data = connected(
+            CpuVendor::Intel(IntelGen::Skylake),
+            NaReason::NotApplicable, // amd: N/A on Intel silicon
+            NaReason::DriverMissing, // intel: module absent
+        );
+        let requirements = diagnose(&data);
+        assert_eq!(
+            requirements.len(),
+            1,
+            "a connected Intel driver-missing snapshot yields exactly the Intel DKMS requirement: {requirements:?}"
+        );
+        assert_eq!(
+            requirements[0].summary,
+            "Install the `ramsleuth_intel` kernel module (live Intel subtimings)"
+        );
+        assert_eq!(
+            requirements[0].command.as_deref(),
+            Some("sudo ramsleuth-install-intel-dkms")
+        );
+
+        // Intel silicon without the driver-missing reason → no DKMS
+        // requirement.
+        let not_missing = connected(
+            CpuVendor::Intel(IntelGen::Skylake),
+            NaReason::NotApplicable,
+            NaReason::NotApplicable,
+        );
+        assert!(
+            diagnose(&not_missing).is_empty(),
+            "non-DriverMissing Intel yields no requirement"
+        );
+    }
+
     /// (d) Intel silicon (the built-in MCHBAR decode — no extra
     /// driver), the daemon connected, an all-`Na` snapshot → zero
     /// requirements.
@@ -650,7 +735,8 @@ mod tests {
 
     /// (g) The frozen C21-01 helper argv: `--user <name>` always
     /// (under `pkexec` the user must be explicit — `SUDO_USER` may be
-    /// unset), `--with-dkms` only on the AMD variant.
+    /// unset), `--with-dkms` present when the `with_dkms` flag is set
+    /// (the vendor-aware flag — AMD or Intel `DriverMissing`).
     #[test]
     fn setup_argv_contract() {
         assert_eq!(
@@ -680,7 +766,10 @@ mod tests {
         assert!(!setup_with_dkms(&[]));
         assert!(!setup_with_dkms(&[daemon_down_requirement("disconnected")]));
         assert!(!setup_with_dkms(&[group_requirement()]));
+        // The AMD `DriverMissing` case.
         assert!(setup_with_dkms(&[group_requirement(), dkms_requirement()]));
+        // The Intel `DriverMissing` case (the mirror).
+        assert!(setup_with_dkms(&[group_requirement(), intel_dkms_requirement()]));
     }
 
     /// (i) The wizard over the two-frame `ctx.run` idiom: the primary
@@ -804,5 +893,54 @@ mod tests {
             |ctx| show_strip(ctx, &requirement, &mut open, &mut setup),
         );
         assert!(!open, "a click on the Got-it button must close the strip");
+    }
+
+    /// (j) The wizard's primary button label for the Intel variant: an
+    /// Intel `DriverMissing` requirement paints the `+ Intel driver`
+    /// label (the AMD one paints `+ AMD driver`).
+    #[test]
+    fn first_run_setup_wizard_intel_label() {
+        let requirement = intel_dkms_requirement(); // the Intel variant
+        let ctx = egui::Context::default();
+        let mut open = true;
+        let mut setup = SetupOutcome::default();
+        let frame_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(968.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        fn show_strip(
+            ctx: &egui::Context,
+            requirement: &Requirement,
+            open: &mut bool,
+            setup: &mut SetupOutcome,
+        ) {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_requirements_strip_with_setup(
+                    ui,
+                    std::slice::from_ref(requirement),
+                    open,
+                    setup,
+                );
+            });
+        }
+        let first = ctx.run(frame_input(Vec::new()), |ctx| {
+            show_strip(ctx, &requirement, &mut open, &mut setup)
+        });
+        let texts: Vec<&str> = first
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&"Set up RamSleuth + Intel driver"),
+            "the Intel-labelled primary button must paint: {texts:?}"
+        );
     }
 }
