@@ -66,7 +66,7 @@ source=("https://github.com/MadGoatHaz/RamSleuth/releases/download/v$pkgver/rams
 # asset, independently verified by download + sha256sum (the all-zeros
 # fail-loud placeholder is gone — the pin is the asset hash itself).
 #
-sha256sums=('3b7449639d46ffd78b2fa0b149fec225326889c80bdf4044d19321201eb0746c')
+sha256sums=('6e0c5d3b127d87aba47fb63d154e12b3da529acacfa319fe270132e9f8eacd3d')
 install=ramsleuth-bin.install
 conflicts=('ramsleuth')
 depends=(libx11 libxkbcommon wayland libxrandr libxi libxcursor libxinerama mesa)
