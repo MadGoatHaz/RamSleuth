@@ -148,7 +148,7 @@
 use crate::amd_readout::{CadBus, ClockReadout, DivMode, GearMode, TimingSet, VoltageSet};
 use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
-use crate::intel_gen::{GearCap, GenMap, profile_for};
+use crate::intel_gen::{AlderChannelMap, ALDER_FIELDS, GearCap, GenMap, profile_for};
 use crate::intel_mchbar::MchBar;
 
 // ---------------------------------------------------------------------------
@@ -590,6 +590,112 @@ pub fn tc_rap2_wr(reg: u32) -> u16 {
     field16(reg, 13, 8)
 }
 
+// ---------------------------------------------------------------------------
+// Tier-3 (Alder/Raptor Lake, DDR5) bitfield decoders — the widened
+// `ALDER_FIELDS` ranges transcribed verbatim from the Research Alder/Raptor
+// table (lines 111–132, IG-20). The table's bit ranges apply to
+// Controller 0 / Subchannel 0 (and Controller 1 / Subchannel 2) and are
+// reused per subchannel (Research line 107).
+// ---------------------------------------------------------------------------
+
+/// tCL — `TC_ACT` bits [23:16] (**8-bit**, widened to accommodate the DDR5
+/// CL40–CL56 latencies; Research line 111).
+pub fn tc_act_tcl(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.tcl.0, ALDER_FIELDS.tcl.1)
+}
+
+/// tFAW — `TC_ACT` bits [7:0] (8-bit; Research line 116).
+pub fn tc_act_tfaw(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.tfaw.0, ALDER_FIELDS.tfaw.1)
+}
+
+/// tRRD_S — `TC_ACT` bits [11:8] (4-bit; Research line 117).
+pub fn tc_act_trrd_s(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.trrd_s.0, ALDER_FIELDS.trrd_s.1)
+}
+
+/// tRRD_L — `TC_ACT` bits [15:12] (4-bit; Research line 118).
+pub fn tc_act_trrd_l(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.trrd_l.0, ALDER_FIELDS.trrd_l.1)
+}
+
+/// tPPD — `TC_ACT2` bits [3:0] (4-bit, DDR5-specific; Research line
+/// 125). Decoded by the core but has **no frozen display slot** (not
+/// shown; the raw value stays available via the sysfs attributes).
+pub fn tc_act2_tppd(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.tppd.0, ALDER_FIELDS.tppd.1)
+}
+
+/// tRCD — `TC_PRE` bits [14:8] (**7-bit**, widened; Research line 112).
+/// Intel enforces a *unified, symmetric* tRCD (as in Tier 1): the same
+/// value feeds both the `rcdrd` and `rcwdwr` display slots.
+pub fn tc_pre_trcd(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.trcd.0, ALDER_FIELDS.trcd.1)
+}
+
+/// tRP — `TC_PRE` bits [6:0] (**7-bit**, widened for the DDR5 precharge
+/// cycle requirements; Research line 113).
+pub fn tc_pre_trp(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.trp.0, ALDER_FIELDS.trp.1)
+}
+
+/// tRAS — `TC_PRE` bits [23:16] (**8-bit**, widened for the DDR5 row
+/// active constraints; Research line 114).
+pub fn tc_pre_tras(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.tras.0, ALDER_FIELDS.tras.1)
+}
+
+/// tCWL — `TC_PRE` bits [30:24] (7-bit; Research line 115).
+pub fn tc_pre_tcwl(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.tcwl.0, ALDER_FIELDS.tcwl.1)
+}
+
+/// tWTR_S — `TC_WTR` bits [6:0] (**7-bit**, widened; Research line 119).
+pub fn tc_wtr_twtr_s(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.twtr_s.0, ALDER_FIELDS.twtr_s.1)
+}
+
+/// tWTR_L — `TC_WTR` bits [14:8] (**7-bit**, widened; Research line 120).
+pub fn tc_wtr_twtr_l(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.twtr_l.0, ALDER_FIELDS.twtr_l.1)
+}
+
+/// tWR — `TC_WTR` bits [23:16] (**8-bit**, widened to absorb the on-die
+/// ECC write recovery penalties; Research line 121).
+pub fn tc_wtr_twr(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.twr.0, ALDER_FIELDS.twr.1)
+}
+
+/// tRTP — `TC_WTR` bits [30:24] (7-bit; Research line 122).
+pub fn tc_wtr_trtp(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.trtp.0, ALDER_FIELDS.trtp.1)
+}
+
+/// tRFC1 — `TC_RFP` bits [11:0] (**12-bit**, widened for the
+/// high-density DRAM refresh cycles; Research line 123).
+pub fn tc_rfp_trfc1(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.trfc1.0, ALDER_FIELDS.trfc1.1)
+}
+
+/// tRFCsb — `TC_RFP2` bits [10:0] (11-bit, **DDR5-specific** same-bank
+/// refresh; Research line 124). Feeds the `rfcsb` display slot
+/// (populated on Tier 3, unlike Tier 1).
+pub fn tc_rfp2_trfcsb(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.trfcsb.0, ALDER_FIELDS.trfcsb.1)
+}
+
+/// tWRWR_sg — `TC_WRWR` bits [5:0] (6-bit; Research line 131). Only the
+/// two documented Alder entries (sg / dg) are decoded — the Tier-1
+/// _dr/_dd rows are not extrapolated (IG-20).
+pub fn tc_wrwr_s(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.twrwr_sg.0, ALDER_FIELDS.twrwr_sg.1)
+}
+
+/// tWRWR_dg — `TC_WRWR` bits [11:6] (6-bit; Research line 132).
+pub fn tc_wrwr_d(reg: u32) -> u16 {
+    field16(reg, ALDER_FIELDS.twrwr_dg.0, ALDER_FIELDS.twrwr_dg.1)
+}
+
 /// The 4×6-bit turnaround quartet of one `TC_*` register:
 /// `(sg, dg, dr, dd)` — same channel / same bank group / different rank
 /// / different channel, per the frozen `TC_RDRD` / `TC_RDWR` / `TC_WRRD`
@@ -823,6 +929,168 @@ fn decode_tier1_channel(index: u8, mclk: Section<f64>, regs: &ChannelRegs) -> In
         wrwr_dd: quartet_cell(wrwr, "tWRWR(dd)", 3),
         wrwr_scl: quartet_cell(wrwr, "tWRWR(sg)", 0),
         wrwr_sc: quartet_cell(wrwr, "tWRWR(dg)", 1),
+    };
+
+    // The legacy skeleton's "RTL" was fiction — the real IMC table has
+    // no RTL.
+    let rtl = Section::na(NaReason::NotApplicable);
+
+    // CAD bus + voltages: not exposed by the Intel IMC window (unchanged
+    // from the v2.2.1 model).
+    let cad_bus = CadBus {
+        proc_odt: Section::na(NaReason::NotApplicable),
+        rtt_nom: Section::na(NaReason::NotApplicable),
+        rtt_wr: Section::na(NaReason::NotApplicable),
+        rtt_park: Section::na(NaReason::NotApplicable),
+        clk_drv: Section::na(NaReason::NotApplicable),
+        addr_cmd_drv: Section::na(NaReason::NotApplicable),
+        cs_odt_drv: Section::na(NaReason::NotApplicable),
+        cke_drv: Section::na(NaReason::NotApplicable),
+    };
+    let voltages = VoltageSet {
+        vddcr_soc_mv: Section::na(NaReason::NotApplicable),
+        vddio_mem_mv: Section::na(NaReason::NotApplicable),
+        vdd_misc_mv: Section::na(NaReason::NotApplicable),
+        vpp_mv: Section::na(NaReason::NotApplicable),
+        vcore_mv: Section::na(NaReason::NotApplicable),
+    };
+
+    IntelChannel {
+        index,
+        clocks,
+        timings,
+        cad_bus,
+        voltages,
+        rtl,
+    }
+}
+
+/// Decode one Tier-3 (Alder/Raptor Lake, DDR5) subchannel from its raw
+/// [`MclRegs`] register set + the shared DRAM core clock + the
+/// subchannel's [`AlderChannelMap`] descriptor (the per-subchannel heart
+/// of the Tier-3 decode path, IG-24). Never panics (D5): every cell is a
+/// `Value`, an honest `Na(ParseError)` (a sourced register failed / a
+/// field is untrained), or a structural `Na(NotApplicable)`.
+///
+/// The widened field extracts follow the Research Alder/Raptor table
+/// (lines 111–132, pinned in [`ALDER_FIELDS`]): tCL / tRAS / tWR 8-bit,
+/// tRCD / tRP 7-bit, tRFC1 12-bit, tRFCsb 11-bit → the `rfcsb` slot
+/// (populated on DDR5, unlike Tier 1), tPPD 4-bit (decoded — no display
+/// slot), and the `TC_RDRD` 4×6-bit quartet unchanged. The table's bit
+/// ranges apply to Controller 0 / Subchannel 0 (Research line 107) and
+/// are reused per subchannel — the extraction is map-invariant; the
+/// `map` parameter carries the subchannel's provenance (mirror / MCL
+/// bases) for the IG-25 fallback selection.
+///
+/// The same [1, 2048] tick / [1, 4096] MHz sanity gates as Tier 1 apply
+/// to every decoded cell, and the `rc = ras + rp` synthesis is preserved
+/// (Breakdown §6 — Intel exposes no tRC register). The gear cells
+/// (`gear_mode` / `uclk_mhz`) stay `Na(NotApplicable)` here, exactly as
+/// in [`decode_tier1_channel`] — the caller dispatch (IG-26) layers them
+/// on from `MC_BIOS_REQ[17:16]` via [`gear_uclk_cells`] on the
+/// `GearCap::Gear4` Alder profile.
+pub fn decode_tier3_channel(
+    index: u8,
+    mclk: Section<f64>,
+    regs: &MclRegs,
+    map: &AlderChannelMap,
+) -> IntelChannel {
+    // --- timings (integer DRAM clock cycles) ---------------------------
+    // TC_PRE: tRCD (the unified symmetric tRCD feeds both the rcdrd and
+    // the rcwdwr slot, as in Tier 1) / tRP / tRAS / tCWL.
+    let rcdrd = timing_cell(regs.tc_pre, "tRCD", tc_pre_trcd);
+    let rcwdwr = rcdrd.clone();
+    let rp = timing_cell(regs.tc_pre, "tRP", tc_pre_trp);
+    let ras = timing_cell(regs.tc_pre, "tRAS", tc_pre_tras);
+    let cwl = timing_cell(regs.tc_pre, "tCWL", tc_pre_tcwl);
+
+    // TC_ACT: tCL / tFAW / tRRD_S / tRRD_L (widened).
+    let cl = timing_cell(regs.tc_act, "tCL", tc_act_tcl);
+    let faw = timing_cell(regs.tc_act, "tFAW", tc_act_tfaw);
+    let rrds = timing_cell(regs.tc_act, "tRRD_S", tc_act_trrd_s);
+    let rrld = timing_cell(regs.tc_act, "tRRD_L", tc_act_trrd_l);
+
+    // tRC is synthesized (the JEDEC identity — Intel exposes no tRC
+    // register): `tRAS + tRP` when both decode.
+    let rc = match (ras.value().copied(), rp.value().copied()) {
+        (Some(a), Some(b)) => ticks_section(a.saturating_add(b), "tRC (tRAS + tRP)"),
+        _ => Section::na(NaReason::NotApplicable),
+    };
+
+    // TC_WTR: tWTR_S / tWTR_L / tWR / tRTP (widened).
+    let wtrs = timing_cell(regs.tc_wtr, "tWTR_S", tc_wtr_twtr_s);
+    let wtrl = timing_cell(regs.tc_wtr, "tWTR_L", tc_wtr_twtr_l);
+    let wr = timing_cell(regs.tc_wtr, "tWR", tc_wtr_twr);
+    let rtp = timing_cell(regs.tc_wtr, "tRTP", tc_wtr_trtp);
+
+    // TC_RFP: tRFC1 (12-bit; tREFI is decoded — no display slot).
+    let rfc1 = timing_cell(regs.tc_rfp, "tRFC1", tc_rfp_trfc1);
+
+    // TC_RFP2: tRFCsb — the DDR5-specific same-bank refresh feeds the
+    // `rfcsb` display slot (Tier 1 keeps it not-applicable).
+    let rfcsb = timing_cell(regs.tc_rfp2, "tRFCsb", tc_rfp2_trfcsb);
+
+    // TC_RDRD: the unchanged 4×6-bit sg / dg / dr / dd quartet.
+    let rdrd = regs.tc_rdrd.map(turnaround_quartet);
+    let rdrd_scl = quartet_cell(rdrd, "tRDRD(sg)", 0);
+    let rdrd_sc = quartet_cell(rdrd, "tRDRD(dg)", 1);
+    let rdrd_sd = quartet_cell(rdrd, "tRDRD(dr)", 2);
+    let rdrd_dd = quartet_cell(rdrd, "tRDRD(dd)", 3);
+
+    // TC_WRWR: only the two documented Alder entries (sg / dg) — the
+    // Tier-1 _dr/_dd rows are not extrapolated (IG-20).
+    let wrwr_scl = timing_cell(regs.tc_wrwr, "tWRWR(sg)", tc_wrwr_s);
+    let wrwr_sc = timing_cell(regs.tc_wrwr, "tWRWR(dg)", tc_wrwr_d);
+
+    // tPPD (TC_ACT2) is decoded by the core but has no frozen display
+    // slot (DDR5-specific; the raw stays available via sysfs).
+
+    // The extraction is map-invariant (Research line 107: the bit ranges
+    // are reused per subchannel) — `map` carries this subchannel's
+    // provenance (mirror / MCL bases) for the IG-25 fallback selection.
+    let _ = map;
+
+    // --- clocks: the shared map decodes mclk only; the gear cells layer
+    // on in the caller dispatch (as in Tier 1 / Rocket Lake) -----------
+    let clocks = ClockReadout {
+        mclk_mhz: mclk,
+        uclk_mhz: Section::na(NaReason::NotApplicable),
+        fclk_mhz: Section::na(NaReason::NotApplicable),
+        div_mode: Section::na(NaReason::NotApplicable),
+        gear_mode: Section::na(NaReason::NotApplicable),
+        gdm: Section::na(NaReason::NotApplicable),
+        pdm: Section::na(NaReason::NotApplicable),
+        command_rate: Section::na(NaReason::NotApplicable),
+    };
+
+    let timings = TimingSet {
+        cl,
+        rcwdwr,
+        rcdrd,
+        rp,
+        ras,
+        rc,
+        rrds,
+        rrld,
+        faw,
+        wtrs,
+        wtrl,
+        wr,
+        rfc1,
+        rfc2: Section::na(NaReason::NotApplicable),
+        rfcsb,
+        cwl,
+        rtp,
+        rdwr: Section::na(NaReason::NotApplicable),
+        wrrd: Section::na(NaReason::NotApplicable),
+        rdrd_sd,
+        rdrd_dd,
+        rdrd_scl,
+        rdrd_sc,
+        wrwr_sd: Section::na(NaReason::NotApplicable),
+        wrwr_dd: Section::na(NaReason::NotApplicable),
+        wrwr_scl,
+        wrwr_sc,
     };
 
     // The legacy skeleton's "RTL" was fiction — the real IMC table has
@@ -1487,6 +1755,7 @@ mod tests {
 
     use super::*;
     use crate::cpuid::AmdZen;
+    use crate::intel_gen::ALDER_CHANNELS;
 
     // -----------------------------------------------------------------
     // The §6.1 acceptance fixture (Skylake i5-6600T, ratio 18 @
@@ -1915,6 +2184,282 @@ mod tests {
         assert_eq!(regs.mcl1, MclRegs::default());
         assert!(regs.mad_dimm_ch2.is_none());
         assert!(regs.mad_dimm_ch3.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Tier-3 (Alder/Raptor Lake, DDR5) decode — `decode_tier3_channel`
+    // (IG-24): the widened fields per Research lines 111–132.
+    // -----------------------------------------------------------------
+
+    /// The DDR5-4800 Tier-3 fixture raws: `mcbios_req = 0x12` (ratio 18
+    /// @ 133.3333 MHz → 2400 MHz MCLK / 4800 MT/s — the same word as
+    /// the Skylake acceptance test) + the widened DDR5-4800 40-class
+    /// timings (CL40-40-40-77 — a tCL 40 that only the 8-bit `TC_ACT`
+    /// field carries, and a 1200-class tRFC1 that only the 12-bit
+    /// field carries).
+    fn tier3_ddr5_4800_mcl() -> MclRegs {
+        MclRegs {
+            // TC_PRE: tRP 40 [6:0], tRCD 40 [14:8], tRAS 77 [23:16],
+            // tCWL 40 [30:24].
+            tc_pre: Some(0x284D_2828),
+            // TC_ACT: tFAW 16 [7:0], tRRD_S 4 [11:8], tRRD_L 8 [15:12],
+            // tCL 40 [23:16].
+            tc_act: Some(0x0028_8410),
+            // TC_ACT2: tPPD 4 [3:0] (decoded — no display slot).
+            tc_act2: Some(0x4),
+            // TC_WTR: tWTR_S 12 [6:0], tWTR_L 14 [14:8], tWR 40 [23:16],
+            // tRTP 8 [30:24].
+            tc_wtr: Some(0x0828_0E0C),
+            // TC_RFP: tRFC1 1200 [11:0], tREFI 8192 [31:16] (multiplier —
+            // no display slot).
+            tc_rfp: Some(0x2000_04B0),
+            // TC_RFP2: tRFCsb 135 [10:0] (DDR5-specific → the `rfcsb`
+            // slot).
+            tc_rfp2: Some(0x87),
+            // TC_RDRD: the unchanged 4×6-bit sg 6 / dg 10 / dr 12 / dd 18.
+            tc_rdrd: Some(0x0048_C286),
+            // TC_WRWR: only the two documented entries — sg 6 / dg 10.
+            tc_wrwr: Some(0x286),
+        }
+    }
+
+    /// The DDR5-4800 widened decode, pinned end to end: the 40-class
+    /// tCL / tCWL / tRCD / tRP / tWR across the widened fields, tRFC1
+    /// 1200 in the 12-bit field, tRFCsb 135 in the `rfcsb` slot, the
+    /// unchanged `TC_RDRD` quartet, the two documented `TC_WRWR`
+    /// entries (the _dr/_dd rows not-applicable), and `rc = tRAS + tRP
+    /// = 117`.
+    #[test]
+    fn tier3_ddr5_4800_pins_the_widened_40_class_values() {
+        let mcl = tier3_ddr5_4800_mcl();
+        let mclk = decode_mclk(Some(0x0000_0012));
+        assert_eq!(mclk, Section::Value(2400.0), "DDR5-4800: 2400 MHz MCLK");
+        let ch = decode_tier3_channel(0, mclk, &mcl, &ALDER_CHANNELS[0]);
+        assert_eq!(ch.index, 0);
+
+        // --- clocks (the shared mclk; the gear cells layer on later) ---
+        assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0));
+        assert_eq!(ch.clocks.uclk_mhz, Section::na(NaReason::NotApplicable));
+        assert_eq!(ch.clocks.fclk_mhz, Section::na(NaReason::NotApplicable));
+        assert_eq!(ch.clocks.div_mode, Section::na(NaReason::NotApplicable));
+        assert_eq!(ch.clocks.gear_mode, Section::na(NaReason::NotApplicable));
+        assert_eq!(ch.clocks.gdm, Section::na(NaReason::NotApplicable));
+        assert_eq!(ch.clocks.pdm, Section::na(NaReason::NotApplicable));
+        assert_eq!(ch.clocks.command_rate, Section::na(NaReason::NotApplicable));
+        assert_eq!(ch.rtl, Section::na(NaReason::NotApplicable));
+
+        // --- the widened DDR5-4800 40-class timings --------------------
+        assert_eq!(ch.timings.cl, Section::Value(40), "tCL 8-bit [23:16]");
+        assert_eq!(ch.timings.cwl, Section::Value(40), "tCWL 7-bit [30:24]");
+        assert_eq!(ch.timings.rcdrd, Section::Value(40), "tRCD 7-bit [14:8]");
+        assert_eq!(
+            ch.timings.rcwdwr,
+            Section::Value(40),
+            "the unified symmetric tRCD feeds both rcdrd and rcwdwr"
+        );
+        assert_eq!(ch.timings.rp, Section::Value(40), "tRP 7-bit [6:0]");
+        assert_eq!(ch.timings.ras, Section::Value(77), "tRAS 8-bit [23:16]");
+        assert_eq!(
+            ch.timings.rc,
+            Section::Value(117),
+            "tRAS + tRP = 77 + 40 (synthesized — Intel exposes no tRC)"
+        );
+        assert_eq!(ch.timings.rrds, Section::Value(4), "tRRD_S 4-bit [11:8]");
+        assert_eq!(ch.timings.rrld, Section::Value(8), "tRRD_L 4-bit [15:12]");
+        assert_eq!(ch.timings.faw, Section::Value(16), "tFAW 8-bit [7:0]");
+        assert_eq!(ch.timings.wtrs, Section::Value(12), "tWTR_S 7-bit [6:0]");
+        assert_eq!(ch.timings.wtrl, Section::Value(14), "tWTR_L 7-bit [14:8]");
+        assert_eq!(ch.timings.wr, Section::Value(40), "tWR 8-bit [23:16]");
+        assert_eq!(ch.timings.rtp, Section::Value(8), "tRTP 7-bit [30:24]");
+        assert_eq!(ch.timings.rfc1, Section::Value(1200), "tRFC1 12-bit [11:0]");
+        assert_eq!(
+            ch.timings.rfcsb,
+            Section::Value(135),
+            "tRFCsb 11-bit [10:0] → the DDR5 `rfcsb` slot"
+        );
+
+        // --- the unchanged TC_RDRD quartet + the two TC_WRWR entries ----
+        assert_eq!(ch.timings.rdrd_scl, Section::Value(6), "sg");
+        assert_eq!(ch.timings.rdrd_sc, Section::Value(10), "dg");
+        assert_eq!(ch.timings.rdrd_sd, Section::Value(12), "dr");
+        assert_eq!(ch.timings.rdrd_dd, Section::Value(18), "dd");
+        assert_eq!(ch.timings.wrwr_scl, Section::Value(6), "sg (documented)");
+        assert_eq!(ch.timings.wrwr_sc, Section::Value(10), "dg (documented)");
+
+        // --- the slots with no Tier-3 source ----------------------------
+        for s in [
+            &ch.timings.rfc2,
+            &ch.timings.rdwr,
+            &ch.timings.wrrd,
+            &ch.timings.wrwr_sd,
+            &ch.timings.wrwr_dd,
+        ] {
+            assert_eq!(*s, Section::na(NaReason::NotApplicable), "{s:?}");
+        }
+
+        // --- CAD bus + voltages: never exposed by the IMC window --------
+        for s in [
+            &ch.cad_bus.proc_odt,
+            &ch.cad_bus.clk_drv,
+            &ch.cad_bus.addr_cmd_drv,
+            &ch.cad_bus.cs_odt_drv,
+            &ch.cad_bus.cke_drv,
+        ] {
+            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
+        }
+        for s in [&ch.cad_bus.rtt_nom, &ch.cad_bus.rtt_wr, &ch.cad_bus.rtt_park] {
+            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
+        }
+        for s in [
+            &ch.voltages.vddcr_soc_mv,
+            &ch.voltages.vddio_mem_mv,
+            &ch.voltages.vdd_misc_mv,
+            &ch.voltages.vpp_mv,
+            &ch.voltages.vcore_mv,
+        ] {
+            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
+        }
+    }
+
+    /// The all-absent Tier-3 arm: every `MclRegs` register absent (and
+    /// an absent `MC_BIOS_REQ` → `Na` mclk) degrades the whole channel
+    /// to honest `Na` — no panic, no garbage values (D5).
+    #[test]
+    fn tier3_all_absent_degrades_all_na() {
+        let ch = decode_tier3_channel(2, decode_mclk(None), &MclRegs::default(), &ALDER_CHANNELS[2]);
+        assert_eq!(ch.index, 2);
+        assert!(ch.clocks.mclk_mhz.is_na(), "{:?}", ch.clocks.mclk_mhz);
+        assert!(ch.clocks.uclk_mhz.is_na(), "{:?}", ch.clocks.uclk_mhz);
+        assert!(ch.clocks.fclk_mhz.is_na(), "{:?}", ch.clocks.fclk_mhz);
+        assert!(ch.clocks.gdm.is_na(), "{:?}", ch.clocks.gdm);
+        assert!(ch.clocks.pdm.is_na(), "{:?}", ch.clocks.pdm);
+        assert!(ch.clocks.div_mode.is_na(), "{:?}", ch.clocks.div_mode);
+        assert!(ch.clocks.gear_mode.is_na(), "{:?}", ch.clocks.gear_mode);
+        assert!(
+            ch.clocks.command_rate.is_na(),
+            "{:?}",
+            ch.clocks.command_rate
+        );
+        assert_eq!(ch.rtl, Section::na(NaReason::NotApplicable));
+        let cells: [&Section<u16>; 27] = [
+            &ch.timings.cl,
+            &ch.timings.rcwdwr,
+            &ch.timings.rcdrd,
+            &ch.timings.rp,
+            &ch.timings.ras,
+            &ch.timings.rc,
+            &ch.timings.rrds,
+            &ch.timings.rrld,
+            &ch.timings.faw,
+            &ch.timings.wtrs,
+            &ch.timings.wtrl,
+            &ch.timings.wr,
+            &ch.timings.rfc1,
+            &ch.timings.rfc2,
+            &ch.timings.rfcsb,
+            &ch.timings.cwl,
+            &ch.timings.rtp,
+            &ch.timings.rdwr,
+            &ch.timings.wrrd,
+            &ch.timings.rdrd_sd,
+            &ch.timings.rdrd_dd,
+            &ch.timings.rdrd_scl,
+            &ch.timings.rdrd_sc,
+            &ch.timings.wrwr_sd,
+            &ch.timings.wrwr_dd,
+            &ch.timings.wrwr_scl,
+            &ch.timings.wrwr_sc,
+        ];
+        for s in &cells {
+            assert!(s.is_na(), "{s:?}");
+        }
+    }
+
+    /// Per-register containment (Tier 3): only `tc_pre` unreadable →
+    /// only its sourced fields (tRCD / tRP / tRAS / tCWL — and the
+    /// derived `rc`) degrade to `Na(ParseError)`; every other
+    /// register's fields decode untouched.
+    #[test]
+    fn tier3_per_register_containment() {
+        let mut mcl = tier3_ddr5_4800_mcl();
+        mcl.tc_pre = None;
+        let ch = decode_tier3_channel(1, decode_mclk(Some(0x0000_0012)), &mcl, &ALDER_CHANNELS[1]);
+        assert_eq!(ch.index, 1);
+        for s in [
+            &ch.timings.rcdrd,
+            &ch.timings.rcwdwr,
+            &ch.timings.rp,
+            &ch.timings.ras,
+            &ch.timings.cwl,
+        ] {
+            assert!(matches!(s, Section::Na(NaReason::ParseError(_))), "{s:?}");
+        }
+        assert_eq!(ch.timings.rc, Section::na(NaReason::NotApplicable));
+        // The other registers' fields decode untouched.
+        assert_eq!(ch.timings.cl, Section::Value(40));
+        assert_eq!(ch.timings.faw, Section::Value(16));
+        assert_eq!(ch.timings.rrds, Section::Value(4));
+        assert_eq!(ch.timings.rrld, Section::Value(8));
+        assert_eq!(ch.timings.wtrs, Section::Value(12));
+        assert_eq!(ch.timings.wtrl, Section::Value(14));
+        assert_eq!(ch.timings.wr, Section::Value(40));
+        assert_eq!(ch.timings.rtp, Section::Value(8));
+        assert_eq!(ch.timings.rfc1, Section::Value(1200));
+        assert_eq!(ch.timings.rfcsb, Section::Value(135));
+        assert_eq!(ch.timings.rdrd_dd, Section::Value(18));
+        assert_eq!(ch.timings.wrwr_sc, Section::Value(10));
+    }
+
+    /// Research line 107: the widened bit ranges apply to Controller 0
+    /// / Subchannel 0 and are reused per subchannel — the same raws
+    /// decode to identical timings under every `ALDER_CHANNELS`
+    /// descriptor (the extraction is map-invariant; only the channel
+    /// index differs).
+    #[test]
+    fn tier3_extraction_is_map_invariant_across_subchannels() {
+        let mcl = tier3_ddr5_4800_mcl();
+        let mclk = decode_mclk(Some(0x0000_0012));
+        let mut decoded = Vec::new();
+        for (i, map) in ALDER_CHANNELS.iter().enumerate() {
+            let ch = decode_tier3_channel(i as u8, mclk.clone(), &mcl, map);
+            assert_eq!(ch.index, i as u8);
+            decoded.push(ch);
+        }
+        let ref_ch0 = decoded[0].clone();
+        for ch in &decoded[1..] {
+            assert_eq!(ch.timings, ref_ch0.timings, "map-invariant extraction");
+            assert_eq!(ch.clocks, ref_ch0.clocks);
+            assert_eq!(ch.cad_bus, ref_ch0.cad_bus);
+            assert_eq!(ch.voltages, ref_ch0.voltages);
+        }
+    }
+
+    /// The widened field widths, pinned at their maxima (the widening
+    /// over the Tier-1 6-bit fields is the point): tCL 8-bit → 255
+    /// (the 40–56 DDR5 class fits), tRCD / tRP / tWTR_S / tWTR_L
+    /// 7-bit → 127, tRFC1 12-bit → 4095, tRFCsb 11-bit → 2047, tPPD
+    /// 4-bit → 15 (decoded, no display slot) — and the masks never
+    /// alias into neighboring fields.
+    #[test]
+    fn tier3_widened_field_widths_at_maximums() {
+        // 8-bit tCL max (a 6-bit mask would truncate to 63).
+        assert_eq!(tc_act_tcl(0x00FF_0000), 255);
+        // 7-bit fields max.
+        assert_eq!(tc_pre_trcd(0x0000_7F00), 127);
+        assert_eq!(tc_pre_trp(0x7F), 127);
+        assert_eq!(tc_wtr_twtr_s(0x7F), 127);
+        assert_eq!(tc_wtr_twtr_l(0x0000_7F00), 127);
+        // 12-bit tRFC1 / 11-bit tRFCsb max.
+        assert_eq!(tc_rfp_trfc1(0x0000_0FFF), 4095);
+        assert_eq!(tc_rfp2_trfcsb(0x0000_07FF), 2047);
+        // 4-bit tPPD max (decoded, no display slot).
+        assert_eq!(tc_act2_tppd(0x0F), 15);
+        // The masks never alias into a neighboring field: the fixture
+        // words decode their fields independently of the rest.
+        assert_eq!(tc_act_tcl(0x0028_8410), 40);
+        assert_eq!(tc_pre_tcwl(0x284D_2828), 40);
+        assert_eq!(tc_wtr_twr(0x0828_0E0C), 40);
+        assert_eq!(tc_pre_tras(0x284D_2828), 77);
     }
 
     // -----------------------------------------------------------------
