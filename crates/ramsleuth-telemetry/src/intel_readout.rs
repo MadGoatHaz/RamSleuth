@@ -4,8 +4,9 @@
 //! This module is the readout half of the Intel telemetry branch: it
 //! decodes the raw memory-controller (IMC) register values — exposed RAW
 //! by the `ramsleuth_intel` kernel module (the sysfs path) or read from
-//! the `/dev/mem` MCHBAR fallback ([`IntelImcRegs::from_bar`]) — into the
-//! frozen vendor-neutral display types shared with the AMD readout
+//! the `/dev/mem` MCHBAR fallback ([`IntelImcRegs::from_bar`] /
+//! [`IntelImcRegs::from_bar_wide`]) — into the frozen vendor-neutral
+//! display types shared with the AMD readout
 //! ([`ClockReadout`], [`TimingSet`], [`CadBus`], [`VoltageSet`]).
 //!
 //! The design split mirrors AMD (plan §2.4): **the source exposes raw
@@ -148,7 +149,7 @@
 use crate::amd_readout::{CadBus, ClockReadout, DivMode, GearMode, TimingSet, VoltageSet};
 use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
-use crate::intel_gen::{AlderChannelMap, ALDER_FIELDS, GearCap, GenMap, profile_for};
+use crate::intel_gen::{AlderChannelMap, ALDER_CHANNELS, ALDER_FIELDS, GearCap, GenMap, profile_for};
 use crate::intel_mchbar::MchBar;
 
 // ---------------------------------------------------------------------------
@@ -162,6 +163,13 @@ use crate::intel_mchbar::MchBar;
 /// `intel_mchbar.rs` uses the same 64 KiB size. Tier-2 (Alder/Raptor)
 /// will require 256 KiB (0x40000).
 pub const MCHBAR_WINDOW: usize = 1 << 16;
+
+/// Tier-3 (Alder/Raptor Lake and later) MCHBAR window is 256 KiB
+/// (0x40000) — the profiled window of the Alder family (IG-03;
+/// Research roadmap Tier 3: "Expand window to 256 KiB"). The wide
+/// `/dev/mem` map ([`IntelImcRegs::from_bar_wide`], IG-25) and
+/// `intel_mchbar::acquire` (via `intel_mchbar::window_size_for`) use it.
+pub const MCHBAR_WINDOW_TIER3: usize = 1 << 18;
 
 /// Global register: the BIOS request word carrying the DRAM clock ratio
 /// (bits 7:0), the reference-clock select (bit 8), the gear ratio (bits
@@ -235,6 +243,49 @@ const _ASSERT_IMC_READS_IN_WINDOW: () = {
         && MAX_CHANNEL_OFFSET <= MCHBAR_WINDOW
         && LEGACY_FREQ_RATIO_OFFSET + 4 <= MCHBAR_WINDOW
         && LEGACY_MCS_MAX_OFFSET <= MCHBAR_WINDOW;
+    let _proof: usize = 1 / if in_window { 1 } else { 0 };
+};
+
+// ---------------------------------------------------------------------------
+// Tier-3 (Alder/Raptor Lake) offset set — the 256 KiB wide window (IG-25).
+// ---------------------------------------------------------------------------
+
+/// Native MCL block bases (per controller; Research lines 107, 329,
+/// OQ-4 — subchannels 1 and 3 have no MCL base): MC0 @ `0xD000`,
+/// MC1 @ `0xD800`.
+pub const MCL0_BASE: usize = 0xD000;
+pub const MCL1_BASE: usize = 0xD800;
+
+/// Offsets within a native MCL block (4-byte registers; the Alder
+/// layout per `ALDER_FIELDS`, in decode order).
+pub const MCL_TC_PRE_OFFSET: usize = 0x00;
+pub const MCL_TC_ACT_OFFSET: usize = 0x04;
+pub const MCL_TC_ACT2_OFFSET: usize = 0x08;
+pub const MCL_TC_WTR_OFFSET: usize = 0x10;
+pub const MCL_TC_RFP_OFFSET: usize = 0x14;
+pub const MCL_TC_RFP2_OFFSET: usize = 0x18;
+pub const MCL_TC_RDRD_OFFSET: usize = 0x20;
+pub const MCL_TC_WRWR_OFFSET: usize = 0x28;
+
+/// `MAD_DIMM_CH2` / `MAD_DIMM_CH3` (Alder/DDR5 subchannel 2/3 geometry;
+/// Research lines 212-213).
+pub const MAD_DIMM_CH2_OFFSET: usize = 0x5060;
+pub const MAD_DIMM_CH3_OFFSET: usize = 0x5064;
+
+/// Highest Tier-3 MCL offset (MC1's `TC_WRWR`, 4-byte access).
+pub const MAX_MCL_OFFSET: usize = MCL1_BASE + MCL_TC_WRWR_OFFSET + 4;
+
+/// Highest Tier-3 global/MAD offset (`MAD_DIMM_CH3`, 4-byte access).
+pub const MAX_MAD_DIMM_OFFSET: usize = MAD_DIMM_CH3_OFFSET + 4;
+
+// Compile-time proof that the Tier-3 offset set (IG-25) fits the 256 KiB
+// wide window (every read is a 4-byte access). A violated bound fails
+// const evaluation (division by zero).
+const _ASSERT_TIER3_READS_IN_WIDE_WINDOW: () = {
+    let in_window = MAX_MCL_OFFSET <= MCHBAR_WINDOW_TIER3
+        && MAX_MAD_DIMM_OFFSET <= MCHBAR_WINDOW_TIER3
+        && MAX_IMC_OFFSET <= MCHBAR_WINDOW_TIER3
+        && MAX_CHANNEL_OFFSET <= MCHBAR_WINDOW_TIER3;
     let _proof: usize = 1 / if in_window { 1 } else { 0 };
 };
 
@@ -368,8 +419,57 @@ impl IntelImcRegs {
             // mad_dimm_ch2 / mad_dimm_ch3) stay default (all `None`):
             // `from_bar` reads only the 64 KiB Tier-1 window (offsets
             // <= 0x5E04); the Tier-3 `/dev/mem` reads route through
-            // the widened map in IG-25.
+            // [`IntelImcRegs::from_bar_wide`] (the 256 KiB wide map,
+            // IG-25).
             ..Self::default()
+        }
+    }
+
+    /// Read the full Tier-3 (Alder/Raptor Lake) offset set from a live,
+    /// read-only [`MchBar`] map: the global `MC_BIOS_REQ`, the four
+    /// legacy mirror blocks (the `ALDER_CHANNELS` subchannel mirrors at
+    /// `0x4000` / `0x4400` / `0x4800` / `0x4C00`), the two native MCL
+    /// blocks (`mcl0` @ `0xD000` / `mcl1` @ `0xD800`, OQ-4), and the
+    /// two Alder/DDR5 `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws — the full
+    /// 51-slot [`IntelImcRegs`] set (the wide `/dev/mem` half of plan
+    /// §3.5; IG-25).
+    ///
+    /// The map is profile-sized ([`intel_mchbar::window_size_for`]:
+    /// 256 KiB for the Alder family, 64 KiB for Tier 1/2 — where every
+    /// offset here still fits); the 64 KiB 9-register [`from_bar`] is
+    /// untouched.
+    ///
+    /// Per-register containment (D5) mirrors [`from_bar`]: each read
+    /// degrades independently to `None` on failure (bounds, unmap, …) —
+    /// one bad read never poisons the rest and never panics.
+    pub fn from_bar_wide(bar: &MchBar) -> Self {
+        let mut ch0 = ChannelRegs::default();
+        let mut ch1 = ChannelRegs::default();
+        let mut ch2 = ChannelRegs::default();
+        let mut ch3 = ChannelRegs::default();
+        for (i, map) in ALDER_CHANNELS.iter().enumerate() {
+            let block = match i {
+                0 => &mut ch0,
+                1 => &mut ch1,
+                2 => &mut ch2,
+                _ => &mut ch3,
+            };
+            read_channel_regs(bar, map.mirror_base as usize, block);
+        }
+        let mut mcl0 = MclRegs::default();
+        let mut mcl1 = MclRegs::default();
+        read_mcl_regs(bar, MCL0_BASE, &mut mcl0);
+        read_mcl_regs(bar, MCL1_BASE, &mut mcl1);
+        Self {
+            mcbios_req: bar.read_u32(MC_BIOS_REQ_OFFSET).ok(),
+            ch0,
+            ch1,
+            ch2,
+            ch3,
+            mcl0,
+            mcl1,
+            mad_dimm_ch2: bar.read_u32(MAD_DIMM_CH2_OFFSET).ok(),
+            mad_dimm_ch3: bar.read_u32(MAD_DIMM_CH3_OFFSET).ok(),
         }
     }
 }
@@ -385,6 +485,19 @@ fn read_channel_regs(bar: &MchBar, base: usize, regs: &mut ChannelRegs) {
     regs.tc_rdwr = bar.read_u32(base + TC_RDWR_OFFSET).ok();
     regs.tc_wrrd = bar.read_u32(base + TC_WRRD_OFFSET).ok();
     regs.tc_wrwr = bar.read_u32(base + TC_WRWR_OFFSET).ok();
+}
+
+/// Read one native MCL block's eight raw registers from the live map
+/// into `regs` (per-register containment via `read_u32().ok()`).
+fn read_mcl_regs(bar: &MchBar, base: usize, regs: &mut MclRegs) {
+    regs.tc_pre = bar.read_u32(base + MCL_TC_PRE_OFFSET).ok();
+    regs.tc_act = bar.read_u32(base + MCL_TC_ACT_OFFSET).ok();
+    regs.tc_act2 = bar.read_u32(base + MCL_TC_ACT2_OFFSET).ok();
+    regs.tc_wtr = bar.read_u32(base + MCL_TC_WTR_OFFSET).ok();
+    regs.tc_rfp = bar.read_u32(base + MCL_TC_RFP_OFFSET).ok();
+    regs.tc_rfp2 = bar.read_u32(base + MCL_TC_RFP2_OFFSET).ok();
+    regs.tc_rdrd = bar.read_u32(base + MCL_TC_RDRD_OFFSET).ok();
+    regs.tc_wrwr = bar.read_u32(base + MCL_TC_WRWR_OFFSET).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -980,7 +1093,7 @@ fn decode_tier1_channel(index: u8, mclk: Section<f64>, regs: &ChannelRegs) -> In
 /// ranges apply to Controller 0 / Subchannel 0 (Research line 107) and
 /// are reused per subchannel — the extraction is map-invariant; the
 /// `map` parameter carries the subchannel's provenance (mirror / MCL
-/// bases) for the IG-25 fallback selection.
+/// bases) for the IG-25 fallback selection ([`tier3_mcl_for`]).
 ///
 /// The same [1, 2048] tick / [1, 4096] MHz sanity gates as Tier 1 apply
 /// to every decoded cell, and the `rc = ras + rp` synthesis is preserved
@@ -1047,7 +1160,8 @@ pub fn decode_tier3_channel(
 
     // The extraction is map-invariant (Research line 107: the bit ranges
     // are reused per subchannel) — `map` carries this subchannel's
-    // provenance (mirror / MCL bases) for the IG-25 fallback selection.
+    // provenance (mirror / MCL bases) for the IG-25 fallback selection
+    // ([`tier3_mcl_for`]).
     let _ = map;
 
     // --- clocks: the shared map decodes mclk only; the gear cells layer
@@ -1124,6 +1238,72 @@ pub fn decode_tier3_channel(
         cad_bus,
         voltages,
         rtl,
+    }
+}
+
+/// The mirror → MCL fallback selector (Research line 329, verbatim
+/// rule): select `mirror_reg` unless `mirror ∈ {0x0, 0xFFFFFFFF}`, in
+/// which case select `mcl_reg` — the research doc's "verify 0xD004 if
+/// 0x4004 returns 0x0 or 0xFFFFFFFF" over the `Option<u32>` raws.
+///
+/// Some mobile / OEM boards disable the legacy mirror window; when a
+/// mirrored register then reads the disabled-mirror default `0x0` or
+/// the uncleared `0xFFFFFFFF`, the corresponding native-MCL register is
+/// selected instead (the research doc's example: 0x4004 → 0xD004).
+///
+/// Containment: a populated non-default mirror wins; a failed mirror
+/// read (`None`) is **not** a disabled mirror → no fallback (`None`);
+/// a disabled mirror with an absent MCL read → `None` (honest
+/// degradation, never a bogus zero).
+pub fn mirror_or_mcl(mirror: Option<u32>, mcl: Option<u32>) -> Option<u32> {
+    if matches!(mirror, Some(0x0) | Some(0xFFFF_FFFF)) {
+        mcl
+    } else {
+        mirror
+    }
+}
+
+/// The effective Tier-3 [`MclRegs`] for one subchannel: the Research
+/// line 329 mirror → MCL fallback applied per controller (IG-25).
+///
+/// The legacy mirror block is the primary source; where the subchannel's
+/// controller has a documented MCL base (subchannels 0 and 2 — OQ-4),
+/// every mirrored register reading the disabled-mirror default
+/// (`0x0` / `0xFFFFFFFF`) falls back to the corresponding native-MCL
+/// register. Subchannels 1 and 3 carry no MCL base → mirror-only
+/// (their words are taken as-is; a disabled mirror degrades to `None`).
+///
+/// Register pairing is by MCHBAR-relative offset (the mirror is a
+/// legacy alias of the MCL block — the same words, under the Tier-1
+/// `ChannelRegs` names vs. the Alder `MclRegs` names): `+0x00` /
+/// `+0x04` / `+0x08` / `+0x20` / `+0x28` fall back per register; the
+/// MCL-only registers (`+0x10` `TC_WTR`, `+0x14` `TC_RFP`, `+0x18`
+/// `TC_RFP2`) have no word in the Tier-1 layout and ride the MCL block
+/// as-is (mirror-only subchannels: `None`).
+pub fn tier3_mcl_for(index: usize, map: &AlderChannelMap, regs: &IntelImcRegs) -> MclRegs {
+    let mirror = match index {
+        0 => &regs.ch0,
+        1 => &regs.ch1,
+        2 => &regs.ch2,
+        _ => &regs.ch3,
+    };
+    // OQ-4: the fallback applies only where the subchannel's controller
+    // has a documented MCL base (MC0 for subchannel 0, MC1 for
+    // subchannel 2); subchannels 1 and 3 are mirror-only.
+    let mcl: Option<&MclRegs> = match (index, map.mcl_base) {
+        (0, Some(_)) => Some(&regs.mcl0),
+        (2, Some(_)) => Some(&regs.mcl1),
+        _ => None,
+    };
+    MclRegs {
+        tc_pre: mirror_or_mcl(mirror.tc_dbp, mcl.and_then(|m| m.tc_pre)),
+        tc_act: mirror_or_mcl(mirror.tc_rap, mcl.and_then(|m| m.tc_act)),
+        tc_act2: mirror_or_mcl(mirror.tc_rfp, mcl.and_then(|m| m.tc_act2)),
+        tc_wtr: mcl.and_then(|m| m.tc_wtr),
+        tc_rfp: mcl.and_then(|m| m.tc_rfp),
+        tc_rfp2: mcl.and_then(|m| m.tc_rfp2),
+        tc_rdrd: mirror_or_mcl(mirror.tc_rdrd, mcl.and_then(|m| m.tc_rdrd)),
+        tc_wrwr: mirror_or_mcl(mirror.tc_wrrd, mcl.and_then(|m| m.tc_wrwr)),
     }
 }
 
@@ -2460,6 +2640,214 @@ mod tests {
         assert_eq!(tc_pre_tcwl(0x284D_2828), 40);
         assert_eq!(tc_wtr_twr(0x0828_0E0C), 40);
         assert_eq!(tc_pre_tras(0x284D_2828), 77);
+    }
+
+    // -----------------------------------------------------------------
+    // Mirror → MCL fallback (Research line 329) + the wide `/dev/mem`
+    // Tier-3 offset set (IG-25).
+    // -----------------------------------------------------------------
+
+    /// The verbatim Research line 329 selector: a disabled-mirror word
+    /// (`0x0` / `0xFFFFFFFF`) selects the MCL register; a populated
+    /// mirror wins; a failed mirror read is not a disabled mirror (no
+    /// fallback); an absent MCL read yields nothing (never a bogus
+    /// zero).
+    #[test]
+    fn mirror_or_mcl_selects_per_research_line_329() {
+        assert_eq!(
+            mirror_or_mcl(Some(0xFFFF_FFFF), Some(0x0028_8410)),
+            Some(0x0028_8410),
+            "0x4004 = 0xFFFFFFFF + valid 0xD004 -> MCL wins"
+        );
+        assert_eq!(
+            mirror_or_mcl(Some(0x0), Some(0x0028_8410)),
+            Some(0x0028_8410),
+            "0x4004 = 0x0 + valid 0xD004 -> MCL wins"
+        );
+        assert_eq!(
+            mirror_or_mcl(Some(0x0028_8410), Some(0xDEAD_BEEF)),
+            Some(0x0028_8410),
+            "0x4004 valid -> mirror wins"
+        );
+        assert_eq!(
+            mirror_or_mcl(None, Some(0x0028_8410)),
+            None,
+            "a failed mirror read is not a disabled mirror"
+        );
+        assert_eq!(
+            mirror_or_mcl(Some(0xFFFF_FFFF), None),
+            None,
+            "disabled mirror + absent MCL -> nothing (no bogus zero)"
+        );
+        assert_eq!(mirror_or_mcl(None, None), None);
+    }
+
+    /// The brief's fallback arm, wired per controller: MC0 subchannel 0
+    /// with a disabled mirror word at 0x4004 (`TC_ACT` @ the `ch0`
+    /// block +0x04) and a valid native MCL word at 0xD004 → the MCL
+    /// value wins end to end through the Tier-3 decode (tCL 40 from
+    /// 0xD004, not the disabled mirror).
+    #[test]
+    fn mirror_fallback_disabled_mirror_selects_mcl() {
+        let regs = IntelImcRegs {
+            ch0: ChannelRegs {
+                tc_rap: Some(0xFFFF_FFFF), // 0x4004: mirror disabled
+                ..ChannelRegs::default()
+            },
+            mcl0: tier3_ddr5_4800_mcl(), // 0xD004 = 0x0028_8410 (valid)
+            ..IntelImcRegs::default()
+        };
+        let mcl = tier3_mcl_for(0, &ALDER_CHANNELS[0], &regs);
+        assert_eq!(
+            mcl.tc_act,
+            Some(0x0028_8410),
+            "0xD004 wins over the disabled 0x4004"
+        );
+        // The MCL-only registers ride the MCL block as-is.
+        assert_eq!(mcl.tc_wtr, Some(0x0828_0E0C));
+        assert_eq!(mcl.tc_rfp, Some(0x2000_04B0));
+        assert_eq!(mcl.tc_rfp2, Some(0x87));
+        // The un-fallen mirror registers (absent here) stay absent.
+        assert_eq!(mcl.tc_pre, None);
+        // End to end: the decoded channel carries the MCL-sourced tCL.
+        let ch = decode_tier3_channel(0, decode_mclk(Some(0x0000_0012)), &mcl, &ALDER_CHANNELS[0]);
+        assert_eq!(ch.timings.cl, Section::Value(40), "tCL from 0xD004");
+    }
+
+    /// The brief's mirror-wins arm: a populated mirror word beats the
+    /// MCL word (the retail-desktop default — the mirror is enabled);
+    /// pinned for both MCL-bearing controllers (MC0 subch0 and MC1
+    /// subch2).
+    #[test]
+    fn mirror_wins_when_populated() {
+        // MC0 subch0: a populated 0x4004 wins over the MCL 0xD004.
+        let regs = IntelImcRegs {
+            ch0: ChannelRegs {
+                tc_rap: Some(0x0028_8410), // 0x4004 valid
+                ..ChannelRegs::default()
+            },
+            mcl0: tier3_ddr5_4800_mcl(), // 0xD004
+            ..IntelImcRegs::default()
+        };
+        let mcl = tier3_mcl_for(0, &ALDER_CHANNELS[0], &regs);
+        assert_eq!(mcl.tc_act, Some(0x0028_8410), "0x4004 valid -> mirror wins");
+
+        // MC1 subch2: a distinct valid 0x4804 beats a distinct 0xD804.
+        let regs = IntelImcRegs {
+            ch2: ChannelRegs {
+                tc_rap: Some(0x0018_0410), // 0x4804 valid (tCL 24)
+                ..ChannelRegs::default()
+            },
+            mcl1: MclRegs {
+                tc_act: Some(0x0028_8410), // 0xD804 (tCL 40)
+                ..MclRegs::default()
+            },
+            ..IntelImcRegs::default()
+        };
+        let mcl2 = tier3_mcl_for(2, &ALDER_CHANNELS[2], &regs);
+        assert_eq!(mcl2.tc_act, Some(0x0018_0410), "0x4804 valid -> mirror wins");
+        let ch =
+            decode_tier3_channel(2, decode_mclk(Some(0x0000_0012)), &mcl2, &ALDER_CHANNELS[2]);
+        assert_eq!(ch.timings.cl, Section::Value(24), "tCL 24 from the mirror");
+    }
+
+    /// The brief's both-absent arm: no mirror read and no MCL read →
+    /// the effective register set is all-`None` → the Tier-3 decode
+    /// degrades every sourced slot to `Na(ParseError)` (never a value,
+    /// never a panic); the mirror-only subchannels (OQ-4) degrade the
+    /// same way with no MCL base to fall back to.
+    #[test]
+    fn mirror_and_mcl_both_absent_degrade_to_parse_error() {
+        let mcl = tier3_mcl_for(0, &ALDER_CHANNELS[0], &IntelImcRegs::default());
+        assert_eq!(mcl, MclRegs::default());
+        let ch = decode_tier3_channel(0, decode_mclk(Some(0x0000_0012)), &mcl, &ALDER_CHANNELS[0]);
+        for s in [
+            &ch.timings.cl,
+            &ch.timings.rcdrd,
+            &ch.timings.rfc1,
+            &ch.timings.rdrd_scl,
+            &ch.timings.wrwr_sc,
+        ] {
+            assert!(matches!(s, Section::Na(NaReason::ParseError(_))), "{s:?}");
+        }
+        // OQ-4: the mirror-only subchannels — no MCL base → the same
+        // all-absent effective set.
+        assert_eq!(
+            tier3_mcl_for(1, &ALDER_CHANNELS[1], &IntelImcRegs::default()),
+            MclRegs::default()
+        );
+        assert_eq!(
+            tier3_mcl_for(3, &ALDER_CHANNELS[3], &IntelImcRegs::default()),
+            MclRegs::default()
+        );
+    }
+
+    /// Mirror-only subchannels (OQ-4): a populated mirror block is
+    /// taken as-is under the Alder layout naming (the mirror is a
+    /// legacy alias of the MCL block); the MCL-only registers have no
+    /// source and stay absent.
+    #[test]
+    fn mirror_only_subchannels_take_the_mirror_as_is() {
+        let regs = IntelImcRegs {
+            ch1: ChannelRegs {
+                tc_dbp: Some(0x284D_2828), // +0x00
+                tc_rap: Some(0x0028_8410), // +0x04
+                tc_rfp: Some(0x4),         // +0x08
+                tc_rdrd: Some(0x0048_C286), // +0x20
+                tc_wrrd: Some(0x286),      // +0x28
+                ..ChannelRegs::default()
+            },
+            ..IntelImcRegs::default()
+        };
+        let mcl = tier3_mcl_for(1, &ALDER_CHANNELS[1], &regs);
+        assert_eq!(mcl.tc_pre, Some(0x284D_2828));
+        assert_eq!(mcl.tc_act, Some(0x0028_8410));
+        assert_eq!(mcl.tc_act2, Some(0x4));
+        assert_eq!(mcl.tc_rdrd, Some(0x0048_C286));
+        assert_eq!(mcl.tc_wrwr, Some(0x286));
+        assert_eq!(mcl.tc_wtr, None);
+        assert_eq!(mcl.tc_rfp, None);
+        assert_eq!(mcl.tc_rfp2, None);
+    }
+
+    /// The wide `/dev/mem` Tier-3 offset set (IG-25): the 256 KiB
+    /// window constant matches the Alder profile window (IG-03,
+    /// `window_size` from `profile_for`) and every Tier-3 offset (the
+    /// four mirror bases, both MCL blocks, the global `MC_BIOS_REQ`,
+    /// the `MAD_DIMM_CH2/3` raws) fits it.
+    #[test]
+    fn devmem_wide_map_is_256_kib_for_tier3() {
+        assert_eq!(MCHBAR_WINDOW_TIER3, 0x40000, "the Alder profile window (IG-03)");
+        assert_eq!(
+            MCHBAR_WINDOW_TIER3,
+            profile_for(IntelGen::AlderLake).unwrap().window_size,
+            "window size from profile_for"
+        );
+        assert_eq!(
+            MCHBAR_WINDOW_TIER3,
+            profile_for(IntelGen::MeteorLake).unwrap().window_size
+        );
+        for off in [
+            MAX_MCL_OFFSET,
+            MAX_MAD_DIMM_OFFSET,
+            MAX_IMC_OFFSET,
+            MAX_CHANNEL_OFFSET,
+        ] {
+            assert!(
+                off <= MCHBAR_WINDOW_TIER3,
+                "offset {off:#x} must fit the 256 KiB Tier-3 window"
+            );
+        }
+        // The MCL bases sit inside the wide window too (compile-proven
+        // by `_ASSERT_TIER3_READS_IN_WIDE_WINDOW` over MAX_MCL_OFFSET,
+        // which is the highest MCL read).
+        for map in ALDER_CHANNELS {
+            assert!(
+                map.mirror_base as usize + 4 <= MCHBAR_WINDOW_TIER3,
+                "mirror base {:#x}",
+                map.mirror_base
+            );
+        }
     }
 
     // -----------------------------------------------------------------
