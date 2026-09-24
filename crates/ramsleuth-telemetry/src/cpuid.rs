@@ -284,6 +284,80 @@ fn intel_gen_from_model(model: u32) -> Option<IntelGen> {
     }
 }
 
+/// Extract the Intel marketing generation from a CPUID brand string.
+///
+/// The brand string carries the model number (e.g. `i7-11700K`,
+/// `i5-10500`, `W-10905`); its leading digits encode the marketing
+/// generation, a signal the CPUID model field alone does not carry.
+/// This is the general distinguishing input for model-number collisions
+/// (the shared `0xA5` Comet/Rocket case, OQ-10; wired for it by
+/// [`intel_gen_from_brand`]):
+/// - 5-digit model numbers: the first two digits (10th–14th gen,
+///   e.g. `11700` → 11, `10905` → 10);
+/// - 4-digit model numbers: the first digit, but only for Core
+///   `i3`/`i5`/`i7`/`i9` tokens (6th–9th gen, e.g. `8700` → 8) — other
+///   4-digit part numbers (Pentium `G6400`, Xeon `E-2288G`) are not
+///   generation-numbered and yield no hint.
+///
+/// Returns `None` when the brand has no dash-digit model token (AMD
+/// brands, empty strings, …) or the candidate is outside `1..=14`.
+pub fn brand_gen_hint(brand: &str) -> Option<u8> {
+    for token in brand.split_whitespace() {
+        let Some(dash) = token.find('-') else {
+            continue;
+        };
+        let rest = &token[dash + 1..];
+        let dlen = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if dlen == 0 {
+            continue;
+        }
+        let digits = rest.as_bytes();
+        let gen: u8 = if dlen == 5 {
+            // Two-digit marketing generation (10th–14th).
+            (digits[0] - b'0') * 10 + (digits[1] - b'0')
+        } else if dlen == 4 {
+            // Single-digit generation (6th–9th): Core i3/i5/i7/i9 only.
+            let prefix = &token[..dash];
+            let is_core_i = prefix.len() >= 2
+                && prefix.as_bytes()[prefix.len() - 2] == b'i'
+                && prefix.as_bytes()[prefix.len() - 1].is_ascii_digit();
+            if !is_core_i {
+                continue;
+            }
+            digits[0] - b'0'
+        } else {
+            continue;
+        };
+        return (1..=14).contains(&gen).then_some(gen);
+    }
+    None
+}
+
+/// Resolve an Intel generation from the CPUID model number, with the
+/// brand string as the general distinguishing signal.
+///
+/// [`intel_gen_from_model`] is consulted first and its result returned
+/// unchanged for every unambiguous model (the brand is ignored). The one
+/// collision the model field cannot split — `0xA5`, shared by Comet Lake
+/// (10th) and Rocket Lake (11th) (OQ-10) — is resolved by the brand
+/// string's marketing generation: an 11th-gen brand (e.g. `i7-11700K`)
+/// is Rocket Lake; any other (absent, non-Intel, 10th-gen, …) brand
+/// stays the conservative Comet Lake.
+///
+/// This is the general mechanism: any future model-number collision is
+/// disambiguated by adding a [`brand_gen_hint`] check here.
+pub fn intel_gen_from_brand(brand: &str, model: u32) -> Option<IntelGen> {
+    let from_model = intel_gen_from_model(model);
+    if model == 0xA5 && from_model == Some(IntelGen::CometLake) {
+        match brand_gen_hint(brand) {
+            Some(11) => Some(IntelGen::RocketLake),
+            _ => Some(IntelGen::CometLake),
+        }
+    } else {
+        from_model
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,5 +566,78 @@ mod tests {
         for m in 0..=0xFFu32 {
             assert_ne!(intel_gen_from_model(m), Some(IntelGen::RocketLake));
         }
+    }
+
+    /// (h) `brand_gen_hint` (IG-14): the brand string's model-number
+    /// token as the marketing-generation distinguishing signal.
+    #[test]
+    fn brand_gen_hint_parses_model_number_tokens() {
+        assert_eq!(
+            brand_gen_hint("Intel(R) Core(TM) i7-11700K CPU @ 3.60GHz"),
+            Some(11)
+        );
+        assert_eq!(
+            brand_gen_hint("Intel(R) Core(TM) i5-10500 CPU @ 3.10GHz"),
+            Some(10)
+        );
+        assert_eq!(
+            brand_gen_hint("Intel(R) Xeon(R) W-10905 CPU @ 3.20GHz"),
+            Some(10)
+        );
+        // Pentium 4-digit part number: not a Core generation number.
+        assert_eq!(
+            brand_gen_hint("Intel(R) Pentium(R) Gold G6400 CPU @ 4.00GHz"),
+            None
+        );
+        // Non-Intel brand: no dash-digit model token.
+        assert_eq!(brand_gen_hint("AMD Ryzen 9 5950X"), None);
+        // Empty brand.
+        assert_eq!(brand_gen_hint(""), None);
+        // Compact forms (no "Intel(R)" prefix).
+        assert_eq!(brand_gen_hint("i9-10900K"), Some(10));
+        assert_eq!(brand_gen_hint("i7-12700"), Some(12));
+        assert_eq!(brand_gen_hint("i5-13600K"), Some(13));
+        // Xeon E 4-digit part number: no hint.
+        assert_eq!(brand_gen_hint("E-2288G"), None);
+        // Single-digit generation (8th) from a 4-digit Core model.
+        assert_eq!(brand_gen_hint("i7-8700"), Some(8));
+    }
+
+    /// (i) `intel_gen_from_brand` (IG-14): the general
+    /// distinguishing-signal resolver — the model number always wins for
+    /// unambiguous models; only the shared `0xA5` consults the brand.
+    #[test]
+    fn intel_gen_from_brand_resolves_the_shared_0xa5() {
+        // 0xA5 + 11th-gen brand → Rocket Lake.
+        assert_eq!(
+            intel_gen_from_brand("i7-11700K", 0xA5),
+            Some(IntelGen::RocketLake)
+        );
+        // 0xA5 + 10th-gen brand → Comet Lake.
+        assert_eq!(
+            intel_gen_from_brand("i7-10700", 0xA5),
+            Some(IntelGen::CometLake)
+        );
+        // 0xA5 + empty brand → conservative Comet Lake default.
+        assert_eq!(
+            intel_gen_from_brand("", 0xA5),
+            Some(IntelGen::CometLake)
+        );
+        // 0xA5 + non-Intel brand → conservative Comet Lake default.
+        assert_eq!(
+            intel_gen_from_brand("AMD Ryzen 9 5950X", 0xA5),
+            Some(IntelGen::CometLake)
+        );
+        // Unambiguous models: the brand is ignored, the model wins.
+        assert_eq!(
+            intel_gen_from_brand("i7-11700K", 0xA6),
+            Some(IntelGen::AlderLake)
+        );
+        assert_eq!(
+            intel_gen_from_brand("i7-11700K", 0x9A),
+            Some(IntelGen::CoffeeLake)
+        );
+        // Unlisted model → None regardless of brand.
+        assert_eq!(intel_gen_from_brand("i7-11700K", 0x00), None);
     }
 }
