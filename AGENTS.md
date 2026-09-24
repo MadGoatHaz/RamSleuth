@@ -1,6 +1,6 @@
 # RamSleuth — Project Notes
 
-RamSleuth is a Rust Cargo workspace (v2.2.1) providing live RAM telemetry plus an
+RamSleuth is a Rust Cargo workspace (v2.4.0) providing live RAM telemetry plus an
 AIDA64-style memory benchmark for AMD/Intel desktops: a privileged root daemon
 (`CAP_SYS_RAWIO` only, Unix-socket IPC) feeding dual frontends (ratatui TUI + egui
 GUI), with CLI and standalone tools.
@@ -16,9 +16,10 @@ GUI), with CLI and standalone tools.
   benchmark engine, install/deployment, and testing/CI.
 - `Docs/User_Guide.md` — how to install, run, and read the data (GUI, TUI, CLI,
   standalone tools, N/A reasons, troubleshooting, uninstall).
-- `packaging/README.md` — the packaging / AUR / operator guide: the two-package AUR
-  model, the version-bump standing policy, the `ryzen-smu-dkms` extra, and the
-  CI/release artifact contracts.
+- `packaging/README.md` — the packaging / AUR / operator guide: the AUR package
+  model (2 main packages + 2 optional vendor DKMS extras), the version-bump
+  standing policy, the `ryzen-smu-dkms` extra, and the CI/release artifact
+  contracts.
 
 **Development documentation — local-only, gitignored, never commit:**
 
