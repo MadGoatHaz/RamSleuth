@@ -17,12 +17,13 @@
 //! # Register table (verified Tier-1 layout, MCHBAR-relative)
 //!
 //! One **global** register plus **two per-channel** blocks (Tier 1 =
-//! Skylake / Kaby Lake / Coffee Lake / Comet Lake: a single memory
-//! controller, 2 channels, DDR4, a 64 KiB mapped region):
+//! Skylake / Kaby Lake / Coffee Lake / Comet Lake — shared with Rocket
+//! Lake: a single memory controller, 2 channels, DDR4, a 64 KiB mapped
+//! region):
 //!
 //! | Offset | Register | Fields decoded |
 //! |---|---|---|
-//! | `0x5E00` | `MC_BIOS_REQ` | `[7:0]` CLK_RATIO · `[8]` REF_CLK (0 = 133.3333 MHz, 1 = 100 MHz) · `[17:16]` GEAR_RATIO (Rocket+ only — not decoded in v1) · `[31]` RUN_BUSY (status — not decoded) |
+//! | `0x5E00` | `MC_BIOS_REQ` | `[7:0]` CLK_RATIO · `[8]` REF_CLK (0 = 133.3333 MHz, 1 = 100 MHz) · `[17:16]` GEAR_RATIO (Rocket Lake and later — the Rocket Lake profile decodes it) · `[31]` RUN_BUSY (status — not decoded) |
 //! | `0x4000` (ch0) / `0x4400` (ch1), stride `0x400`, `+0x00` | `TC_DBP` | `[5:0]` tCL · `[13:8]` tCWL · `[21:16]` tRCD · `[29:24]` tRP (6-bit each) |
 //! | `+0x04` | `TC_RAP` | `[5:0]` tRRD_S · `[11:6]` tRTP · `[15:12]` tCKE (**4-bit**, 1–15) · `[23:16]` tFAW (8-bit) · `[31:24]` tRAS (8-bit) |
 //! | `+0x08` | `TC_RFP` | `[10:0]` tRFC (11-bit, 1–2047) · `[27:16]` tREFI (12-bit) |
@@ -52,11 +53,14 @@
 //!   clock MCLK — e.g. ratio 18 × 133.3333 = **2400 MHz**; for DDR,
 //!   MT/s = MCLK × 2), sanity-gated to [1, 4096] MHz; a ratio of 0 =
 //!   unconfigured → `Na(ParseError)`.
-//! - `uclk_mhz`, `fclk_mhz`, `gdm`, `pdm` ← `Na(NotApplicable)`
-//!   (AMD-fabric concepts with no IMC analog).
-//! - `div_mode`, `gear_mode` ← `Na(NotApplicable)` in v1 (the gear ratio
-//!   exists only on Rocket+; Tier 2 will decode it from
-//!   `MC_BIOS_REQ[17:16]`).
+//! - `uclk_mhz` ← `MC_BIOS_REQ`: `mclk / gear` (gears 1/2/4, Breakdown
+//!   §3D) on the Rocket Lake profile; `Na(NotApplicable)` on Tier 1
+//!   (no gear register).
+//! - `fclk_mhz`, `gdm`, `pdm` ← `Na(NotApplicable)` (AMD-fabric
+//!   concepts with no IMC analog).
+//! - `div_mode` ← `Na(NotApplicable)` on both profiled maps (D-C11
+//!   unchanged); `gear_mode` ← `Na(NotApplicable)` on Tier 1, decoded
+//!   from `MC_BIOS_REQ[17:16]` on the Rocket Lake profile.
 //! - `command_rate` ← `Na(NotApplicable)` (D-C11 unchanged).
 //! - `rtl` ← `Na(NotApplicable)` (the old skeleton's "RTL" register was
 //!   fiction; the real IMC table has no RTL).
@@ -89,14 +93,19 @@
 //! - `cad_bus`, `voltages` → every field `Na(NotApplicable)` (unchanged:
 //!   the IMC window does not expose drive strengths or rails).
 //!
-//! # Generation gate (v1 Tier 1)
+//! # Generation gate (profile dispatch)
 //!
-//! [`decode`] runs only for `{Skylake, KabyLake, CoffeeLake,
-//! CometLake}`. Any other detected Intel generation (Alder/Raptor =
-//! Tier 2, Meteor/Arrow = Tier 3, `Unrecognized`) degrades the whole
-//! readout to `Na(UnsupportedHardware)` — never garbage data from a
-//! mismatched register map. [`tier1_gate`] carries the rich detail (the
-//! generation and its tier) for the facade's branch-level error.
+//! [`decode`] dispatches on [`intel_gen::profile_for`]: the profiled
+//! generations (Tier 1 = `{Skylake, KabyLake, CoffeeLake, CometLake}`,
+//! plus Rocket Lake) decode from the verified register map — Tier 1 and
+//! Rocket share the identical 64 KiB offsets, and Rocket additionally
+//! decodes `gear_mode` + `uclk_mhz` from `MC_BIOS_REQ[17:16]`. Any
+//! other detected generation (Alder/Raptor/Arrow = roadmap Tier 3,
+//! Meteor, `Unrecognized`) degrades the whole readout to
+//! `Na(UnsupportedHardware)` — never garbage data from a mismatched
+//! register map. [`tier1_gate`] (the facade's branch-level gate,
+//! Tier-1-only) carries the rich detail (the generation and its
+//! roadmap tier).
 //!
 //! # No-panic contract (D5)
 //!
@@ -136,7 +145,7 @@
 use crate::amd_readout::{CadBus, ClockReadout, DivMode, GearMode, TimingSet, VoltageSet};
 use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
-use crate::intel_gen::GearCap;
+use crate::intel_gen::{GearCap, profile_for};
 use crate::intel_mchbar::MchBar;
 
 // ---------------------------------------------------------------------------
@@ -153,7 +162,8 @@ pub const MCHBAR_WINDOW: usize = 1 << 16;
 
 /// Global register: the BIOS request word carrying the DRAM clock ratio
 /// (bits 7:0), the reference-clock select (bit 8), the gear ratio (bits
-/// 17:16 — Rocket+ only, not decoded in v1), and RUN_BUSY (bit 31).
+/// 17:16 — Rocket Lake and later; decoded by the Rocket Lake profile),
+/// and RUN_BUSY (bit 31).
 pub const MC_BIOS_REQ_OFFSET: usize = 0x5E00;
 
 /// Per-channel IMC block bases: channel 0 at `0x4000`, channel 1 at
@@ -334,8 +344,10 @@ pub fn intel_gen_gate(info: &CpuInfo) -> TelemetryResult<IntelGen> {
     }
 }
 
-/// v1 Tier 1: the generations the hardware-authoritative register map
-/// above is verified for.
+/// The Tier-1 set: the generations the hardware-authoritative register
+/// map above is verified for. A compatibility alias kept from the
+/// pre-dispatch name — use [`gen_supported`] for "does this generation
+/// have a decode profile" (Tier 1 plus Rocket Lake as of this build).
 pub fn tier1_supported(gen: IntelGen) -> bool {
     matches!(
         gen,
@@ -343,9 +355,19 @@ pub fn tier1_supported(gen: IntelGen) -> bool {
     )
 }
 
-/// The rich v1 Tier-1 generation gate: `Ok(())` for Tier 1, else
+/// Profile dispatch: `true` for every generation that
+/// [`intel_gen::profile_for`] resolves to a decode profile (Tier 1 —
+/// Skylake / Kaby Lake / Coffee Lake / Comet Lake — plus Rocket Lake as
+/// of this build).
+pub fn gen_supported(gen: IntelGen) -> bool {
+    profile_for(gen).is_some()
+}
+
+/// The rich v1 Tier-1 generation gate (the facade's branch-level
+/// gate): `Ok(())` for Tier 1 only, else
 /// [`TelemetryError::UnsupportedHardware`] whose `vendor` detail names
-/// the detected generation and its tier — the facade surfaces this as
+/// the detected generation and its research-roadmap tier (Rocket Lake =
+/// Tier 2; Alder/Raptor/Arrow = Tier 3) — the facade surfaces this as
 /// the branch-level `Na(UnsupportedHardware)` (plan §3.4: never garbage
 /// data from a mismatched register map).
 pub fn tier1_gate(gen: IntelGen) -> TelemetryResult<()> {
@@ -354,9 +376,12 @@ pub fn tier1_gate(gen: IntelGen) -> TelemetryResult<()> {
     }
     let tier = match gen {
         IntelGen::AlderLake | IntelGen::RaptorLake => {
-            "Tier 2 (dual-MC DDR4/DDR5, designed-for, not implemented in v1)"
+            "Tier 3 (dual-MC DDR4/DDR5, designed-for, not implemented in v1)"
         }
         IntelGen::MeteorLake | IntelGen::ArrowLake => "Tier 3 (DDR5, out of v1 scope)",
+        IntelGen::RocketLake => {
+            "Tier 2 (Gear Mode + turnaround parity; outside this Tier-1 gate)"
+        }
         _ => "beyond Tier 1",
     };
     Err(TelemetryError::UnsupportedHardware {
@@ -367,22 +392,23 @@ pub fn tier1_gate(gen: IntelGen) -> TelemetryResult<()> {
 }
 
 /// The fixed channel-count model for an [`IntelGen`] (plan: per-channel
-/// 0–3). DDR4-class generations expose 2 channels; DDR5-class client
-/// generations expose 4; an unrecognized family-6 Intel falls back to
-/// the common 2-channel desktop layout. Tier 1 is always 2.
+/// 0–3): the profiled generations take their count from their
+/// [`intel_gen::GenProfile`] (Tier 1 and Rocket Lake: 2); the
+/// non-profiled generations keep the legacy model — DDR4-class
+/// generations expose 2 channels, DDR5-class client generations expose
+/// 4, and an unrecognized family-6 Intel falls back to the common
+/// 2-channel desktop layout. Same values as before this dispatch, so no
+/// wire change.
 pub fn channel_count(gen: IntelGen) -> u8 {
+    if let Some(p) = profile_for(gen) {
+        return p.channel_count;
+    }
     match gen {
-        IntelGen::Skylake
-        | IntelGen::KabyLake
-        | IntelGen::CoffeeLake
-        | IntelGen::CometLake
-        | IntelGen::IceLake
-        | IntelGen::TigerLake
-        | IntelGen::AlderLake
-        | IntelGen::RaptorLake
-        | IntelGen::RocketLake => 2,
+        IntelGen::IceLake | IntelGen::TigerLake | IntelGen::AlderLake | IntelGen::RaptorLake => 2,
         IntelGen::MeteorLake | IntelGen::ArrowLake => 4,
-        IntelGen::Unrecognized => 2,
+        // The profiled generations (Tier 1 + Rocket Lake) return above;
+        // any future profiled family never reaches this legacy fallback.
+        _ => 2,
     }
 }
 
@@ -490,8 +516,9 @@ pub fn turnaround_quartet(reg: u32) -> [u16; 4] {
 /// sanity-gated to [1, 4096] MHz.
 ///
 /// Containment: an absent register → `Na(ParseError)`; a ratio of 0 =
-/// unconfigured → `Na(ParseError)`; a reserved GEAR_RATIO encoding
-/// (bits 17:16, Rocket+ only) does not affect the v1 decode.
+/// unconfigured → `Na(ParseError)`; the GEAR_RATIO bits (17:16,
+/// Rocket+ only) do not affect the MCLK decode — on the Rocket Lake
+/// profile they feed the gear cells via [`mcbios_gear`], not MCLK.
 fn decode_mclk(reg: Option<u32>) -> Section<f64> {
     match reg {
         None => Section::na(NaReason::ParseError(
@@ -534,9 +561,8 @@ fn mcbios_refclk_100(raw: u32) -> bool {
 ///   `None`.
 ///
 /// A `11b` field follows the bit-16 rule (gear 2) — the pinned
-/// Breakdown §4 example D reading. Pure and cap-parameterized
-/// (IG-11, ISOLATED): no live path calls this until IG-12 wires it
-/// into [`decode`].
+/// Breakdown §4 example D reading. Pure and cap-parameterized (IG-11);
+/// wired into [`decode`] by IG-12 for the Rocket Lake profile.
 pub fn mcbios_gear(raw: u32, cap: GearCap) -> Option<GearMode> {
     if raw & 0x0001_0000 != 0 {
         // Gear 2 (bit 16 = 1b): every 2×-gear-capable platform.
@@ -557,8 +583,8 @@ pub fn mcbios_gear(raw: u32, cap: GearCap) -> Option<GearMode> {
 ///
 /// Containment mirrors the legacy uclk rule: an `Na` gear cell (a
 /// failed register read, a reserved, or an over-cap encoding) →
-/// `Na(ParseError)` — never a bogus clock. Pure (IG-11, ISOLATED);
-/// wired into [`decode`] by IG-12.
+/// `Na(ParseError)` — never a bogus clock. Pure (IG-11); wired into
+/// [`decode`] by IG-12 for the Rocket Lake profile.
 pub fn decode_uclk(mclk: f64, gear: &Section<GearMode>) -> Section<f64> {
     match gear.value().copied() {
         Some(g) => clock_section(mclk / gear_divisor(g)),
@@ -661,9 +687,10 @@ fn decode_tier1_channel(index: u8, mclk: Section<f64>, regs: &ChannelRegs) -> In
     let wtrs = quartet_cell(wrrd, "tWTR_S(dg)", 1);
     let wtrl = quartet_cell(wrrd, "tWTR_L(sg)", 0);
 
-    // --- clocks: v1 decodes mclk only (the gear ratio is Rocket+,
-    // decoded by Tier 2 from MC_BIOS_REQ[17:16]; the AMD-fabric slots
-    // have no IMC analog) ----------------------------------------------
+    // --- clocks: the shared map decodes mclk only; the Rocket Lake
+    // profile layers on gear_mode + uclk (MC_BIOS_REQ[17:16], Breakdown
+    // §3D) in [`decode`] after this call. The AMD-fabric slots have no
+    // IMC analog -------------------------------------------------------
     let clocks = ClockReadout {
         mclk_mhz: mclk,
         uclk_mhz: Section::na(NaReason::NotApplicable),
@@ -821,41 +848,103 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 /// implementation for both producers — the sysfs path and the `/dev/mem`
 /// fallback; plan §3.5).
 ///
-/// - **v1 Tier-1 generations** (`{Skylake, KabyLake, CoffeeLake,
-///   CometLake}`): both channels decode from the verified register map —
-///   the shared `MC_BIOS_REQ` core clock plus the per-channel `TC_*`
-///   blocks (per-register containment; the frozen [1, 2048] tick /
-///   [1, 4096] MHz sanity gates).
-/// - **any other generation** (Tier 2 / Tier 3 / `Unrecognized`): the
-///   whole readout degrades to `Na(UnsupportedHardware)` channels — the
-///   registers are *not* decoded (never garbage from a mismatched map;
-///   [`tier1_gate`] carries the rich detail for the branch-level error).
+/// Dispatches on [`intel_gen::profile_for`] — "Tier 1 is one case of
+/// the dispatcher":
+///
+/// - **profiled generations** (Tier 1 = `{Skylake, KabyLake,
+///   CoffeeLake, CometLake}`; Rocket Lake): both channels decode from
+///   the verified 64 KiB register map (identical offsets — Tier 1 and
+///   Rocket share it): the shared `MC_BIOS_REQ` core clock plus the
+///   per-channel `TC_*` blocks (per-register containment; the frozen
+///   [1, 2048] tick / [1, 4096] MHz sanity gates). Rocket Lake
+///   additionally decodes `gear_mode` + `uclk_mhz` from
+///   `MC_BIOS_REQ[17:16]` (Breakdown §3D, Gear2 cap). Breakdown §3B's
+///   Rocket Lake CLK_RATIO widening is a no-op in code: [`decode_mclk`]
+///   already masks `[7:0]`.
+/// - **unprofiled generations** (roadmap Tier 3+ — Alder / Raptor /
+///   Meteor / Arrow — and `Unrecognized`): the whole readout degrades
+///   to `Na(UnsupportedHardware)` channels — the registers are *not*
+///   decoded (never garbage from a mismatched map; [`tier1_gate`]
+///   carries the rich detail for the branch-level error).
 ///
 /// The `channel_mode` slot decodes `MAD_INTER_CHANNEL[1:0]` from
 /// `mad_inter_channel` (`None` → `None`; reserved `11` → `None`); it is
-/// independent of the generation gate and populated whenever the raw
-/// value is present.
+/// populated on the profiled path (the unprofiled degradation keeps
+/// `None` — behavior preserved).
 ///
 /// Never panics (D5): a `None` register degrades only its sourced fields.
 pub fn decode(regs: &IntelImcRegs, gen: IntelGen, mad_inter_channel: Option<u32>) -> IntelReadout {
-    let count = channel_count(gen);
-    if !tier1_supported(gen) {
-        let mut channels = Vec::with_capacity(usize::from(count));
-        for ch in 0..count {
-            channels.push(unsupported_channel(ch));
+    match profile_for(gen) {
+        // Profiled: Tier 1 and Rocket Lake reuse the identical 64 KiB
+        // register map; Rocket additionally decodes the gear cells.
+        Some(p) => {
+            let mclk = decode_mclk(regs.mcbios_req);
+            let mut channels = Vec::with_capacity(usize::from(p.channel_count));
+            for i in 0..p.channel_count {
+                let per = match i {
+                    0 => &regs.ch0,
+                    _ => &regs.ch1,
+                };
+                let mut channel = decode_tier1_channel(i, mclk.clone(), per);
+                if p.gear != GearCap::None {
+                    let (gear_mode, uclk) = gear_uclk_cells(p.gear, &mclk, regs.mcbios_req);
+                    channel.clocks.gear_mode = gear_mode;
+                    channel.clocks.uclk_mhz = uclk;
+                }
+                channels.push(channel);
+            }
+            IntelReadout {
+                channels,
+                channel_mode: mad_inter_channel.and_then(ChannelMode::from_raw),
+            }
         }
-        return IntelReadout {
-            channels,
-            channel_mode: None,
-        };
+        // Unprofiled: behavior preserved — the all-Na(UnsupportedHardware)
+        // degradation at the generation's channel count.
+        None => {
+            let count = channel_count(gen);
+            let mut channels = Vec::with_capacity(usize::from(count));
+            for ch in 0..count {
+                channels.push(unsupported_channel(ch));
+            }
+            IntelReadout {
+                channels,
+                channel_mode: None,
+            }
+        }
     }
-    let mclk = decode_mclk(regs.mcbios_req);
-    let ch0 = decode_tier1_channel(0, mclk.clone(), &regs.ch0);
-    let ch1 = decode_tier1_channel(1, mclk, &regs.ch1);
-    IntelReadout {
-        channels: vec![ch0, ch1],
-        channel_mode: mad_inter_channel.and_then(ChannelMode::from_raw),
-    }
+}
+
+/// The Rocket Lake gear cells (Breakdown §3D, Gear2 cap): `gear_mode`
+/// from `MC_BIOS_REQ[17:16]` via [`mcbios_gear`] and `uclk = mclk /
+/// gear` via [`decode_uclk`].
+///
+/// Containment mirrors the legacy uclk rule: an absent register, a
+/// reserved, or an over-cap encoding → `Na(ParseError)` gear (and thus
+/// uclk); an absent / out-of-band MCLK → `Na(ParseError)` uclk — never
+/// a bogus clock.
+fn gear_uclk_cells(
+    gear_cap: GearCap,
+    mclk: &Section<f64>,
+    mcbios_req: Option<u32>,
+) -> (Section<GearMode>, Section<f64>) {
+    let gear = mcbios_req.and_then(|raw| mcbios_gear(raw, gear_cap));
+    let gear_mode = match gear {
+        Some(g) => Section::Value(g),
+        None => Section::na(NaReason::ParseError(
+            "MC_BIOS_REQ: gear unavailable (register read failed) or reserved/over-cap encoding"
+                .to_owned(),
+        )),
+    };
+    let uclk = match (gear, mclk.value().copied()) {
+        (Some(g), Some(m)) => decode_uclk(m, &Section::Value(g)),
+        (None, _) => Section::na(NaReason::ParseError(
+            "uclk = mclk / gear: gear unavailable or reserved encoding".to_owned(),
+        )),
+        (_, None) => Section::na(NaReason::ParseError(
+            "uclk = mclk / gear: mclk unavailable".to_owned(),
+        )),
+    };
+    (gear_mode, uclk)
 }
 
 // ---------------------------------------------------------------------------
@@ -872,11 +961,12 @@ pub fn decode(regs: &IntelImcRegs, gen: IntelGen, mad_inter_channel: Option<u32>
 ///    read.
 /// 2. [`IntelImcRegs::from_bar`] reads the 9-register set with
 ///    per-register containment (a failed read → `None`).
-/// 3. [`decode`] runs the v1 Tier-1 generation gate + the register map:
-///    Tier 1 decodes both channels; any other Intel generation returns
-///    the degraded all-`Na(UnsupportedHardware)` readout (honest N/A,
-///    never garbage — the facade's branch-level gate in a later phase
-///    surfaces [`tier1_gate`]'s rich detail).
+/// 3. [`decode`] dispatches on the generation's profile: the profiled
+///    generations (Tier 1 + Rocket Lake) decode both channels; any
+///    other Intel generation returns the degraded all-
+///    `Na(UnsupportedHardware)` readout (honest N/A, never garbage —
+///    the facade's branch-level gate surfaces [`tier1_gate`]'s rich
+///    detail).
 ///
 /// No I/O happens beyond the bounds-checked [`MchBar::read_u32`].
 pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
@@ -892,7 +982,8 @@ pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
 /// Total and panic-free: the vendor gate runs first — a non-Intel host
 /// (this AMD reference host) yields the degraded all-`Na` readout
 /// (2 channels) with zero register decoding; an Intel host decodes
-/// through [`decode`] (the Tier-1 gate applies inside). The facade's
+/// through [`decode`] (the profile dispatch applies inside). The
+/// facade's
 /// branch-level gates (vendor → Tier 1 → source) run before this call
 /// in the live topology; this function re-verifies so it can never
 /// decode off-vendor hardware even if misused directly.
@@ -922,11 +1013,12 @@ pub fn read_regs(regs: &IntelImcRegs) -> IntelReadout {
 pub struct IntelChannel {
     /// 0-based channel index (`index < channel_count(gen)`).
     pub index: u8,
-    /// Clocks and ratios: in the live Tier-1 decode `mclk` comes from
-    /// `MC_BIOS_REQ` and every other clock cell is `Na(NotApplicable)`
-    /// (v1 — the gear ratio is Rocket+ only; AMD-fabric slots have no
-    /// IMC analog). The legacy compat path may populate the gear /
-    /// uclk cells.
+    /// Clocks and ratios: in the live decode `mclk` comes from
+    /// `MC_BIOS_REQ`; the Rocket Lake profile additionally decodes
+    /// `gear_mode` + `uclk_mhz` from `MC_BIOS_REQ[17:16]`, while on
+    /// Tier 1 (and for the AMD-fabric slots) those cells are
+    /// `Na(NotApplicable)`. The legacy compat path may populate the
+    /// gear / uclk cells.
     pub clocks: ClockReadout,
     /// DRAM subtimings in integer DRAM clock cycles: 24 populated /
     /// derived slots + 3 structural `Na(NotApplicable)` in the live
@@ -1920,7 +2012,7 @@ mod tests {
 
     /// [`tier1_gate`]: Tier 1 passes; every other generation yields
     /// `UnsupportedHardware` with a detail that names the generation
-    /// and its tier.
+    /// and its research-roadmap tier.
     #[test]
     fn tier1_gate_dispatches_by_generation() {
         for gen in [
@@ -1939,12 +2031,122 @@ mod tests {
         ));
         let ald_msg = ald.to_string();
         assert!(ald_msg.contains("AlderLake"), "{ald_msg}");
-        assert!(ald_msg.contains("Tier 2"), "{ald_msg}");
+        assert!(ald_msg.contains("Tier 3"), "{ald_msg}");
         let met = tier1_gate(IntelGen::MeteorLake).unwrap_err();
         assert!(met.to_string().contains("Tier 3"), "{met}");
+        let rock = tier1_gate(IntelGen::RocketLake).unwrap_err();
+        assert!(rock.to_string().contains("RocketLake"), "{rock}");
+        assert!(rock.to_string().contains("Tier 2"), "{rock}");
         let ice = tier1_gate(IntelGen::IceLake).unwrap_err();
         assert!(ice.to_string().contains("IceLake"), "{ice}");
         assert!(!tier1_supported(IntelGen::Unrecognized));
+    }
+
+    // -----------------------------------------------------------------
+    // Profile dispatch (IG-12): Tier 1 is one case of the dispatcher.
+    // -----------------------------------------------------------------
+
+    /// [`gen_supported`] mirrors [`intel_gen::profile_for`]: the Tier-1
+    /// set plus Rocket Lake are profiled; every other generation is
+    /// not.
+    #[test]
+    fn gen_supported_matches_profile_for() {
+        for gen in [
+            IntelGen::Skylake,
+            IntelGen::KabyLake,
+            IntelGen::CoffeeLake,
+            IntelGen::CometLake,
+            IntelGen::RocketLake,
+        ] {
+            assert!(gen_supported(gen), "{gen:?}");
+        }
+        for gen in [
+            IntelGen::IceLake,
+            IntelGen::TigerLake,
+            IntelGen::AlderLake,
+            IntelGen::RaptorLake,
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
+            IntelGen::Unrecognized,
+        ] {
+            assert!(!gen_supported(gen), "{gen:?}");
+        }
+    }
+
+    /// Rocket Lake through [`decode`]: the shared 64 KiB map decodes
+    /// identically for the same raws (every mclk / timing / CAD /
+    /// voltage cell equal to the Tier-1 result), and the gear cells
+    /// layer on from `MC_BIOS_REQ[17:16]` (Breakdown §3D, Gear2 cap):
+    /// bit 16 set → gear Two → uclk = mclk / 2.
+    #[test]
+    fn decode_rocket_lake_is_tier1_map_plus_gear() {
+        let tier1 = decode(&acceptance_regs(), IntelGen::Skylake, None);
+        let mut regs = acceptance_regs();
+        regs.mcbios_req = Some(0x0001_0012); // ratio 18 + bit 16 (gear 2)
+        let rocket = decode(&regs, IntelGen::RocketLake, None);
+        assert_eq!(rocket.channels.len(), 2, "Rocket Lake: two channels");
+        for (t, r) in tier1.channels.iter().zip(&rocket.channels) {
+            // Every shared-map cell is identical for the same raws.
+            assert_eq!(t.clocks.mclk_mhz, r.clocks.mclk_mhz, "mclk identical");
+            assert_eq!(t.clocks.fclk_mhz, r.clocks.fclk_mhz);
+            assert_eq!(t.clocks.div_mode, r.clocks.div_mode);
+            assert_eq!(t.clocks.gdm, r.clocks.gdm);
+            assert_eq!(t.clocks.pdm, r.clocks.pdm);
+            assert_eq!(t.clocks.command_rate, r.clocks.command_rate);
+            assert_eq!(t.timings, r.timings, "all timings identical");
+            assert_eq!(t.cad_bus, r.cad_bus);
+            assert_eq!(t.voltages, r.voltages);
+            assert_eq!(t.rtl, r.rtl);
+            // The Rocket gear cells (Tier 1 keeps them not-applicable).
+            assert_eq!(t.clocks.gear_mode, Section::na(NaReason::NotApplicable));
+            assert_eq!(t.clocks.uclk_mhz, Section::na(NaReason::NotApplicable));
+            assert_eq!(r.clocks.gear_mode, Section::Value(GearMode::Two));
+            assert_eq!(r.clocks.uclk_mhz, Section::Value(1200.0), "uclk = 2400 / 2");
+        }
+    }
+
+    /// Rocket Lake gear containment: gear bits `00b` → gear One (uclk =
+    /// mclk, the synchronous default); an absent `MC_BIOS_REQ` degrades
+    /// mclk, gear, and uclk to `Na(ParseError)` (never a bogus clock).
+    #[test]
+    fn decode_rocket_lake_gear_containment() {
+        let sync = decode(&acceptance_regs(), IntelGen::RocketLake, None); // 0x12 → 00b
+        for ch in &sync.channels {
+            assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
+            assert_eq!(ch.clocks.uclk_mhz, Section::Value(2400.0), "uclk = mclk (gear 1)");
+        }
+        let absent = decode(&IntelImcRegs::default(), IntelGen::RocketLake, None);
+        for ch in &absent.channels {
+            assert!(matches!(
+                ch.clocks.mclk_mhz,
+                Section::Na(NaReason::ParseError(_))
+            ));
+            assert!(matches!(
+                ch.clocks.gear_mode,
+                Section::Na(NaReason::ParseError(_))
+            ));
+            assert!(matches!(
+                ch.clocks.uclk_mhz,
+                Section::Na(NaReason::ParseError(_))
+            ));
+        }
+    }
+
+    /// [`channel_count`] delegates the profiled generations to their
+    /// profile (same values as the legacy model — no wire change).
+    #[test]
+    fn channel_count_delegates_to_profile() {
+        for gen in [
+            IntelGen::Skylake,
+            IntelGen::KabyLake,
+            IntelGen::CoffeeLake,
+            IntelGen::CometLake,
+            IntelGen::RocketLake,
+        ] {
+            let p = profile_for(gen)
+                .unwrap_or_else(|| panic!("{gen:?} must be profiled"));
+            assert_eq!(channel_count(gen), p.channel_count, "{gen:?}");
+        }
     }
 
     // -----------------------------------------------------------------
