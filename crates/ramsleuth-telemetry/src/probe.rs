@@ -21,14 +21,24 @@
 //!   vendor / generation, the PCI host-bridge id (when known), kernel /
 //!   OS / arch, the RamSleuth version, and the telemetry source.
 //!
-//! **This chunk defines the wire shapes only.** The daemon-side builder
-//! (chunk 1b) populates these from the live snapshot + raw sources; the
-//! frontends (chunks 3/4) render them.
+//! The daemon-side builder (chunk 1b) populates these from the live
+//! snapshot + raw sources; [`render_probe_report_md`] (chunk 2) turns a
+//! report into the copy-paste-ready markdown document (the GitHub
+//! issue / clipboard / email form); the frontends (chunks 3/4) embed
+//! that renderer output.
 //!
 //! **No-panic contract (D5):** all three structs are plain data — no I/O,
 //! no panics on construction. Every field is serde-serializable so the
 //! whole report crosses the wire verbatim (plan D3).
 
+use crate::amd_readout::{
+    AmdReadout, CadBus, ClockReadout, CommandRate, DivMode, GearMode, RttValue, TimingSet,
+    VoltageSet,
+};
+use crate::cpuid::{CpuInfo, CpuVendor};
+use crate::error::{NaReason, Section};
+use crate::intel_readout::IntelReadout;
+use crate::spd_decode::SpdModule;
 use crate::SystemMemoryTelemetry;
 
 /// The top-level probe report — the `Response::ProbeReport` payload.
@@ -170,6 +180,893 @@ pub struct ProbeSystem {
     pub ramsleuth_version: String,
     /// The telemetry source (e.g. "ramsleuth_intel", "ryzen_smu", "devmem").
     pub telemetry_source: String,
+}
+
+// ---------------------------------------------------------------------------
+// Markdown renderer (chunk-probe-2): the GitHub issue / clipboard / email
+// form of a [`ProbeReport`].
+// ---------------------------------------------------------------------------
+
+/// Render a [`ProbeReport`] as a copy-paste-ready markdown document.
+///
+/// The section layout mirrors the GitHub issue template
+/// (`.github/ISSUE_TEMPLATE/probe-report.md`, chunk-probe-5), which the
+/// frontends pre-fill from this renderer:
+///
+/// 1. `# RamSleuth Probe Report` — the header + a one-line summary
+///    (CPU brand + generation + OS + kernel + RamSleuth version).
+/// 2. `## System` — the [`ProbeSystem`] identity table (the template's
+///    nine fields, verbatim).
+/// 3. `## Decoded Telemetry` — the [`SystemMemoryTelemetry`] in the
+///    dashboard's canonical display form (the same cell formatting the
+///    TUI / GUI / CLI `dump` renderers use: MHz to two decimals, the
+///    derived MT/s = MCLK × 2, ticks as integers, mV→V to three
+///    decimals, ohms to one decimal, and `N/A (<reason>)` for every
+///    degraded cell): the CPU identity, the AMD readout (the clocks &
+///    ratios, all 27 timings, the CAD bus, the voltages), the Intel
+///    readout (the readout-level channel mode + the same display sets
+///    per decoded channel, plus the channel-level RTL), the SPD
+///    modules (the module identity + the factory-rated profiles), and
+///    the platform branch (incl. the derived per-DIMM / total
+///    capacities).
+/// 4. `## Raw Registers` — the [`ProbeRaw`] table (every register as
+///    `0x…`; `N/A (absent)` per unread register), or a not-captured
+///    note when `raw` is `None`.
+/// 5. `## N/A Reasons` — every `Na` cell of the decoded telemetry (and
+///    every absent raw register when `raw` is present) with its
+///    reason — the "why is this N/A" development detail.
+/// 6. The footer — the generating RamSleuth version + the
+///    no-personal-information note (no username, hostname, IP, MAC, or
+///    serial numbers).
+///
+/// Pure (no I/O, D5): the same report always yields the same string,
+/// and no field value can make the renderer panic.
+pub fn render_probe_report_md(report: &ProbeReport) -> String {
+    let mut out = String::new();
+    // 1. The header: the title + the one-line summary.
+    out.push_str("# RamSleuth Probe Report\n\n");
+    out.push_str(&format!(
+        "> **{}** — {} on {} (kernel {}), RamSleuth v{}\n\n",
+        report.system.cpu_brand, report.system.cpu_gen, report.system.os,
+        report.system.kernel, report.system.ramsleuth_version,
+    ));
+    // 2. The System table (the issue template's nine fields).
+    out.push_str("## System\n\n");
+    out.push_str("| Field | Value |\n|---|---|\n");
+    for (field, value) in system_rows(&report.system) {
+        out.push_str(&format!("| {} | {} |\n", md_escape(field), md_escape(&value)));
+    }
+    out.push('\n');
+    // 3. The decoded telemetry in the dashboard display form.
+    out.push_str("## Decoded Telemetry\n\n");
+    render_cpu(&mut out, &report.telemetry.cpu);
+    render_amd(&mut out, &report.telemetry.amd);
+    render_intel(&mut out, &report.telemetry.intel);
+    render_spd(&mut out, &report.telemetry.spd);
+    render_platform(&mut out, &report.telemetry);
+    // 4. The raw registers (or the not-captured note).
+    out.push_str("## Raw Registers\n\n");
+    match &report.raw {
+        Some(raw) => render_raw_table(&mut out, raw),
+        None => out.push_str("_not captured (no Intel raw source available: AMD / unknown silicon, or both sources unavailable)_\n\n"),
+    }
+    // 5. The N/A reasons (the "why is this N/A" development detail).
+    out.push_str("## N/A Reasons\n\n");
+    let mut reasons: Vec<(String, String)> = Vec::new();
+    collect_na_reasons(report, &mut reasons);
+    if reasons.is_empty() {
+        out.push_str("_none — every decoded field carried a value_\n\n");
+    } else {
+        for (path, text) in &reasons {
+            out.push_str(&format!("- `{path}` — {text}\n"));
+        }
+        out.push('\n');
+    }
+    // 6. The footer: the generating version + the no-personal-info note.
+    out.push_str("---\n\n");
+    out.push_str(&format!(
+        "_This report was auto-generated by RamSleuth v{}. It contains no personal information (no username, hostname, IP, MAC, or serial numbers)._\n",
+        report.system.ramsleuth_version,
+    ));
+    out
+}
+
+/// The [`ProbeSystem`] rows of the System table (the issue template's
+/// nine fields, verbatim; the host bridge renders `N/A` when unknown).
+fn system_rows(system: &ProbeSystem) -> Vec<(&str, String)> {
+    vec![
+        ("CPU", system.cpu_brand.clone()),
+        ("Vendor", system.cpu_vendor.clone()),
+        ("Generation", system.cpu_gen.clone()),
+        (
+            "PCI Host Bridge",
+            system.pci_host_bridge.clone().unwrap_or_else(|| "N/A".to_owned()),
+        ),
+        ("Kernel", system.kernel.clone()),
+        ("OS", system.os.clone()),
+        ("Arch", system.arch.clone()),
+        ("RamSleuth Version", system.ramsleuth_version.clone()),
+        ("Telemetry Source", system.telemetry_source.clone()),
+    ]
+}
+
+/// Escape the one markdown-table-breaking character (`|`) in a cell so
+/// the table stays well-formed when pasted into GitHub.
+fn md_escape(value: &str) -> String {
+    value.replace('|', "\\|")
+}
+
+/// The CPU vendor as a display string (the same form the CLI `dump`
+/// renderer prints; the snapshot carries the vendor + brand only).
+fn vendor_text(vendor: &CpuVendor) -> String {
+    match vendor {
+        CpuVendor::Amd(zen) => format!("AMD {zen:?}"),
+        CpuVendor::Intel(gen) => format!("Intel {gen:?}"),
+        CpuVendor::Unknown => "unknown".to_owned(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cell formatters: one per value kind. Each renders a [`Section`] cell
+// as its formatted value or `N/A (<reason>)` — the same compact,
+// user-presentable forms the TUI / GUI / CLI `dump` renderers print
+// (mirrored here: this crate sits below the display crates, so it owns
+// its copy of the frozen display forms; [`NaReason`] has no `Display`
+// impl, so the renderer owns the reason text).
+// ---------------------------------------------------------------------------
+
+/// The human-readable text of an absent cell: `N/A (<reason>)`.
+fn na_cell(reason: &NaReason) -> String {
+    match reason {
+        NaReason::UnsupportedHardware => "N/A (unsupported hardware)".to_owned(),
+        NaReason::DriverMissing => "N/A (driver missing)".to_owned(),
+        NaReason::InsufficientPrivilege => "N/A (insufficient privilege)".to_owned(),
+        NaReason::UnknownPmTableVersion => "N/A (unknown PM table version)".to_owned(),
+        NaReason::NotApplicable => "N/A (not applicable)".to_owned(),
+        NaReason::ParseError(detail) => format!("N/A (parse error: {detail})"),
+    }
+}
+
+/// A bare displayable cell: the formatted value, or `N/A (<reason>)`.
+fn cell<T: std::fmt::Display>(section: &Section<T>) -> String {
+    match section {
+        Section::Value(value) => value.to_string(),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// A memory-clock cell in megahertz (two decimals).
+fn mhz(section: &Section<f64>) -> String {
+    match section {
+        Section::Value(value) => format!("{value:.2} MHz"),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// The DDR data rate derived from the memory clock: MT/s = MCLK × 2
+/// (the DDR double-pumping rule — the `intel_readout` module docs);
+/// `N/A` when MCLK itself is `Na` (never a fabricated rate).
+fn derived_mts(mclk: &Section<f64>) -> String {
+    match mclk {
+        Section::Value(value) => format!("{:.0} MT/s", value * 2.0),
+        Section::Na(_) => "N/A (derived from MCLK)".to_owned(),
+    }
+}
+
+/// An ohm cell (one decimal + Ω).
+fn ohms(section: &Section<f64>) -> String {
+    match section {
+        Section::Value(value) => format!("{value:.1} Ω"),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// An RTT cell: disabled / RZQ divisor (with the resolved ohms) / ohms.
+fn rtt(section: &Section<RttValue>) -> String {
+    match section {
+        Section::Value(RttValue::Disabled) => "disabled".to_owned(),
+        Section::Value(RttValue::Rzq(code)) => match RttValue::Rzq(*code).ohms() {
+            Some(value) => format!("RZQ/{code} ({value:.1} Ω)"),
+            None => format!("RZQ/{code}"),
+        },
+        Section::Value(RttValue::Ohms(value)) => format!("{value:.1} Ω"),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// The UCLK:MCLK divide mode: `1:1` / `1:2` or `N/A (<reason>)`.
+fn div_mode(section: &Section<DivMode>) -> String {
+    match section {
+        Section::Value(DivMode::OneToOne) => "1:1".to_owned(),
+        Section::Value(DivMode::OneToTwo) => "1:2".to_owned(),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// The SA:MEM gear multiplier: `1x` / `2x` / `4x` or `N/A (<reason>)`.
+fn gear_mode(section: &Section<GearMode>) -> String {
+    match section {
+        Section::Value(GearMode::One) => "1x".to_owned(),
+        Section::Value(GearMode::Two) => "2x".to_owned(),
+        Section::Value(GearMode::Four) => "4x".to_owned(),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// A boolean mode flag (GDM / PDM): `on` / `off` or `N/A (<reason>)`.
+fn flag(section: &Section<bool>) -> String {
+    match section {
+        Section::Value(true) => "on".to_owned(),
+        Section::Value(false) => "off".to_owned(),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// The DRAM command rate: `1T` / `2T` or `N/A (<reason>)`.
+fn command_rate(section: &Section<CommandRate>) -> String {
+    match section {
+        Section::Value(CommandRate::OneT) => "1T".to_owned(),
+        Section::Value(CommandRate::TwoT) => "2T".to_owned(),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// A memory-rail cell in volts (the frozen mV value over 1000, three
+/// decimals — the plan's mV→V display rule).
+fn volts(section: &Section<u16>) -> String {
+    match section {
+        Section::Value(mv) => format!("{:.3} V", f64::from(*mv) / 1000.0),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// A module data-rate cell in megatransfers per second.
+fn mts(section: &Section<u16>) -> String {
+    match section {
+        Section::Value(value) => format!("{value} MT/s"),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// A DRAM die density cell in mebibits.
+fn density(section: &Section<u16>) -> String {
+    match section {
+        Section::Value(value) => format!("{value} Mbit"),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// An absent raw-register cell: `0x…` when read, `N/A (absent)` when the
+/// underlying read failed / was unavailable.
+fn hex32(value: Option<u32>) -> String {
+    match value {
+        Some(word) => format!("0x{word:08X}"),
+        None => "N/A (absent)".to_owned(),
+    }
+}
+
+/// The MCHBAR base in hex (`0x…`), `N/A (absent)` when unread.
+fn hex64(value: Option<u64>) -> String {
+    match value {
+        Some(base) => format!("0x{base:X}"),
+        None => "N/A (absent)".to_owned(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-display-set row builders (the shared display sets of the AMD
+// readout and each Intel channel).
+// ---------------------------------------------------------------------------
+
+/// The clocks & ratios rows of a [`ClockReadout`] (the dashboard order,
+/// with the derived MT/s = MCLK × 2 row).
+fn clocks_rows(clocks: &ClockReadout) -> Vec<(&str, String)> {
+    vec![
+        ("MCLK", mhz(&clocks.mclk_mhz)),
+        ("MT/s", derived_mts(&clocks.mclk_mhz)),
+        ("UCLK", mhz(&clocks.uclk_mhz)),
+        ("FCLK", mhz(&clocks.fclk_mhz)),
+        ("UCLK:MCLK", div_mode(&clocks.div_mode)),
+        ("gear mode", gear_mode(&clocks.gear_mode)),
+        ("GDM", flag(&clocks.gdm)),
+        ("PDM", flag(&clocks.pdm)),
+        ("command rate", command_rate(&clocks.command_rate)),
+    ]
+}
+
+/// All 27 DRAM subtiming rows of a [`TimingSet`], in canonical order
+/// (primary first, then secondary, then tertiary + turnarounds — the
+/// same order the TUI / CLI `dump` renderers print).
+fn timings_rows(timings: &TimingSet) -> Vec<(&str, String)> {
+    vec![
+        ("tCL", cell(&timings.cl)),
+        ("tRCDWR", cell(&timings.rcwdwr)),
+        ("tRCDRD", cell(&timings.rcdrd)),
+        ("tRP", cell(&timings.rp)),
+        ("tRAS", cell(&timings.ras)),
+        ("tRC", cell(&timings.rc)),
+        ("tRRDS", cell(&timings.rrds)),
+        ("tRRLD", cell(&timings.rrld)),
+        ("tFAW", cell(&timings.faw)),
+        ("tWTRS", cell(&timings.wtrs)),
+        ("tWTRL", cell(&timings.wtrl)),
+        ("tWR", cell(&timings.wr)),
+        ("tRFC1", cell(&timings.rfc1)),
+        ("tRFC2", cell(&timings.rfc2)),
+        ("tRFCsb", cell(&timings.rfcsb)),
+        ("tCWL", cell(&timings.cwl)),
+        ("tRTP", cell(&timings.rtp)),
+        ("tRDWR", cell(&timings.rdwr)),
+        ("tWRRD", cell(&timings.wrrd)),
+        ("tRDRD(SD)", cell(&timings.rdrd_sd)),
+        ("tRDRD(CCD)", cell(&timings.rdrd_dd)),
+        ("tRDRD(SCL)", cell(&timings.rdrd_scl)),
+        ("tRDRD(SC)", cell(&timings.rdrd_sc)),
+        ("tWRWR(SD)", cell(&timings.wrwr_sd)),
+        ("tWRWR(CCD)", cell(&timings.wrwr_dd)),
+        ("tWRWR(SCL)", cell(&timings.wrwr_scl)),
+        ("tWRWR(SC)", cell(&timings.wrwr_sc)),
+    ]
+}
+
+/// The eight CAD-bus rows of a [`CadBus`] (ohms + the three RTT fields).
+fn cad_rows(cad: &CadBus) -> Vec<(&str, String)> {
+    vec![
+        ("proc ODT", ohms(&cad.proc_odt)),
+        ("RTT nom", rtt(&cad.rtt_nom)),
+        ("RTT wr", rtt(&cad.rtt_wr)),
+        ("RTT park", rtt(&cad.rtt_park)),
+        ("CLK drive", ohms(&cad.clk_drv)),
+        ("ADD/CMD drive", ohms(&cad.addr_cmd_drv)),
+        ("CS/ODT drive", ohms(&cad.cs_odt_drv)),
+        ("CKE drive", ohms(&cad.cke_drv)),
+    ]
+}
+
+/// The five memory-rail rows of a [`VoltageSet`] (volts; the Vcore
+/// primary rail leads, the TUI order).
+fn voltages_rows(voltages: &VoltageSet) -> Vec<(&str, String)> {
+    vec![
+        ("VDDCR_VDD (Vcore)", volts(&voltages.vcore_mv)),
+        ("VDDCR_SOC", volts(&voltages.vddcr_soc_mv)),
+        ("VDDIO_MEM", volts(&voltages.vddio_mem_mv)),
+        ("VDD_MISC", volts(&voltages.vdd_misc_mv)),
+        ("VPP", volts(&voltages.vpp_mv)),
+    ]
+}
+
+/// One markdown `| <h1> | <h2> |` table (the two-column form the issue
+/// template uses for every section).
+fn md_table(out: &mut String, h1: &str, h2: &str, rows: &[(&str, String)]) {
+    out.push_str(&format!("| {h1} | {h2} |\n|---|---|\n"));
+    for (key, value) in rows {
+        out.push_str(&format!("| {} | {} |\n", md_escape(key), md_escape(value)));
+    }
+    out.push('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry sections (the `## Decoded Telemetry` subsections).
+// ---------------------------------------------------------------------------
+
+/// The four display-set tables of one readout (the AMD readout, or one
+/// Intel channel): the clocks & ratios, all 27 timings, the CAD bus,
+/// and the voltages — plus the channel-level RTL row on Intel.
+fn render_display_sets(
+    out: &mut String,
+    clocks: &ClockReadout,
+    timings: &TimingSet,
+    cad: &CadBus,
+    voltages: &VoltageSet,
+    rtl: Option<&Section<u16>>,
+) {
+    md_table(out, "Clock", "Value", &clocks_rows(clocks));
+    md_table(out, "Timing (ticks)", "Value", &timings_rows(timings));
+    md_table(out, "CAD bus (ohms)", "Value", &cad_rows(cad));
+    md_table(out, "Rail (V)", "Value", &voltages_rows(voltages));
+    if let Some(rtl) = rtl {
+        md_table(out, "RTL (ticks)", "Value", &[("RTL", cell(rtl))]);
+    }
+}
+
+/// The `### CPU` subsection: vendor + brand (the snapshot root carries
+/// the detected CPU — always populated).
+fn render_cpu(out: &mut String, cpu: &CpuInfo) {
+    out.push_str("### CPU\n\n");
+    md_table(
+        out,
+        "Field",
+        "Value",
+        &[
+            ("vendor", vendor_text(&cpu.vendor)),
+            ("brand", cpu.brand.clone()),
+        ],
+    );
+}
+
+/// The `### AMD` subsection: the four display sets, or one
+/// `N/A (<reason>)` line when the branch degraded.
+fn render_amd(out: &mut String, section: &Section<AmdReadout>) {
+    out.push_str("### AMD\n\n");
+    match section {
+        Section::Na(reason) => out.push_str(&format!("{}\n\n", na_cell(reason))),
+        Section::Value(readout) => render_display_sets(
+            out,
+            &readout.clocks,
+            &readout.timings,
+            &readout.cad_bus,
+            &readout.voltages,
+            None,
+        ),
+    }
+}
+
+/// The `### Intel` subsection: the readout-level `channel mode` row
+/// (the hardware `MAD_INTER_CHANNEL` mode — `N/A` on the `/dev/mem`
+/// fallback where no mode is carried), then one `#### Channel n` block
+/// per decoded IMC channel, or one `N/A (<reason>)` line when the
+/// branch degraded.
+fn render_intel(out: &mut String, section: &Section<IntelReadout>) {
+    out.push_str("### Intel\n\n");
+    match section {
+        Section::Na(reason) => out.push_str(&format!("{}\n\n", na_cell(reason))),
+        Section::Value(readout) => {
+            let mode = readout
+                .channel_mode
+                .map(|m| m.label().to_owned())
+                .unwrap_or_else(|| "N/A".to_owned());
+            md_table(out, "Field", "Value", &[("channel mode", mode)]);
+            if readout.channels.is_empty() {
+                out.push_str("_no channels decoded_\n\n");
+                return;
+            }
+            for channel in &readout.channels {
+                out.push_str(&format!("#### Channel {}\n\n", channel.index));
+                render_display_sets(
+                    out,
+                    &channel.clocks,
+                    &channel.timings,
+                    &channel.cad_bus,
+                    &channel.voltages,
+                    Some(&channel.rtl),
+                );
+            }
+        }
+    }
+}
+
+/// The `### SPD` subsection: one `#### Module 0xNN (DDRn)` block per
+/// decoded module (the module identity + the factory-rated profiles),
+/// or a no-modules note when the list is empty.
+fn render_spd(out: &mut String, modules: &[SpdModule]) {
+    out.push_str("### SPD\n\n");
+    if modules.is_empty() {
+        out.push_str("_no modules (ee1004 driver absent or no device bound)_\n\n");
+        return;
+    }
+    for module in modules {
+        let gen = if module.is_ddr5 { "DDR5" } else { "DDR4" };
+        out.push_str(&format!("#### Module 0x{:02X} ({gen})\n\n", module.index));
+        md_table(
+            out,
+            "Field",
+            "Value",
+            &[
+                ("maker", cell(&module.maker)),
+                ("die maker", cell(&module.die_maker)),
+                ("die type", cell(&module.die_type)),
+                ("devices", cell(&module.devices)),
+                ("part", cell(&module.part)),
+                ("serial", cell(&module.serial)),
+                ("rank", cell(&module.rank)),
+                ("density", density(&module.density_mbit)),
+                ("speed", mts(&module.speed_mts)),
+            ],
+        );
+        if module.profiles.is_empty() {
+            out.push_str("_no factory-rated profiles_\n\n");
+        } else {
+            for profile in &module.profiles {
+                let scheme = if module.is_ddr5 { "EXPO" } else { "XMP" };
+                out.push_str(&format!(
+                    "- profile {} ({scheme}): {}, {}-{}-{}-{} @ {}\n",
+                    profile.index,
+                    mts(&profile.speed_mts),
+                    cell(&profile.cas),
+                    cell(&profile.trcd),
+                    cell(&profile.trp),
+                    cell(&profile.tras),
+                    volts(&profile.voltage),
+                ));
+            }
+            out.push('\n');
+        }
+    }
+}
+
+/// The `### Platform` subsection: the vendor-neutral identity fields +
+/// the derived per-DIMM / total capacities.
+fn render_platform(out: &mut String, telemetry: &SystemMemoryTelemetry) {
+    let platform = &telemetry.platform;
+    out.push_str("### Platform\n\n");
+    let dimm_sizes = if telemetry.dimm_sizes.is_empty() {
+        "none".to_owned()
+    } else {
+        telemetry
+            .dimm_sizes
+            .iter()
+            .map(|size| match size {
+                Section::Value(gib) => format!("{gib:.1} GiB"),
+                Section::Na(_) => "N/A".to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    md_table(
+        out,
+        "Field",
+        "Value",
+        &[
+            ("CPU clock (MHz)", mhz(&platform.cpu_clock_mhz)),
+            ("motherboard", cell(&platform.motherboard)),
+            ("BIOS", cell(&platform.bios)),
+            ("AGESA", cell(&platform.agesa)),
+            ("SMU version", cell(&platform.smu_version)),
+            ("total capacity", capacity(&telemetry.total_capacity)),
+            ("per-DIMM sizes", dimm_sizes),
+        ],
+    );
+}
+
+/// A GiB capacity cell (one decimal), or the branch's `Na` text.
+fn capacity(section: &Section<f64>) -> String {
+    match section {
+        Section::Value(gib) => format!("{gib:.1} GiB"),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The raw-register table (the `## Raw Registers` section).
+// ---------------------------------------------------------------------------
+
+/// The full [`ProbeRaw`] table — every register in the wire (field)
+/// order as `0x…` (or `N/A (absent)`), plus the MCHBAR diagnostics.
+fn render_raw_table(out: &mut String, raw: &ProbeRaw) {
+    md_table(
+        out,
+        "Register",
+        "Value",
+        &[
+            ("MC_BIOS_REQ", hex32(raw.mcbios_req)),
+            ("TC_CH0_DBP", hex32(raw.tc_ch0_dbp)),
+            ("TC_CH0_RAP", hex32(raw.tc_ch0_rap)),
+            ("TC_CH0_RFP", hex32(raw.tc_ch0_rfp)),
+            ("TC_CH0_RAP2", hex32(raw.tc_ch0_rap2)),
+            ("TC_CH0_RDRD", hex32(raw.tc_ch0_rdrd)),
+            ("TC_CH0_RDWR", hex32(raw.tc_ch0_rdwr)),
+            ("TC_CH0_WRRD", hex32(raw.tc_ch0_wrrd)),
+            ("TC_CH0_WRWR", hex32(raw.tc_ch0_wrwr)),
+            ("TC_CH1_DBP", hex32(raw.tc_ch1_dbp)),
+            ("TC_CH1_RAP", hex32(raw.tc_ch1_rap)),
+            ("TC_CH1_RFP", hex32(raw.tc_ch1_rfp)),
+            ("TC_CH1_RAP2", hex32(raw.tc_ch1_rap2)),
+            ("TC_CH1_RDRD", hex32(raw.tc_ch1_rdrd)),
+            ("TC_CH1_RDWR", hex32(raw.tc_ch1_rdwr)),
+            ("TC_CH1_WRRD", hex32(raw.tc_ch1_wrrd)),
+            ("TC_CH1_WRWR", hex32(raw.tc_ch1_wrwr)),
+            ("TC_CH2_DBP", hex32(raw.tc_ch2_dbp)),
+            ("TC_CH2_RAP", hex32(raw.tc_ch2_rap)),
+            ("TC_CH2_RFP", hex32(raw.tc_ch2_rfp)),
+            ("TC_CH2_RAP2", hex32(raw.tc_ch2_rap2)),
+            ("TC_CH2_RDRD", hex32(raw.tc_ch2_rdrd)),
+            ("TC_CH2_RDWR", hex32(raw.tc_ch2_rdwr)),
+            ("TC_CH2_WRRD", hex32(raw.tc_ch2_wrrd)),
+            ("TC_CH2_WRWR", hex32(raw.tc_ch2_wrwr)),
+            ("TC_CH3_DBP", hex32(raw.tc_ch3_dbp)),
+            ("TC_CH3_RAP", hex32(raw.tc_ch3_rap)),
+            ("TC_CH3_RFP", hex32(raw.tc_ch3_rfp)),
+            ("TC_CH3_RAP2", hex32(raw.tc_ch3_rap2)),
+            ("TC_CH3_RDRD", hex32(raw.tc_ch3_rdrd)),
+            ("TC_CH3_RDWR", hex32(raw.tc_ch3_rdwr)),
+            ("TC_CH3_WRRD", hex32(raw.tc_ch3_wrrd)),
+            ("TC_CH3_WRWR", hex32(raw.tc_ch3_wrwr)),
+            ("MCL0_PRE", hex32(raw.mcl0_pre)),
+            ("MCL0_ACT", hex32(raw.mcl0_act)),
+            ("MCL0_ACT2", hex32(raw.mcl0_act2)),
+            ("MCL0_WTR", hex32(raw.mcl0_wtr)),
+            ("MCL0_RFP", hex32(raw.mcl0_rfp)),
+            ("MCL0_RFP2", hex32(raw.mcl0_rfp2)),
+            ("MCL0_RDRD", hex32(raw.mcl0_rdrd)),
+            ("MCL0_WRWR", hex32(raw.mcl0_wrwr)),
+            ("MCL1_PRE", hex32(raw.mcl1_pre)),
+            ("MCL1_ACT", hex32(raw.mcl1_act)),
+            ("MCL1_ACT2", hex32(raw.mcl1_act2)),
+            ("MCL1_WTR", hex32(raw.mcl1_wtr)),
+            ("MCL1_RFP", hex32(raw.mcl1_rfp)),
+            ("MCL1_RFP2", hex32(raw.mcl1_rfp2)),
+            ("MCL1_RDRD", hex32(raw.mcl1_rdrd)),
+            ("MCL1_WRWR", hex32(raw.mcl1_wrwr)),
+            ("MAD_INTER_CHANNEL", hex32(raw.mad_inter_channel)),
+            ("MAD_INTRA_CH0", hex32(raw.mad_intra_ch0)),
+            ("MAD_INTRA_CH1", hex32(raw.mad_intra_ch1)),
+            ("MAD_DIMM_CH0", hex32(raw.mad_dimm_ch0)),
+            ("MAD_DIMM_CH1", hex32(raw.mad_dimm_ch1)),
+            ("MAD_DIMM_CH2", hex32(raw.mad_dimm_ch2)),
+            ("MAD_DIMM_CH3", hex32(raw.mad_dimm_ch3)),
+            ("MCHBAR_BASE", hex64(raw.mchbar_base)),
+            (
+                "MCHBAR_ENABLED",
+                if raw.mchbar_enabled { "true".to_owned() } else { "false".to_owned() },
+            ),
+        ],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The N/A-reason collection (the `## N/A Reasons` section).
+// ---------------------------------------------------------------------------
+
+/// Push one `Na` cell as a (`<field path>`, `N/A (<reason>)`) pair; a
+/// `Value` cell contributes nothing.
+fn push_na<T>(out: &mut Vec<(String, String)>, path: &str, section: &Section<T>) {
+    if let Section::Na(reason) = section {
+        out.push((path.to_owned(), na_cell(reason)));
+    }
+}
+
+/// The 27 [`TimingSet`] cells as (field name, section) pairs (the raw
+/// field names, for the N/A-reason paths).
+fn timings_sections(timings: &TimingSet) -> [(&str, &Section<u16>); 27] {
+    [
+        ("cl", &timings.cl),
+        ("rcwdwr", &timings.rcwdwr),
+        ("rcdrd", &timings.rcdrd),
+        ("rp", &timings.rp),
+        ("ras", &timings.ras),
+        ("rc", &timings.rc),
+        ("rrds", &timings.rrds),
+        ("rrld", &timings.rrld),
+        ("faw", &timings.faw),
+        ("wtrs", &timings.wtrs),
+        ("wtrl", &timings.wtrl),
+        ("wr", &timings.wr),
+        ("rfc1", &timings.rfc1),
+        ("rfc2", &timings.rfc2),
+        ("rfcsb", &timings.rfcsb),
+        ("cwl", &timings.cwl),
+        ("rtp", &timings.rtp),
+        ("rdwr", &timings.rdwr),
+        ("wrrd", &timings.wrrd),
+        ("rdrd_sd", &timings.rdrd_sd),
+        ("rdrd_dd", &timings.rdrd_dd),
+        ("rdrd_scl", &timings.rdrd_scl),
+        ("rdrd_sc", &timings.rdrd_sc),
+        ("wrwr_sd", &timings.wrwr_sd),
+        ("wrwr_dd", &timings.wrwr_dd),
+        ("wrwr_scl", &timings.wrwr_scl),
+        ("wrwr_sc", &timings.wrwr_sc),
+    ]
+}
+
+/// The five [`VoltageSet`] cells as (field name, section) pairs.
+fn voltages_sections(voltages: &VoltageSet) -> [(&str, &Section<u16>); 5] {
+    [
+        ("vcore", &voltages.vcore_mv),
+        ("vddcr_soc", &voltages.vddcr_soc_mv),
+        ("vddio_mem", &voltages.vddio_mem_mv),
+        ("vdd_misc", &voltages.vdd_misc_mv),
+        ("vpp", &voltages.vpp_mv),
+    ]
+}
+
+/// Push the `Na` cells of one display readout (the shared clock /
+/// timing / CAD / voltage cell sets) under `<prefix>`.
+fn push_display_na(
+    prefix: &str,
+    out: &mut Vec<(String, String)>,
+    clocks: &ClockReadout,
+    timings: &TimingSet,
+    cad: &CadBus,
+    voltages: &VoltageSet,
+) {
+    push_na(out, &format!("{prefix}.clocks.mclk"), &clocks.mclk_mhz);
+    push_na(out, &format!("{prefix}.clocks.uclk"), &clocks.uclk_mhz);
+    push_na(out, &format!("{prefix}.clocks.fclk"), &clocks.fclk_mhz);
+    push_na(out, &format!("{prefix}.clocks.div_mode"), &clocks.div_mode);
+    push_na(out, &format!("{prefix}.clocks.gear_mode"), &clocks.gear_mode);
+    push_na(out, &format!("{prefix}.clocks.gdm"), &clocks.gdm);
+    push_na(out, &format!("{prefix}.clocks.pdm"), &clocks.pdm);
+    push_na(
+        out,
+        &format!("{prefix}.clocks.command_rate"),
+        &clocks.command_rate,
+    );
+    for (name, section) in timings_sections(timings) {
+        push_na(out, &format!("{prefix}.timings.{name}"), section);
+    }
+    push_na(out, &format!("{prefix}.cad_bus.proc_odt"), &cad.proc_odt);
+    push_na(out, &format!("{prefix}.cad_bus.rtt_nom"), &cad.rtt_nom);
+    push_na(out, &format!("{prefix}.cad_bus.rtt_wr"), &cad.rtt_wr);
+    push_na(out, &format!("{prefix}.cad_bus.rtt_park"), &cad.rtt_park);
+    push_na(out, &format!("{prefix}.cad_bus.clk_drv"), &cad.clk_drv);
+    push_na(out, &format!("{prefix}.cad_bus.addr_cmd_drv"), &cad.addr_cmd_drv);
+    push_na(out, &format!("{prefix}.cad_bus.cs_odt_drv"), &cad.cs_odt_drv);
+    push_na(out, &format!("{prefix}.cad_bus.cke_drv"), &cad.cke_drv);
+    for (name, section) in voltages_sections(voltages) {
+        push_na(out, &format!("{prefix}.voltages.{name}"), section);
+    }
+}
+
+/// The 56 [`ProbeRaw`] `Option<u32>` slots as (field path, value)
+/// pairs, in the wire (declaration) order.
+fn raw_u32_sections(raw: &ProbeRaw) -> [(&str, Option<u32>); 56] {
+    [
+        ("raw.mcbios_req", raw.mcbios_req),
+        ("raw.tc_ch0_dbp", raw.tc_ch0_dbp),
+        ("raw.tc_ch0_rap", raw.tc_ch0_rap),
+        ("raw.tc_ch0_rfp", raw.tc_ch0_rfp),
+        ("raw.tc_ch0_rap2", raw.tc_ch0_rap2),
+        ("raw.tc_ch0_rdrd", raw.tc_ch0_rdrd),
+        ("raw.tc_ch0_rdwr", raw.tc_ch0_rdwr),
+        ("raw.tc_ch0_wrrd", raw.tc_ch0_wrrd),
+        ("raw.tc_ch0_wrwr", raw.tc_ch0_wrwr),
+        ("raw.tc_ch1_dbp", raw.tc_ch1_dbp),
+        ("raw.tc_ch1_rap", raw.tc_ch1_rap),
+        ("raw.tc_ch1_rfp", raw.tc_ch1_rfp),
+        ("raw.tc_ch1_rap2", raw.tc_ch1_rap2),
+        ("raw.tc_ch1_rdrd", raw.tc_ch1_rdrd),
+        ("raw.tc_ch1_rdwr", raw.tc_ch1_rdwr),
+        ("raw.tc_ch1_wrrd", raw.tc_ch1_wrrd),
+        ("raw.tc_ch1_wrwr", raw.tc_ch1_wrwr),
+        ("raw.tc_ch2_dbp", raw.tc_ch2_dbp),
+        ("raw.tc_ch2_rap", raw.tc_ch2_rap),
+        ("raw.tc_ch2_rfp", raw.tc_ch2_rfp),
+        ("raw.tc_ch2_rap2", raw.tc_ch2_rap2),
+        ("raw.tc_ch2_rdrd", raw.tc_ch2_rdrd),
+        ("raw.tc_ch2_rdwr", raw.tc_ch2_rdwr),
+        ("raw.tc_ch2_wrrd", raw.tc_ch2_wrrd),
+        ("raw.tc_ch2_wrwr", raw.tc_ch2_wrwr),
+        ("raw.tc_ch3_dbp", raw.tc_ch3_dbp),
+        ("raw.tc_ch3_rap", raw.tc_ch3_rap),
+        ("raw.tc_ch3_rfp", raw.tc_ch3_rfp),
+        ("raw.tc_ch3_rap2", raw.tc_ch3_rap2),
+        ("raw.tc_ch3_rdrd", raw.tc_ch3_rdrd),
+        ("raw.tc_ch3_rdwr", raw.tc_ch3_rdwr),
+        ("raw.tc_ch3_wrrd", raw.tc_ch3_wrrd),
+        ("raw.tc_ch3_wrwr", raw.tc_ch3_wrwr),
+        ("raw.mcl0_pre", raw.mcl0_pre),
+        ("raw.mcl0_act", raw.mcl0_act),
+        ("raw.mcl0_act2", raw.mcl0_act2),
+        ("raw.mcl0_wtr", raw.mcl0_wtr),
+        ("raw.mcl0_rfp", raw.mcl0_rfp),
+        ("raw.mcl0_rfp2", raw.mcl0_rfp2),
+        ("raw.mcl0_rdrd", raw.mcl0_rdrd),
+        ("raw.mcl0_wrwr", raw.mcl0_wrwr),
+        ("raw.mcl1_pre", raw.mcl1_pre),
+        ("raw.mcl1_act", raw.mcl1_act),
+        ("raw.mcl1_act2", raw.mcl1_act2),
+        ("raw.mcl1_wtr", raw.mcl1_wtr),
+        ("raw.mcl1_rfp", raw.mcl1_rfp),
+        ("raw.mcl1_rfp2", raw.mcl1_rfp2),
+        ("raw.mcl1_rdrd", raw.mcl1_rdrd),
+        ("raw.mcl1_wrwr", raw.mcl1_wrwr),
+        ("raw.mad_inter_channel", raw.mad_inter_channel),
+        ("raw.mad_intra_ch0", raw.mad_intra_ch0),
+        ("raw.mad_intra_ch1", raw.mad_intra_ch1),
+        ("raw.mad_dimm_ch0", raw.mad_dimm_ch0),
+        ("raw.mad_dimm_ch1", raw.mad_dimm_ch1),
+        ("raw.mad_dimm_ch2", raw.mad_dimm_ch2),
+        ("raw.mad_dimm_ch3", raw.mad_dimm_ch3),
+    ]
+}
+
+/// Collect every `Na` cell of the decoded telemetry (and every absent
+/// raw register when `raw` is present) as a (`<field path>`, `N/A
+/// (<reason>)`) pair — the "why is this N/A" development detail.
+fn collect_na_reasons(report: &ProbeReport, out: &mut Vec<(String, String)>) {
+    let telemetry = &report.telemetry;
+    match &telemetry.amd {
+        Section::Na(reason) => out.push((
+            "amd (whole branch)".to_owned(),
+            na_cell(reason),
+        )),
+        Section::Value(readout) => push_display_na(
+            "amd",
+            out,
+            &readout.clocks,
+            &readout.timings,
+            &readout.cad_bus,
+            &readout.voltages,
+        ),
+    }
+    match &telemetry.intel {
+        Section::Na(reason) => out.push((
+            "intel (whole branch)".to_owned(),
+            na_cell(reason),
+        )),
+        Section::Value(readout) => {
+            if readout.channel_mode.is_none() {
+                out.push((
+                    "intel.channel_mode".to_owned(),
+                    "N/A (not decoded: /dev/mem fallback or a pre-24-attr module)".to_owned(),
+                ));
+            }
+            for channel in &readout.channels {
+                let prefix = format!("intel.ch{}", channel.index);
+                push_display_na(
+                    &prefix,
+                    out,
+                    &channel.clocks,
+                    &channel.timings,
+                    &channel.cad_bus,
+                    &channel.voltages,
+                );
+                push_na(out, &format!("{prefix}.rtl"), &channel.rtl);
+            }
+        }
+    }
+    for module in &telemetry.spd {
+        let prefix = format!("spd[0x{:02X}]", module.index);
+        push_na(out, &format!("{prefix}.maker"), &module.maker);
+        push_na(out, &format!("{prefix}.die_maker"), &module.die_maker);
+        push_na(out, &format!("{prefix}.die_type"), &module.die_type);
+        push_na(out, &format!("{prefix}.devices"), &module.devices);
+        push_na(out, &format!("{prefix}.part"), &module.part);
+        push_na(out, &format!("{prefix}.serial"), &module.serial);
+        push_na(out, &format!("{prefix}.rank"), &module.rank);
+        push_na(
+            out,
+            &format!("{prefix}.density_mbit"),
+            &module.density_mbit,
+        );
+        push_na(out, &format!("{prefix}.speed_mts"), &module.speed_mts);
+        for (profile_index, profile) in module.profiles.iter().enumerate() {
+            let pp = format!("{prefix}.profiles[{profile_index}]");
+            push_na(out, &format!("{pp}.speed_mts"), &profile.speed_mts);
+            push_na(out, &format!("{pp}.cas"), &profile.cas);
+            push_na(out, &format!("{pp}.trcd"), &profile.trcd);
+            push_na(out, &format!("{pp}.trp"), &profile.trp);
+            push_na(out, &format!("{pp}.tras"), &profile.tras);
+            push_na(out, &format!("{pp}.voltage"), &profile.voltage);
+        }
+    }
+    let platform = &telemetry.platform;
+    push_na(
+        out,
+        "platform.cpu_clock_mhz",
+        &platform.cpu_clock_mhz,
+    );
+    push_na(out, "platform.motherboard", &platform.motherboard);
+    push_na(out, "platform.bios", &platform.bios);
+    push_na(out, "platform.agesa", &platform.agesa);
+    push_na(out, "platform.smu_version", &platform.smu_version);
+    push_na(out, "total_capacity", &telemetry.total_capacity);
+    for (index, size) in telemetry.dimm_sizes.iter().enumerate() {
+        push_na(out, &format!("dimm_sizes[{index}]"), size);
+    }
+    match &report.raw {
+        None => out.push((
+            "raw (whole dump)".to_owned(),
+            "not captured (no Intel raw source available)".to_owned(),
+        )),
+        Some(raw) => {
+            for (name, value) in raw_u32_sections(raw) {
+                if value.is_none() {
+                    out.push((
+                        name.to_owned(),
+                        "N/A (register absent / read failed)".to_owned(),
+                    ));
+                }
+            }
+            if raw.mchbar_base.is_none() {
+                out.push((
+                    "raw.mchbar_base".to_owned(),
+                    "N/A (register absent / read failed)".to_owned(),
+                ));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -390,5 +1287,241 @@ mod tests {
         let back: ProbeReport =
             bincode::deserialize(&bytes).expect("ProbeReport must deserialize");
         assert_eq!(report, back);
+    }
+
+    // ------------------------------------------------------------------
+    // (chunk-probe-2: the markdown renderer pins).
+    // ------------------------------------------------------------------
+
+    use crate::intel_readout::{ChannelMode, IntelChannel};
+
+    /// (4) The sample (fully-populated) [`ProbeReport`] renders to the
+    /// six issue-template sections with the expected headers + key
+    /// values: the summary line, the System table, the branch `N/A`
+    /// cells, the SPD module, the platform identity + derived
+    /// capacities, the hex raw table (incl. the absent ch3 block), the
+    /// N/A-reason list, and the footer.
+    #[test]
+    fn render_probe_report_md_has_all_sections_and_key_values() {
+        let report = ProbeReport {
+            telemetry: fixture_telemetry(),
+            raw: Some(fixture_raw()),
+            system: fixture_system(),
+        };
+        let md = render_probe_report_md(&report);
+
+        // The six section headers (the issue-template mirror).
+        assert!(md.contains("# RamSleuth Probe Report"), "{md}");
+        assert!(md.contains("## System"), "{md}");
+        assert!(md.contains("## Decoded Telemetry"), "{md}");
+        assert!(md.contains("## Raw Registers"), "{md}");
+        assert!(md.contains("## N/A Reasons"), "{md}");
+        assert!(md.contains("---"), "{md}");
+
+        // The one-line summary (CPU brand + gen + OS + kernel + version).
+        assert!(
+            md.contains(
+                "> **Intel(R) Core(TM) i7-11700K CPU @ 3.60GHz** — RocketLake on Linux / Arch (kernel 6.6.0-1-cachyos), RamSleuth v2.4.0"
+            ),
+            "{md}"
+        );
+
+        // The System table (the template's nine fields).
+        assert!(md.contains("| CPU | Intel(R) Core(TM) i7-11700K CPU @ 3.60GHz |"), "{md}");
+        assert!(md.contains("| Vendor | Intel |"), "{md}");
+        assert!(md.contains("| Generation | RocketLake |"), "{md}");
+        assert!(md.contains("| PCI Host Bridge | 8086:4250 |"), "{md}");
+        assert!(md.contains("| Kernel | 6.6.0-1-cachyos |"), "{md}");
+        assert!(md.contains("| OS | Linux / Arch |"), "{md}");
+        assert!(md.contains("| Arch | x86_64 |"), "{md}");
+        assert!(md.contains("| RamSleuth Version | 2.4.0 |"), "{md}");
+        assert!(md.contains("| Telemetry Source | ramsleuth_intel |"), "{md}");
+
+        // Decoded Telemetry: the branch N/A cells, the SPD module, the
+        // platform identity + derived capacities.
+        assert!(md.contains("N/A (unsupported hardware)"), "{md}");
+        assert!(md.contains("N/A (driver missing)"), "{md}");
+        assert!(md.contains("#### Module 0x52 (DDR4)"), "{md}");
+        assert!(md.contains("| maker | 0xC1 |"), "{md}");
+        assert!(md.contains("| rank | 1 |"), "{md}");
+        assert!(md.contains("| density | 16384 Mbit |"), "{md}");
+        assert!(md.contains("| speed | 3200 MT/s |"), "{md}");
+        assert!(md.contains("| motherboard | Test Board |"), "{md}");
+        assert!(md.contains("| BIOS | 1.0 |"), "{md}");
+        assert!(md.contains("16.0 GiB"), "{md}");
+
+        // Raw Registers: the hex values in 0x form + the absent ch3
+        // block + the MCHBAR diagnostics.
+        assert!(md.contains("| MC_BIOS_REQ | 0x00000012 |"), "{md}");
+        assert!(md.contains("| TC_CH0_DBP | 0x11110F11 |"), "{md}");
+        assert!(md.contains("| TC_CH1_WRWR | 0x0040C204 |"), "{md}");
+        assert!(md.contains("| MCL0_ACT | 0x12284D28 |"), "{md}");
+        assert!(md.contains("| MAD_DIMM_CH3 | 0x00000014 |"), "{md}");
+        assert!(md.contains("| TC_CH3_DBP | N/A (absent) |"), "{md}");
+        assert!(md.contains("| MCHBAR_BASE | 0xFED10000 |"), "{md}");
+        assert!(md.contains("| MCHBAR_ENABLED | true |"), "{md}");
+
+        // N/A Reasons: the branch reasons, the SPD module N/A fields,
+        // the absent ch3 raws, and the platform N/A fields.
+        assert!(md.contains("`amd (whole branch)` — N/A (unsupported hardware)"), "{md}");
+        assert!(md.contains("`intel (whole branch)` — N/A (driver missing)"), "{md}");
+        assert!(md.contains("`spd[0x52].die_maker` — N/A (not applicable)"), "{md}");
+        assert!(
+            md.contains("`raw.tc_ch3_dbp` — N/A (register absent / read failed)"),
+            "{md}"
+        );
+        assert!(md.contains("`platform.agesa` — N/A (not applicable)"), "{md}");
+
+        // The footer: the generating version + the no-personal-info note.
+        assert!(
+            md.contains(
+                "_This report was auto-generated by RamSleuth v2.4.0. It contains no personal information (no username, hostname, IP, MAC, or serial numbers)._"
+            ),
+            "{md}"
+        );
+    }
+
+    /// (5) A populated two-channel Intel readout renders the readout-
+    /// level channel mode, each channel's clocks (MCLK + the derived
+    /// MT/s = MCLK × 2 + UCLK + gear), all 27 timings, the CAD bus,
+    /// the voltages, and the channel RTL; `raw: None` renders the
+    /// not-captured note.
+    #[test]
+    fn render_probe_report_md_intel_readout_renders_all_display_sets() {
+        fn na<T>() -> Section<T> {
+            Section::na(NaReason::NotApplicable)
+        }
+        fn populated_channel(index: u8) -> IntelChannel {
+            let v = |x: u16| Section::Value(x);
+            IntelChannel {
+                index,
+                clocks: ClockReadout {
+                    mclk_mhz: Section::Value(2400.0),
+                    uclk_mhz: Section::Value(1200.0),
+                    fclk_mhz: na(),
+                    div_mode: na(),
+                    gear_mode: Section::Value(GearMode::Two),
+                    gdm: na(),
+                    pdm: na(),
+                    command_rate: na(),
+                },
+                timings: TimingSet {
+                    cl: v(16),
+                    rcwdwr: v(16),
+                    rcdrd: v(16),
+                    rp: v(16),
+                    ras: v(36),
+                    rc: v(52),
+                    rrds: v(4),
+                    rrld: v(8),
+                    faw: v(16),
+                    wtrs: v(4),
+                    wtrl: v(12),
+                    wr: v(20),
+                    rfc1: v(75),
+                    rfc2: na(),
+                    rfcsb: v(38),
+                    cwl: v(12),
+                    rtp: v(8),
+                    rdwr: v(8),
+                    wrrd: v(4),
+                    rdrd_sd: v(4),
+                    rdrd_dd: v(8),
+                    rdrd_scl: v(8),
+                    rdrd_sc: v(8),
+                    wrwr_sd: v(4),
+                    wrwr_dd: v(8),
+                    wrwr_scl: v(8),
+                    wrwr_sc: v(8),
+                },
+                cad_bus: CadBus {
+                    proc_odt: na(),
+                    rtt_nom: na(),
+                    rtt_wr: na(),
+                    rtt_park: na(),
+                    clk_drv: na(),
+                    addr_cmd_drv: na(),
+                    cs_odt_drv: na(),
+                    cke_drv: na(),
+                },
+                voltages: VoltageSet {
+                    vddcr_soc_mv: na(),
+                    vddio_mem_mv: na(),
+                    vdd_misc_mv: na(),
+                    vpp_mv: na(),
+                    vcore_mv: na(),
+                },
+                rtl: na(),
+            }
+        }
+        let report = ProbeReport {
+            telemetry: SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                    brand: "Intel(R) Core(TM) i7-12700K CPU @ 3.60GHz".to_owned(),
+                },
+                amd: Section::na(NaReason::UnsupportedHardware),
+                intel: Section::Value(IntelReadout {
+                    channels: vec![populated_channel(0), populated_channel(1)],
+                    channel_mode: Some(ChannelMode::DualSymmetric),
+                }),
+                spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::Value(3600.0),
+                    motherboard: Section::Value("Test Board".to_owned()),
+                    bios: Section::Value("1.0".to_owned()),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::Value(32.0),
+                dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            },
+            raw: None,
+            system: ProbeSystem {
+                cpu_brand: "Intel(R) Core(TM) i7-12700K CPU @ 3.60GHz".to_owned(),
+                cpu_vendor: "Intel".to_owned(),
+                cpu_gen: "AlderLake".to_owned(),
+                pci_host_bridge: None,
+                kernel: "6.6.0-1-cachyos".to_owned(),
+                os: "Linux / Arch".to_owned(),
+                arch: "x86_64".to_owned(),
+                ramsleuth_version: "2.4.0".to_owned(),
+                telemetry_source: "unavailable".to_owned(),
+            },
+        };
+        let md = render_probe_report_md(&report);
+
+        // The readout-level channel mode leads the Intel section.
+        assert!(md.contains("| channel mode | Dual-Channel (Symmetric) |"), "{md}");
+        // Both channels render their own blocks.
+        assert!(md.contains("#### Channel 0"), "{md}");
+        assert!(md.contains("#### Channel 1"), "{md}");
+        // Clocks + ratios incl. the derived MT/s = MCLK × 2.
+        assert!(md.contains("| MCLK | 2400.00 MHz |"), "{md}");
+        assert!(md.contains("| MT/s | 4800 MT/s |"), "{md}");
+        assert!(md.contains("| UCLK | 1200.00 MHz |"), "{md}");
+        assert!(md.contains("| gear mode | 2x |"), "{md}");
+        // All 27 timings per channel (the canonical display names).
+        for name in [
+            "tCL", "tRCDWR", "tRCDRD", "tRP", "tRAS", "tRC", "tRRDS", "tRRLD", "tFAW",
+            "tWTRS", "tWTRL", "tWR", "tRFC1", "tRFC2", "tRFCsb", "tCWL", "tRTP", "tRDWR",
+            "tWRRD", "tRDRD(SD)", "tRDRD(CCD)", "tRDRD(SCL)", "tRDRD(SC)", "tWRWR(SD)",
+            "tWRWR(CCD)", "tWRWR(SCL)", "tWRWR(SC)",
+        ] {
+            assert!(md.contains(&format!("| {name} |")), "{md}");
+        }
+        // The populated values + the Na cells.
+        assert!(md.contains("| tCL | 16 |"), "{md}");
+        assert!(md.contains("| tRC | 52 |"), "{md}");
+        assert!(md.contains("N/A (not applicable)"), "{md}");
+        // The N/A-reason paths for one channel's degraded cells.
+        assert!(md.contains("`intel.ch0.clocks.fclk` — N/A (not applicable)"), "{md}");
+        assert!(md.contains("`intel.ch0.timings.rfc2` — N/A (not applicable)"), "{md}");
+        assert!(md.contains("`intel.ch1.rtl` — N/A (not applicable)"), "{md}");
+        // raw: None renders the not-captured note + the raw N/A reason.
+        assert!(md.contains("not captured"), "{md}");
+        assert!(md.contains("`raw (whole dump)` — not captured"), "{md}");
+        // The empty SPD list note.
+        assert!(md.contains("no modules"), "{md}");
     }
 }
