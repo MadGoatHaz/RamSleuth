@@ -277,10 +277,46 @@ pub struct ChannelRegs {
     pub tc_wrwr: Option<u32>,
 }
 
+/// The raw registers of one MCL (native uncore memory-controller)
+/// block: the eight `TC_*` registers of a Tier-3 (Alder/Raptor) native
+/// MCL block (MC0 @ `0xD000`, MC1 @ `0xD800`; register set per the
+/// Research Alder/Raptor table, offsets relative to the MCL base).
+/// OQ-4: retail desktops mirror MC0/MC1 into the legacy 64 KiB space
+/// (0x4000/0x4400/0x4800/0x4C00); the MCL blocks are the native-uncore
+/// fallback where the mirror is disabled (per-controller; the doc
+/// gives no MCL bases for subchannel 1/3). `None` when the underlying
+/// read failed — per-register containment.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MclRegs {
+    /// `TC_PRE` @ +0x00 (tRCD / tRP / tRAS / tCWL — widened).
+    pub tc_pre: Option<u32>,
+    /// `TC_ACT` @ +0x04 (tCL / tFAW / tRRD_S / tRRD_L — widened).
+    pub tc_act: Option<u32>,
+    /// `TC_ACT2` @ +0x08 (tPPD — DDR5-specific).
+    pub tc_act2: Option<u32>,
+    /// `TC_WTR` @ +0x10 (tWTR_S / tWTR_L / tWR / tRTP — widened).
+    pub tc_wtr: Option<u32>,
+    /// `TC_RFP` @ +0x14 (tRFC1 12-bit / tREFI).
+    pub tc_rfp: Option<u32>,
+    /// `TC_RFP2` @ +0x18 (tRFCsb — DDR5-specific).
+    pub tc_rfp2: Option<u32>,
+    /// `TC_RDRD` @ +0x20 (4×6-bit sg / dg / dr / dd turnaround).
+    pub tc_rdrd: Option<u32>,
+    /// `TC_WRWR` @ +0x28 (tWRWR sg / dg — the two documented entries).
+    pub tc_wrwr: Option<u32>,
+}
+
 /// The full raw IMC register set the decode consumes: one global
-/// register plus the two Tier-1 channels (17 slots; `mchbar_base` /
-/// `mchbar_enabled` are diagnostics carried by the producer, not decode
-/// inputs).
+/// register, the two Tier-1 channels, and the Tier-3 (Alder/Raptor)
+/// extension — the `0x4800` / `0x4C00` mirror blocks (`ch2` / `ch3`),
+/// the two native MCL blocks (`mcl0` @ `0xD000` / `mcl1` @ `0xD800`,
+/// OQ-4), and the two Alder/DDR5 `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws
+/// (51 `Option<u32>` slots; `mchbar_base` / `mchbar_enabled` are
+/// diagnostics carried by the producer, not decode inputs).
+///
+/// Every Tier-3 field defaults to `None` (containment, IG-22): no
+/// Tier-1/2 producer sets them, so the existing raw-set comparisons
+/// and fixture tests stay valid unchanged.
 ///
 /// Producers: `intel_sysfs::acquire()` (the `ramsleuth_intel` kobject)
 /// and [`IntelImcRegs::from_bar`] (the `/dev/mem` fallback). Both feed
@@ -293,6 +329,22 @@ pub struct IntelImcRegs {
     pub ch0: ChannelRegs,
     /// Channel 1 (`0x4400` block).
     pub ch1: ChannelRegs,
+    /// Channel 2 (`0x4800` mirror block — Tier-3 subchannel 2).
+    pub ch2: ChannelRegs,
+    /// Channel 3 (`0x4C00` mirror block — Tier-3 subchannel 3).
+    pub ch3: ChannelRegs,
+    /// MC0 MCL block raws (`0xD000` — Tier-3 native-uncore fallback,
+    /// OQ-4).
+    pub mcl0: MclRegs,
+    /// MC1 MCL block raws (`0xD800` — Tier-3 native-uncore fallback,
+    /// OQ-4).
+    pub mcl1: MclRegs,
+    /// `MAD_DIMM_CH2` @ `0x5060` (Alder/DDR5 subchannel 2 geometry,
+    /// raw).
+    pub mad_dimm_ch2: Option<u32>,
+    /// `MAD_DIMM_CH3` @ `0x5064` (Alder/DDR5 subchannel 3 geometry,
+    /// raw).
+    pub mad_dimm_ch3: Option<u32>,
 }
 
 impl IntelImcRegs {
@@ -312,6 +364,12 @@ impl IntelImcRegs {
             mcbios_req: bar.read_u32(MC_BIOS_REQ_OFFSET).ok(),
             ch0,
             ch1,
+            // The Tier-3 extension fields (ch2 / ch3, mcl0 / mcl1,
+            // mad_dimm_ch2 / mad_dimm_ch3) stay default (all `None`):
+            // `from_bar` reads only the 64 KiB Tier-1 window (offsets
+            // <= 0x5E04); the Tier-3 `/dev/mem` reads route through
+            // the widened map in IG-25.
+            ..Self::default()
         }
     }
 }
@@ -1459,6 +1517,9 @@ mod tests {
             mcbios_req: Some(0x0000_0012),
             ch1: ch0.clone(),
             ch0,
+            // The Tier-3 extension fields stay default (all `None` —
+            // containment, IG-22; no Tier-1/2 producer sets them).
+            ..IntelImcRegs::default()
         }
     }
 
@@ -1838,6 +1899,22 @@ mod tests {
             [6, 10, 12, 18],
             "sg / dg / dr / dd at bits 5:0 / 11:6 / 17:12 / 23:18"
         );
+    }
+
+    /// IG-22 containment: the Tier-3 extension fields all default
+    /// to `None` (every `ChannelRegs` / `MclRegs` slot absent, both
+    /// `MAD_DIMM_CH2/3` raws `None`) — no Tier-1/2 producer sets
+    /// them, so the existing raw-set comparisons and the all-absent
+    /// degradation stay valid unchanged.
+    #[test]
+    fn ig22_extended_fields_default_to_all_none() {
+        let regs = IntelImcRegs::default();
+        assert_eq!(regs.ch2, ChannelRegs::default());
+        assert_eq!(regs.ch3, ChannelRegs::default());
+        assert_eq!(regs.mcl0, MclRegs::default());
+        assert_eq!(regs.mcl1, MclRegs::default());
+        assert!(regs.mad_dimm_ch2.is_none());
+        assert!(regs.mad_dimm_ch3.is_none());
     }
 
     // -----------------------------------------------------------------

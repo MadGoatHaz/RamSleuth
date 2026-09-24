@@ -257,6 +257,10 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
             mcbios_req: read_u32_attr(root, "mcbios_req")?,
             ch0,
             ch1,
+            // The Tier-3 extension fields stay default (all `None` —
+            // containment, IG-22: the 24-attr module exposes no
+            // ch2/ch3/MCL attributes; reading them is IG-23).
+            ..IntelImcRegs::default()
         },
         mchbar,
         mad_inter_channel,
@@ -469,6 +473,10 @@ mod tests {
             mcbios_req: Some(0x0000_0012),
             ch1: ch0.clone(),
             ch0,
+            // The Tier-3 extension fields stay default (all `None` —
+            // containment, IG-22: the 24-attr module exposes none of
+            // them).
+            ..IntelImcRegs::default()
         }
     }
 
