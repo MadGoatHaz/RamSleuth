@@ -3431,6 +3431,203 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Tier 3 acceptance fixtures (IG-27): Breakdown §4 Example C
+    // pinned end to end under the Alder-family dispatch, the DDR5
+    // widened-field raws (Research lines 111-124), the MCL fallback
+    // arm, and the widened-width degradation arms.
+    // -----------------------------------------------------------------
+
+    /// Breakdown §4 Example C, pinned verbatim under AlderLake
+    /// through the full Tier-3 `decode()` dispatch (DoD 3 — the CI
+    /// stand-in for the hardware acceptance): `MC_BIOS_REQ =
+    /// 0x0001_0012` — bit 8 = 0b (133.3333 MHz RefClk), multiplier
+    /// ratio 18 in the widened [7:0] field, bit 16 = 1b (Gear 2):
+    /// Step 1: MCLK = 18 × 133.3333 = **2400.0 MHz**; Step 2: data
+    /// transfer rate = 2 × 2400 = **4800 MT/s** (Breakdown §3C);
+    /// Step 3: Gear 2 → uclk = 2400 / 2 = **1200.0 MHz** — every
+    /// decoded subchannel carries the identical shared cells.
+    #[test]
+    fn tier3_acceptance_example_c_pinned_under_alderlake() {
+        // The dispatch fixture's `mcbios_req` is the Example C word
+        // verbatim (bit 8 = 0, ratio 18, bit 16 = 1).
+        assert_eq!(
+            tier3_ddr5_condition_regs().mcbios_req,
+            Some(0x0001_0012),
+            "Example C register settings: 133.3333 MHz base, ratio 18, Gear 2"
+        );
+        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, None);
+        assert_eq!(ro.channels.len(), 4, "DDR5 condition met -> 4 subchannels");
+        for ch in &ro.channels {
+            // Step 1 (memory clock): 18 x 133.3333 MHz = 2400 MHz.
+            assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "MCLK 2400 MHz");
+            // Step 2 (transfer rate): DDR -> 2 x MCLK = 4800 MT/s.
+            assert_eq!(
+                ch.clocks.mclk_mhz.value().copied().map(|v| v * 2.0),
+                Some(4800.0),
+                "4800 MT/s"
+            );
+            // Step 3 (controller clock): Gear 2 -> MCLK / 2 = 1200 MHz.
+            assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Two), "Gear 2");
+            assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "uclk 1200 MHz");
+        }
+    }
+
+    /// The DDR5 widened-field acceptance raws (Research lines 111-124)
+    /// through the MCL fallback arm (Research line 329) of the full
+    /// dispatch: the 0x4004 mirror reads the disabled-mirror reserved
+    /// word (`0xFFFFFFFF`), the valid 0xD004 MCL word wins, and its
+    /// widened fields decode — tCL **40** in the 8-bit `[23:16]`
+    /// TC_ACT field, tRFC1 **1200** in the 12-bit `[11:0]` TC_RFP
+    /// field, tRFCsb **135** in the 11-bit `[10:0]` TC_RFP2 field →
+    /// the `rfcsb` slot (the MCL-only registers have no mirror word,
+    /// so they ride the MCL block as-is). The 2-channel DDR4 default
+    /// geometry is taken (no `MAD_DIMM_CH2/3` raws).
+    #[test]
+    fn tier3_acceptance_widened_fields_via_mcl_fallback() {
+        let regs = IntelImcRegs {
+            // The Example C clock word (bit 8 = 0, ratio 18, bit 16 = 1).
+            mcbios_req: Some(0x0001_0012),
+            ch0: ChannelRegs {
+                tc_rap: Some(0xFFFF_FFFF), // 0x4004: mirror disabled
+                ..ChannelRegs::default()
+            },
+            mcl0: MclRegs {
+                // TC_ACT @ 0xD004: tCL 40 [23:16], tFAW 16 [7:0],
+                // tRRD_S 4 [11:8], tRRD_L 8 [15:12].
+                tc_act: Some(0x0028_8410),
+                // TC_RFP @ 0xD014: tRFC1 1200 [11:0].
+                tc_rfp: Some(0x0000_04B0),
+                // TC_RFP2 @ 0xD018: tRFCsb 135 [10:0] (DDR5-specific).
+                tc_rfp2: Some(0x0000_0087),
+                ..MclRegs::default()
+            },
+            ..IntelImcRegs::default()
+        };
+        let ro = decode(&regs, IntelGen::AlderLake, None);
+        assert_eq!(
+            ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
+            vec![0, 2],
+            "DDR4 default geometry (no MAD raws)"
+        );
+        let ch0 = &ro.channels[0];
+        assert_eq!(
+            ch0.timings.cl,
+            Section::Value(40),
+            "tCL 40 in the 8-bit field, 0xD004 winning over the disabled 0x4004"
+        );
+        assert_eq!(ch0.timings.faw, Section::Value(16), "tFAW 16 in the 8-bit field");
+        assert_eq!(ch0.timings.rfc1, Section::Value(1200), "tRFC1 1200 in the 12-bit field");
+        assert_eq!(
+            ch0.timings.rfcsb,
+            Section::Value(135),
+            "tRFCsb 135 in the 11-bit field -> the rfcsb slot"
+        );
+        // The disabled mirror poisoned nothing: the un-sourced
+        // mirrored registers stay absent -> honest Na(ParseError).
+        assert!(
+            matches!(ch0.timings.rcdrd, Section::Na(NaReason::ParseError(_))),
+            "tc_dbp absent -> tRCD Na"
+        );
+    }
+
+    /// The widened-width degradation arms through the full dispatch
+    /// (4-subchannel DDR5 geometry): (a) zero fields — every
+    /// mirrored register disabled (`0xFFFFFFFF`) → the all-zero MCL
+    /// words win (Research line 329) → every sourced slot degrades to
+    /// `Na(ParseError)` (0 ticks = untrained, outside [1, 2048]) —
+    /// never a bogus zero value; (b) the reserved quartet — the
+    /// TC_RDRD mirror word reads the disabled-mirror `0xFFFFFFFF`:
+    /// on the mirror-only subchannels (OQ-4: no MCL base) it degrades
+    /// to absent → the 4×6-bit quartet slots are `Na(ParseError)`.
+    /// The clocks stay valid: the degradation is per-register.
+    #[test]
+    fn tier3_acceptance_widened_zero_and_reserved_degrade() {
+        let zero_mcl = MclRegs {
+            tc_pre: Some(0),
+            tc_act: Some(0),
+            tc_act2: Some(0),
+            tc_wtr: Some(0),
+            tc_rfp: Some(0),
+            tc_rfp2: Some(0),
+            tc_rdrd: Some(0),
+            tc_wrwr: Some(0),
+        };
+        let regs = IntelImcRegs {
+            mcbios_req: Some(0x0001_0012), // the Example C clock word
+            ch0: ChannelRegs {
+                tc_dbp: Some(0xFFFF_FFFF), // all five paired mirrors disabled
+                tc_rap: Some(0xFFFF_FFFF),
+                tc_rfp: Some(0xFFFF_FFFF),
+                tc_rdrd: Some(0xFFFF_FFFF),
+                tc_wrrd: Some(0xFFFF_FFFF),
+                ..ChannelRegs::default()
+            },
+            ch1: ChannelRegs {
+                tc_rdrd: Some(0xFFFF_FFFF), // mirror-only subchannel (OQ-4)
+                ..ChannelRegs::default()
+            },
+            ch3: ChannelRegs {
+                tc_rdrd: Some(0xFFFF_FFFF), // mirror-only subchannel (OQ-4)
+                ..ChannelRegs::default()
+            },
+            mcl0: zero_mcl,
+            mad_dimm_ch2: Some(1), // DDR5 condition met
+            mad_dimm_ch3: Some(1),
+            ..IntelImcRegs::default()
+        };
+        let ro = decode(&regs, IntelGen::AlderLake, None);
+        assert_eq!(ro.channels.len(), 4, "DDR5 condition met -> 4 subchannels");
+        assert_eq!(
+            ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        // The clocks stay valid (the degradation is per-register, not
+        // wholesale).
+        for ch in &ro.channels {
+            assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0));
+            assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0));
+        }
+        // Every sourced slot of every subchannel degrades to Na:
+        // subch0 from the zero MCL words, subch1/3 from the reserved
+        // mirror words (no MCL base), subch2 all absent.
+        fn assert_all_sourced_na(ch: &IntelChannel, why: &str) {
+            let cells: [&Section<u16>; 18] = [
+                &ch.timings.cl,
+                &ch.timings.rcwdwr,
+                &ch.timings.rcdrd,
+                &ch.timings.rp,
+                &ch.timings.ras,
+                &ch.timings.wtrs,
+                &ch.timings.wtrl,
+                &ch.timings.wr,
+                &ch.timings.rfc1,
+                &ch.timings.rfcsb,
+                &ch.timings.cwl,
+                &ch.timings.rtp,
+                &ch.timings.rdrd_scl,
+                &ch.timings.rdrd_sc,
+                &ch.timings.rdrd_sd,
+                &ch.timings.rdrd_dd,
+                &ch.timings.wrwr_scl,
+                &ch.timings.wrwr_sc,
+            ];
+            for s in &cells {
+                assert!(s.is_na(), "{why}: {s:?}");
+            }
+        }
+        assert_all_sourced_na(&ro.channels[0], "subch0: zero MCL words win (mirrors disabled)");
+        assert_all_sourced_na(&ro.channels[1], "subch1: mirror-only, reserved TC_RDRD word");
+        assert_all_sourced_na(&ro.channels[2], "subch2: all registers absent");
+        assert_all_sourced_na(&ro.channels[3], "subch3: mirror-only, reserved TC_RDRD word");
+        // `rc` is synthesized from tRAS + tRP — neither decodes from a
+        // zero word -> not applicable (never a bogus 0 + 0).
+        assert_eq!(
+            ro.channels[0].timings.rc,
+            Section::na(NaReason::NotApplicable)
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Degradation + containment (the no-panic contract, D5).
     // -----------------------------------------------------------------
 
