@@ -96,16 +96,18 @@
 //! # Generation gate (profile dispatch)
 //!
 //! [`decode`] dispatches on [`intel_gen::profile_for`]: the profiled
-//! generations (Tier 1 = `{Skylake, KabyLake, CoffeeLake, CometLake}`,
-//! plus Rocket Lake) decode from the verified register map — Tier 1 and
-//! Rocket share the identical 64 KiB offsets, and Rocket additionally
-//! decodes `gear_mode` + `uclk_mhz` from `MC_BIOS_REQ[17:16]`. Any
-//! other detected generation (Alder/Raptor/Arrow = roadmap Tier 3,
-//! Meteor, `Unrecognized`) degrades the whole readout to
+//! generations with a live decode path (Tier 1 = `{Skylake, KabyLake,
+//! CoffeeLake, CometLake}`, plus Rocket Lake) decode from the verified
+//! register map — Tier 1 and Rocket share the identical 64 KiB
+//! offsets, and Rocket additionally decodes `gear_mode` + `uclk_mhz`
+//! from `MC_BIOS_REQ[17:16]`. Any other detected generation — the
+//! profiled-but-undecoded Tier-3 Alder family (its decode path lands in
+//! IG-26) and `Unrecognized` — degrades the whole readout to
 //! `Na(UnsupportedHardware)` — never garbage data from a mismatched
-//! register map. [`gen_gate`] (the facade's branch-level gate,
-//! Tier 1 + Rocket Lake) carries the rich detail (the generation and
-//! its roadmap tier); [`tier1_gate`] remains the Tier-1-only
+//! register map. [`gen_gate`] (the facade's branch-level gate: Tier 1,
+//! Rocket Lake, and the Tier-3 Alder family) carries the rich detail
+//! for the remaining unprofiled generations (Ice Lake / Tiger Lake /
+//! `Unrecognized`); [`tier1_gate`] remains the Tier-1-only
 //! compatibility alias.
 //!
 //! # No-panic contract (D5)
@@ -146,7 +148,7 @@
 use crate::amd_readout::{CadBus, ClockReadout, DivMode, GearMode, TimingSet, VoltageSet};
 use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
-use crate::intel_gen::{GearCap, profile_for};
+use crate::intel_gen::{GearCap, GenMap, profile_for};
 use crate::intel_mchbar::MchBar;
 
 // ---------------------------------------------------------------------------
@@ -360,8 +362,9 @@ pub fn tier1_supported(gen: IntelGen) -> bool {
 
 /// Profile dispatch: `true` for every generation that
 /// [`intel_gen::profile_for`] resolves to a decode profile (Tier 1 —
-/// Skylake / Kaby Lake / Coffee Lake / Comet Lake — plus Rocket Lake as
-/// of this build).
+/// Skylake / Kaby Lake / Coffee Lake / Comet Lake — plus Rocket Lake
+/// (Tier 2) and the Tier-3 Alder family — Alder / Raptor / Meteor /
+/// Arrow Lake — as of IG-03).
 pub fn gen_supported(gen: IntelGen) -> bool {
     profile_for(gen).is_some()
 }
@@ -396,13 +399,13 @@ pub fn tier1_gate(gen: IntelGen) -> TelemetryResult<()> {
 
 /// The profile-based generation gate (the facade's branch-level gate
 /// as of IG-16): `Ok(())` for every generation [`gen_supported`]
-/// admits — Tier 1 (Skylake / Kaby Lake / Coffee Lake / Comet Lake)
-/// plus Rocket Lake (Tier 2) — else
+/// admits — Tier 1 (Skylake / Kaby Lake / Coffee Lake / Comet Lake),
+/// Rocket Lake (Tier 2), and the Tier-3 Alder family (profiled as of
+/// IG-03; its decode path lands in IG-26) — else
 /// [`TelemetryError::UnsupportedHardware`] whose `vendor` detail names
-/// the detected generation and its research-roadmap tier (Alder/Raptor
-/// = Tier 3; Meteor/Arrow = Tier 3; the remaining unprofiled
-/// generations — Ice Lake / Tiger Lake / `Unrecognized` — "beyond Tier
-/// 2") — the facade surfaces this as the branch-level
+/// the detected generation and its research-roadmap tier (the remaining
+/// unprofiled generations — Ice Lake / Tiger Lake / `Unrecognized` —
+/// "beyond Tier 2") — the facade surfaces this as the branch-level
 /// `Na(UnsupportedHardware)` (plan §3.4: never garbage data from a
 /// mismatched register map).
 ///
@@ -414,28 +417,22 @@ pub fn gen_gate(gen: IntelGen) -> TelemetryResult<()> {
     if gen_supported(gen) {
         return Ok(());
     }
-    let tier = match gen {
-        IntelGen::AlderLake | IntelGen::RaptorLake => {
-            "Tier 3 (dual-MC DDR4/DDR5, designed-for, not implemented in v1)"
-        }
-        IntelGen::MeteorLake | IntelGen::ArrowLake => "Tier 3 (DDR5, out of v1 scope)",
-        _ => "beyond Tier 2",
-    };
     Err(TelemetryError::UnsupportedHardware {
         vendor: format!(
-            "Intel {gen:?} is {tier}; v1 decodes Tier 1 + Tier 2 (Skylake/Kaby Lake/Coffee Lake/Comet Lake/Rocket Lake) only"
+            "Intel {gen:?} is beyond Tier 2; v1 decodes Tier 1 + Tier 2 (Skylake/Kaby Lake/Coffee Lake/Comet Lake/Rocket Lake) only"
         ),
     })
 }
 
 /// The fixed channel-count model for an [`IntelGen`] (plan: per-channel
 /// 0–3): the profiled generations take their count from their
-/// [`intel_gen::GenProfile`] (Tier 1 and Rocket Lake: 2); the
-/// non-profiled generations keep the legacy model — DDR4-class
-/// generations expose 2 channels, DDR5-class client generations expose
-/// 4, and an unrecognized family-6 Intel falls back to the common
-/// 2-channel desktop layout. Same values as before this dispatch, so no
-/// wire change.
+/// [`intel_gen::GenProfile`] (Tier 1 and Rocket Lake: 2; the Alder
+/// family: 2 for Alder/Raptor Lake — the DDR4 default — and 4 for
+/// Meteor/Arrow Lake, as of IG-03); the non-profiled generations keep
+/// the legacy model — DDR4-class generations expose 2 channels and an
+/// unrecognized family-6 Intel falls back to the common 2-channel
+/// desktop layout. Same values as before this dispatch, so no wire
+/// change.
 pub fn channel_count(gen: IntelGen) -> u8 {
     if let Some(p) = profile_for(gen) {
         return p.channel_count;
@@ -443,8 +440,9 @@ pub fn channel_count(gen: IntelGen) -> u8 {
     match gen {
         IntelGen::IceLake | IntelGen::TigerLake | IntelGen::AlderLake | IntelGen::RaptorLake => 2,
         IntelGen::MeteorLake | IntelGen::ArrowLake => 4,
-        // The profiled generations (Tier 1 + Rocket Lake) return above;
-        // any future profiled family never reaches this legacy fallback.
+        // The profiled generations (Tier 1 + Rocket Lake + the Alder
+        // family) return above; any future profiled family never
+        // reaches this legacy fallback.
         _ => 2,
     }
 }
@@ -888,35 +886,40 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 /// Dispatches on [`intel_gen::profile_for`] — "Tier 1 is one case of
 /// the dispatcher":
 ///
-/// - **profiled generations** (Tier 1 = `{Skylake, KabyLake,
-///   CoffeeLake, CometLake}`; Rocket Lake): both channels decode from
-///   the verified 64 KiB register map (identical offsets — Tier 1 and
-///   Rocket share it): the shared `MC_BIOS_REQ` core clock plus the
-///   per-channel `TC_*` blocks (per-register containment; the frozen
-///   [1, 2048] tick / [1, 4096] MHz sanity gates). Rocket Lake
-///   additionally decodes `gear_mode` + `uclk_mhz` from
-///   `MC_BIOS_REQ[17:16]` (Breakdown §3D, Gear2 cap). Breakdown §3B's
-///   Rocket Lake CLK_RATIO widening is a no-op in code: [`decode_mclk`]
-///   already masks `[7:0]`.
-/// - **unprofiled generations** (roadmap Tier 3+ — Alder / Raptor /
-///   Meteor / Arrow — and `Unrecognized`): the whole readout degrades
-///   to `Na(UnsupportedHardware)` channels — the registers are *not*
-///   decoded (never garbage from a mismatched map; [`gen_gate`] — the
-///   facade's branch gate — carries the rich detail for the
-///   branch-level error; [`tier1_gate`] remains the Tier-1-only
+/// - **profiled generations with a live decode path** (Tier 1 =
+///   `{Skylake, KabyLake, CoffeeLake, CometLake}`; Rocket Lake): both
+///   channels decode from the verified 64 KiB register map (identical
+///   offsets — Tier 1 and Rocket share it): the shared `MC_BIOS_REQ`
+///   core clock plus the per-channel `TC_*` blocks (per-register
+///   containment; the frozen [1, 2048] tick / [1, 4096] MHz sanity
+///   gates). Rocket Lake additionally decodes `gear_mode` + `uclk_mhz`
+///   from `MC_BIOS_REQ[17:16]` (Breakdown §3D, Gear2 cap). Breakdown
+///   §3B's Rocket Lake CLK_RATIO widening is a no-op in code:
+///   [`decode_mclk`] already masks `[7:0]`.
+/// - **every other generation** — the profiled-but-undecoded Tier-3
+///   Alder family (profiled as of IG-03; its decode path,
+///   `decode_tier3_channel`, lands in IG-26) and the unprofiled
+///   generations (Ice Lake / Tiger Lake / `Unrecognized`): the whole
+///   readout degrades to `Na(UnsupportedHardware)` channels — the
+///   registers are *not* decoded (never garbage from a mismatched map;
+///   [`gen_gate`] — the facade's branch gate — carries the rich detail
+///   for the branch-level error; [`tier1_gate`] remains the Tier-1-only
 ///   alias).
 ///
 /// The `channel_mode` slot decodes `MAD_INTER_CHANNEL[1:0]` from
 /// `mad_inter_channel` (`None` → `None`; reserved `11` → `None`); it is
-/// populated on the profiled path (the unprofiled degradation keeps
-/// `None` — behavior preserved).
+/// populated on the decoded path (the degradation keeps `None` —
+/// behavior preserved).
 ///
 /// Never panics (D5): a `None` register degrades only its sourced fields.
 pub fn decode(regs: &IntelImcRegs, gen: IntelGen, mad_inter_channel: Option<u32>) -> IntelReadout {
     match profile_for(gen) {
-        // Profiled: Tier 1 and Rocket Lake reuse the identical 64 KiB
-        // register map; Rocket additionally decodes the gear cells.
-        Some(p) => {
+        // Profiled with a live decode path: Tier 1 and Rocket Lake reuse
+        // the identical 64 KiB register map; Rocket additionally decodes
+        // the gear cells. The Alder family is profiled (IG-03) but its
+        // decode path lands in IG-26 — until then it takes the
+        // degradation arm (never a mismatched-map decode, plan §3.4).
+        Some(p) if matches!(p.map, GenMap::Tier1 | GenMap::Rocket) => {
             let mclk = decode_mclk(regs.mcbios_req);
             let mut channels = Vec::with_capacity(usize::from(p.channel_count));
             for i in 0..p.channel_count {
@@ -937,9 +940,12 @@ pub fn decode(regs: &IntelImcRegs, gen: IntelGen, mad_inter_channel: Option<u32>
                 channel_mode: mad_inter_channel.and_then(ChannelMode::from_raw),
             }
         }
-        // Unprofiled: behavior preserved — the all-Na(UnsupportedHardware)
-        // degradation at the generation's channel count.
-        None => {
+        // Unprofiled generations, and profiled families whose decode
+        // path has not landed yet (the Alder family — IG-26; future
+        // Sandy / Haswell families): behavior preserved — the all-
+        // Na(UnsupportedHardware) degradation at the generation's
+        // channel count.
+        _ => {
             let count = channel_count(gen);
             let mut channels = Vec::with_capacity(usize::from(count));
             for ch in 0..count {
@@ -1001,11 +1007,12 @@ fn gear_uclk_cells(
 /// 2. [`IntelImcRegs::from_bar`] reads the 9-register set with
 ///    per-register containment (a failed read → `None`).
 /// 3. [`decode`] dispatches on the generation's profile: the profiled
-///    generations (Tier 1 + Rocket Lake) decode both channels; any
-///    other Intel generation returns the degraded all-
-///    `Na(UnsupportedHardware)` readout (honest N/A, never garbage —
-///    the facade's branch-level gate surfaces [`gen_gate`]'s rich
-///    detail).
+///    generations with a live decode path (Tier 1 + Rocket Lake)
+///    decode their channels; the profiled-but-undecoded Alder family
+///    (IG-26) and any other Intel generation return the degraded
+///    all-`Na(UnsupportedHardware)` readout (honest N/A, never
+///    garbage — the facade's branch-level gate surfaces
+///    [`gen_gate`]'s rich detail).
 ///
 /// No I/O happens beyond the bounds-checked [`MchBar::read_u32`].
 pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
@@ -2083,13 +2090,13 @@ mod tests {
     }
 
     /// [`gen_gate`] (the facade's branch-level gate, IG-16): every
-    /// profiled generation — Tier 1 plus Rocket Lake (Tier 2) —
-    /// passes; every unprofiled generation yields
-    /// `UnsupportedHardware` with a detail that names the generation
-    /// and its research-roadmap tier under the new numbering (Alder /
-    /// Raptor / Meteor / Arrow = Tier 3; Ice Lake / Tiger Lake /
-    /// `Unrecognized` = beyond Tier 2). Rocket Lake now reaches
-    /// [`decode`] (IG-12's profile dispatch) through the live facade.
+    /// profiled generation — Tier 1, Rocket Lake (Tier 2), and the
+    /// Tier-3 Alder family (profiled as of IG-03) — passes; every
+    /// unprofiled generation yields `UnsupportedHardware` with a
+    /// detail that names the generation and its research-roadmap tier
+    /// (Ice Lake / Tiger Lake / `Unrecognized` = beyond Tier 2).
+    /// Rocket Lake now reaches [`decode`] (IG-12's profile dispatch)
+    /// through the live facade.
     #[test]
     fn gen_gate_dispatches_by_generation() {
         for gen in [
@@ -2098,19 +2105,13 @@ mod tests {
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
             IntelGen::RocketLake,
+            IntelGen::AlderLake,
+            IntelGen::RaptorLake,
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
         ] {
             assert_eq!(gen_gate(gen), Ok(()), "{gen:?}");
         }
-        let ald = gen_gate(IntelGen::AlderLake).unwrap_err();
-        assert!(matches!(
-            ald,
-            TelemetryError::UnsupportedHardware { .. }
-        ));
-        let ald_msg = ald.to_string();
-        assert!(ald_msg.contains("AlderLake"), "{ald_msg}");
-        assert!(ald_msg.contains("Tier 3"), "{ald_msg}");
-        let met = gen_gate(IntelGen::MeteorLake).unwrap_err();
-        assert!(met.to_string().contains("Tier 3"), "{met}");
         let ice = gen_gate(IntelGen::IceLake).unwrap_err();
         assert!(ice.to_string().contains("beyond Tier 2"), "{ice}");
         let un = gen_gate(IntelGen::Unrecognized).unwrap_err();
@@ -2122,8 +2123,8 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// [`gen_supported`] mirrors [`intel_gen::profile_for`]: the Tier-1
-    /// set plus Rocket Lake are profiled; every other generation is
-    /// not.
+    /// set, Rocket Lake, and the Tier-3 Alder family (IG-03) are
+    /// profiled; every other generation is not.
     #[test]
     fn gen_supported_matches_profile_for() {
         for gen in [
@@ -2132,16 +2133,16 @@ mod tests {
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
             IntelGen::RocketLake,
+            IntelGen::AlderLake,
+            IntelGen::RaptorLake,
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
         ] {
             assert!(gen_supported(gen), "{gen:?}");
         }
         for gen in [
             IntelGen::IceLake,
             IntelGen::TigerLake,
-            IntelGen::AlderLake,
-            IntelGen::RaptorLake,
-            IntelGen::MeteorLake,
-            IntelGen::ArrowLake,
             IntelGen::Unrecognized,
         ] {
             assert!(!gen_supported(gen), "{gen:?}");
