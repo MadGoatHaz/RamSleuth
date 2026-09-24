@@ -365,6 +365,23 @@ async fn dispatch(
                 .await
             }
         }
+        Message::Request(Request::GetProbeReport) => {
+            // The consent-gated "Submit Probe Report" (chunk probe-1a
+            // wire types). The daemon-side builder that assembles the
+            // `ProbeReport` payload (the live snapshot + the Intel raw
+            // dump + the system identity) lands in chunk 1b — until
+            // then this arm returns a structured, wire-safe
+            // "not wired yet" (the no-panic contract, D5: a plain
+            // `Response::Error`, never a panic, never a partial
+            // payload).
+            write_frame(
+                writer,
+                &Message::Response(Response::Error(
+                    "probe report not wired (chunk 1b)".to_owned(),
+                )),
+            )
+            .await
+        }
         // A client must never send a `Response` frame: protocol
         // violation, close the connection.
         Message::Response(_) => {

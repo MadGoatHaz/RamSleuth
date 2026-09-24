@@ -213,6 +213,15 @@ pub fn bench(
                     "unexpected burn-in frame during benchmark".to_owned(),
                 ))
             }
+            Response::ProbeReport(_) => {
+                // A probe-report frame in a normal-bench stream
+                // violates the wire contract (probe reports reply only
+                // to `GetProbeReport`, chunk probe-1a) — this
+                // subcommand only ever starts a `StartBenchmark`.
+                return Err(ClientError::Protocol(
+                    "unexpected probe report during benchmark".to_owned(),
+                ))
+            }
         }
     }
 }
