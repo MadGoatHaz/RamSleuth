@@ -5,7 +5,9 @@
  * Probes the host bridge at PCI 0000:00:00.0, decodes MCHBAR from
  * config space (offset 0x48 = low dword, 0x4C = high dword; bit 0 of
  * the low dword = MCHBAR_EN; base = raw & 0x0000007F_FFFF_F000),
- * ioremaps the 64 KiB window, and publishes the raw IMC registers as
+ * ioremaps the MCHBAR window (64 KiB by default; 256 KiB for the
+ * Tier-3 host-bridge device IDs in the OQ-14 table, currently empty
+ * so 64 KiB for every device), and publishes the raw IMC registers as
  * world-readable (0444) sysfs attributes under
  * /sys/kernel/ramsleuth_intel/.
  *
@@ -38,9 +40,17 @@
 #define MCHBAR_EN		BIT(0)		/* bit 0: MCHBAR enable */
 #define MCHBAR_ADDR_MASK	0x0000007FFFFFF000ULL	/* bits 12..38 */
 
-/* Tier 1: map the 64 KiB window covering every register we expose
- * (the highest exposed offset is MC_BIOS_REQ at 0x5E00). */
-#define IMC_MAP_SIZE	0x10000
+/* Default window (Tier 1 / Tier 2): the 64 KiB covering every
+ * register we expose (the highest exposed offset is MC_BIOS_REQ at
+ * 0x5E00). */
+#define IMC_MAP_SIZE_DEFAULT	0x10000
+
+/* Tier 3 (12th/13th/14th gen): the wider 256 KiB window, selected
+ * ONLY for the host-bridge device IDs in tier3_device_ids[] (OQ-14).
+ * The research docs do not list those IDs, so the table ships as a
+ * TODO constant block; while it is empty, every device maps the
+ * default 64 KiB window. */
+#define IMC_MAP_SIZE_TIER3	0x40000
 
 /* IMC register offsets relative to the MCHBAR base */
 #define REG_MC_BIOS_REQ	0x5E00
@@ -168,12 +178,35 @@ static struct attribute_group ramsleuth_group = {
 	.attrs = ramsleuth_attrs,
 };
 
+/*
+ * OQ-14: verified 12th/13th/14th-gen (Alder / Raptor / Arrow Lake)
+ * host-bridge device IDs, 0x0000-terminated.  The research docs do
+ * not list the IDs, so the table ships empty (its only element is
+ * the terminator): the 256 KiB window is selected for NO device
+ * yet.  Add each ID confirmed against a live box before the final
+ * 0x0000.
+ */
+static const u16 tier3_device_ids[] = {
+	0x0000,	/* TODO(OQ-14): confirmed Tier-3 host-bridge device IDs */
+};
+
+static bool is_tier3_device(u16 device)
+{
+	unsigned int i;
+
+	for (i = 0; tier3_device_ids[i] != 0x0000; i++)
+		if (tier3_device_ids[i] == device)
+			return true;
+	return false;
+}
+
 static int __init ramsleuth_intel_init(void)
 {
 	struct pci_dev *pdev;
 	u32 lo, hi;
 	u64 raw;
-	u16 vendor;
+	u16 vendor, device;
+	size_t map_size;
 	int ret;
 
 	pdev = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(0, 0));
@@ -183,6 +216,7 @@ static int __init ramsleuth_intel_init(void)
 	}
 
 	vendor = pdev->vendor;
+	device = pdev->device;
 	pci_read_config_dword(pdev, MCHBAR_LO_OFF, &lo);
 	pci_read_config_dword(pdev, MCHBAR_HI_OFF, &hi);
 	pci_dev_put(pdev);
@@ -200,6 +234,14 @@ static int __init ramsleuth_intel_init(void)
 		return -ENODEV;
 	}
 
+	/*
+	 * Window size: 256 KiB only for the Tier-3 host-bridge device
+	 * IDs in tier3_device_ids[] (OQ-14; the table is a TODO block
+	 * and currently empty), the default 64 KiB for every other ID.
+	 */
+	map_size = is_tier3_device(device) ? IMC_MAP_SIZE_TIER3 :
+					      IMC_MAP_SIZE_DEFAULT;
+
 	raw = ((u64)hi << 32) | lo;
 	if (!(raw & MCHBAR_EN)) {
 		pr_err(DRIVER_NAME
@@ -213,7 +255,7 @@ static int __init ramsleuth_intel_init(void)
 		return -ENODEV;
 	}
 
-	mchbar_mmio = ioremap(mchbar_base, IMC_MAP_SIZE);
+	mchbar_mmio = ioremap(mchbar_base, map_size);
 	if (!mchbar_mmio) {
 		pr_err(DRIVER_NAME ": ioremap of MCHBAR 0x%llx failed\n",
 		       (unsigned long long)mchbar_base);
