@@ -96,20 +96,27 @@
 //!
 //! # Generation gate (profile dispatch)
 //!
-//! [`decode`] dispatches on [`intel_gen::profile_for`]: the profiled
-//! generations with a live decode path (Tier 1 = `{Skylake, KabyLake,
-//! CoffeeLake, CometLake}`, plus Rocket Lake) decode from the verified
-//! register map — Tier 1 and Rocket share the identical 64 KiB
-//! offsets, and Rocket additionally decodes `gear_mode` + `uclk_mhz`
-//! from `MC_BIOS_REQ[17:16]`. Any other detected generation — the
-//! profiled-but-undecoded Tier-3 Alder family (its decode path lands in
-//! IG-26) and `Unrecognized` — degrades the whole readout to
-//! `Na(UnsupportedHardware)` — never garbage data from a mismatched
-//! register map. [`gen_gate`] (the facade's branch-level gate: Tier 1,
-//! Rocket Lake, and the Tier-3 Alder family) carries the rich detail
-//! for the remaining unprofiled generations (Ice Lake / Tiger Lake /
-//! `Unrecognized`); [`tier1_gate`] remains the Tier-1-only
-//! compatibility alias.
+//! [`decode`] dispatches on [`intel_gen::profile_for`]: every profiled
+//! generation has a live decode path — Tier 1 = `{Skylake, KabyLake,
+//! CoffeeLake, CometLake}` and Rocket Lake decode from the verified
+//! 64 KiB register map (identical offsets — Rocket additionally
+//! decodes `gear_mode` + `uclk_mhz` from `MC_BIOS_REQ[17:16]`), and
+//! the Tier-3 Alder family (Alder / Raptor / Meteor / Arrow Lake,
+//! IG-26) decodes its subchannels from the widened 256 KiB offset set:
+//! the decode-time subchannel set is picked by OQ-11's DDR5 condition
+//! (both `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws present and non-zero → 4
+//! subchannels, else the 2-channel DDR4 default), each subchannel maps
+//! to its [`AlderChannelMap`] descriptor and decodes through the
+//! Research-line-329 mirror → MCL fallback ([`tier3_mcl_for`]) into
+//! [`decode_tier3_channel`], with the gear cells layered on from
+//! `MC_BIOS_REQ[17:16]` on its `GearCap::Gear4` profile. Every
+//! remaining generation (Ice Lake / Tiger Lake / `Unrecognized`)
+//! degrades the whole readout to `Na(UnsupportedHardware)` — never
+//! garbage data from a mismatched register map. [`gen_gate`] (the
+//! facade's branch-level gate: Tier 1, Rocket Lake, and the Tier-3
+//! Alder family) carries the rich detail for the unprofiled
+//! generations; [`tier1_gate`] remains the Tier-1-only compatibility
+//! alias.
 //!
 //! # No-panic contract (D5)
 //!
@@ -553,9 +560,11 @@ pub fn tier1_gate(gen: IntelGen) -> TelemetryResult<()> {
     }
     let tier = match gen {
         IntelGen::AlderLake | IntelGen::RaptorLake => {
-            "Tier 3 (dual-MC DDR4/DDR5, designed-for, not implemented in v1)"
+            "Tier 3 (dual-MC DDR4/DDR5, decoded on the Alder profile — outside this Tier-1 gate)"
         }
-        IntelGen::MeteorLake | IntelGen::ArrowLake => "Tier 3 (DDR5, out of v1 scope)",
+        IntelGen::MeteorLake | IntelGen::ArrowLake => {
+            "Tier 3 (DDR5, decoded on the Alder profile — outside this Tier-1 gate)"
+        }
         IntelGen::RocketLake => {
             "Tier 2 (Gear Mode + turnaround parity; outside this Tier-1 gate)"
         }
@@ -572,7 +581,7 @@ pub fn tier1_gate(gen: IntelGen) -> TelemetryResult<()> {
 /// as of IG-16): `Ok(())` for every generation [`gen_supported`]
 /// admits — Tier 1 (Skylake / Kaby Lake / Coffee Lake / Comet Lake),
 /// Rocket Lake (Tier 2), and the Tier-3 Alder family (profiled as of
-/// IG-03; its decode path lands in IG-26) — else
+/// IG-03; decoding on the Tier-3 subchannel path as of IG-26) — else
 /// [`TelemetryError::UnsupportedHardware`] whose `vendor` detail names
 /// the detected generation and its research-roadmap tier (the remaining
 /// unprofiled generations — Ice Lake / Tiger Lake / `Unrecognized` —
@@ -603,7 +612,10 @@ pub fn gen_gate(gen: IntelGen) -> TelemetryResult<()> {
 /// the legacy model — DDR4-class generations expose 2 channels and an
 /// unrecognized family-6 Intel falls back to the common 2-channel
 /// desktop layout. Same values as before this dispatch, so no wire
-/// change.
+/// change. (The Tier-3 *decode* may expose a different decode-time
+/// subchannel count for the Alder family — OQ-11's DDR5 condition
+/// flips [`decode`] to the 4-subchannel geometry; this function stays
+/// the static model.)
 pub fn channel_count(gen: IntelGen) -> u8 {
     if let Some(p) = profile_for(gen) {
         return p.channel_count;
@@ -1392,22 +1404,34 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 /// Dispatches on [`intel_gen::profile_for`] — "Tier 1 is one case of
 /// the dispatcher":
 ///
-/// - **profiled generations with a live decode path** (Tier 1 =
-///   `{Skylake, KabyLake, CoffeeLake, CometLake}`; Rocket Lake): both
-///   channels decode from the verified 64 KiB register map (identical
-///   offsets — Tier 1 and Rocket share it): the shared `MC_BIOS_REQ`
-///   core clock plus the per-channel `TC_*` blocks (per-register
-///   containment; the frozen [1, 2048] tick / [1, 4096] MHz sanity
-///   gates). Rocket Lake additionally decodes `gear_mode` + `uclk_mhz`
-///   from `MC_BIOS_REQ[17:16]` (Breakdown §3D, Gear2 cap). Breakdown
-///   §3B's Rocket Lake CLK_RATIO widening is a no-op in code:
-///   [`decode_mclk`] already masks `[7:0]`.
-/// - **every other generation** — the profiled-but-undecoded Tier-3
-///   Alder family (profiled as of IG-03; its decode path,
-///   `decode_tier3_channel`, lands in IG-26) and the unprofiled
-///   generations (Ice Lake / Tiger Lake / `Unrecognized`): the whole
-///   readout degrades to `Na(UnsupportedHardware)` channels — the
-///   registers are *not* decoded (never garbage from a mismatched map;
+/// - **Tier 1 + Rocket Lake**: both channels decode from the verified
+///   64 KiB register map (identical offsets — Tier 1 and Rocket share
+///   it): the shared `MC_BIOS_REQ` core clock plus the per-channel
+///   `TC_*` blocks (per-register containment; the frozen [1, 2048]
+///   tick / [1, 4096] MHz sanity gates). Rocket Lake additionally
+///   decodes `gear_mode` + `uclk_mhz` from `MC_BIOS_REQ[17:16]`
+///   (Breakdown §3D, Gear2 cap). Breakdown §3B's Rocket Lake
+///   CLK_RATIO widening is a no-op in code: [`decode_mclk`] already
+///   masks `[7:0]`.
+/// - **the Tier-3 Alder family** (`AlderLake` / `RaptorLake` /
+///   `MeteorLake` / `ArrowLake` — IG-26): the decode-time subchannel
+///   set is picked by OQ-11's DDR5 condition — **4 subchannels** when
+///   both `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws are present and
+///   non-zero, else the **2-channel DDR4 default** (MC0 subch0 + MC1
+///   subch2). Each subchannel index maps to its [`AlderChannelMap`]
+///   descriptor; its effective [`MclRegs`] is the Research-line-329
+///   mirror → MCL fallback ([`tier3_mcl_for`]); the widened DDR5
+///   fields decode through [`decode_tier3_channel`] (per-register
+///   containment; the same [1, 2048] tick / [1, 4096] MHz gates); the
+///   gear cells layer on from `MC_BIOS_REQ[17:16]` on the profile's
+///   `GearCap::Gear4` (Breakdown §3D: gear 4 on Alder / Meteor /
+///   Arrow for LPDDR5X and high-speed DDR5; Research line 145:
+///   >7200 MT/s). **OQ-11: confirm on hardware before shipping** —
+///   the DDR5 condition is the working assumption.
+/// - **every remaining generation** — the unprofiled generations
+///   (Ice Lake / Tiger Lake / `Unrecognized`): the whole readout
+///   degrades to `Na(UnsupportedHardware)` channels — the registers
+///   are *not* decoded (never garbage from a mismatched map;
 ///   [`gen_gate`] — the facade's branch gate — carries the rich detail
 ///   for the branch-level error; [`tier1_gate`] remains the Tier-1-only
 ///   alias).
@@ -1422,9 +1446,7 @@ pub fn decode(regs: &IntelImcRegs, gen: IntelGen, mad_inter_channel: Option<u32>
     match profile_for(gen) {
         // Profiled with a live decode path: Tier 1 and Rocket Lake reuse
         // the identical 64 KiB register map; Rocket additionally decodes
-        // the gear cells. The Alder family is profiled (IG-03) but its
-        // decode path lands in IG-26 — until then it takes the
-        // degradation arm (never a mismatched-map decode, plan §3.4).
+        // the gear cells.
         Some(p) if matches!(p.map, GenMap::Tier1 | GenMap::Rocket) => {
             let mclk = decode_mclk(regs.mcbios_req);
             let mut channels = Vec::with_capacity(usize::from(p.channel_count));
@@ -1446,11 +1468,43 @@ pub fn decode(regs: &IntelImcRegs, gen: IntelGen, mad_inter_channel: Option<u32>
                 channel_mode: mad_inter_channel.and_then(ChannelMode::from_raw),
             }
         }
-        // Unprofiled generations, and profiled families whose decode
-        // path has not landed yet (the Alder family — IG-26; future
-        // Sandy / Haswell families): behavior preserved — the all-
-        // Na(UnsupportedHardware) degradation at the generation's
-        // channel count.
+        // The Tier-3 Alder family (IG-26): OQ-11's DDR5 condition
+        // (both MAD_DIMM_CH2 / MAD_DIMM_CH3 raws present and non-zero)
+        // selects the 4-subchannel geometry; absent / zero raws keep
+        // the 2-channel DDR4 default (MC0 subch0 + MC1 subch2).
+        // OQ-11: confirm on hardware before shipping (working
+        // assumption).
+        Some(p) if matches!(p.map, GenMap::Alder) => {
+            let ddr5 = regs.mad_dimm_ch2.is_some_and(|v| v != 0)
+                && regs.mad_dimm_ch3.is_some_and(|v| v != 0);
+            let subch_indices: &[usize] = if ddr5 {
+                &[0, 1, 2, 3]
+            } else {
+                &[0, 2]
+            };
+            let mclk = decode_mclk(regs.mcbios_req);
+            // The gear cells are shared across subchannels (the same
+            // MC_BIOS_REQ word): decode once, layer on every channel
+            // (GearCap::Gear4 — the Alder profile; Breakdown §3D).
+            let (gear_mode, uclk) = gear_uclk_cells(p.gear, &mclk, regs.mcbios_req);
+            let mut channels = Vec::with_capacity(subch_indices.len());
+            for &i in subch_indices {
+                let map = &ALDER_CHANNELS[i];
+                let mcl = tier3_mcl_for(i, map, regs);
+                let mut channel = decode_tier3_channel(i as u8, mclk.clone(), &mcl, map);
+                channel.clocks.gear_mode = gear_mode.clone();
+                channel.clocks.uclk_mhz = uclk.clone();
+                channels.push(channel);
+            }
+            IntelReadout {
+                channels,
+                channel_mode: mad_inter_channel.and_then(ChannelMode::from_raw),
+            }
+        }
+        // Unprofiled generations, and any future profiled family whose
+        // decode path has not landed (Sandy / Haswell): behavior
+        // preserved — the all-Na(UnsupportedHardware) degradation at
+        // the generation's channel count.
         _ => {
             let count = channel_count(gen);
             let mut channels = Vec::with_capacity(usize::from(count));
@@ -1512,13 +1566,14 @@ fn gear_uclk_cells(
 ///    read.
 /// 2. [`IntelImcRegs::from_bar`] reads the 9-register set with
 ///    per-register containment (a failed read → `None`).
-/// 3. [`decode`] dispatches on the generation's profile: the profiled
-///    generations with a live decode path (Tier 1 + Rocket Lake)
-///    decode their channels; the profiled-but-undecoded Alder family
-///    (IG-26) and any other Intel generation return the degraded
-///    all-`Na(UnsupportedHardware)` readout (honest N/A, never
-///    garbage — the facade's branch-level gate surfaces
-///    [`gen_gate`]'s rich detail).
+/// 3. [`decode`] dispatches on the generation's profile: every
+///    profiled generation decodes its channels — Tier 1 + Rocket Lake
+///    on the 64 KiB map, the Alder family on the Tier-3 subchannel
+///    path (IG-26: the 2-channel DDR4 default, or the 4-subchannel
+///    geometry when OQ-11's DDR5 condition holds); any non-profiled
+///    Intel generation returns the degraded all-`Na(UnsupportedHardware)`
+///    readout (honest N/A, never garbage — the facade's branch-level
+///    gate surfaces [`gen_gate`]'s rich detail).
 ///
 /// No I/O happens beyond the bounds-checked [`MchBar::read_u32`].
 pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
@@ -2851,6 +2906,188 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // The Tier-3 decode dispatch (IG-26): OQ-11's DDR5 condition picks
+    // the subchannel set; the mirror → MCL fallback (IG-25) and the
+    // gear cells (IG-11, GearCap::Gear4) wire decode_tier3_channel
+    // into `decode`.
+    // -----------------------------------------------------------------
+
+    /// A populated mirror block under the Alder layout (the mirror is a
+    /// legacy alias of the MCL block — the same words, Tier-1 names):
+    /// the DDR5-4800 40-class fixture, so every MCL-paired mirror word
+    /// decodes; the MCL-only registers (+0x10 `TC_WTR` / +0x14 `TC_RFP`
+    /// / +0x18 `TC_RFP2`) have no mirror word and ride the MCL block
+    /// (absent here → `None`).
+    fn ddr5_mirror_block() -> ChannelRegs {
+        ChannelRegs {
+            tc_dbp: Some(0x284D_2828),  // +0x00 → tc_pre
+            tc_rap: Some(0x0028_8410),  // +0x04 → tc_act
+            tc_rfp: Some(0x0000_0004),  // +0x08 → tc_act2
+            tc_rdrd: Some(0x0048_C286), // +0x20 → tc_rdrd
+            tc_wrrd: Some(0x0000_0286), // +0x28 → tc_wrwr
+            ..ChannelRegs::default()
+        }
+    }
+
+    /// The Tier-3 dispatch fixture with OQ-11's DDR5 condition met:
+    /// all four mirror blocks populated, both `MAD_DIMM_CH2/CH3` raws
+    /// present and non-zero, `MC_BIOS_REQ = 0x0001_0012` (ratio 18 @
+    /// 133.3333 MHz → 2400 MHz, bit 16 → gear 2).
+    fn tier3_ddr5_condition_regs() -> IntelImcRegs {
+        IntelImcRegs {
+            mcbios_req: Some(0x0001_0012),
+            ch0: ddr5_mirror_block(),
+            ch1: ddr5_mirror_block(),
+            ch2: ddr5_mirror_block(),
+            ch3: ddr5_mirror_block(),
+            mad_dimm_ch2: Some(1),
+            mad_dimm_ch3: Some(1),
+            ..IntelImcRegs::default()
+        }
+    }
+
+    /// OQ-11's DDR5 condition met (both `MAD_DIMM_CH2/CH3` raws
+    /// present and non-zero) → the decode exposes the 4-subchannel
+    /// geometry under every Alder-family generation: indices 0–3, each
+    /// subchannel decodes from its mirror block through the widened
+    /// Tier-3 fields, the gear cells layer on (bit 16 → gear 2 →
+    /// uclk = 2400 / 2 = 1200), and `channel_mode` follows
+    /// `MAD_INTER_CHANNEL[1:0]` (Breakdown §7).
+    /// **OQ-11: confirm on hardware before shipping** (working
+    /// assumption).
+    #[test]
+    fn decode_tier3_ddr5_condition_exposes_four_subchannels() {
+        for gen in [
+            IntelGen::AlderLake,
+            IntelGen::RaptorLake,
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
+        ] {
+            let ro = decode(&tier3_ddr5_condition_regs(), gen, Some(0));
+            assert_eq!(ro.channels.len(), 4, "{gen:?}: DDR5 condition met -> 4 subchannels");
+            assert_eq!(
+                ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
+                vec![0, 1, 2, 3],
+                "{gen:?}"
+            );
+            assert_eq!(
+                ro.channel_mode,
+                Some(ChannelMode::DualSymmetric),
+                "{gen:?}: MAD_INTER_CHANNEL[1:0] = 00"
+            );
+            for ch in &ro.channels {
+                // The shared core clock + gear cells (Breakdown §3D,
+                // the profile's GearCap::Gear4).
+                assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
+                assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Two), "{gen:?}");
+                assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "{gen:?}: uclk = mclk / 2");
+                // The widened DDR5-4800 40-class timings decode from
+                // the mirror block (no MCL base populated here).
+                assert_eq!(ch.timings.cl, Section::Value(40), "{gen:?}");
+                assert_eq!(ch.timings.cwl, Section::Value(40), "{gen:?}");
+                assert_eq!(ch.timings.rc, Section::Value(117), "{gen:?}");
+                assert_eq!(ch.timings.rdrd_scl, Section::Value(6), "{gen:?}");
+                assert_eq!(ch.timings.wrwr_scl, Section::Value(6), "{gen:?}");
+                // MCL-only registers absent here -> Na(ParseError).
+                assert!(
+                    matches!(ch.timings.rfc1, Section::Na(NaReason::ParseError(_))),
+                    "{gen:?}"
+                );
+                assert!(
+                    matches!(ch.timings.rfcsb, Section::Na(NaReason::ParseError(_))),
+                    "{gen:?}"
+                );
+            }
+        }
+    }
+
+    /// OQ-11's DDR5 condition NOT met → the 2-channel DDR4 default
+    /// (MC0 subch0 + MC1 subch2) under every Alder-family generation,
+    /// for both absence forms: raws absent (`None` — the 64 KiB /
+    /// 24-attr build) and present-but-zero (`Some(0)`).
+    #[test]
+    fn decode_tier3_ddr4_default_exposes_two_channels() {
+        for gen in [
+            IntelGen::AlderLake,
+            IntelGen::RaptorLake,
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
+        ] {
+            for (label, mad2, mad3) in [
+                ("raws absent", None, None),
+                ("raws zero", Some(0u32), Some(0u32)),
+            ] {
+                let mut regs = tier3_ddr5_condition_regs();
+                regs.mad_dimm_ch2 = mad2;
+                regs.mad_dimm_ch3 = mad3;
+                let ro = decode(&regs, gen, Some(1));
+                assert_eq!(ro.channels.len(), 2, "{gen:?} ({label}): DDR4 default");
+                assert_eq!(
+                    ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
+                    vec![0, 2],
+                    "{gen:?} ({label}): MC0 subch0 + MC1 subch2"
+                );
+                assert_eq!(
+                    ro.channel_mode,
+                    Some(ChannelMode::DualFlex),
+                    "{gen:?} ({label}): MAD_INTER_CHANNEL[1:0] = 01"
+                );
+                for ch in &ro.channels {
+                    assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?} ({label})");
+                    assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Two), "{gen:?} ({label})");
+                    assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "{gen:?} ({label})");
+                    assert_eq!(ch.timings.cl, Section::Value(40), "{gen:?} ({label})");
+                }
+            }
+        }
+    }
+
+    /// Gear 4 (Breakdown §3D: Alder / Meteor / Arrow for LPDDR5X and
+    /// high-speed DDR5; Research line 145: >7200 MT/s) wires the
+    /// `GearCap::Gear4` cap into the Tier-3 dispatch:
+    /// `MC_BIOS_REQ = 0x0002_0012` (ratio 18 @ 133.3333 MHz, bits
+    /// [17:16] = 10b) → gear **Four** → uclk = 2400 / 4 = **600 MHz**
+    /// on every decoded subchannel.
+    #[test]
+    fn decode_tier3_gear4_uclk_is_mclk_over_four() {
+        let mut regs = tier3_ddr5_condition_regs();
+        regs.mcbios_req = Some(0x0002_0012); // 10b + ratio 18
+        for gen in [
+            IntelGen::AlderLake,
+            IntelGen::RaptorLake,
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
+        ] {
+            let ro = decode(&regs, gen, None);
+            for ch in &ro.channels {
+                assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
+                assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Four), "{gen:?}");
+                assert_eq!(
+                    ch.clocks.uclk_mhz,
+                    Section::Value(600.0),
+                    "{gen:?}: uclk = mclk / 4"
+                );
+            }
+        }
+    }
+
+    /// The 4-subchannel Tier-3 readout round-trips through bincode —
+    /// the wire-frozen shape: `IntelReadout` is the same
+    /// `Vec<IntelChannel>` + `Option<ChannelMode>` struct the
+    /// 2-channel and Tier-1/2 readouts use (no protocol change; only
+    /// which cells carry `Value` vs `Na` differs).
+    #[test]
+    fn decode_tier3_four_channel_readout_bincode_round_trip() {
+        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, Some(0));
+        assert_eq!(ro.channels.len(), 4, "the 4-subchannel DDR5 shape");
+        let bytes = bincode::serialize(&ro)
+            .expect("IntelReadout must serialize (no-panic contract)");
+        let back: IntelReadout =
+            bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
+        assert_eq!(ro, back);
+    }
+
+    // -----------------------------------------------------------------
     // Degradation + containment (the no-panic contract, D5).
     // -----------------------------------------------------------------
 
@@ -3001,20 +3238,19 @@ mod tests {
     // The v1 Tier-1 generation gate.
     // -----------------------------------------------------------------
 
-    /// Any non-Tier-1 generation degrades the whole readout to
+    /// Every *unprofiled* generation (Ice Lake / Tiger Lake /
+    /// `Unrecognized`) degrades the whole readout to
     /// `Na(UnsupportedHardware)` channels — the registers are not
     /// decoded at all (never garbage from a mismatched map); the
-    /// channel count follows the frozen model.
+    /// channel count follows the frozen model. The profiled Tier-3
+    /// Alder family has a live decode path as of IG-26 (the dedicated
+    /// Tier-3 dispatch tests above pin its shapes).
     #[test]
     fn decode_non_tier1_gen_degrades_all_na() {
         let regs = acceptance_regs();
         for (gen, count) in [
             (IntelGen::IceLake, 2u8),
             (IntelGen::TigerLake, 2),
-            (IntelGen::AlderLake, 2),
-            (IntelGen::RaptorLake, 2),
-            (IntelGen::MeteorLake, 4),
-            (IntelGen::ArrowLake, 4),
             (IntelGen::Unrecognized, 2),
         ] {
             let ro = decode(&regs, gen, None);
