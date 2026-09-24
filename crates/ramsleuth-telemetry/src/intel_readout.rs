@@ -103,9 +103,10 @@
 //! other detected generation (Alder/Raptor/Arrow = roadmap Tier 3,
 //! Meteor, `Unrecognized`) degrades the whole readout to
 //! `Na(UnsupportedHardware)` — never garbage data from a mismatched
-//! register map. [`tier1_gate`] (the facade's branch-level gate,
-//! Tier-1-only) carries the rich detail (the generation and its
-//! roadmap tier).
+//! register map. [`gen_gate`] (the facade's branch-level gate,
+//! Tier 1 + Rocket Lake) carries the rich detail (the generation and
+//! its roadmap tier); [`tier1_gate`] remains the Tier-1-only
+//! compatibility alias.
 //!
 //! # No-panic contract (D5)
 //!
@@ -389,6 +390,40 @@ pub fn tier1_gate(gen: IntelGen) -> TelemetryResult<()> {
     Err(TelemetryError::UnsupportedHardware {
         vendor: format!(
             "Intel {gen:?} is {tier}; v1 decodes Tier 1 (Skylake/Kaby Lake/Coffee Lake/Comet Lake) only"
+        ),
+    })
+}
+
+/// The profile-based generation gate (the facade's branch-level gate
+/// as of IG-16): `Ok(())` for every generation [`gen_supported`]
+/// admits — Tier 1 (Skylake / Kaby Lake / Coffee Lake / Comet Lake)
+/// plus Rocket Lake (Tier 2) — else
+/// [`TelemetryError::UnsupportedHardware`] whose `vendor` detail names
+/// the detected generation and its research-roadmap tier (Alder/Raptor
+/// = Tier 3; Meteor/Arrow = Tier 3; the remaining unprofiled
+/// generations — Ice Lake / Tiger Lake / `Unrecognized` — "beyond Tier
+/// 2") — the facade surfaces this as the branch-level
+/// `Na(UnsupportedHardware)` (plan §3.4: never garbage data from a
+/// mismatched register map).
+///
+/// This is the gate that lets Rocket Lake reach [`decode`]'s profile
+/// dispatch for the first time (IG-14/IG-15 make `detect()` emit it;
+/// IG-12 wires the profile). [`tier1_gate`] is retained as the
+/// Tier-1-only compatibility alias for other callers.
+pub fn gen_gate(gen: IntelGen) -> TelemetryResult<()> {
+    if gen_supported(gen) {
+        return Ok(());
+    }
+    let tier = match gen {
+        IntelGen::AlderLake | IntelGen::RaptorLake => {
+            "Tier 3 (dual-MC DDR4/DDR5, designed-for, not implemented in v1)"
+        }
+        IntelGen::MeteorLake | IntelGen::ArrowLake => "Tier 3 (DDR5, out of v1 scope)",
+        _ => "beyond Tier 2",
+    };
+    Err(TelemetryError::UnsupportedHardware {
+        vendor: format!(
+            "Intel {gen:?} is {tier}; v1 decodes Tier 1 + Tier 2 (Skylake/Kaby Lake/Coffee Lake/Comet Lake/Rocket Lake) only"
         ),
     })
 }
@@ -866,8 +901,10 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 /// - **unprofiled generations** (roadmap Tier 3+ — Alder / Raptor /
 ///   Meteor / Arrow — and `Unrecognized`): the whole readout degrades
 ///   to `Na(UnsupportedHardware)` channels — the registers are *not*
-///   decoded (never garbage from a mismatched map; [`tier1_gate`]
-///   carries the rich detail for the branch-level error).
+///   decoded (never garbage from a mismatched map; [`gen_gate`] — the
+///   facade's branch gate — carries the rich detail for the
+///   branch-level error; [`tier1_gate`] remains the Tier-1-only
+///   alias).
 ///
 /// The `channel_mode` slot decodes `MAD_INTER_CHANNEL[1:0]` from
 /// `mad_inter_channel` (`None` → `None`; reserved `11` → `None`); it is
@@ -967,7 +1004,7 @@ fn gear_uclk_cells(
 ///    generations (Tier 1 + Rocket Lake) decode both channels; any
 ///    other Intel generation returns the degraded all-
 ///    `Na(UnsupportedHardware)` readout (honest N/A, never garbage —
-///    the facade's branch-level gate surfaces [`tier1_gate`]'s rich
+///    the facade's branch-level gate surfaces [`gen_gate`]'s rich
 ///    detail).
 ///
 /// No I/O happens beyond the bounds-checked [`MchBar::read_u32`].
@@ -986,9 +1023,10 @@ pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
 /// (2 channels) with zero register decoding; an Intel host decodes
 /// through [`decode`] (the profile dispatch applies inside). The
 /// facade's
-/// branch-level gates (vendor → Tier 1 → source) run before this call
-/// in the live topology; this function re-verifies so it can never
-/// decode off-vendor hardware even if misused directly.
+/// branch-level gates (vendor → profiled generation → source) run
+/// before this call in the live topology; this function re-verifies
+/// so it can never decode off-vendor hardware even if misused
+/// directly.
 pub fn read_regs(regs: &IntelImcRegs) -> IntelReadout {
     match intel_gen_gate(&CpuInfo::detect()) {
         Ok(gen) => decode(regs, gen, None),
@@ -2042,6 +2080,41 @@ mod tests {
         let ice = tier1_gate(IntelGen::IceLake).unwrap_err();
         assert!(ice.to_string().contains("IceLake"), "{ice}");
         assert!(!tier1_supported(IntelGen::Unrecognized));
+    }
+
+    /// [`gen_gate`] (the facade's branch-level gate, IG-16): every
+    /// profiled generation — Tier 1 plus Rocket Lake (Tier 2) —
+    /// passes; every unprofiled generation yields
+    /// `UnsupportedHardware` with a detail that names the generation
+    /// and its research-roadmap tier under the new numbering (Alder /
+    /// Raptor / Meteor / Arrow = Tier 3; Ice Lake / Tiger Lake /
+    /// `Unrecognized` = beyond Tier 2). Rocket Lake now reaches
+    /// [`decode`] (IG-12's profile dispatch) through the live facade.
+    #[test]
+    fn gen_gate_dispatches_by_generation() {
+        for gen in [
+            IntelGen::Skylake,
+            IntelGen::KabyLake,
+            IntelGen::CoffeeLake,
+            IntelGen::CometLake,
+            IntelGen::RocketLake,
+        ] {
+            assert_eq!(gen_gate(gen), Ok(()), "{gen:?}");
+        }
+        let ald = gen_gate(IntelGen::AlderLake).unwrap_err();
+        assert!(matches!(
+            ald,
+            TelemetryError::UnsupportedHardware { .. }
+        ));
+        let ald_msg = ald.to_string();
+        assert!(ald_msg.contains("AlderLake"), "{ald_msg}");
+        assert!(ald_msg.contains("Tier 3"), "{ald_msg}");
+        let met = gen_gate(IntelGen::MeteorLake).unwrap_err();
+        assert!(met.to_string().contains("Tier 3"), "{met}");
+        let ice = gen_gate(IntelGen::IceLake).unwrap_err();
+        assert!(ice.to_string().contains("beyond Tier 2"), "{ice}");
+        let un = gen_gate(IntelGen::Unrecognized).unwrap_err();
+        assert!(un.to_string().contains("beyond Tier 2"), "{un}");
     }
 
     // -----------------------------------------------------------------

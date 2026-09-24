@@ -65,8 +65,8 @@ use crate::spd_eeprom;
 ///   table version.
 /// - `intel`: the Intel IMC readout (the `ramsleuth_intel` sysfs
 ///   kobject primary, the `/dev/mem` MCHBAR fallback); `Na` when not
-///   on Intel silicon, not a v1 Tier-1 generation, or when both raw
-///   sources are unavailable.
+///   on Intel silicon, not a v1 profiled generation (Tier 1 + Rocket
+///   Lake), or when both raw sources are unavailable.
 /// - `spd`: the decoded SPD modules, one per bound `ee1004` device;
 ///   empty when the driver is absent or no device is bound.
 /// - `platform`: the vendor-neutral platform identity (C6-01, D-C1);
@@ -128,7 +128,8 @@ pub struct SystemMemoryTelemetry {
 /// 2. AMD branch (AMD silicon only): `amd_smu::acquire()` →
 ///    `amd_pm::parse()` → `amd_smn::apply_smn` (no-panic overlay) →
 ///    `amd_readout::map_amd()`.
-/// 3. Intel branch (Intel silicon only, v1 Tier-1 generations):
+/// 3. Intel branch (Intel silicon only, v1 profiled generations —
+///    Tier 1 + Rocket Lake):
 ///    `intel_sysfs::acquire()` → `intel_readout::decode` (primary);
 ///    on `DriverMissing` (kobject absent) only:
 ///    `intel_mchbar::acquire()` → `intel_readout::read_intel` (the
@@ -240,10 +241,11 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
 /// Gated on the already-detected vendor: non-Intel silicon returns
 /// `Err(UnsupportedHardware)` before any provider call (zero I/O in
 /// this branch — the provider's own vendor gate is a second line of
-/// defense, never the first). A non-Tier-1 Intel generation (v1 decodes
-/// Skylake / Kaby Lake / Coffee Lake / Comet Lake only) degrades the
-/// whole branch to `Err(UnsupportedHardware)` before either raw source
-/// is touched — never garbage data from a mismatched register map.
+/// defense, never the first). A non-profiled Intel generation (v1
+/// decodes Tier 1 — Skylake / Kaby Lake / Coffee Lake / Comet Lake —
+/// plus Rocket Lake) degrades the whole branch to
+/// `Err(UnsupportedHardware)` before either raw source is touched —
+/// never garbage data from a mismatched register map.
 ///
 /// The fallback rule is frozen: only a sysfs `DriverMissing` takes the
 /// `/dev/mem` path; any other sysfs outcome (`Parse` /
@@ -259,10 +261,11 @@ fn intel_branch(cpu: &CpuInfo) -> TelemetryResult<IntelReadout> {
     // 2. The detected generation (pure; the vendor gate passed, so this
     //    is `Ok` for Intel silicon — re-verified, zero I/O).
     let gen = intel_readout::intel_gen_gate(cpu)?;
-    // 3. The v1 Tier-1 generation gate: any other Intel generation
-    //    degrades the whole branch before any raw source is touched
-    //    (never garbage from a mismatched register map).
-    intel_readout::tier1_gate(gen)?;
+    // 3. The profile-based generation gate (IG-16): Tier 1 + Rocket
+    //    Lake (Tier 2) pass; any other Intel generation degrades the
+    //    whole branch before any raw source is touched (never garbage
+    //    from a mismatched register map).
+    intel_readout::gen_gate(gen)?;
 
     // 4. Primary: the `ramsleuth_intel` sysfs kobject (plan §3.5).
     match intel_sysfs::acquire() {
@@ -480,7 +483,7 @@ mod tests {
     /// Intel branch is `Na(UnsupportedHardware)` on non-Intel silicon
     /// (vendor gate) and — vendor/hardware-conditional, plan §3.5 — a
     /// `Value` or a hardware-access `Na` from the frozen set (the
-    /// virtualized BAR5=0 / non-Tier-1 `UnsupportedHardware`, the
+    /// virtualized BAR5=0 / non-profiled `UnsupportedHardware`, the
     /// absent-kobject `DriverMissing` the blocked `/dev/mem` fallback
     /// still cannot clear, an `InsufficientPrivilege` / `ParseError`
     /// access failure) on Intel silicon, and `spd` is a `Vec` (the count
@@ -520,7 +523,7 @@ mod tests {
         // Na(UnsupportedHardware) before any provider call. On Intel
         // silicon the branch is a `Value` (either raw source decoded) or
         // a hardware-access `Na` from the frozen set — the virtualized
-        // BAR5=0 / non-Tier-1 `UnsupportedHardware`, the absent-kobject
+        // BAR5=0 / non-profiled `UnsupportedHardware`, the absent-kobject
         // `DriverMissing` that the blocked `/dev/mem` fallback still
         // cannot clear, an `InsufficientPrivilege` / `ParseError` access
         // failure — shape-only, never a panic.
