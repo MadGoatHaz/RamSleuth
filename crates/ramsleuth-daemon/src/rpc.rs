@@ -29,6 +29,15 @@
 //!   [`Response::BenchCancelled { run_id }] when the run was active,
 //!   [`Response::Error`] when no such run is active (the owner still
 //!   receives the terminal `Cancelled`/`Result` exactly once);
+//! - [`Request::GetProbeReport`] → the chunk 1b daemon builder: take
+//!   the P3-14 TTL cache (offloaded to the blocking pool, same as
+//!   [`Request::GetTelemetry`]), then assemble the [`ProbeReport`] — the
+//!   decoded snapshot + the Intel raw dump (module-first, `/dev/mem`
+//!   fallback, plan §3.5) + the system identity — all inside the same
+//!   `spawn_blocking` (the raw acquisition may `mmap` / read sysfs) →
+//!   [`Response::ProbeReport`]. A failed raw acquisition degrades to
+//!   `raw: None` + `telemetry_source: "unavailable"` (no-panic, D5) —
+//!   the arm never errors the connection;
 //! - a client-sent [`Message::Response`] is a protocol violation →
 //!   close the connection.
 //!
@@ -50,6 +59,12 @@ use std::marker::Unpin;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message, Request, Response};
+use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
+use ramsleuth_telemetry::error::TelemetryError;
+use ramsleuth_telemetry::intel_gen::{self, GenMap};
+use ramsleuth_telemetry::intel_readout::IntelImcRegs;
+use ramsleuth_telemetry::intel_sysfs::SysfsRegs;
+use ramsleuth_telemetry::{ProbeRaw, ProbeReport, ProbeSystem, SystemMemoryTelemetry};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{BenchJobManager, JobEvent, TelemetryCache};
@@ -367,20 +382,27 @@ async fn dispatch(
         }
         Message::Request(Request::GetProbeReport) => {
             // The consent-gated "Submit Probe Report" (chunk probe-1a
-            // wire types). The daemon-side builder that assembles the
-            // `ProbeReport` payload (the live snapshot + the Intel raw
-            // dump + the system identity) lands in chunk 1b — until
-            // then this arm returns a structured, wire-safe
-            // "not wired yet" (the no-panic contract, D5: a plain
-            // `Response::Error`, never a panic, never a partial
-            // payload).
-            write_frame(
-                writer,
-                &Message::Response(Response::Error(
-                    "probe report not wired (chunk 1b)".to_owned(),
-                )),
-            )
+            // wire types; chunk 1b daemon builder). Take the shared P3-14
+            // TTL cache (the same offloaded `get` as the `GetTelemetry`
+            // arm — `get` is `&mut self` and may call the slow
+            // collector, so it runs on the blocking pool behind the
+            // mutex), then assemble the [`ProbeReport`]: the decoded
+            // snapshot + the Intel raw dump (module-first, `/dev/mem`
+            // fallback — plan §3.5) + the system identity. The raw
+            // acquisition may `mmap` / read sysfs, so it runs in the same
+            // `spawn_blocking`. A failed raw acquisition degrades to
+            // `raw: None` + `telemetry_source: "unavailable"` (no-panic
+            // contract, D5) — the arm never errors the connection and
+            // never sends a partial / malformed payload.
+            let cache = Arc::clone(&ctx.cache);
+            let report = tokio::task::spawn_blocking(move || {
+                let mut c = cache.lock().unwrap_or_else(PoisonError::into_inner);
+                let telemetry = c.get();
+                build_probe_report(&telemetry, acquire_raw(), SystemIdentity::detect())
+            })
             .await
+            .map_err(|e| RpcError::Join(e.to_string()))?;
+            write_frame(writer, &Message::Response(Response::ProbeReport(report))).await
         }
         // A client must never send a `Response` frame: protocol
         // violation, close the connection.
@@ -399,14 +421,320 @@ async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), message: &Message) 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// chunk-probe-1b: the `GetProbeReport` daemon-side builder.
+// ---------------------------------------------------------------------------
+
+/// The raw Intel register set, normalized across the two acquisition
+/// sources (the `ramsleuth_intel` sysfs kobject and the `/dev/mem` MCHBAR
+/// map) so a single flatten ([`probe_raw_from_source`]) builds the wire
+/// [`ProbeRaw`] from either (plan §3.5: module-first, devmem-fallback).
+#[derive(Debug, Clone)]
+struct ProbeRawSource {
+    /// The 51-slot raw register set.
+    regs: IntelImcRegs,
+    /// MCHBAR physical base (`None` when absent / malformed).
+    mchbar_base: Option<u64>,
+    /// MCHBAR enable bit (`false` when absent / malformed).
+    mchbar_enabled: bool,
+    /// The 7 global MAD channel/geometry raws — module-sysfs-only; the
+    /// `/dev/mem` path carries none of them (`None`).
+    mad_inter_channel: Option<u32>,
+    mad_intra_ch0: Option<u32>,
+    mad_intra_ch1: Option<u32>,
+    mad_dimm_ch0: Option<u32>,
+    mad_dimm_ch1: Option<u32>,
+    mad_dimm_ch2: Option<u32>,
+    mad_dimm_ch3: Option<u32>,
+}
+
+/// The raw-acquisition outcome: which source produced the register set
+/// (drives the `telemetry_source` field) — the sysfs kobject, the
+/// `/dev/mem` MCHBAR map, or neither.
+#[derive(Debug)]
+enum RawAcquisition {
+    /// The `ramsleuth_intel` sysfs kobject (the primary, world-readable
+    /// path).
+    Sysfs(ProbeRawSource),
+    /// The `/dev/mem` MCHBAR map (the root + `CAP_SYS_RAWIO` fallback).
+    DevMem(ProbeRawSource),
+    /// Neither raw source was available (AMD / unknown silicon, a
+    /// non-`DriverMissing` sysfs fault, or a failed devmem map).
+    Unavailable,
+}
+
+/// The OS / system identity facts that do not come from the telemetry
+/// snapshot (the host-I/O half of [`ProbeSystem`]): kept separate and
+/// injectable so [`build_probe_report`] is a pure, unit-testable
+/// function (no I/O).
+#[derive(Debug, Clone)]
+struct SystemIdentity {
+    /// The PCI host-bridge device id (e.g. "0x066C"); `None` when the
+    /// sysfs file is absent.
+    pci_host_bridge: Option<String>,
+    /// The kernel release (`/proc/sys/kernel/osrelease`).
+    kernel: String,
+    /// The OS name (`std::env::consts::OS`).
+    os: String,
+    /// The CPU architecture (`std::env::consts::ARCH`).
+    arch: String,
+    /// The RamSleuth version that produced the report.
+    ramsleuth_version: String,
+}
+
+impl SystemIdentity {
+    /// Read the host identity facts (the production path — the daemon
+    /// is root, so these sysfs / proc reads succeed on Linux).
+    fn detect() -> Self {
+        Self {
+            pci_host_bridge: read_pci_host_bridge_device(),
+            kernel: read_kernel_release(),
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            ramsleuth_version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+}
+
+/// Assemble a [`ProbeReport`] from a decoded telemetry snapshot, a raw
+/// acquisition, and the system identity.
+///
+/// **Pure (no I/O):** the raw acquisition ([`RawAcquisition`]) and the
+/// system identity ([`SystemIdentity`]) are precomputed and passed in
+/// — the production caller builds them via [`acquire_raw`] and
+/// [`SystemIdentity::detect`] inside the `spawn_blocking` closure. This
+/// keeps the builder unit-testable with mock inputs (the chunk 1b
+/// quality gate).
+fn build_probe_report(
+    telemetry: &SystemMemoryTelemetry,
+    raw: RawAcquisition,
+    identity: SystemIdentity,
+) -> ProbeReport {
+    let (raw, telemetry_source) = match raw {
+        RawAcquisition::Sysfs(source) => (Some(probe_raw_from_source(&source)), "sysfs-module"),
+        RawAcquisition::DevMem(source) => (Some(probe_raw_from_source(&source)), "dev-mem"),
+        RawAcquisition::Unavailable => (None, "unavailable"),
+    };
+    let system = ProbeSystem {
+        cpu_brand: telemetry.cpu.brand.clone(),
+        cpu_vendor: cpu_vendor_string(&telemetry.cpu.vendor),
+        cpu_gen: cpu_gen_string(&telemetry.cpu.vendor),
+        pci_host_bridge: identity.pci_host_bridge,
+        kernel: identity.kernel,
+        os: identity.os,
+        arch: identity.arch,
+        ramsleuth_version: identity.ramsleuth_version,
+        telemetry_source: telemetry_source.to_owned(),
+    };
+    ProbeReport {
+        telemetry: telemetry.clone(),
+        raw,
+        system,
+    }
+}
+
+/// Flatten one [`ProbeRawSource`] into the wire [`ProbeRaw`].
+///
+/// The field mapping is one-to-one and **order-stable**: the [`ProbeRaw`]
+/// declaration order (the chunk 1a wire contract) is reproduced exactly,
+/// so the flattened set crosses the wire verbatim. Every `Option<u32>`
+/// register carries the source's per-register containment (`None` on a
+/// failed / absent read); the MCHBAR diagnostics ride as-is.
+fn probe_raw_from_source(source: &ProbeRawSource) -> ProbeRaw {
+    let r = &source.regs;
+    ProbeRaw {
+        mcbios_req: r.mcbios_req,
+        tc_ch0_dbp: r.ch0.tc_dbp,
+        tc_ch0_rap: r.ch0.tc_rap,
+        tc_ch0_rfp: r.ch0.tc_rfp,
+        tc_ch0_rap2: r.ch0.tc_rap2,
+        tc_ch0_rdrd: r.ch0.tc_rdrd,
+        tc_ch0_rdwr: r.ch0.tc_rdwr,
+        tc_ch0_wrrd: r.ch0.tc_wrrd,
+        tc_ch0_wrwr: r.ch0.tc_wrwr,
+        tc_ch1_dbp: r.ch1.tc_dbp,
+        tc_ch1_rap: r.ch1.tc_rap,
+        tc_ch1_rfp: r.ch1.tc_rfp,
+        tc_ch1_rap2: r.ch1.tc_rap2,
+        tc_ch1_rdrd: r.ch1.tc_rdrd,
+        tc_ch1_rdwr: r.ch1.tc_rdwr,
+        tc_ch1_wrrd: r.ch1.tc_wrrd,
+        tc_ch1_wrwr: r.ch1.tc_wrwr,
+        tc_ch2_dbp: r.ch2.tc_dbp,
+        tc_ch2_rap: r.ch2.tc_rap,
+        tc_ch2_rfp: r.ch2.tc_rfp,
+        tc_ch2_rap2: r.ch2.tc_rap2,
+        tc_ch2_rdrd: r.ch2.tc_rdrd,
+        tc_ch2_rdwr: r.ch2.tc_rdwr,
+        tc_ch2_wrrd: r.ch2.tc_wrrd,
+        tc_ch2_wrwr: r.ch2.tc_wrwr,
+        tc_ch3_dbp: r.ch3.tc_dbp,
+        tc_ch3_rap: r.ch3.tc_rap,
+        tc_ch3_rfp: r.ch3.tc_rfp,
+        tc_ch3_rap2: r.ch3.tc_rap2,
+        tc_ch3_rdrd: r.ch3.tc_rdrd,
+        tc_ch3_rdwr: r.ch3.tc_rdwr,
+        tc_ch3_wrrd: r.ch3.tc_wrrd,
+        tc_ch3_wrwr: r.ch3.tc_wrwr,
+        mcl0_pre: r.mcl0.tc_pre,
+        mcl0_act: r.mcl0.tc_act,
+        mcl0_act2: r.mcl0.tc_act2,
+        mcl0_wtr: r.mcl0.tc_wtr,
+        mcl0_rfp: r.mcl0.tc_rfp,
+        mcl0_rfp2: r.mcl0.tc_rfp2,
+        mcl0_rdrd: r.mcl0.tc_rdrd,
+        mcl0_wrwr: r.mcl0.tc_wrwr,
+        mcl1_pre: r.mcl1.tc_pre,
+        mcl1_act: r.mcl1.tc_act,
+        mcl1_act2: r.mcl1.tc_act2,
+        mcl1_wtr: r.mcl1.tc_wtr,
+        mcl1_rfp: r.mcl1.tc_rfp,
+        mcl1_rfp2: r.mcl1.tc_rfp2,
+        mcl1_rdrd: r.mcl1.tc_rdrd,
+        mcl1_wrwr: r.mcl1.tc_wrwr,
+        mad_inter_channel: source.mad_inter_channel,
+        mad_intra_ch0: source.mad_intra_ch0,
+        mad_intra_ch1: source.mad_intra_ch1,
+        mad_dimm_ch0: source.mad_dimm_ch0,
+        mad_dimm_ch1: source.mad_dimm_ch1,
+        mad_dimm_ch2: source.mad_dimm_ch2,
+        mad_dimm_ch3: source.mad_dimm_ch3,
+        mchbar_base: source.mchbar_base,
+        mchbar_enabled: source.mchbar_enabled,
+    }
+}
+
+/// Normalize the `ramsleuth_intel` sysfs kobject raw set into a
+/// [`ProbeRawSource`] (the MCHBAR diagnostics + the 7 global MAD raws
+/// ride the module's sysfs surface).
+fn raw_source_from_sysfs(sysfs: &SysfsRegs) -> ProbeRawSource {
+    ProbeRawSource {
+        regs: sysfs.regs.clone(),
+        mchbar_base: sysfs.mchbar.base,
+        mchbar_enabled: sysfs.mchbar.enabled.unwrap_or(false),
+        mad_inter_channel: sysfs.mad_inter_channel,
+        mad_intra_ch0: sysfs.mad_intra_ch0,
+        mad_intra_ch1: sysfs.mad_intra_ch1,
+        mad_dimm_ch0: sysfs.mad_dimm_ch0,
+        mad_dimm_ch1: sysfs.mad_dimm_ch1,
+        mad_dimm_ch2: sysfs.mad_dimm_ch2,
+        mad_dimm_ch3: sysfs.mad_dimm_ch3,
+    }
+}
+
+/// The CPU vendor as the wire string ("Intel" / "AMD" / "Unknown").
+fn cpu_vendor_string(vendor: &CpuVendor) -> String {
+    match vendor {
+        CpuVendor::Intel(_) => "Intel".to_owned(),
+        CpuVendor::Amd(_) => "AMD".to_owned(),
+        CpuVendor::Unknown => "Unknown".to_owned(),
+    }
+}
+
+/// The CPU generation as its variant name (e.g. "RocketLake", "Zen5";
+/// "Unknown" for an unrecognized vendor).
+fn cpu_gen_string(vendor: &CpuVendor) -> String {
+    match vendor {
+        CpuVendor::Intel(gen) => format!("{gen:?}"),
+        CpuVendor::Amd(zen) => format!("{zen:?}"),
+        CpuVendor::Unknown => "Unknown".to_owned(),
+    }
+}
+
+/// The PCI host-bridge device id from sysfs
+/// (`/sys/bus/pci/devices/0000:00:00.0/device`, e.g. "0x066C"); `None`
+/// when the file is absent or empty (the daemon is root, so a present
+/// file is readable).
+fn read_pci_host_bridge_device() -> Option<String> {
+    std::fs::read_to_string("/sys/bus/pci/devices/0000:00:00.0/device")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// The kernel release string from `/proc/sys/kernel/osrelease` (empty
+/// when the file is absent — the daemon runs on Linux, so it is normally
+/// present).
+fn read_kernel_release() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// Acquire the raw Intel register set from the two production sources
+/// (module-first, devmem-fallback — the plan §3.5 / facade contract).
+///
+/// Returns [`RawAcquisition`]: the sysfs kobject when loaded (the
+/// primary, world-readable path), the `/dev/mem` MCHBAR map when the
+/// sysfs outcome is exactly `DriverMissing` (kobject absent — the root +
+/// `CAP_SYS_RAWIO` fallback), and [`RawAcquisition::Unavailable`] when
+/// neither yields a set (AMD / unknown silicon — the vendor gate fires
+/// before any I/O; a non-`DriverMissing` sysfs fault; a failed devmem
+/// map). Never panics (the no-panic contract, D5).
+fn acquire_raw() -> RawAcquisition {
+    // The frozen facade vendor gate: non-Intel silicon has no raw source
+    // (zero I/O).
+    let info = CpuInfo::detect();
+    if !matches!(info.vendor, CpuVendor::Intel(_)) {
+        return RawAcquisition::Unavailable;
+    }
+    match ramsleuth_telemetry::intel_sysfs::acquire() {
+        Ok(sysfs) => RawAcquisition::Sysfs(raw_source_from_sysfs(&sysfs)),
+        // The frozen fallthrough: ONLY a `DriverMissing` (kobject absent
+        // — module not loaded) takes the `/dev/mem` path. Any other
+        // sysfs outcome means the module is present (hardware reachable)
+        // — do not silently switch sources (facade §3.5).
+        Err(TelemetryError::DriverMissing { .. }) => acquire_devmem(&info),
+        Err(_) => RawAcquisition::Unavailable,
+    }
+}
+
+/// The `/dev/mem` MCHBAR fallback: map the window read-only and read the
+/// register set (the `read_intel` routing contract: the Tier-3 Alder
+/// family takes the 256 KiB wide set; Tier 1 / Rocket Lake keep the
+/// 64 KiB set).
+fn acquire_devmem(info: &CpuInfo) -> RawAcquisition {
+    let bar = match ramsleuth_telemetry::intel_mchbar::acquire() {
+        Ok(bar) => bar,
+        Err(_) => return RawAcquisition::Unavailable,
+    };
+    let gen = match ramsleuth_telemetry::intel_readout::intel_gen_gate(info) {
+        Ok(gen) => gen,
+        Err(_) => return RawAcquisition::Unavailable,
+    };
+    let regs = match intel_gen::profile_for(gen).map(|p| p.map) {
+        Some(GenMap::Alder) => IntelImcRegs::from_bar_wide(&bar),
+        _ => IntelImcRegs::from_bar(&bar),
+    };
+    RawAcquisition::DevMem(ProbeRawSource {
+        regs,
+        // A successfully mapped, decoded MCHBAR is enabled by definition
+        // (a disabled / zero base fails `acquire` with
+        // `UnsupportedHardware` before this point).
+        mchbar_base: Some(bar.base()),
+        mchbar_enabled: true,
+        // The 7 MAD raws are module-sysfs-only — the `/dev/mem` path
+        // carries none of them.
+        mad_inter_channel: None,
+        mad_intra_ch0: None,
+        mad_intra_ch1: None,
+        mad_dimm_ch0: None,
+        mad_dimm_ch1: None,
+        mad_dimm_ch2: None,
+        mad_dimm_ch3: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use ramsleuth_bench::{BenchOp, Metric, StreamTarget, Tier};
     use ramsleuth_protocol::BenchMode;
-    use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
+    use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
+    use ramsleuth_telemetry::intel_readout::ChannelRegs;
+    use ramsleuth_telemetry::intel_sysfs::{MchBarInfo, SysfsRegs};
     use ramsleuth_telemetry::SystemMemoryTelemetry;
     use ramsleuth_telemetry::SystemPlatform;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -887,5 +1215,185 @@ mod tests {
             protocol.to_string().contains("protocol violation"),
             "the Protocol display must name the class: {protocol}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // (i) chunk-probe-1b: the daemon-side `ProbeReport` builder.
+    // ------------------------------------------------------------------
+
+    /// A mock `ramsleuth_intel` sysfs raw set (host-independent): the
+    /// Skylake acceptance `ch0` block + the MCHBAR diagnostics + the 5
+    /// global MAD raws; every other register / the Tier-3 extension
+    /// fields stay `None` (the all-`Default` containment shape).
+    fn mock_sysfs_regs() -> SysfsRegs {
+        let regs = IntelImcRegs {
+            mcbios_req: Some(0x0000_0012),
+            ch0: ChannelRegs {
+                tc_dbp: Some(0x1111_0F11),
+                tc_rap: Some(0x2718_0204),
+                tc_rfp: Some(0x0000_01A4),
+                tc_rap2: Some(0x0000_0C0A),
+                tc_rdrd: Some(0x0048_C286),
+                tc_rdwr: Some(0x0000_0280),
+                tc_wrrd: Some(0x0000_0308),
+                tc_wrwr: Some(0x0040_C204),
+            },
+            ..IntelImcRegs::default()
+        };
+        SysfsRegs {
+            regs,
+            mchbar: MchBarInfo {
+                base: Some(0xFED1_0000),
+                enabled: Some(true),
+            },
+            mad_inter_channel: Some(0x0000_0003),
+            mad_intra_ch0: Some(0x0000_0005),
+            mad_intra_ch1: Some(0x0000_0007),
+            mad_dimm_ch0: Some(0x0000_0008),
+            mad_dimm_ch1: Some(0x0000_000C),
+            mad_dimm_ch2: None,
+            mad_dimm_ch3: None,
+        }
+    }
+
+    /// A mock Intel [`SystemMemoryTelemetry`] (Rocket Lake) carrying the
+    /// vendor identity fields the builder reads; the vendor branches /
+    /// capacities are host-independent `Na` / `Value` placeholders.
+    fn mock_intel_telemetry() -> SystemMemoryTelemetry {
+        SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Intel(IntelGen::RocketLake),
+                brand: "Intel(R) Core(TM) i7-11700K CPU @ 3.60GHz".to_owned(),
+            },
+            amd: Section::na(NaReason::UnsupportedHardware),
+            intel: Section::na(NaReason::DriverMissing),
+            spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3600.0),
+                motherboard: Section::Value("Test Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(16.0),
+            dimm_sizes: vec![Section::Value(16.0)],
+        }
+    }
+
+    /// A mock [`SystemIdentity`] (host-independent, fixed values — the
+    /// injectable half that keeps the builder pure).
+    fn mock_identity() -> SystemIdentity {
+        SystemIdentity {
+            pci_host_bridge: Some("0x066C".to_owned()),
+            kernel: "6.6.0-1-cachyos".to_owned(),
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            ramsleuth_version: "2.4.0".to_owned(),
+        }
+    }
+
+    /// (i1) The builder assembles the [`ProbeReport`] from a mock
+    /// snapshot + mock sysfs raws + mock identity: the `raw` is the
+    /// flattened [`ProbeRaw`] (the populated `ch0` block + `MC_BIOS_REQ`
+    /// land in their flat slots, the MAD raws + MCHBAR diagnostics ride,
+    /// and the absent / Tier-3 fields stay `None`), and the `system` is
+    /// the probe identity (the Intel vendor / "RocketLake" generation
+    /// strings, the injected host facts, and `telemetry_source` =
+    /// "sysfs-module").
+    #[test]
+    fn build_probe_report_from_sysfs_raws() {
+        let telemetry = mock_intel_telemetry();
+        let sysfs = mock_sysfs_regs();
+        let report = build_probe_report(
+            &telemetry,
+            RawAcquisition::Sysfs(raw_source_from_sysfs(&sysfs)),
+            mock_identity(),
+        );
+
+        // The telemetry snapshot is carried verbatim.
+        assert_eq!(report.telemetry, telemetry);
+
+        // The raw is present (the sysfs path) with the flattened fields.
+        let raw = report.raw.expect("the sysfs path must populate the raw");
+        assert_eq!(raw.mcbios_req, Some(0x0000_0012));
+        assert_eq!(raw.tc_ch0_dbp, Some(0x1111_0F11));
+        assert_eq!(raw.tc_ch0_rap, Some(0x2718_0204));
+        assert_eq!(raw.tc_ch0_rfp, Some(0x0000_01A4));
+        assert_eq!(raw.tc_ch0_rap2, Some(0x0000_0C0A));
+        assert_eq!(raw.tc_ch0_rdrd, Some(0x0048_C286));
+        assert_eq!(raw.tc_ch0_rdwr, Some(0x0000_0280));
+        assert_eq!(raw.tc_ch0_wrrd, Some(0x0000_0308));
+        assert_eq!(raw.tc_ch0_wrwr, Some(0x0040_C204));
+        // The unpopulated `ch1` block stays all-`None`.
+        assert_eq!(raw.tc_ch1_dbp, None);
+        assert_eq!(raw.tc_ch1_rap, None);
+        // The Tier-3 extension fields stay `None`.
+        assert_eq!(raw.tc_ch2_dbp, None);
+        assert_eq!(raw.tc_ch3_dbp, None);
+        assert_eq!(raw.mcl0_pre, None);
+        assert_eq!(raw.mcl1_pre, None);
+        // The global MAD raws ride.
+        assert_eq!(raw.mad_inter_channel, Some(0x0000_0003));
+        assert_eq!(raw.mad_intra_ch0, Some(0x0000_0005));
+        assert_eq!(raw.mad_intra_ch1, Some(0x0000_0007));
+        assert_eq!(raw.mad_dimm_ch0, Some(0x0000_0008));
+        assert_eq!(raw.mad_dimm_ch1, Some(0x0000_000C));
+        assert_eq!(raw.mad_dimm_ch2, None);
+        assert_eq!(raw.mad_dimm_ch3, None);
+        // The MCHBAR diagnostics ride.
+        assert_eq!(raw.mchbar_base, Some(0xFED1_0000));
+        assert!(raw.mchbar_enabled);
+
+        // The system identity.
+        assert_eq!(
+            report.system.cpu_brand,
+            "Intel(R) Core(TM) i7-11700K CPU @ 3.60GHz"
+        );
+        assert_eq!(report.system.cpu_vendor, "Intel");
+        assert_eq!(report.system.cpu_gen, "RocketLake");
+        assert_eq!(report.system.pci_host_bridge, Some("0x066C".to_owned()));
+        assert_eq!(report.system.kernel, "6.6.0-1-cachyos");
+        assert_eq!(report.system.os, "linux");
+        assert_eq!(report.system.arch, "x86_64");
+        assert_eq!(report.system.ramsleuth_version, "2.4.0");
+        assert_eq!(report.system.telemetry_source, "sysfs-module");
+    }
+
+    /// (i2) The unavailable arm: neither raw source (AMD / unknown
+    /// silicon, or both paths failing) yields `raw: None` +
+    /// `telemetry_source` = "unavailable"; the snapshot + identity still
+    /// assemble.
+    #[test]
+    fn build_probe_report_unavailable_raw() {
+        let telemetry = mock_intel_telemetry();
+        let report = build_probe_report(&telemetry, RawAcquisition::Unavailable, mock_identity());
+        assert_eq!(report.telemetry, telemetry);
+        assert_eq!(report.raw, None);
+        assert_eq!(report.system.telemetry_source, "unavailable");
+        assert_eq!(report.system.cpu_vendor, "Intel");
+        assert_eq!(report.system.cpu_gen, "RocketLake");
+    }
+
+    /// (i3) The built report (raw `Some`) is wire-safe: the
+    /// `Response::ProbeReport` frame round-trips through the P3-11
+    /// frame codec (length-prefixed bincode) and decodes back to an
+    /// identical report (the chunk 1a wire contract, exercised
+    /// end-to-end from the daemon builder).
+    #[test]
+    fn build_probe_report_round_trips_through_the_frame_codec() {
+        let telemetry = mock_intel_telemetry();
+        let sysfs = mock_sysfs_regs();
+        let report = build_probe_report(
+            &telemetry,
+            RawAcquisition::Sysfs(raw_source_from_sysfs(&sysfs)),
+            mock_identity(),
+        );
+        let frame = encode_frame(&Message::Response(Response::ProbeReport(report.clone())))
+            .expect("the built report frame must encode");
+        let decoded = decode_frame(&frame).expect("the built report frame must decode");
+        let Message::Response(Response::ProbeReport(back)) = decoded.message else {
+            panic!("the decoded frame must be the ProbeReport response: {decoded:?}")
+        };
+        assert_eq!(back, report);
     }
 }
