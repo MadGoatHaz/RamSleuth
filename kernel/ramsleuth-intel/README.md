@@ -1,6 +1,7 @@
 # ramsleuth_intel
 
-Out-of-tree kernel module for RamSleuth's live Intel memory controller
+An original, in-repo RamSleuth creation (no upstream project): an
+out-of-tree kernel module for RamSleuth's live Intel memory controller
 (IMC) telemetry. It probes the host bridge (PCI `0000:00:00.0`), decodes
 **MCHBAR** from PCI config space, maps the 64 KiB window, and publishes
 the raw IMC registers as world-readable (`0444`) sysfs attributes under

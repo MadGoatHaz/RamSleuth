@@ -72,10 +72,12 @@ The architecture is shaped by four standing goals:
 3. **Transparency & provenance.** Every privileged operation is auditable:
    the install flow prints the exact commit, artifacts, and destinations before
    touching the system; the only third-party code (the `ryzen_smu` kernel
-   module) is byte-pinned and checksummed; every released file is byte-identical
-   to a file in the repository; and telemetry fields carry their reasons, not
-   silent zeros. A `0` is never drawn as data when it means "no source" —
-   absence renders as `N/A`, because a flat zero line is a lie.
+   module) is byte-pinned and checksummed; the `ramsleuth_intel` module, by
+   contrast, is the project's own original in-repo code (no upstream); every
+   released file is byte-identical to a file in the repository; and telemetry
+   fields carry their reasons, not silent zeros. A `0` is never drawn as data
+   when it means "no source" — absence renders as `N/A`, because a flat zero
+   line is a lie.
 4. **MSRV 1.75.** The workspace builds, tests, and lints clean on Rust 1.75.
    Every external dependency is chosen (and the dependency tree is pinned) so
    that the `1.75 × stable` CI matrix stays green. This is what keeps the
@@ -1156,7 +1158,8 @@ behavior: no PCI config is read, no kobject is probed, and `/dev/mem` is
 never opened.** On Intel, the raw IMC registers come from two sources that
 feed **one** pure decode core:
 
-1. **primary — the `ramsleuth_intel` kernel module** (GPL-2.0, the in-repo
+1. **primary — the `ramsleuth_intel` kernel module** (GPL-2.0, the project's
+   own original work — no upstream project, no pin — in the in-repo
    `kernel/ramsleuth-intel/` tree; provisioned by the `ramsleuth-intel-dkms`
    extra, §12.5). It probes the host bridge at PCI `0000:00:00.0`, decodes
    the MCHBAR from config space, `ioremap`s the 64 KiB window, and publishes
