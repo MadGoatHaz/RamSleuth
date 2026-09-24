@@ -1,7 +1,7 @@
 # RamSleuth — Architecture
 
 **Document:** `Docs/Architecture.md` (part of the RamSleuth v2 repository-facing documentation)
-**Applies to:** workspace v2.2.1 (branch `v2-development`)
+**Applies to:** workspace v2.4.0 (branch `v2-development`)
 **Audience:** expert readers — kernel-aware systems programmers, packagers, and maintainers who need the full design rationale behind RamSleuth.
 
 Companion documents: [`README.md`](../README.md) (entry point), [`Docs/User_Guide.md`](User_Guide.md) (operational guide), [`packaging/README.md`](../packaging/README.md) (packaging and operator guide).
@@ -114,7 +114,7 @@ no direct MMIO from userspace* — the daemon reads:
 
 **Intel.** Two raw sources feed one decode (§10.3). The **primary** is the
 `ramsleuth_intel` kernel module, which maps the host-bridge **MCHBAR** window
-in kernel space and publishes the raw IMC registers as 19 world-readable sysfs
+in kernel space and publishes the raw IMC registers as 24 world-readable sysfs
 attributes under `/sys/kernel/ramsleuth_intel/` — no C-side decoding; all
 bit-field semantics live in Rust. The **fallback** is a read-only `mmap` of
 the same window via `/dev/mem` (the operation that forces `CAP_SYS_RAWIO`),
@@ -252,7 +252,7 @@ development tool — all inheriting a single version:
 
 | Workspace fact | Value |
 |----------------|-------|
-| Version | **2.2.1** (`[workspace.package].version`) |
+| Version | **2.4.0** (`[workspace.package].version`) |
 | Edition | 2021 |
 | MSRV | **1.75** (`rust-version`) |
 | Resolver | 2 |
@@ -310,7 +310,7 @@ section is N/A, exit 2 on a bad flag).
 | `amd_readout.rs` | The four vendor-neutral display types (`ClockReadout`, `TimingSet`, `CadBus`, `VoltageSet`) and the AMD mapping onto them, with sanity gating. |
 | `intel_mchbar.rs` | MCHBAR location in PCI config space + the read-only `/dev/mem` RAII window — the fallback source (the one `unsafe` cluster in the crate). |
 | `intel_readout.rs` | The hardware-verified Tier-1 IMC register map (MCHBAR-relative) + the single pure decode core fed by both raw sources, into the same display types. |
-| `intel_sysfs.rs` | The primary raw reader: the `ramsleuth_intel` kobject's 19 attributes under `/sys/kernel/ramsleuth_intel/` → the raw `IntelImcRegs` set (per-attribute containment: absent / malformed → `None`). |
+| `intel_sysfs.rs` | The primary raw reader: the `ramsleuth_intel` kobject's 24 attributes (the 19 IMC-register attributes — 2 MCHBAR diagnostics, `MC_BIOS_REQ`, 16 per-channel `TC_*` — plus the 5 MAD channel/geometry) under `/sys/kernel/ramsleuth_intel/` → the raw `IntelImcRegs` set + the MAD words (per-attribute containment: absent / malformed → `None`). |
 | `spd_eeprom.rs` | Unprivileged enumeration + raw-image acquisition of every bound `ee1004` device. |
 | `spd_decode.rs` | Pure decode of the raw image: JEP106 makers, rank/density/speed, part/serial, XMP 2.0 / XMP 3.0-EXPO profiles. |
 | `platform.rs` | The vendor-neutral identity branch: DMI, `/proc/cpuinfo`, `/proc/meminfo`, the `ryzen_smu` version attribute. |
@@ -362,6 +362,7 @@ in the workspace. Both a library and the `ramsleuth-daemon` binary.
 | `socket.rs` | Synchronous listener setup: parent-dir creation, stale-socket probe, `0660` mode, best-effort group chown, per-user ACL re-application, `tokio::from_std` hand-off. |
 | `caps.rs` | The soft privilege probe: root + `CAP_SYS_RAWIO` (bit 21 of `CapEff`) with human-readable degradation warnings. |
 | `cache.rs` | The TTL telemetry cache over an injectable collector (default 2 s), with the cold-cache warm-up double read. |
+| `spd_bind.rs` | The guarded SPD EEPROM auto-bind fallback: as root (the daemon is the only process that may write here), binds the `ee1004` client(s) the kernel missed via the i2c `new_device` sysfs write when bound-SPDs < channel count — Intel-only, non-fatal, never unbinds, process-lifetime attempt set; disabled by `--no-spd-autobind` (default on). |
 | `dram_spike.rs` | The bounded ~250 ms / 256 MiB DRAM load that pulls the memory controller out of idle before each SMU re-read. |
 | `bench_job.rs` | The single-flight job manager: monotonic `run_id`s, the `(target, mode)` folding, progress/burn-in event streams, clean cancel, self-releasing slot. |
 | `rpc.rs` | The per-connection async RPC loop: incremental frame decode, request dispatch, owner-connection streaming, `spawn_blocking` offload of the blocking event pumps. |
@@ -447,6 +448,9 @@ Usage: ramsleuth-daemon [OPTIONS]
   --socket <path>    Unix socket to listen on (default: /run/ramsleuth/ramsleuth.sock)
   --max-age <secs>   Telemetry cache TTL in seconds, a non-negative
                      integer (default: 2)
+  --no-spd-autobind  Disable the guarded SPD EEPROM auto-bind
+                     fallback (default: enabled; Intel-only,
+                     root-only, non-fatal)
   -h, --help         Print this help and exit
 ```
 
@@ -770,7 +774,10 @@ protocol violation and closes the connection.
 **Payloads are reused, never duplicated**: `Request` / `Response` embed the
 telemetry crate's `SystemMemoryTelemetry` and the bench crate's
 `StreamTarget` / `StreamProgress` / `BenchmarkGrid` / `BurnInTick` verbatim —
-the single source of truth for each is its owning crate. Every arm is
+the single source of truth for each is its owning crate. The snapshot's
+`intel` slot is a `Section<IntelReadout>`, which carries the hardware-derived
+`channel_mode: Option<ChannelMode>` wire field (decoded from
+`MAD_INTER_CHANNEL[1:0]`, §10.3) alongside the raw register set. Every arm is
 bincode-serializable; failures cross the wire as structured payloads, never as
 panics.
 
@@ -1153,16 +1160,19 @@ feed **one** pure decode core:
    `kernel/ramsleuth-intel/` tree; provisioned by the `ramsleuth-intel-dkms`
    extra, §12.5). It probes the host bridge at PCI `0000:00:00.0`, decodes
    the MCHBAR from config space, `ioremap`s the 64 KiB window, and publishes
-   the raw IMC registers as **19 world-readable (`0444`) sysfs attributes**
-   under `/sys/kernel/ramsleuth_intel/` — each register attribute the raw
-   word, one line, `0x%08x` (the MCHBAR diagnostics as `%016llx` and a
-   constant `1`). **No C-side decoding**: the module exposes raw values and
+   the raw IMC registers as **24 world-readable (`0444`) sysfs attributes**
+   under `/sys/kernel/ramsleuth_intel/` — the 19 IMC-register attributes
+   (the 2 MCHBAR diagnostics, `MC_BIOS_REQ`, and the 16 per-channel `TC_*`)
+   plus the 5 MAD channel/geometry registers (`0x5000`–`0x5010`) — each
+   register attribute the raw word, one line, `0x%08x` (the MCHBAR
+   diagnostics as `%016llx` and a constant `1`). **No C-side decoding**:
+   the module exposes raw values and
    Rust owns the bit-field semantics, so one module spans the supported
    client generations. The kobject exists **only on a fully successful
    probe** (Intel vendor, MCHBAR_EN set, non-zero masked base, `ioremap`
    OK); any probe failure leaves no kobject behind, and on a non-Intel host
    the load fails `-ENODEV` by design — the module is Intel-only. The Rust
-   reader (`intel_sysfs`) takes the 19 attributes with per-attribute
+   reader (`intel_sysfs`) takes the 24 attributes with per-attribute
    containment: an **absent** attribute and a **malformed** payload both
    degrade to `None` for that register only; only a permission / other-I/O
    failure on a present attribute is reported as a structured
@@ -1187,7 +1197,7 @@ feed **one** pure decode core:
      `N/A (unsupported hardware)`); a disabled MCHBAR that carries
      address bits, or a short config image → `Parse`;
    - open **`/dev/mem`** (fallback `/dev/fmem`) and `mmap(PROT_READ, MAP_PRIVATE)`
-     the **1 MiB** MCHBAR window at that base, owned by an RAII guard whose
+     the **64 KiB** (`0x10000`) MCHBAR window at that base, owned by an RAII guard whose
      `Drop` calls `munmap` exactly once. This is the
      **`CAP_SYS_RAWIO` requirement**: EACCES/EPERM, or a `STRICT_DEVMEM`
      range rejection surfaced as EIO/ENODATA, → `InsufficientPrivilege`.
@@ -1211,8 +1221,9 @@ reads).
 
 **The hardware-authoritative Tier-1 register map (MCHBAR-relative).** Tier 1
 = Skylake / Kaby Lake / Coffee Lake / Comet Lake: one memory controller, two
-channels, DDR4. One global register plus two per-channel blocks (channel 0
-at `0x4000`, channel 1 at `0x4400`, stride `0x400`):
+channels, DDR4. One global register, two per-channel blocks (channel 0
+at `0x4000`, channel 1 at `0x4400`, stride `0x400`), and the MAD
+channel/geometry block at `0x5000`:
 
 | Offset | Register | Fields decoded (bits) |
 |--------|----------|-----------------------|
@@ -1222,6 +1233,11 @@ at `0x4000`, channel 1 at `0x4400`, stride `0x400`):
 | `+0x08` | `TC_RFP` | `[10:0]` tRFC (11-bit, 1–2047) · `[27:16]` tREFI (12-bit) |
 | `+0x0C` | `TC_RAP2` | `[5:0]` tRRD_L · `[13:8]` tWR (6-bit each) |
 | `+0x20` / `+0x24` / `+0x28` / `+0x2C` | `TC_RDRD` / `TC_RDWR` / `TC_WRRD` / `TC_WRWR` | 4×6-bit `sg / dg / dr / dd` turnaround each |
+| `0x5000` | `MAD_INTER_CHANNEL` | `[1:0]` channel mode — drives the user-visible channel-mode label (00b symmetric / 01b flex / 10b single / 11b reserved) |
+| `0x5004` | `MAD_INTRA_CH0` | channel-0 intra-channel rank/geometry (raw word) |
+| `0x5008` | `MAD_INTRA_CH1` | channel-1 intra-channel rank/geometry (raw word) |
+| `0x500C` | `MAD_DIMM_CH0` | channel-0 DIMM presence/capacity (raw word) |
+| `0x5010` | `MAD_DIMM_CH1` | channel-1 DIMM presence/capacity (raw word) |
 
 The timing unit is **integer DRAM clock cycles** (1 cycle = 2 UI). This
 replaces the pre-v2.2.1 skeleton table, which mis-located the frequency
@@ -1234,7 +1250,9 @@ ratio 12 @ 100 MHz; `tc_dbp = 0x11110F11` →
 symmetric).
 
 **The decode (one pure core for both sources).** The 17 raw slots
-(`IntelImcRegs` — 1 global + 2×8 per-channel) feed `intel_readout::decode`:
+(`IntelImcRegs` — 1 global + 2×8 per-channel), plus the raw
+`mad_inter_channel` word as the decode's third argument (the other four MAD
+registers stay raw in the sysfs attributes), feed `intel_readout::decode`:
 
 - `mclk_mhz` ← `MC_BIOS_REQ`: `ratio × refclk` (no ÷2; MT/s = 2 × MCLK),
   sanity-gated to [1, 4096] MHz; a ratio of 0 = unconfigured →
@@ -1259,14 +1277,29 @@ symmetric).
   the slots sourced from it to `Na(ParseError)` — never a silent zero,
   never a panic.
 
+**Platform/firmware N/A conditions (not bugs).** Three Intel readout
+fields can legitimately read `N/A` on otherwise healthy hardware:
+**`tRAS` / `tWTRS` / `tWTRL`** — firmware leaves those TC fields
+unprogrammed on some SKUs, so they fail the [1, 2048] sanity gate; the
+**2nd DIMM's SPD** — unavailable where the board's DSDT advertises a
+single slot (the §10.4 daemon-side auto-bind attempts to recover it);
+and **UCLK:MCLK** — `Na` where the uncore ratio is not populated. Each
+is a structured `N/A (<reason>)`, never a silent zero, and none
+indicates a RamSleuth defect.
+
 **The Tier-1 generation gate.** The decode runs only for
 `{Skylake, KabyLake, CoffeeLake, CometLake}`. Any other detected Intel
 generation (Alder / Raptor = Tier 2, dual-MC DDR4/DDR5; Meteor / Arrow =
 Tier 3, DDR5;
 unrecognized) degrades the **whole** readout to `Na(UnsupportedHardware)` —
-never garbage data from a mismatched register map. The channel count is a
-function of the detected generation: 2 for DDR4-class, 4 for DDR5-class
-client silicon.
+never garbage data from a mismatched register map. The channel **count**
+used for SPD enumeration is a function of the detected generation: 2 for
+DDR4-class, 4 for DDR5-class client silicon. The channel-**mode label**
+shown to the user is hardware-derived, not derived from the count: `decode`
+maps `MAD_INTER_CHANNEL[1:0]` onto `IntelReadout.channel_mode` — `00b` =
+Dual-Channel Symmetric (fully interleaved), `01b` = Dual-Channel Flex
+(asymmetric), `10b` = Single-Channel, `11b` = reserved (no label) — and when
+the module is absent the label falls back to the installed-DIMM count.
 
 ### 10.4 The SPD path — fully unprivileged
 
@@ -1288,6 +1321,19 @@ blocks at `0xD0` / `0xF0`) and the **XMP 3.0 / EXPO** region (DDR5, 256 B at
 `0x300..0x400` — four 32-byte profile blocks, coexisting with the DDR5 part
 number at `0x200..0x220`). Truncated or malformed fields degrade to `Na`
 cells — the decoder can never panic.
+
+**Daemon-side auto-bind (root, non-fatal).** The unprivileged acquisition
+above is the read-only half: on an Intel platform where the kernel's
+`ee1004` driver bound fewer SPD EEPROMs than active channels (a slot the
+board's DSDT failed to advertise), the daemon — the only process
+permitted to write — attempts to bind the missing client(s) by echoing
+`ee1004 <addr>` to `/sys/bus/i2c/devices/i2c-<bus>/new_device` before
+each collection, so a freshly bound EEPROM lands in the same snapshot.
+It is **on by default** (`--no-spd-autobind` disables it), Intel-only,
+strictly non-fatal (a NAKing/absent EEPROM is recorded in a
+process-lifetime attempt set and never re-written), and **never
+unbinds**: a bound EEPROM is a real DIMM the DSDT missed, a persistent
+desired state.
 
 ### 10.5 The platform branch
 
@@ -1573,7 +1619,7 @@ fallback remains available where unblocked. When present:
   will be used"); the at-boot load entry
   (`/etc/modules-load.d/ramsleuth_intel.conf`) is written **only** on a
   successful Intel load (a stale one is removed on the non-Intel path);
-- the **frozen kobject contract** is the 19 world-readable attributes under
+- the **frozen kobject contract** is the 24 world-readable attributes under
   `/sys/kernel/ramsleuth_intel/` (§10.3): the module creates the kobject
   only on a fully successful probe, and any probe failure leaves no kobject
   behind;
@@ -1593,7 +1639,7 @@ fallback remains available where unblocked. When present:
 
 ### 13.1 The test suite
 
-**727/727 tests green** across the workspace, in debug **and** release, with
+**The full workspace test suite green** in debug **and** release, with
 `cargo clippy --workspace --all-targets -- -D warnings` reporting **zero
 warnings**. All tests are **in-crate unit tests** (there are no `tests/`
 integration dirs and no `benches/` dirs) — the crate interfaces are designed
