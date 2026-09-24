@@ -109,8 +109,14 @@
 //! to its [`AlderChannelMap`] descriptor and decodes through the
 //! Research-line-329 mirror → MCL fallback ([`tier3_mcl_for`]) into
 //! [`decode_tier3_channel`], with the gear cells layered on from
-//! `MC_BIOS_REQ[17:16]` on its `GearCap::Gear4` profile. Every
-//! remaining generation (Ice Lake / Tiger Lake / `Unrecognized`)
+//! `MC_BIOS_REQ[17:16]` on its `GearCap::Gear4` profile; for
+//! `MeteorLake` / `ArrowLake` the OQ-5 tile-routing probe (IG-28)
+//! runs first — a fully degenerate primary window (`None` / `0x0` /
+//! `0xFFFF_FFFF`, Research line 328: the IMC behind the secondary
+//! `MCHBAR + 0x180000` SoC-tile range) degrades the whole readout to
+//! `Na(UnsupportedHardware)` (branch-level detail:
+//! [`tile_routing_suspected`]) — never a decode of the empty window.
+//! Every remaining generation (Ice Lake / Tiger Lake / `Unrecognized`)
 //! degrades the whole readout to `Na(UnsupportedHardware)` — never
 //! garbage data from a mismatched register map. [`gen_gate`] (the
 //! facade's branch-level gate: Tier 1, Rocket Lake, and the Tier-3
@@ -525,6 +531,51 @@ impl IntelImcRegs {
             mad_dimm_ch3: read(MAD_DIMM_CH3_OFFSET),
         }
     }
+
+    /// OQ-5's tile-routing probe (IG-28): `true` when **every**
+    /// primary-window register in this set is degenerate — `None`
+    /// (failed / unreadable read) or a present-but-invalid word
+    /// (`0x0` = untrained, `0xFFFF_FFFF` = bus-fault readback — the two
+    /// degenerate encodings Research line 329 uses for the mirror
+    /// window). On Meteor / Arrow Lake this is the runtime signature
+    /// that the physical IMC sits behind the secondary SoC-tile uncore
+    /// range (MCHBAR + 0x180000) the module does not expose (Research
+    /// line 328) — see [`tile_routing_suspected`] and the pre-decode
+    /// probe in [`decode`].
+    pub fn primary_window_degenerate(&self) -> bool {
+        fn degenerate(v: &Option<u32>) -> bool {
+            matches!(v, None | Some(0) | Some(0xFFFF_FFFF))
+        }
+        let channel_all = |c: &ChannelRegs| {
+            [&c.tc_dbp,
+                &c.tc_rap,
+                &c.tc_rfp,
+                &c.tc_rap2,
+                &c.tc_rdrd,
+                &c.tc_rdwr,
+                &c.tc_wrrd,
+                &c.tc_wrwr]
+                .iter()
+                .all(|v| degenerate(v))
+        };
+        let mcl_all = |m: &MclRegs| {
+            [&m.tc_pre,
+                &m.tc_act,
+                &m.tc_act2,
+                &m.tc_wtr,
+                &m.tc_rfp,
+                &m.tc_rfp2,
+                &m.tc_rdrd,
+                &m.tc_wrwr]
+                .iter()
+                .all(|v| degenerate(v))
+        };
+        [&self.mcbios_req, &self.mad_dimm_ch2, &self.mad_dimm_ch3]
+            .iter()
+            .all(|v| degenerate(v))
+            && [&self.ch0, &self.ch1, &self.ch2, &self.ch3].iter().all(|c| channel_all(c))
+            && [&self.mcl0, &self.mcl1].iter().all(|m| mcl_all(m))
+    }
 }
 
 /// Read one channel's eight raw registers through `read` into `regs`
@@ -653,6 +704,24 @@ pub fn gen_gate(gen: IntelGen) -> TelemetryResult<()> {
             "Intel {gen:?} is beyond Tier 2; v1 decodes Tier 1 + Tier 2 (Skylake/Kaby Lake/Coffee Lake/Comet Lake/Rocket Lake) only"
         ),
     })
+}
+
+/// OQ-5's branch-level tile-routing detail (IG-28): the
+/// [`TelemetryError::UnsupportedHardware`] that accompanies a Meteor /
+/// Arrow Lake readout whose primary window is fully degenerate
+/// ([`IntelImcRegs::primary_window_degenerate`]). Per Research line
+/// 328, on disaggregated SoC/compute tiles the physical IMC can sit
+/// behind the secondary uncore range (MCHBAR + 0x180000) that the
+/// module does not expose; the honest degradation is the all-Na
+/// readout ([`decode`] returns the all-`Na(UnsupportedHardware)` shape
+/// at the generation's channel count) with this message — never a
+/// value fabricated from the secondary range.
+pub fn tile_routing_suspected(gen: IntelGen) -> TelemetryError {
+    TelemetryError::UnsupportedHardware {
+        vendor: format!(
+            "Intel {gen:?}: SoC-tile IMC routing suspected (MCHBAR + 0x180000 secondary range) — primary window empty; see OQ-5"
+        ),
+    }
 }
 
 /// The fixed channel-count model for an [`IntelGen`] (plan: per-channel
@@ -1479,6 +1548,16 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 ///   Arrow for LPDDR5X and high-speed DDR5; Research line 145:
 ///   \>7200 MT/s). **OQ-11: confirm on hardware before shipping** —
 ///   the DDR5 condition is the working assumption.
+/// - **the OQ-5 tile-routing probe (IG-28)** — `MeteorLake` /
+///   `ArrowLake` only, before any subchannel decode: if every
+///   primary-window register in [`IntelImcRegs`] is degenerate
+///   (`None` / `0x0` / `0xFFFF_FFFF` — Research line 328's signature
+///   for the IMC behind the secondary `MCHBAR + 0x180000` range the
+///   module does not expose), the whole readout degrades to
+///   `Na(UnsupportedHardware)` at the generation's channel count —
+///   never a decode of the empty window, never a value fabricated
+///   from the secondary range; the branch-level detail is
+///   [`tile_routing_suspected`].
 /// - **every remaining generation** — the unprofiled generations
 ///   (Ice Lake / Tiger Lake / `Unrecognized`): the whole readout
 ///   degrades to `Na(UnsupportedHardware)` channels — the registers
@@ -1526,6 +1605,29 @@ pub fn decode(regs: &IntelImcRegs, gen: IntelGen, mad_inter_channel: Option<u32>
         // OQ-11: confirm on hardware before shipping (working
         // assumption).
         Some(p) if matches!(p.map, GenMap::Alder) => {
+            // OQ-5 (IG-28): the tile-routing probe — on Meteor /
+            // Arrow Lake, a fully degenerate primary window (every
+            // register None / 0x0 / 0xFFFF_FFFF) is the runtime
+            // signature of SoC-tile IMC routing (Research line 328):
+            // the physical IMC sits behind the secondary range
+            // (MCHBAR + 0x180000) the module does not expose.
+            // All-Na(UnsupportedHardware) at the generation's channel
+            // count (the branch-level detail is
+            // [`tile_routing_suspected`]) — never a decode of the
+            // empty window, never a secondary-range fabrication.
+            if matches!(gen, IntelGen::MeteorLake | IntelGen::ArrowLake)
+                && regs.primary_window_degenerate()
+            {
+                let count = channel_count(gen);
+                let mut channels = Vec::with_capacity(usize::from(count));
+                for ch in 0..count {
+                    channels.push(unsupported_channel(ch));
+                }
+                return IntelReadout {
+                    channels,
+                    channel_mode: None,
+                };
+            }
             let ddr5 = regs.mad_dimm_ch2.is_some_and(|v| v != 0)
                 && regs.mad_dimm_ch3.is_some_and(|v| v != 0);
             let subch_indices: &[usize] = if ddr5 {
@@ -3430,7 +3532,139 @@ mod tests {
         assert_eq!(ro, back);
     }
 
+
+
     // -----------------------------------------------------------------
+    // OQ-5 tile-routing probe (IG-28): Meteor / Arrow Lake.
+    // -----------------------------------------------------------------
+
+    /// The probe fires on every fully degenerate form — all-`None`,
+    /// all-zero, all-bus-fault, and mixed 0x0 / 0xFFFF_FFFF raws —
+    /// and not when any single slot is valid (the populated Tier-3
+    /// fixture, and a lone valid `MC_BIOS_REQ` among zeros).
+    #[test]
+    fn ig28_primary_window_degenerate_probe() {
+        assert!(IntelImcRegs::default().primary_window_degenerate(), "all-None");
+        let all_zero = IntelImcRegs::from_wide_reader(|_off: usize| Some(0u32));
+        assert!(all_zero.primary_window_degenerate(), "all-zero");
+        let all_fault = IntelImcRegs::from_wide_reader(|_off: usize| Some(0xFFFF_FFFFu32));
+        assert!(all_fault.primary_window_degenerate(), "all-bus-fault");
+        let mixed = IntelImcRegs::from_wide_reader(|off: usize| {
+            if off & 1 == 0 {
+                Some(0u32)
+            } else {
+                Some(0xFFFF_FFFFu32)
+            }
+        });
+        assert!(mixed.primary_window_degenerate(), "mixed 0x0 / 0xFFFF_FFFF");
+        assert!(
+            !tier3_ddr5_condition_regs().primary_window_degenerate(),
+            "populated Tier-3 fixture"
+        );
+        let one_valid = IntelImcRegs::from_wide_reader(|off: usize| {
+            if off == MC_BIOS_REQ_OFFSET {
+                Some(0x0001_0012)
+            } else {
+                Some(0u32)
+            }
+        });
+        assert!(!one_valid.primary_window_degenerate(), "one valid slot");
+    }
+
+    /// All-degenerate primary-window raws (0x0 / 0xFFFF_FFFF / None)
+    /// on Meteor / Arrow Lake → the all-`Na(UnsupportedHardware)`
+    /// readout at the generation's channel count (4) — never a decode
+    /// of the empty window — and the branch-level
+    /// [`tile_routing_suspected`] detail names the SoC-tile routing
+    /// (OQ-5, Research line 328).
+    #[test]
+    fn ig28_all_degenerate_window_degrades_all_na_with_tile_detail() {
+        type Fill = fn(usize) -> Option<u32>;
+        let fills: [(&str, Fill); 3] = [
+            ("all-zero raws", |_off: usize| Some(0u32)),
+            ("all-bus-fault raws", |_off: usize| Some(0xFFFF_FFFFu32)),
+            ("all-absent raws", |_off: usize| None),
+        ];
+        for gen in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
+            for (label, fill) in fills {
+                let regs = IntelImcRegs::from_wide_reader(fill);
+                assert!(regs.primary_window_degenerate(), "{gen:?} ({label})");
+                let ro = decode(&regs, gen, None);
+                assert_eq!(ro.channels.len(), 4, "{gen:?} ({label})");
+                for ch in &ro.channels {
+                    assert_eq!(
+                        ch.clocks.mclk_mhz,
+                        Section::na(NaReason::UnsupportedHardware),
+                        "{gen:?} ({label})"
+                    );
+                    assert_eq!(
+                        ch.clocks.gear_mode,
+                        Section::na(NaReason::UnsupportedHardware),
+                        "{gen:?} ({label})"
+                    );
+                    assert_eq!(
+                        ch.clocks.uclk_mhz,
+                        Section::na(NaReason::UnsupportedHardware),
+                        "{gen:?} ({label})"
+                    );
+                    assert_eq!(
+                        ch.timings.cl,
+                        Section::na(NaReason::UnsupportedHardware),
+                        "{gen:?} ({label})"
+                    );
+                    assert_eq!(
+                        ch.rtl,
+                        Section::na(NaReason::UnsupportedHardware),
+                        "{gen:?} ({label})"
+                    );
+                }
+                assert_eq!(ro.channel_mode, None, "{gen:?} ({label})");
+            }
+            match tile_routing_suspected(gen) {
+                TelemetryError::UnsupportedHardware { vendor } => {
+                    assert!(
+                        vendor.contains(
+                            "SoC-tile IMC routing suspected (MCHBAR + 0x180000 secondary range) — primary window empty; see OQ-5"
+                        ),
+                        "{gen:?}: {vendor}"
+                    );
+                }
+                other => unreachable!("{gen:?}: expected UnsupportedHardware, got {other:?}"),
+            }
+        }
+    }
+
+    /// One valid primary-window register (the rest degenerate) keeps
+    /// the normal decode path for Meteor / Arrow Lake: the probe does
+    /// not fire, the valid `MC_BIOS_REQ` decodes (ratio 18 @
+    /// 133.3333 MHz → 2400 MHz MCLK, bit 16 → gear 2 → uclk 1200),
+    /// and the absent / zero registers degrade per-register
+    /// (`Na(ParseError)`) on the 2-channel DDR4 default shape —
+    /// never to the tile-routing all-Na readout.
+    #[test]
+    fn ig28_one_valid_register_keeps_the_normal_decode_path() {
+        for gen in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
+            let regs = IntelImcRegs::from_wide_reader(|off: usize| {
+                if off == MC_BIOS_REQ_OFFSET {
+                    Some(0x0001_0012)
+                } else {
+                    Some(0u32)
+                }
+            });
+            assert!(!regs.primary_window_degenerate(), "{gen:?}");
+            let ro = decode(&regs, gen, None);
+            assert_eq!(ro.channels.len(), 2, "{gen:?}: DDR4 default (MAD raws zero)");
+            for ch in &ro.channels {
+                assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
+                assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Two), "{gen:?}");
+                assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "{gen:?}");
+                assert!(
+                    matches!(ch.timings.cl, Section::Na(NaReason::ParseError(_))),
+                    "{gen:?}: untrained zero field degrades per-register"
+                );
+            }
+        }
+    }
     // Degradation + containment (the no-panic contract, D5).
     // -----------------------------------------------------------------
 
