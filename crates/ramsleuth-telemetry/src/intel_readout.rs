@@ -2150,6 +2150,132 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Tier 2 acceptance fixtures (IG-13): Breakdown §4 pinned verbatim
+    // end-to-end under `gen = RocketLake` through `decode` — the
+    // Rocket Lake profile is the Tier-1 shared map plus the §3D gear
+    // cells (IG-12), and Research line 346's 27-subtiming ryzen_smu
+    // parity (the 0x4020–0x402C turnaround quartets) is pinned below.
+    // -----------------------------------------------------------------
+
+    /// Breakdown §4 Example A, verbatim, end-to-end under Rocket Lake:
+    /// `mcbios_req = 0x00000110` (bit 8 = 1b → 100 MHz RefClk, ratio
+    /// 16, bits [17:16] = 00b → Gear 1) → 16 × 100 = **1600 MHz**
+    /// MCLK / **3200 MT/s** (DDR: ×2), uclk = mclk = **1600 MHz**
+    /// (the 1:1 synchronous clock) — on both channels, every shared-
+    /// map cell equal to the Tier-1 decode of the identical raws.
+    #[test]
+    fn tier2_example_a_gear1_100_mhz_base_end_to_end() {
+        let mut regs = acceptance_regs();
+        regs.mcbios_req = Some(0x0000_0110);
+        let ro = decode(&regs, IntelGen::RocketLake, None);
+        assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
+        for ch in &ro.channels {
+            // §4 Example A numbers, pinned exactly.
+            assert_eq!(ch.clocks.mclk_mhz, Section::Value(1600.0), "mclk = 16 × 100 MHz");
+            assert_eq!(
+                ch.clocks.mclk_mhz.value().copied().map(|v| v * 2.0),
+                Some(3200.0),
+                "DDR: two transfers per DRAM clock = 3200 MT/s"
+            );
+            assert_eq!(
+                ch.clocks.gear_mode,
+                Section::Value(GearMode::One),
+                "bits [17:16] = 00b → gear 1"
+            );
+            assert_eq!(
+                ch.clocks.uclk_mhz,
+                Section::Value(1600.0),
+                "gear 1: uclk = mclk (1:1)"
+            );
+        }
+    }
+
+    /// Breakdown §4 Example D, verbatim, end-to-end under Rocket Lake:
+    /// the narrative register settings — bit 8 = 1b (100 MHz RefClk),
+    /// ratio 30, bit 16 = 1b (Gear 2), bit 17 clear — are the raw word
+    /// `mcbios_req = 0x0001011E` → 30 × 100 = **3000 MHz** MCLK /
+    /// **6000 MT/s**, gear **Two** (the 01b field on the Gear2 cap),
+    /// uclk = 3000 / 2 = **1500 MHz** (Gear 2). (The 11b field variants
+    /// `0x0003001E` / `0x0003011E` follow the bit-16 rule to the same
+    /// gear Two and stay unit-pinned by IG-11's `breakdown_example_d_*`
+    /// tests; this is the Rocket arm's ratio-≤-32, bit-16-set /
+    /// bit-17-clear word, per plan IG-13.)
+    #[test]
+    fn tier2_example_d_gear2_100_mhz_base_end_to_end() {
+        let mut regs = acceptance_regs();
+        regs.mcbios_req = Some(0x0001_011E);
+        let ro = decode(&regs, IntelGen::RocketLake, None);
+        assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
+        for ch in &ro.channels {
+            // §4 Example D numbers, pinned exactly.
+            assert_eq!(ch.clocks.mclk_mhz, Section::Value(3000.0), "mclk = 30 × 100 MHz");
+            assert_eq!(
+                ch.clocks.mclk_mhz.value().copied().map(|v| v * 2.0),
+                Some(6000.0),
+                "DDR: two transfers per DRAM clock = 6000 MT/s"
+            );
+            assert_eq!(
+                ch.clocks.gear_mode,
+                Section::Value(GearMode::Two),
+                "bits [17:16] = 01b → gear 2"
+            );
+            assert_eq!(
+                ch.clocks.uclk_mhz,
+                Section::Value(1500.0),
+                "gear 2: uclk = mclk / 2"
+            );
+        }
+    }
+
+    /// The Rocket Lake turnaround quartets (the 0x4020–0x402C bus
+    /// turnaround registers — Research line 346: decoding them
+    /// achieves the 27-subtiming ryzen_smu parity) decode end-to-end
+    /// through `decode` under `gen = RocketLake`: the existing
+    /// acceptance raws yield the pinned quartet slots on both channels,
+    /// with every shared-map cell identical to the Tier-1 decode of the
+    /// same raws (the quartet decoders are shared-map; Rocket Lake
+    /// only layers on the gear cells).
+    #[test]
+    fn tier2_rocket_turnaround_quartets_end_to_end() {
+        let regs = acceptance_regs();
+        // The 0x4020–0x402C raws → their 4×6-bit sg / dg / dr / dd
+        // quartets (bits 5:0 / 11:6 / 17:12 / 23:18).
+        assert_eq!(turnaround_quartet(0x0048_C286), [6, 10, 12, 18], "TC_RDRD");
+        assert_eq!(turnaround_quartet(0x0000_0280), [0, 10, 0, 0], "TC_RDWR");
+        assert_eq!(turnaround_quartet(0x0000_0308), [8, 12, 0, 0], "TC_WRRD");
+        assert_eq!(turnaround_quartet(0x0040_C204), [4, 8, 12, 16], "TC_WRWR");
+
+        let ro = decode(&regs, IntelGen::RocketLake, None);
+        assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
+        for ch in &ro.channels {
+            // TC_RDRD: the full sg / dg / dr / dd quartet.
+            assert_eq!(ch.timings.rdrd_scl, Section::Value(6), "sg");
+            assert_eq!(ch.timings.rdrd_sc, Section::Value(10), "dg");
+            assert_eq!(ch.timings.rdrd_sd, Section::Value(12), "dr");
+            assert_eq!(ch.timings.rdrd_dd, Section::Value(18), "dd");
+            // TC_RDWR: dg — the representative bank-group turnaround.
+            assert_eq!(ch.timings.rdwr, Section::Value(10), "dg");
+            // TC_WRRD: tWTR_S = dg, tWTR_L = sg (parity matrix).
+            assert_eq!(ch.timings.wtrs, Section::Value(12), "dg");
+            assert_eq!(ch.timings.wtrl, Section::Value(8), "sg");
+            // TC_WRWR: the full sg / dg / dr / dd quartet.
+            assert_eq!(ch.timings.wrwr_scl, Section::Value(4), "sg");
+            assert_eq!(ch.timings.wrwr_sc, Section::Value(8), "dg");
+            assert_eq!(ch.timings.wrwr_sd, Section::Value(12), "dr");
+            assert_eq!(ch.timings.wrwr_dd, Section::Value(16), "dd");
+            // The 0x12 word (ratio 18 @ 133.3333 MHz, gear bits 00b)
+            // keeps the synchronous default.
+            assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
+            assert_eq!(ch.clocks.uclk_mhz, Section::Value(2400.0), "gear 1: uclk = mclk");
+        }
+        // Shared-map proof: identical raws decode identically under
+        // Tier 1 (only the gear cells differ — pinned above).
+        let tier1 = decode(&regs, IntelGen::Skylake, None);
+        for (r, t) in ro.channels.iter().zip(&tier1.channels) {
+            assert_eq!(r.timings, t.timings, "all shared-map timings identical");
+        }
+    }
+    // -----------------------------------------------------------------
     // Entry points: `read_regs` total + panic-free on this host.
     // -----------------------------------------------------------------
 
