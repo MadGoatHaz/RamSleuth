@@ -1,6 +1,6 @@
 # RamSleuth — User Guide
 
-**Version:** 2.2.1 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
+**Version:** 2.4.0 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
 
 RamSleuth v2 is a live RAM telemetry suite and an AIDA64-style memory benchmark for
 AMD and Intel desktops. It watches your memory system in real time — clocks, the
@@ -27,7 +27,7 @@ policy, version-bump process, CI) see `packaging/README.md`.
 1. [What you can do with RamSleuth](#1-what-you-can-do-with-ramsleuth)
 2. [Installation](#2-installation)
    - [2.1 One-command install from GitHub (`install.sh`)](#21-one-command-install-from-github-installsh)
-   - [2.2 Arch User Repository — the two published packages](#22-arch-user-repository-the-two-published-packages)
+   - [2.2 Arch User Repository — the published packages](#22-arch-user-repository-the-published-packages)
    - [2.3 Manual install from a source checkout (`makepkg`)](#23-manual-install-from-a-source-checkout-makepkg)
    - [2.4 Build from source (`cargo`)](#24-build-from-source-cargo)
    - [2.5 Optional extra: `ryzen-smu-dkms` (AMD live subtimings)](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings)
@@ -56,10 +56,11 @@ memory controller's own state and shows it in a dense dashboard:
   FCLK (the Infinity Fabric clock on AMD), the UCLK:MCLK sync ratio (1:1
   synchronous or 1:2 asynchronous), the DRAM command rate (1T/2T), and the
   CPU's live core frequency.
-- **Live DRAM subtimings** — all 27 of them (tCL, tRCD, tRP, tRAS, tRFC, …)
-  straight from the SMU PM table on AMD, decoded per-channel from the memory
-  controller registers on Intel. Not the values baked into an XMP profile —
-  the values the controller is *actually running right now*.
+- **Live DRAM subtimings** — on AMD, all 27 (tCL, tRCD, tRP, tRAS, tRFC, …)
+  straight from the SMU PM table; on Intel, the subset its MCHBAR registers
+  expose, decoded per-channel from the memory controller (Section 8.2). Not
+  the values baked into an XMP profile — the values the controller is
+  *actually running right now*.
 - **Signal integrity settings** — CAD-bus ODT and driver strengths (in ohms,
   RZQ-relative) and the RTT modes.
 - **Voltages** — the VDDCR_CPU (Vcore), VDDCR_SOC, VDDIO_MEM, VDD_MISC, and
@@ -108,16 +109,20 @@ fields simply show a structured `N/A (<reason>)` and every process exits 0.
 
 RamSleuth is a pure-Rust Cargo workspace (8 crates: 7 product crates + the
 `tools/gen-icon` dev tool), MIT-licensed, for x86_64 Linux. It is packaged for
-Arch Linux: a two-package AUR model, a self-contained one-command installer,
-and a plain `makepkg`/`cargo` path for building it yourself.
+Arch Linux: a two-core AUR package model (`ramsleuth` source +
+`ramsleuth-bin` binary, plus the optional `ryzen-smu-dkms` (AMD) and
+`ramsleuth-intel-dkms` (Intel) vendor DKMS extras), a self-contained
+one-command installer, and a plain `makepkg`/`cargo` path for building it
+yourself.
 
 Whichever method you pick, the install lands the same six binaries
 (`ramsleuth-daemon`, `ramsleuth-client`, `ramsleuth-tui`, `ramsleuth`,
 `ramsleuth-bench`, `ramsleuth-telemetry`) into `/usr/bin`, the frozen daemon
 unit `systemd/ramsleuth.service`, the systemd preset, the `ramsleuth` system
 group, the app-menu entry, the hicolor icons, the one-click setup helper
-(`ramsleuth-setup` + its polkit policy), and the pinned AMD-driver helper
-(`ramsleuth-install-ryzen-smu-dkms`). The `ramsleuth-protocol` crate is
+(`ramsleuth-setup` + its polkit policy), and the two pinned vendor-driver
+helpers (`ramsleuth-install-ryzen-smu-dkms` for AMD and
+`ramsleuth-install-intel-dkms` for Intel). The `ramsleuth-protocol` crate is
 library-only and is never installed. The daemon is enabled and started
 automatically at the end of every install path.
 
@@ -152,7 +157,7 @@ What makes it worth using:
   same file set as the AUR packages: the 6 binaries, the frozen daemon unit
   (verbatim copy of `systemd/ramsleuth.service`), the systemd preset, the
   desktop entry, the icon tree, the `ramsleuth` system group
-  (`groupadd -r`), the DKMS helper, the one-click setup helper + polkit
+  (`groupadd -r`), the two DKMS helpers (AMD + Intel), the one-click setup helper + polkit
   policy, and `install.sh` itself (kept at `/usr/share/ramsleuth/install.sh`
   for audit and re-runs). It finishes with `systemctl daemon-reload` and
   `systemctl enable --now ramsleuth` so the daemon is running when it exits.
@@ -173,8 +178,9 @@ What makes it worth using:
   **Intel host?** It prints an optional next-step note: the built-in `/dev/mem`
   MCHBAR decode already gives live Intel subtimings on a supported (Tier-1)
   generation, and the `ramsleuth_intel` DKMS module is the preferred source
-  for them — `sudo ramsleuth-install-intel-dkms`, or one-click
-  `sudo ramsleuth-setup --with-dkms` (which routes by CPU vendor; Section
+  for them — `sudo ramsleuth-install-intel-dkms` (the built-in helper),
+  one-click `sudo ramsleuth-setup --with-dkms` (which routes by CPU vendor),
+  or `sudo scripts/install-intel-dkms.sh` from a source checkout (Section
   10.5).
 
 Prerequisites and exit codes:
@@ -194,48 +200,59 @@ GUI with `ramsleuth` (one click on *Set up RamSleuth*), use
 `sudo ramsleuth-setup` as the terminal equivalent, and for day-2,
 `systemctl status ramsleuth` and `journalctl -u ramsleuth -f`.
 
-### 2.2 Arch User Repository — the two published packages
+### 2.2 Arch User Repository — the published packages
 
 Arch users can install from the AUR with any assistant (`yay` shown; `paru`
 works identically):
 
 ```sh
-yay -S ramsleuth       # STABLE — the default recommendation
-yay -S ramsleuth-bin   # PRECOMPILED — the fastest install
+yay -S ramsleuth             # STABLE — the default recommendation
+yay -S ramsleuth-bin         # PRECOMPILED — the fastest install
+# optional vendor DKMS extras — install only the one matching your CPU:
+yay -S ryzen-smu-dkms        # AMD — live AMD subtimings (Section 2.5)
+yay -S ramsleuth-intel-dkms  # Intel — preferred live-Intel-subtimings source (Section 10.5)
 ```
 
-The two packages are deliberately distinct:
+The two **core** packages are deliberately distinct:
 
 - **`ramsleuth` — STABLE source.** Builds the workspace from the official
-  git tag `v$pkgver` (currently `v2.2.1`). A tag is a reproducible,
+  git tag `v$pkgver` (currently `v2.4.0`). A tag is a reproducible,
   auditable snapshot — this is the **default recommendation for production
   installs**. It compiles only the pinned repository (`--locked`), with no
   third-party code in the build.
 - **`ramsleuth-bin` — PRECOMPILED.** Downloads the release binary tarball
-  `ramsleuth-2.2.1-x86_64.tar.zst` from the official GitHub Release (pinned
+  `ramsleuth-2.4.0-x86_64.tar.zst` from the official GitHub Release (pinned
   by its `sha256sums`) and installs it as-is — **no build, no makedepends**.
   This is the **fastest install path**.
 
-Both install the **identical file set**, so `ramsleuth` and `ramsleuth-bin`
-declare each other in `conflicts=` — **pick exactly one**; pacman will refuse
-to install both.
+The two core packages install the **identical file set**, so
+`ramsleuth` and `ramsleuth-bin` declare each other in `conflicts=` — **pick
+exactly one**; pacman will refuse to install both.
 
 Package pages:
 
 - <https://aur.archlinux.org/packages/ramsleuth>
 - <https://aur.archlinux.org/packages/ramsleuth-bin>
+- <https://aur.archlinux.org/packages/ryzen-smu-dkms> (AMD extra)
+- <https://aur.archlinux.org/packages/ramsleuth-intel-dkms> (Intel extra)
 
 Both packages create the `ramsleuth` system group (via their `.install`
 hooks), install the daemon unit + preset, the one-click setup helper + polkit
-policy, and the pinned DKMS helper, then `systemctl enable --now ramsleuth`.
+policy, and the two pinned DKMS helpers (AMD + Intel), then
+`systemctl enable --now ramsleuth`.
 When the install is invoked under `sudo`, the hooks additionally grant the
 invoking user group membership (persistent) and seed
 `/etc/ramsleuth/authorized-users` (immediate current-session socket access),
 then restart the daemon so the ACL applies — the same result as the GUI
 one-click setup, done at install time.
 
-The optional AMD driver extra lives in the AUR as its own package — see
-[2.5](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings).
+The two optional vendor driver extras also live in the AUR as their own
+packages: `ryzen-smu-dkms` (AMD) — see
+[2.5](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings) — and
+`ramsleuth-intel-dkms` (Intel) — see
+[10.5](#105-intel-live-subtimings-the-ramsleuth_intel-module-optional).
+They are independent of the two core packages and install alongside
+whichever of them you use.
 
 ### 2.3 Manual install from a source checkout (`makepkg`)
 
@@ -245,7 +262,7 @@ can build and install either package directly from the `packaging/`
 directories:
 
 ```sh
-cd packaging/ramsleuth      # STABLE source (builds from the v2.2.1 tag)
+cd packaging/ramsleuth      # STABLE source (builds from the v2.4.0 tag)
 # cd packaging/ramsleuth-bin   # PRECOMPILED (downloads the release tarball)
 makepkg -si
 ```
@@ -441,7 +458,7 @@ shows `Disconnected` with a hint, and the dashboard stays responsive.
 
 ### 4.1 The 3-line header
 
-**Line 1** — the title **`RamSleuth v2.2.1`**, a **platform tag**
+**Line 1** — the title **`RamSleuth v2.4.0`**, a **platform tag**
 (`[AMD AM4 Platform]` for Zen 1–3, `[AMD AM5 Platform]` for Zen 4/5,
 `[Intel LGA Platform]`, or a bare `[Platform]` when the vendor is unknown),
 the **daemon status** (`Daemon: Connected (IPC: /run/ramsleuth/ramsleuth.sock)`
@@ -463,9 +480,10 @@ colour-coded: **amber** for `Synchronous 1:1` (UCLK = MCLK — the healthy
 memory-clock configuration), **crimson** for `Asynchronous 1:2` (UCLK = MCLK/2
 — the fallback when the fabric cannot keep up), and plain text for an honest
 `N/A`. On **Intel**, both the `<channel mode>` label and the `Mode:`
-slot are overridden by the hardware `MAD_INTER_CHANNEL` register when the
-`ramsleuth_intel` module is loaded (a Flex-Mode box reads `Dual-Channel
-(Flex)` / `Mode: Flex`); see [Section 8.6](#86-channel-mode--the-ram-summary).
+slot come from the hardware `MAD_INTER_CHANNEL[1:0]` register (read via the
+`ramsleuth_intel` module when it is loaded) — `Dual-Channel (Symmetric)`,
+`Dual-Channel (Flex)`, or `Single-Channel`; see
+[Section 8.6](#86-channel-mode--the-ram-summary).
 When the OS total exceeds what SPD can see (e.g. four DIMMs installed
 but only two bound to the SPD bus), a slot note is appended —
 `2 of 4 slots SPD-visible`.
@@ -819,8 +837,11 @@ language tour.
 ### 8.1 The clocks
 
 - **MCLK** — the *memory clock*: the rate the DRAM interface runs at, in MHz.
-  For DDR5, the data rate (MT/s) is 2× MCLK (DDR5 "6000 MT/s" memory runs at
-  MCLK = 3000 MHz).
+  On Intel it is derived from the controller as **MCLK = CLK_RATIO ×
+  refclk** (no ÷2) — a DDR4-2133 system (refclk 133.3333 MHz, CLK_RATIO 8)
+  runs at MCLK = 1066.67 MHz. As on every DDR platform, the data rate
+  (MT/s) is 2× MCLK (DDR4 "2133 MT/s" at MCLK 1066.67 MHz; DDR5 "6000
+  MT/s" memory runs at MCLK = 3000 MHz).
 - **UCLK** — the *memory-controller (uncore) clock*: the internal clock the
   CPU's memory controller uses. Its relationship to MCLK is the sync mode
   below.
@@ -851,8 +872,10 @@ language tour.
 The live timings are the controller's *actual* timing state, in **ticks**
 (clock cycles of the DRAM clock domain — a tick at 3000 MHz is ~0.33 ns).
 AMD: all 27, from the SMU PM table. Intel: the subset its MCHBAR registers
-expose (tCL/tRCD/tRP/tRAS, tCCD_S/L, the RDRD/RDWR/WRWR/WRRD set, RTL),
-with the rest `N/A (not applicable)` by design.
+expose (tCL/tRCD/tRP, tCCD_S/L, the RDRD/RDWR/WRWR/WRRD set, RTL); tRAS —
+and tWTRS/tWTRL — may read `N/A` on some SKUs because the firmware leaves
+those TC fields unprogrammed, a platform/firmware condition rather than a
+bug (Section 9).
 
 | # | Timing | Meaning |
 |---|---|---|
@@ -947,10 +970,15 @@ capacity than the SPD bus binds, a slot note (`2 of 4 slots SPD-visible`).
 On **Intel** the DIMM count is only the fallback. When the
 `ramsleuth_intel` module is loaded, the channel label and the `Mode:`
 segment come from the memory controller's hardware `MAD_INTER_CHANNEL`
-register instead — so a Flex-Mode box with asymmetric DIMMs (e.g. `16 + 8
-GB`) reads `Dual-Channel (Flex)` / `Mode: Flex`, not the previously-wrong
-`Single-Channel` / `Mode: N/A`. Without the module (the `/dev/mem`
-fallback) the label degrades back to the DIMM count above.
+register instead — its bits `[1:0]` select the mode: **`00b`** =
+`Dual-Channel (Symmetric)` (fully interleaved — the normal healthy
+configuration), **`01b`** = `Dual-Channel (Flex)` (asymmetric interleaving),
+**`10b`** = `Single-Channel`. The label is whatever the firmware programmed,
+not what the DIMM population implies: an asymmetric configuration (e.g.
+`16 + 8 GB`) may read **either** `Dual-Channel (Symmetric)` **or**
+`Dual-Channel (Flex)` depending on the BIOS/firmware choice — it is not
+guaranteed to be Flex. Without the module (the `/dev/mem` fallback) the
+label degrades back to the DIMM count above.
 
 ---
 
@@ -975,6 +1003,16 @@ listing and `ramsleuth-telemetry` show a human-readable phrase
 | **`UnknownPmTableVersion`** — *unknown PM table version* | The AMD SMU PM-table version the firmware reports is outside the layout set RamSleuth knows how to parse. | Update the **AGESA/firmware** (the table versions move with the SMU firmware) or the `ryzen_smu` driver, and retry. If it persists, it is a genuine "newer firmware than supported" case — report the version word upstream. |
 | **`NotApplicable`** — *not applicable* | This field does not apply to the detected platform by design — e.g. Intel does not expose the CAD bus or voltage rails through MCHBAR, AMD does not report gear mode, Intel voltages are out of the readout's scope. | Nothing — it is a *correct* blank, not a failure. |
 | **`ParseError("<detail>")`** — *parse error: \<detail\>* | A payload read from hardware was malformed or outside its plausible range; the detail names the field (e.g. a clock reading of 0, a truncated block). | Usually transient or firmware-specific; check `journalctl -u ramsleuth`. A persistent one on a specific field is worth reporting with the detail text. |
+
+Beyond the six reason variants, a few specific fields read `N/A` for
+**platform/firmware** reasons that are not RamSleuth bugs — on such systems
+everything else stays live and every process still exits `0`:
+
+| Field | Why it reads `N/A` | What to do |
+|---|---|---|
+| **tRAS / tWTRS / tWTRL** (Intel subtimings) | The firmware leaves the corresponding TC fields unprogrammed on some SKUs, so the controller does not populate them. | Nothing — it is a platform/firmware condition, not a failure; the remaining Intel subtimings are fully live (Section 8.2). |
+| **UCLK:MCLK** (the sync ratio) | The uncore ratio is not populated by the firmware on some configurations. | Nothing — MCLK and the other clocks remain readable; the sync segment shows an honest `N/A`. |
+| **SPD for a second (or later) DIMM** | The board's DSDT advertises only one slot, so the kernel's `ee1004` driver binds fewer EEPROMs than DIMMs are installed. | See [Section 11.5](#115-a-few-honest-limitations): the daemon's SPD auto-bind (on by default) attempts to bind the missed EEPROMs, and the manual `new_device` workaround is listed there. |
 
 The daemon's **`status`** subcommand is the fastest way to see which of the
 four major sections (CPU / AMD / Intel / SPD) is degraded and why — one line
@@ -1122,7 +1160,7 @@ The unit is `Restart=on-failure`, so most transient crashes recover on
 their own — the journal tells you whether you are looking at something that
 recurred and stuck.
 
-### 11.2 `N/A (DriverMissing)` on AMD
+### 11.2 `N/A (DriverMissing)` on AMD (and the Intel counterpart)
 
 The `ryzen_smu` module is not loaded (fresh boot after a kernel update
 without the DKMS rebuild, never installed, or the module was removed):
@@ -1138,6 +1176,22 @@ ls /sys/kernel/ryzen_smu_drv/pm_table   # confirm it is live
 Then re-open the GUI / re-run `ramsleuth-client status` — the AMD section
 fills in on the next poll (no app restart needed; the daemon re-reads on
 every telemetry pass).
+
+**Intel counterpart** — if the Intel subtimings read **`N/A
+(DriverMissing)`** (e.g. after a kernel update left the `ramsleuth_intel`
+module stale, or it was never installed), re-run the Intel DKMS install
+helper to rebuild + reload the module:
+
+```sh
+sudo ramsleuth-install-intel-dkms   # the built-in helper (or the AUR extra's ramsleuth-intel-dkms-install)
+# or, one-click and vendor-aware:
+sudo ramsleuth-setup --with-dkms
+ls /sys/kernel/ramsleuth_intel/     # confirm the kobject is live
+```
+
+Then re-run `ramsleuth-client status` — the Intel section fills in on the
+next poll (no app restart needed; the daemon re-reads on every telemetry
+pass).
 
 ### 11.3 Group membership / socket access problems
 
@@ -1269,6 +1323,6 @@ group, no socket, no driver.
 
 ---
 
-*This guide describes RamSleuth v2.2.1. For the technical design, see
+*This guide describes RamSleuth v2.4.0. For the technical design, see
 `Docs/Architecture.md`; for the packaging operator guide, see
 `packaging/README.md`.*
