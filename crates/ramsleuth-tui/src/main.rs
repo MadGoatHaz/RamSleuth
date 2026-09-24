@@ -402,7 +402,8 @@ fn poll_with_client(client: &mut Client, socket: &Path, state: &mut AppState) {
             | Response::BenchProgress(_)
             | Response::BenchResult { .. }
             | Response::BenchCancelled { .. }
-            | Response::BurnInProgress(_),
+            | Response::BurnInProgress(_)
+            | Response::ProbeReport(_),
         ) => {
             // A benchmark / burn-in frame in reply to `GetTelemetry`
             // violates the wire contract (the daemon streams those
@@ -636,6 +637,16 @@ fn run_bench(
                 s.bench.running = false;
                 break;
             }
+            Ok(Response::ProbeReport(_)) => {
+                // A probe-report frame in a normal-bench stream
+                // violates the wire contract (probe reports reply
+                // only to `GetProbeReport`, chunk probe-1a): stop
+                // the run and record it.
+                let mut s = state.write().unwrap();
+                s.error = Some("unexpected probe report during benchmark".to_owned());
+                s.bench.running = false;
+                break;
+            }
             Err(error) => {
                 let mut s = state.write().unwrap();
                 s.error = Some(error.to_string());
@@ -864,6 +875,16 @@ fn run_burn_in(
                 // it.
                 let mut s = state.write().unwrap();
                 s.error = Some("unexpected response during burn-in".to_owned());
+                s.bench.burn_in.running = false;
+                break;
+            }
+            Ok(Response::ProbeReport(_)) => {
+                // A probe-report frame in a burn-in stream
+                // violates the wire contract (probe reports reply
+                // only to `GetProbeReport`, chunk probe-1a): stop
+                // the run and record it.
+                let mut s = state.write().unwrap();
+                s.error = Some("unexpected probe report during burn-in".to_owned());
                 s.bench.burn_in.running = false;
                 break;
             }

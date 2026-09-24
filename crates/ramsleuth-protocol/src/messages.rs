@@ -16,7 +16,7 @@
 //! and the `Na(reason)` sections inside a snapshot — never as panics.
 
 use ramsleuth_bench::{BenchmarkGrid, BurnInTick, StreamProgress, StreamTarget};
-use ramsleuth_telemetry::SystemMemoryTelemetry;
+use ramsleuth_telemetry::{ProbeReport, SystemMemoryTelemetry};
 
 /// The default daemon Unix-socket path: the single socket-path source
 /// for the daemon and every client (plan D5). The daemon accepts a
@@ -61,6 +61,14 @@ pub enum Request {
     /// run is active gets [`Response::Error`], plan D6); its progress
     /// streams on [`Response::BurnInProgress`].
     StartBurnIn { target: StreamTarget, duration_minutes: u32 },
+    /// Fetch the consent-gated "Submit Probe Report": the full telemetry
+    /// snapshot + the Intel raw-register dump (when available) + the
+    /// system identity — the [`Response::ProbeReport`] payload (the
+    /// telemetry crate's `ProbeReport`, chunk probe-1a). The daemon-side
+    /// builder that fills it is chunk 1b; this arm is append-only (OQ-10:
+    /// it lands at the next discriminant after `StartBurnIn`, so every
+    /// pre-existing variant's wire encoding is unchanged).
+    GetProbeReport,
 }
 
 /// A daemon → client RPC response.
@@ -95,6 +103,13 @@ pub enum Response {
     /// latency pass of each burn-in iteration. The normal-bench
     /// [`Response::BenchProgress`] arm stays byte-identical.
     BurnInProgress(BurnInTick),
+    /// The consent-gated "Submit Probe Report" payload (the
+    /// [`Request::GetProbeReport`] reply): the full snapshot + the Intel
+    /// raw-register dump (when available) + the system identity — the
+    /// telemetry crate's `ProbeReport` (chunk probe-1a). Append-only
+    /// (OQ-10: it lands at the next discriminant after `BurnInProgress`,
+    /// so every pre-existing variant's wire encoding is unchanged).
+    ProbeReport(ProbeReport),
 }
 
 /// The top-level wire frame payload: one request or one response per
@@ -296,5 +311,128 @@ mod tests {
     #[test]
     fn default_socket_path_is_frozen() {
         assert_eq!(DEFAULT_SOCKET_PATH, "/run/ramsleuth/ramsleuth.sock");
+    }
+
+    /// (d) OQ-10 wire pinning: appending `Request::GetProbeReport` and
+    /// `Response::ProbeReport` must not shift any pre-existing variant's
+    /// bincode discriminant. bincode 1.x encodes an enum's leading u32
+    /// discriminant little-endian, so each pre-existing variant keeps its
+    /// original leading bytes and the appended arms land at the next
+    /// discriminant only (the OQ-10 append rule, byte-for-byte).
+    #[test]
+    fn request_response_bincode_byte_pinning_oq10() {
+        use ramsleuth_telemetry::ProbeSystem;
+
+        // Pin the leading 4 bytes (the u32-LE discriminant) of a payload.
+        let lead = |v: &[u8], disc: u32, name: &str| {
+            assert_eq!(
+                &v[..4],
+                &disc.to_le_bytes()[..],
+                "{name} discriminant must be unchanged (OQ-10)"
+            );
+        };
+
+        // --- Request: pre-existing discriminants unchanged. ---------
+        // The unit variant serializes to exactly its u32 discriminant.
+        assert_eq!(
+            bincode::serialize(&Request::GetTelemetry).unwrap(),
+            0u32.to_le_bytes().to_vec(),
+            "Request::GetTelemetry wire encoding must be unchanged (OQ-10)"
+        );
+        lead(
+            &bincode::serialize(&Request::StartBenchmark {
+                target: StreamTarget::Full,
+                mode: BenchMode::Full,
+            })
+            .unwrap(),
+            1,
+            "Request::StartBenchmark",
+        );
+        lead(
+            &bincode::serialize(&Request::CancelBenchmark { run_id: 1 }).unwrap(),
+            2,
+            "Request::CancelBenchmark",
+        );
+        lead(
+            &bincode::serialize(&Request::StartBurnIn {
+                target: StreamTarget::Full,
+                duration_minutes: 0,
+            })
+            .unwrap(),
+            3,
+            "Request::StartBurnIn",
+        );
+        // The appended arm lands at the next discriminant (unit variant).
+        assert_eq!(
+            bincode::serialize(&Request::GetProbeReport).unwrap(),
+            4u32.to_le_bytes().to_vec(),
+            "Request::GetProbeReport must land at discriminant 4 (OQ-10 append)"
+        );
+
+        // --- Response: pre-existing discriminants unchanged. --------
+        let resp_lead = |r: &Response, disc: u32, name: &str| {
+            lead(&bincode::serialize(r).unwrap(), disc, name);
+        };
+        resp_lead(&Response::Telemetry(fixture_snapshot()), 0, "Response::Telemetry");
+        resp_lead(&Response::BenchStarted { run_id: 1 }, 1, "Response::BenchStarted");
+        resp_lead(
+            &Response::BenchProgress(StreamProgress {
+                cell_index: 0,
+                total_cells: 0,
+                tier: Tier::L1,
+                op: BenchOp::Read,
+                value: 0.0,
+                label: String::new(),
+            }),
+            2,
+            "Response::BenchProgress",
+        );
+        resp_lead(
+            &Response::BenchResult {
+                run_id: 1,
+                grid: BenchmarkGrid {
+                    read_gbps: [0.0; 4],
+                    write_gbps: [0.0; 4],
+                    copy_gbps: [0.0; 4],
+                    latency_ns: [0.0; 4],
+                },
+            },
+            3,
+            "Response::BenchResult",
+        );
+        resp_lead(&Response::BenchCancelled { run_id: 1 }, 4, "Response::BenchCancelled");
+        resp_lead(&Response::Error(String::new()), 5, "Response::Error");
+        resp_lead(
+            &Response::BurnInProgress(BurnInTick {
+                iteration: 0,
+                elapsed_secs: 0.0,
+                tier: Tier::L1,
+                bandwidth: None,
+                latency_ns: None,
+            }),
+            6,
+            "Response::BurnInProgress",
+        );
+        // The appended arm lands at the next discriminant.
+        let minimal_report = ProbeReport {
+            telemetry: fixture_snapshot(),
+            raw: None,
+            system: ProbeSystem {
+                cpu_brand: String::new(),
+                cpu_vendor: String::new(),
+                cpu_gen: String::new(),
+                pci_host_bridge: None,
+                kernel: String::new(),
+                os: String::new(),
+                arch: String::new(),
+                ramsleuth_version: String::new(),
+                telemetry_source: String::new(),
+            },
+        };
+        lead(
+            &bincode::serialize(&Response::ProbeReport(minimal_report)).unwrap(),
+            7,
+            "Response::ProbeReport",
+        );
     }
 }

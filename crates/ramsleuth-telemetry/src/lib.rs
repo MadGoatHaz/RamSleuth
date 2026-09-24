@@ -27,8 +27,11 @@ pub mod spd_decode; // P2-09 — pure SPD decode: JEP106 / rank / density / spee
 pub mod facade; // P2-10 — SystemMemoryTelemetry facade + collect() (per-branch containment).
 pub mod platform; // C6-01 — SystemPlatform: DMI + /proc sourced vendor-neutral branch (D-C1; per-field Na degradation).
 pub mod board_vrm; // C12-03 — DMI-keyed board VRM profiles + the nct6798 hwmon binder (board-specific Super I/O rails; graceful all-Na on unknown board).
+pub mod probe; // probe-1a — consent-gated "Submit Probe Report" wire types (ProbeReport/ProbeRaw/ProbeSystem; CRITICAL-PATH foundation).
 
 // P2-10: the crate's public snapshot API, re-exported at the root.
 pub use facade::{collect, SystemMemoryTelemetry};
 // C6-07: the C6-01 platform types, re-exported at the root.
 pub use platform::{SystemPlatform, mem_total_gib};
+pub use probe::{ProbeRaw, ProbeReport, ProbeSystem};
+
