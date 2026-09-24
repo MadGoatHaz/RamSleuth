@@ -110,8 +110,10 @@ fields simply show a structured `N/A (<reason>)` and every process exits 0.
 RamSleuth is a pure-Rust Cargo workspace (8 crates: 7 product crates + the
 `tools/gen-icon` dev tool), MIT-licensed, for x86_64 Linux. It is packaged for
 Arch Linux: a two-core AUR package model (`ramsleuth` source +
-`ramsleuth-bin` binary, plus the optional `ryzen-smu-dkms` (AMD) and
-`ramsleuth-intel-dkms` (Intel) vendor DKMS extras), a self-contained
+`ramsleuth-bin` binary — both of which bundle the in-repo `ramsleuth_intel`
+module source — plus the optional `ryzen-smu-dkms` (AMD) and
+`ramsleuth-intel-dkms` (Intel) vendor DKMS extras; the Intel extra is
+mutually exclusive with the two core packages), a self-contained
 one-command installer, and a plain `makepkg`/`cargo` path for building it
 yourself.
 
@@ -210,7 +212,9 @@ yay -S ramsleuth             # STABLE — the default recommendation
 yay -S ramsleuth-bin         # PRECOMPILED — the fastest install
 # optional vendor DKMS extras — install only the one matching your CPU:
 yay -S ryzen-smu-dkms        # AMD — live AMD subtimings (Section 2.5)
-yay -S ramsleuth-intel-dkms  # Intel — preferred live-Intel-subtimings source (Section 10.5)
+yay -S ramsleuth-intel-dkms  # Intel — the standalone provisioning extra (Section 10.5);
+                             # mutually exclusive with the two core packages
+                             # (they already bundle the Intel module source)
 ```
 
 The two **core** packages are deliberately distinct:
@@ -251,8 +255,12 @@ packages: `ryzen-smu-dkms` (AMD) — see
 [2.5](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings) — and
 `ramsleuth-intel-dkms` (Intel) — see
 [10.5](#105-intel-live-subtimings-the-ramsleuth_intel-module-optional).
-They are independent of the two core packages and install alongside
-whichever of them you use.
+The AMD extra is independent of the two core packages and installs
+alongside whichever of them you use; the Intel extra is **mutually
+exclusive** with the core packages (they share the bundled
+`/usr/share/ramsleuth-intel-dkms/src/` source tree, so pacman removes a
+core package first if you install it) — and since the cores already bundle
+that source, it is the standalone/redundant Intel path.
 
 ### 2.3 Manual install from a source checkout (`makepkg`)
 
@@ -1097,25 +1105,32 @@ box reports its true `Single-` / `Dual-Channel (…)` mode and the `Mode:`
 slot (`Interleaved` / `Flex`), not just the SPD-visible DIMM count.
 
 Three ways to get it (all build the **same in-repo** source,
-`kernel/ramsleuth-intel/`, vendored with the package — no network, unlike
-the AMD extra’s pinned clone):
+`kernel/ramsleuth-intel/` — the project's own original creation, shipped
+verbatim with the package, no network, unlike the AMD extra's pinned
+clone):
 
 1. **One-click, vendor-aware** — `sudo ramsleuth-setup --with-dkms` routes
    by CPU vendor: on an Intel host it hands off to the Intel helper (on AMD,
    to the AMD arm); `sudo ramsleuth-setup --with-intel-dkms` is the
    Intel-only fast path (a hard failure on non-Intel silicon). The GUI’s
-   SETUP strip offers the same one-click.
+   SETUP strip offers the same one-click. **On a bare AUR install of either
+   core package this is the complete path** — the package bundles the module
+   source, so no manual source step is needed.
 2. **The built-in helper** — every ramsleuth install ships
    **`sudo ramsleuth-install-intel-dkms`** (at
    `/usr/bin/ramsleuth-install-intel-dkms`): it verifies the matching kernel
    headers, resolves the source from the in-repo tree
    (`kernel/ramsleuth-intel/` in a dev checkout, the installed
-   `/usr/share/ramsleuth-intel-dkms/src/` copy from the AUR extra in a
-   package install), then `dkms add/build/install` + `modprobe` —
+   `/usr/share/ramsleuth-intel-dkms/src/` copy — bundled by the core AUR
+   packages (or the standalone extra) in a package install), then
+   `dkms add/build/install` + `modprobe` —
    **immediate, no reboot** — and persists the module for boot.
 3. **The AUR extra** — `yay -S ramsleuth-intel-dkms && sudo
    ramsleuth-intel-dkms-install`: the same helper, plus the module source
    shipped verbatim with the package, so the build is fully network-free.
+   **Mutually exclusive with the core packages** (installing it removes a
+   core package first — shared source-tree path), and since the cores
+   already bundle the source it is now the standalone/redundant Intel path.
    `AUTOINSTALL=yes` in the bundled `dkms.conf` rebuilds the module on
    kernel updates automatically.
 
@@ -1265,6 +1280,9 @@ icons, desktop entry, helper scripts, and polkit policy, and runs the
 ```sh
 yay -Rns ramsleuth        # or: ramsleuth-bin (whichever you have)
 yay -Rns ryzen-smu-dkms   # only if you installed the AMD extra
+yay -Rns ramsleuth-intel-dkms   # only if you installed the standalone Intel extra
+                              # (mutually exclusive with the core packages — you can only
+                              # have it *instead of* one of them, not alongside)
 ```
 
 **`install.sh` installs** — there is no package metadata, so remove the
@@ -1284,8 +1302,9 @@ sudo systemctl daemon-reload
 sudo rm /usr/bin/ramsleuth-daemon /usr/bin/ramsleuth-client /usr/bin/ramsleuth-tui \
         /usr/bin/ramsleuth /usr/bin/ramsleuth-bench /usr/bin/ramsleuth-telemetry
 
-# 4. Remove the helpers + the kept installer
-sudo rm /usr/bin/ramsleuth-setup /usr/bin/ramsleuth-install-ryzen-smu-dkms
+# 4. Remove the helpers (AMD + Intel) + the kept installer
+sudo rm /usr/bin/ramsleuth-setup /usr/bin/ramsleuth-install-ryzen-smu-dkms \
+        /usr/bin/ramsleuth-install-intel-dkms
 sudo rm -rf /usr/share/ramsleuth
 
 # 5. Remove the polkit policy
@@ -1313,6 +1332,17 @@ sudo rmmod ryzen_smu
 sudo dkms remove ryzen_smu/1.d298366   # the installed DKMS version (list with: dkms status)
 sudo rm /etc/modules-load.d/ryzen_smu.conf
 sudo rm -rf /usr/src/ryzen_smu-*
+```
+
+And if the **Intel `ramsleuth_intel` module** was installed, remove it:
+
+```sh
+sudo rmmod ramsleuth_intel
+sudo dkms remove ramsleuth_intel/2.4.0   # the installed DKMS version (list with: dkms status)
+sudo rm /etc/modules-load.d/ramsleuth_intel.conf
+sudo rm -rf /usr/src/ramsleuth_intel-*
+# and, if you had the standalone Intel extra (mutually exclusive with the core packages):
+sudo pacman -R ramsleuth-intel-dkms
 ```
 
 Files you create outside the install (e.g. TUI snapshot `.txt` files in

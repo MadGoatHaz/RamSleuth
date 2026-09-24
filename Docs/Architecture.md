@@ -1160,7 +1160,8 @@ feed **one** pure decode core:
 
 1. **primary — the `ramsleuth_intel` kernel module** (GPL-2.0, the project's
    own original work — no upstream project, no pin — in the in-repo
-   `kernel/ramsleuth-intel/` tree; provisioned by the `ramsleuth-intel-dkms`
+   `kernel/ramsleuth-intel/` tree; provisioned from the source bundled by
+   the main AUR packages — or by the standalone `ramsleuth-intel-dkms`
    extra, §12.5). It probes the host bridge at PCI `0000:00:00.0`, decodes
    the MCHBAR from config space, `ioremap`s the 64 KiB window, and publishes
    the raw IMC registers as **24 world-readable (`0444`) sysfs attributes**
@@ -1539,13 +1540,20 @@ reference): 6 binaries → `/usr/bin/`; the unit → `/usr/lib/systemd/system/`
 (+ preset); the `ramsleuth` group (idempotent `groupadd -r` in the `.install`
 hooks); the DKMS helper → `/usr/bin/ramsleuth-install-ryzen-smu-dkms`; the
 Intel DKMS helper → `/usr/bin/ramsleuth-install-intel-dkms` (guarded —
-skipped with a note in a pre-Intel checkout); the setup helper →
-`/usr/bin/ramsleuth-setup`; the polkit policy →
-`/usr/share/polkit-1/actions/`; and `install.sh` → `/usr/share/ramsleuth/`.
-`ramsleuth-protocol` is library-only and is never installed. Two optional
-DKMS extras provision the vendor kernel drivers — `ryzen-smu-dkms` (§12.4)
-and `ramsleuth-intel-dkms` (§12.5); neither is a dependency of the two
-packages, and neither conflicts with them.
+skipped with a note in a pre-Intel checkout); **the in-repo
+`ramsleuth_intel` source tree → `/usr/share/ramsleuth-intel-dkms/src/`**
+(guarded the same way — the exact path the Intel helper resolves, so the
+one-click Intel DKMS install works from a bare AUR install with no manual
+source step); the setup helper → `/usr/bin/ramsleuth-setup`; the polkit
+policy → `/usr/share/polkit-1/actions/`; and `install.sh` →
+`/usr/share/ramsleuth/`. `ramsleuth-protocol` is library-only and is never
+installed. Two optional DKMS extras provision the vendor kernel drivers —
+`ryzen-smu-dkms` (§12.4) and `ramsleuth-intel-dkms` (§12.5). The AMD extra
+is neither a dependency nor a conflict of the two packages (co-install-safe);
+the Intel extra is **mutually exclusive** with them (each declares the other
+in `conflicts=` — they share the bundled source-tree path) and is the
+standalone provisioning path, redundant for Intel once a main package is
+installed.
 
 ### 12.3 The `ramsleuth` group + ACL model
 
@@ -1602,19 +1610,28 @@ fallback remains available where unblocked. When present:
   tree (GPL-2.0 — a separate work from the MIT RamSleuth code, byte-verbatim,
   never compiled into any RamSleuth binary) — unlike the AMD extra's pinned
   `ryzen_smu` clone, there is no network and no upstream pin;
-- the AUR extra is a **thin provisioning package** (mirroring
+- **both main packages bundle that source tree** (to
+  `/usr/share/ramsleuth-intel-dkms/src/` — guarded like the Intel helper, so
+  a pre-2.4.0 tag / the published v2.2.1 tarball ships nothing and skips
+  cleanly), which is the exact path the helper resolves as its installed
+  copy: the **one-click Intel DKMS install works from a bare AUR install**
+  (either `ramsleuth` or `ramsleuth-bin`) with **no manual source step**;
+- the standalone AUR extra is a **thin provisioning package** (mirroring
   `ryzen-smu-dkms`): it ships the DKMS config, the operator helper, and the
   module source under `/usr/share/ramsleuth-intel-dkms/` — the module is
   **never built in the build chroot** (no matching kernel headers, and it
   would build against the chroot kernel, not the target's); the
   `dkms add` / `build` / `install` run on the **target** via the helper, and
   `AUTOINSTALL=yes` rebuilds the module on kernel updates;
-- the **helper is installed under two names** to stay co-install-safe:
+- the **helper is installed under two names**:
   `/usr/bin/ramsleuth-install-intel-dkms` (both `ramsleuth` packages +
   `install.sh`; the name `ramsleuth-setup --with-dkms` /
   `--with-intel-dkms` delegates to, §5.9) and
   `/usr/bin/ramsleuth-intel-dkms-install` (the standalone
-  `ramsleuth-intel-dkms` extra only);
+  `ramsleuth-intel-dkms` extra only); the distinct names kept the AMD extra
+  co-install-safe, but the Intel extra is now **mutually exclusive** with
+  the mains (shared `/usr/share/ramsleuth-intel-dkms/src/` path — installing
+  it removes a main package first);
 - the helper is **vendor-aware and non-Intel-safe**: on a non-Intel host
   (e.g. an AMD dev box) the module builds fine, `modprobe` leaves it idle
   (the module's vendor gate rejects with `-ENODEV` by design — no kobject),
