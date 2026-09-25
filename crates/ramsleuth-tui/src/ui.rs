@@ -40,8 +40,10 @@
 //! chain adds over these zones (TUI-10…16): the 3-line header, the
 //! settings strip (`settings.settings_open`), the requirements strip
 //! (`settings.requirements_open` — driven by the TUI-08 diagnose
-//! presence rule), and the graphs overlay (`settings.graphs_open`,
-//! drawn over the zone area from `graph`).
+//! presence rule), the graphs overlay (`settings.graphs_open`, drawn
+//! over the zone area from `graph`), and the probe-report overlay
+//! (`probe` — the consent / preview modal, chunk probe-4, drawn last
+//! + topmost over the whole frame from `crate::probe`).
 //!
 //! The semantic palette (Grand Design §3.2) is exact: values in cyan
 //! `#00D4FF`, warnings in amber `#FFB300`, N/A in grey `#8A8A94`,
@@ -72,6 +74,7 @@ use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
 use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
 
 use crate::graphs::GraphState;
+use crate::probe::ProbeOverlayState;
 
 // ---------------------------------------------------------------------------
 // Semantic palette (Grand Design §3.2, exact values).
@@ -219,7 +222,8 @@ impl Default for TuiSettings {
 /// P3-24's main loop builds it from `GetTelemetry` / benchmark frames
 /// behind an `Arc<RwLock<_>>` and calls [`render`] each tick; `Default` is
 /// the not-yet-connected state (no telemetry, idle bench, empty ring,
-/// default settings, no error) and renders pure placeholders.
+/// closed probe overlay, default settings, no error) and renders pure
+/// placeholders.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
     /// The latest telemetry snapshot (`None` before the first successful
@@ -241,6 +245,10 @@ pub struct AppState {
     pub graph: GraphState,
     /// The in-memory settings knobs (the `[t]` strip + the cycle keys).
     pub settings: TuiSettings,
+    /// The probe-report overlay (chunk probe-4 — the modal consent
+    /// prompt / markdown preview, drawn last + topmost by
+    /// [`render`]; `None` = closed, the dashboard renders normally).
+    pub probe: ProbeOverlayState,
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +352,13 @@ pub fn render(frame: &mut Frame, state: &AppState) {
             zone_area,
         );
     }
+
+    // The probe-report overlay (chunk probe-4): drawn last of all,
+    // topmost, over the whole frame (the same paint-order trick —
+    // the dashboard renders underneath first, the overlay wins the
+    // paint). It is modal: while open, the main loop routes keys to
+    // it (bypassing the global key table); `None` draws nothing.
+    crate::probe::render_probe_overlay(frame, &state.probe, area);
 }
 
 /// The shared zone decoration: a light-grey titled border on a slate
@@ -755,7 +770,7 @@ fn key_legend(budget: usize) -> String {
     const ENTRIES: &[&str] = &[
         "R refresh", "S snapshot", "Q quit", "B bench", "M memory", "X burn-in",
         "C cancel", "E export", "G graphs", "T settings", "D reqs", "P poll",
-        "U cap", "K clock", "A auto", "W window",
+        "U cap", "K clock", "A auto", "W window", "F probe-report",
     ];
     let mut text = String::new();
     for entry in ENTRIES {

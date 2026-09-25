@@ -32,6 +32,7 @@
 //! | `k` / `K`   | [`Action::ToggleClock`]        | toggle clock MHz ↔ GHz                         |
 //! | `a` / `A`   | [`Action::ToggleRefresh`]      | toggle refresh on ↔ off                        |
 //! | `w` / `W`   | [`Action::CycleWindow`]        | cycle graphs window (1 → 60 min)               |
+//! | `f` / `F`   | [`Action::ProbeReport`]        | consent → preview → file / clipboard (probe-4) |
 //!
 //! Everything else (other chars, `Esc`, `Enter`, arrows, function keys,
 //! mouse, resize) maps to `None` and is ignored — the terminal re-reads
@@ -41,10 +42,12 @@ use crossterm::event::{Event, KeyEvent, KeyCode};
 
 /// The user-facing TUI actions: the P3-22 trio (`Refresh`/`Snapshot`/
 /// `Quit`), the TUI-01 bench-class quartet (`BenchFull`/`BenchMemory`/
-/// `BurnIn`/`Cancel`), plus the TUI-02 view class (`ToggleGraphs`/
+/// `BurnIn`/`Cancel`), the TUI-02 view class (`ToggleGraphs`/
 /// `ToggleSettings`/`ToggleRequirements`/`ExportJson`/`CyclePoll`/
 /// `ToggleCapacity`/`ToggleClock`/`ToggleRefresh`/`CycleWindow`),
-/// additive per the TUI-parity plan.
+/// and the probe-report action (`ProbeReport`, chunk probe-4 — the
+/// consent-gated `GetProbeReport` fetch), additive per the
+/// TUI-parity plan.
 ///
 /// `Copy` so the P3-24 main loop can dispatch on owned values; the derived
 /// `Eq` keeps the dispatch a plain `match`.
@@ -82,14 +85,20 @@ pub enum Action {
     ToggleRefresh,
     /// Cycle the graphs window presets: 1 → 5 → 15 → 60 min (default 5).
     CycleWindow,
+    /// Gather the probe report (chunk probe-4): the one-shot
+    /// `GetProbeReport` fetch → the consent prompt → the markdown
+    /// preview (`[w]` write / `[c]` copy / `[q]` quit preview).
+    /// Bound to `f`/`F` — `r`/`R` is the frozen P3-22
+    /// `[R]`efresh key (the table is case-insensitive).
+    ProbeReport,
 }
 
 /// Pure key -> action mapping: the whole keybinding table in one function.
 ///
-/// Case-insensitive on the sixteen action keys (`r`/`s`/`q`/`b`/`m`/`x`/
-/// `c`/`g`/`t`/`d`/`e`/`p`/`u`/`k`/`a`/`w`); key modifiers are **ignored**
-/// (a `Ctrl`- or `Alt`-prefixed action char still maps — simple and
-/// deterministic, per the P3-22 scope boundary).
+/// Case-insensitive on the seventeen action keys (`r`/`s`/`q`/`b`/
+/// `m`/`x`/`c`/`g`/`t`/`d`/`e`/`p`/`u`/`k`/`a`/`w`/`f`); key modifiers
+/// are **ignored** (a `Ctrl`- or `Alt`-prefixed action char still
+/// maps — simple and deterministic, per the P3-22 scope boundary).
 /// Every other key (`Esc`, `Enter`, arrows, function keys, other chars)
 /// maps to `None`.
 ///
@@ -126,6 +135,7 @@ pub fn key_to_action(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('k') | KeyCode::Char('K') => Some(Action::ToggleClock),
         KeyCode::Char('a') | KeyCode::Char('A') => Some(Action::ToggleRefresh),
         KeyCode::Char('w') | KeyCode::Char('W') => Some(Action::CycleWindow),
+        KeyCode::Char('f') | KeyCode::Char('F') => Some(Action::ProbeReport),
         _ => None,
     }
 }
@@ -250,6 +260,7 @@ mod tests {
             Action::ToggleClock,
             Action::ToggleRefresh,
             Action::CycleWindow,
+            Action::ProbeReport,
         ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
@@ -321,6 +332,14 @@ mod tests {
         assert_eq!(key_to_action(key(KeyCode::Char('W'))), Some(Action::CycleWindow));
     }
 
+    // (t) 'f' / 'F' -> ProbeReport (chunk probe-4 — `r`/`R` stays
+    // the frozen P3-22 Refresh key; the table is case-insensitive)
+    #[test]
+    fn f_key_maps_to_probe_report() {
+        assert_eq!(key_to_action(key(KeyCode::Char('f'))), Some(Action::ProbeReport));
+        assert_eq!(key_to_action(key(KeyCode::Char('F'))), Some(Action::ProbeReport));
+    }
+
     // modifiers are ignored: every action key maps with any modifier set
     #[test]
     fn modifiers_are_ignored() {
@@ -341,6 +360,7 @@ mod tests {
             assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('k'), mods)), Some(Action::ToggleClock));
             assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('a'), mods)), Some(Action::ToggleRefresh));
             assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('w'), mods)), Some(Action::CycleWindow));
+            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('f'), mods)), Some(Action::ProbeReport));
         }
     }
 }

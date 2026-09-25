@@ -102,8 +102,19 @@
 //!   `$HOME/ramsleuth-export-<unix-ts>.json` (the CWD fallback when
 //!   `HOME` is unset, the GUI F3 rule) — one file write on the main
 //!   thread — and records the written path (or the failure, or the
-//!   no-telemetry hint) in the state the same transient way, and
-//!   `[Q]`uit breaks the loop.
+//!   no-telemetry hint) in the state the same transient way,
+//!   `[F]` probe-report (chunk probe-4) performs the consent-gated
+//!   `GetProbeReport` fetch on a fresh connection (one request —
+//!   not a telemetry poll) and, on a report, opens the modal
+//!   consent overlay (the chunk-2-rendered markdown rides along in
+//!   the state); while the overlay is open the main loop routes its
+//!   keys to it, bypassing the global key table — `[y]` moves the
+//!   markdown into the scrollable preview, `[n]`/`Esc` close it,
+//!   and in the preview `[w]` writes `~/.ramsleuth/probe-report.md`,
+//!   `[c]` copies to the clipboard (`wl-copy` / `xclip` / `xsel`),
+//!   and `[q]`/`Esc` return to the dashboard (a `[q]` there closes
+//!   the preview, it does not quit the TUI) — and `[Q]`uit breaks
+//!   the loop.
 //!
 //! **No-panic contract (plan D5):** errors never end the TUI — a daemon
 //! down, a timeout, a protocol violation, a draw failure, or an event
@@ -122,8 +133,11 @@
 //! the three zones from the live snapshot (values update every ~2 s,
 //! `[R]` forces one now, `[S]` writes `ramsleuth-tui-<unix-ts>.txt` in
 //! the CWD, `[E]` writes `ramsleuth-export-<unix-ts>.json` in `$HOME`
-//! (the CWD when `HOME` is unset), `[Q]` restores the terminal + exit
-//! 0); with no daemon the
+//! (the CWD when `HOME` is unset), `[F]` fetches the probe report
+//! (the consent prompt → the markdown preview → `[w]` writes
+//! `~/.ramsleuth/probe-report.md`, `[c]` copies to the clipboard,
+//! `[q]` returns to the dashboard), `[Q]` restores the terminal +
+//! exit 0); with no daemon the
 //! dashboard stays responsive and shows `disconnected` + the
 //! daemon-start hint.
 //!
@@ -151,6 +165,7 @@
 //!   [K]lock          toggle the clock units (MHz ↔ GHz)
 //!   [A]uto refresh   toggle the periodic data poll (on ↔ off)
 //!   [W]indow         cycle the graphs window (1 → 5 → 15 → 60 min)
+//!   [F] probe report  consent → preview → write/copy the report
 //! Exit codes: 0 quit, 1 terminal init failure, 2 usage error
 //! ```
 
@@ -165,18 +180,27 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::cursor::Show;
-use crossterm::event::Event;
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use ramsleuth_bench::{BenchmarkGrid, BenchOp, BurnInTick, StreamTarget, Tier};
 use ramsleuth_client::Client;
 use ramsleuth_protocol::{BenchMode, Request, Response, DEFAULT_SOCKET_PATH};
+use ramsleuth_telemetry::probe::render_probe_report_md;
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 use ramsleuth_tui::events;
+use ramsleuth_tui::probe::{
+    NoticeTone,
+    ProbeOverlayState,
+    copy_to_clipboard,
+    probe_report_default_path,
+    write_probe_report,
+};
 use ramsleuth_tui::{key_to_action, render, Action, AppState, BenchState};
 
 /// The poll interval's sane lower bound in milliseconds (the GUI
@@ -229,7 +253,7 @@ const BENCH_READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// literal: `concat!` only accepts literals, and the protocol freeze
 /// test pins the string.
 const USAGE: &str = concat!(
-    "ramsleuth-tui — the live terminal dashboard (16-key parity)\n",
+    "ramsleuth-tui — the live terminal dashboard (17-key parity)\n",
     "\n",
     "Usage: ramsleuth-tui [OPTIONS]\n",
     "\n",
@@ -254,6 +278,7 @@ const USAGE: &str = concat!(
     "  [K]lock          toggle the clock units (MHz ↔ GHz)\n",
     "  [A]uto refresh   toggle the periodic data poll (on ↔ off)\n",
     "  [W]indow         cycle the graphs window (1 → 5 → 15 → 60 min)\n",
+    "  [F] probe report  consent → preview → write/copy the report\n",
     "Exit codes: 0 quit, 1 terminal init failure, 2 usage error\n",
 );
 
@@ -1275,11 +1300,191 @@ fn write_export(state: &Arc<RwLock<AppState>>) {
 }
 
 // ------------------------------------------------------------------
-// TUI-22: the action dispatch — the frozen 16-key table (P3-22 +
-// TUI-01/02) over the shared state: the state-only actions (the
-// toggles, the cycles, the run keys, the cancel) mutate the state
-// and report no side effect; the I/O actions report the effect the
-// main loop performs with the lock released.
+// chunk probe-4: the probe-report flow — the one-shot
+// `GetProbeReport` fetch (the `[F]` key's I/O side effect) + the
+// modal overlay key handler (the consent keys, the preview keys,
+// the preview scroll).
+// ------------------------------------------------------------------
+
+/// The `[F]` probe-report fetch (chunk probe-4): a one-shot
+/// `GetProbeReport` over a fresh connection (the poller's
+/// one-connection-per-request precedent — the probe report is its
+/// own request class, not a telemetry poll): a
+/// `Response::ProbeReport` renders to markdown (chunk 2's
+/// `render_probe_report_md`) and opens the consent overlay (the
+/// submission is consent-gated — the `[y]` answer moves the
+/// markdown into the preview, no second fetch). Every failure class
+/// (daemon down, a structured daemon `Error`, a contract-violating
+/// frame, a transport error) is recorded in `state.error` — the
+/// no-panic contract (D5); the dashboard keeps running, the overlay
+/// never opens on a failed fetch.
+fn probe_report_fetch(socket: &Path, state: &Arc<RwLock<AppState>>) {
+    let mut client = match Client::connect(socket) {
+        Ok(client) => client,
+        Err(error) => {
+            state.write().unwrap().error = Some(error.to_string());
+            return;
+        }
+    };
+    match client.request(&Request::GetProbeReport) {
+        Ok(Response::ProbeReport(report)) => {
+            let markdown = render_probe_report_md(&report);
+            state.write().unwrap().probe = ProbeOverlayState::Consent { markdown };
+        }
+        Ok(Response::Error(message)) => {
+            // The daemon was reachable but rejected the request
+            // (a structured wire error, not a transport failure).
+            state.write().unwrap().error = Some(message);
+        }
+        Ok(_) => {
+            // Any other frame in reply to `GetProbeReport` violates
+            // the wire contract (probe reports reply only to
+            // `GetProbeReport`, chunk probe-1a): record it (D5).
+            state
+                .write()
+                .unwrap()
+                .error = Some("unexpected response to GetProbeReport".to_owned());
+        }
+        Err(error) => {
+            state.write().unwrap().error = Some(error.to_string());
+        }
+    }
+}
+
+/// The preview's markdown, when the overlay is in the preview phase
+/// (the `[w]`/`[c]` actions' guard — the consent phase has no write
+/// / copy): a one-time clone (an intentional action, never a
+/// per-keystroke cost).
+fn preview_markdown(state: &Arc<RwLock<AppState>>) -> Option<String> {
+    let app = state.read().unwrap();
+    match &app.probe {
+        ProbeOverlayState::Preview { markdown, .. } => Some(markdown.clone()),
+        _ => None,
+    }
+}
+
+/// Set the preview's transient notice line (the `[w]`/`[c]`
+/// outcome): the tone colors it (the render maps `Ok` → green,
+/// `Warn` → amber, `Error` → crimson); a closed overlay is a
+/// no-op (the callers' phase guard makes that unreachable — the
+/// fn stays total, D5).
+fn set_preview_notice(state: &Arc<RwLock<AppState>>, tone: NoticeTone, text: String) {
+    if let ProbeOverlayState::Preview { notice, .. } = &mut state.write().unwrap().probe {
+        *notice = Some((tone, text));
+    }
+}
+
+/// Scroll the preview's markdown by `delta` lines (the
+/// `Up`/`Down`/`PageUp`/`PageDown` keys): clamped to the probe
+/// module's `preview_max_scroll` over the current terminal `area`
+/// (the same layout the render draws) — a short markdown never
+/// scrolls, the end is never overshot.
+fn scroll_probe_preview(state: &Arc<RwLock<AppState>>, area: Rect, delta: i32) {
+    let (current, max) = {
+        let app = state.read().unwrap();
+        match &app.probe {
+            ProbeOverlayState::Preview { markdown, scroll, .. } => {
+                (*scroll, ramsleuth_tui::probe::preview_max_scroll(markdown, area))
+            }
+            _ => return,
+        }
+    };
+    let next = (i64::from(current) + i64::from(delta)).clamp(0, i64::from(max)) as u16;
+    if next != current {
+        if let ProbeOverlayState::Preview { scroll, .. } = &mut state.write().unwrap().probe {
+            *scroll = next;
+        }
+    }
+}
+
+/// The modal overlay's key handler (chunk probe-4): the consent
+/// keys (`[y]` → the preview, `[n]`/`Esc` → close), the preview
+/// keys (`[w]` → write `write_path`, `[c]` → the `clipboard`
+/// closure, `[q]`/`Esc` → close), and the preview scroll
+/// (`Up`/`Down`/`PageUp`/`PageDown` over `area`) — every other key
+/// (including `[f]` itself) is inert while the overlay is open.
+/// The caller (the main loop) routes a key here only while the
+/// overlay is open and bypasses the global key table (a `[q]` in
+/// the preview closes it — it does not quit the TUI).
+fn handle_probe_overlay_key(
+    key: KeyEvent,
+    state: &Arc<RwLock<AppState>>,
+    area: Rect,
+    write_path: &Path,
+    clipboard: &dyn Fn(&str) -> Result<String, String>,
+) {
+    match key.code {
+        // `[y]` (consent only): move the carried markdown into the
+        // preview (the one-time clone; a `[y]` in the preview is a
+        // no-op — the answer keys are consumed).
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let mut app = state.write().unwrap();
+            if let ProbeOverlayState::Consent { markdown } =
+                std::mem::replace(&mut app.probe, ProbeOverlayState::None)
+            {
+                app.probe = ProbeOverlayState::Preview { markdown, notice: None, scroll: 0 };
+            }
+        }
+        // `[n]` / `Esc` (both phases): cancel — close the overlay.
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            state.write().unwrap().probe = ProbeOverlayState::None;
+        }
+        // `[q]` (preview only): quit the preview to the dashboard
+        // (the consent phase has no `[q]` — its answer keys are
+        // `[y]`/`[n]`).
+        KeyCode::Char('q') | KeyCode::Char('Q') => {
+            let mut app = state.write().unwrap();
+            if matches!(app.probe, ProbeOverlayState::Preview { .. }) {
+                app.probe = ProbeOverlayState::None;
+            }
+        }
+        // `[w]` (preview only): write the report to `write_path`
+        // (the live loop passes `~/.ramsleuth/probe-report.md`; the
+        // tests pass a temp dir) — the outcome is the notice line.
+        KeyCode::Char('w') | KeyCode::Char('W') => {
+            let Some(markdown) = preview_markdown(state) else {
+                return;
+            };
+            let (tone, text) = match write_probe_report(write_path, &markdown) {
+                Ok(path) => (NoticeTone::Ok, format!("Report written to {}", path.display())),
+                Err(error) => (NoticeTone::Error, format!("write failed: {error}")),
+            };
+            set_preview_notice(state, tone, text);
+        }
+        // `[c]` (preview only): copy the report to the clipboard —
+        // the outcome (a success note naming the utility, or the
+        // fixed no-utility warning) is the notice line.
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            let Some(markdown) = preview_markdown(state) else {
+                return;
+            };
+            let (tone, text) = match clipboard(&markdown) {
+                Ok(note) => (NoticeTone::Ok, note),
+                Err(_) => (
+                    NoticeTone::Warn,
+                    "No clipboard utility found — use [w] to write to file".to_owned(),
+                ),
+            };
+            set_preview_notice(state, tone, text);
+        }
+        // The preview scroll (the `area` clamp — the render's
+        // layout).
+        KeyCode::Up => scroll_probe_preview(state, area, -1),
+        KeyCode::Down => scroll_probe_preview(state, area, 1),
+        KeyCode::PageUp => scroll_probe_preview(state, area, -10),
+        KeyCode::PageDown => scroll_probe_preview(state, area, 10),
+        // Every other key is inert while the overlay is open.
+        _ => {}
+    }
+}
+
+// ------------------------------------------------------------------
+// TUI-22 + chunk probe-4: the action dispatch — the frozen 17-key
+// table (P3-22 + TUI-01/02 + the probe-report action) over the
+// shared state: the state-only actions (the toggles, the cycles,
+// the run keys, the cancel) mutate the state and report no side
+// effect; the I/O actions report the effect the main loop performs
+// with the lock released.
 // ------------------------------------------------------------------
 
 /// The I/O side effect one dispatched action asks the main loop to
@@ -1297,6 +1502,9 @@ enum SideEffect {
     Snapshot,
     /// `[E]`: write the JSON export to `$HOME` (the CWD fallback).
     Export,
+    /// `[F]`: fetch the probe report (one RPC on a fresh
+    /// connection) + open the consent overlay (chunk probe-4).
+    ProbeReport,
     /// `[Q]`: quit the TUI (exit 0).
     Quit,
 }
@@ -1386,7 +1594,8 @@ fn bench_cmd(action: Action) -> Option<TuiBenchCmd> {
 /// cancel flag; the I/O actions return their effect for the loop to
 /// perform with the lock released: `[R]` → [`SideEffect::Refresh`],
 /// `[S]` → [`SideEffect::Snapshot`], `[E]` → [`SideEffect::Export`],
-/// `[Q]` → [`SideEffect::Quit`].
+/// `[F]` → [`SideEffect::ProbeReport`], `[Q]` →
+/// [`SideEffect::Quit`].
 fn dispatch_action(
     action: Action,
     state: &mut AppState,
@@ -1423,6 +1632,7 @@ fn dispatch_action(
             SideEffect::None
         }
         Action::ExportJson => SideEffect::Export,
+        Action::ProbeReport => SideEffect::ProbeReport,
         Action::ToggleGraphs => {
             state.settings.graphs_open = !state.settings.graphs_open;
             SideEffect::None
@@ -1563,6 +1773,34 @@ fn run(args: TuiArgs) -> ExitCode {
 
         match events::poll_event(POLL_TIMEOUT) {
             Ok(Some(Event::Key(key))) => {
+                // The modal probe-report overlay (chunk probe-4):
+                // while one is open, it consumes the key (the
+                // global key table below is bypassed — a `[q]` in
+                // the preview closes it, it does not quit the TUI;
+                // `[f]` does not re-fetch).
+                if state.read().unwrap().probe.is_open() {
+                    // The overlay's key handler takes the
+                    // terminal's area (the scroll clamp's layout —
+                    // the render draws the preview into the same
+                    // whole-frame rect); a failed size read
+                    // degrades to a zero rect (the clamp is total,
+                    // D5).
+                    let area = terminal
+                        .size()
+                        .map(|s| Rect::new(0, 0, s.width, s.height))
+                        .unwrap_or(Rect::new(0, 0, 0, 0));
+                    handle_probe_overlay_key(
+                        key,
+                        &state,
+                        area,
+                        &probe_report_default_path(),
+                        &copy_to_clipboard,
+                    );
+                    // The overlay consumed the key: skip the global
+                    // dispatch this tick (the next draw shows the
+                    // overlay's update).
+                    continue;
+                }
                 if let Some(action) = key_to_action(key) {
                     // The action's state mutations (the toggles, the
                     // cycles, the run-key channel sends, the cancel
@@ -1599,6 +1837,12 @@ fn run(args: TuiArgs) -> ExitCode {
                         // state (transient, as the `[S]`napshot
                         // path).
                         SideEffect::Export => write_export(&state),
+                        // `[F]`: fetch the probe report (one RPC on
+                        // a fresh connection) + open the consent
+                        // overlay (chunk probe-4 — the preview is
+                        // gated on the user's `[y]`; the overlay
+                        // keys are consumed modal-style above).
+                        SideEffect::ProbeReport => probe_report_fetch(&args.socket, &state),
                         // `[Q]`: stop the updater, break, restore
                         // the terminal (guard drop), exit 0.
                         SideEffect::Quit => {
@@ -4151,9 +4395,9 @@ mod tests {
         assert!(cancel.load(Ordering::Relaxed), "the `[c]` key set the shared cancel flag");
     }
 
-    /// (bq) Every one of the 16 actions dispatches a defined effect
+    /// (bq) Every one of the 17 actions dispatches a defined effect
     /// (the no-op placeholder arms are gone — the plan's exit
-    /// criterion): the three I/O actions report their side effect,
+    /// criterion): the four I/O actions report their side effect,
     /// `[Q]`uit reports the break, and the ten state-only actions
     /// (the five toggles, the two cycles, the three run keys, the
     /// cancel) mutate the state and report `SideEffect::None`.
@@ -4181,15 +4425,20 @@ mod tests {
             (Action::ToggleClock, SideEffect::None),
             (Action::ToggleRefresh, SideEffect::None),
             (Action::CycleWindow, SideEffect::None),
+            (Action::ProbeReport, SideEffect::ProbeReport),
         ];
-        assert_eq!(expected.len(), 16, "the full frozen table (P3-22 + TUI-01/02)");
+        assert_eq!(
+            expected.len(),
+            17,
+            "the full frozen table (P3-22 + TUI-01/02 + chunk probe-4)"
+        );
         for (action, side_effect) in expected {
             let side = dispatch_action(action, &mut state, &mut dismissed, &tx, &cancel);
             assert_eq!(side, side_effect, "{action:?} must dispatch its defined effect");
         }
     }
 
-    /// (br) The USAGE text carries the full 16-key table (plan
+    /// (br) The USAGE text carries the full 17-key table (plan
     /// §2.2) + the unchanged exit-code note — the `--help`-style
     /// surface of the parity dashboard.
     #[test]
@@ -4211,6 +4460,7 @@ mod tests {
             "[K]lock",
             "[A]uto refresh",
             "[W]indow",
+            "[F] probe report",
         ] {
             assert!(USAGE.contains(entry), "the USAGE must list {entry}");
         }
@@ -4220,4 +4470,359 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // chunk probe-4: the probe-report fetch + the modal overlay keys.
+    // ------------------------------------------------------------------
+
+    /// A probe-report fixture (host-independent — the chunk-1a wire
+    /// shapes; the assertions target the renderer's header, not its
+    /// full body).
+    fn probe_fixture() -> ramsleuth_telemetry::ProbeReport {
+        ramsleuth_telemetry::ProbeReport {
+            telemetry: mock_snapshot(),
+            raw: None,
+            system: ramsleuth_telemetry::ProbeSystem {
+                cpu_brand: "TUI Test CPU".to_owned(),
+                cpu_vendor: "unknown".to_owned(),
+                cpu_gen: "Unknown".to_owned(),
+                pci_host_bridge: None,
+                kernel: "6.6.0-test".to_owned(),
+                os: "Linux / Test".to_owned(),
+                arch: "x86_64".to_owned(),
+                ramsleuth_version: "2.4.0".to_owned(),
+                telemetry_source: "unavailable".to_owned(),
+            },
+        }
+    }
+
+    /// A unique temp dir (pid-qualified — parallel test runs never
+    /// collide; removed best-effort on drop, the `TempSocket`
+    /// precedent).
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("ramsleuth-tui-probe-{name}-{}", process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("test dir must create");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// One plain (no-modifier) key event (the events.rs helper shape).
+    fn overlay_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// (ps) The fetch against a stand-in that answers
+    /// `GetProbeReport` with a canned report opens the consent
+    /// overlay with the rendered markdown (the `[y]` move needs no
+    /// second fetch — the markdown rides the state).
+    #[test]
+    fn probe_report_fetch_opens_consent_overlay() {
+        let sock = TempSocket::new("probe-fetch");
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetProbeReport)) => {}
+                other => panic!("stand-in expected GetProbeReport, got {other:?}"),
+            }
+            let bytes =
+                encode_frame(&Message::Response(Response::ProbeReport(probe_fixture())))
+                    .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+
+        let state = Arc::new(RwLock::new(AppState::default()));
+        probe_report_fetch(sock.path(), &state);
+
+        let app = state.read().unwrap();
+        match &app.probe {
+            ProbeOverlayState::Consent { markdown } => {
+                assert!(markdown.starts_with("# RamSleuth Probe Report"), "{markdown}");
+                assert!(markdown.contains("TUI Test CPU"), "{markdown}");
+            }
+            other => panic!("the consent overlay must open, got {other:?}"),
+        }
+        assert!(app.error.is_none(), "a successful fetch must not record an error");
+        stand_in.join();
+    }
+
+    /// (pt) The fetch against a missing socket records the friendly
+    /// error (the `DaemonDown` hint) and never opens the overlay
+    /// (D5).
+    #[test]
+    fn probe_report_fetch_missing_socket_never_opens_overlay() {
+        let sock = TempSocket::new("probe-missing");
+        let state = Arc::new(RwLock::new(AppState::default()));
+        probe_report_fetch(sock.path(), &state);
+        let app = state.read().unwrap();
+        assert_eq!(app.probe, ProbeOverlayState::None, "no overlay on a failed fetch");
+        let error = app.error.clone().expect("a friendly error must be recorded");
+        assert!(error.contains("daemon not running"), "{error}");
+    }
+
+    /// (pu) A contract-violating reply (a `Telemetry` frame to
+    /// `GetProbeReport`) records the structured error, never the
+    /// overlay (D5).
+    #[test]
+    fn probe_report_fetch_contract_violation_records_error() {
+        let sock = TempSocket::new("probe-violation");
+        let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetProbeReport)) => {}
+                other => panic!("stand-in expected GetProbeReport, got {other:?}"),
+            }
+            let bytes =
+                encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                    .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+        let state = Arc::new(RwLock::new(AppState::default()));
+        probe_report_fetch(sock.path(), &state);
+        let app = state.read().unwrap();
+        assert_eq!(app.probe, ProbeOverlayState::None, "no overlay on a contract violation");
+        assert_eq!(app.error.as_deref(), Some("unexpected response to GetProbeReport"));
+        stand_in.join();
+    }
+
+    /// (pv) The consent keys: `[n]` closes; every other key
+    /// (including `[q]` and `[f]`) leaves the consent open (the
+    /// consent's answer keys are `[y]`/`[n]`).
+    #[test]
+    fn overlay_consent_keys() {
+        let dir = TempDir::new("overlay-consent");
+        let area = Rect::new(0, 0, 80, 24);
+        let no_clip = |_: &str| Ok("copied".to_owned());
+
+        let state = Arc::new(RwLock::new(AppState {
+            probe: ProbeOverlayState::Consent { markdown: "# the report".to_owned() },
+            ..Default::default()
+        }));
+        handle_probe_overlay_key(
+            overlay_key(KeyCode::Char('q')),
+            &state,
+            area,
+            &dir.path,
+            &no_clip,
+        );
+        assert!(
+            matches!(state.read().unwrap().probe, ProbeOverlayState::Consent { .. }),
+            "[q] must not close the consent"
+        );
+        handle_probe_overlay_key(
+            overlay_key(KeyCode::Char('f')),
+            &state,
+            area,
+            &dir.path,
+            &no_clip,
+        );
+        assert!(
+            matches!(state.read().unwrap().probe, ProbeOverlayState::Consent { .. }),
+            "[f] must not close the consent"
+        );
+        handle_probe_overlay_key(
+            overlay_key(KeyCode::Char('n')),
+            &state,
+            area,
+            &dir.path,
+            &no_clip,
+        );
+        assert_eq!(
+            state.read().unwrap().probe,
+            ProbeOverlayState::None,
+            "[n] must close the consent"
+        );
+    }
+
+    /// (pw) `[y]` on the consent moves the carried markdown into the
+    /// preview (scroll 0, no notice) — no second fetch.
+    #[test]
+    fn overlay_consent_yes_opens_preview() {
+        let dir = TempDir::new("overlay-yes");
+        let area = Rect::new(0, 0, 80, 24);
+        let state = Arc::new(RwLock::new(AppState {
+            probe: ProbeOverlayState::Consent { markdown: "# the report".to_owned() },
+            ..Default::default()
+        }));
+        handle_probe_overlay_key(
+            overlay_key(KeyCode::Char('y')),
+            &state,
+            area,
+            &dir.path,
+            &|_: &str| Ok("copied".to_owned()),
+        );
+        let app = state.read().unwrap();
+        match &app.probe {
+            ProbeOverlayState::Preview { markdown, notice, scroll } => {
+                assert_eq!(markdown, "# the report", "the carried markdown must move over");
+                assert!(notice.is_none(), "the preview opens with no notice");
+                assert_eq!(*scroll, 0, "the preview opens at the top");
+            }
+            other => panic!("the preview must open, got {other:?}"),
+        }
+    }
+
+    /// (px) The preview `[w]`: writes the markdown to `write_path`
+    /// (the test's temp dir — the live default path is never
+    /// touched) + records the green success notice; `[q]` closes
+    /// the preview.
+    #[test]
+    fn overlay_preview_write_and_quit() {
+        let dir = TempDir::new("overlay-write");
+        let path = dir.path.join(".ramsleuth").join("probe-report.md");
+        let area = Rect::new(0, 0, 80, 24);
+        let state = Arc::new(RwLock::new(AppState {
+            probe: ProbeOverlayState::Preview {
+                markdown: "the markdown".to_owned(),
+                notice: None,
+                scroll: 0,
+            },
+            ..Default::default()
+        }));
+        let no_clip = |_: &str| Ok("copied".to_owned());
+        handle_probe_overlay_key(
+            overlay_key(KeyCode::Char('w')),
+            &state,
+            area,
+            &path,
+            &no_clip,
+        );
+        let back = std::fs::read_to_string(&path).expect("the report must be written");
+        assert_eq!(back, "the markdown", "the markdown must land verbatim");
+        handle_probe_overlay_key(
+            overlay_key(KeyCode::Char('q')),
+            &state,
+            area,
+            &path,
+            &no_clip,
+        );
+        assert_eq!(
+            state.read().unwrap().probe,
+            ProbeOverlayState::None,
+            "[q] must close the preview"
+        );
+    }
+    /// (py) The preview `[c]`: a clipboard success records the
+    /// success notice; a failure (the no-utility class) records the
+    /// fixed "use [w]" warning — the markdown and the overlay
+    /// survive (D5).
+    #[test]
+    fn overlay_preview_copy_outcomes() {
+        let dir = TempDir::new("overlay-copy");
+        let area = Rect::new(0, 0, 80, 24);
+
+        let state = Arc::new(RwLock::new(AppState {
+            probe: ProbeOverlayState::Preview {
+                markdown: "md".to_owned(),
+                notice: None,
+                scroll: 0,
+            },
+            ..Default::default()
+        }));
+        handle_probe_overlay_key(
+            overlay_key(KeyCode::Char('c')),
+            &state,
+            area,
+            &dir.path,
+            &|md: &str| {
+                assert_eq!(md, "md", "the preview markdown is the clipboard payload");
+                Ok("Copied to clipboard (wl-copy)".to_owned())
+            },
+        );
+        let app = state.read().unwrap();
+        match &app.probe {
+            ProbeOverlayState::Preview { notice: Some((tone, text)), .. } => {
+                assert_eq!(*tone, NoticeTone::Ok);
+                assert_eq!(text, "Copied to clipboard (wl-copy)");
+            }
+            other => panic!("the preview must stay open after [c], got {other:?}"),
+        }
+
+        let state = Arc::new(RwLock::new(AppState {
+            probe: ProbeOverlayState::Preview {
+                markdown: "md".to_owned(),
+                notice: None,
+                scroll: 0,
+            },
+            ..Default::default()
+        }));
+        handle_probe_overlay_key(
+            overlay_key(KeyCode::Char('c')),
+            &state,
+            area,
+            &dir.path,
+            &|_: &str| Err("no clipboard utility found".to_owned()),
+        );
+        let app = state.read().unwrap();
+        match &app.probe {
+            ProbeOverlayState::Preview { notice: Some((tone, text)), .. } => {
+                assert_eq!(*tone, NoticeTone::Warn, "no utility is a warning, not a failure");
+                assert_eq!(text, "No clipboard utility found — use [w] to write to file");
+            }
+            other => panic!("the preview must stay open after [c], got {other:?}"),
+        }
+    }
+
+    /// (pz) The preview scroll: clamped to `lines − visible` over
+    /// the passed `area` (the render's layout) — the end is never
+    /// overshot, the top never undershot.
+    #[test]
+    fn overlay_preview_scroll_clamps() {
+        let dir = TempDir::new("overlay-scroll");
+        // 14 rows: the borders (2) + the footer (2) leave 10 visible.
+        let area = Rect::new(0, 0, 80, 14);
+        let markdown: String = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let state = Arc::new(RwLock::new(AppState {
+            probe: ProbeOverlayState::Preview { markdown, notice: None, scroll: 0 },
+            ..Default::default()
+        }));
+        let no_clip = |_: &str| Ok("copied".to_owned());
+
+        for _ in 0..15 {
+            handle_probe_overlay_key(
+                overlay_key(KeyCode::Down),
+                &state,
+                area,
+                &dir.path,
+                &no_clip,
+            );
+        }
+        assert_eq!(scroll_of(&state), 10, "the scroll must clamp at max (20 − 10)");
+        handle_probe_overlay_key(
+            overlay_key(KeyCode::Down),
+            &state,
+            area,
+            &dir.path,
+            &no_clip,
+        );
+        assert_eq!(scroll_of(&state), 10, "the end must never be overshot");
+        for _ in 0..15 {
+            handle_probe_overlay_key(overlay_key(KeyCode::Up), &state, area, &dir.path, &no_clip);
+        }
+        assert_eq!(scroll_of(&state), 0, "the top must never be undershot");
+        handle_probe_overlay_key(overlay_key(KeyCode::Up), &state, area, &dir.path, &no_clip);
+        assert_eq!(scroll_of(&state), 0, "the top must never be undershot");
+    }
+
+    /// The current preview scroll offset (the test assertion helper;
+    /// panics if the overlay is not in the preview phase).
+    fn scroll_of(state: &Arc<RwLock<AppState>>) -> u16 {
+        let app = state.read().unwrap();
+        match &app.probe {
+            ProbeOverlayState::Preview { scroll, .. } => *scroll,
+            other => panic!("the preview must stay open, got {other:?}"),
+        }
+    }
 }
