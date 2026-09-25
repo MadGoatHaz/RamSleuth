@@ -445,53 +445,61 @@ enum HeaderAction {
 }
 
 /// The consent-gated "Submit Probe Report" flow state (chunk probe-3):
-/// the lifecycle of the two modal dialogs.
+/// the lifecycle of the two modal dialogs. There is no terminal state
+/// — every closing path ([Cancel] in either dialog, [Open GitHub
+/// Issue], [Copy to Clipboard], Esc) returns to `Idle`, so the
+/// header's "Probe" button is always re-openable.
 ///
 /// - `Idle` — no probe flow in progress (the default).
 /// - `Consent` — the consent dialog is open (the "Probe" button was
-///   clicked; [Allow] hands the request to the poller, [Cancel]
-///   returns here).
+///   clicked; [Allow] hands the request to the poller, [Cancel] /
+///   Esc return here).
 /// - `Preview(md)` — the rendered report markdown is shown in the
 ///   preview dialog ([Open GitHub Issue] / [Copy to Clipboard] /
-///   [Cancel]).
-/// - `Done` — the report was submitted (the flow is complete; no
-///   dialog renders).
+///   [Cancel] / Esc all return to `Idle`).
 #[derive(Debug, Clone, PartialEq, Default)]
 enum ProbeState {
     #[default]
     Idle,
     Consent,
     Preview(String),
-    Done,
 }
 
 /// One user event on the probe-flow state machine (chunk probe-3):
-/// the pure transitions the consent / preview dialog buttons and the
-/// header's "Probe" button apply.
+/// the pure transitions the consent / preview dialog buttons, the
+/// modal's Esc dismiss, and the header's "Probe" button apply. Every
+/// closing event returns to `Idle` (the machine has no terminal
+/// state — the flow is always re-openable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeEvent {
     /// The header's "Probe" button (Idle → Consent).
     Open,
-    /// The consent dialog's [Cancel] (Consent → Idle).
+    /// The consent dialog's [Cancel] / Esc (Consent → Idle).
     CancelConsent,
-    /// The preview dialog's [Cancel] (Preview → Idle).
+    /// The preview dialog's [Cancel] / Esc (Preview → Idle).
     CancelPreview,
-    /// The preview dialog's [Open GitHub Issue] (Preview → Done).
+    /// The preview dialog's [Copy to Clipboard] (Preview → Idle).
+    Copy,
+    /// The preview dialog's [Open GitHub Issue] (Preview → Idle).
     Submit,
 }
 
 impl ProbeState {
     /// Apply one user event (pure): `Open` (Idle → Consent),
-    /// `CancelConsent` (Consent → Idle), `CancelPreview` (Preview →
-    /// Idle), `Submit` (Preview → Done). An event outside its expected
-    /// state is a no-op (the state machine is total — never a panic).
+    /// `CancelConsent` (Consent → Idle), and the preview dialog's
+    /// closers `CancelPreview` / `Copy` / `Submit` (Preview → Idle).
+    /// Every closing path resets the flow to `Idle` (the machine has
+    /// no terminal state — the header's Probe button is always
+    /// re-openable). An event outside its expected state is a no-op
+    /// (the state machine is total — never a panic).
     fn apply(&mut self, event: ProbeEvent) {
         let this = &*self;
         match (this, event) {
             (ProbeState::Idle, ProbeEvent::Open) => *self = ProbeState::Consent,
             (ProbeState::Consent, ProbeEvent::CancelConsent) => *self = ProbeState::Idle,
             (ProbeState::Preview(_), ProbeEvent::CancelPreview) => *self = ProbeState::Idle,
-            (ProbeState::Preview(_), ProbeEvent::Submit) => *self = ProbeState::Done,
+            (ProbeState::Preview(_), ProbeEvent::Copy) => *self = ProbeState::Idle,
+            (ProbeState::Preview(_), ProbeEvent::Submit) => *self = ProbeState::Idle,
             _ => {}
         }
     }
@@ -632,8 +640,9 @@ struct RamSleuthApp {
     restart_prompt_dismissed: bool,
     /// The consent-gated "Submit Probe Report" flow state (chunk
     /// probe-3): `Idle` → (the header's Probe button) `Consent` →
-    /// (the poller lands the report) `Preview(md)` → ([Cancel] /
-    /// [Open GitHub Issue]) `Idle` / `Done`.
+    /// (the poller lands the report) `Preview(md)` → (any closing
+    /// path: [Cancel] / [Copy to Clipboard] / [Open GitHub Issue] /
+    /// Esc) `Idle` — no terminal state, the flow is re-openable.
     probe_state: ProbeState,
     /// The pre-filled GitHub issue title for the current probe report
     /// (chunk probe-3): `[Probe] <cpu_brand> · <cpu_gen> · <os> ·
@@ -795,6 +804,31 @@ impl eframe::App for RamSleuthApp {
                     self.handle_action(ctx, keyed_action);
                 }
             }
+        }
+
+        // The probe-flow modal's Esc dismiss (the TUI's close
+        // contract): a fresh, non-repeated Esc key-down while the
+        // probe dialog is open closes it (Consent / Preview → Idle —
+        // every closing path resets the flow, the Probe button is
+        // re-openable). The modal blocks the key legend above; the
+        // probe modal is topmost (it renders last), so it takes the
+        // Esc over the setup prompt.
+        if probe_open
+            && ctx.input(|i| {
+                i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            pressed: true,
+                            repeat: false,
+                            ..
+                        }
+                    )
+                })
+            })
+        {
+            self.handle_probe_esc();
         }
 
         // The Graphs window's telemetry lifecycle (C9-02, D-2): the
@@ -1722,6 +1756,20 @@ impl RamSleuthApp {
         }
     }
 
+    /// The probe-flow modal's Esc dismiss (the TUI's close contract):
+    /// close the open probe dialog — Consent / Preview → Idle (every
+    /// closing path resets the flow, so the header's Probe button is
+    /// re-openable without a restart). A no-op when no probe dialog
+    /// is open.
+    fn handle_probe_esc(&mut self) {
+        self.probe_state
+            .apply(if matches!(self.probe_state, ProbeState::Consent) {
+                ProbeEvent::CancelConsent
+            } else {
+                ProbeEvent::CancelPreview
+            });
+    }
+
     /// The consent dialog (chunk probe-3): the modal pattern of
     /// [`Self::render_setup_complete_dialog`] — two topmost
     /// (`Order::Foreground`) areas, the dimmed full-screen block
@@ -1731,7 +1779,7 @@ impl RamSleuthApp {
     /// disclosure of what the report collects + the no-PII note;
     /// [Allow] (the primary CYAN fill) hands the request to the
     /// poller (the render thread's one probe write, no I/O — D6),
-    /// [Cancel] returns to `Idle`. While the poller is fetching
+    /// [Cancel] / Esc return to `Idle`. While the poller is fetching
     /// (`probe_result == Pending`), a spinner shows and the buttons
     /// stay inert.
     fn render_probe_consent_dialog(&mut self, ctx: &egui::Context) {
@@ -1823,9 +1871,10 @@ impl RamSleuthApp {
     /// `issues/new` URL (the title only — the body would exceed
     /// GitHub's issue-form limit, the 404) in the OS browser,
     /// flashes the "paste it into the issue body" notice in the
-    /// header, + moves the flow to `Done`; [Copy to Clipboard]
-    /// copies the markdown (the dialog stays open); [Cancel]
-    /// returns to `Idle`.
+    /// header, + returns the flow to `Idle`; [Copy to Clipboard]
+    /// copies the markdown + returns to `Idle`; [Cancel] / Esc
+    /// return to `Idle`. Every closing path resets the flow — the
+    /// header's Probe button is re-openable without a restart.
     fn render_probe_preview_dialog(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
         egui::Area::new(egui::Id::new("ramsleuth_probe_preview_block"))
@@ -1892,7 +1941,9 @@ impl RamSleuthApp {
                                 // the clipboard, open the
                                 // pre-filled (title-only) GitHub
                                 // issue, flash the paste notice,
-                                // end the flow.
+                                // return the flow to `Idle` (the
+                                // dialog closes — the Probe button
+                                // is re-openable).
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -1922,10 +1973,13 @@ impl RamSleuthApp {
                                     }
                                     self.probe_state.apply(ProbeEvent::Submit);
                                 }
-                                // Secondary: copy the markdown (the
-                                // dialog stays open).
+                                // Secondary: copy the markdown +
+                                // return to `Idle` (the dialog
+                                // closes — the Probe button is
+                                // re-openable).
                                 if ui.add(egui::Button::new("Copy to Clipboard")).clicked() {
                                     ctx.copy_text(md.clone());
+                                    self.probe_state.apply(ProbeEvent::Copy);
                                 }
                                 // Tertiary (the `Got it` precedent):
                                 // plain — return to `Idle`.
@@ -4187,9 +4241,11 @@ mod tests {
     /// `Idle → Consent → Preview → Idle` chain — the header's Probe
     /// button opens the consent, the poller's landed report renders
     /// the preview (the markdown + the title, the slot consumed), and
-    /// [Cancel] closes — plus the `Submit` → `Done` arm, the
-    /// `CancelConsent` → `Idle` arm, and the `Err` → `Idle` + notice
-    /// arm. Out-of-state events are no-ops.
+    /// [Cancel] closes — plus the `Submit` → `Idle` arm, the
+    /// `Copy` → `Idle` arm, the `CancelConsent` → `Idle` arm, and
+    /// the `Err` → `Idle` + notice arm. Every closing path returns
+    /// to `Idle` (no terminal state — the flow is re-openable);
+    /// out-of-state events are no-ops.
     #[test]
     fn probe_state_machine_transitions() {
         // The full consent → preview → idle chain, driven through the
@@ -4231,12 +4287,21 @@ mod tests {
 
         fs::remove_dir_all(out_dir).expect("cleanup");
 
-        // The `Submit` arm: Preview → Done.
+        // The `Submit` arm: Preview → Idle (the flow is re-openable
+        // — no terminal state).
         let mut app = probe_test_app("probe-submit");
         let out_dir = app.out_dir.clone();
         app.probe_state = ProbeState::Preview("md".to_owned());
         app.probe_state.apply(ProbeEvent::Submit);
-        assert_eq!(app.probe_state, ProbeState::Done);
+        assert_eq!(app.probe_state, ProbeState::Idle);
+        fs::remove_dir_all(out_dir).expect("cleanup");
+
+        // The `Copy` arm: Preview → Idle.
+        let mut app = probe_test_app("probe-copy");
+        let out_dir = app.out_dir.clone();
+        app.probe_state = ProbeState::Preview("md".to_owned());
+        app.probe_state.apply(ProbeEvent::Copy);
+        assert_eq!(app.probe_state, ProbeState::Idle);
         fs::remove_dir_all(out_dir).expect("cleanup");
 
         // The `CancelConsent` arm: Consent → Idle.
@@ -4273,11 +4338,45 @@ mod tests {
         let mut s = ProbeState::Idle;
         s.apply(ProbeEvent::CancelPreview);
         assert_eq!(s, ProbeState::Idle);
+        s.apply(ProbeEvent::Copy);
+        assert_eq!(s, ProbeState::Idle);
         s.apply(ProbeEvent::Submit);
         assert_eq!(s, ProbeState::Idle);
         let mut s = ProbeState::Consent;
         s.apply(ProbeEvent::Open);
         assert_eq!(s, ProbeState::Consent);
+        s.apply(ProbeEvent::CancelPreview);
+        assert_eq!(s, ProbeState::Consent);
+        s.apply(ProbeEvent::Copy);
+        assert_eq!(s, ProbeState::Consent);
+        s.apply(ProbeEvent::Submit);
+        assert_eq!(s, ProbeState::Consent);
+    }
+
+    /// (q1b) The probe modal's Esc dismiss (the TUI's close
+    /// contract): Consent and Preview both close to `Idle`; with no
+    /// probe dialog open the handler is a no-op.
+    #[test]
+    fn handle_probe_esc_closes_the_open_modal() {
+        let mut app = probe_test_app("probe-esc-consent");
+        let out_dir = app.out_dir.clone();
+        app.probe_state = ProbeState::Consent;
+        app.handle_probe_esc();
+        assert_eq!(app.probe_state, ProbeState::Idle);
+        fs::remove_dir_all(out_dir).expect("cleanup");
+
+        let mut app = probe_test_app("probe-esc-preview");
+        let out_dir = app.out_dir.clone();
+        app.probe_state = ProbeState::Preview("md".to_owned());
+        app.handle_probe_esc();
+        assert_eq!(app.probe_state, ProbeState::Idle);
+        fs::remove_dir_all(out_dir).expect("cleanup");
+
+        let mut app = probe_test_app("probe-esc-idle");
+        let out_dir = app.out_dir.clone();
+        app.handle_probe_esc();
+        assert_eq!(app.probe_state, ProbeState::Idle);
+        fs::remove_dir_all(out_dir).expect("cleanup");
     }
 
     /// (q2) The GitHub issue URL construction: the title form
@@ -4566,7 +4665,9 @@ mod tests {
     /// full markdown report to the clipboard (a 4–5 KB body would
     /// exceed GitHub's issue-form URL limit — the 404), opens the
     /// title-only `issues/new` URL, flashes the paste-into-the-body
-    /// notice in the header, and moves the flow to `Done`.
+    /// notice in the header, and returns the flow to `Idle` (the
+    /// dialog closes — the Probe button is re-openable without a
+    /// restart).
     #[test]
     fn preview_dialog_open_issue_copies_report_and_notices() {
         let mut app = probe_test_app("preview-issue");
@@ -4612,14 +4713,14 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         };
         // Press + release → the clipboard copy + the notice + the
-        // title-only URL open + the Done transition (the click
+        // title-only URL open + the Idle transition (the click
         // completes on the release frame).
         frame(vec![click(true)], &mut app);
         let out = frame(vec![click(false)], &mut app);
         assert_eq!(
             app.probe_state,
-            ProbeState::Done,
-            "a press + release on Open GitHub Issue must end the flow in Done"
+            ProbeState::Idle,
+            "a press + release on Open GitHub Issue must return the flow to Idle"
         );
         // The full report is in the clipboard (egui's copied_text
         // output — eframe forwards it to the OS clipboard).
@@ -4653,6 +4754,69 @@ mod tests {
             app.notice.as_ref().map(|(text, _)| text.as_str()),
             Some(PROBE_ISSUE_COPY_NOTICE),
             "the paste-into-the-body notice must be set"
+        );
+
+        fs::remove_dir_all(out_dir).expect("cleanup");
+    }
+
+    /// (q5c) The preview dialog's [Copy to Clipboard] copies the
+    /// full markdown report to the clipboard (egui's copied_text
+    /// output — eframe forwards it to the OS clipboard) and returns
+    /// the flow to `Idle` (the dialog closes — the Probe button is
+    /// re-openable without a restart).
+    #[test]
+    fn preview_dialog_copy_copies_and_returns_to_idle() {
+        let mut app = probe_test_app("preview-copy");
+        let report = fixture_probe_report();
+        let md = render_probe_report_md(&report);
+        app.probe_state = ProbeState::Preview(md.clone());
+        app.probe_title = Some(probe_issue_title(&report));
+        let out_dir = app.out_dir.clone();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(968.0, 600.0));
+        let frame_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let frame = |events: Vec<egui::Event>, app: &mut RamSleuthApp| {
+            ctx.run(frame_input(events), |ctx| {
+                app.render_probe_preview_dialog(ctx)
+            })
+        };
+
+        frame(Vec::new(), &mut app);
+        let first = frame(Vec::new(), &mut app);
+        let copy = first
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Copy to Clipboard" => {
+                    Some(egui::pos2(
+                        text.pos.x + text.galley.size().x / 2.0,
+                        text.pos.y + text.galley.size().y / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .expect("the Copy to Clipboard button's label must be painted");
+        let click = |pressed: bool| egui::Event::PointerButton {
+            pos: copy,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![click(true)], &mut app);
+        let out = frame(vec![click(false)], &mut app);
+        assert_eq!(
+            out.platform_output.copied_text.as_str(),
+            md.as_str(),
+            "the full markdown report must be copied to the clipboard"
+        );
+        assert_eq!(
+            app.probe_state,
+            ProbeState::Idle,
+            "a press + release on Copy to Clipboard must return the flow to Idle"
         );
 
         fs::remove_dir_all(out_dir).expect("cleanup");
