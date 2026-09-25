@@ -591,6 +591,7 @@ fn decode_serial(data: &[u8], is_ddr5: bool) -> Section<String> {
 ///   die manufacturer ([`decode_die_maker`]);
 /// - DDR5: JEP106 vendor + continuation nibbles at `0x01`/`0x02`; when
 ///   no module ID is present, falls back to the DRAM die manufacturer.
+///
 /// All-absent -> `Na(NotApplicable)`.
 fn decode_maker(data: &[u8], is_ddr5: bool) -> Section<String> {
     if is_ddr5 {
@@ -620,6 +621,7 @@ fn decode_maker(data: &[u8], is_ddr5: bool) -> Section<String> {
 /// - DDR5: JEP106 vendor + continuation nibbles at `0x2E`/`0x2F` - the
 ///   source [`decode_maker`] reads as its fallback, now carried
 ///   separately in [`SpdModule.die_maker`] (C6-02).
+///
 /// A present-but-unknown code renders as its raw form (still a `Value`),
 /// never a panic.
 fn decode_die_maker(data: &[u8], is_ddr5: bool) -> Section<String> {
@@ -659,6 +661,7 @@ fn width_from_code(code: u8) -> Option<u8> {
 ///   unrecognized code (4-7) or an absent `0x0C` -> `NaReason` naming
 ///   `0x0C`;
 /// - DDR5: byte `0x81` bits 2:0 (the documented hub model; codes 0-2).
+///
 /// Missing / unrecognized width -> `NaReason`; never a panic.
 fn device_width(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
     if is_ddr5 {
@@ -688,6 +691,7 @@ fn device_width(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
 ///   `NaReason` naming `0x0C` (the byte `0x80` hub nibble is the
 ///   DDR5-only fallback now);
 /// - DDR5 = byte `0x80` bits 7:4 (the documented hub model).
+///
 /// Never a panic.
 fn rank_count(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
     if is_ddr5 {
@@ -769,6 +773,7 @@ fn bus_width(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
 ///   `0x0C` width - no hub arithmetic);
 /// - DDR5: the byte `0x80` hub nibble, derived when it fails the
 ///   consistency rule ([`per_rank_count`]).
+///
 /// Any organization failure -> `NaReason` naming the byte; never a
 /// panic.
 fn total_devices(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
@@ -821,6 +826,7 @@ fn decode_devices(data: &[u8], is_ddr5: bool) -> Section<u8> {
 /// - DDR5: documented model at byte `0x13`, code `0x11..=0x18` -> 1..64
 ///   Gb (a result >= 64 Gb = 65536 Mbit overflows the u16 cell ->
 ///   `Na(ParseError)`).
+///
 /// An absent byte -> `Na(ParseError)`; never a panic.
 fn decode_density(data: &[u8], is_ddr5: bool) -> Section<u16> {
     if is_ddr5 {
@@ -2356,6 +2362,7 @@ mod tests {
 
     /// The JEDEC base speed (no XMP present) is `tCKAVGmin` (0x12 x 125
     /// + i8(0x7D) ps) -> `2000 / tCK_ns` MT/s, floored to the largest
+    ///
     /// standard bin <= the computed value: 0x12 = 0x0D + 0x7D = 0x11 ->
     /// 1642 ps -> 1218 -> 1066; a mid-bin case (0x12 = 0x06 + 0x7D =
     /// 0x64 -> 850 ps -> 2353 -> 2133).
