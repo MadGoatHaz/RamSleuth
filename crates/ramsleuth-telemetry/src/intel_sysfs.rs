@@ -11,12 +11,14 @@
 //! devmem-fallback, single decode core).
 //!
 //! 24-attr module builds additionally expose 5 **global** MAD
-//! channel/geometry attributes (`mad_inter_channel`, `mad_intra_ch0/1`,
-//! `mad_dimm_ch0/1`) — outside the per-channel `ch0`/`ch1` stride, so
-//! they are NOT decode inputs: they ride as raw `Option<u32>` siblings on
-//! [`SysfsRegs`]. On a pre-24-attr build (19 attrs) those files are
-//! absent and the 5 fields simply read `None` — graceful degradation,
-//! not an error; the core 19 keep their existing semantics.
+//! channel/geometry attributes: `mad_inter_channel` and
+//! `mad_dimm_ch0/1` are decode inputs (the facade passes them alongside
+//! the register set to [`crate::intel_readout::decode`] — the
+//! channel-mode population cross-check), while `mad_intra_ch0/1` ride as
+//! raw `Option<u32>` siblings on [`SysfsRegs`] (no decode consumes
+//! them). On a pre-24-attr build (19 attrs) those files are absent and
+//! the 5 fields simply read `None` — graceful degradation, not an
+//! error; the core 19 keep their existing semantics.
 //!
 //! The Tier-3 (Alder/Raptor) extension attributes — the `ch2_tc_*` /
 //! `ch3_tc_*` mirror blocks (8 each), the `mcl0_tc_*` / `mcl1_tc_*`
@@ -127,10 +129,11 @@ pub struct MchBarInfo {
 
 /// Raw acquisition result from the `ramsleuth_intel` kobject: the 51-slot
 /// raw IMC register set for the decode core, the MCHBAR diagnostics as a
-/// sibling, the 5 global MAD channel/geometry registers as raw siblings
-/// (not decode inputs, 24-attr module builds), and — the Tier-3
-/// extension (IG-23) — the 2 Alder/DDR5 `mad_dimm_ch2` / `mad_dimm_ch3`
-/// raws as sibling copies of their decode-input fields.
+/// sibling, the 5 global MAD channel/geometry registers (24-attr module
+/// builds: `mad_inter_channel` + `mad_dimm_ch0/1` as decode inputs
+/// passed alongside, `mad_intra_ch0/1` as raw siblings), and — the
+/// Tier-3 extension (IG-23) — the 2 Alder/DDR5 `mad_dimm_ch2` /
+/// `mad_dimm_ch3` raws as sibling copies of their decode-input fields.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SysfsRegs {
     /// The raw register set (51 `Option<u32>` slots; `None` per register
@@ -148,10 +151,12 @@ pub struct SysfsRegs {
     /// Channel 1 rank/geometry (raw `mad_intra_ch1`). `None` on a
     /// pre-24-attr module build (absent) or a malformed read.
     pub mad_intra_ch1: Option<u32>,
-    /// Channel 0 DIMM capacity (raw `mad_dimm_ch0`). `None` on a
+    /// Channel 0 DIMM capacity (raw `mad_dimm_ch0`) — a decode input
+    /// for the channel-mode population cross-check. `None` on a
     /// pre-24-attr module build (absent) or a malformed read.
     pub mad_dimm_ch0: Option<u32>,
-    /// Channel 1 DIMM capacity (raw `mad_dimm_ch1`). `None` on a
+    /// Channel 1 DIMM capacity (raw `mad_dimm_ch1`) — a decode input
+    /// for the channel-mode population cross-check. `None` on a
     /// pre-24-attr module build (absent) or a malformed read.
     pub mad_dimm_ch1: Option<u32>,
     /// Channel 2 DIMM capacity (raw `mad_dimm_ch2` — the Alder/DDR5

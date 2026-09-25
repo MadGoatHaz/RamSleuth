@@ -1569,10 +1569,21 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 /// The `channel_mode` slot decodes `MAD_INTER_CHANNEL[1:0]` from
 /// `mad_inter_channel` (`None` → `None`; reserved `11` → `None`); it is
 /// populated on the decoded path (the degradation keeps `None` —
-/// behavior preserved).
+/// behavior preserved). On the Tier-1 arm the raw mode is additionally
+/// cross-checked against the `MAD_DIMM_CH0/1` DIMM population
+/// ([`channel_mode_with_population`]): the field is
+/// population-conditional, and the Skylake-family firmware leaves it at
+/// the 00b (Dual Symmetric) default on single-channel and asymmetric
+/// (Flex) systems where the spec calls for `10b` / `01b`.
 ///
 /// Never panics (D5): a `None` register degrades only its sourced fields.
-pub fn decode(regs: &IntelImcRegs, gen: IntelGen, mad_inter_channel: Option<u32>) -> IntelReadout {
+pub fn decode(
+    regs: &IntelImcRegs,
+    gen: IntelGen,
+    mad_inter_channel: Option<u32>,
+    mad_dimm_ch0: Option<u32>,
+    mad_dimm_ch1: Option<u32>,
+) -> IntelReadout {
     match profile_for(gen) {
         // Profiled with a live decode path: Tier 1 and Rocket Lake reuse
         // the identical 64 KiB register map; Rocket additionally decodes
@@ -1595,7 +1606,11 @@ pub fn decode(regs: &IntelImcRegs, gen: IntelGen, mad_inter_channel: Option<u32>
             }
             IntelReadout {
                 channels,
-                channel_mode: mad_inter_channel.and_then(ChannelMode::from_raw),
+                channel_mode: channel_mode_with_population(
+                    mad_inter_channel.and_then(ChannelMode::from_raw),
+                    mad_dimm_ch0,
+                    mad_dimm_ch1,
+                ),
             }
         }
         // The Tier-3 Alder family (IG-26): OQ-11's DDR5 condition
@@ -1749,7 +1764,7 @@ pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
         Some(GenMap::Alder) => IntelImcRegs::from_bar_wide(bar),
         _ => IntelImcRegs::from_bar(bar),
     };
-    Ok(decode(&regs, gen, None))
+    Ok(decode(&regs, gen, None, None, None))
 }
 
 /// Decode a raw register set produced by *any* source (the sysfs path
@@ -1767,7 +1782,7 @@ pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
 /// directly.
 pub fn read_regs(regs: &IntelImcRegs) -> IntelReadout {
     match intel_gen_gate(&CpuInfo::detect()) {
-        Ok(gen) => decode(regs, gen, None),
+        Ok(gen) => decode(regs, gen, None, None, None),
         Err(_) => {
             let mut channels = Vec::with_capacity(2);
             for ch in 0..2u8 {
@@ -1822,7 +1837,11 @@ pub struct IntelChannel {
 /// so the SPD-count label is authoritative only as a frontend fallback.
 ///
 /// Wire-safe (serde + bincode); the reserved encoding `11` decodes to
-/// `None`.
+/// `None`. The field is population-conditional, and the
+/// Skylake-family firmware is not reliable in maintaining it (live
+/// 6600T: `00b` on a single-channel and on an 8 + 16 GiB asymmetric
+/// box), so the Tier-1 decode cross-checks it against the
+/// `MAD_DIMM_CH0/1` population ([`channel_mode_with_population`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChannelMode {
     /// `00`: dual-channel, symmetric interleaving.
@@ -1864,6 +1883,58 @@ impl ChannelMode {
     }
 }
 
+/// A channel's reported DIMM capacity (in GiB) from its `MAD_DIMM_CHx`
+/// raw, decoded with the Skylake-family layout the mainline
+/// `ie31200_edac` driver uses for this register pair (`skl_cfg`: DIMM 0
+/// slot size = bits `[5:0]`, DIMM 1 slot size = bits `[21:16]`, each a
+/// 1 GiB granularity index). The sum of both slot sizes is returned;
+/// `None` when the raw is absent.
+fn mad_dimm_capacity_gib(mad_dimm_ch: Option<u32>) -> Option<u32> {
+    let r = mad_dimm_ch?;
+    Some((r & 0x3F) + ((r >> 16) & 0x3F))
+}
+
+/// Cross-check a decoded channel mode against DIMM population.
+/// `MAD_INTER_CHANNEL[1:0]` is population-conditional, and the
+/// Skylake-family firmware leaves it at the 00b (Dual Symmetric)
+/// default in configurations where the spec calls for another
+/// encoding: a single populated channel (`10b`) and an asymmetric
+/// dual (Flex, `01b`). Live-verified on the i5-6600T box (24-attr
+/// module): 16 GiB on channel 1 alone → `00b`; 8 + 16 GiB
+/// asymmetric → `00b` (the same box's earlier 16 + 8 GiB
+/// configuration read `01b`). Demote `DualSymmetric` → `Single` when
+/// exactly one channel reports a populated DIMM, and → `DualFlex` when
+/// both report populated DIMMs with unequal capacities. `DualFlex` /
+/// `Single` are already consistent with their population and pass
+/// through unchanged; an absent raw on either channel (no population
+/// evidence) and all-zero size fields keep the decoded value.
+fn channel_mode_with_population(
+    mode: Option<ChannelMode>,
+    mad_dimm_ch0: Option<u32>,
+    mad_dimm_ch1: Option<u32>,
+) -> Option<ChannelMode> {
+    let Some(m) = mode else { return None; };
+    if m == ChannelMode::DualSymmetric {
+        let (Some(c0), Some(c1)) = (
+            mad_dimm_capacity_gib(mad_dimm_ch0),
+            mad_dimm_capacity_gib(mad_dimm_ch1),
+        ) else {
+            return Some(m);
+        };
+        if c0 == 0 && c1 == 0 {
+            // No population evidence (all sizes zero): keep the decode.
+            return Some(m);
+        }
+        if (c0 > 0) != (c1 > 0) {
+            return Some(ChannelMode::Single);
+        }
+        if c0 != c1 {
+            return Some(ChannelMode::DualFlex);
+        }
+    }
+    Some(m)
+}
+
 /// The full Intel readout: one [`IntelChannel`] per detected channel.
 ///
 /// Wire-safe (serde + bincode); the struct shape is frozen — only which
@@ -1872,8 +1943,11 @@ impl ChannelMode {
 pub struct IntelReadout {
     /// Decoded channels (0-based indices, `channels.len() == channel_count`).
     pub channels: Vec<IntelChannel>,
-    /// Hardware channel mode from `MAD_INTER_CHANNEL[1:0]`; `None` on the
-    /// `/dev/mem` fallback or a pre-24-attr module.
+    /// Hardware channel mode from `MAD_INTER_CHANNEL[1:0]` (the Tier-1
+    /// decode cross-checks it against the `MAD_DIMM_CH0/1` DIMM
+    /// population — a firmware-`00b` single populated channel reports
+    /// `Single`, an asymmetric `00b` dual reports `DualFlex`); `None` on
+    /// the `/dev/mem` fallback or a pre-24-attr module.
     pub channel_mode: Option<ChannelMode>,
 }
 
@@ -2231,7 +2305,7 @@ mod tests {
     /// not-applicable, the CAD bus / voltages not exposed.
     #[test]
     fn acceptance_skylake_readout_pins_the_section_numbers() {
-        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0));
+        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0), None, None);
         assert_eq!(ro.channels.len(), 2, "Tier 1: two channels");
         assert_eq!(
             ro.channel_mode,
@@ -3408,7 +3482,7 @@ mod tests {
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
         ] {
-            let ro = decode(&tier3_ddr5_condition_regs(), gen, Some(0));
+            let ro = decode(&tier3_ddr5_condition_regs(), gen, Some(0), None, None);
             assert_eq!(ro.channels.len(), 4, "{gen:?}: DDR5 condition met -> 4 subchannels");
             assert_eq!(
                 ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
@@ -3465,7 +3539,7 @@ mod tests {
                 let mut regs = tier3_ddr5_condition_regs();
                 regs.mad_dimm_ch2 = mad2;
                 regs.mad_dimm_ch3 = mad3;
-                let ro = decode(&regs, gen, Some(1));
+                let ro = decode(&regs, gen, Some(1), None, None);
                 assert_eq!(ro.channels.len(), 2, "{gen:?} ({label}): DDR4 default");
                 assert_eq!(
                     ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
@@ -3503,7 +3577,7 @@ mod tests {
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
         ] {
-            let ro = decode(&regs, gen, None);
+            let ro = decode(&regs, gen, None, None, None);
             for ch in &ro.channels {
                 assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
                 assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Four), "{gen:?}");
@@ -3523,7 +3597,7 @@ mod tests {
     /// which cells carry `Value` vs `Na` differs).
     #[test]
     fn decode_tier3_four_channel_readout_bincode_round_trip() {
-        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, Some(0));
+        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, Some(0), None, None);
         assert_eq!(ro.channels.len(), 4, "the 4-subchannel DDR5 shape");
         let bytes = bincode::serialize(&ro)
             .expect("IntelReadout must serialize (no-panic contract)");
@@ -3559,7 +3633,7 @@ mod tests {
             Some(0x0001_0012),
             "Example C register settings: 133.3333 MHz base, ratio 18, Gear 2"
         );
-        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, None);
+        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, None, None, None);
         assert_eq!(ro.channels.len(), 4, "DDR5 condition met -> 4 subchannels");
         for ch in &ro.channels {
             // Step 1 (memory clock): 18 x 133.3333 MHz = 2400 MHz.
@@ -3607,7 +3681,7 @@ mod tests {
             },
             ..IntelImcRegs::default()
         };
-        let ro = decode(&regs, IntelGen::AlderLake, None);
+        let ro = decode(&regs, IntelGen::AlderLake, None, None, None);
         assert_eq!(
             ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
             vec![0, 2],
@@ -3679,7 +3753,7 @@ mod tests {
             mad_dimm_ch3: Some(1),
             ..IntelImcRegs::default()
         };
-        let ro = decode(&regs, IntelGen::AlderLake, None);
+        let ro = decode(&regs, IntelGen::AlderLake, None, None, None);
         assert_eq!(ro.channels.len(), 4, "DDR5 condition met -> 4 subchannels");
         assert_eq!(
             ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
@@ -3786,7 +3860,7 @@ mod tests {
             for (label, fill) in fills {
                 let regs = IntelImcRegs::from_wide_reader(fill);
                 assert!(regs.primary_window_degenerate(), "{gen:?} ({label})");
-                let ro = decode(&regs, gen, None);
+                let ro = decode(&regs, gen, None, None, None);
                 assert_eq!(ro.channels.len(), 4, "{gen:?} ({label})");
                 for ch in &ro.channels {
                     assert_eq!(
@@ -3849,7 +3923,7 @@ mod tests {
                 }
             });
             assert!(!regs.primary_window_degenerate(), "{gen:?}");
-            let ro = decode(&regs, gen, None);
+            let ro = decode(&regs, gen, None, None, None);
             assert_eq!(ro.channels.len(), 2, "{gen:?}: DDR4 default (MAD raws zero)");
             for ch in &ro.channels {
                 assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
@@ -3869,7 +3943,7 @@ mod tests {
     /// whole channel to honest `Na` — no panic, no garbage values.
     #[test]
     fn decode_all_absent_degrades_without_panic() {
-        let ro = decode(&IntelImcRegs::default(), IntelGen::Skylake, None);
+        let ro = decode(&IntelImcRegs::default(), IntelGen::Skylake, None, None, None);
         for ch in &ro.channels {
             assert!(ch.clocks.mclk_mhz.is_na(), "{:?}", ch.clocks.mclk_mhz);
             for s in [&ch.clocks.uclk_mhz, &ch.clocks.fclk_mhz] {
@@ -3947,7 +4021,7 @@ mod tests {
     fn decode_per_register_containment() {
         let mut regs = acceptance_regs();
         regs.ch0.tc_rap = None;
-        let ro = decode(&regs, IntelGen::Skylake, None);
+        let ro = decode(&regs, IntelGen::Skylake, None, None, None);
         let ch0 = &ro.channels[0];
 
         for s in [&ch0.timings.ras, &ch0.timings.rrds, &ch0.timings.rtp, &ch0.timings.faw] {
@@ -3984,7 +4058,7 @@ mod tests {
         regs.ch0.tc_dbp = Some(0);
         regs.ch0.tc_rfp = Some(0);
         regs.ch1.tc_rap = Some(0);
-        let ro = decode(&regs, IntelGen::Skylake, None);
+        let ro = decode(&regs, IntelGen::Skylake, None, None, None);
 
         let ch0 = &ro.channels[0];
         for s in [
@@ -4027,7 +4101,7 @@ mod tests {
             (IntelGen::TigerLake, 2),
             (IntelGen::Unrecognized, 2),
         ] {
-            let ro = decode(&regs, gen, None);
+            let ro = decode(&regs, gen, None, None, None);
             assert_eq!(ro.channels.len(), usize::from(count), "{gen:?}");
             for (i, ch) in ro.channels.iter().enumerate() {
                 assert_eq!(ch.index, i as u8, "{gen:?}");
@@ -4176,10 +4250,10 @@ mod tests {
     /// bit 16 set → gear Two → uclk = mclk / 2.
     #[test]
     fn decode_rocket_lake_is_tier1_map_plus_gear() {
-        let tier1 = decode(&acceptance_regs(), IntelGen::Skylake, None);
+        let tier1 = decode(&acceptance_regs(), IntelGen::Skylake, None, None, None);
         let mut regs = acceptance_regs();
         regs.mcbios_req = Some(0x0001_0012); // ratio 18 + bit 16 (gear 2)
-        let rocket = decode(&regs, IntelGen::RocketLake, None);
+        let rocket = decode(&regs, IntelGen::RocketLake, None, None, None);
         assert_eq!(rocket.channels.len(), 2, "Rocket Lake: two channels");
         for (t, r) in tier1.channels.iter().zip(&rocket.channels) {
             // Every shared-map cell is identical for the same raws.
@@ -4206,12 +4280,12 @@ mod tests {
     /// mclk, gear, and uclk to `Na(ParseError)` (never a bogus clock).
     #[test]
     fn decode_rocket_lake_gear_containment() {
-        let sync = decode(&acceptance_regs(), IntelGen::RocketLake, None); // 0x12 → 00b
+        let sync = decode(&acceptance_regs(), IntelGen::RocketLake, None, None, None); // 0x12 → 00b
         for ch in &sync.channels {
             assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
             assert_eq!(ch.clocks.uclk_mhz, Section::Value(2400.0), "uclk = mclk (gear 1)");
         }
-        let absent = decode(&IntelImcRegs::default(), IntelGen::RocketLake, None);
+        let absent = decode(&IntelImcRegs::default(), IntelGen::RocketLake, None, None, None);
         for ch in &absent.channels {
             assert!(matches!(
                 ch.clocks.mclk_mhz,
@@ -4263,7 +4337,7 @@ mod tests {
     fn tier2_example_a_gear1_100_mhz_base_end_to_end() {
         let mut regs = acceptance_regs();
         regs.mcbios_req = Some(0x0000_0110);
-        let ro = decode(&regs, IntelGen::RocketLake, None);
+        let ro = decode(&regs, IntelGen::RocketLake, None, None, None);
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
             // §4 Example A numbers, pinned exactly.
@@ -4300,7 +4374,7 @@ mod tests {
     fn tier2_example_d_gear2_100_mhz_base_end_to_end() {
         let mut regs = acceptance_regs();
         regs.mcbios_req = Some(0x0001_011E);
-        let ro = decode(&regs, IntelGen::RocketLake, None);
+        let ro = decode(&regs, IntelGen::RocketLake, None, None, None);
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
             // §4 Example D numbers, pinned exactly.
@@ -4341,7 +4415,7 @@ mod tests {
         assert_eq!(turnaround_quartet(0x0000_0308), [8, 12, 0, 0], "TC_WRRD");
         assert_eq!(turnaround_quartet(0x0040_C204), [4, 8, 12, 16], "TC_WRWR");
 
-        let ro = decode(&regs, IntelGen::RocketLake, None);
+        let ro = decode(&regs, IntelGen::RocketLake, None, None, None);
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
             // TC_RDRD: the full sg / dg / dr / dd quartet.
@@ -4366,7 +4440,7 @@ mod tests {
         }
         // Shared-map proof: identical raws decode identically under
         // Tier 1 (only the gear cells differ — pinned above).
-        let tier1 = decode(&regs, IntelGen::Skylake, None);
+        let tier1 = decode(&regs, IntelGen::Skylake, None, None, None);
         for (r, t) in ro.channels.iter().zip(&tier1.channels) {
             assert_eq!(r.timings, t.timings, "all shared-map timings identical");
         }
@@ -4459,9 +4533,9 @@ mod tests {
     #[test]
     fn decode_readout_bincode_round_trip() {
         for ro in [
-            decode(&acceptance_regs(), IntelGen::Skylake, Some(1)),
-            decode(&IntelImcRegs::default(), IntelGen::Skylake, None),
-            decode(&acceptance_regs(), IntelGen::AlderLake, None),
+            decode(&acceptance_regs(), IntelGen::Skylake, Some(1), None, None),
+            decode(&IntelImcRegs::default(), IntelGen::Skylake, None, None, None),
+            decode(&acceptance_regs(), IntelGen::AlderLake, None, None, None),
         ] {
             let bytes = bincode::serialize(&ro)
                 .expect("IntelReadout must serialize (no-panic contract)");
@@ -5047,5 +5121,107 @@ mod tests {
         assert_eq!(ChannelMode::DualSymmetric.mode_label(), "Interleaved");
         assert_eq!(ChannelMode::DualFlex.mode_label(), "Flex");
         assert_eq!(ChannelMode::Single.mode_label(), "N/A");
+    }
+
+    /// The population cross-check decodes the SKL `MAD_DIMM_CHx`
+    /// slot-size fields (the mainline `ie31200` `skl_cfg` layout: DIMM 0
+    /// = bits [5:0], DIMM 1 = bits [21:16], 1 GiB index each) and sums
+    /// them; absent raws stay absent.
+    #[test]
+    fn mad_dimm_capacity_gib_decodes_both_slots() {
+        assert_eq!(mad_dimm_capacity_gib(None), None);
+        assert_eq!(mad_dimm_capacity_gib(Some(0x0)), Some(0));
+        // 16 GiB in slot 0 (index 16 in the low field).
+        assert_eq!(mad_dimm_capacity_gib(Some(0x10)), Some(16));
+        // 8 GiB in slot 0 + 16 GiB in slot 1 (16 << 16).
+        assert_eq!(mad_dimm_capacity_gib(Some(0x10_0008)), Some(24));
+    }
+
+    /// The population cross-check demotes a firmware-`00b`
+    /// `DualSymmetric` to the mode the population actually shows:
+    /// exactly one populated channel → `Single`; both populated with
+    /// unequal capacities → `DualFlex`; equal capacities or no
+    /// population evidence → unchanged. `DualFlex` / `Single` / `None`
+    /// pass through untouched.
+    #[test]
+    fn channel_mode_with_population_demotes_per_populated_channels() {
+        // 16 GiB on channel 0 alone (the canonical 1-DIMM shape):
+        assert_eq!(
+            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(0x10), Some(0x0)),
+            Some(ChannelMode::Single)
+        );
+        // 16 GiB on channel 1 alone:
+        assert_eq!(
+            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(0x0), Some(0x10)),
+            Some(ChannelMode::Single)
+        );
+        // True symmetric dual keeps DualSymmetric:
+        assert_eq!(
+            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(5), Some(5)),
+            Some(ChannelMode::DualSymmetric)
+        );
+        // The live 6600T asymmetric pair (8 + 16 GiB — this box's actual
+        // 24 GiB configuration): 00b demotes to DualFlex.
+        assert_eq!(
+            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(0x8), Some(0x10)),
+            Some(ChannelMode::DualFlex)
+        );
+        // No population evidence (both raws zero): keep the decode.
+        assert_eq!(
+            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(0x0), Some(0x0)),
+            Some(ChannelMode::DualSymmetric)
+        );
+        // Absent raw (pre-24-attr module / one bad read): keep the decode.
+        assert_eq!(
+            channel_mode_with_population(Some(ChannelMode::DualSymmetric), None, None),
+            Some(ChannelMode::DualSymmetric)
+        );
+        assert_eq!(
+            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(0x10), None),
+            Some(ChannelMode::DualSymmetric)
+        );
+        // DualFlex / Single / None pass through unchanged.
+        assert_eq!(
+            channel_mode_with_population(Some(ChannelMode::DualFlex), Some(5), Some(0)),
+            Some(ChannelMode::DualFlex)
+        );
+        assert_eq!(
+            channel_mode_with_population(Some(ChannelMode::Single), Some(0x10), Some(0x10)),
+            Some(ChannelMode::Single)
+        );
+        assert_eq!(channel_mode_with_population(None, Some(0x10), None), None);
+    }
+
+    /// End to end: the Tier-1 decode with a firmware-`00b`
+    /// `MAD_INTER_CHANNEL` and the box's live asymmetric raws
+    /// (8 + 16 GiB) reports `DualFlex`; a single populated channel
+    /// reports `Single`; reserved `11` and absent raws keep their
+    /// pre-cross-check values.
+    #[test]
+    fn decode_tier1_channel_mode_population_cross_check() {
+        // The live i5-6600T raws (the 24-attr module capture):
+        // 0x8010 → bits [1:0] = 00b; 8 GiB on ch0 + 16 GiB on ch1.
+        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0x8010), Some(0x08), Some(0x10));
+        assert_eq!(
+            ro.channel_mode,
+            Some(ChannelMode::DualFlex),
+            "00b + asymmetric 8 + 16 GiB demotes to DualFlex"
+        );
+        // Single populated channel (16 GiB on ch0) → Single:
+        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0x0), Some(0x10), Some(0x0));
+        assert_eq!(
+            ro.channel_mode,
+            Some(ChannelMode::Single),
+            "00b + one populated channel demotes to Single"
+        );
+        // Symmetric 16 + 16 keeps DualSymmetric:
+        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0x0), Some(0x10), Some(0x10));
+        assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));
+        // Reserved 11 stays None regardless of population:
+        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0x3), Some(0x10), Some(0x0));
+        assert_eq!(ro.channel_mode, None, "reserved encoding is not cross-checked");
+        // Absent raws keep the raw 00b decode (no population evidence):
+        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0x0), None, None);
+        assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));
     }
 }
