@@ -109,8 +109,8 @@
 //!   consent overlay (the chunk-2-rendered markdown rides along in
 //!   the state); while the overlay is open the main loop routes its
 //!   keys to it, bypassing the global key table — `[y]` moves the
-//!   markdown into the scrollable preview, `[n]`/`Esc` close it,
-//!   and in the preview `[w]` writes `~/.ramsleuth/probe-report.md`,
+//!   markdown into the scrollable preview, `[q]`/`[n]`/`Esc` close
+//!   it, and in the preview `[w]` writes `~/.ramsleuth/probe-report.md`,
 //!   `[c]` copies to the clipboard (`wl-copy` / `xclip` / `xsel`),
 //!   and `[q]`/`Esc` return to the dashboard (a `[q]` there closes
 //!   the preview, it does not quit the TUI) — and `[Q]`uit breaks
@@ -1398,9 +1398,10 @@ fn scroll_probe_preview(state: &Arc<RwLock<AppState>>, area: Rect, delta: i32) {
 }
 
 /// The modal overlay's key handler (chunk probe-4): the consent
-/// keys (`[y]` → the preview, `[n]`/`Esc` → close), the preview
-/// keys (`[w]` → write `write_path`, `[c]` → the `clipboard`
-/// closure, `[q]`/`Esc` → close), and the preview scroll
+/// keys (`[y]` → the preview, `[q]`/`[n]`/`Esc` → close), the
+/// preview keys (`[w]` → write `write_path`, `[c]` → the
+/// `clipboard` closure, `[q]`/`[n]`/`Esc` → close), and the preview
+/// scroll
 /// (`Up`/`Down`/`PageUp`/`PageDown` over `area`) — every other key
 /// (including `[f]` itself) is inert while the overlay is open.
 /// The caller (the main loop) routes a key here only while the
@@ -1425,18 +1426,16 @@ fn handle_probe_overlay_key(
                 app.probe = ProbeOverlayState::Preview { markdown, notice: None, scroll: 0 };
             }
         }
-        // `[n]` / `Esc` (both phases): cancel — close the overlay.
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+        // `[q]` / `[n]` / `Esc` (both phases): close the overlay —
+        // cancel the consent / quit the preview (the natural
+        // `[q]`uit key must never be trapped by the modal; it
+        // closes it, it does not quit the TUI).
+        KeyCode::Char('q')
+        | KeyCode::Char('Q')
+        | KeyCode::Char('n')
+        | KeyCode::Char('N')
+        | KeyCode::Esc => {
             state.write().unwrap().probe = ProbeOverlayState::None;
-        }
-        // `[q]` (preview only): quit the preview to the dashboard
-        // (the consent phase has no `[q]` — its answer keys are
-        // `[y]`/`[n]`).
-        KeyCode::Char('q') | KeyCode::Char('Q') => {
-            let mut app = state.write().unwrap();
-            if matches!(app.probe, ProbeOverlayState::Preview { .. }) {
-                app.probe = ProbeOverlayState::None;
-            }
         }
         // `[w]` (preview only): write the report to `write_path`
         // (the live loop passes `~/.ramsleuth/probe-report.md`; the
@@ -4594,9 +4593,9 @@ mod tests {
         stand_in.join();
     }
 
-    /// (pv) The consent keys: `[n]` closes; every other key
-    /// (including `[q]` and `[f]`) leaves the consent open (the
-    /// consent's answer keys are `[y]`/`[n]`).
+    /// (pv) The consent keys: `[q]` and `[n]` close; every other key
+    /// (including `[f]`) leaves the consent open (the consent's
+    /// answer key is `[y]`).
     #[test]
     fn overlay_consent_keys() {
         let dir = TempDir::new("overlay-consent");
@@ -4607,17 +4606,6 @@ mod tests {
             probe: ProbeOverlayState::Consent { markdown: "# the report".to_owned() },
             ..Default::default()
         }));
-        handle_probe_overlay_key(
-            overlay_key(KeyCode::Char('q')),
-            &state,
-            area,
-            &dir.path,
-            &no_clip,
-        );
-        assert!(
-            matches!(state.read().unwrap().probe, ProbeOverlayState::Consent { .. }),
-            "[q] must not close the consent"
-        );
         handle_probe_overlay_key(
             overlay_key(KeyCode::Char('f')),
             &state,
@@ -4630,6 +4618,18 @@ mod tests {
             "[f] must not close the consent"
         );
         handle_probe_overlay_key(
+            overlay_key(KeyCode::Char('q')),
+            &state,
+            area,
+            &dir.path,
+            &no_clip,
+        );
+        assert_eq!(
+            state.read().unwrap().probe,
+            ProbeOverlayState::None,
+            "[q] must close the consent"
+        );
+        handle_probe_overlay_key(
             overlay_key(KeyCode::Char('n')),
             &state,
             area,
@@ -4639,7 +4639,7 @@ mod tests {
         assert_eq!(
             state.read().unwrap().probe,
             ProbeOverlayState::None,
-            "[n] must close the consent"
+            "[n] stays closed after the `[q]`"
         );
     }
 
