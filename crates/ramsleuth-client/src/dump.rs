@@ -576,6 +576,7 @@ mod tests {
                 decode_channel(1, None, [None, None, None, None]),
             ],
             channel_mode: Some(ChannelMode::DualFlex),
+            ecc_status: EccStatus::Unknown,
         }
     }
 

@@ -314,6 +314,7 @@ mod tests {
     use std::thread;
 
     use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message};
+    use ramsleuth_telemetry::amd_readout::EccStatus;
     use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
@@ -445,6 +446,7 @@ mod tests {
                     [Some(cmd0), Some(cmd1), Some(cmd2), Some(cmd3)],
                 )],
                 channel_mode: None,
+                ecc_status: EccStatus::Unknown,
             }),
             spd: vec![SpdModule {
                 index: 0x50,

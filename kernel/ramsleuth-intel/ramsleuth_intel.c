@@ -37,6 +37,13 @@
 /* Host bridge MCHBAR (BAR4 of PCI 0000:00:00.0) */
 #define MCHBAR_LO_OFF	0x48
 #define MCHBAR_HI_OFF	0x4C
+/* CAPID0_A: host-bridge capability register (config-space
+ * offset 0xE4, 32-bit). Exposed raw (the userspace reader owns bitfield
+ * semantics, e.g. bit 17 = ECC_DIS). Read in-kernel via
+ * pci_read_config_dword: the host bridge config space is 64-byte truncated
+ * in /sys/bus/pci/devices/0000:00:00.0/config. */
+#define CAPID0A_OFF	0xE4
+#define CAPID0A_UNREADABLE	0xFFFFFFFFu
 #define MCHBAR_EN		BIT(0)		/* bit 0: MCHBAR enable */
 #define MCHBAR_ADDR_MASK	0x0000007FFFFFF000ULL	/* bits 12..38 */
 
@@ -83,6 +90,7 @@
 
 static u64 mchbar_base;		/* masked MCHBAR physical base */
 static void __iomem *mchbar_mmio;
+static struct pci_dev *host_bridge;
 static struct kobject *ramsleuth_kobj;
 
 /*
@@ -147,6 +155,26 @@ static ssize_t mchbar_enabled_show(struct kobject *kobj,
 }
 static struct kobj_attribute dev_attr_mchbar_enabled = __ATTR_RO(mchbar_enabled);
 
+/*
+ * CAPID0_A raw 32-bit value (config-space offset 0xE4).  Read in-kernel
+ * via pci_read_config_dword (the host bridge config space is 64-byte
+ * truncated in /sys/.../config).  On a read failure (no retained handle
+ * or a config read error) print the 0xffffffff sentinel so the attribute
+ * never fails a read; module load is unaffected.
+ */
+static ssize_t capid0a_show(struct kobject *kobj,
+			    struct kobj_attribute *attr, char *buf)
+{
+	u32 val;
+
+	if (!host_bridge)
+		return sysfs_emit(buf, "0x%08x\n", CAPID0A_UNREADABLE);
+	if (pci_read_config_dword(host_bridge, CAPID0A_OFF, &val) != 0)
+		return sysfs_emit(buf, "0x%08x\n", CAPID0A_UNREADABLE);
+	return sysfs_emit(buf, "0x%08x\n", val);
+}
+static struct kobj_attribute dev_attr_capid0a = __ATTR_RO(capid0a);
+
 static struct attribute *ramsleuth_attrs[] = {
 	&dev_attr_mchbar_base.attr,
 	&dev_attr_mchbar_enabled.attr,
@@ -172,6 +200,7 @@ static struct attribute *ramsleuth_attrs[] = {
 	&dev_attr_mad_intra_ch1.attr,
 	&dev_attr_mad_dimm_ch0.attr,
 	&dev_attr_mad_dimm_ch1.attr,
+	&dev_attr_capid0a.attr,
 	NULL,
 };
 static struct attribute_group ramsleuth_group = {
@@ -219,6 +248,14 @@ static int __init ramsleuth_intel_init(void)
 	device = pdev->device;
 	pci_read_config_dword(pdev, MCHBAR_LO_OFF, &lo);
 	pci_read_config_dword(pdev, MCHBAR_HI_OFF, &hi);
+
+	/*
+	 * Retain a module-lifetime reference to the host bridge so the
+	 * capid0a attribute can read its config space (offset 0xE4) on demand
+	 * (the 64-byte /sys config-space truncation makes the in-kernel read
+	 * the only path).  The original lookup ref is dropped.
+	 */
+	host_bridge = pci_dev_get(pdev);
 	pci_dev_put(pdev);
 
 	/*
@@ -231,6 +268,8 @@ static int __init ramsleuth_intel_init(void)
 		pr_err(DRIVER_NAME
 		       ": 0000:00:00.0 is not an Intel host bridge (vendor 0x%04x)\n",
 		       vendor);
+		pci_dev_put(host_bridge);
+		host_bridge = NULL;
 		return -ENODEV;
 	}
 
@@ -246,12 +285,16 @@ static int __init ramsleuth_intel_init(void)
 	if (!(raw & MCHBAR_EN)) {
 		pr_err(DRIVER_NAME
 		       ": MCHBAR not enabled (bit 0 of config 0x48 clear)\n");
+		pci_dev_put(host_bridge);
+		host_bridge = NULL;
 		return -ENODEV;
 	}
 
 	mchbar_base = raw & MCHBAR_ADDR_MASK;
 	if (!mchbar_base) {
 		pr_err(DRIVER_NAME ": MCHBAR base is zero\n");
+		pci_dev_put(host_bridge);
+		host_bridge = NULL;
 		return -ENODEV;
 	}
 
@@ -259,6 +302,8 @@ static int __init ramsleuth_intel_init(void)
 	if (!mchbar_mmio) {
 		pr_err(DRIVER_NAME ": ioremap of MCHBAR 0x%llx failed\n",
 		       (unsigned long long)mchbar_base);
+		pci_dev_put(host_bridge);
+		host_bridge = NULL;
 		return -ENOMEM;
 	}
 
@@ -267,6 +312,8 @@ static int __init ramsleuth_intel_init(void)
 		iounmap(mchbar_mmio);
 		mchbar_mmio = NULL;
 		pr_err(DRIVER_NAME ": failed to create the sysfs kobject\n");
+		pci_dev_put(host_bridge);
+		host_bridge = NULL;
 		return -ENOMEM;
 	}
 
@@ -278,6 +325,8 @@ static int __init ramsleuth_intel_init(void)
 		mchbar_mmio = NULL;
 		pr_err(DRIVER_NAME
 		       ": failed to create sysfs attributes (%d)\n", ret);
+		pci_dev_put(host_bridge);
+		host_bridge = NULL;
 		return ret;
 	}
 
@@ -294,6 +343,8 @@ static void __exit ramsleuth_intel_exit(void)
 		kobject_put(ramsleuth_kobj);
 	if (mchbar_mmio)
 		iounmap(mchbar_mmio);
+	if (host_bridge)
+		pci_dev_put(host_bridge);
 }
 
 module_init(ramsleuth_intel_init);

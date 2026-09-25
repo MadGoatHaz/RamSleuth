@@ -161,7 +161,7 @@
 //! reserved / overflow gates, the gen gate, and bincode round-trips —
 //! all without hardware, root, or I/O.
 
-use crate::amd_readout::{CadBus, ClockReadout, DivMode, GearMode, TimingSet, VoltageSet};
+use crate::amd_readout::{CadBus, ClockReadout, DivMode, EccStatus, GearMode, TimingSet, VoltageSet};
 use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_gen::{AlderChannelMap, ALDER_CHANNELS, ALDER_FIELDS, GearCap, GenMap, profile_for};
@@ -1611,6 +1611,7 @@ pub fn decode(
                     mad_dimm_ch0,
                     mad_dimm_ch1,
                 ),
+                ecc_status: EccStatus::Unknown,
             }
         }
         // The Tier-3 Alder family (IG-26): OQ-11's DDR5 condition
@@ -1641,6 +1642,7 @@ pub fn decode(
                 return IntelReadout {
                     channels,
                     channel_mode: None,
+                    ecc_status: EccStatus::Unknown,
                 };
             }
             let ddr5 = regs.mad_dimm_ch2.is_some_and(|v| v != 0)
@@ -1667,6 +1669,7 @@ pub fn decode(
             IntelReadout {
                 channels,
                 channel_mode: mad_inter_channel.and_then(ChannelMode::from_raw),
+                ecc_status: EccStatus::Unknown,
             }
         }
         // Unprofiled generations, and any future profiled family whose
@@ -1682,6 +1685,7 @@ pub fn decode(
             IntelReadout {
                 channels,
                 channel_mode: None,
+                ecc_status: EccStatus::Unknown,
             }
         }
     }
@@ -1791,6 +1795,7 @@ pub fn read_regs(regs: &IntelImcRegs) -> IntelReadout {
             IntelReadout {
                 channels,
                 channel_mode: None,
+                ecc_status: EccStatus::Unknown,
             }
         }
     }
@@ -1894,6 +1899,22 @@ fn mad_dimm_capacity_gib(mad_dimm_ch: Option<u32>) -> Option<u32> {
     Some((r & 0x3F) + ((r >> 16) & 0x3F))
 }
 
+/// Decode the ECC capability from the raw CAPID0_A register (host-bridge
+/// config-space offset 0xE4, read in-kernel by the module): bit 17
+/// (ECC_DIS) set = the platform cannot do ECC (NotCapable); clear = the
+/// controller is ECC-capable but ECC is inactive (CapableButDisabled).
+/// An absent raw (no capid0a attribute / a read failure) yields Unknown.
+///
+/// The decode keys off the register bit, never the CPU vendor string
+/// (the i5-6600T Q170 box is ECC-capable despite being a client CPU).
+pub fn decode_ecc_status(capid0a: Option<u32>) -> EccStatus {
+    match capid0a {
+        None => EccStatus::Unknown,
+        Some(v) if v & 0x0002_0000 != 0 => EccStatus::NotCapable,
+        Some(_) => EccStatus::CapableButDisabled,
+    }
+}
+
 /// Cross-check a decoded channel mode against DIMM population.
 /// `MAD_INTER_CHANNEL[1:0]` is population-conditional, and the
 /// Skylake-family firmware leaves it at the 00b (Dual Symmetric)
@@ -1949,6 +1970,8 @@ pub struct IntelReadout {
     /// `Single`, an asymmetric `00b` dual reports `DualFlex`); `None` on
     /// the `/dev/mem` fallback or a pre-24-attr module.
     pub channel_mode: Option<ChannelMode>,
+    /// ECC state (the CAPID0_A bit-17 decode). OQ-10 wire append.
+    pub ecc_status: EccStatus,
 }
 
 // ---------------------------------------------------------------------------
@@ -5044,6 +5067,7 @@ mod tests {
         let ro = IntelReadout {
             channels: vec![a, b],
             channel_mode: None,
+            ecc_status: EccStatus::Unknown,
         };
         assert_eq!(ro.channels.len(), 2);
         assert_eq!(ro.channels[0].index, 0);
@@ -5062,6 +5086,7 @@ mod tests {
                 decode_channel(1, None, [None; 4]), // all-Na channel
             ],
             channel_mode: Some(ChannelMode::DualFlex),
+            ecc_status: EccStatus::CapableButDisabled,
         };
 
         let bytes = bincode::serialize(&ro)
@@ -5069,6 +5094,7 @@ mod tests {
         let back: IntelReadout =
             bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
         assert_eq!(ro, back);
+        assert_eq!(back.ecc_status, EccStatus::CapableButDisabled);
 
         // the fully degraded readout (every channel all-Na) is wire-safe
         // too
@@ -5078,12 +5104,28 @@ mod tests {
                 decode_channel(1, None, [None; 4]),
             ],
             channel_mode: None,
+            ecc_status: EccStatus::Unknown,
         };
         let bytes = bincode::serialize(&all_na)
             .expect("IntelReadout must serialize (no-panic contract)");
         let back: IntelReadout =
             bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
         assert_eq!(all_na, back);
+    }
+
+    /// decode_ecc_status maps the raw CAPID0_A bit 17 (ECC_DIS) to the
+    /// EccStatus verdict (the i5-6600T live value 0x62012671 is
+    /// CapableButDisabled; a bit-17-set value is NotCapable; absent is
+    /// Unknown).
+    #[test]
+    fn decode_ecc_status_maps_capid0a_bit17() {
+        // Live-verified i5-6600T value: bit 17 clear -> CapableButDisabled.
+        assert_eq!(decode_ecc_status(Some(0x6201_2671)), EccStatus::CapableButDisabled);
+        // Bit 17 set (ECC_DIS) -> NotCapable.
+        assert_eq!(decode_ecc_status(Some(0x0002_0000)), EccStatus::NotCapable);
+        assert_eq!(decode_ecc_status(Some(0xFFFF_FFFF)), EccStatus::NotCapable);
+        // Absent raw -> Unknown.
+        assert_eq!(decode_ecc_status(None), EccStatus::Unknown);
     }
 
     // -----------------------------------------------------------------

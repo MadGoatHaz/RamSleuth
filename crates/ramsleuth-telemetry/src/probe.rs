@@ -1455,6 +1455,7 @@ mod tests {
     // (chunk-probe-2: the markdown renderer pins).
     // ------------------------------------------------------------------
 
+    use crate::amd_readout::EccStatus;
     use crate::intel_readout::{ChannelMode, IntelChannel};
 
     /// (4) The sample (fully-populated) [`ProbeReport`] renders to the
@@ -1626,6 +1627,7 @@ mod tests {
                 intel: Section::Value(IntelReadout {
                     channels: vec![populated_channel(0), populated_channel(1)],
                     channel_mode: Some(ChannelMode::DualSymmetric),
+                    ecc_status: EccStatus::Unknown,
                 }),
                 spd: Vec::new(),
                 platform: SystemPlatform {

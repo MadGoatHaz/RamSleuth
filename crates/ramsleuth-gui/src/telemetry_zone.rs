@@ -779,6 +779,7 @@ mod tests {
                 decode_channel(1, None, [None; 4]),
             ],
             channel_mode: None,
+            ecc_status: EccStatus::Unknown,
         }
     }
 

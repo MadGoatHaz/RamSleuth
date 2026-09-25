@@ -2387,6 +2387,7 @@ mod tests {
                         decode_channel(1, None, [None; 4]),
                     ],
                     channel_mode: None,
+                    ecc_status: EccStatus::Unknown,
                 }),
                 spd: Vec::new(),
                 platform: SystemPlatform {
@@ -2788,6 +2789,7 @@ mod tests {
                 intel: Section::Value(IntelReadout {
                     channels: Vec::new(),
                     channel_mode: mode,
+                    ecc_status: EccStatus::Unknown,
                 }),
                 spd: Vec::new(),
                 platform: SystemPlatform {
@@ -2851,6 +2853,7 @@ mod tests {
         let flex = one_dimm(Section::Value(IntelReadout {
             channels: Vec::new(),
             channel_mode: Some(ChannelMode::DualFlex),
+            ecc_status: EccStatus::Unknown,
         }));
         assert_eq!(
             ram_line_prefix(&flex, true),
@@ -2861,6 +2864,7 @@ mod tests {
         let no_mode = one_dimm(Section::Value(IntelReadout {
             channels: Vec::new(),
             channel_mode: None,
+            ecc_status: EccStatus::Unknown,
         }));
         assert_eq!(
             ram_line_prefix(&no_mode, true),
@@ -3048,6 +3052,7 @@ mod tests {
                     decode_channel(1, None, [None; 4]),
                 ],
                 channel_mode: None,
+                ecc_status: EccStatus::Unknown,
             }),
             spd: vec![module(Section::na(NaReason::NotApplicable), None)],
             platform: SystemPlatform {
@@ -3473,6 +3478,7 @@ mod tests {
                         None,
                     ])],
                     channel_mode: None,
+                    ecc_status: EccStatus::Unknown,
                 }),
                 spd: Vec::new(),
                 platform: SystemPlatform {

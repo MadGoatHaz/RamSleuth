@@ -1333,6 +1333,7 @@ mod tests {
             mad_dimm_ch1: Some(0x0000_000C),
             mad_dimm_ch2: None,
             mad_dimm_ch3: None,
+            capid0a: None,
         }
     }
 

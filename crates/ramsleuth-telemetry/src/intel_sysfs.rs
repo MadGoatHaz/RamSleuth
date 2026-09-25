@@ -171,6 +171,10 @@ pub struct SysfsRegs {
     /// exposes no `mad_dimm_ch3` attribute (e.g. the 64 KiB builds) or a
     /// malformed read.
     pub mad_dimm_ch3: Option<u32>,
+    /// CAPID0_A raw (host-bridge config offset 0xE4, read in-kernel by
+    /// the module). The Intel ECC decode input; `None` on a module build
+    /// that exposes no `capid0a` attribute or a malformed read.
+    pub capid0a: Option<u32>,
 }
 
 /// Acquire the raw IMC register set from the `ramsleuth_intel` sysfs
@@ -344,6 +348,10 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
     // containment as the core 19.
     let mad_dimm_ch2 = read_u32_attr(root, "mad_dimm_ch2")?;
     let mad_dimm_ch3 = read_u32_attr(root, "mad_dimm_ch3")?;
+    // CAPID0_A (host-bridge config offset 0xE4): the Intel ECC decode
+    // input. Absent on a module build that exposes no capid0a attribute ->
+    // `None` (graceful), the same per-attribute containment as the MAD raws.
+    let capid0a = read_u32_attr(root, "capid0a")?;
 
     Ok(SysfsRegs {
         regs: IntelImcRegs {
@@ -365,6 +373,7 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
         mad_dimm_ch1,
         mad_dimm_ch2,
         mad_dimm_ch3,
+        capid0a,
     })
 }
 
@@ -720,6 +729,23 @@ mod tests {
         assert_eq!(out.mad_intra_ch1, None);
         assert_eq!(out.mad_dimm_ch0, Some(0x0000_0008));
         assert_eq!(out.mad_dimm_ch1, Some(0x0000_000C));
+    }
+
+    /// capid0a populates on a build that exposes it and degrades to
+    /// `None` on a build that does not (graceful containment; the Intel
+    /// ECC decode input).
+    #[test]
+    fn capid0a_present_and_absent_containment() {
+        let k = TempKobject::new("capid0a");
+        write_acceptance_kobject(&k);
+        k.write("capid0a", "0x62012671\n");
+        let out = read_from(&k.root).expect("containment -> Ok");
+        assert_eq!(out.capid0a, Some(0x6201_2671));
+
+        let k2 = TempKobject::new("capid0a-absent");
+        write_acceptance_kobject(&k2); // no capid0a file
+        let out2 = read_from(&k2.root).expect("containment -> Ok");
+        assert_eq!(out2.capid0a, None);
     }
 
     // -----------------------------------------------------------------

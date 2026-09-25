@@ -2489,6 +2489,7 @@ mod tests {
     use ramsleuth_gui::{BenchState, CapacityUnit, ClockUnit, DEFAULT_POLL_INTERVAL_MS};
     use ramsleuth_telemetry::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
     use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode, map_amd};
+    use ramsleuth_telemetry::amd_readout::EccStatus;
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::intel_readout::{ChannelMode, IntelReadout};
@@ -3149,6 +3150,7 @@ mod tests {
             intel_mode(&intel_t(Section::Value(IntelReadout {
                 channels: Vec::new(),
                 channel_mode: Some(ChannelMode::DualSymmetric),
+                ecc_status: EccStatus::Unknown,
             }))),
             Some(("Interleaved".to_owned(), Some(CYAN)))
         );
@@ -3156,6 +3158,7 @@ mod tests {
             intel_mode(&intel_t(Section::Value(IntelReadout {
                 channels: Vec::new(),
                 channel_mode: Some(ChannelMode::DualFlex),
+                ecc_status: EccStatus::Unknown,
             }))),
             Some(("Flex".to_owned(), Some(AMBER)))
         );
@@ -3163,6 +3166,7 @@ mod tests {
             intel_mode(&intel_t(Section::Value(IntelReadout {
                 channels: Vec::new(),
                 channel_mode: Some(ChannelMode::Single),
+                ecc_status: EccStatus::Unknown,
             }))),
             Some(("N/A".to_owned(), None))
         );
@@ -3171,6 +3175,7 @@ mod tests {
             intel_mode(&intel_t(Section::Value(IntelReadout {
                 channels: Vec::new(),
                 channel_mode: None,
+                ecc_status: EccStatus::Unknown,
             }))),
             None
         );
@@ -3210,6 +3215,7 @@ mod tests {
         let flex = one_dimm(Section::Value(IntelReadout {
             channels: Vec::new(),
             channel_mode: Some(ChannelMode::DualFlex),
+            ecc_status: EccStatus::Unknown,
         }));
         assert_eq!(
             ram_line_prefix(&flex, &Units::default()),
@@ -3220,6 +3226,7 @@ mod tests {
         let no_mode = one_dimm(Section::Value(IntelReadout {
             channels: Vec::new(),
             channel_mode: None,
+            ecc_status: EccStatus::Unknown,
         }));
         assert_eq!(
             ram_line_prefix(&no_mode, &Units::default()),
