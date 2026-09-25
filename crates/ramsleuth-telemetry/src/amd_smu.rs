@@ -299,6 +299,29 @@ pub fn version_from_sources(blob: &[u8], version_attr: Option<&[u8]>) -> Telemet
     }
 }
 
+/// The five key PM-table f32 values' byte offsets (little-endian, 4 bytes
+/// each): VDDCR_VDD, VDDCR_SOC, FCLK, UCLK, MCLK (the verified field layout,
+/// `amd_pm`).
+const PM_KEY_VALUE_OFFSETS: [usize; 5] = [0x0A0, 0x0B0, 0x0C0, 0x0C8, 0x0CC];
+
+/// Read the five key PM-table f32 values as their raw `u32` bit patterns.
+///
+/// The PM blob is a headerless little-endian f32 array (byte offset = index
+/// × 4). Each key value is read as its 4 LE bytes reinterpreted as a `u32`
+/// (the f32 bit pattern — no float math, no NaN / overflow handling). A blob
+/// too short for an offset yields `None` for that value (per-value
+/// containment, no panic). Returns the values in [`PM_KEY_VALUE_OFFSETS`]
+/// order: (vddcr_vdd, vddcr_soc, fclk, uclk, mclk).
+pub fn read_pm_key_values(pm_blob: &[u8]) -> [Option<u32>; 5] {
+    let mut out = [None; 5];
+    for (i, &off) in PM_KEY_VALUE_OFFSETS.iter().enumerate() {
+        out[i] = pm_blob
+            .get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    }
+    out
+}
+
 /// Classify a raw I/O error into a structured [`TelemetryError`].
 ///
 /// - `NotFound` → [`TelemetryError::DriverMissing`] (the `ryzen_smu`
@@ -692,5 +715,36 @@ mod tests {
                 "/sys/kernel/ryzen_smu/pm_table_size"
             ]
         );
+    }
+
+    /// (a) The five key PM-table f32 values are read as their raw LE u32 bit
+    /// patterns from the verified offsets; a short blob degrades the
+    /// out-of-bounds values to `None` (per-value containment, no panic).
+    #[test]
+    fn read_pm_key_values_reads_the_five_f32_bit_patterns() {
+        // A blob long enough for every key offset (>= 0x0C8 + 4 = 208 bytes).
+        let mut blob = vec![0u8; 0x0D0];
+        let patterns = [
+            0x3E4C_CCCDu32, // VDDCR_VDD @ 0x0A0
+            0x3EF2_CCCCu32, // VDDCR_SOC @ 0x0B0
+            0x40F0_0000u32, // FCLK @ 0x0C0
+            0x40C8_0000u32, // UCLK @ 0x0C8
+            0x40C8_0000u32, // MCLK @ 0x0CC
+        ];
+        for (pattern, off) in patterns.iter().zip(PM_KEY_VALUE_OFFSETS.iter()) {
+            blob[*off..*off + 4].copy_from_slice(&pattern.to_le_bytes());
+        }
+        assert_eq!(read_pm_key_values(&blob), patterns.map(Some));
+
+        // A blob long enough for only the first three offsets degrades the
+        // last two to `None` (the earlier ones still read, as zeros here).
+        let short = vec![0u8; 0x0C0 + 4];
+        assert_eq!(
+            read_pm_key_values(&short),
+            [Some(0), Some(0), Some(0), None, None]
+        );
+
+        // An empty blob degrades everything to `None`.
+        assert_eq!(read_pm_key_values(&[]), [None, None, None, None, None]);
     }
 }

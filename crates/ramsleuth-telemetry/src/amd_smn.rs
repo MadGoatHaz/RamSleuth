@@ -143,7 +143,10 @@ const SMN_RFC: u32 = 0x50260;
 const SMN_RFC_MIRROR: u32 = 0x50264;
 
 /// The verified 13-register read set (plan §1) in `monitor_cpu` read order.
-const SMN_REGISTER_SET: [u32; 13] = [
+///
+/// Exposed (`pub`) as the single source of truth for the probe report's AMD
+/// SMN table (the `probe` renderer names each row from these addresses).
+pub const SMN_REGISTER_SET: [u32; 13] = [
     SMN_MCLK, SMN_CMD0, SMN_CMD1, SMN_CMD2, SMN_CMD3, SMN_CMD4, SMN_CMD5,
     SMN_RDRD, SMN_WRWR, SMN_TURN, SMN_CKE, SMN_RFC, SMN_RFC_MIRROR,
 ];
@@ -450,6 +453,77 @@ pub fn read_smn_register(address: u32) -> TelemetryResult<u32> {
             vendor: "non-linux platform (the ryzen_smu smn attribute requires Linux)".to_owned(),
         })
     }
+}
+
+/// Read all 13 known DRAM timing SMN registers, in address order.
+///
+/// Returns a `Vec` with one entry per register in [`SMN_REGISTER_SET`]
+/// order: `Some(word)` on a successful read, `None` when that read failed
+/// (per-register containment — a failed word's fields decode to `0`
+/// downstream, never as data, P6-10).
+///
+/// **Offset rule** (reference line 220): the first read of `0x50200` decides
+/// the base — a word of exactly [`SMN_HIGH_BASE_MARKER`] relocates the whole
+/// block by [`SMN_HIGH_BASE`] (every register, including the re-read
+/// set-point, is read at `address + 0x100000`); any other outcome reads the
+/// 12 remaining registers at the bare base. This mirrors
+/// [`apply_smn_with`] exactly (the offset decision is the first read's only).
+///
+/// Returns an **empty** `Vec` when nothing can be captured: a non-AMD vendor
+/// (the gate fires before any I/O) or a missing `smn` attribute
+/// (`DriverMissing` — the whole read is a no-op, matching the overlay). Every
+/// other failure yields the full 13-entry list with per-register `None`s.
+///
+/// Never panics (no-panic contract, D5): every hardware path degrades to a
+/// structured [`TelemetryError`] inside [`read_smn_register`], which is
+/// collapsed per register by [`read_word`].
+pub fn read_all_dram_registers() -> Vec<Option<u32>> {
+    // Vendor gate: pure, so non-AMD hardware yields nothing before any file
+    // access (plan D1 gate discipline).
+    if vendor_gate(&CpuInfo::detect()).is_err() {
+        return Vec::new();
+    }
+    read_all_dram_registers_with(read_smn_register)
+}
+
+/// The [`read_all_dram_registers`] core with an **injectable register
+/// reader** (the hermetic test seam: tests feed synthetic words / errors;
+/// production injects [`read_smn_register`]). No vendor gate here — that
+/// belongs to the public [`read_all_dram_registers`] contract, keeping this
+/// core host-independent.
+///
+/// The first read of `0x50200` decides the base (offset rule, the mirror of
+/// [`apply_smn_with`]); `DriverMissing` on that probe yields an empty list
+/// (the whole read is a no-op), and every other read is contained per
+/// register by [`read_word`] (a failed read and the `0xFFFF_FFFF` sentinel
+/// both become `None`).
+fn read_all_dram_registers_with<R: FnMut(u32) -> TelemetryResult<u32>>(
+    mut reader: R,
+) -> Vec<Option<u32>> {
+    // Offset rule (mirror of `apply_smn_with`): the first read of `0x50200`
+    // decides the base.
+    let (setpoint, base) = match reader(SMN_MCLK) {
+        // The marker relocates the whole block; the set-point word is
+        // re-read at the relocated address.
+        Ok(word) if word == SMN_HIGH_BASE_MARKER => {
+            (read_word(reader(SMN_MCLK + SMN_HIGH_BASE)), SMN_HIGH_BASE)
+        }
+        // A failed probe read: no set-point, no relocation; the rest run at
+        // the bare base.
+        Ok(word) if word == SMN_READ_FAILURE_SENTINEL => (None, 0),
+        Ok(word) => (Some(word), 0),
+        // No `smn` attribute at all: nothing captured (whole-read no-op).
+        Err(TelemetryError::DriverMissing { .. }) => return Vec::new(),
+        // Privilege / I/O / short read: per-register containment.
+        Err(_) => (None, 0),
+    };
+
+    let mut regs: Vec<Option<u32>> = Vec::with_capacity(SMN_REGISTER_SET.len());
+    regs.push(setpoint);
+    for &addr in SMN_REGISTER_SET.iter().skip(1) {
+        regs.push(read_word(reader(addr + base)));
+    }
+    regs
 }
 
 /// Open the first existing `smn` attribute `O_RDWR` (canonical kobject
@@ -1419,5 +1493,88 @@ mod tests {
         assert!(t.wrwr_dd <= 15 && t.wrwr_sd <= 15 && t.wrwr_sc <= 15 && t.wrwr_scl <= 63);
         assert!(t.wrrd <= 15 && t.rdwr <= 31);
         assert!(t.rfc1 <= 1023 && t.rfc2 <= 1023 && t.rfcsb <= 1023);
+    }
+
+    /// (g) The bulk-read core: the full 13-entry list in address order, the
+    /// offset rule deciding the base (a `0x300` probe relocates every
+    /// register by `+0x100000`, incl. the re-read set-point), and
+    /// per-register containment (a failed read / sentinel is `None`);
+    /// `DriverMissing` on the probe is a whole-read no-op (empty list).
+    #[test]
+    fn read_all_dram_registers_with_pins_the_set_and_offset_rule() {
+        // Bare base: the probe word is data (not the marker) -> 13 entries,
+        // the first is the probe word, the rest read at the bare addresses.
+        let mut seen: Vec<u32> = Vec::new();
+        let regs = read_all_dram_registers_with(|addr| {
+            seen.push(addr);
+            Ok(0x1539)
+        });
+        assert_eq!(regs.len(), 13);
+        assert_eq!(regs[0], Some(0x1539)); // the probe word
+        for word in &regs[1..] {
+            assert_eq!(*word, Some(0x1539));
+        }
+        // 1 probe + 12 bare reads.
+        assert_eq!(seen.len(), 13);
+        assert_eq!(seen[0], SMN_MCLK);
+        assert_eq!(seen[1], SMN_CMD0);
+
+        // Offset rule: the probe word is the marker -> the re-read set-point
+        // + the 12 others run at `+0x100000`.
+        let mut seen: Vec<u32> = Vec::new();
+        let regs = read_all_dram_registers_with(|addr| {
+            seen.push(addr);
+            if addr == SMN_MCLK {
+                Ok(SMN_HIGH_BASE_MARKER)
+            } else {
+                Ok(0x1539)
+            }
+        });
+        assert_eq!(regs.len(), 13);
+        assert_eq!(regs[0], Some(0x1539)); // the relocated set-point re-read
+        assert_eq!(seen.len(), 14); // 1 probe + 1 relocated re-read + 12
+        assert_eq!(seen[0], SMN_MCLK);
+        assert_eq!(seen[1], SMN_MCLK + SMN_HIGH_BASE);
+        for a in &seen[2..] {
+            assert!(
+                *a >= SMN_CMD0 + SMN_HIGH_BASE,
+                "bare address after relocation: {a:#x}"
+            );
+        }
+
+        // Per-register containment: one register reads the sentinel ->
+        // `None` (its fields decode to 0 downstream); the others are data.
+        let regs = read_all_dram_registers_with(|addr| {
+            if addr == SMN_CMD0 {
+                Ok(SMN_READ_FAILURE_SENTINEL)
+            } else if addr == SMN_MCLK {
+                Ok(0x1539)
+            } else {
+                Ok(0x1111_0000)
+            }
+        });
+        assert_eq!(regs.len(), 13);
+        assert_eq!(regs[0], Some(0x1539));
+        assert_eq!(regs[1], None); // the sentinel word
+        assert_eq!(regs[2], Some(0x1111_0000));
+
+        // DriverMissing on the probe -> the whole read is a no-op (empty).
+        let regs = read_all_dram_registers_with(|_| {
+            Err(TelemetryError::DriverMissing { driver: DRIVER })
+        });
+        assert!(regs.is_empty());
+    }
+
+    /// (g) On this host the public bulk read is graceful: an empty list
+    /// (non-AMD / missing `smn` attribute) or the full 13-entry list —
+    /// never a panic, and never a partial list.
+    #[test]
+    fn read_all_dram_registers_on_this_host_is_graceful() {
+        let regs = read_all_dram_registers();
+        assert!(
+            regs.is_empty() || regs.len() == 13,
+            "the bulk read is all-or-nothing (13 entries): {} entries",
+            regs.len()
+        );
     }
 }

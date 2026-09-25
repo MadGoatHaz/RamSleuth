@@ -7,16 +7,18 @@
 //! append pattern):
 //!
 //! - [`ProbeReport`] — the top-level report: the full
-//!   [`SystemMemoryTelemetry`] snapshot, the optional Intel raw-register
+//!   [`SystemMemoryTelemetry`] snapshot, the optional vendor raw-register
 //!   dump ([`ProbeRaw`]), and the system identity ([`ProbeSystem`]).
 //! - [`ProbeRaw`] — a serde-friendly **flattened** representation of the
-//!   Intel raw IMC registers: the 51 `Option<u32>` slots of
-//!   `IntelImcRegs` re-laid flat (the 4 per-channel `TC_*` blocks, the 2
-//!   native `MCL_*` blocks, the global `MC_BIOS_REQ`, the 7 global MAD
-//!   registers) plus the MCHBAR diagnostics. It is a **flat, stable wire
-//!   format** (no nesting that would break the bincode round-trip) — the
-//!   existing `IntelImcRegs` / `MclRegs` / `ChannelRegs` deliberately keep
-//!   no serde derives and are NOT changed.
+//!   vendor raw registers: the Intel raw IMC registers (the 51
+//!   `Option<u32>` slots of `IntelImcRegs` re-laid flat — the 4
+//!   per-channel `TC_*` blocks, the 2 native `MCL_*` blocks, the global
+//!   `MC_BIOS_REQ`, the 7 global MAD registers — plus the MCHBAR
+//!   diagnostics) and the AMD raw section (the 13 SMN DRAM words + the
+//!   PM-table version / blob length + the five key f32 values). It is a
+//!   **flat, stable wire format** (no nesting that would break the
+//!   bincode round-trip) — the existing `IntelImcRegs` / `MclRegs` /
+//!   `ChannelRegs` deliberately keep no serde derives and are NOT changed.
 //! - [`ProbeSystem`] — the operator-facing system identity: CPU brand /
 //!   vendor / generation, the PCI host-bridge id (when known), kernel /
 //!   OS / arch, the RamSleuth version, and the telemetry source.
@@ -57,28 +59,37 @@ use crate::SystemMemoryTelemetry;
 pub struct ProbeReport {
     /// The full system memory telemetry snapshot.
     pub telemetry: SystemMemoryTelemetry,
-    /// The Intel raw-register dump (flattened), when available.
+    /// The vendor raw-register dump (flattened — the Intel IMC registers
+    /// and/or the AMD SMN/PM section), when available.
     pub raw: Option<ProbeRaw>,
     /// The operator-facing system identity.
     pub system: ProbeSystem,
 }
 
-/// A serde-friendly **flattened** representation of the Intel raw IMC
+/// A serde-friendly **flattened** representation of the vendor raw
 /// registers — the flat, stable wire form of the 51-slot `IntelImcRegs`
-/// plus the 7 global MAD registers plus the MCHBAR diagnostics.
+/// plus the 7 global MAD registers plus the MCHBAR diagnostics, and the
+/// AMD raw section (the 13 SMN DRAM words + the PM-table version / blob
+/// length + the five key f32 values).
 ///
 /// The existing `IntelImcRegs` / `MclRegs` / `ChannelRegs` deliberately
 /// carry **no** serde derives (they are decode inputs, not wire types);
 /// this struct re-lays them flat so the raw set crosses the wire as a
 /// stable, nesting-free shape. bincode serializes a struct's fields in
-/// declaration order — **the field order below is the wire contract**.
+/// declaration order — **the field order below is the wire contract**
+/// (the AMD section is appended after every Intel field, OQ-10
+/// append-only).
 ///
-/// Every register field is `Option<u32>` (per-register containment:
+/// Every Intel register field is `Option<u32>` (per-register containment:
 /// `None` when the underlying read failed / was absent). The MCHBAR
 /// diagnostics: `mchbar_base` is `Option<u64>` (the physical base, `None`
 /// when absent / malformed) and `mchbar_enabled` is a plain `bool`
-/// (`false` when absent / malformed).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// (`false` when absent / malformed). The AMD fields: `amd_smn_regs` is a
+/// `Vec<Option<u32>>` (empty when no `smn` attribute was available) and
+/// the PM fields are `Option<u32>` (`None` when absent). An Intel report
+/// leaves every AMD field absent, and an AMD report leaves every Intel
+/// field absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProbeRaw {
     // --- global --------------------------------------------------------
     /// `MC_BIOS_REQ` @ `0x5E00` (the global DRAM clock word).
@@ -150,6 +161,28 @@ pub struct ProbeRaw {
     pub mchbar_base: Option<u64>,
     /// MCHBAR enable bit (`false` when absent / malformed).
     pub mchbar_enabled: bool,
+    // --- AMD raw section (appended after all Intel fields — OQ-10
+    //     append-only; the flat declaration order is the wire contract) ---
+    /// The 13 SMN DRAM timing register words in address order (base
+    /// addresses, per the offset rule): `Some(word)` on a successful read,
+    /// `None` when that read failed. Empty when no `smn` attribute was
+    /// available (the whole read is a no-op).
+    pub amd_smn_regs: Vec<Option<u32>>,
+    /// The PM-table `TableVersionId` (the sibling `pm_table_version` value,
+    /// or the legacy first word of the blob).
+    pub amd_pm_version: Option<u32>,
+    /// The PM-table blob length in bytes (`None` when no blob was acquired).
+    pub amd_pm_blob_len: Option<u32>,
+    /// `VDDCR_VDD` (Vcore) f32 bit pattern @ `0x0A0`.
+    pub amd_pm_vddcr_vdd: Option<u32>,
+    /// `VDDCR_SOC` f32 bit pattern @ `0x0B0`.
+    pub amd_pm_vddcr_soc: Option<u32>,
+    /// `FCLK` f32 bit pattern @ `0x0C0`.
+    pub amd_pm_fclk: Option<u32>,
+    /// `UCLK` f32 bit pattern @ `0x0C8`.
+    pub amd_pm_uclk: Option<u32>,
+    /// `MCLK` f32 bit pattern @ `0x0CC`.
+    pub amd_pm_mclk: Option<u32>,
 }
 
 /// The operator-facing system identity for a probe report: the CPU
@@ -244,11 +277,14 @@ pub fn render_probe_report_md(report: &ProbeReport) -> String {
     render_intel(&mut out, &report.telemetry.intel);
     render_spd(&mut out, &report.telemetry.spd);
     render_platform(&mut out, &report.telemetry);
-    // 4. The raw registers (or the not-captured note).
+    // 4. The raw registers: the Intel IMC table when Intel raw is the
+    //    active source, the AMD SMN/PM table when AMD raw is, or the
+    //    vendor-neutral not-captured note when neither.
     out.push_str("## Raw Registers\n\n");
     match &report.raw {
-        Some(raw) => render_raw_table(&mut out, raw),
-        None => out.push_str("_not captured (no Intel raw source available: AMD / unknown silicon, or both sources unavailable)_\n\n"),
+        Some(raw) if has_intel_raw(raw) => render_raw_table(&mut out, raw),
+        Some(raw) if has_amd_raw(raw) => render_amd_raw_table(&mut out, raw),
+        _ => out.push_str("_not captured (no raw source available)_\n\n"),
     }
     // 5. The N/A reasons (the "why is this N/A" development detail).
     out.push_str("## N/A Reasons\n\n");
@@ -803,6 +839,83 @@ fn render_raw_table(out: &mut String, raw: &ProbeRaw) {
     );
 }
 
+/// `true` when the Intel raw slots are the active source (at least one of
+/// the 56 register words is read, or the MCHBAR diagnostics carry data).
+fn has_intel_raw(raw: &ProbeRaw) -> bool {
+    raw_u32_sections(raw)
+        .iter()
+        .any(|(_, value)| value.is_some())
+        || raw.mchbar_base.is_some()
+        || raw.mchbar_enabled
+}
+
+/// `true` when the AMD raw section is populated (a non-empty SMN register
+/// list, or a PM-table version).
+fn has_amd_raw(raw: &ProbeRaw) -> bool {
+    !raw.amd_smn_regs.is_empty() || raw.amd_pm_version.is_some()
+}
+
+/// The AMD raw section of the `## Raw Registers` table: the 13 SMN DRAM
+/// register words (named by their base address) + the PM-table key values
+/// (version, blob length, and the five f32 bit patterns).
+fn render_amd_raw_table(out: &mut String, raw: &ProbeRaw) {
+    // The 13 SMN register words, in address order.
+    out.push_str("### AMD SMN Registers\n\n");
+    out.push_str("| Register | Value |\n|---|---|\n");
+    for (index, address) in crate::amd_smn::SMN_REGISTER_SET.iter().enumerate() {
+        let value = raw.amd_smn_regs.get(index).copied().flatten();
+        out.push_str(&format!(
+            "| SMN_{:#X} | {} |\n",
+            address,
+            match value {
+                Some(word) => format!("0x{word:08X}"),
+                None => "N/A (absent)".to_owned(),
+            }
+        ));
+    }
+    out.push('\n');
+    // The PM-table key values.
+    out.push_str("### AMD PM Table\n\n");
+    out.push_str("| Field | Value |\n|---|---|\n");
+    out.push_str(&format!(
+        "| PM Version | {} |\n",
+        match raw.amd_pm_version {
+            Some(version) => format!("0x{version:08X}"),
+            None => "N/A (absent)".to_owned(),
+        }
+    ));
+    out.push_str(&format!(
+        "| PM Blob Length | {} |\n",
+        match raw.amd_pm_blob_len {
+            Some(len) => format!("{len} bytes"),
+            None => "N/A (absent)".to_owned(),
+        }
+    ));
+    for (name, value) in amd_pm_sections(raw) {
+        out.push_str(&format!(
+            "| {} | {} |\n",
+            md_escape(name),
+            match value {
+                Some(bits) => format!("0x{bits:08X} (f32 bits)"),
+                None => "N/A (absent)".to_owned(),
+            }
+        ));
+    }
+    out.push('\n');
+}
+
+/// The five AMD PM-table key-value cells as (field name, value) pairs, in
+/// display order (VDDCR_VDD, VDDCR_SOC, FCLK, UCLK, MCLK).
+fn amd_pm_sections(raw: &ProbeRaw) -> [(&str, Option<u32>); 5] {
+    [
+        ("VDDCR_VDD", raw.amd_pm_vddcr_vdd),
+        ("VDDCR_SOC", raw.amd_pm_vddcr_soc),
+        ("FCLK", raw.amd_pm_fclk),
+        ("UCLK", raw.amd_pm_uclk),
+        ("MCLK", raw.amd_pm_mclk),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // The N/A-reason collection (the `## N/A Reasons` section).
 // ---------------------------------------------------------------------------
@@ -1048,22 +1161,69 @@ fn collect_na_reasons(report: &ProbeReport, out: &mut Vec<(String, String)>) {
     match &report.raw {
         None => out.push((
             "raw (whole dump)".to_owned(),
-            "not captured (no Intel raw source available)".to_owned(),
+            "not captured (no raw source available)".to_owned(),
         )),
         Some(raw) => {
-            for (name, value) in raw_u32_sections(raw) {
-                if value.is_none() {
+            // The Intel raw slots — only when Intel is the active source
+            // (an AMD report carries all-`None` Intel fields, which are not
+            // "absent" but "not this vendor's source").
+            if has_intel_raw(raw) {
+                for (name, value) in raw_u32_sections(raw) {
+                    if value.is_none() {
+                        out.push((
+                            name.to_owned(),
+                            "N/A (register absent / read failed)".to_owned(),
+                        ));
+                    }
+                }
+                if raw.mchbar_base.is_none() {
                     out.push((
-                        name.to_owned(),
+                        "raw.mchbar_base".to_owned(),
                         "N/A (register absent / read failed)".to_owned(),
                     ));
                 }
             }
-            if raw.mchbar_base.is_none() {
-                out.push((
-                    "raw.mchbar_base".to_owned(),
-                    "N/A (register absent / read failed)".to_owned(),
-                ));
+            // The AMD raw section.
+            if has_amd_raw(raw) {
+                // No `smn` attribute (a PM-only capture) → the whole SMN
+                // block is not captured.
+                if raw.amd_smn_regs.is_empty() {
+                    out.push((
+                        "amd.smn (whole block)".to_owned(),
+                        "AMD SMN: not captured (no ryzen_smu driver)".to_owned(),
+                    ));
+                }
+                // Per-register N/A entries for the failed SMN words.
+                for (index, value) in raw.amd_smn_regs.iter().enumerate() {
+                    if value.is_none() {
+                        let address = crate::amd_smn::SMN_REGISTER_SET[index];
+                        out.push((
+                            format!("amd.smn.smn_{address:#X}"),
+                            "N/A (register absent / read failed)".to_owned(),
+                        ));
+                    }
+                }
+                // The PM-table key values.
+                if raw.amd_pm_version.is_none() {
+                    out.push((
+                        "amd.pm.version".to_owned(),
+                        "N/A (absent / read failed)".to_owned(),
+                    ));
+                }
+                if raw.amd_pm_blob_len.is_none() {
+                    out.push((
+                        "amd.pm.blob_len".to_owned(),
+                        "N/A (absent / read failed)".to_owned(),
+                    ));
+                }
+                for (name, value) in amd_pm_sections(raw) {
+                    if value.is_none() {
+                        out.push((
+                            format!("amd.pm.{name}"),
+                            "N/A (absent / read failed)".to_owned(),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1145,6 +1305,8 @@ mod tests {
             mad_dimm_ch3: Some(0x0000_0014),
             mchbar_base: Some(0xFED1_0000),
             mchbar_enabled: true,
+            // AMD raw: absent (the Intel fixture carries no AMD data).
+            ..Default::default()
         }
     }
 
@@ -1523,5 +1685,123 @@ mod tests {
         assert!(md.contains("`raw (whole dump)` — not captured"), "{md}");
         // The empty SPD list note.
         assert!(md.contains("no modules"), "{md}");
+    }
+
+    /// An AMD [`ProbeRaw`] fixture: the 13 SMN words (the last a failed
+    /// read) + the PM version / blob length + the five key f32 bit patterns;
+    /// every Intel field absent (an AMD report carries none).
+    fn amd_fixture_raw() -> ProbeRaw {
+        ProbeRaw {
+            amd_smn_regs: vec![
+                Some(0x0000_1539),
+                Some(0x1010_2410),
+                Some(0x0010_0030),
+                Some(0x0400_0404),
+                Some(0x0000_0010),
+                Some(0x0008_0410),
+                Some(0x0000_0010),
+                Some(0x0504_0302),
+                Some(0x0908_0706),
+                Some(0x0000_0602),
+                Some(0x0400_0000),
+                Some(0x7E08_20A0),
+                None, // 0x50264: a failed read
+            ],
+            amd_pm_version: Some(0x0038_0805),
+            amd_pm_blob_len: Some(2288),
+            amd_pm_vddcr_vdd: Some(0x3E4C_CCCD),
+            amd_pm_vddcr_soc: Some(0x3EF2_CCCC),
+            amd_pm_fclk: Some(0x40F0_0000),
+            amd_pm_uclk: Some(0x40C8_0000),
+            amd_pm_mclk: Some(0x40C8_0000),
+            // All Intel raw: absent (an AMD report carries none).
+            ..Default::default()
+        }
+    }
+
+    /// An AMD [`ProbeReport`] fixture: the AMD SMN/PM raw section populated,
+    /// the Intel raw absent, an AMD system identity (host-independent).
+    fn amd_fixture_report() -> ProbeReport {
+        ProbeReport {
+            telemetry: SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Amd(AmdZen::Zen3),
+                    brand: "AMD Ryzen 9 5950X".to_owned(),
+                },
+                amd: Section::na(NaReason::DriverMissing),
+                intel: Section::na(NaReason::UnsupportedHardware),
+                spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                    motherboard: Section::na(NaReason::NotApplicable),
+                    bios: Section::na(NaReason::NotApplicable),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::na(NaReason::NotApplicable),
+                dimm_sizes: Vec::new(),
+            },
+            raw: Some(amd_fixture_raw()),
+            system: ProbeSystem {
+                cpu_brand: "AMD Ryzen 9 5950X".to_owned(),
+                cpu_vendor: "AMD".to_owned(),
+                cpu_gen: "Zen3".to_owned(),
+                pci_host_bridge: None,
+                kernel: "6.6.0-1-cachyos".to_owned(),
+                os: "Linux / Arch".to_owned(),
+                arch: "x86_64".to_owned(),
+                ramsleuth_version: "2.4.2".to_owned(),
+                telemetry_source: "ryzen_smu".to_owned(),
+            },
+        }
+    }
+
+    /// (7) A [`ProbeReport`] with an AMD raw section (the 13 SMN words + the
+    /// PM key values; all Intel raw `None`) round-trips through bincode and
+    /// compares equal — the appended AMD fields cross the wire (OQ-10
+    /// append-only).
+    #[test]
+    fn probe_report_bincode_round_trip_amd_raw() {
+        let report = amd_fixture_report();
+        let bytes =
+            bincode::serialize(&report).expect("ProbeReport must serialize (no-panic contract)");
+        let back: ProbeReport =
+            bincode::deserialize(&bytes).expect("ProbeReport must deserialize");
+        assert_eq!(report, back);
+    }
+
+    /// (8) An AMD [`ProbeReport`] (raw = the AMD SMN/PM section, Intel raw
+    /// absent) renders the AMD table in the `## Raw Registers` section: the
+    /// 13 SMN register rows (named by address, the failed word as N/A), the
+    /// PM version / blob length, and the five f32 bit patterns — and the
+    /// N/A-reason list carries the AMD per-register entry for the failed
+    /// word.
+    #[test]
+    fn render_probe_report_md_amd_raw_section() {
+        let report = amd_fixture_report();
+        let md = render_probe_report_md(&report);
+
+        // The AMD SMN table is present (not the Intel IMC table).
+        assert!(md.contains("### AMD SMN Registers"), "{md}");
+        assert!(
+            !md.contains("MC_BIOS_REQ"),
+            "an AMD report must not render the Intel IMC table: {md}"
+        );
+        // The 13 SMN rows, named by base address; the failed word is N/A.
+        assert!(md.contains("| SMN_0x50200 | 0x00001539 |"), "{md}");
+        assert!(md.contains("| SMN_0x50204 | 0x10102410 |"), "{md}");
+        assert!(md.contains("| SMN_0x50264 | N/A (absent) |"), "{md}");
+        // The PM table: version, blob length, the five f32 bit patterns.
+        assert!(md.contains("### AMD PM Table"), "{md}");
+        assert!(md.contains("| PM Version | 0x00380805 |"), "{md}");
+        assert!(md.contains("| PM Blob Length | 2288 bytes |"), "{md}");
+        assert!(md.contains("| VDDCR_VDD | 0x3E4CCCCD (f32 bits) |"), "{md}");
+        assert!(md.contains("| MCLK | 0x40C80000 (f32 bits) |"), "{md}");
+        // The N/A reasons carry the AMD per-register entry for the failed
+        // word.
+        assert!(
+            md.contains("`amd.smn.smn_0x50264` — N/A (register absent / read failed)"),
+            "{md}"
+        );
     }
 }

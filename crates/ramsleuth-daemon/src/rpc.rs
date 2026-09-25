@@ -32,8 +32,9 @@
 //! - [`Request::GetProbeReport`] → the chunk 1b daemon builder: take
 //!   the P3-14 TTL cache (offloaded to the blocking pool, same as
 //!   [`Request::GetTelemetry`]), then assemble the [`ProbeReport`] — the
-//!   decoded snapshot + the Intel raw dump (module-first, `/dev/mem`
-//!   fallback, plan §3.5) + the system identity — all inside the same
+//!   decoded snapshot + the vendor raw dump (Intel: module-first,
+//!   `/dev/mem` fallback, plan §3.5; AMD: the `ryzen_smu` SMN/PM section)
+//!   + the system identity — all inside the same
 //!   `spawn_blocking` (the raw acquisition may `mmap` / read sysfs) →
 //!   [`Response::ProbeReport`]. A failed raw acquisition degrades to
 //!   `raw: None` + `telemetry_source: "unavailable"` (no-panic, D5) —
@@ -387,8 +388,9 @@ async fn dispatch(
             // arm — `get` is `&mut self` and may call the slow
             // collector, so it runs on the blocking pool behind the
             // mutex), then assemble the [`ProbeReport`]: the decoded
-            // snapshot + the Intel raw dump (module-first, `/dev/mem`
-            // fallback — plan §3.5) + the system identity. The raw
+            // snapshot + the vendor raw dump (Intel: module-first,
+            // `/dev/mem` fallback — plan §3.5; AMD: the `ryzen_smu`
+            // SMN/PM section) + the system identity. The raw
             // acquisition may `mmap` / read sysfs, so it runs in the same
             // `spawn_blocking`. A failed raw acquisition degrades to
             // `raw: None` + `telemetry_source: "unavailable"` (no-panic
@@ -448,9 +450,23 @@ struct ProbeRawSource {
     mad_dimm_ch3: Option<u32>,
 }
 
+/// The raw AMD register set, normalized from the `ryzen_smu` driver: the
+/// 13 SMN DRAM timing words + the PM-table blob (from which the key f32
+/// values are extracted) + the PM version.
+#[derive(Debug, Clone)]
+struct ProbeAmdSource {
+    /// The 13 SMN DRAM register words in address order (`None` per failed
+    /// read); empty when no `smn` attribute was available.
+    smn_regs: Vec<Option<u32>>,
+    /// The PM-table `TableVersionId` (`None` when no blob was acquired).
+    pm_version: Option<u32>,
+    /// The raw PM-table blob (headerless f32 array); empty when unavailable.
+    pm_blob: Vec<u8>,
+}
+
 /// The raw-acquisition outcome: which source produced the register set
-/// (drives the `telemetry_source` field) — the sysfs kobject, the
-/// `/dev/mem` MCHBAR map, or neither.
+/// (drives the `telemetry_source` field) — the Intel sysfs kobject, the
+/// Intel `/dev/mem` MCHBAR map, the AMD `ryzen_smu` driver, or none.
 #[derive(Debug)]
 enum RawAcquisition {
     /// The `ramsleuth_intel` sysfs kobject (the primary, world-readable
@@ -458,8 +474,11 @@ enum RawAcquisition {
     Sysfs(ProbeRawSource),
     /// The `/dev/mem` MCHBAR map (the root + `CAP_SYS_RAWIO` fallback).
     DevMem(ProbeRawSource),
-    /// Neither raw source was available (AMD / unknown silicon, a
-    /// non-`DriverMissing` sysfs fault, or a failed devmem map).
+    /// The `ryzen_smu` driver (AMD): the SMN DRAM words + the PM-table blob
+    /// (the AMD raw section).
+    Amd(ProbeAmdSource),
+    /// No raw source was available (unknown silicon, or every source for
+    /// the detected vendor failed).
     Unavailable,
 }
 
@@ -513,6 +532,7 @@ fn build_probe_report(
     let (raw, telemetry_source) = match raw {
         RawAcquisition::Sysfs(source) => (Some(probe_raw_from_source(&source)), "sysfs-module"),
         RawAcquisition::DevMem(source) => (Some(probe_raw_from_source(&source)), "dev-mem"),
+        RawAcquisition::Amd(source) => (Some(probe_raw_from_amd_source(&source)), "ryzen_smu"),
         RawAcquisition::Unavailable => (None, "unavailable"),
     };
     let system = ProbeSystem {
@@ -601,6 +621,29 @@ fn probe_raw_from_source(source: &ProbeRawSource) -> ProbeRaw {
         mad_dimm_ch3: source.mad_dimm_ch3,
         mchbar_base: source.mchbar_base,
         mchbar_enabled: source.mchbar_enabled,
+        // AMD raw: absent (the Intel source carries no AMD data).
+        ..Default::default()
+    }
+}
+
+/// Flatten one [`ProbeAmdSource`] into the wire [`ProbeRaw`] AMD section:
+/// the 13 SMN words + the PM version / blob length + the five key f32
+/// values (extracted from the blob). Every Intel field is absent (an AMD
+/// report carries no Intel raw).
+fn probe_raw_from_amd_source(source: &ProbeAmdSource) -> ProbeRaw {
+    let key_values = ramsleuth_telemetry::amd_smu::read_pm_key_values(&source.pm_blob);
+    ProbeRaw {
+        amd_smn_regs: source.smn_regs.clone(),
+        amd_pm_version: source.pm_version,
+        amd_pm_blob_len: (!source.pm_blob.is_empty())
+            .then(|| u32::try_from(source.pm_blob.len()).unwrap_or(u32::MAX)),
+        amd_pm_vddcr_vdd: key_values[0],
+        amd_pm_vddcr_soc: key_values[1],
+        amd_pm_fclk: key_values[2],
+        amd_pm_uclk: key_values[3],
+        amd_pm_mclk: key_values[4],
+        // All Intel raw: absent (an AMD report carries none).
+        ..Default::default()
     }
 }
 
@@ -661,31 +704,41 @@ fn read_kernel_release() -> String {
         .unwrap_or_default()
 }
 
-/// Acquire the raw Intel register set from the two production sources
-/// (module-first, devmem-fallback — the plan §3.5 / facade contract).
+/// Acquire the raw register set from the production sources for the
+/// detected vendor: Intel (module-first, devmem-fallback — the plan §3.5 /
+/// facade contract) and AMD (the `ryzen_smu` driver — the SMN DRAM words +
+/// the PM-table blob).
 ///
-/// Returns [`RawAcquisition`]: the sysfs kobject when loaded (the
-/// primary, world-readable path), the `/dev/mem` MCHBAR map when the
+/// Returns [`RawAcquisition`]: for Intel, the sysfs kobject when loaded
+/// (the primary, world-readable path) or the `/dev/mem` MCHBAR map when the
 /// sysfs outcome is exactly `DriverMissing` (kobject absent — the root +
-/// `CAP_SYS_RAWIO` fallback), and [`RawAcquisition::Unavailable`] when
-/// neither yields a set (AMD / unknown silicon — the vendor gate fires
-/// before any I/O; a non-`DriverMissing` sysfs fault; a failed devmem
-/// map). Never panics (the no-panic contract, D5).
+/// `CAP_SYS_RAWIO` fallback); for AMD, the `ryzen_smu` driver when it
+/// yields a PM blob and/or the SMN register set; and
+/// [`RawAcquisition::Unavailable`] when no source for the detected vendor
+/// yields a set (unknown silicon — the vendor gate fires before any I/O; a
+/// non-`DriverMissing` Intel sysfs fault; a failed devmem map; an AMD
+/// driver that yields neither source). Never panics (the no-panic
+/// contract, D5).
 fn acquire_raw() -> RawAcquisition {
-    // The frozen facade vendor gate: non-Intel silicon has no raw source
-    // (zero I/O).
+    // The frozen facade vendor gate: reject before any I/O (zero I/O for an
+    // unrecognized vendor).
     let info = CpuInfo::detect();
-    if !matches!(info.vendor, CpuVendor::Intel(_)) {
-        return RawAcquisition::Unavailable;
-    }
-    match ramsleuth_telemetry::intel_sysfs::acquire() {
-        Ok(sysfs) => RawAcquisition::Sysfs(raw_source_from_sysfs(&sysfs)),
-        // The frozen fallthrough: ONLY a `DriverMissing` (kobject absent
-        // — module not loaded) takes the `/dev/mem` path. Any other
-        // sysfs outcome means the module is present (hardware reachable)
-        // — do not silently switch sources (facade §3.5).
-        Err(TelemetryError::DriverMissing { .. }) => acquire_devmem(&info),
-        Err(_) => RawAcquisition::Unavailable,
+    match info.vendor {
+        // Intel: module-first, devmem-fallback (plan §3.5).
+        CpuVendor::Intel(_) => match ramsleuth_telemetry::intel_sysfs::acquire() {
+            Ok(sysfs) => RawAcquisition::Sysfs(raw_source_from_sysfs(&sysfs)),
+            // The frozen fallthrough: ONLY a `DriverMissing` (kobject
+            // absent — module not loaded) takes the `/dev/mem` path. Any
+            // other sysfs outcome means the module is present (hardware
+            // reachable) — do not silently switch sources (facade §3.5).
+            Err(TelemetryError::DriverMissing { .. }) => acquire_devmem(&info),
+            Err(_) => RawAcquisition::Unavailable,
+        },
+        // AMD: the `ryzen_smu` driver (the PM-table blob + the SMN DRAM
+        // words — the AMD raw section).
+        CpuVendor::Amd(_) => acquire_amd_raw(),
+        // Unknown silicon: no raw source (zero I/O).
+        CpuVendor::Unknown => RawAcquisition::Unavailable,
     }
 }
 
@@ -723,6 +776,32 @@ fn acquire_devmem(info: &CpuInfo) -> RawAcquisition {
         mad_dimm_ch2: None,
         mad_dimm_ch3: None,
     })
+}
+
+/// Acquire the AMD raw section from the `ryzen_smu` driver: the PM-table
+/// blob (version + the five key f32 values) + the 13 SMN DRAM words.
+///
+/// Returns [`RawAcquisition::Amd`] when at least one source yields data
+/// (a PM blob, or a non-empty SMN register list), and
+/// [`RawAcquisition::Unavailable`] when both are absent. Never panics
+/// (no-panic contract, D5): each source degrades to its structured error,
+/// collapsed here.
+fn acquire_amd_raw() -> RawAcquisition {
+    // The PM-table blob (the `ryzen_smu` `pm_table`): `None` when the
+    // driver is absent / the read fails.
+    let pm = ramsleuth_telemetry::amd_smu::acquire().ok();
+    // The 13 SMN DRAM words: empty when no `smn` attribute is available.
+    let smn_regs = ramsleuth_telemetry::amd_smn::read_all_dram_registers();
+
+    if pm.is_some() || !smn_regs.is_empty() {
+        RawAcquisition::Amd(ProbeAmdSource {
+            smn_regs,
+            pm_version: pm.as_ref().map(|ctx| ctx.version),
+            pm_blob: pm.map(|ctx| ctx.pm).unwrap_or_default(),
+        })
+    } else {
+        RawAcquisition::Unavailable
+    }
 }
 
 #[cfg(test)]
@@ -1390,6 +1469,105 @@ mod tests {
         );
         let frame = encode_frame(&Message::Response(Response::ProbeReport(report.clone())))
             .expect("the built report frame must encode");
+        let decoded = decode_frame(&frame).expect("the built report frame must decode");
+        let Message::Response(Response::ProbeReport(back)) = decoded.message else {
+            panic!("the decoded frame must be the ProbeReport response: {decoded:?}")
+        };
+        assert_eq!(back, report);
+    }
+
+    /// A mock AMD [`ProbeAmdSource`] (host-independent): the 13 SMN words
+    /// (the last a failed read) + the PM version + a PM blob long enough for
+    /// the five key f32 values (seeded with distinct bit patterns).
+    fn mock_amd_source() -> ProbeAmdSource {
+        // A blob long enough for every key offset (>= 0x0C8 + 4 = 208 bytes).
+        let mut blob = vec![0u8; 0x0D0];
+        let patterns = [
+            0x3E4C_CCCDu32, // VDDCR_VDD @ 0x0A0
+            0x3EF2_CCCCu32, // VDDCR_SOC @ 0x0B0
+            0x40F0_0000u32, // FCLK @ 0x0C0
+            0x40C8_0000u32, // UCLK @ 0x0C8
+            0x40C8_0000u32, // MCLK @ 0x0CC
+        ];
+        let offsets = [0x0A0, 0x0B0, 0x0C0, 0x0C8, 0x0CC];
+        for (pattern, off) in patterns.iter().zip(offsets.iter()) {
+            blob[*off..*off + 4].copy_from_slice(&pattern.to_le_bytes());
+        }
+        ProbeAmdSource {
+            smn_regs: vec![
+                Some(0x0000_1539),
+                Some(0x1010_2410),
+                Some(0x0010_0030),
+                Some(0x0400_0404),
+                Some(0x0000_0010),
+                Some(0x0008_0410),
+                Some(0x0000_0010),
+                Some(0x0504_0302),
+                Some(0x0908_0706),
+                Some(0x0000_0602),
+                Some(0x0400_0000),
+                Some(0x7E08_20A0),
+                None, // 0x50264: a failed read
+            ],
+            pm_version: Some(0x0038_0805),
+            pm_blob: blob,
+        }
+    }
+
+    /// (i4) The AMD arm: `build_probe_report` assembles the report from a
+    /// mock AMD source: `telemetry_source` = "ryzen_smu", the AMD raw
+    /// section populated (the 13 SMN words, the PM version / blob length,
+    /// the five key f32 values), and every Intel raw field absent.
+    #[test]
+    fn build_probe_report_from_amd_source() {
+        let telemetry = mock_snapshot();
+        let report = build_probe_report(
+            &telemetry,
+            RawAcquisition::Amd(mock_amd_source()),
+            mock_identity(),
+        );
+
+        // The AMD source's identity.
+        assert_eq!(report.system.telemetry_source, "ryzen_smu");
+
+        let raw = report.raw.expect("the AMD path must populate the raw");
+        // The 13 SMN words (the last is a failed read).
+        assert_eq!(raw.amd_smn_regs.len(), 13);
+        assert_eq!(raw.amd_smn_regs[0], Some(0x0000_1539));
+        assert_eq!(raw.amd_smn_regs[11], Some(0x7E08_20A0));
+        assert_eq!(raw.amd_smn_regs[12], None);
+        // The PM version + blob length.
+        assert_eq!(raw.amd_pm_version, Some(0x0038_0805));
+        assert_eq!(raw.amd_pm_blob_len, Some(0x0D0));
+        // The five key f32 values (the seeded bit patterns).
+        assert_eq!(raw.amd_pm_vddcr_vdd, Some(0x3E4C_CCCD));
+        assert_eq!(raw.amd_pm_vddcr_soc, Some(0x3EF2_CCCC));
+        assert_eq!(raw.amd_pm_fclk, Some(0x40F0_0000));
+        assert_eq!(raw.amd_pm_uclk, Some(0x40C8_0000));
+        assert_eq!(raw.amd_pm_mclk, Some(0x40C8_0000));
+        // Every Intel raw field is absent (an AMD report carries none).
+        assert_eq!(raw.mcbios_req, None);
+        assert_eq!(raw.tc_ch0_dbp, None);
+        assert_eq!(raw.mad_dimm_ch3, None);
+        assert_eq!(raw.mchbar_base, None);
+        assert!(!raw.mchbar_enabled);
+    }
+
+    /// (i5) An AMD-built report is wire-safe: the `Response::ProbeReport`
+    /// frame round-trips through the P3-11 frame codec and decodes back to
+    /// an identical report (the appended AMD fields cross the wire).
+    #[test]
+    fn build_probe_report_amd_round_trips_through_the_frame_codec() {
+        let telemetry = mock_snapshot();
+        let report = build_probe_report(
+            &telemetry,
+            RawAcquisition::Amd(mock_amd_source()),
+            mock_identity(),
+        );
+        let frame = encode_frame(&Message::Response(Response::ProbeReport(
+            report.clone(),
+        )))
+        .expect("the built report frame must encode");
         let decoded = decode_frame(&frame).expect("the built report frame must decode");
         let Message::Response(Response::ProbeReport(back)) = decoded.message else {
             panic!("the decoded frame must be the ProbeReport response: {decoded:?}")
