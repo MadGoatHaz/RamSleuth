@@ -4,11 +4,16 @@
 //! P3-23 — is consumed from the crate root). It wires the frozen pieces
 //! into the running TUI:
 //!
-//! - **Terminal init** — crossterm raw mode + alternate screen, wrapped in
-//!   a `Drop` guard ([`TerminalGuard`]) that restores everything (disable
-//!   raw mode, leave the alternate screen, show the cursor) on *every*
-//!   exit path: a normal `[Q]`uit, an early return, or an unwind — the
-//!   terminal is never left in raw mode.
+//! - **Terminal init** — crossterm raw mode + alternate screen (the
+//!   cursor hidden, the screen cleared on entry — the ghosting
+//!   baseline), wrapped in a `Drop` guard ([`TerminalGuard`]) that
+//!   restores everything (disable raw mode, leave the alternate screen,
+//!   show the cursor) on *every* exit path: a normal `[Q]`uit, an early
+//!   return, or an unwind — the terminal is never left in raw mode. The
+//!   main loop re-clears the screen on any strip visible→hidden
+//!   transition (the ghosting guard — a closing strip's stale pixels
+//!   would otherwise linger where the re-laid-out frame does not
+//!   overwrite them).
 //! - **Background updater** — a `std::thread` poller loop (the GUI
 //!   `update.rs` `spawn_poller` precedent adapted to the TUI's fixed
 //!   socket): each tick it re-reads the live [`TuiSettings`] from the
@@ -179,7 +184,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossterm::cursor::Show;
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -938,18 +943,22 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    /// Enable raw mode, enter the alternate screen, and create the
-    /// ratatui terminal. Every partial failure unwinds what it already
-    /// changed before returning the error — raw mode is never left on.
+    /// Enable raw mode, enter the alternate screen (hiding the cursor),
+    /// create the ratatui terminal, and clear it. Every partial failure
+    /// unwinds what it already changed before returning the error — raw
+    /// mode is never left on. The entry clear is the ghosting baseline:
+    /// the alternate screen arrives with whatever pixels it last held
+    /// (the main screen's content, a stale prior TUI's buffer), and the
+    /// first frame must draw onto a blank surface.
     fn new() -> Result<Self, String> {
         enable_raw_mode().map_err(|e| format!("failed to enable raw mode: {e}"))?;
         let mut stdout = io::stdout();
-        if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        if let Err(e) = execute!(stdout, EnterAlternateScreen, Hide) {
             let _ = disable_raw_mode();
             return Err(format!("failed to enter the alternate screen: {e}"));
         }
         let backend = CrosstermBackend::new(stdout);
-        let terminal = match Terminal::new(backend) {
+        let mut terminal = match Terminal::new(backend) {
             Ok(terminal) => terminal,
             Err(e) => {
                 let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
@@ -957,6 +966,11 @@ impl TerminalGuard {
                 return Err(format!("failed to initialize the terminal: {e}"));
             }
         };
+        if let Err(e) = terminal.clear() {
+            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, Show);
+            let _ = disable_raw_mode();
+            return Err(format!("failed to clear the terminal: {e}"));
+        }
         Ok(Self { terminal: Some(terminal) })
     }
 }
@@ -1705,12 +1719,27 @@ fn apply_requirements_auto_open(state: &RwLock<AppState>, dismissed: bool) {
     }
 }
 
+/// The strip visibility the [`render`] draws (the ghosting guard's
+/// predicate, the main loop's transition check): the requirements strip
+/// is presence-driven — its `requirements_open` flag AND a non-empty
+/// [`ramsleuth_tui::requirements::diagnose`] (the strip auto-vanishes on
+/// the daemon-connect transition — `diagnose` empties — so the flag
+/// alone would miss it) — and the settings strip its `settings_open`
+/// flag alone.
+fn strip_visibility(state: &AppState) -> (bool, bool) {
+    (
+        !ramsleuth_tui::requirements::diagnose(state).is_empty() && state.settings.requirements_open,
+        state.settings.settings_open,
+    )
+}
+
 /// The terminal event loop (P3-24): initialize the terminal (the
 /// [`TerminalGuard`] restores it on the way out of this function), spawn
-/// the background updater, then tick — draw the dashboard, poll events
-/// for 250 ms, dispatch the frozen `Action` table. Returns the process
-/// exit code: `0` on a normal quit, `1` when the terminal could not be
-/// initialized.
+/// the background updater, then tick — guard the screen against strip
+/// ghosting (clear on a visible→hidden transition), draw the dashboard,
+/// poll events for 250 ms, dispatch the frozen `Action` table. Returns
+/// the process exit code: `0` on a normal quit, `1` when the terminal
+/// could not be initialized.
 fn run(args: TuiArgs) -> ExitCode {
     let mut guard = match TerminalGuard::new() {
         Ok(guard) => guard,
@@ -1742,6 +1771,15 @@ fn run(args: TuiArgs) -> ExitCode {
     // user toggles the strip open again); `false` at startup and
     // after an explicit reopen.
     let mut requirements_dismissed = false;
+    // The ghosting guard (the startup clear's continuation): a strip
+    // leaves the layout tree when it closes, so a strip drawn one frame
+    // and gone the next would leave its stale pixels (the yellow SETUP
+    // box, the settings line) where the re-laid-out frame does not
+    // overwrite them — the screen is cleared on any visible→hidden
+    // transition. Both strips start closed (`false`); the previous-frame
+    // values are advanced after each draw.
+    let mut prev_requirements_shown = false;
+    let mut prev_settings_shown = false;
 
     let updater = spawn_updater(
         Arc::clone(&state),
@@ -1758,6 +1796,22 @@ fn run(args: TuiArgs) -> ExitCode {
         // closed until the user toggles it open again).
         apply_requirements_auto_open(&state, requirements_dismissed);
 
+        // The ghosting guard: the strip visibility the render draws this
+        // tick (the requirements strip is presence-driven — its flag AND a
+        // non-empty `diagnose`; the settings strip its flag alone). A
+        // visible→hidden transition clears the screen before the draw —
+        // the closing strip's stale pixels would otherwise linger where
+        // the re-laid-out frame does not reach them.
+        let (requirements_shown, settings_shown) = {
+            let app = state.read().unwrap();
+            strip_visibility(&app)
+        };
+        if (prev_requirements_shown && !requirements_shown)
+            || (prev_settings_shown && !settings_shown)
+        {
+            let _ = terminal.clear();
+        }
+
         // One draw per tick (250 ms cadence): the read lock is held only
         // for the frame render (pure over `&AppState`, P3-23).
         let draw_state = Arc::clone(&state);
@@ -1769,6 +1823,11 @@ fn run(args: TuiArgs) -> ExitCode {
             // not fatal: the loop keeps running, the status zone shows it.
             state.write().unwrap().error = Some(format!("terminal draw failed: {message}"));
         }
+
+        // Advance the ghosting guard's previous-frame visibility (the
+        // next tick's transition check compares against this frame).
+        prev_requirements_shown = requirements_shown;
+        prev_settings_shown = settings_shown;
 
         match events::poll_event(POLL_TIMEOUT) {
             Ok(Some(Event::Key(key))) => {
@@ -4814,6 +4873,32 @@ mod tests {
         assert_eq!(scroll_of(&state), 0, "the top must never be undershot");
         handle_probe_overlay_key(overlay_key(KeyCode::Up), &state, area, &dir.path, &no_clip);
         assert_eq!(scroll_of(&state), 0, "the top must never be undershot");
+    }
+
+    /// (qa) The ghosting guard's visibility predicate: the
+    /// requirements strip is presence-driven — its flag AND a non-empty
+    /// `diagnose` (the daemon-connect auto-vanish: a connected clean
+    /// state hides the strip even with the flag open) — and the
+    /// settings strip its flag alone.
+    #[test]
+    fn strip_visibility_is_presence_driven() {
+        // The daemon-less default: the daemon-down requirement is
+        // present. Closed flag → hidden; open flag → shown.
+        let mut state = AppState::default();
+        assert_eq!(strip_visibility(&state), (false, false));
+        state.settings.requirements_open = true;
+        assert_eq!(strip_visibility(&state), (true, false));
+
+        // The settings strip: its flag alone.
+        state.settings.settings_open = true;
+        assert_eq!(strip_visibility(&state), (true, true));
+
+        // The daemon-connect transition (the ghosting case): connected,
+        // no telemetry, no error → `diagnose` empties → the
+        // requirements strip auto-vanishes even with its flag open,
+        // while the settings strip stays shown on its flag.
+        state.daemon_status = "connected: /run/ramsleuth/ramsleuth.sock".to_owned();
+        assert_eq!(strip_visibility(&state), (false, true));
     }
 
     /// The current preview scroll offset (the test assertion helper;
