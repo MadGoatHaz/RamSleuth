@@ -97,7 +97,10 @@ pub use graph::{
     GRAPH_CAPACITY,
 };
 
-pub use update::{poll_telemetry, run_bench, spawn_poller, BenchCmd, BenchState, TelemetryData};
+pub use update::{
+    poll_telemetry, request_probe_report, run_bench, spawn_poller, BenchCmd, BenchState,
+    ProbeResult, TelemetryData,
+};
 
 // P3-27: zone 1 (the live memory controller & subtimings), re-exported
 // at the root (workspace re-export style) — the app shell (P3-30)
