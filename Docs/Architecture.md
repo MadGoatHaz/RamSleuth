@@ -1323,10 +1323,23 @@ absent → empty list + a warning; one unreadable device → that device skipped
 a length that is neither 512 nor 1024 → skipped.
 
 The **pure decode** (no I/O at all) yields, per module: **JEP106 maker**
-(module and die — two-nibble vendor/continuation codes, with the known-code
-table), **rank** count and device width, **density** (Gb), **base speed**
-(MT/s), part / serial numbers, and the **XMP 2.0** profiles (DDR4, 32-byte
-blocks at `0xD0` / `0xF0`) and the **XMP 3.0 / EXPO** region (DDR5, 256 B at
+(DDR4: a 16-bit (bank, code) pair — `bank = (0x140 & 0x7F) + 1`,
+`code = 0x141` — for the module, and the same encoding at `0x15E` / `0x15F`
+for the DRAM die; DDR5: the historical 8-bit vendor/continuation nibbles at
+`0x01` / `0x02` and `0x2E` / `0x2F` — each against the known-code table, an
+unknown code rendering its raw form, an absent module ID falling back to the
+die maker), **rank** count and device width (DDR4: byte `0x0C` — bits 5:3 =
+ranks − 1, bits 2:0 = x4 / x8 / x16 / x32 — with the `0x0D` bus code; DDR5:
+the `0x80` / `0x81` hub model), **density** (DDR4: byte `0x04` bits 3:0 →
+the 10-entry Mbit table; DDR5: byte `0x13`), **base speed** in MT/s (DDR4:
+the XMP 2.0 profile-1 data rate, falling back to the JEDEC `tCKAVGmin` rate
+(byte `0x12` in 125 ps MTB units + the signed fine-timebase byte `0x7D`)
+floored to the nearest standard bin; DDR5: byte `0x20` × 100), part /
+serial numbers (DDR4: the 20-char part at `0x149..0x15C`, the 4 binary
+serial bytes at `0x145..0x148` hex-rendered; DDR5: the 32-char part at
+`0x200..0x220`, the 16-char serial at `0x91..0xA1`), and the **XMP 2.0**
+profiles (DDR4: a 9-byte header at `0x180` + two 47-byte profiles at `0x189`
+/ `0x1B8`) and the **XMP 3.0 / EXPO** region (DDR5, 256 B at
 `0x300..0x400` — four 32-byte profile blocks, coexisting with the DDR5 part
 number at `0x200..0x220`). Truncated or malformed fields degrade to `Na`
 cells — the decoder can never panic.

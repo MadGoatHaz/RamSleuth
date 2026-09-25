@@ -948,22 +948,26 @@ single vs dual channel).
 SPD is the serial presence-detect EEPROM on each module, read over `ee1004`
 (unprivileged). Per slot you get:
 
-- **maker** — the module manufacturer (JEP106 code decoded to a name —
-  Samsung, SK hynix, Micron, G.Skill, …);
-- **dram die** — the DRAM manufacturer + die type + density per die
+- **maker** — the module manufacturer (its JEP106 manufacturer ID decoded
+  to a name — Samsung, SK hynix, Micron, G.Skill, …; on DDR4 the ID is a
+  two-byte (bank, code) pair, and when a module carries no maker ID the DRAM
+  die maker stands in for it);
+- **dram die** — the DRAM die manufacturer + the density per die
   (e.g. `SK hynix (16Gb)`);
-- **part** / **serial** — the module part number and serial;
+- **part** / **serial** — the module part number and serial (on DDR4 the
+  serial is four binary bytes, shown as an 8-char hex value);
 - **rank** — how many DRAM ranks the module carries (`Single-Rank` /
   `Dual-Rank` / …);
 - **density** — DRAM density per die (Mbit, shown as Gb);
-- **speed** — the module's **base (JEDEC) data rate** in MT/s — the speed it
-  is guaranteed to run at without any profile;
+- **speed** — the module's rated data rate in MT/s: on DDR4, the first
+  factory profile's (XMP 2.0) rated speed, falling back to the JEDEC minimum
+  guaranteed speed when the module carries no profile; on DDR5, the SPD's
+  minimum data-rate field;
 - **profiles** — the factory-validated overclock profiles stored on the
   module: **XMP 2.0** (DDR4; two slots) or **XMP 3.0 / EXPO** (DDR5; four
   slots), each rendered as `<speed> MT/s <CL>-<tRCD>-<tRP>-<tRAS> @ <volts>`.
-  Enabling one in BIOS is how you move from the base speed to the rated
-  speed — and the dashboard then shows you *what the controller actually
-  settled on* live.
+  Enabling one in BIOS is what moves the live data rate — and the
+  dashboard then shows you *what the controller actually settled on* live.
 
 ### 8.6 Channel mode & the RAM summary
 
