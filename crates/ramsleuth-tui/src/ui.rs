@@ -10,9 +10,13 @@
 //!
 //! - **Zone 1 — live memory controller & subtimings:** every cell of the
 //!   AMD (and Intel, if present) readout as `key: value` or `key: N/A
-//!   (<reason>)` — clocks/ratios (MCLK/UCLK/FCLK), GEAR_DOWN/CR, primary /
-//!   secondary / tertiary + turnaround timings, CAD drive/termination
-//!   (Ω), voltages (the VDDCR_VDD primary rail first).
+//!   (<reason>)`, in a two-column layout — the left column: clocks/
+//!   ratios (MCLK/UCLK/FCLK), GEAR_DOWN/CR, the primary + secondary
+//!   timings; the right column: tertiary + turnaround timings, CAD
+//!   drive/termination (Ω), voltages (the VDDCR_VDD primary rail
+//!   first). The Intel `N/A (unsupported hardware)` row is hidden on
+//!   non-Intel hosts (AMD-platform noise — the AMD row carries the
+//!   verdict).
 //! - **Zone 2 — AIDA-style benchmark engine:** the 4×4 grid (tier rows ×
 //!   Read/Write/Copy/Latency columns) — live during a run: a normal
 //!   bench's [`live_grid`] accumulates the streamed progress events
@@ -32,8 +36,9 @@
 //!   (`Burn-in: iteration <n> · <m:ss> elapsed · Memory Read <…> ·
 //!   <latency>`, present only while a burn-in runs — the GUI
 //!   `burn_in_row` form).
-//! - **Zone 3 — hardware & SPD telemetry:** per-slot module lines (maker /
-//!   dram die / part / rank / density / speed + XMP/EXPO profiles), the
+//! - **Zone 3 — hardware & SPD telemetry:** each SPD slot as its own
+//!   bordered sub-card (the `slot 0xXX (DDR4|5)` title + maker / dram
+//!   die / part / rank / density / speed + XMP/EXPO profiles), then the
 //!   daemon status line, and the error line when present.
 //!
 //! The frozen state shapes also carry the parity surfaces the render
@@ -328,6 +333,9 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     }
 
     let zone_area = outer[row];
+    // The one-column spacing keeps the zones from butting against
+    // each other (the native `Layout::spacing` gap — the percentages
+    // resolve over the shrunken area, the gaps stay blank).
     let zones = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -335,6 +343,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
             Constraint::Percentage(32),
             Constraint::Percentage(28),
         ])
+        .spacing(1)
         .split(zone_area);
 
     render_zone1(frame, state, zones[0]);
@@ -907,89 +916,138 @@ fn settings_strip_text(state: &AppState) -> String {
 // Zone 1 — live memory controller & subtimings.
 // ---------------------------------------------------------------------------
 
-/// Zone 1: the AMD (and Intel, if present) timing cells, top-aligned and
-/// clipped to the block.
+/// Zone 1: the AMD (and Intel, if present) timing cells in a two-column
+/// layout — clocks & ratios + the primary/secondary timings in the left
+/// column, the tertiary & turnaround timings + the CAD bus + the
+/// voltages in the right column (a dim `│` separator between them) —
+/// top-aligned and clipped to the block.
 fn render_zone1(frame: &mut Frame, state: &AppState, area: Rect) {
     let block = zone_block("1 · MEMORY CONTROLLER");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(List::new(zone1_items(state.telemetry.as_ref())), inner);
+    let (left, right) = zone1_columns(state.telemetry.as_ref());
+    // Two equal columns with a one-column separator between them (the
+    // 50/50 split of the inner width minus the separator: an even
+    // inner width gives the surplus column to the left).
+    let half = inner.width / 2;
+    let left_area = Rect::new(inner.x, inner.y, half, inner.height);
+    let sep_area = Rect::new(inner.x + half, inner.y, 1, inner.height);
+    let right_area = Rect::new(
+        inner.x + half + 1,
+        inner.y,
+        inner.width.saturating_sub(half + 1),
+        inner.height,
+    );
+    frame.render_widget(List::new(left), left_area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(DIM)),
+        sep_area,
+    );
+    frame.render_widget(List::new(right), right_area);
 }
 
-/// The zone-1 content: every cell of the AMD (and Intel) readout as
-/// `key: value` or `key: N/A (<reason>)` in the canonical dump order.
+/// The zone-1 content split into its two columns: the left column
+/// carries each readout's label, clocks & ratios, and the primary +
+/// secondary timings; the right column the tertiary & turnaround
+/// timings, the CAD bus, and the voltages (plus the channel-level RTL
+/// on Intel).
 ///
-/// A section that degraded whole renders a single `N/A (<reason>)` line;
-/// no telemetry at all renders a single grey placeholder — never a
-/// panic, never an omitted section.
-fn zone1_items(telemetry: Option<&SystemMemoryTelemetry>) -> Vec<ListItem<'static>> {
+/// A section that degraded whole renders a single `N/A (<reason>)` line
+/// (left column); no telemetry at all renders a single grey
+/// placeholder — never a panic, never an omitted section.
+///
+/// The Intel section's `N/A (unsupported hardware)` row is meaningful
+/// only on Intel silicon (an unrecognized generation): on a non-Intel
+/// host the AMD row already carries the platform verdict, so the Intel
+/// row is skipped there.
+fn zone1_columns(
+    telemetry: Option<&SystemMemoryTelemetry>,
+) -> (Vec<ListItem<'static>>, Vec<ListItem<'static>>) {
     let Some(telemetry) = telemetry else {
-        return vec![na_item("N/A (no telemetry)")];
+        return (vec![na_item("N/A (no telemetry)")], Vec::new());
     };
-    let mut items = Vec::new();
+    let mut left = Vec::new();
+    let mut right = Vec::new();
     match &telemetry.amd {
-        Section::Na(reason) => items.push(section_na("AMD", reason)),
-        Section::Value(readout) => items.extend(readout_items(
-            "AMD",
-            &readout.clocks,
-            &readout.timings,
-            &readout.cad_bus,
-            &readout.voltages,
-            None,
-        )),
+        Section::Na(reason) => left.push(section_na("AMD", reason)),
+        Section::Value(readout) => {
+            let (l, r) = readout_columns(
+                "AMD",
+                &readout.clocks,
+                &readout.timings,
+                &readout.cad_bus,
+                &readout.voltages,
+                None,
+            );
+            left.extend(l);
+            right.extend(r);
+        }
     }
     match &telemetry.intel {
-        Section::Na(reason) => items.push(section_na("Intel", reason)),
+        Section::Na(_)
+            if !matches!(telemetry.cpu.vendor, CpuVendor::Intel(_)) => {}
+        Section::Na(reason) => left.push(section_na("Intel", reason)),
         Section::Value(readout) => {
             if readout.channels.is_empty() {
-                items.push(section_na("Intel", &NaReason::NotApplicable));
+                left.push(section_na("Intel", &NaReason::NotApplicable));
             } else {
                 for channel in &readout.channels {
                     let label = format!("Intel ch {}", channel.index);
-                    items.extend(readout_items(
+                    let (l, r) = readout_columns(
                         &label,
                         &channel.clocks,
                         &channel.timings,
                         &channel.cad_bus,
                         &channel.voltages,
                         Some(&channel.rtl),
-                    ));
+                    );
+                    left.extend(l);
+                    right.extend(r);
                 }
             }
         }
     }
-    items
+    (left, right)
 }
 
-/// The rows of one readout (the AMD branch or an Intel channel): a label
-/// subheader, then clocks & ratios, the three timing groups + turnarounds,
-/// the CAD bus, the voltages, and (Intel only) the channel-level RTL.
-fn readout_items(
+/// The rows of one readout (the AMD branch or an Intel channel) split
+/// into its two zone-1 columns:
+///
+/// - **left**: the label subheader, clocks & ratios, the primary
+///   timings, the secondary timings;
+/// - **right**: the tertiary & turnaround timings, the CAD bus, the
+///   voltages, and (Intel only) the channel-level RTL.
+///
+/// The same cells (and row helpers) as the pre-split flat readout list
+/// — only the column assignment differs.
+fn readout_columns(
     label: &str,
     clocks: &ClockReadout,
     timings: &TimingSet,
     cad_bus: &CadBus,
     voltages: &VoltageSet,
     rtl: Option<&Section<u16>>,
-) -> Vec<ListItem<'static>> {
-    let mut items = vec![sub_item(label)];
+) -> (Vec<ListItem<'static>>, Vec<ListItem<'static>>) {
+    let mut left = vec![sub_item(label)];
 
-    items.push(sub_item("clocks & ratios"));
-    items.push(cell_row("MCLK", &clocks.mclk_mhz, CYAN, fmt_mhz));
-    items.push(cell_row("UCLK", &clocks.uclk_mhz, CYAN, fmt_mhz));
-    items.push(cell_row("FCLK", &clocks.fclk_mhz, CYAN, fmt_mhz));
+    left.push(sub_item("clocks & ratios"));
+    left.push(cell_row("MCLK", &clocks.mclk_mhz, CYAN, fmt_mhz));
+    left.push(cell_row("UCLK", &clocks.uclk_mhz, CYAN, fmt_mhz));
+    left.push(cell_row("FCLK", &clocks.fclk_mhz, CYAN, fmt_mhz));
     // A 1:2 UCLK:MCLK divide is a desync warning (amber); 1:1 stays cyan.
     let div_color = match &clocks.div_mode {
         Section::Value(DivMode::OneToTwo) => AMBER,
         _ => CYAN,
     };
-    items.push(cell_row("UCLK:MCLK", &clocks.div_mode, div_color, fmt_div));
+    left.push(cell_row("UCLK:MCLK", &clocks.div_mode, div_color, fmt_div));
     // The `GDM / CR` split (the GUI's D-6 form): the gear-down mode and
     // the DRAM command rate each own a bare-value row; an absent cell
     // degrades its row to the GUI's bare `N/A` (D-4).
-    items.push(bare_na_row("GEAR_DOWN", &clocks.gdm, CYAN, fmt_gear_down));
-    items.push(bare_na_row("CR", &clocks.command_rate, CYAN, fmt_cr));
-    items.push(cell_row("PDM", &clocks.pdm, CYAN, fmt_flag));
+    left.push(bare_na_row("GEAR_DOWN", &clocks.gdm, CYAN, fmt_gear_down));
+    left.push(bare_na_row("CR", &clocks.command_rate, CYAN, fmt_cr));
+    left.push(cell_row("PDM", &clocks.pdm, CYAN, fmt_flag));
 
     let primary: &[(&str, &Section<u16>)] = &[
         ("tCL", &timings.cl),
@@ -997,8 +1055,8 @@ fn readout_items(
         ("tRCDRD", &timings.rcdrd),
         ("tRP", &timings.rp),
     ];
-    items.push(sub_item("primary timings"));
-    tick_rows(&mut items, primary);
+    left.push(sub_item("primary timings"));
+    tick_rows(&mut left, primary);
 
     let secondary: &[(&str, &Section<u16>)] = &[
         ("tRAS", &timings.ras),
@@ -1007,8 +1065,10 @@ fn readout_items(
         ("tRRLD", &timings.rrld),
         ("tFAW", &timings.faw),
     ];
-    items.push(sub_item("secondary timings"));
-    tick_rows(&mut items, secondary);
+    left.push(sub_item("secondary timings"));
+    tick_rows(&mut left, secondary);
+
+    let mut right = Vec::new();
 
     let tertiary: &[(&str, &Section<u16>)] = &[
         ("tWTRS", &timings.wtrs),
@@ -1030,37 +1090,37 @@ fn readout_items(
         ("tWRWR(SCL)", &timings.wrwr_scl),
         ("tWRWR(SC)", &timings.wrwr_sc),
     ];
-    items.push(sub_item("tertiary & turnarounds"));
-    tick_rows(&mut items, tertiary);
+    right.push(sub_item("tertiary & turnarounds"));
+    tick_rows(&mut right, tertiary);
 
-    items.push(sub_item("CAD bus (ohms)"));
-    items.push(cell_row("proc ODT", &cad_bus.proc_odt, CYAN, fmt_ohms));
-    items.push(cell_row("RTT nom", &cad_bus.rtt_nom, CYAN, fmt_rtt));
-    items.push(cell_row("RTT wr", &cad_bus.rtt_wr, CYAN, fmt_rtt));
-    items.push(cell_row("RTT park", &cad_bus.rtt_park, CYAN, fmt_rtt));
-    items.push(cell_row("CLK drive", &cad_bus.clk_drv, CYAN, fmt_ohms));
-    items.push(cell_row("ADD/CMD drive", &cad_bus.addr_cmd_drv, CYAN, fmt_ohms));
-    items.push(cell_row("CS/ODT drive", &cad_bus.cs_odt_drv, CYAN, fmt_ohms));
-    items.push(cell_row("CKE drive", &cad_bus.cke_drv, CYAN, fmt_ohms));
+    right.push(sub_item("CAD bus (ohms)"));
+    right.push(cell_row("proc ODT", &cad_bus.proc_odt, CYAN, fmt_ohms));
+    right.push(cell_row("RTT nom", &cad_bus.rtt_nom, CYAN, fmt_rtt));
+    right.push(cell_row("RTT wr", &cad_bus.rtt_wr, CYAN, fmt_rtt));
+    right.push(cell_row("RTT park", &cad_bus.rtt_park, CYAN, fmt_rtt));
+    right.push(cell_row("CLK drive", &cad_bus.clk_drv, CYAN, fmt_ohms));
+    right.push(cell_row("ADD/CMD drive", &cad_bus.addr_cmd_drv, CYAN, fmt_ohms));
+    right.push(cell_row("CS/ODT drive", &cad_bus.cs_odt_drv, CYAN, fmt_ohms));
+    right.push(cell_row("CKE drive", &cad_bus.cke_drv, CYAN, fmt_ohms));
 
-    items.push(sub_item("voltages"));
+    right.push(sub_item("voltages"));
     // The Vcore primary rail (the C12 frozen wire field) leads the
     // section exactly as the GUI; on Intel it degrades to a bare N/A.
-    items.push(bare_na_row("VDDCR_VDD", &voltages.vcore_mv, CYAN, fmt_volts));
+    right.push(bare_na_row("VDDCR_VDD", &voltages.vcore_mv, CYAN, fmt_volts));
     // A SOC rail above 1.30 V is out of spec on AM5 -> amber warning.
     let soc_color = match &voltages.vddcr_soc_mv {
         Section::Value(mv) if f64::from(*mv) > 1300.0 => AMBER,
         _ => CYAN,
     };
-    items.push(cell_row("VDDCR_SOC", &voltages.vddcr_soc_mv, soc_color, fmt_volts));
-    items.push(cell_row("VDDIO_MEM", &voltages.vddio_mem_mv, CYAN, fmt_volts));
-    items.push(cell_row("VDD_MISC", &voltages.vdd_misc_mv, CYAN, fmt_volts));
-    items.push(cell_row("VPP", &voltages.vpp_mv, CYAN, fmt_volts));
+    right.push(cell_row("VDDCR_SOC", &voltages.vddcr_soc_mv, soc_color, fmt_volts));
+    right.push(cell_row("VDDIO_MEM", &voltages.vddio_mem_mv, CYAN, fmt_volts));
+    right.push(cell_row("VDD_MISC", &voltages.vdd_misc_mv, CYAN, fmt_volts));
+    right.push(cell_row("VPP", &voltages.vpp_mv, CYAN, fmt_volts));
 
     if let Some(rtl) = rtl {
-        items.push(cell_row("RTL", rtl, CYAN, fmt_ticks));
+        right.push(cell_row("RTL", rtl, CYAN, fmt_ticks));
     }
-    items
+    (left, right)
 }
 
 /// Append one cyan `key: <ticks>` row per pair (grey `N/A` when the
@@ -1535,34 +1595,71 @@ fn burn_in_row_line(burn_in: &BurnInState) -> Option<Line<'static>> {
 // Zone 3 — hardware & SPD telemetry.
 // ---------------------------------------------------------------------------
 
-/// Zone 3: the per-slot SPD modules, the daemon status line (with the
-/// last-update stamp), and the error line when present.
+/// Dim cyan: the SPD sub-card border (the subdued form of the value
+/// `CYAN` — a zone-local const, like `STATUS_DONE`; the §3.2 palette
+/// stays frozen).
+const SUBCARD_CYAN: Color = Color::Rgb(0x00, 0x6A, 0x80);
+
+/// Zone 3: each SPD slot as its own bordered sub-card (the `slot 0xXX
+/// (DDR4|5)` title + the module's cells + its profiles), then the
+/// daemon status line (with the last-update stamp) and the error line
+/// when present — the footer fills the space left below the cards.
 fn render_zone3(frame: &mut Frame, state: &AppState, area: Rect) {
     let block = zone_block("3 · HARDWARE & SPD");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(List::new(zone3_items(state)), inner);
+
+    let (modules, footer) = zone3_content(state);
+    // One exact-height block per module (the borders + its six cells +
+    // its profile rows), then the footer takes the remainder — the
+    // cards never overlap, the daemon line stays the bottom anchor.
+    let constraints: Vec<Constraint> = modules
+        .iter()
+        .map(|module| Constraint::Length(spd_module_height(module)))
+        .chain(std::iter::once(Constraint::Fill(1)))
+        .collect();
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+    for (module, part) in modules.iter().copied().zip(parts.iter()) {
+        let card = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(SUBCARD_CYAN))
+            .title(spd_module_title(module));
+        let card_inner = card.inner(*part);
+        frame.render_widget(card, *part);
+        frame.render_widget(List::new(spd_module_body(module)), card_inner);
+    }
+    frame.render_widget(
+        List::new(footer),
+        *parts
+            .last()
+            .expect("the footer constraint is always present"),
+    );
 }
 
-/// The zone-3 content: one block per SPD slot, then the daemon status
-/// line and (when present) the crimson error line.
-fn zone3_items(state: &AppState) -> Vec<ListItem<'static>> {
-    let mut items = Vec::new();
-    match &state.telemetry {
-        None => items.push(na_item("N/A (no telemetry)")),
+/// The zone-3 content: the SPD modules (rendered as the bordered
+/// sub-cards) and the footer rows (the no-telemetry / no-SPD
+/// placeholder, the daemon status line, and the crimson error line
+/// when present).
+fn zone3_content(state: &AppState) -> (Vec<&SpdModule>, Vec<ListItem<'static>>) {
+    let mut footer = Vec::new();
+    let modules = match &state.telemetry {
+        None => {
+            footer.push(na_item("N/A (no telemetry)"));
+            Vec::new()
+        }
         Some(telemetry) => {
             if telemetry.spd.is_empty() {
-                items.push(section_na("SPD", &NaReason::DriverMissing));
-            } else {
-                for module in &telemetry.spd {
-                    items.extend(spd_module_items(module));
-                }
+                footer.push(section_na("SPD", &NaReason::DriverMissing));
             }
+            telemetry.spd.iter().collect()
         }
-    }
+    };
 
-    // Daemon status line: the status + the last-update stamp; amber when
-    // not connected, crimson when the latest attempt errored.
+    // Daemon status line: the status + the last-update stamp; amber
+    // when not connected, crimson when the latest attempt errored.
     let status = if state.daemon_status.is_empty() {
         "not connected".to_owned()
     } else {
@@ -1582,23 +1679,33 @@ fn zone3_items(state: &AppState) -> Vec<ListItem<'static>> {
     } else {
         DIM
     };
-    items.push(text_item(&text, color));
+    footer.push(text_item(&text, color));
 
     if let Some(error) = &state.error {
-        items.push(text_item(&format!("! {error}"), CRIMSON));
+        footer.push(text_item(&format!("! {error}"), CRIMSON));
     }
-    items
+    (modules, footer)
 }
 
-/// One SPD slot: a subheader + maker / dram die / part / rank / density
-/// / speed cells + one line per XMP/EXPO profile (or a `none`
-/// placeholder).
-fn spd_module_items(module: &SpdModule) -> Vec<ListItem<'static>> {
+/// A sub-card's exact height: the two border rows, the six cell rows
+/// (maker / dram die / part / rank / density / speed), and one row per
+/// profile (a `none` placeholder keeps the slot when it has none).
+fn spd_module_height(module: &SpdModule) -> u16 {
+    8 + module.profiles.len().max(1) as u16
+}
+
+/// A sub-card's title: ` slot 0xXX (DDR4|DDR5) ` (the slot address +
+/// generation — the former per-slot subheader, now the border title).
+fn spd_module_title(module: &SpdModule) -> String {
     let gen = if module.is_ddr5 { "DDR5" } else { "DDR4" };
-    let mut items = vec![sub_item(&format!(
-        "slot 0x{:02X} ({gen})",
-        module.index
-    ))];
+    format!(" slot 0x{:02X} ({gen}) ", module.index)
+}
+
+/// One SPD slot's body rows (the sub-card's title carries the slot
+/// identity): maker / dram die / part / rank / density / speed cells +
+/// one line per XMP/EXPO profile (or a `none` placeholder).
+fn spd_module_body(module: &SpdModule) -> Vec<ListItem<'static>> {
+    let mut items = Vec::new();
     items.push(cell_row("maker", &module.maker, CYAN, |s| s.clone()));
     // The die row (the GUI `status_zone` "dram die" cell): the composed
     // `<die_maker> (<die_type>, <density>Gb)` value — cyan when the die
@@ -2018,7 +2125,9 @@ mod tests {
     /// least one formatted value per zone, and the daemon status line.
     #[test]
     fn representative_state_renders_zones_and_values() {
-        let text = draw(&representative());
+        // 120 cols: the zone-3 sub-card's `dram die` row (25 cells)
+        // needs the wider zone-3 inner — the 100-col default clips it.
+        let text = draw_at(&representative(), 120, 30);
 
         // the three zone titles
         assert!(text.contains("1 · MEMORY CONTROLLER"), "{text}");
@@ -2204,8 +2313,8 @@ mod tests {
             ..Default::default()
         };
         // 100×62: the 3-row header leaves a 57-row inner zone surface
-        // (channel 0 is 55 rows), just enough to reach the second
-        // channel's label; a shorter terminal clips it.
+        // (each channel is now a two-column block of 35 rows) — both
+        // channel labels reach it; a shorter terminal clips later rows.
         let text = draw_at(&state, 100, 62);
 
         assert!(text.contains("Intel ch 0"), "{text}");
@@ -2892,13 +3001,16 @@ mod tests {
     /// first (C12).
     #[test]
     fn zone1_clocks_and_voltages_row_shape() {
-        // 100×62: the 55-line AMD readout (incl. the voltages section)
-        // needs the taller surface — the 30-row default clips it.
-        let text = draw_at(&representative(), 100, 62);
+        // 150×62: the two zone-1 columns are 28 cells wide each — the
+        // full subheader lengths (the `--- tertiary & turnarounds ---`
+        // title is the longest) render whole; the 100-col default
+        // clips them, the 30-row default the voltages section.
+        let text = draw_at(&representative(), 150, 62);
         // Zone 1 occupies the leftmost screen columns: extract its
-        // inner segment per row (the text between the first two
-        // vertical borders), skipping the frame corners.
-        let z1: Vec<String> = text
+        // left (segment 1) and right (segment 2) column per row — the
+        // dim `│` separator between them splits the inner into two
+        // segments, skipping the frame corners.
+        let z1l: Vec<String> = text
             .split('\n')
             .filter_map(|line| {
                 line.split('│')
@@ -2906,20 +3018,28 @@ mod tests {
                     .map(|segment| segment.trim_end().to_owned())
             })
             .collect();
+        let z1r: Vec<String> = text
+            .split('\n')
+            .filter_map(|line| {
+                line.split('│')
+                    .nth(2)
+                    .map(|segment| segment.trim_end().to_owned())
+            })
+            .collect();
 
-        let rows_between = |from: &str, to: &str| -> Vec<&str> {
-            let start = z1
+        fn rows_between<'a>(lines: &'a [String], from: &str, to: &str) -> Vec<&'a str> {
+            let start = lines
                 .iter()
                 .position(|line| line == from)
                 .expect("the start subheader must render");
-            let end = z1
+            let end = lines
                 .iter()
                 .position(|line| line == to)
                 .expect("the end marker must render");
-            z1[start + 1..end].iter().map(|line| line.as_str()).collect()
-        };
+            lines[start + 1..end].iter().map(|line| line.as_str()).collect()
+        }
 
-        let clocks = rows_between("--- clocks & ratios ---", "--- primary timings ---");
+        let clocks = rows_between(&z1l, "--- clocks & ratios ---", "--- primary timings ---");
         assert_eq!(
             clocks,
             vec![
@@ -2934,7 +3054,17 @@ mod tests {
             "the 7 clocks rows (the GUI's AMD shape, D-6)"
         );
 
-        let voltages = rows_between("--- voltages ---", "Intel: N/A (unsupported hardware)");
+        // The voltages section is the right column's last one (the
+        // Intel N/A row is hidden on this AMD host) — the five rows
+        // after its subheader.
+        let volt_start = z1r
+            .iter()
+            .position(|line| line == "--- voltages ---")
+            .expect("the voltages subheader must render");
+        let voltages: Vec<&str> = z1r[volt_start + 1..volt_start + 6]
+            .iter()
+            .map(|line| line.as_str())
+            .collect();
         assert_eq!(
             voltages,
             vec![
@@ -2949,8 +3079,8 @@ mod tests {
 
         // The old rows are gone entirely (no `gear` label, no `GDM`
         // row — the combined form is split, D-6).
-        assert!(!z1.iter().any(|line| line.starts_with("gear:")));
-        assert!(!z1.iter().any(|line| line.starts_with("GDM:")));
+        assert!(!z1l.iter().chain(z1r.iter()).any(|line| line.starts_with("gear:")));
+        assert!(!z1l.iter().chain(z1r.iter()).any(|line| line.starts_with("GDM:")));
     }
 
     /// (u) The VDDCR_VDD row (the C12 frozen wire field — the Vcore
@@ -2959,8 +3089,11 @@ mod tests {
     /// the GUI's bare `N/A`.
     #[test]
     fn vddcr_vdd_value_and_na() {
+        // 104 cols: the measured row (`VDDCR_VDD: 1.150 V`, 18 cells)
+        // needs the 18-wide right column the 104-col surface yields
+        // (the 100-col default's zone-1 split leaves it 17 wide).
         // The fixture's vcore is Na (the Intel-shape cell) -> bare N/A.
-        let text = draw_at(&representative(), 100, 62);
+        let text = draw_at(&representative(), 104, 62);
         assert!(text.contains("VDDCR_VDD: N/A"), "{text}");
 
         // A measured Vcore rail: 1150 mV -> 1.150 V.
@@ -2970,7 +3103,7 @@ mod tests {
                 readout.voltages.vcore_mv = Section::Value(1150);
             }
         }
-        let text = draw_at(&state, 100, 62);
+        let text = draw_at(&state, 104, 62);
         assert!(text.contains("VDDCR_VDD: 1.150 V"), "{text}");
     }
 
@@ -3007,8 +3140,11 @@ mod tests {
     /// `N/A` (the value semantics — the `gdm` flag — unchanged).
     #[test]
     fn gear_down_text_matrix() {
+        // 104 cols: the `GEAR_DOWN: Disabled` row (19 cells) needs the
+        // 19-wide left column the 104-col surface yields (the 100-col
+        // default's zone-1 split leaves it 18 wide).
         // The fixture carries gdm = true.
-        let text = draw_at(&representative(), 100, 62);
+        let text = draw_at(&representative(), 104, 62);
         assert!(text.contains("GEAR_DOWN: Enabled"), "{text}");
 
         let mut off = representative();
@@ -3017,7 +3153,7 @@ mod tests {
                 readout.clocks.gdm = Section::Value(false);
             }
         }
-        let text = draw_at(&off, 100, 62);
+        let text = draw_at(&off, 104, 62);
         assert!(text.contains("GEAR_DOWN: Disabled"), "{text}");
 
         let mut na = representative();
@@ -3026,7 +3162,7 @@ mod tests {
                 readout.clocks.gdm = Section::na(NaReason::NotApplicable);
             }
         }
-        let text = draw_at(&na, 100, 62);
+        let text = draw_at(&na, 104, 62);
         assert!(text.contains("GEAR_DOWN: N/A"), "{text}");
     }
 
