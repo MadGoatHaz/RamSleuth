@@ -15,10 +15,14 @@
 //!   at most one spike in flight; a second caller no-ops (`enter`
 //!   returns `None`). The gate is released by an RAII `RunningGuard` on
 //!   every exit path.
-//! - Footprint: the buffer is allocated per spike (`vec!`, zeroed — the
-//!   one-time touch is itself a write pass over every page), used for
-//!   the duration, then freed by drop. No static buffer, no growth, no
-//!   `unsafe`.
+//! - Footprint: the buffer is allocated per spike (a fallible
+//!   `try_reserve` + zeroed `resize` — the one-time touch is itself a
+//!   write pass over every page), used for the duration, then freed by
+//!   drop. No static buffer, no growth, no `unsafe`. A failed
+//!   reservation (transient memory pressure on a loaded host) skips the
+//!   spike with a stderr warning instead of panicking the daemon's
+//!   blocking-pool closure — [`spike`] returns `false` and the
+//!   collector proceeds to `collect()`.
 //! - No-panic: no `unwrap`/`expect`/`panic!` on any derived data; the
 //!   strided index stays in-bounds by construction and degrades via
 //!   `match` on the (always-`Ok`) `try_into`.
@@ -76,24 +80,56 @@ fn enter(gate: &AtomicBool) -> Option<RunningGuard<'_>> {
 /// data; no panic. An in-flight load already covers the DIMMs, so a
 /// concurrent caller simply skips rather than stacking a second
 /// 256 MiB allocation.
-pub fn spike() {
+///
+/// Returns `true` when the spike ran; `false` when it was skipped (the
+/// gate was busy, or the 256 MiB reservation failed). The reservation
+/// is fallible because `vec![0u8; n]` *panics* on allocation failure —
+/// on a loaded workstation a transient OOM there would unwind the
+/// daemon's `spawn_blocking` collector closure (a `JoinError`), closing
+/// the client socket before the telemetry frame. A failed reservation
+/// instead logs a stderr warning (the daemon never panics, plan D5)
+/// and skips the load: the collector proceeds to `collect()` and the
+/// `MCLK` sample may read the idle frequency once — a degraded sample
+/// beats a dead daemon.
+pub fn spike() -> bool {
+    spike_with_gate(&SPIKE_RUNNING, SPIKE_BUF_BYTES, SPIKE_DURATION)
+}
+
+/// The [`spike`] body with an injectable gate and buffer size, so the
+/// test module can exercise every exit path (gate busy, reservation
+/// failure, a successful run) on a small buffer without the 256 MiB
+/// allocation.
+fn spike_with_gate(gate: &AtomicBool, bytes: usize, duration: Duration) -> bool {
     // Acquire the single-flight gate; no-op if a spike is already running.
     // Keep-alive binding: holds the gate for the whole body (RAII drop
     // after `buf` is freed); `_` prefix suppresses the unused-variable
     // lint (the guard is intentionally never read).
-    let _guard = match enter(&SPIKE_RUNNING) {
+    let _guard = match enter(gate) {
         Some(guard) => guard,
-        None => return,
+        None => return false,
     };
-    // Zeroed allocation: the one-time touch is itself a write pass over
-    // every page (no `unsafe`, no pre-filled static). Declared after the
-    // guard so it frees *before* the gate is released (RAII drop order).
-    let mut buf = vec![0u8; SPIKE_BUF_BYTES];
-    let sink = spike_run(&mut buf, SPIKE_DURATION);
+    // Guarded allocation: `Vec::new()` (no allocation) + `try_reserve`
+    // (fallible) + zeroed `resize` (no further allocation — the
+    // capacity is already reserved; the one-time touch is itself a
+    // write pass over every page). Declared after the guard so it frees
+    // *before* the gate is released (RAII drop order). This replaces
+    // the panicking `vec![0u8; n]`: a transient OOM on a loaded host
+    // degrades to a skip, never a crash.
+    let mut buf = Vec::new();
+    if buf.try_reserve(bytes).is_err() {
+        eprintln!(
+            "warning: DRAM spike skipped: the {} MiB buffer reservation failed under memory pressure; the next MCLK sample may read the idle frequency",
+            bytes / (1024 * 1024)
+        );
+        return false;
+    }
+    buf.resize(bytes, 0);
+    let sink = spike_run(&mut buf, duration);
     // Sink the accumulator so the compiler cannot elide the loop.
     std::hint::black_box(sink);
-    // `buf` drops (frees the 256 MiB), then `guard` drops (releases the
+    // `buf` drops (frees the buffer), then `guard` drops (releases the
     // gate) — on every exit path.
+    true
 }
 
 /// Drive a time-boxed strided read+write loop over `buf` for `duration`,
@@ -187,15 +223,59 @@ mod tests {
         assert_eq!(buf, vec![0u8; 4], "buffer left untouched");
     }
 
-    /// (e) The global `spike()` path (256 MiB) returns, leaves
-    /// `SPIKE_RUNNING` released, and is bounded well under 3 s.
+    /// (e) The global `spike()` path (256 MiB) runs (returns `true`),
+    /// leaves `SPIKE_RUNNING` released, and is bounded well under 3 s.
     #[test]
     fn spike_global_path_releases_gate_and_is_bounded() {
         assert!(!SPIKE_RUNNING.load(Ordering::SeqCst), "gate free before the spike");
         let start = Instant::now();
-        spike();
+        assert!(spike(), "the 256 MiB reservation succeeds on a healthy host");
         let elapsed = start.elapsed();
         assert!(!SPIKE_RUNNING.load(Ordering::SeqCst), "gate released after spike() returns");
         assert!(elapsed < Duration::from_secs(3), "spike() is bounded: {elapsed:?}");
+    }
+
+    /// (f) `spike_with_gate` on a local gate + a 4096-byte buffer runs
+    /// the full body (reserve + zeroed resize + strided traffic) and
+    /// returns `true`.
+    #[test]
+    fn spike_with_gate_small_buffer_runs() {
+        let gate = AtomicBool::new(false);
+        assert!(
+            spike_with_gate(&gate, 4096, Duration::from_millis(5)),
+            "a 4096-byte reservation succeeds and the spike runs"
+        );
+        assert!(!gate.load(Ordering::SeqCst), "the local gate is released");
+    }
+
+    /// (g) `spike_with_gate` with an unreservable size (`usize::MAX`)
+    /// takes the graceful-failure path: no panic, returns `false`, the
+    /// gate is released.
+    #[test]
+    fn spike_with_gate_unreservable_size_skips_no_panic() {
+        let gate = AtomicBool::new(false);
+        assert!(
+            !spike_with_gate(&gate, usize::MAX, Duration::ZERO),
+            "an unreservable allocation skips the spike"
+        );
+        assert!(
+            !gate.load(Ordering::SeqCst),
+            "the gate is released after a skipped spike"
+        );
+    }
+
+    /// (h) A second caller on a held gate skips (`false`) without
+    /// stacking a second allocation.
+    #[test]
+    fn spike_with_gate_busy_gate_skips() {
+        let gate = AtomicBool::new(true);
+        assert!(
+            !spike_with_gate(&gate, 4096, Duration::from_millis(5)),
+            "a busy gate skips the spike"
+        );
+        assert!(
+            gate.load(Ordering::SeqCst),
+            "the caller does not touch a gate it does not own"
+        );
     }
 }

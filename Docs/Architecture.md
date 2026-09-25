@@ -545,6 +545,11 @@ spike()            ~256 MiB buffer, 250 ms of strided read+write traffic
 The spike is pure userspace (no privilege, no hardware data, no `unsafe`),
 single-flight behind a global atomic gate (a second caller no-ops), and
 time-boxed; it runs on the blocking pool immediately before `collect()`.
+Its 256 MiB buffer is reserved with a fallible `try_reserve` (the `vec!`
+macro panics on allocation failure and would crash the daemon's
+`spawn_blocking` collector closure): a transient OOM on a loaded host
+skips the spike with a stderr warning and the collector proceeds — the
+`MCLK` sample may read the idle frequency once, which beats a dead daemon.
 In-TTL clone paths never spike (the collector is not called).
 
 ### 5.6 The single-flight benchmark job manager

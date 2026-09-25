@@ -19,7 +19,9 @@
 //!   `run_streamed`.
 //! - `dram_spike` — C10-03 (D-3) — a short DRAM load before every
 //!   SMU PM-table re-read (single-flight; the MCLK is sampled at the
-//!   operating frequency, not the idle frequency).
+//!   operating frequency, not the idle frequency; a failed 256 MiB
+//!   reservation skips the spike with a stderr warning instead of
+//!   panicking the daemon).
 //! - `rpc` — P3-16 — per-connection frame dispatch + progress
 //!   forwarding.
 //! - `spd_bind` — the guarded SPD EEPROM auto-bind fallback
@@ -66,7 +68,10 @@ pub use cache::TelemetryCache;
 pub use bench_job::{BenchJobManager, JobError, JobEvent, JobHandle};
 // C10-03 (D-3): the short DRAM load, re-exported at the root
 // (workspace re-export style) — C10-04 (main) wraps the injected
-// collector so every SMU PM-table re-read is preceded by `spike()`.
+// collector so every SMU PM-table re-read is preceded by `spike()`
+// (returns `false`, with a stderr warning, if the 256 MiB reservation
+// fails under memory pressure — the collector proceeds to `collect()`
+// regardless).
 pub use dram_spike::spike;
 // P3-16: the per-connection async RPC loop, re-exported at the root
 // (workspace re-export style) — P3-17 (main) builds one

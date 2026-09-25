@@ -223,6 +223,11 @@ async fn main() {
                 // captures the `Copy` `spd_autobind` flag; `args.max_age`
                 // is a separate argument below.)
                 ensure_spd_eeproms_bound(spd_autobind);
+                // `spike()` returns `false` (with a stderr warning) if
+                // its 256 MiB reservation fails under memory pressure —
+                // the collector proceeds to `collect()` regardless (a
+                // skipped spike is a degraded MCLK sample, never a hard
+                // error).
                 spike();
                 std::thread::sleep(CLOCK_SETTLE);
                 ramsleuth_telemetry::collect()
