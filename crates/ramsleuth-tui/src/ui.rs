@@ -689,10 +689,12 @@ fn intel_mode(t: &SystemMemoryTelemetry) -> Option<(String, Color)> {
 /// The line-3 pieces — the single source of truth for the flat
 /// [`ram_line_prefix`] text and the per-segment-coloured
 /// [`header_line3`]: the total (selected capacity unit), the
-/// breakdown, the optional max-SPD speed, the channel mode (hardware-
-/// preferred on Intel, the SPD-count [`channel_mode`] elsewhere), the
-/// optional slot note, and the mode segment (text + color; the Intel
-/// hardware mode takes the slot over the AMD sync mode).
+/// breakdown, the optional speed segment (the max SPD speed; the
+/// platform MCLK×2 fallback when no module carries one —
+/// [`mclk_derived_speed`]), the channel mode (hardware-preferred on
+/// Intel, the SPD-count [`channel_mode`] elsewhere), the optional
+/// slot note, and the mode segment (text + color; the Intel hardware
+/// mode takes the slot over the AMD sync mode).
 fn ram_line3_parts(
     t: &SystemMemoryTelemetry,
     capacity_gib: bool,
@@ -710,12 +712,17 @@ fn ram_line3_parts(
         None => "N/A".to_owned(),
     };
     let summary = dimm_summary(&t.dimm_sizes, &t.spd, capacity_gib);
+    // The max SPD speed; the platform MCLK×2 fallback when no bound
+    // module carries one (the SPD byte-0x20 guard degrades
+    // implausible codes to Na, so the derived rate is the honest
+    // summary-line source).
     let speed = t
         .spd
         .iter()
         .filter_map(|m| m.speed_mts.value().copied())
         .max()
-        .map(|mts| format!("{mts} MT/s"));
+        .map(|mts| format!("{mts} MT/s"))
+        .or_else(|| mclk_derived_speed(t));
     // Hardware-preferred channel label: the Intel `MAD_INTER_CHANNEL`
     // mode (a Flex-Mode box can be Dual-Flex with one bound SPD), the
     // SPD-count label elsewhere (AMD / no-mode Intel).
@@ -732,13 +739,38 @@ fn ram_line3_parts(
     (total, summary, speed, channel, note, mode)
 }
 
+/// The summary-line speed fallback when no bound SPD module carries a
+/// speed: the platform's derived MT/s = MCLK × 2 (the DDR
+/// double-pumping rule — the probe renderer's `derived_mts` idiom),
+/// from the AMD readout's MCLK, else the max Intel channel MCLK
+/// (`None` when no channel carries one). `None` overall when neither
+/// branch yields an MCLK (the segment is omitted — the pre-fallback
+/// behavior).
+fn mclk_derived_speed(t: &SystemMemoryTelemetry) -> Option<String> {
+    let mclk = match t.amd.value() {
+        Some(readout) => readout.clocks.mclk_mhz.value().copied(),
+        None => t
+            .intel
+            .value()
+            .and_then(|readout| {
+                readout
+                    .channels
+                    .iter()
+                    .filter_map(|c| c.clocks.mclk_mhz.value().copied())
+                    .reduce(|a, b| if b > a { b } else { a })
+            }),
+    }?;
+    Some(format!("{:.0} MT/s", mclk * 2.0))
+}
+
 /// Line 3's non-mode part (the GUI `ram_line_prefix` mirror, C6-20/
 /// C9-01): the total capacity in the selected capacity unit, the
-/// per-DIMM breakdown (with the rank word), the max SPD speed (omitted
-/// when no module carries one), the channel mode (hardware-preferred on
-/// Intel, the SPD-count label elsewhere), the slot note when the OS
-/// total strictly exceeds the SPD sum, and the `Mode: ` lead-in the
-/// mode segment completes.
+/// per-DIMM breakdown (with the rank word), the speed segment (the max
+/// SPD speed; the platform MCLK×2 fallback when no module carries one
+/// — [`mclk_derived_speed`]; omitted only when neither is available),
+/// the channel mode (hardware-preferred on Intel, the SPD-count label
+/// elsewhere), the slot note when the OS total strictly exceeds the
+/// SPD sum, and the `Mode: ` lead-in the mode segment completes.
 ///
 /// Test-only: [`header_line3`] builds its per-segment-coloured spans
 /// from [`ram_line3_parts`] directly; this flat-text form exists so the
@@ -2955,6 +2987,78 @@ mod tests {
         assert_eq!(
             ram_line_prefix(&balanced, true),
             "RAM: 32 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | Mode: "
+        );
+    }
+
+    /// (q2) The speed segment's MCLK×2 fallback: no bound module
+    /// carries a speed, so the line derives the rate from the
+    /// platform — the AMD readout's MCLK (the fixture's 1600 MHz →
+    /// 3200 MT/s) and the max Intel channel MCLK (the legacy
+    /// `decode_channel` 160 ratio → 1600 MHz → 3200 MT/s; the
+    /// Na-MCLK second channel is skipped by the max).
+    #[test]
+    fn ram_line_prefix_speed_falls_back_to_mclk_x2() {
+        // The AMD branch carries the MCLK.
+        let amd = SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Amd(AmdZen::Zen3),
+                brand: "synthetic".to_owned(),
+            },
+            amd: Section::Value(fixture_amd()),
+            intel: Section::na(NaReason::UnsupportedHardware),
+            spd: vec![module(Section::na(NaReason::NotApplicable), None)],
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3600.0),
+                motherboard: Section::Value("Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(32.0),
+            dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+        };
+        assert_eq!(
+            ram_line_prefix(&amd, true),
+            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | Mode: "
+        );
+        // The Intel branch: the max channel MCLK wins (the Na-MCLK
+        // second channel is skipped).
+        let cmd0: u32 = 16 | (16 << 8) | (16 << 16) | (32 << 24);
+        let cmd1: u32 = 6 << 4;
+        let cmd2: u32 = 4 | (12 << 8);
+        let cmd3: u32 = 10 | (8 << 8) | (12 << 16) | (4 << 24);
+        let intel = SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Intel(IntelGen::Skylake),
+                brand: "synthetic".to_owned(),
+            },
+            amd: Section::na(NaReason::UnsupportedHardware),
+            intel: Section::Value(IntelReadout {
+                channels: vec![
+                    decode_channel(0, Some(160), [
+                        Some(cmd0),
+                        Some(cmd1),
+                        Some(cmd2),
+                        Some(cmd3),
+                    ]),
+                    decode_channel(1, None, [None; 4]),
+                ],
+                channel_mode: None,
+            }),
+            spd: vec![module(Section::na(NaReason::NotApplicable), None)],
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3600.0),
+                motherboard: Section::Value("Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(32.0),
+            dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+        };
+        assert_eq!(
+            ram_line_prefix(&intel, true),
+            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | Mode: "
         );
     }
 

@@ -1077,8 +1077,10 @@ fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String> {
 /// default GiB keeps the carried wire value, the GB arm converts
 /// × 1.073741824), the per-DIMM breakdown (C9-01, D-1: with the
 /// rank word from the parallel SPD list — `2x16 GiB Single-Rank`),
-/// the max SPD speed (omitted entirely when no module carries one),
-/// the channel mode (hardware-preferred on Intel — the
+/// the speed segment (the max SPD speed; the platform MCLK×2
+/// fallback when no module carries one — [`mclk_derived_speed`];
+/// omitted only when neither is available), the channel mode
+/// (hardware-preferred on Intel — the
 /// `MAD_INTER_CHANNEL` mode; the SPD-count [`channel_mode`] elsewhere),
 /// the total-vs-breakdown slot note when the OS total strictly exceeds
 /// the SPD sum (C9-01, D-1: `2 of 4 slots SPD-visible`), and the
@@ -1089,8 +1091,17 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
         None => "N/A".to_owned(),
     };
     let mut line = format!("RAM: {total} ({})", dimm_summary(&t.dimm_sizes, &t.spd, units));
-    if let Some(mts) = t.spd.iter().filter_map(|m| m.speed_mts.value().copied()).max() {
-        line.push_str(&format!(" {mts} MT/s"));
+    // The max SPD speed; the platform MCLK×2 fallback when no bound
+    // module carries one (omitted only when neither is available).
+    let speed = t
+        .spd
+        .iter()
+        .filter_map(|m| m.speed_mts.value().copied())
+        .max()
+        .map(|mts| format!("{mts} MT/s"))
+        .or_else(|| mclk_derived_speed(t));
+    if let Some(speed) = speed {
+        line.push_str(&format!(" {speed}"));
     }
     // Hardware-preferred channel label: the Intel `MAD_INTER_CHANNEL`
     // mode (a Flex-Mode box can be Dual-Flex with one bound SPD), the
@@ -1107,6 +1118,30 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
     }
     line.push_str(" | Mode: ");
     line
+}
+
+/// The summary-line speed fallback when no bound SPD module carries a
+/// speed (the GUI mirror of the TUI `mclk_derived_speed`): the
+/// platform's derived MT/s = MCLK × 2 (the DDR double-pumping rule —
+/// the probe renderer's `derived_mts` idiom), from the AMD readout's
+/// MCLK, else the max Intel channel MCLK (`None` when no channel
+/// carries one). `None` overall when neither branch yields an MCLK
+/// (the segment is omitted — the pre-fallback behavior).
+fn mclk_derived_speed(t: &SystemMemoryTelemetry) -> Option<String> {
+    let mclk = match t.amd.value() {
+        Some(readout) => readout.clocks.mclk_mhz.value().copied(),
+        None => t
+            .intel
+            .value()
+            .and_then(|readout| {
+                readout
+                    .channels
+                    .iter()
+                    .filter_map(|c| c.clocks.mclk_mhz.value().copied())
+                    .reduce(|a, b| if b > a { b } else { a })
+            }),
+    }?;
+    Some(format!("{:.0} MT/s", mclk * 2.0))
 }
 
 /// Line 3's mode segment (D-C8): the UCLK:MCLK ratio from the AMD
@@ -2452,7 +2487,8 @@ mod tests {
 
     use ramsleuth_bench::BenchmarkGrid;
     use ramsleuth_gui::{BenchState, CapacityUnit, ClockUnit, DEFAULT_POLL_INTERVAL_MS};
-    use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
+    use ramsleuth_telemetry::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
+    use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode, map_amd};
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::intel_readout::{ChannelMode, IntelReadout};
@@ -3289,6 +3325,95 @@ mod tests {
         assert_eq!(
             ram_line_prefix(&balanced, &Units::default()),
             "RAM: 32 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | Mode: "
+        );
+    }
+
+    /// (h6b) `ram_line_prefix` speed fallback: no bound module
+    /// carries a speed, so the line derives the rate from the
+    /// platform's MCLK × 2 — the AMD readout's MCLK (1200 MHz →
+    /// 2400 MT/s); an out-of-band MCLK (0 → Na) keeps the
+    /// pre-fallback omission.
+    #[test]
+    fn ram_line_prefix_speed_falls_back_to_mclk_x2() {
+        fn amd_snapshot(mclk_mhz: u16) -> AmdPmSnapshot {
+            AmdPmSnapshot {
+                version: 0x0007_0B02,
+                mclk_mhz,
+                uclk_mhz: 1600,
+                fclk_mhz: 1600,
+                div_mode: 0,
+                gdm: 1,
+                pdm: 0,
+                command_rate: 0,
+                timings: AmdPmTimings {
+                    cl: 16,
+                    rcwdwr: 16,
+                    rcdrd: 16,
+                    rp: 16,
+                    ras: 32,
+                    rc: 48,
+                    rrds: 4,
+                    rrld: 4,
+                    faw: 16,
+                    wtrs: 8,
+                    wtrl: 8,
+                    wr: 8,
+                    rfc1: 160,
+                    rfc2: 160,
+                    rfcsb: 160,
+                    cwl: 16,
+                    rtp: 8,
+                    rdwr: 8,
+                    wrrd: 4,
+                    rdrd_sd: 100,
+                    rdrd_dd: 101,
+                    rdrd_scl: 102,
+                    rdrd_sc: 103,
+                    wrwr_sd: 104,
+                    wrwr_dd: 105,
+                    wrwr_scl: 106,
+                    wrwr_sc: 107,
+                },
+                cad_bus: AmdPmCadBus {
+                    proc_odt: 5,
+                    rtt_nom: 2,
+                    rtt_wr: 0,
+                    rtt_park: 4,
+                    clk_drv: 6,
+                    addr_cmd_drv: 8,
+                    cs_odt_drv: 10,
+                    cke_drv: 12,
+                },
+                voltages: AmdPmVoltages {
+                    vddcr_soc_mv: 1150,
+                    vddio_mem_mv: 1350,
+                    vdd_misc_mv: 1000,
+                    vpp_mv: 1800,
+                    vcore_mv: 1150,
+                },
+            }
+        }
+        // The AMD readout's MCLK (1200 MHz → 2400 MT/s derived).
+        let mut t = fixture_telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![fixture_spd_module(None)],
+        );
+        t.amd = Section::Value(map_amd(&amd_snapshot(1200)));
+        assert_eq!(
+            ram_line_prefix(&t, &Units::default()),
+            "RAM: 32 GiB (2x16 GiB) 2400 MT/s | Dual-Channel | Mode: "
+        );
+        // An out-of-band MCLK (0 → Na) keeps the pre-fallback omission.
+        let mut na = fixture_telemetry(
+            Section::Value(32.0),
+            vec![Section::Value(16.0), Section::Value(16.0)],
+            vec![fixture_spd_module(None)],
+        );
+        na.amd = Section::Value(map_amd(&amd_snapshot(0)));
+        assert_eq!(
+            ram_line_prefix(&na, &Units::default()),
+            "RAM: 32 GiB (2x16 GiB) | Dual-Channel | Mode: "
         );
     }
 

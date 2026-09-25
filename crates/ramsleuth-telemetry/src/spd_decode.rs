@@ -677,8 +677,13 @@ fn decode_density(data: &[u8], is_ddr5: bool) -> Section<u16> {
 }
 
 /// Decode the minimum guaranteed data rate (byte `0x20`): the code is
-/// in 100 MT/s units, so `mts = code * 100` (max 25500, fits a u16).
-/// Zero -> `Na(ParseError)`.
+/// read as 100 MT/s units, so `mts = code * 100`. NOTE: per JESD79-4
+/// the byte is `tRFC2min` LSB, not a speed code — the 5950X "3200"
+/// (code 32) was a coincidental match, and out-of-band values (e.g.
+/// the i5-6600T code 240 → 24000 MT/s) are byte-location artifacts,
+/// not speeds. Zero -> `Na(ParseError)`; a computed value above the
+/// DDR5 max (8800 MT/s) degrades to `Na(ParseError)` (implausible)
+/// pending the full decoder re-baselining.
 fn decode_base_speed(data: &[u8]) -> Section<u16> {
     let Some(code) = get(data, BYTE_BASE_SPEED) else {
         return Section::na(oob(BYTE_BASE_SPEED));
@@ -688,7 +693,15 @@ fn decode_base_speed(data: &[u8]) -> Section<u16> {
             "base speed byte 0x20 is 0 (no minimum data rate recorded)".to_owned(),
         ));
     }
-    Section::Value(u16::from(code) * 100)
+    let speed = u16::from(code) * 100;
+    // Guard: DDR4 max ~3200, DDR5 max ~8800. Values above are
+    // byte-location artifacts, not speeds.
+    if speed > 8800 {
+        return Section::na(NaReason::ParseError(
+            format!("base speed {speed} MT/s implausible (byte 0x20 = {code}; likely tRFC2min LSB, not a speed code)"),
+        ));
+    }
+    Section::Value(speed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,6 +1384,43 @@ mod tests {
         assert_eq!(m.part, Section::Value("F4-3600C18-32GVK".to_owned()));
         assert_eq!(m.serial, Section::Na(NaReason::NotApplicable));
         assert!(m.profiles.is_empty(), "the live module carries no XMP");
+    }
+
+    /// Implausibility guard: byte `0x20` is `tRFC2min` LSB per
+    /// JESD79-4, not a speed code — the i5-6600T live shape (code
+    /// 240 → 24000 MT/s, above the DDR5 max of 8800) degrades to
+    /// `Na(ParseError)` naming the byte (never a fabricated speed);
+    /// the 8800 boundary (code 88) stays a value.
+    #[test]
+    fn implausible_base_speed_degrades_to_na() {
+        // The i5-6600T live shape: code 240 -> 24000 MT/s (impossible).
+        let mut data = live_5950x_image().data;
+        data[0x20] = 240;
+        let m = decode(&SpdImage {
+            index: 0x52,
+            data,
+        });
+        let Section::Na(NaReason::ParseError(detail)) = m.speed_mts else {
+            panic!("code 240 must be Na(ParseError)");
+        };
+        assert!(detail.contains("24000 MT/s"), "{detail}");
+        assert!(detail.contains("tRFC2min"), "{detail}");
+        // Boundary sweep: code 88 -> exactly 8800 MT/s (the DDR5 max)
+        // stays a value; 89 / 255 degrade.
+        for (code, expected_na) in [(88u8, false), (89, true), (255, true)] {
+            let mut data = live_5950x_image().data;
+            data[0x20] = code;
+            let m = decode(&SpdImage {
+                index: 0x52,
+                data,
+            });
+            assert_eq!(
+                m.speed_mts.is_na(),
+                expected_na,
+                "code {code} ({} MT/s) must be Na={expected_na}",
+                u16::from(code) * 100
+            );
+        }
     }
 
     /// The operator's live shape (C8-03, D-2; the reported `2 GiB`
