@@ -81,7 +81,7 @@ use std::time::{Duration, Instant};
 use ramsleuth_bench::{BenchOp, BenchmarkGrid, BurnInTick, StreamProgress, StreamTarget, Tier};
 use ramsleuth_client::Client;
 use ramsleuth_protocol::{BenchMode, Request, Response};
-use ramsleuth_telemetry::SystemMemoryTelemetry;
+use ramsleuth_telemetry::{ProbeReport, SystemMemoryTelemetry};
 
 use crate::graph::GraphState;
 use crate::history::HistoryState;
@@ -240,6 +240,17 @@ pub struct TelemetryData {
     /// settings panel mutating these knobs (no I/O, D6); the poller
     /// is the only writer of every other field.
     pub settings: GuiSettings,
+    /// The consent-gated "Submit Probe Report" request edge (chunk
+    /// probe-3): the consent dialog's [Allow] button sets it (the
+    /// render thread's one probe write — no I/O, D6); the poller
+    /// clears it and runs [`request_probe_report`] once per tick.
+    pub probe_requested: bool,
+    /// The probe-report request outcome (chunk probe-3): the poller
+    /// writes [`ProbeResult::Pending`] → `Ok(report)` / `Err(text)`
+    /// (the only daemon I/O off the render thread, D6); the render
+    /// thread consumes it (the consent → preview transition) and
+    /// resets it to `None`.
+    pub probe_result: ProbeResult,
 }
 
 /// One benchmark request from the UI to the background poller (the
@@ -257,6 +268,38 @@ pub struct BenchCmd {
     /// infinite — stop only via the Cancel flag /
     /// [`Request::CancelBenchmark`]).
     pub duration_minutes: Option<u32>,
+}
+
+/// The consent-gated "Submit Probe Report" request outcome (chunk
+/// probe-3): shared between the background poller (the only writer —
+/// it does the daemon I/O off the render thread, D6) and the render
+/// thread (the reader/consumer — the consent → preview transition).
+///
+/// - `None` — no probe request in flight / no result (the idle
+///   default).
+/// - `Pending` — a request is in flight (the consent dialog shows a
+///   progress indicator).
+/// - `Ok(report)` — the report landed (the render thread renders it
+///   to markdown and moves to the preview).
+/// - `Err(text)` — the request failed (the structured error text; the
+///   render thread flashes it as a notice and returns to idle).
+///
+/// `ProbeReport` is not `Eq` (it embeds `f64` cells), so this derives
+/// `PartialEq` only.
+///
+/// The same deliberate `large_enum_variant` allow as the protocol's
+/// [`Response`]: the `Ok` arm carries the transient per-request
+/// [`ProbeReport`] (the daemon's `GetProbeReport` reply, consumed
+/// once by the render thread) — boxing it would gain nothing, since
+/// the value is a short-lived one-shot, not a long-lived field.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum ProbeResult {
+    #[default]
+    None,
+    Pending,
+    Ok(ProbeReport),
+    Err(String),
 }
 
 // ---------------------------------------------------------------------
@@ -333,6 +376,55 @@ pub fn poll_telemetry(socket: &Path, state: &mut TelemetryData) -> Result<(), St
         Err(error) => {
             state.error = Some(error.to_string());
             state.daemon_status = "disconnected".to_owned();
+        }
+    }
+    Ok(())
+}
+
+/// One consent-gated probe-report request (chunk probe-3): connect to
+/// the daemon at `socket`, send `GetProbeReport`, and land the reply
+/// into `state.probe_result` — the single daemon I/O unit the
+/// background poller runs when the consent dialog's [Allow] edge sets
+/// `probe_requested`.
+///
+/// Testable, no thread: it takes the shared `&RwLock<TelemetryData>`
+/// and locks it only briefly, per mutation (C14-03). The no-panic
+/// contract (plan D5), as in [`poll_telemetry`]: every failure class
+/// (a missing / refused socket → the `ClientError::DaemonDown`
+/// "start it with …" text, a timeout, a protocol violation, a closed
+/// stream, a structured wire `Error`) is recorded in
+/// `state.probe_result` as `Err(…)`, and the function always returns
+/// `Ok(())` — the poller's loop keeps running against a flapping
+/// daemon.
+pub fn request_probe_report(socket: &Path, state: &RwLock<TelemetryData>) -> Result<(), String> {
+    // The in-flight marker (the consent dialog's progress indicator).
+    state.write().unwrap().probe_result = ProbeResult::Pending;
+    let mut client = match Client::connect(socket) {
+        Ok(client) => client,
+        Err(error) => {
+            state
+                .write()
+                .unwrap()
+                .probe_result = ProbeResult::Err(error.to_string());
+            return Ok(());
+        }
+    };
+    match client.request(&Request::GetProbeReport) {
+        Ok(Response::ProbeReport(report)) => {
+            state.write().unwrap().probe_result = ProbeResult::Ok(report);
+        }
+        Ok(Response::Error(message)) => {
+            state.write().unwrap().probe_result = ProbeResult::Err(message);
+        }
+        Ok(_) => {
+            // Any other frame in reply to `GetProbeReport` violates
+            // the wire contract (P3-16: the daemon answers one
+            // request with exactly one response).
+            state.write().unwrap().probe_result =
+                ProbeResult::Err("unexpected response to GetProbeReport".to_owned());
+        }
+        Err(error) => {
+            state.write().unwrap().probe_result = ProbeResult::Err(error.to_string());
         }
     }
     Ok(())
@@ -887,6 +979,20 @@ pub fn spawn_poller(
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            // The consent-gated probe-report request (chunk probe-3):
+            // the consent dialog's [Allow] edge sets `probe_requested`
+            // (the render thread's one probe write, no I/O — D6); the
+            // poller is the only place the GUI talks to the daemon, so
+            // it clears the flag and runs the one-shot request here,
+            // before the bench dispatch (a probe never blocks a run).
+            let (probe_requested, socket) = {
+                let s = state.read().unwrap();
+                (s.probe_requested, s.settings.socket.clone())
+            };
+            if probe_requested {
+                state.write().unwrap().probe_requested = false;
+                let _ = request_probe_report(Path::new(&socket), &state);
+            }
             match bench_rx.try_recv() {
                 Ok(cmd) => {
                     // The live settings socket (C6-30): a panel edit
@@ -969,7 +1075,7 @@ mod tests {
     use ramsleuth_telemetry::amd_readout::map_amd;
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
-    use ramsleuth_telemetry::SystemPlatform;
+    use ramsleuth_telemetry::{ProbeSystem, SystemPlatform};
 
     use crate::history::HISTORY_CAPACITY;
 
@@ -3009,5 +3115,78 @@ mod tests {
         let s = state.read().expect("the poller must not poison the lock");
         assert!(!s.bench.burn_in.running, "the cancel must clear burn_in.running");
         assert!(s.error.is_none(), "a clean cancel must not record an error");
+    }
+
+    // -----------------------------------------------------------------
+    // The consent-gated probe-report request (chunk probe-3).
+    // -----------------------------------------------------------------
+
+    /// A minimal probe-report fixture (the `request_probe_report`
+    /// stand-in tests' payload).
+    fn fixture_probe_report() -> ProbeReport {
+        ProbeReport {
+            telemetry: mock_snapshot(),
+            raw: None,
+            system: ProbeSystem {
+                cpu_brand: "GUI Test CPU".to_owned(),
+                cpu_vendor: "unknown".to_owned(),
+                cpu_gen: "Unknown".to_owned(),
+                pci_host_bridge: None,
+                kernel: "6.6.0-test".to_owned(),
+                os: "Linux / Test".to_owned(),
+                arch: "x86_64".to_owned(),
+                ramsleuth_version: "2.4.0".to_owned(),
+                telemetry_source: "unavailable".to_owned(),
+            },
+        }
+    }
+
+    /// (q6) `request_probe_report` against a live stand-in (a
+    /// `GetProbeReport` answered with a canned
+    /// `Response::ProbeReport`) lands `probe_result = Ok(report)`.
+    #[test]
+    fn request_probe_report_against_a_live_stand_in_updates_state() {
+        let sock = TempSocket::new("probe-report");
+        let report = fixture_probe_report();
+        let expected = report.clone();
+        // Spawn (no join before the request — the existing stand-in
+        // pattern: the handle detaches when the test ends, after the
+        // handler has served the one connection).
+        let _stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
+            let msg = read_one_message(&mut stream).expect("the request must arrive");
+            assert!(
+                matches!(msg, Message::Request(Request::GetProbeReport)),
+                "the stand-in must receive a GetProbeReport"
+            );
+            let frame = encode_frame(&Message::Response(Response::ProbeReport(report)))
+                .expect("must encode");
+            stream.write_all(&frame).expect("the reply must write");
+        });
+        let state = Arc::new(RwLock::new(TelemetryData::default()));
+        let _ = request_probe_report(sock.path(), &state);
+        let guard = state.read().unwrap();
+        match &guard.probe_result {
+            ProbeResult::Ok(r) => {
+                assert_eq!(*r, expected, "the landed report must match")
+            }
+            other => panic!("expected Ok(report), got {other:?}"),
+        }
+    }
+
+    /// (q7) `request_probe_report` against a missing socket records a
+    /// structured `Err` (the no-panic contract — the poller's loop
+    /// survives a flapping daemon).
+    #[test]
+    fn request_probe_report_against_missing_socket_is_friendly() {
+        let sock = TempSocket::new("probe-report-missing");
+        let state = Arc::new(RwLock::new(TelemetryData::default()));
+        let _ = request_probe_report(sock.path(), &state);
+        let guard = state.read().unwrap();
+        match &guard.probe_result {
+            ProbeResult::Err(msg) => {
+                assert!(!msg.is_empty(), "a friendly error text")
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
     }
 }

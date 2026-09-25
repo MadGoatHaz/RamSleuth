@@ -126,15 +126,16 @@ use ramsleuth_gui::{
     first_run::{render_requirements_strip_with_setup, setup_argv, setup_with_dkms, SetupOutcome},
     format_capacity, format_clock, render_bench_zone, render_graphs_window, render_settings_panel,
     render_status_zone, render_telemetry_zone, snapshot_png, spawn_poller, BenchCmd, GuiAction,
-    GuiError, GuiSettings, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
+    GuiError, GuiSettings, ProbeResult, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
 use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::Section;
 use ramsleuth_telemetry::intel_readout::ChannelMode;
+use ramsleuth_telemetry::probe::render_probe_report_md;
 use ramsleuth_telemetry::spd_decode::SpdModule;
-use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
+use ramsleuth_telemetry::{ProbeReport, SystemMemoryTelemetry, SystemPlatform};
 
 /// How long a transient header notice (an F2 / F3 export result) stays
 /// visible before it fades.
@@ -422,6 +423,125 @@ fn notice_color(text: &str) -> egui::Color32 {
     }
 }
 
+/** The consent dialog's body (chunk probe-3): the exact disclosure of
+what the probe report collects + the explicit no-personal-information
+note. */
+const PROBE_CONSENT_BODY: &str = "RamSleuth can gather the following system information to help the developers improve the app:\n\n\u{2022} CPU brand, detected generation, PCI host-bridge ID\n\u{2022} Kernel version, OS, architecture\n\u{2022} RamSleuth version, telemetry source\n\u{2022} The decoded memory readout (MCLK, MT/s, timings, SPD)\n\u{2022} The raw IMC register values\n\u{2022} N/A reasons\n\n**Not collected:** username, hostname, IP address, MAC address, serial numbers, file paths.\n\nDo you allow RamSleuth to gather this information?";
+
+/// The header's per-frame action (the header buttons that need
+/// app-level dispatch): `None` when nothing was clicked this frame,
+/// `Probe` when the "Probe" button was clicked (chunk probe-3 — the
+/// app shell opens the consent flow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderAction {
+    None,
+    Probe,
+}
+
+/// The consent-gated "Submit Probe Report" flow state (chunk probe-3):
+/// the lifecycle of the two modal dialogs.
+///
+/// - `Idle` — no probe flow in progress (the default).
+/// - `Consent` — the consent dialog is open (the "Probe" button was
+///   clicked; [Allow] hands the request to the poller, [Cancel]
+///   returns here).
+/// - `Preview(md)` — the rendered report markdown is shown in the
+///   preview dialog ([Open GitHub Issue] / [Copy to Clipboard] /
+///   [Cancel]).
+/// - `Done` — the report was submitted (the flow is complete; no
+///   dialog renders).
+#[derive(Debug, Clone, PartialEq, Default)]
+enum ProbeState {
+    #[default]
+    Idle,
+    Consent,
+    Preview(String),
+    Done,
+}
+
+/// One user event on the probe-flow state machine (chunk probe-3):
+/// the pure transitions the consent / preview dialog buttons and the
+/// header's "Probe" button apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeEvent {
+    /// The header's "Probe" button (Idle → Consent).
+    Open,
+    /// The consent dialog's [Cancel] (Consent → Idle).
+    CancelConsent,
+    /// The preview dialog's [Cancel] (Preview → Idle).
+    CancelPreview,
+    /// The preview dialog's [Open GitHub Issue] (Preview → Done).
+    Submit,
+}
+
+impl ProbeState {
+    /// Apply one user event (pure): `Open` (Idle → Consent),
+    /// `CancelConsent` (Consent → Idle), `CancelPreview` (Preview →
+    /// Idle), `Submit` (Preview → Done). An event outside its expected
+    /// state is a no-op (the state machine is total — never a panic).
+    fn apply(&mut self, event: ProbeEvent) {
+        let this = &*self;
+        match (this, event) {
+            (ProbeState::Idle, ProbeEvent::Open) => *self = ProbeState::Consent,
+            (ProbeState::Consent, ProbeEvent::CancelConsent) => *self = ProbeState::Idle,
+            (ProbeState::Preview(_), ProbeEvent::CancelPreview) => *self = ProbeState::Idle,
+            (ProbeState::Preview(_), ProbeEvent::Submit) => *self = ProbeState::Done,
+            _ => {}
+        }
+    }
+}
+
+/// The pre-filled GitHub issue title for a probe report (chunk
+/// probe-3): `[Probe] <cpu_brand> · <cpu_gen> · <os> · v<version>` —
+/// the issue template's `[Probe] ` prefix + the report's CPU / OS
+/// identity + the generating version.
+fn probe_issue_title(report: &ProbeReport) -> String {
+    let s = &report.system;
+    format!(
+        "[Probe] {} \u{00b7} {} \u{00b7} {} \u{00b7} v{}",
+        s.cpu_brand, s.cpu_gen, s.os, s.ramsleuth_version
+    )
+}
+
+/// The pre-filled GitHub issue URL (chunk probe-3): the repo's
+/// `issues/new` form with the title + the rendered markdown body, both
+/// percent-encoded (RFC 3986).
+fn probe_issue_url(title: &str, body: &str) -> String {
+    format!(
+        "https://github.com/MadGoat/RamSleuth/issues/new?title={}&body={}",
+        url_encode(title),
+        url_encode(body)
+    )
+}
+
+/// Percent-encode `s` per RFC 3986: the unreserved set (`A-Z a-z 0-9
+/// - _ . ~`) passes through; every other byte becomes `%XX` (upper-
+/// case hex). A space encodes as `%20` (never `+`).
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(to_hex(byte >> 4) as char);
+                out.push(to_hex(byte & 0x0f) as char);
+            }
+        }
+    }
+    out
+}
+
+/// One nibble as an upper-case hex digit (the [`url_encode`] helper).
+fn to_hex(n: u8) -> u8 {
+    match n {
+        0..=9 => b'0' + n,
+        _ => b'A' + (n - 10),
+    }
+}
+
 /// The eframe app (P3-30): the shared state, the poller's command
 /// channel, the stop / cancel flags, the settings-panel visibility,
 /// the one-click setup outcome (C21-06), the post-setup restart
@@ -501,6 +621,16 @@ struct RamSleuthApp {
     /// run does not re-prompt); a `Restart now` exits the process
     /// instead, so the fresh instance starts `false`.
     restart_prompt_dismissed: bool,
+    /// The consent-gated "Submit Probe Report" flow state (chunk
+    /// probe-3): `Idle` → (the header's Probe button) `Consent` →
+    /// (the poller lands the report) `Preview(md)` → ([Cancel] /
+    /// [Open GitHub Issue]) `Idle` / `Done`.
+    probe_state: ProbeState,
+    /// The pre-filled GitHub issue title for the current probe report
+    /// (chunk probe-3): `[Probe] <cpu_brand> · <cpu_gen> · <os> ·
+    /// v<version>` — set alongside the `Preview` transition, used to
+    /// build the `issues/new` URL.
+    probe_title: Option<String>,
 }
 
 impl Drop for RamSleuthApp {
@@ -543,6 +673,11 @@ impl eframe::App for RamSleuthApp {
         if expired {
             self.notice = None;
         }
+        // The probe flow (chunk probe-3): consume the poller's
+        // probe-report result (the consent dialog's [Allow] edge sets
+        // `probe_requested`; the poller does the daemon I/O and lands
+        // `probe_result`) — the consent → preview transition.
+        self.advance_probe();
         // The C21-36 post-setup restart prompt's open state: the
         // helper succeeded (the `done` outcome) and the user has
         // not dismissed it with `Later` — while open, the dialog's
@@ -555,13 +690,20 @@ impl eframe::App for RamSleuthApp {
             let setup = self.setup.read().unwrap();
             setup_prompt_open(setup.done, self.restart_prompt_dismissed)
         };
+        // The probe-flow dialog's open state (chunk probe-3): the
+        // consent + preview modals (like the setup prompt) block the
+        // key legend + the button dispatch — their full-screen layer
+        // consumes the pointer over the rest of the UI.
+        let probe_open =
+            matches!(self.probe_state, ProbeState::Consent | ProbeState::Preview(_));
+        let modal_open = prompt_open || probe_open;
         // The keyboard (C6-30, the spec's key legend): a fresh
         // key-down — egui marks OS key-repeats `repeat: true`, so a
         // held key fires exactly once, the button's click semantics —
         // routes through the same [`GuiAction`] dispatch as the
         // status zone's buttons (D-C7: keys and buttons are
         // behaviorally identical).
-        let keyed_action = if prompt_open {
+        let keyed_action = if modal_open {
             // The modal dialog blocks the key legend (F2 / F3 / Q)
             // while open.
             None
@@ -583,7 +725,7 @@ impl eframe::App for RamSleuthApp {
         // then the central panel): each takes its own brief lock
         // (the render thread does no I/O, D6 — the settings strip is
         // its one permitted write).
-        {
+        let header_action = {
             let data = self.state.read().unwrap();
             Self::render_header(
                 ctx,
@@ -592,8 +734,8 @@ impl eframe::App for RamSleuthApp {
                 &mut self.requirements_open,
                 &self.graphs_open,
                 &self.notice,
-            );
-        }
+            )
+        };
         // The SETUP requirements strip (C18, D-18.5): while the
         // header's `Setup` toggle is open, allocate it between the
         // header and the settings strip only while a requirement is
@@ -630,7 +772,14 @@ impl eframe::App for RamSleuthApp {
         // dialog's full-screen layer has consumed the pointer and
         // the key legend is gated above: the dialog's two buttons
         // are the only interactive content.
-        if !prompt_open {
+        if !modal_open {
+            // The header's "Probe" button (chunk probe-3): open the
+            // consent flow (the state machine guards the Idle source —
+            // a click while a dialog is open is unreachable, the
+            // modal block covers the header).
+            if header_action == HeaderAction::Probe {
+                self.probe_state.apply(ProbeEvent::Open);
+            }
             self.handle_action(ctx, button_action);
             if let Some(keyed_action) = keyed_action {
                 if keyed_action != button_action {
@@ -660,6 +809,16 @@ impl eframe::App for RamSleuthApp {
         // central panel.
         if prompt_open {
             self.render_setup_complete_dialog(ctx);
+        }
+        // The probe-flow modal (chunk probe-3): allocated after the
+        // setup prompt (topmost) — the consent dialog, then the
+        // preview dialog, matching the current `probe_state`.
+        if probe_open {
+            match &self.probe_state {
+                ProbeState::Consent => self.render_probe_consent_dialog(ctx),
+                ProbeState::Preview(_) => self.render_probe_preview_dialog(ctx),
+                _ => {}
+            }
         }
 
         // ~60 FPS: eframe's vsync drives the present; this only asks
@@ -989,7 +1148,7 @@ impl RamSleuthApp {
         requirements_open: &mut bool,
         graphs_open: &Arc<AtomicBool>,
         notice: &Option<(String, Instant)>,
-    ) {
+    ) -> HeaderAction {
         // The line builders over the current snapshot (the capacity +
         // clock segments honor the live `units` knob — C7-11) — or
         // the placeholders when no poll has landed yet (never a panic).
@@ -1010,6 +1169,9 @@ impl RamSleuthApp {
         // field is the single source (seeded from the CLI `--socket`
         // at startup; the poller reads it live).
         let status = daemon_status_text(data, Path::new(&data.settings.socket));
+        // The "Probe" button's click edge (chunk probe-3): captured in
+        // the closure, reported as the function's return value.
+        let mut probe_clicked = false;
         egui::TopBottomPanel::top("ramsleuth_header")
             .frame(
                 egui::Frame::default()
@@ -1065,6 +1227,18 @@ impl RamSleuthApp {
                             *requirements_open = !*requirements_open;
                         }
                         ui.add_space(8.0);
+                        // The Probe button (chunk probe-3): the
+                        // consent-gated "Submit Probe Report" flow — a
+                        // click sets the captured edge (reported as
+                        // `HeaderAction::Probe`; the app shell opens
+                        // the consent dialog).
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("Probe")))
+                            .clicked()
+                        {
+                            probe_clicked = true;
+                        }
+                        ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("[F2] snapshot · [F3] export · [Q] quit").weak(),
                         );
@@ -1090,6 +1264,11 @@ impl RamSleuthApp {
                     ui.label(egui::RichText::new(text).color(notice_color(text)));
                 }
             });
+        if probe_clicked {
+            HeaderAction::Probe
+        } else {
+            HeaderAction::None
+        }
     }
 
     /// The three zones: the telemetry matrix (zone 1) on the left; the
@@ -1494,6 +1673,236 @@ impl RamSleuthApp {
                                 // running as-is.
                                 if ui.add(egui::Button::new("Later")).clicked() {
                                     self.restart_prompt_dismissed = true;
+                                }
+                            });
+                        });
+                    },
+                );
+            });
+    }
+
+    /// The consent-gated "Submit Probe Report" flow's state advance
+    /// (chunk probe-3): consume the poller's landed `probe_result` —
+    /// `Ok(report)` renders it to markdown + the pre-filled title and
+    /// moves to `Preview`; `Err(text)` flashes a notice and returns to
+    /// `Idle`; `Pending` / `None` (in flight / not yet processed) stay
+    /// in `Consent`. A brief read, then a brief write on completion
+    /// (the C14-03 pattern — never held across a frame).
+    fn advance_probe(&mut self) {
+        if !matches!(self.probe_state, ProbeState::Consent) {
+            return;
+        }
+        let result = self.state.read().unwrap().probe_result.clone();
+        match result {
+            ProbeResult::Ok(report) => {
+                let md = render_probe_report_md(&report);
+                self.probe_title = Some(probe_issue_title(&report));
+                self.probe_state = ProbeState::Preview(md);
+                self.state.write().unwrap().probe_result = ProbeResult::None;
+            }
+            ProbeResult::Err(message) => {
+                self.probe_state = ProbeState::Idle;
+                self.probe_title = None;
+                self.notice = Some((format!("! {message}"), Instant::now()));
+                self.state.write().unwrap().probe_result = ProbeResult::None;
+            }
+            ProbeResult::Pending | ProbeResult::None => {
+                // In flight / the poller has not processed the edge
+                // yet: stay in `Consent` (the dialog shows progress).
+            }
+        }
+    }
+
+    /// The consent dialog (chunk probe-3): the modal pattern of
+    /// [`Self::render_setup_complete_dialog`] — two topmost
+    /// (`Order::Foreground`) areas, the dimmed full-screen block
+    /// (allocated first, consumes every pointer event over the
+    /// dashboard) + the centered "Submit Probe Report" box (allocated
+    /// after — its buttons beat the block). The body is the exact
+    /// disclosure of what the report collects + the no-PII note;
+    /// [Allow] (the primary CYAN fill) hands the request to the
+    /// poller (the render thread's one probe write, no I/O — D6),
+    /// [Cancel] returns to `Idle`. While the poller is fetching
+    /// (`probe_result == Pending`), a spinner shows and the buttons
+    /// stay inert.
+    fn render_probe_consent_dialog(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("ramsleuth_probe_consent_block"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.set_max_size(screen.size());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
+                let _ = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+            });
+        egui::Area::new(egui::Id::new("ramsleuth_probe_consent"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.set_max_size(screen.size());
+                ui.with_layout(
+                    egui::Layout::from_main_dir_and_cross_align(
+                        egui::Direction::TopDown,
+                        egui::Align::Center,
+                    ),
+                    |ui| {
+                        let frame = egui::Frame::default()
+                            .fill(SLATE)
+                            .stroke(egui::Stroke::new(1.0_f32, CYAN))
+                            .inner_margin(egui::Margin::symmetric(12.0, 10.0));
+                        frame.show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Submit Probe Report")
+                                    .strong()
+                                    .color(CYAN),
+                            );
+                            ui.add_space(4.0);
+                            ui.add(egui::Label::new(PROBE_CONSENT_BODY).wrap(true));
+                            ui.add_space(8.0);
+                            // The in-flight indicator (the poller is
+                            // fetching): a spinner + the disabled
+                            // buttons.
+                            let in_flight = self.state.read().unwrap().probe_result
+                                == ProbeResult::Pending;
+                            ui.horizontal(|ui| {
+                                if in_flight {
+                                    ui.add(egui::Spinner::new());
+                                    ui.label("Gathering report…");
+                                }
+                                // Primary (the wizard button's
+                                // precedent): the CYAN fill + the
+                                // SLATE text — the consent edge.
+                                if !in_flight
+                                    && ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Allow").color(SLATE),
+                                            )
+                                            .fill(CYAN),
+                                        )
+                                        .clicked()
+                                {
+                                    // Hand the request to the poller
+                                    // (the render thread's one probe
+                                    // write, no I/O — D6): the poller
+                                    // clears the flag + does the
+                                    // daemon I/O, landing
+                                    // `probe_result`.
+                                    self.state.write().unwrap().probe_requested = true;
+                                }
+                                // Secondary (the `Got it` precedent):
+                                // plain — return to `Idle`.
+                                if !in_flight
+                                    && ui.add(egui::Button::new("Cancel")).clicked()
+                                {
+                                    self.probe_state.apply(ProbeEvent::CancelConsent);
+                                }
+                            });
+                        });
+                    },
+                );
+            });
+    }
+
+    /// The preview dialog (chunk probe-3): the same modal pattern —
+    /// the dimmed full-screen block + the centered "Probe Report
+    /// Preview" box. The body is a scrollable read-only
+    /// `TextEdit::multiline` over the rendered markdown;
+    /// [Open GitHub Issue] (the primary CYAN fill) opens the
+    /// pre-filled `issues/new` URL (the title + the markdown body,
+    /// percent-encoded) in the OS browser + moves the flow to
+    /// `Done`; [Copy to Clipboard] copies the markdown (the dialog
+    /// stays open); [Cancel] returns to `Idle`.
+    fn render_probe_preview_dialog(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("ramsleuth_probe_preview_block"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.set_max_size(screen.size());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
+                let _ = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+            });
+        egui::Area::new(egui::Id::new("ramsleuth_probe_preview"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.set_max_size(screen.size());
+                ui.with_layout(
+                    egui::Layout::from_main_dir_and_cross_align(
+                        egui::Direction::TopDown,
+                        egui::Align::Center,
+                    ),
+                    |ui| {
+                        // The markdown to show (cloned out of the
+                        // state before the mutable button borrows).
+                        let mut md = match &self.probe_state {
+                            ProbeState::Preview(md) => md.clone(),
+                            _ => return,
+                        };
+                        let frame = egui::Frame::default()
+                            .fill(SLATE)
+                            .stroke(egui::Stroke::new(1.0_f32, CYAN))
+                            .inner_margin(egui::Margin::symmetric(12.0, 10.0));
+                        frame.show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Probe Report Preview")
+                                    .strong()
+                                    .color(CYAN),
+                            );
+                            ui.add_space(4.0);
+                            // A scrollable read-only multi-line edit
+                            // over the rendered markdown (a bounded
+                            // box inside the centered frame; the
+                            // `desired_width` fills the column).
+                            let max_size = egui::vec2(
+                                (screen.size().x - 60.0).max(320.0),
+                                (screen.size().y * 0.6).max(200.0),
+                            );
+                            egui::ScrollArea::vertical()
+                                .max_width(max_size.x)
+                                .max_height(max_size.y)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut md)
+                                            .interactive(false)
+                                            .font(egui::FontId::monospace(12.0))
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                });
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                // Primary (the wizard button's
+                                // precedent): the CYAN fill + the
+                                // SLATE text — open the pre-filled
+                                // GitHub issue + end the flow.
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("Open GitHub Issue").color(SLATE),
+                                        )
+                                        .fill(CYAN),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(title) = self.probe_title.clone() {
+                                        ctx.open_url(egui::OpenUrl::same_tab(
+                                            probe_issue_url(&title, &md),
+                                        ));
+                                    }
+                                    self.probe_state.apply(ProbeEvent::Submit);
+                                }
+                                // Secondary: copy the markdown (the
+                                // dialog stays open).
+                                if ui.add(egui::Button::new("Copy to Clipboard")).clicked() {
+                                    ctx.copy_text(md.clone());
+                                }
+                                // Tertiary (the `Got it` precedent):
+                                // plain — return to `Idle`.
+                                if ui.add(egui::Button::new("Cancel")).clicked() {
+                                    self.probe_state.apply(ProbeEvent::CancelPreview);
                                 }
                             });
                         });
@@ -1906,6 +2315,8 @@ fn main() -> ExitCode {
                 poller: Some(poller),
                 notice: None,
                 restart_prompt_dismissed: false,
+                probe_state: ProbeState::default(),
+                probe_title: None,
             })
         }),
     );
@@ -1941,7 +2352,7 @@ mod tests {
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::intel_readout::{ChannelMode, IntelReadout};
     use ramsleuth_telemetry::spd_decode::SpdModule;
-    use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
+    use ramsleuth_telemetry::{ProbeSystem, SystemMemoryTelemetry, SystemPlatform};
 
     use super::*;
 
@@ -3220,6 +3631,8 @@ mod tests {
                 poller: None,
                 notice: None,
                 restart_prompt_dismissed: false,
+                probe_state: ProbeState::default(),
+                probe_title: None,
             };
             let gate = |app: &RamSleuthApp| app.state.read().unwrap().settings.refresh_enabled;
 
@@ -3290,6 +3703,8 @@ mod tests {
                 poller: None,
                 notice: None,
                 restart_prompt_dismissed: false,
+                probe_state: ProbeState::default(),
+                probe_title: None,
             };
             let data = TelemetryData::default();
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(w, h));
@@ -3582,6 +3997,8 @@ mod tests {
             poller: None,
             notice: None,
             restart_prompt_dismissed: false,
+            probe_state: ProbeState::default(),
+            probe_title: None,
         };
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(968.0, 600.0));
@@ -3682,5 +4099,440 @@ mod tests {
         );
 
         fs::remove_dir_all(&out_dir).expect("cleanup");
+    }
+
+    // -----------------------------------------------------------------
+    // The consent-gated "Submit Probe Report" flow (chunk probe-3).
+    // -----------------------------------------------------------------
+
+    /// A minimal probe-report fixture (the identity the title + the
+    /// markdown body the preview / URL tests consume).
+    fn fixture_probe_report() -> ProbeReport {
+        ProbeReport {
+            telemetry: fixture_telemetry(
+                Section::na(NaReason::NotApplicable),
+                Vec::new(),
+                Vec::new(),
+            ),
+            raw: None,
+            system: ProbeSystem {
+                cpu_brand: "Test CPU".to_owned(),
+                cpu_vendor: "unknown".to_owned(),
+                cpu_gen: "Unknown".to_owned(),
+                pci_host_bridge: None,
+                kernel: "6.6.0-test".to_owned(),
+                os: "Linux / Test".to_owned(),
+                arch: "x86_64".to_owned(),
+                ramsleuth_version: "2.4.0".to_owned(),
+                telemetry_source: "unavailable".to_owned(),
+            },
+        }
+    }
+
+    /// A fully-constructed app in the probe-flow idle state (the
+    /// dialog + state-machine test fixture; the caller cleans up
+    /// `out_dir`).
+    fn probe_test_app(name: &str) -> RamSleuthApp {
+        let (bench_tx, _bench_rx) = std::sync::mpsc::channel::<BenchCmd>();
+        RamSleuthApp {
+            state: Arc::new(RwLock::new(TelemetryData::default())),
+            bench_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            settings_open: false,
+            requirements_open: false,
+            setup: Arc::new(RwLock::new(SetupOutcome::default())),
+            icon: None,
+            graphs_open: Arc::new(AtomicBool::new(false)),
+            saved_refresh: None,
+            last_graphs_open: false,
+            out_dir: temp_out_dir(name),
+            poller: None,
+            notice: None,
+            restart_prompt_dismissed: false,
+            probe_state: ProbeState::default(),
+            probe_title: None,
+        }
+    }
+
+    /// (q1) The probe-flow state machine: the full
+    /// `Idle → Consent → Preview → Idle` chain — the header's Probe
+    /// button opens the consent, the poller's landed report renders
+    /// the preview (the markdown + the title, the slot consumed), and
+    /// [Cancel] closes — plus the `Submit` → `Done` arm, the
+    /// `CancelConsent` → `Idle` arm, and the `Err` → `Idle` + notice
+    /// arm. Out-of-state events are no-ops.
+    #[test]
+    fn probe_state_machine_transitions() {
+        // The full consent → preview → idle chain, driven through the
+        // app's `advance_probe` (the result consumer).
+        let mut app = probe_test_app("probe-chain");
+        let out_dir = app.out_dir.clone();
+        assert_eq!(app.probe_state, ProbeState::Idle);
+
+        // Open (the header's Probe button): Idle → Consent.
+        app.probe_state.apply(ProbeEvent::Open);
+        assert_eq!(app.probe_state, ProbeState::Consent);
+
+        // The poller lands the report: Consent → Preview (the
+        // markdown is rendered, the title is set, the slot consumed).
+        app.state
+            .write()
+            .unwrap()
+            .probe_result = ProbeResult::Ok(fixture_probe_report());
+        app.advance_probe();
+        match &app.probe_state {
+            ProbeState::Preview(md) => {
+                assert!(
+                    md.contains("# RamSleuth Probe Report"),
+                    "the preview must carry the rendered markdown: {md}"
+                );
+            }
+            other => panic!("expected Preview, got {other:?}"),
+        }
+        assert!(app.probe_title.is_some(), "the title must be set");
+        assert_eq!(
+            app.state.read().unwrap().probe_result,
+            ProbeResult::None,
+            "the result slot must be consumed"
+        );
+
+        // [Cancel]: Preview → Idle.
+        app.probe_state.apply(ProbeEvent::CancelPreview);
+        assert_eq!(app.probe_state, ProbeState::Idle);
+
+        fs::remove_dir_all(out_dir).expect("cleanup");
+
+        // The `Submit` arm: Preview → Done.
+        let mut app = probe_test_app("probe-submit");
+        let out_dir = app.out_dir.clone();
+        app.probe_state = ProbeState::Preview("md".to_owned());
+        app.probe_state.apply(ProbeEvent::Submit);
+        assert_eq!(app.probe_state, ProbeState::Done);
+        fs::remove_dir_all(out_dir).expect("cleanup");
+
+        // The `CancelConsent` arm: Consent → Idle.
+        let mut app = probe_test_app("probe-cancelconsent");
+        let out_dir = app.out_dir.clone();
+        app.probe_state = ProbeState::Consent;
+        app.probe_state.apply(ProbeEvent::CancelConsent);
+        assert_eq!(app.probe_state, ProbeState::Idle);
+        fs::remove_dir_all(out_dir).expect("cleanup");
+
+        // The `Err` arm: Consent + a failed request → Idle + notice
+        // (the slot consumed).
+        let mut app = probe_test_app("probe-err");
+        let out_dir = app.out_dir.clone();
+        app.probe_state = ProbeState::Consent;
+        app.state
+            .write()
+            .unwrap()
+            .probe_result = ProbeResult::Err("daemon down".to_owned());
+        app.advance_probe();
+        assert_eq!(app.probe_state, ProbeState::Idle);
+        assert!(
+            app.notice.as_ref().is_some_and(|(text, _)| text.contains("daemon down")),
+            "the failure must flash a notice"
+        );
+        assert_eq!(
+            app.state.read().unwrap().probe_result,
+            ProbeResult::None,
+            "the result slot must be consumed"
+        );
+        fs::remove_dir_all(out_dir).expect("cleanup");
+
+        // Out-of-state events are no-ops (the machine is total).
+        let mut s = ProbeState::Idle;
+        s.apply(ProbeEvent::CancelPreview);
+        assert_eq!(s, ProbeState::Idle);
+        s.apply(ProbeEvent::Submit);
+        assert_eq!(s, ProbeState::Idle);
+        let mut s = ProbeState::Consent;
+        s.apply(ProbeEvent::Open);
+        assert_eq!(s, ProbeState::Consent);
+    }
+
+    /// (q2) The GitHub issue URL construction: the title form
+    /// (`[Probe] <brand> · <gen> · <os> · v<version>`) + the
+    /// `issues/new` URL with the percent-encoded title + body.
+    #[test]
+    fn probe_issue_title_and_url_construction() {
+        let report = fixture_probe_report();
+        // The title (the template's [Probe] prefix + the identity).
+        let title = probe_issue_title(&report);
+        assert_eq!(
+            title,
+            "[Probe] Test CPU \u{00b7} Unknown \u{00b7} Linux / Test \u{00b7} v2.4.0"
+        );
+        // The title's percent-encoding (the brackets, the spaces, the
+        // middot, the slash).
+        assert_eq!(
+            url_encode(&title),
+            "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.0"
+        );
+        // The URL (the issues/new form, both fields percent-encoded).
+        let body = "# RamSleuth Probe Report\n\nsome body";
+        let url = probe_issue_url(&title, body);
+        assert!(
+            url.starts_with("https://github.com/MadGoat/RamSleuth/issues/new?title="),
+            "the URL must be the issues/new form: {url}"
+        );
+        assert!(
+            url.contains("title=%5BProbe%5D%20Test%20CPU"),
+            "the title must be percent-encoded in the URL: {url}"
+        );
+        assert!(
+            url.contains("body=%23%20RamSleuth%20Probe%20Report%0A%0Asome%20body"),
+            "the body must be percent-encoded in the URL: {url}"
+        );
+    }
+
+    /// (q2b) The percent-encoder: the RFC 3986 unreserved set passes
+    /// through; every other byte is `%XX` (space → `%20`, never `+`).
+    #[test]
+    fn url_encode_percent_encoding() {
+        assert_eq!(url_encode("ABCdef019-_.~"), "ABCdef019-_.~");
+        assert_eq!(url_encode("a b"), "a%20b");
+        assert_eq!(url_encode("[x]"), "%5Bx%5D");
+        assert_eq!(url_encode("\u{00b7}"), "%C2%B7");
+        assert_eq!(url_encode("#"), "%23");
+        assert_eq!(url_encode("a/b"), "a%2Fb");
+        assert_eq!(url_encode("a=b&c"), "a%3Db%26c");
+    }
+
+    /// (q3) The consent dialog renders headless — the title, the
+    /// body, and both buttons paint — and a two-frame press / release
+    /// on [Allow] sets the poller's `probe_requested` edge (the
+    /// consent hand-off) while the flow stays `Consent` (in flight).
+    #[test]
+    fn consent_dialog_paints_and_allow_sets_the_request_edge() {
+        let mut app = probe_test_app("consent-allow");
+        app.probe_state = ProbeState::Consent;
+        let out_dir = app.out_dir.clone();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(968.0, 600.0));
+        let frame_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let frame = |events: Vec<egui::Event>, app: &mut RamSleuthApp| {
+            ctx.run(frame_input(events), |ctx| {
+                app.render_probe_consent_dialog(ctx);
+            })
+        };
+
+        // Frame 1: new areas — hidden for one frame (the
+        // first-frame placement heuristic).
+        frame(Vec::new(), &mut app);
+        // Frame 2: the dialog paints (the title, the body, both
+        // buttons).
+        let first = frame(Vec::new(), &mut app);
+        let texts: Vec<&str> = first
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&"Submit Probe Report"),
+            "the title must paint: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| *t == PROBE_CONSENT_BODY),
+            "the body must paint: {texts:?}"
+        );
+        assert!(texts.contains(&"Allow"), "the Allow button must paint: {texts:?}");
+        assert!(
+            texts.contains(&"Cancel"),
+            "the Cancel button must paint: {texts:?}"
+        );
+        assert!(
+            !app.state.read().unwrap().probe_requested,
+            "no click must not set the edge"
+        );
+
+        // The [Allow] label's center (the graph.rs text-click idiom).
+        let allow = first
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Allow" => {
+                    Some(egui::pos2(
+                        text.pos.x + text.galley.size().x / 2.0,
+                        text.pos.y + text.galley.size().y / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .expect("the Allow button's label must be painted");
+
+        let click = |pressed: bool| egui::Event::PointerButton {
+            pos: allow,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Frames 3 + 4: press, then release, on [Allow] → the consent
+        // edge is set (the poller will do the I/O); the flow stays
+        // `Consent` (in flight).
+        frame(vec![click(true)], &mut app);
+        frame(vec![click(false)], &mut app);
+        assert!(
+            app.state.read().unwrap().probe_requested,
+            "a press + release on Allow must set the request edge"
+        );
+        assert_eq!(
+            app.probe_state,
+            ProbeState::Consent,
+            "Allow must stay in Consent (in flight)"
+        );
+
+        fs::remove_dir_all(out_dir).expect("cleanup");
+    }
+
+    /// (q4) The consent dialog's [Cancel] returns the flow to `Idle`.
+    #[test]
+    fn consent_dialog_cancel_returns_to_idle() {
+        let mut app = probe_test_app("consent-cancel");
+        app.probe_state = ProbeState::Consent;
+        let out_dir = app.out_dir.clone();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(968.0, 600.0));
+        let frame_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let frame = |events: Vec<egui::Event>, app: &mut RamSleuthApp| {
+            ctx.run(frame_input(events), |ctx| {
+                app.render_probe_consent_dialog(ctx);
+            })
+        };
+
+        frame(Vec::new(), &mut app);
+        let first = frame(Vec::new(), &mut app);
+        let cancel = first
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Cancel" => {
+                    Some(egui::pos2(
+                        text.pos.x + text.galley.size().x / 2.0,
+                        text.pos.y + text.galley.size().y / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .expect("the Cancel button's label must be painted");
+
+        let click = |pressed: bool| egui::Event::PointerButton {
+            pos: cancel,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![click(true)], &mut app);
+        frame(vec![click(false)], &mut app);
+        assert_eq!(
+            app.probe_state,
+            ProbeState::Idle,
+            "a press + release on Cancel must return to Idle"
+        );
+        assert!(
+            !app.state.read().unwrap().probe_requested,
+            "Cancel must not set the request edge"
+        );
+
+        fs::remove_dir_all(out_dir).expect("cleanup");
+    }
+
+    /// (q5) The preview dialog renders headless — the title + the
+    /// markdown body + all three buttons paint — and [Cancel] returns
+    /// the flow to `Idle` (the dialog's buttons are the only
+    /// interactive content, the modal precedent).
+    #[test]
+    fn preview_dialog_paints_and_cancel_returns_to_idle() {
+        let mut app = probe_test_app("preview-cancel");
+        let report = fixture_probe_report();
+        let md = render_probe_report_md(&report);
+        app.probe_state = ProbeState::Preview(md);
+        app.probe_title = Some(probe_issue_title(&report));
+        let out_dir = app.out_dir.clone();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(968.0, 600.0));
+        let frame_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let frame = |events: Vec<egui::Event>, app: &mut RamSleuthApp| {
+            ctx.run(frame_input(events), |ctx| {
+                app.render_probe_preview_dialog(ctx);
+            })
+        };
+
+        frame(Vec::new(), &mut app);
+        let first = frame(Vec::new(), &mut app);
+        let texts: Vec<&str> = first
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&"Probe Report Preview"),
+            "the title must paint: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("# RamSleuth Probe Report")),
+            "the markdown body must paint: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Open GitHub Issue"),
+            "the Open GitHub Issue button must paint: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Copy to Clipboard"),
+            "the Copy to Clipboard button must paint: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Cancel"),
+            "the Cancel button must paint: {texts:?}"
+        );
+
+        // [Cancel] → Idle.
+        let cancel = first
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Cancel" => {
+                    Some(egui::pos2(
+                        text.pos.x + text.galley.size().x / 2.0,
+                        text.pos.y + text.galley.size().y / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .expect("the Cancel button's label must be painted");
+        let click = |pressed: bool| egui::Event::PointerButton {
+            pos: cancel,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![click(true)], &mut app);
+        frame(vec![click(false)], &mut app);
+        assert_eq!(
+            app.probe_state,
+            ProbeState::Idle,
+            "a press + release on Cancel must return to Idle"
+        );
+
+        fs::remove_dir_all(out_dir).expect("cleanup");
     }
 }
