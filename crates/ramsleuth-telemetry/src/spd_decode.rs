@@ -1036,13 +1036,13 @@ fn decode_profiles(data: &[u8], is_ddr5: bool) -> Vec<SpdProfile> {
 /// | `0x00` | VDD | bit 7 = +1 V, bits 6:0 = 1/100 V -> `mV = (b & 0x80 != 0) x 1000 + (b & 0x7F) x 10` (`0xA3` -> 1350 mV) |
 /// | `0x03` | tCK | MTB units -> `speed_mts = 16000 / tCK` (`tCK = 5` -> 3200 MT/s); `0` -> `Na` |
 /// | `0x04..0x06` | CL supported bitmap | 24-bit LE, bit N = CL 7+N -> `cas = first set bit + 7` |
-/// | `0x09` / `0x24` | tRCD | `0x24 x 125 + i8(0x09)` ps -> ticks |
-/// | `0x0A` / `0x23` | tRP | `0x23 x 125 + i8(0x0A)` ps -> ticks |
-/// | `0x0B` / `0x0C` | tRAS | `(0x0B << 8 \| 0x0C)` ps -> ticks |
+/// | `0x09` / `0x24` | tRCD | MTB at `+0x09`, signed FTB at `+0x24`: `0x09 x 125 + i8(0x24)` ps -> ticks |
+/// | `0x0A` / `0x23` | tRP | MTB at `+0x0A`, signed FTB at `+0x23`: `0x0A x 125 + i8(0x23)` ps -> ticks |
+/// | `0x0B` / `0x0C` | tRAS | 16-bit MTB value: high nibble = `+0x0B` bits 3:0, low byte = `+0x0C`: `((+0x0B & 0x0F) << 8 \| +0x0C) x 125` ps -> ticks (`+0x0B` bits 7:4 + `+0x0D` = tRC - not carried by the frozen struct) |
 ///
-/// ps -> ticks: `round(ps / (tCK x 125))` (the frozen `trcd`/`trp`/
-/// `tras` cells are tick counts); `tCK = 0` -> the timing cells are
-/// `Na`.
+/// ps -> ticks: `floor(ps / (tCK x 125))` (the frozen `trcd`/`trp`/
+/// `tras` cells are tick counts; a zero-FTB timing is exactly
+/// `floor(MTB / tCK)`); `tCK = 0` -> the timing cells are `Na`.
 fn decode_xmp2_profile(data: &[u8], index: u8, base: usize) -> Option<SpdProfile> {
     let block = read_block(data, base, XMP2_LEN)?;
     if block.iter().all(|&b| b == 0) {
@@ -1059,18 +1059,24 @@ fn decode_xmp2_profile(data: &[u8], index: u8, base: usize) -> Option<SpdProfile
     let cas = (0..24)
         .find(|&n| cl_bitmap & (1 << n) != 0)
         .map(|n| (7 + n) as u8);
-    // Timings: ps values -> ticks (round(ps / (tCK x 125))).
-    let tck_ps = tck as u32 * 125;
+    // Timings: JESD79-4 XMP 2.0 stores tRCD / tRP as MTB/FTB pairs
+    // (the MTB at +0x09 / +0x0A, the signed FTB ps at +0x24 / +0x23)
+    // and tRAS as a 16-bit MTB value (high nibble in +0x0B bits 3:0,
+    // low byte in +0x0C; +0x0B bits 7:4 + +0x0D = tRC, not carried by
+    // the frozen struct). Ticks = floor(ps / (tCK x 125)) - integer
+    // floor division (a zero-FTB timing is exactly floor(MTB / tCK)).
+    let tck_ps = tck as i32 * 125;
     let to_ticks = |ps: i32| {
         if tck_ps > 0 && ps > 0 {
-            (ps as f64 / f64::from(tck_ps)).round() as u8
+            (ps / tck_ps) as u8
         } else {
             0
         }
     };
-    let trcd = to_ticks(block[0x24] as i32 * 125 + (block[0x09] as i8) as i32);
-    let trp = to_ticks(block[0x23] as i32 * 125 + (block[0x0A] as i8) as i32);
-    let tras = to_ticks(((block[0x0B] as i32) << 8) | (block[0x0C] as i32));
+    let trcd = to_ticks(block[0x09] as i32 * 125 + (block[0x24] as i8) as i32);
+    let trp = to_ticks(block[0x0A] as i32 * 125 + (block[0x23] as i8) as i32);
+    let tras_mtb = (((block[0x0B] & 0x0F) as i32) << 8) | (block[0x0C] as i32);
+    let tras = to_ticks(tras_mtb * 125);
     let p = SpdProfile {
         index,
         speed_mts: if speed > 0 {
@@ -1385,15 +1391,15 @@ mod tests {
         data[XMP2_BASE + 3] = XMP2_VERSION;
         // XMP 2.0 profile 1 @ 0x189 (47 bytes): VDD 0xA3 (1350 mV), tCK 8
         // (-> 2000 MT/s), CL bitmap bit 9 (-> CL 16), tRCD 90 MTB (11250
-        // ps -> 11 ticks), tRP 90 MTB (-> 11 ticks), tRAS 0x84A8 (33960
-        // ps -> 34 ticks).
+        // ps -> 11 ticks), tRP 90 MTB (-> 11 ticks), tRAS 272 MTB
+        // (34000 ps -> 34 ticks).
         data[XMP2_P1] = 0xA3; // +0x00 VDD
         data[XMP2_P1 + 3] = 8; // +0x03 tCK
         data[XMP2_P1 + 5] = 0x02; // +0x05 CL bitmap bit 9 (CL 16)
-        data[XMP2_P1 + 0x24] = 90; // tRCD MTB companion
-        data[XMP2_P1 + 0x23] = 90; // tRP MTB companion
-        data[XMP2_P1 + 0x0B] = 0x84; // tRAS hi
-        data[XMP2_P1 + 0x0C] = 0xA8; // tRAS lo
+        data[XMP2_P1 + 0x09] = 90; // +0x09 tRCD MTB
+        data[XMP2_P1 + 0x0A] = 90; // +0x0A tRP MTB
+        data[XMP2_P1 + 0x0B] = 0x01; // +0x0B tRAS hi nibble (bits 3:0)
+        data[XMP2_P1 + 0x0C] = 0x10; // +0x0C tRAS lo -> 272 MTB
         // Profile 2 @ 0x1B8: blank.
         SpdImage {
             index: 0x52,
@@ -1541,7 +1547,7 @@ mod tests {
     /// 32 GiB per slot), **3200 MT/s** (XMP profile 1 tCK 5), part
     /// `F4-3600C18-32GVK`, a blank serial (all-zero `0x145..0x148`),
     /// the die maker **SK hynix** (1, 0xAD), and profile 1 =
-    /// 3200 / CL18 / 1350 mV.
+    /// 3200 / CL18 / 19-19-37 / 1350 mV.
     #[test]
     fn image_a_decodes_to_live_truth() {
         let m = decode(&image_a_gskill());
@@ -1565,13 +1571,13 @@ mod tests {
         assert_eq!(p.speed_mts, Section::Value(3200));
         assert_eq!(p.cas, Section::Value(18));
         assert_eq!(p.voltage, Section::Value(1350));
-        // The tRCD/tRP/tRAS cells decode to tick counts (present). The
-        // exact values follow the plan's documented FTB/MTB reading
-        // (plan §9 open item - interpretation-dependent); the firm
-        // anchors above (speed/CL/voltage) are the gate.
-        assert!(p.trcd.value().is_some(), "tRCD decodes to a tick count");
-        assert!(p.trp.value().is_some(), "tRP decodes to a tick count");
-        assert!(p.tras.value().is_some(), "tRAS decodes to a tick count");
+        // The XMP 2.0 timings decode to floor(MTB / tCK) ticks (tCK 5):
+        // tRCD 97 MTB -> 19, tRP 97 MTB -> 19, tRAS 186 MTB -> 37 (the
+        // kit's rated 18-19-19-38; tRAS one tick low on the floor - the
+        // verified G.Skill layout, the plan §9 open item resolved).
+        assert_eq!(p.trcd, Section::Value(19), "tRCD 97 MTB / 5");
+        assert_eq!(p.trp, Section::Value(19), "tRP 97 MTB / 5");
+        assert_eq!(p.tras, Section::Value(37), "tRAS 186 MTB / 5");
     }
 
     /// Image B (the real 16 GB capture on the i5-6600T) decodes: maker
