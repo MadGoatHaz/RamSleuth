@@ -16,7 +16,13 @@
 //!   fields as [`RttValue`].
 //! - [`VoltageSet`] — the five rails (the four memory/SOC + Vcore, C12),
 //!   in millivolts.
-//! - [`AmdReadout`] — the AMD aggregate of clocks + the three sets.
+//! - [`AmdReadout`] — the AMD aggregate of clocks + the three sets + the
+//!   channel-mode / ECC state (the 14-register UMC channel-population
+//!   decode; the two trailing fields are OQ-10 wire appends).
+//! - [`EccStatus`] / [`MemoryChannelMode`] — the shared display enums
+//!   ([`EccStatus`] is also the Intel decode's target; the channel-mode
+//!   labels are word-for-word parity with
+//!   [`crate::intel_readout::ChannelMode`]).
 //!
 //! Every field is a [`Section<T>`]: a value, or a structured [`NaReason`] when
 //! the raw data is absent, not applicable to the platform, or outside a
@@ -288,9 +294,103 @@ pub struct VoltageSet {
     pub vcore_mv: Section<u16>,
 }
 
-/// The AMD-specific aggregate of the four vendor-neutral display sets.
+/// ECC status, shared by the AMD and Intel decode.
 ///
-/// Produced by [`map_amd`] from the frozen [`AmdPmSnapshot`].
+/// The decode pipeline must differentiate systems that *cannot* support
+/// ECC (silicon fused off — the Intel client case) from systems where ECC
+/// is supported but inactive (non-ECC DIMMs installed, or ECC disabled in
+/// BIOS/AGESA — the AMD desktop case; the controller silicon retains the
+/// capability across the socket lifecycle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EccStatus {
+    /// Silicon or platform lacks physical ECC capability.
+    NotCapable,
+    /// The controller supports ECC, but it is inactive (non-ECC DIMMs /
+    /// BIOS off).
+    CapableButDisabled,
+    /// Active standard SECDED (single-bit correct / double-bit detect).
+    Enabled,
+    /// Active multi-bit symbol / ChipKill mode.
+    EnabledChipKill,
+    /// Read failure / unknown.
+    Unknown,
+}
+
+impl EccStatus {
+    /// The display label (the frontend renders it verbatim).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotCapable => "ECC: Not Capable",
+            Self::CapableButDisabled => "ECC: Capable (disabled)",
+            Self::Enabled => "ECC: Enabled",
+            Self::EnabledChipKill => "ECC: ChipKill",
+            Self::Unknown => "ECC: Unknown",
+        }
+    }
+}
+
+/// AMD memory channel mode (the UMC CS-population + rank-size synthesis).
+///
+/// The labels are word-for-word parity with the Intel
+/// [`crate::intel_readout::ChannelMode`] so the frontends render both
+/// vendors consistently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MemoryChannelMode {
+    /// Exactly one populated channel.
+    Single,
+    /// Both channels populated with equal capacity.
+    DualSymmetric,
+    /// Both channels populated with unequal capacity (asymmetric — the
+    /// Intel Flex-Mode parity; 8 + 16 GiB is the worked case).
+    DualFlex,
+    /// Three populated channels (reserved — the two-UMC decode never
+    /// synthesizes it; carried for the shared display contract).
+    Triple,
+    /// No populated channel, or an unreadable population state.
+    Unknown,
+}
+
+impl MemoryChannelMode {
+    /// The display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Single => "Single-Channel",
+            Self::DualSymmetric => "Dual-Channel (Symmetric)",
+            Self::DualFlex => "Dual-Channel (Flex)",
+            Self::Triple => "Triple-Channel",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+/// The decoded UMC channel-population + capability state — the output of
+/// the 14-register set ([`crate::amd_smn::decode_channel_registers`]):
+/// the synthesized channel mode + the ECC state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelSmnFields {
+    /// The memory channel mode (Single / DualSymmetric / DualFlex /
+    /// Unknown — the two-UMC decode never yields Triple).
+    pub mode: MemoryChannelMode,
+    /// The ECC state (the UmcCapHi bit 30/31 decode).
+    pub ecc: EccStatus,
+}
+
+impl ChannelSmnFields {
+    /// The no-data state: non-AMD host, missing `smn` attribute, or every
+    /// read failed — both fields `Unknown` (the honest degradation).
+    pub const fn absent() -> Self {
+        Self {
+            mode: MemoryChannelMode::Unknown,
+            ecc: EccStatus::Unknown,
+        }
+    }
+}
+
+/// The AMD-specific aggregate of the four vendor-neutral display sets +
+/// the channel-population / ECC state (the 14-register UMC decode).
+///
+/// Produced by [`map_amd`] / [`map_amd_with`] from the frozen
+/// [`AmdPmSnapshot`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AmdReadout {
     /// Clocks + ratios.
@@ -301,6 +401,11 @@ pub struct AmdReadout {
     pub cad_bus: CadBus,
     /// Memory/SOC rail voltages (mV).
     pub voltages: VoltageSet,
+    /// Memory channel mode (the UMC CS-population + rank-size decode).
+    /// OQ-10 wire append; `Unknown` when no SMN data was captured.
+    pub channel_mode: MemoryChannelMode,
+    /// ECC state (the UmcCapHi bit 30/31 decode). OQ-10 wire append.
+    pub ecc_status: EccStatus,
 }
 
 // ---------------------------------------------------------------------------
@@ -409,8 +514,30 @@ fn map_voltage(mv: u16) -> Section<u16> {
 /// [`AmdReadout`].
 ///
 /// Pure: no I/O, no `unsafe`, no panic. Every field degrades to
-/// [`Section::Na`] on absent / not-applicable / out-of-band data.
+/// [`Section::Na`] on absent / not-applicable / out-of-band data. The
+/// channel-mode / ECC fields carry [`ChannelSmnFields::absent()`] (both
+/// `Unknown`) — use [`map_amd_with`] when the collector captured the 14
+/// UMC channel registers.
 pub fn map_amd(snap: &AmdPmSnapshot) -> AmdReadout {
+    build_readout(snap, &ChannelSmnFields::absent())
+}
+
+/// The production mapping: [`map_amd`] with the decoded 14-register UMC
+/// channel-population + capability state (the collector reads the
+/// registers via [`crate::amd_smn::read_all_channel_registers`] and
+/// decodes them via [`crate::amd_smn::decode_channel_registers`]; a
+/// missing `smn` attribute / every read failed yields the
+/// [`ChannelSmnFields::absent`] state, never a branch failure).
+pub fn map_amd_with(snap: &AmdPmSnapshot, ch: &ChannelSmnFields) -> AmdReadout {
+    build_readout(snap, ch)
+}
+
+/// The shared [`AmdReadout`] builder over the frozen [`AmdPmSnapshot`]
+/// (P2-04) + the channel-population decode state.
+///
+/// Pure: no I/O, no `unsafe`, no panic. Every field degrades to
+/// [`Section::Na`] on absent / not-applicable / out-of-band data.
+fn build_readout(snap: &AmdPmSnapshot, ch: &ChannelSmnFields) -> AmdReadout {
     let t = &snap.timings;
     let c = &snap.cad_bus;
     let v = &snap.voltages;
@@ -474,6 +601,8 @@ pub fn map_amd(snap: &AmdPmSnapshot) -> AmdReadout {
             vpp_mv: map_voltage(v.vpp_mv),
             vcore_mv: map_voltage(v.vcore_mv),
         },
+        channel_mode: ch.mode,
+        ecc_status: ch.ecc,
     }
 }
 
@@ -731,6 +860,9 @@ mod tests {
         assert_traits::<CommandRate>();
         assert_traits::<GearMode>();
         assert_traits::<RttValue>();
+        assert_traits::<MemoryChannelMode>();
+        assert_traits::<EccStatus>();
+        assert_traits::<ChannelSmnFields>();
 
         let ro = map_amd(&good_snapshot());
         let cloned = ro.clone();
@@ -908,6 +1040,8 @@ mod tests {
                 vpp_mv: na_cell(),
                 vcore_mv: na_cell(),
             },
+            channel_mode: MemoryChannelMode::Unknown,
+            ecc_status: EccStatus::Unknown,
         }
     }
 
@@ -940,6 +1074,24 @@ mod tests {
         let back: AmdReadout =
             bincode::deserialize(&bytes).expect("AmdReadout must deserialize");
         assert_eq!(all_na, back);
+
+        // the OQ-10 appended fields: a DualFlex 8 + 16 GiB class readout
+        // (ECC capable but disabled — the consumer non-ECC DIMM case)
+        // round-trips too.
+        let flex = map_amd_with(
+            &s,
+            &ChannelSmnFields {
+                mode: MemoryChannelMode::DualFlex,
+                ecc: EccStatus::CapableButDisabled,
+            },
+        );
+        assert_eq!(flex.channel_mode, MemoryChannelMode::DualFlex);
+        assert_eq!(flex.ecc_status, EccStatus::CapableButDisabled);
+        let bytes = bincode::serialize(&flex)
+            .expect("AmdReadout must serialize (no-panic contract)");
+        let back: AmdReadout =
+            bincode::deserialize(&bytes).expect("AmdReadout must deserialize");
+        assert_eq!(flex, back);
     }
 
     /// (g) P3-03: every [`RttValue`] arm survives a bincode round-trip —
@@ -993,5 +1145,61 @@ mod tests {
         let back: Vec<Section<CommandRate>> =
             bincode::deserialize(&bytes).expect("Section<CommandRate> must deserialize");
         assert_eq!(sections, back);
+    }
+
+    /// (h) The OQ-10 appended fields: `map_amd` (no SMN channel data)
+    /// degrades both to `Unknown`; `map_amd_with` carries every enum arm
+    /// through verbatim.
+    #[test]
+    fn channel_mode_and_ecc_cross_map_amd() {
+        // no channel data: both Unknown (the honest no-data default)
+        let ro = map_amd(&good_snapshot());
+        assert_eq!(ro.channel_mode, MemoryChannelMode::Unknown);
+        assert_eq!(ro.ecc_status, EccStatus::Unknown);
+
+        // every arm crosses through `map_amd_with`
+        for mode in [
+            MemoryChannelMode::Single,
+            MemoryChannelMode::DualSymmetric,
+            MemoryChannelMode::DualFlex,
+            MemoryChannelMode::Triple,
+            MemoryChannelMode::Unknown,
+        ] {
+            for ecc in [
+                EccStatus::NotCapable,
+                EccStatus::CapableButDisabled,
+                EccStatus::Enabled,
+                EccStatus::EnabledChipKill,
+                EccStatus::Unknown,
+            ] {
+                let ro = map_amd_with(&good_snapshot(), &ChannelSmnFields { mode, ecc });
+                assert_eq!(ro.channel_mode, mode);
+                assert_eq!(ro.ecc_status, ecc);
+            }
+        }
+    }
+
+    /// (h′) The display labels are pinned: the channel-mode wording is
+    /// word-for-word parity with the Intel `ChannelMode` labels; the ECC
+    /// labels carry the `ECC:` prefix.
+    #[test]
+    fn channel_mode_and_ecc_labels() {
+        assert_eq!(MemoryChannelMode::Single.label(), "Single-Channel");
+        assert_eq!(
+            MemoryChannelMode::DualSymmetric.label(),
+            "Dual-Channel (Symmetric)"
+        );
+        assert_eq!(MemoryChannelMode::DualFlex.label(), "Dual-Channel (Flex)");
+        assert_eq!(MemoryChannelMode::Triple.label(), "Triple-Channel");
+        assert_eq!(MemoryChannelMode::Unknown.label(), "Unknown");
+
+        assert_eq!(EccStatus::NotCapable.label(), "ECC: Not Capable");
+        assert_eq!(
+            EccStatus::CapableButDisabled.label(),
+            "ECC: Capable (disabled)"
+        );
+        assert_eq!(EccStatus::Enabled.label(), "ECC: Enabled");
+        assert_eq!(EccStatus::EnabledChipKill.label(), "ECC: ChipKill");
+        assert_eq!(EccStatus::Unknown.label(), "ECC: Unknown");
     }
 }

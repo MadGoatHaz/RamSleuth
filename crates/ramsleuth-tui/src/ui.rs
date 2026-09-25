@@ -2058,7 +2058,9 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use ramsleuth_bench::BenchOp;
-    use ramsleuth_telemetry::amd_readout::{AmdReadout, CommandRate};
+    use ramsleuth_telemetry::amd_readout::{
+        AmdReadout, CommandRate, EccStatus, MemoryChannelMode,
+    };
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, IntelGen};
     use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
     use ramsleuth_telemetry::SystemPlatform;
@@ -2150,6 +2152,8 @@ mod tests {
                 vpp_mv: Section::Value(1800),
                 vcore_mv: Section::na(NaReason::NotApplicable),
             },
+            channel_mode: MemoryChannelMode::DualSymmetric,
+            ecc_status: EccStatus::CapableButDisabled,
         }
     }
 
@@ -3394,6 +3398,8 @@ mod tests {
                         vdd_misc_mv: Section::na(NaReason::NotApplicable),
                         vpp_mv: Section::na(NaReason::NotApplicable),
                     },
+                    channel_mode: MemoryChannelMode::Unknown,
+                    ecc_status: EccStatus::Unknown,
                 }),
                 intel: Section::na(NaReason::UnsupportedHardware),
                 spd: Vec::new(),

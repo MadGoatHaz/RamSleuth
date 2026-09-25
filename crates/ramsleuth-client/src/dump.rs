@@ -484,7 +484,7 @@ mod tests {
     use std::thread;
 
     use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message};
-    use ramsleuth_telemetry::amd_readout::CommandRate;
+    use ramsleuth_telemetry::amd_readout::{CommandRate, EccStatus, MemoryChannelMode};
     use ramsleuth_telemetry::cpuid::{AmdZen, IntelGen};
     use ramsleuth_telemetry::intel_readout::{ChannelMode, decode_channel};
     use ramsleuth_telemetry::SystemPlatform;
@@ -552,6 +552,8 @@ mod tests {
                 vpp_mv: Section::Value(1800),
                 vcore_mv: Section::na(NaReason::NotApplicable),
             },
+            channel_mode: MemoryChannelMode::DualSymmetric,
+            ecc_status: EccStatus::CapableButDisabled,
         }
     }
 

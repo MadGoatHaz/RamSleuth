@@ -49,6 +49,23 @@
 //!   the sentinel `0x21060138` *and* differs from the `0x50264` mirror, the
 //!   tRFC fields decode from the mirror word.
 //!
+//! # The 14-register channel set (OQ-10: channel mode + ECC)
+//!
+//! The 13-register timing block above is complemented by a 14-register
+//! channel-population + capability set ([`SMN_CHANNEL_REGISTER_SET`]):
+//! per UMC channel (base `0x00050000` / `0x00150000` — the fixed
+//! `+0x00100000` stride, **not** the offset-rule relocation above) the
+//! CS0–CS3 base words (bit 0 = CsEn), the AddrMask0/1 rank-size words,
+//! and the `UmcCapHi` capability word (bit 30 = EccEn, bit 31 =
+//! ChipKillCap). [`read_all_channel_registers`] reads all 14 at BOTH
+//! bases unconditionally (each channel's own CsEn flags decide activity
+//! — the offset rule never applies to this set), and
+//! [`decode_channel_registers`] maps the feed onto the channel mode
+//! (Single / DualSymmetric / DualFlex / Unknown) + the ECC state
+//! ([`crate::amd_readout::EccStatus`]) via [`decode_rank_size`]
+//! (research Part B equation: `(!mask & 0xFFFFFFFE >> 1 + 1) × 512`
+//! bytes).
+//!
 //! # CAD + PDM: confirm-or-Na (plan D3)
 //!
 //! Verified against the installed driver source and its userspace: no CAD
@@ -89,6 +106,7 @@
 //! per-register containment.
 
 use crate::amd_pm::{AmdPmSnapshot, AmdPmTimings};
+use crate::amd_readout::{ChannelSmnFields, EccStatus, MemoryChannelMode};
 use crate::amd_smu::{classify_io_error, vendor_gate};
 use crate::cpuid::CpuInfo;
 use crate::error::{TelemetryError, TelemetryResult};
@@ -141,6 +159,40 @@ const SMN_CKE: u32 = 0x50254;
 const SMN_RFC: u32 = 0x50260;
 /// `0x50264` — tRFC mirror (sentinel rule).
 const SMN_RFC_MIRROR: u32 = 0x50264;
+
+/// Channel 0 UMC base (the CS register block + `UmcCapHi` aperture).
+const SMN_CH0_BASE: u32 = 0x0005_0000;
+/// Channel 1 UMC base: the fixed `+0x0010_0000` stride between UMC
+/// channels (the research's documented stride — read unconditionally,
+/// never via the offset rule).
+const SMN_CH1_BASE: u32 = 0x0015_0000;
+/// `UmcCapHi` offset from a channel base (bit 30 = EccEn, bit 31 =
+/// ChipKillCap).
+const SMN_UMC_CAP_HI: u32 = 0xDF4;
+
+/// The 14 channel-population + capability registers in read order:
+/// per channel — CS0–CS3 base (bit 0 = CsEn), AddrMask0/1 (the rank
+/// size decode), `UmcCapHi`.
+///
+/// Exposed (`pub`) as the source of truth for this read set — both UMC
+/// bases are read unconditionally (the `+0x100000` offset rule does NOT
+/// apply; each channel's own CsEn flags decide activity).
+pub const SMN_CHANNEL_REGISTER_SET: [u32; 14] = [
+    SMN_CH0_BASE, // UMCCH::BaseAddr0 (CS0; bit 0 = CsEn)
+    SMN_CH0_BASE + 0x04, // UMCCH::BaseAddr1 (CS1; bit 0 = CsEn)
+    SMN_CH0_BASE + 0x08, // UMCCH::BaseAddr2 (CS2; bit 0 = CsEn)
+    SMN_CH0_BASE + 0x0C, // UMCCH::BaseAddr3 (CS3; bit 0 = CsEn)
+    SMN_CH0_BASE + 0x20, // UMCCH::AddrMask0 (DIMM 0 rank size)
+    SMN_CH0_BASE + 0x24, // UMCCH::AddrMask1 (DIMM 1 rank size)
+    SMN_CH0_BASE + SMN_UMC_CAP_HI, // UMCCH::UmcCapHi (bit 30 EccEn, bit 31 ChipKillCap)
+    SMN_CH1_BASE, // UMCCH::BaseAddr0 (CS0; bit 0 = CsEn)
+    SMN_CH1_BASE + 0x04, // UMCCH::BaseAddr1 (CS1; bit 0 = CsEn)
+    SMN_CH1_BASE + 0x08, // UMCCH::BaseAddr2 (CS2; bit 0 = CsEn)
+    SMN_CH1_BASE + 0x0C, // UMCCH::BaseAddr3 (CS3; bit 0 = CsEn)
+    SMN_CH1_BASE + 0x20, // UMCCH::AddrMask0 (DIMM 0 rank size)
+    SMN_CH1_BASE + 0x24, // UMCCH::AddrMask1 (DIMM 1 rank size)
+    SMN_CH1_BASE + SMN_UMC_CAP_HI, // UMCCH::UmcCapHi (bit 30 EccEn, bit 31 ChipKillCap)
+];
 
 /// The verified 13-register read set (plan §1) in `monitor_cpu` read order.
 ///
@@ -337,12 +389,12 @@ pub struct SmnFields {
     pub timings: AmdPmTimings,
 }
 
-/// The raw word for `addr` in a register list: the **first** occurrence's
-/// value, or `0` when the address is absent, its word is `None`, or its
-/// word is the driver's `0xFFFF_FFFF` failed-read sentinel (no panic, no
-/// garbage — the sentinel never decodes as data, P6-10). Unknown
-/// addresses are ignored.
-fn word_at(regs: &[(u32, Option<u32>)], addr: u32) -> u32 {
+/// The raw word for `addr` in a register list: `None` when the address
+/// is absent, its word is `None`, or its word is the driver's
+/// `0xFFFF_FFFF` failed-read sentinel (no panic, no garbage — the
+/// sentinel never decodes as data, P6-10). Unknown addresses are
+/// ignored.
+fn word_opt(regs: &[(u32, Option<u32>)], addr: u32) -> Option<u32> {
     regs.iter()
         .find(|(a, _)| *a == addr)
         .and_then(|(_, word)| {
@@ -351,7 +403,15 @@ fn word_at(regs: &[(u32, Option<u32>)], addr: u32) -> u32 {
                 .filter(|w| **w != SMN_READ_FAILURE_SENTINEL)
                 .copied()
         })
-        .unwrap_or(0)
+}
+
+/// The raw word for `addr` in a register list: the **first** occurrence's
+/// value, or `0` when the address is absent, its word is `None`, or its
+/// word is the driver's `0xFFFF_FFFF` failed-read sentinel (no panic, no
+/// garbage — the sentinel never decodes as data, P6-10). Unknown
+/// addresses are ignored.
+fn word_at(regs: &[(u32, Option<u32>)], addr: u32) -> u32 {
+    word_opt(regs, addr).unwrap_or(0)
 }
 
 /// Maps raw `smn` words onto the confirmed fields (pure: no I/O, no
@@ -405,6 +465,189 @@ pub fn decode_smn(regs: &[(u32, Option<u32>)]) -> SmnFields {
             wrwr_scl: twrwr_scl(word_at(regs, SMN_WRWR)),
             wrwr_sc: twrwr_sc(word_at(regs, SMN_WRWR)),
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Channel-population + capability decode (OQ-10): the rank-size equation,
+// the channel-mode synthesis, and the ECC state from the 14-register set.
+// Pure + fixture-testable (the `decode_smn` pattern).
+// ---------------------------------------------------------------------------
+
+/// The rank capacity in bytes from a `UMCCH::AddrMask` word (the
+/// research Part B equation):
+///
+/// ```text
+/// inverted = (!mask_raw) & 0xFFFFFFFE   // bits [31:1] = normalized
+///                                                // address bits [39:9]
+/// size     = ((inverted >> 1) + 1) × 512
+/// ```
+///
+/// The mask clears exactly the address bits that vary within the rank,
+/// so inverting it recovers the rank's size: a 4 GiB rank reads
+/// `0xFF00_0000`, an 8 GiB rank `0xFE00_0000`, a 16 GiB rank
+/// `0xFC00_0000` (each cleared bit doubling the size).
+///
+/// **Constant note (research anchor correction, recorded):** the
+/// research brief's literal constant is `0x01FFFFFE`, but the brief's
+/// own register map states bits [31:1] of `AddrMask` carry the
+/// normalized address masking, and its worked 16 GiB example requires
+/// bit 25. `0x01FFFFFE` (bits [24:1]) caps the decode at 8 GiB ranks —
+/// an 8 + 16 GiB box would mis-decode as 8 + 8 (DualSymmetric instead
+/// of the correct DualFlex). The `0xFFFFFFFE` mask (bits [31:1]) is
+/// used here so the full documented range decodes (4 / 8 / 16 GiB
+/// pinned in the tests).
+pub fn decode_rank_size(mask_raw: u32) -> u64 {
+    let inverted = (!mask_raw) & 0xFFFF_FFFE;
+    let size_units = (inverted >> 1) + 1;
+    (size_units as u64) * 512
+}
+
+/// One UMC channel's decoded population state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChannelPop {
+    /// Any CS enabled (bit 0 of a BaseAddr word set).
+    active: bool,
+    /// The summed rank capacity in bytes; `None` when an enabled rank's
+    /// `AddrMask` word is unreadable (the channel is active but its size
+    /// is unknown — never synthesized as data).
+    capacity: Option<u64>,
+    /// The populated DIMM count (0–2).
+    dimm_count: usize,
+}
+
+/// Decode one UMC channel's CS population + rank capacity from the
+/// 14-register feed.
+///
+/// `base` is the channel's UMC base. DIMM 0 (CS0 + CS1) shares
+/// `AddrMask0`; DIMM 1 (CS2 + CS3) shares `AddrMask1`. An absent /
+/// failed CS base word reads as a disabled CS (honest: no CsEn
+/// evidence); an enabled CS with an unreadable mask makes the channel's
+/// capacity `None`.
+fn decode_channel(base: u32, regs: &[(u32, Option<u32>)]) -> ChannelPop {
+    let cs = [0u32, 4, 8, 0xC]
+        .map(|off| (word_opt(regs, base + off).unwrap_or(0) & 1) != 0);
+
+    let mut active = false;
+    let mut capacity: Option<u64> = Some(0);
+    let mut dimm_count = 0usize;
+
+    // DIMM 0: CS0 + CS1 share AddrMask0. DIMM 1: CS2 + CS3 share
+    // AddrMask1.
+    for &(a, b, mask_off) in &[(0, 1, 0x20u32), (2, 3, 0x24)] {
+        if cs[a] || cs[b] {
+            active = true;
+            dimm_count += 1;
+            // An earlier DIMM's mask unreadable (capacity `None`) stays
+            // unknown (never resurrected as partial data); an absent
+            // mask word for a present DIMM makes it unknown the same.
+            capacity = word_opt(regs, base + mask_off).and_then(|mask| {
+                capacity.map(|c| {
+                    c + (cs[a] as u64) * decode_rank_size(mask)
+                        + (cs[b] as u64) * decode_rank_size(mask)
+                })
+            });
+        }
+    }
+
+    ChannelPop {
+        active,
+        capacity,
+        dimm_count,
+    }
+}
+
+/// Synthesize the channel mode from the two decoded channels (the
+/// research Part B rule): one active channel → Single; both active →
+/// DualSymmetric (equal capacity) / DualFlex (unequal); neither active
+/// → Unknown. Both channels active but one with an unreadable capacity
+/// cannot be compared → Unknown (never a value from partial data).
+fn synthesize_mode(c0: &ChannelPop, c1: &ChannelPop) -> MemoryChannelMode {
+    match (c0.active, c1.active) {
+        (false, false) => MemoryChannelMode::Unknown,
+        (true, false) | (false, true) => MemoryChannelMode::Single,
+        (true, true) => match (c0.capacity, c1.capacity) {
+            (Some(a), Some(b)) => {
+                if a == b {
+                    MemoryChannelMode::DualSymmetric
+                } else {
+                    MemoryChannelMode::DualFlex
+                }
+            }
+            _ => MemoryChannelMode::Unknown,
+        },
+    }
+}
+
+/// The ECC state from the per-channel `UmcCapHi` words (bit 30 = EccEn,
+/// bit 31 = ChipKillCap) + the channel activity flags (the research
+/// Part A `decode_amd_ecc` semantics, verbatim): every active channel
+/// EccEn → `Enabled` (`EnabledChipKill` when every active channel also
+/// ChipKillCap); any active channel without EccEn →
+/// `CapableButDisabled` (the AMD desktop silicon retains the ECC
+/// capability — non-ECC DIMMs / BIOS-off); no active channel, or an
+/// active channel with an unreadable `UmcCapHi` → `Unknown`.
+fn decode_ecc(
+    ch0_cap: Option<u32>,
+    ch1_cap: Option<u32>,
+    ch0_active: bool,
+    ch1_active: bool,
+) -> EccStatus {
+    let mut any_active = false;
+    let mut ecc_enabled = true;
+    let mut chipkill = true;
+
+    for (cap, active) in [(ch0_cap, ch0_active), (ch1_cap, ch1_active)] {
+        if active {
+            match cap {
+                Some(word) => {
+                    any_active = true;
+                    if word & (1 << 30) == 0 {
+                        ecc_enabled = false;
+                    }
+                    if word & (1 << 31) == 0 {
+                        chipkill = false;
+                    }
+                }
+                None => return EccStatus::Unknown,
+            }
+        }
+    }
+
+    if !any_active {
+        return EccStatus::Unknown;
+    }
+    if ecc_enabled {
+        if chipkill {
+            EccStatus::EnabledChipKill
+        } else {
+            EccStatus::Enabled
+        }
+    } else {
+        EccStatus::CapableButDisabled
+    }
+}
+
+/// Decode the 14-register channel-population + capability feed into
+/// [`ChannelSmnFields`] (the channel mode + the ECC state).
+///
+/// Pure: no I/O, no panic on any input (the `decode_smn` pattern). An
+/// empty feed (non-AMD host / missing `smn` attribute) yields
+/// [`ChannelSmnFields::absent()`].
+pub fn decode_channel_registers(regs: &[(u32, Option<u32>)]) -> ChannelSmnFields {
+    if regs.is_empty() {
+        return ChannelSmnFields::absent();
+    }
+    let c0 = decode_channel(SMN_CH0_BASE, regs);
+    let c1 = decode_channel(SMN_CH1_BASE, regs);
+    ChannelSmnFields {
+        mode: synthesize_mode(&c0, &c1),
+        ecc: decode_ecc(
+            word_opt(regs, SMN_CH0_BASE + SMN_UMC_CAP_HI),
+            word_opt(regs, SMN_CH1_BASE + SMN_UMC_CAP_HI),
+            c0.active,
+            c1.active,
+        ),
     }
 }
 
@@ -522,6 +765,56 @@ fn read_all_dram_registers_with<R: FnMut(u32) -> TelemetryResult<u32>>(
     regs.push(setpoint);
     for &addr in SMN_REGISTER_SET.iter().skip(1) {
         regs.push(read_word(reader(addr + base)));
+    }
+    regs
+}
+
+/// Read the 14 channel-population + capability SMN registers (both UMC
+/// bases unconditionally — the `+0x100000` offset rule does NOT apply to
+/// this set; each channel's own CsEn flags decide activity).
+///
+/// Returns a `Vec` with one `(address, word)` entry per register in
+/// [`SMN_CHANNEL_REGISTER_SET`] order: `Some(word)` on a successful
+/// read, `None` when that read failed (per-register containment — P6-10).
+///
+/// Returns an **empty** `Vec` when nothing can be captured: a non-AMD
+/// vendor (the gate fires before any I/O) or a missing `smn` attribute
+/// (`DriverMissing` — the whole read is a no-op, mirroring
+/// [`read_all_dram_registers`]).
+///
+/// Never panics (no-panic contract, D5): every hardware path degrades
+/// to a structured [`TelemetryError`] inside [`read_smn_register`],
+/// which is collapsed per register by [`read_word`].
+pub fn read_all_channel_registers() -> Vec<(u32, Option<u32>)> {
+    // Vendor gate: pure, so non-AMD hardware yields nothing before any
+    // file access (plan D1 gate discipline).
+    if vendor_gate(&CpuInfo::detect()).is_err() {
+        return Vec::new();
+    }
+    read_all_channel_registers_with(read_smn_register)
+}
+
+/// The [`read_all_channel_registers`] core with an **injectable
+/// register reader** (the hermetic test seam: tests feed synthetic
+/// words / errors; production injects [`read_smn_register`]). No vendor
+/// gate here — that belongs to the public contract (the
+/// `read_all_dram_registers_with` mirror). `DriverMissing` on the first
+/// read yields an empty list (the attribute's presence cannot change
+/// mid-list — the whole read is a no-op); every other failure is
+/// contained per register by [`read_word`].
+fn read_all_channel_registers_with<R: FnMut(u32) -> TelemetryResult<u32>>(
+    mut reader: R,
+) -> Vec<(u32, Option<u32>)> {
+    let mut regs: Vec<(u32, Option<u32>)> =
+        Vec::with_capacity(SMN_CHANNEL_REGISTER_SET.len());
+    for &addr in SMN_CHANNEL_REGISTER_SET.iter() {
+        let word = match reader(addr) {
+            Err(TelemetryError::DriverMissing { .. }) if regs.is_empty() => {
+                return Vec::new();
+            }
+            other => read_word(other),
+        };
+        regs.push((addr, word));
     }
     regs
 }
@@ -1574,6 +1867,310 @@ mod tests {
         assert!(
             regs.is_empty() || regs.len() == 13,
             "the bulk read is all-or-nothing (13 entries): {} entries",
+            regs.len()
+        );
+    }
+
+    // ---- channel-population + capability decode (OQ-10) ------------------
+
+    /// The seven words of one UMC channel (CS0–CS3 base, AddrMask0/1,
+    /// `UmcCapHi`), each `None` when that read failed.
+    type ChannelWords = (
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+    );
+
+    /// A 14-register channel feed: per channel, CS0–CS3 base, AddrMask0/1,
+    /// and `UmcCapHi` (each an `Option` word — `None` = the read failed).
+    fn channel_regs_fixture(ch0: ChannelWords, ch1: ChannelWords) -> Vec<(u32, Option<u32>)> {
+        vec![
+            (SMN_CH0_BASE, ch0.0),
+            (SMN_CH0_BASE + 0x04, ch0.1),
+            (SMN_CH0_BASE + 0x08, ch0.2),
+            (SMN_CH0_BASE + 0x0C, ch0.3),
+            (SMN_CH0_BASE + 0x20, ch0.4),
+            (SMN_CH0_BASE + 0x24, ch0.5),
+            (SMN_CH0_BASE + SMN_UMC_CAP_HI, ch0.6),
+            (SMN_CH1_BASE, ch1.0),
+            (SMN_CH1_BASE + 0x04, ch1.1),
+            (SMN_CH1_BASE + 0x08, ch1.2),
+            (SMN_CH1_BASE + 0x0C, ch1.3),
+            (SMN_CH1_BASE + 0x20, ch1.4),
+            (SMN_CH1_BASE + 0x24, ch1.5),
+            (SMN_CH1_BASE + SMN_UMC_CAP_HI, ch1.6),
+        ]
+    }
+
+    /// A single populated rank on the channel: CS0 enabled (base word bit
+    /// 0 = 1), the rank mask, everything else disabled; `cap` the
+    /// `UmcCapHi` word.
+    fn one_rank(mask: u32, cap: u32) -> ChannelWords {
+        (Some(0x0000_0001), None, None, None, Some(mask), None, Some(cap))
+    }
+
+    /// An unpopulated channel: every CS disabled, no data words.
+    fn empty_channel() -> ChannelWords {
+        (None, None, None, None, None, None, None)
+    }
+
+    /// (OQ-10) The rank-size equation pins the research's worked values:
+    /// `0xFF00_0000` → 4 GiB, `0xFE00_0000` → 8 GiB, `0xFC00_0000` →
+    /// 16 GiB (each cleared mask bit doubling the rank, the bits [31:1]
+    /// range the register map documents). The all-zero word is the
+    /// formula's no-data boundary (every normalized bit varying) —
+    /// pinned for the no-overflow guarantee (the u64 cast).
+    #[test]
+    fn decode_rank_size_pins_research_values() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(decode_rank_size(0xFF00_0000), 4 * GIB);
+        assert_eq!(decode_rank_size(0xFE00_0000), 8 * GIB);
+        assert_eq!(decode_rank_size(0xFC00_0000), 16 * GIB);
+        assert_eq!(decode_rank_size(0), 1 << 40);
+    }
+
+    /// (OQ-10) The channel-mode synthesis matrix (the research Part B
+    /// rule + the worked 8 + 16 GiB trace): 8 + 8 → DualSymmetric,
+    /// 8 + 16 → DualFlex, 8 + 0 → Single, 0 + 0 → Unknown.
+    #[test]
+    fn channel_mode_synthesis_matrix() {
+        // 8 GiB rank = mask 0xFE00_0000; 16 GiB rank = 0xFC00_0000;
+        // `UmcCapHi` 0 = ECC disabled (irrelevant to the mode).
+        let ch0_8 = one_rank(0xFE00_0000, 0);
+        let ch0_16 = one_rank(0xFC00_0000, 0);
+        let empty = empty_channel();
+
+        // 8 + 8 → DualSymmetric
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(ch0_8, ch0_8)).mode,
+            MemoryChannelMode::DualSymmetric
+        );
+        // 8 + 16 → DualFlex (the worked 8 + 16 GiB asymmetric trace)
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(ch0_8, ch0_16)).mode,
+            MemoryChannelMode::DualFlex
+        );
+        // 16 + 8 → DualFlex (the asymmetry is direction-independent)
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(ch0_16, ch0_8)).mode,
+            MemoryChannelMode::DualFlex
+        );
+        // 8 + 0 → Single
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(ch0_8, empty)).mode,
+            MemoryChannelMode::Single
+        );
+        // 0 + 8 → Single (the other asymmetry)
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(empty, ch0_8)).mode,
+            MemoryChannelMode::Single
+        );
+        // 0 + 0 → Unknown
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(empty, empty)).mode,
+            MemoryChannelMode::Unknown
+        );
+        // an empty feed (non-AMD / missing attribute) → absent (both
+        // Unknown)
+        assert_eq!(decode_channel_registers(&[]), ChannelSmnFields::absent());
+    }
+
+    /// (OQ-10) A dual-rank DIMM: both CSes of one DIMM enabled (CS0 +
+    /// CS1 share `AddrMask0`) — the channel capacity is the sum of the
+    /// two ranks (2 × 8 GiB = a 16 GiB dual-rank DIMM); the same on
+    /// channel 1 → DualSymmetric, not DualFlex.
+    #[test]
+    fn dual_rank_dimm_sums_both_cs() {
+        let ch0 = (
+            Some(0x0000_0001),
+            Some(0x0000_0001),
+            None,
+            None,
+            Some(0xFE00_0000),
+            None,
+            Some(0),
+        );
+        let ch1 = (
+            Some(0x0000_0001),
+            Some(0x0000_0001),
+            None,
+            None,
+            Some(0xFE00_0000),
+            None,
+            Some(0),
+        );
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(ch0, ch1)).mode,
+            MemoryChannelMode::DualSymmetric
+        );
+        // the same dual-rank DIMM on one channel only → Single
+        let empty = empty_channel();
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(ch0, empty)).mode,
+            MemoryChannelMode::Single
+        );
+    }
+
+    /// (OQ-10) An enabled CS with an unreadable mask: the channel stays
+    /// active, its capacity is unknown — both channels active with one
+    /// unknown size → Unknown (never a synthesized comparison).
+    #[test]
+    fn enabled_cs_with_unreadable_mask_degrades_to_unknown_mode() {
+        // CS0 enabled, AddrMask0 failed (None).
+        let ch0 = (Some(0x0000_0001), None, None, None, None, None, Some(0));
+        let ch1 = one_rank(0xFE00_0000, 0);
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(ch0, ch1)).mode,
+            MemoryChannelMode::Unknown
+        );
+    }
+
+    /// (OQ-10) The ECC decode (the research Part A `decode_amd_ecc`
+    /// semantics on the AMD channel pair): bit 30 = EccEn, bit 31 =
+    /// ChipKillCap — the four arms + the two Unknown degradations.
+    #[test]
+    fn ecc_decode_matrix() {
+        // One active channel (CS0 on); `UmcCapHi` arms:
+        // bit 30 clear → CapableButDisabled (consumer non-ECC DIMMs)
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(
+                one_rank(0xFE00_0000, 0x0000_0000),
+                empty_channel()
+            ))
+            .ecc,
+            EccStatus::CapableButDisabled
+        );
+        // bit 30 set, bit 31 clear → Enabled (standard SECDED)
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(
+                one_rank(0xFE00_0000, 0x4000_0000),
+                empty_channel()
+            ))
+            .ecc,
+            EccStatus::Enabled
+        );
+        // bit 30 + bit 31 set → EnabledChipKill
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(
+                one_rank(0xFE00_0000, 0xC000_0000),
+                empty_channel()
+            ))
+            .ecc,
+            EccStatus::EnabledChipKill
+        );
+        // no active channel → Unknown
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(
+                empty_channel(),
+                empty_channel()
+            ))
+            .ecc,
+            EccStatus::Unknown
+        );
+        // an active channel with an unreadable `UmcCapHi` → Unknown
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(
+                (Some(0x0000_0001), None, None, None, Some(0xFE00_0000), None, None),
+                empty_channel()
+            ))
+            .ecc,
+            EccStatus::Unknown
+        );
+        // split EccEn across the two active channels (one on, one off)
+        // → CapableButDisabled (not every active channel is enabled)
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(
+                one_rank(0xFE00_0000, 0x4000_0000),
+                one_rank(0xFE00_0000, 0x0000_0000)
+            ))
+            .ecc,
+            EccStatus::CapableButDisabled
+        );
+        // both active channels fully enabled + ChipKill → EnabledChipKill
+        assert_eq!(
+            decode_channel_registers(&channel_regs_fixture(
+                one_rank(0xFE00_0000, 0xC000_0000),
+                one_rank(0xFE00_0000, 0xC000_0000)
+            ))
+            .ecc,
+            EccStatus::EnabledChipKill
+        );
+    }
+
+    /// (OQ-10) The 14-register read core: BOTH bases are read
+    /// unconditionally (all 14 addresses in set order — the offset rule
+    /// never applies to this set); a per-register failure and the
+    /// driver's `0xFFFF_FFFF` sentinel are each contained as `None`.
+    #[test]
+    fn channel_register_read_pins_both_bases_and_contains_per_register() {
+        let mut addresses: Vec<u32> = Vec::new();
+        let reader = |addr: u32| -> TelemetryResult<u32> {
+            addresses.push(addr);
+            if addr == SMN_CH1_BASE + 0x20 {
+                return Ok(SMN_READ_FAILURE_SENTINEL); // sentinel → None
+            }
+            if addr == SMN_CH1_BASE + 0x24 {
+                return Err(TelemetryError::Parse {
+                    detail: "test failure".to_owned(),
+                });
+            }
+            Ok(0)
+        };
+        let regs = read_all_channel_registers_with(reader);
+        assert_eq!(regs.len(), 14);
+        assert_eq!(addresses, SMN_CHANNEL_REGISTER_SET.to_vec());
+        assert_eq!(regs[0], (SMN_CH0_BASE, Some(0)));
+        assert_eq!(regs[11].1, None); // sentinel contained
+        assert_eq!(regs[12].1, None); // Parse contained
+        assert_eq!(regs[13].1, Some(0));
+    }
+
+    /// (OQ-10) `DriverMissing` on the first read → the whole read is a
+    /// no-op (an empty list, the `read_all_dram_registers` mirror).
+    #[test]
+    fn channel_register_read_driver_missing_is_empty() {
+        let reader = |_addr: u32| -> TelemetryResult<u32> {
+            Err(TelemetryError::DriverMissing { driver: DRIVER })
+        };
+        assert_eq!(read_all_channel_registers_with(reader), Vec::new());
+    }
+
+    /// (OQ-10) A `DriverMissing` on a LATER read is contained per
+    /// register (the attribute's presence is decided by the first read
+    /// only; a mid-list failure is treated like any other): the list is
+    /// full with the failed entries `None`.
+    #[test]
+    fn channel_register_read_late_driver_missing_is_contained() {
+        let mut n = 0usize;
+        let reader = |addr: u32| -> TelemetryResult<u32> {
+            n += 1;
+            if n > 5 {
+                return Err(TelemetryError::DriverMissing { driver: DRIVER });
+            }
+            Ok(addr)
+        };
+        let regs = read_all_channel_registers_with(reader);
+        assert_eq!(regs.len(), 14);
+        assert_eq!(regs[0].1, Some(SMN_CH0_BASE));
+        assert_eq!(regs[4].1, Some(SMN_CH0_BASE + 0x20));
+        assert_eq!(regs[5].1, None);
+        assert_eq!(regs[13].1, None);
+    }
+
+    /// (OQ-10) On this host the public 14-register read is graceful: an
+    /// empty list (non-AMD / missing `smn` attribute) or the full
+    /// 14-entry list — never a panic, and never a partial list
+    /// (host-state dependent: only the shape is asserted).
+    #[test]
+    fn read_all_channel_registers_on_this_host_is_graceful() {
+        let regs = read_all_channel_registers();
+        assert!(
+            regs.is_empty() || regs.len() == SMN_CHANNEL_REGISTER_SET.len(),
+            "the channel bulk read is all-or-nothing (14 entries): {} entries",
             regs.len()
         );
     }

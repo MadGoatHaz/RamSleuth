@@ -683,7 +683,8 @@ fn cell_color(label: &str, display: &str) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use ramsleuth_telemetry::amd_readout::{
-        AmdReadout, CadBus, ClockReadout, CommandRate, DivMode, RttValue, TimingSet, VoltageSet,
+        AmdReadout, CadBus, ClockReadout, CommandRate, DivMode, EccStatus, MemoryChannelMode,
+        RttValue, TimingSet, VoltageSet,
     };
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
@@ -755,6 +756,8 @@ mod tests {
                 vpp_mv: Section::Value(1800),
                 vcore_mv: Section::Value(1150),
             },
+            channel_mode: MemoryChannelMode::DualSymmetric,
+            ecc_status: EccStatus::CapableButDisabled,
         }
     }
 

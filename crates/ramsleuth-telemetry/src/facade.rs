@@ -23,7 +23,9 @@
 //! I/O of its own):
 //!
 //! ```text
-//! CpuInfo::detect() ──┬─ AMD:      amd_smu::acquire() → amd_pm::parse() → amd_smn::apply_smn (overlay) → amd_readout::map_amd()
+//! CpuInfo::detect() ──┬─ AMD:      amd_smu::acquire() → amd_pm::parse() → amd_smn::apply_smn (overlay)
+//!                     │           → amd_smn::read_all_channel_registers + decode_channel_registers (OQ-10: channel mode + ECC)
+//!                     │           → amd_readout::map_amd_with()
 //!                     ├─ Intel:    intel_sysfs::acquire() (primary, §3.5) → intel_readout::decode
 //!                     │           └─ on DriverMissing only: intel_mchbar::acquire() → read_intel (/dev/mem fallback)
 //!                     ├─ SPD:      spd_eeprom::acquire() → spd_decode::decode() (per image)
@@ -127,7 +129,9 @@ pub struct SystemMemoryTelemetry {
 /// 1. `CpuInfo::detect()` — the single CPUID dispatch key.
 /// 2. AMD branch (AMD silicon only): `amd_smu::acquire()` →
 ///    `amd_pm::parse()` → `amd_smn::apply_smn` (no-panic overlay) →
-///    `amd_readout::map_amd()`.
+///    `amd_smn::read_all_channel_registers` + `decode_channel_registers`
+///    (OQ-10: the 14-register channel mode + ECC decode) →
+///    `amd_readout::map_amd_with()`.
 /// 3. Intel branch (Intel silicon only, v1 profiled generations —
 ///    Tier 1 + Rocket Lake):
 ///    `intel_sysfs::acquire()` → `intel_readout::decode` (primary);
@@ -207,15 +211,19 @@ pub fn reason_from(e: &TelemetryError) -> NaReason {
 }
 
 /// AMD branch: `amd_smu::acquire()` → `amd_pm::parse()` →
-/// `amd_smn::apply_smn` (no-panic overlay) → `amd_readout::map_amd()`.
+/// `amd_smn::apply_smn` (no-panic overlay) → the 14-register UMC
+/// channel read + decode (OQ-10: channel mode + ECC) →
+/// `amd_readout::map_amd_with()`.
 ///
 /// Gated on the already-detected vendor: non-AMD silicon returns
 /// `Err(UnsupportedHardware)` before any provider call (zero I/O in
 /// this branch). Failures are contained here — they never propagate
 /// past the branch. The SMN overlay (P6-03, plan D2) is infallible by
 /// construction — a missing `smn` attribute is a no-op and per-register
-/// failures contain to zeros — so only `acquire` / `parse` can fail the
-/// branch: the error semantics are unchanged.
+/// failures contain to zeros — and the channel read is infallible the
+/// same way (an empty / per-register-`None` feed decodes to the
+/// `absent()` state: both fields `Unknown`); so only `acquire` /
+/// `parse` can fail the branch: the error semantics are unchanged.
 fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
     if !matches!(cpu.vendor, CpuVendor::Amd(_)) {
         return Err(TelemetryError::UnsupportedHardware {
@@ -228,7 +236,14 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
     // `timings` from the driver `smn` attribute when readable; never
     // fails the branch and never touches the PM-table fields.
     amd_smn::apply_smn(&mut snap);
-    Ok(amd_readout::map_amd(&snap))
+    // The 14-register UMC channel-population + capability set (OQ-10):
+    // both bases read unconditionally (the `+0x100000` offset rule does
+    // NOT apply to this set) and decoded to the channel mode + ECC
+    // state. A missing `smn` attribute / every read failed yields the
+    // `absent()` state (both `Unknown`) — never failing the branch.
+    let ch_regs = amd_smn::read_all_channel_registers();
+    let ch = amd_smn::decode_channel_registers(&ch_regs);
+    Ok(amd_readout::map_amd_with(&snap, &ch))
 }
 
 /// Intel branch: the two-source acquisition of plan §3.5 —
@@ -430,7 +445,8 @@ fn section_from<T>(result: TelemetryResult<T>) -> Section<T> {
 mod tests {
     use super::*;
     use crate::amd_readout::{
-        CadBus, ClockReadout, CommandRate, DivMode, RttValue, TimingSet, VoltageSet,
+        CadBus, ClockReadout, CommandRate, DivMode, EccStatus, MemoryChannelMode, RttValue,
+        TimingSet, VoltageSet,
     };
     use crate::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
     use crate::cpuid::{AmdZen, IntelGen};
@@ -783,6 +799,8 @@ mod tests {
                 vpp_mv: Section::Value(1800),
                 vcore_mv: Section::Value(1150),
             },
+            channel_mode: MemoryChannelMode::DualSymmetric,
+            ecc_status: EccStatus::CapableButDisabled,
         }
     }
 
