@@ -518,7 +518,7 @@ fn probe_issue_title(report: &ProbeReport) -> String {
 /// paste-into-the-body notice in the header).
 fn probe_issue_url(title: &str) -> String {
     format!(
-        "https://github.com/MadGoat/RamSleuth/issues/new?title={}",
+        "https://github.com/MadGoatHaz/RamSleuth/issues/new?title={}",
         url_encode(title)
     )
 }
@@ -4305,7 +4305,7 @@ mod tests {
         let url = probe_issue_url(&title);
         assert_eq!(
             url,
-            "https://github.com/MadGoat/RamSleuth/issues/new?title=%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.2"
+            "https://github.com/MadGoatHaz/RamSleuth/issues/new?title=%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.2"
         );
         assert!(
             !url.contains("body="),
@@ -4639,7 +4639,7 @@ mod tests {
         assert!(
             open_url
                 .url
-                .starts_with("https://github.com/MadGoat/RamSleuth/issues/new?title="),
+                .starts_with("https://github.com/MadGoatHaz/RamSleuth/issues/new?title="),
             "the URL must be the issues/new form: {}",
             open_url.url
         );
