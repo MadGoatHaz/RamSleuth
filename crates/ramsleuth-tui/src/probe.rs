@@ -644,6 +644,7 @@ mod tests {
     fn touch_exec(dir: &Path, name: &str) {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .mode(0o755)
             .open(dir.join(name))
@@ -656,6 +657,7 @@ mod tests {
     fn touch_plain(dir: &Path, name: &str) {
         std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .mode(0o644)
             .open(dir.join(name))

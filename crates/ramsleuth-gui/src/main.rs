@@ -4341,7 +4341,7 @@ mod tests {
             "the title must paint: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| *t == PROBE_CONSENT_BODY),
+            texts.contains(&PROBE_CONSENT_BODY),
             "the body must paint: {texts:?}"
         );
         assert!(texts.contains(&"Allow"), "the Allow button must paint: {texts:?}");
