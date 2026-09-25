@@ -1913,7 +1913,7 @@ fn channel_mode_with_population(
     mad_dimm_ch0: Option<u32>,
     mad_dimm_ch1: Option<u32>,
 ) -> Option<ChannelMode> {
-    let Some(m) = mode else { return None; };
+    let m = mode?;
     if m == ChannelMode::DualSymmetric {
         let (Some(c0), Some(c1)) = (
             mad_dimm_capacity_gib(mad_dimm_ch0),

@@ -29,18 +29,19 @@
 //!   [`Response::BenchCancelled { run_id }] when the run was active,
 //!   [`Response::Error`] when no such run is active (the owner still
 //!   receives the terminal `Cancelled`/`Result` exactly once);
-//! - [`Request::GetProbeReport`] → the chunk 1b daemon builder: take
-//!   the P3-14 TTL cache (offloaded to the blocking pool, same as
-//!   [`Request::GetTelemetry`]), then assemble the [`ProbeReport`] — the
-//!   decoded snapshot + the vendor raw dump (Intel: module-first,
-//!   `/dev/mem` fallback, plan §3.5; AMD: the `ryzen_smu` SMN/PM section)
-//!   + the system identity — all inside the same
-//!   `spawn_blocking` (the raw acquisition may `mmap` / read sysfs) →
-//!   [`Response::ProbeReport`]. A failed raw acquisition degrades to
-//!   `raw: None` + `telemetry_source: "unavailable"` (no-panic, D5) —
-//!   the arm never errors the connection;
 //! - a client-sent [`Message::Response`] is a protocol violation →
 //!   close the connection.
+//!
+//! **Probe report:** [`Request::GetProbeReport`] → the chunk 1b daemon
+//! builder: take the P3-14 TTL cache (offloaded to the blocking pool,
+//! same as [`Request::GetTelemetry`]), then assemble the
+//! [`ProbeReport`] — the decoded snapshot + the vendor raw dump (Intel:
+//! module-first, `/dev/mem` fallback, plan §3.5; AMD: the `ryzen_smu`
+//! SMN/PM section) + the system identity — all inside one
+//! `spawn_blocking` (the raw acquisition may `mmap` / read sysfs) →
+//! [`Response::ProbeReport`]; a failed raw acquisition degrades to
+//! `raw: None` + `telemetry_source: "unavailable"` (no-panic, D5) — the
+//! arm never errors the connection.
 //!
 //! **Connection lifecycle:** [`handle_connection`] returns `Ok(())` on
 //! clean EOF (the client closed) and [`RpcError`] on I/O failure or a

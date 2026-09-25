@@ -364,7 +364,7 @@ in the workspace. Both a library and the `ramsleuth-daemon` binary.
 | `socket.rs` | Synchronous listener setup: parent-dir creation, stale-socket probe, `0660` mode, best-effort group chown, per-user ACL re-application, `tokio::from_std` hand-off. |
 | `caps.rs` | The soft privilege probe: root + `CAP_SYS_RAWIO` (bit 21 of `CapEff`) with human-readable degradation warnings. |
 | `cache.rs` | The TTL telemetry cache over an injectable collector (default 2 s), with the cold-cache warm-up double read. |
-| `spd_bind.rs` | The guarded SPD EEPROM auto-bind fallback: as root (the daemon is the only process that may write here), binds the `ee1004` client(s) the kernel missed via the i2c `new_device` sysfs write when bound-SPDs < channel count — Intel-only, non-fatal, never unbinds, process-lifetime attempt set; disabled by `--no-spd-autobind` (default on). |
+| `spd_bind.rs` | The guarded SPD EEPROM auto-bind fallback: as root (the daemon is the only process that may write here), binds the `ee1004` client(s) the kernel missed when bound-SPDs < channel count — via the i2c `new_device` sysfs write, falling back to the driver `bind` file when the write is refused (the address is occupied by a pre-existing, unbound ACPI/DSDT node, `-EBUSY`) — Intel-only, non-fatal, never unbinds, every attempt (accepted or failed) made at most once per process lifetime; disabled by `--no-spd-autobind` (default on). |
 | `dram_spike.rs` | The bounded ~250 ms / 256 MiB DRAM load that pulls the memory controller out of idle before each SMU re-read. |
 | `bench_job.rs` | The single-flight job manager: monotonic `run_id`s, the `(target, mode)` folding, progress/burn-in event streams, clean cancel, self-releasing slot. |
 | `rpc.rs` | The per-connection async RPC loop: incremental frame decode, request dispatch, owner-connection streaming, `spawn_blocking` offload of the blocking event pumps. |
@@ -1335,14 +1335,20 @@ cells — the decoder can never panic.
 above is the read-only half: on an Intel platform where the kernel's
 `ee1004` driver bound fewer SPD EEPROMs than active channels (a slot the
 board's DSDT failed to advertise), the daemon — the only process
-permitted to write — attempts to bind the missing client(s) by echoing
-`ee1004 <addr>` to `/sys/bus/i2c/devices/i2c-<bus>/new_device` before
-each collection, so a freshly bound EEPROM lands in the same snapshot.
-It is **on by default** (`--no-spd-autobind` disables it), Intel-only,
-strictly non-fatal (a NAKing/absent EEPROM is recorded in a
-process-lifetime attempt set and never re-written), and **never
-unbinds**: a bound EEPROM is a real DIMM the DSDT missed, a persistent
-desired state.
+permitted to write — attempts to bind the missing client(s) before each
+collection, so a freshly bound EEPROM lands in the same snapshot. The
+first mechanism echoes `ee1004 <addr>` to
+`/sys/bus/i2c/devices/i2c-<bus>/new_device`; when the kernel refuses
+that write (typically `-EBUSY` — the address is already occupied by a
+pre-existing client node the firmware instantiated that `ee1004` never
+bound), the daemon falls back to the driver's `bind` file, writing the
+node's name (`<bus>-<addr>`, e.g. `0-0051`) to
+`/sys/bus/i2c/drivers/ee1004/bind`. It is **on by default**
+(`--no-spd-autobind` disables it), Intel-only, strictly non-fatal
+(every attempt — accepted, bind-rescued, or failed — is recorded in a
+process-lifetime set and made at most once; a daemon restart
+re-attempts), and **never unbinds**: a bound EEPROM is a real DIMM the
+DSDT missed, a persistent desired state.
 
 ### 10.5 The platform branch
 

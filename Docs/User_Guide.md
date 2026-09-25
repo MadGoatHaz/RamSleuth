@@ -1252,16 +1252,23 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   EEPROMs than the platform's active channels (common on boards whose
   ACPI/DSDT advertises only one DIMM slot), the daemon — as root — tries to
   bind the missing standard addresses (`0x50`–`0x53`) via the sysfs
-  `new_device` mechanism so all installed DIMMs appear. This is on by
-  default, non-fatal (a missing EEPROM simply stays absent), never
+  `new_device` mechanism so all installed DIMMs appear; when the kernel
+  refuses that write because the address is already occupied by a
+  pre-existing (ACPI/DSDT-instantiated) node, the daemon falls back to
+  binding that node through the `ee1004` driver's `bind` file. This is on
+  by default, non-fatal (a missing EEPROM simply stays absent), never
   unbinds, and can be disabled with the daemon flag `--no-spd-autobind`.
-  If the auto-bind cannot find an EEPROM, bind it manually: first see what
-  is bound with `ls /sys/bus/i2c/drivers/ee1004/`, then bind a specific
-  address with
+  If the auto-bind cannot find an EEPROM, bind it manually: first see
+  what is bound with `ls /sys/bus/i2c/drivers/ee1004/`, then bind a
+  specific address with
   `echo "ee1004 0051" | sudo tee /sys/bus/i2c/devices/i2c-0/new_device`
   (substitute the correct bus number and the 7-bit address `0x50`–`0x53`;
   verify the bus and address with `i2cdetect -l` / `i2cdetect -y <bus>`
-  first).
+  first). If the address is occupied by a node that is *not* bound to
+  `ee1004` (the `new_device` write fails with "Device or resource
+  busy"), bind that node directly instead:
+  `echo "0-0051" | sudo tee /sys/bus/i2c/drivers/ee1004/bind` (the
+  node's name — bus decimal, address 4-digit hex).
 - The GUI's **settings knobs are in-memory** — they do not persist across
   restarts (a documented follow-up); the daemon socket, poll interval, and
   units reset to defaults on each launch (the `--socket` flag is the

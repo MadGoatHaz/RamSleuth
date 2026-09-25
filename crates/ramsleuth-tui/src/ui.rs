@@ -957,9 +957,9 @@ fn settings_strip_text(state: &AppState) -> String {
 /// two-column layout — clocks & ratios + the primary/secondary timings
 /// in the left column, the tertiary & turnaround timings + the CAD bus
 /// + the voltages in the right column (a dim `│` separator between
-/// them) — top-aligned; a column that overflows the block is capped to
-/// the first rows that fit with a dim `...` indicator at the bottom
-/// (the overflow safety net).
+///   them) — top-aligned; a column that overflows the block is capped
+///   to the first rows that fit with a dim `...` indicator at the
+///   bottom (the overflow safety net).
 fn render_zone1(frame: &mut Frame, state: &AppState, area: Rect) {
     let block = zone_block("1 · MEMORY CONTROLLER");
     let inner = block.inner(area);
