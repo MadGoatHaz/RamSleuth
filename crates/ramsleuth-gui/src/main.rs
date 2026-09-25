@@ -4123,7 +4123,7 @@ mod tests {
                 kernel: "6.6.0-test".to_owned(),
                 os: "Linux / Test".to_owned(),
                 arch: "x86_64".to_owned(),
-                ramsleuth_version: "2.4.0".to_owned(),
+                ramsleuth_version: "2.4.2".to_owned(),
                 telemetry_source: "unavailable".to_owned(),
             },
         }
@@ -4262,13 +4262,13 @@ mod tests {
         let title = probe_issue_title(&report);
         assert_eq!(
             title,
-            "[Probe] Test CPU \u{00b7} Unknown \u{00b7} Linux / Test \u{00b7} v2.4.0"
+            "[Probe] Test CPU \u{00b7} Unknown \u{00b7} Linux / Test \u{00b7} v2.4.2"
         );
         // The title's percent-encoding (the brackets, the spaces, the
         // middot, the slash).
         assert_eq!(
             url_encode(&title),
-            "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.0"
+            "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.2"
         );
         // The URL (the issues/new form, both fields percent-encoded).
         let body = "# RamSleuth Probe Report\n\nsome body";

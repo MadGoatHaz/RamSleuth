@@ -1,7 +1,7 @@
 # RamSleuth — Architecture
 
 **Document:** `Docs/Architecture.md` (part of the RamSleuth v2 repository-facing documentation)
-**Applies to:** workspace v2.4.0 (branch `v2-development`)
+**Applies to:** workspace v2.4.2 (branch `v2-development`)
 **Audience:** expert readers — kernel-aware systems programmers, packagers, and maintainers who need the full design rationale behind RamSleuth.
 
 Companion documents: [`README.md`](../README.md) (entry point), [`Docs/User_Guide.md`](User_Guide.md) (operational guide), [`packaging/README.md`](../packaging/README.md) (packaging and operator guide).
@@ -254,7 +254,7 @@ development tool — all inheriting a single version:
 
 | Workspace fact | Value |
 |----------------|-------|
-| Version | **2.4.0** (`[workspace.package].version`) |
+| Version | **2.4.2** (`[workspace.package].version`) |
 | Edition | 2021 |
 | MSRV | **1.75** (`rust-version`) |
 | Resolver | 2 |
@@ -1612,7 +1612,7 @@ fallback remains available where unblocked. When present:
   `ryzen_smu` clone, there is no network and no upstream pin;
 - **both main packages bundle that source tree** (to
   `/usr/share/ramsleuth-intel-dkms/src/` — guarded like the Intel helper, so
-  a pre-2.4.0 tag / the published v2.2.1 tarball ships nothing and skips
+  a pre-2.4.2 tag / the published v2.2.1 tarball ships nothing and skips
   cleanly), which is the exact path the helper resolves as its installed
   copy: the **one-click Intel DKMS install works from a bare AUR install**
   (either `ramsleuth` or `ramsleuth-bin`) with **no manual source step**;

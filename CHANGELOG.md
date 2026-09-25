@@ -4,6 +4,17 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project.
 
+## [2.4.2] - 2026-09-25
+
+### Added
+- Intel generational expansion: Tier 1 (Skylake/Kaby), Tier 2 (Coffee Lake/Rocket Lake with Gear2 + brand-based gen disambiguation), Tier 3 (Alder/Raptor/Meteor/Arrow Lake with DDR5 4-subchannel, Gear4, 256 KiB window, MCL fallback, tile-routing probe)
+- In-app "Submit Probe Report" feature: consent-gated markdown report (telemetry + raw IMC registers + system info) with GUI (GitHub issue / clipboard) and TUI (file / clipboard) flows
+- `.github/ISSUE_TEMPLATE/probe-report.md` for pre-filled issue submission
+
+### Changed
+- Packaging: both main AUR packages now bundle `kernel/ramsleuth-intel/` source (guarded install); mutual exclusion with the standalone `ramsleuth-intel-dkms` extra
+- Intel IMC decode now dispatches via `GenProfile` (window size, MCHBAR mask, channel count, gear cap, register map)
+
 ## v2.4.0 (2026-09-23)
 
 **Intel hardening + ergonomics** — channel-mode decode, SPD auto-bind, and the MCLK/MCHBAR fixes that completed Intel parity:
