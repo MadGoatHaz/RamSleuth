@@ -75,7 +75,8 @@ use ratatui::Frame;
 
 use ramsleuth_bench::{BenchOp, BenchmarkGrid, Metric, StreamProgress, Tier};
 use ramsleuth_telemetry::amd_readout::{
-    CadBus, ClockReadout, CommandRate, DivMode, RttValue, TimingSet, VoltageSet,
+    CadBus, ClockReadout, CommandRate, DivMode, EccStatus, MemoryChannelMode, RttValue,
+    TimingSet, VoltageSet,
 };
 use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
@@ -469,16 +470,20 @@ fn header_line2(state: &AppState) -> Line<'static> {
 
 /// Header line 3 (TUI-11 — the RAM summary, the GUI C6-20/C9-01
 /// line-3 mirror): `RAM: <total> (<summary>) <max SPD MT/s> |
-/// <channel> | <note> | Mode: <sync>` — the total capacity in the
-/// selected capacity unit (`settings.capacity_gib`), the per-DIMM
-/// breakdown ([`dimm_summary`], with the rank word), the max SPD speed
-/// (omitted when no module carries one), the channel mode
-/// ([`channel_mode`]), the total-vs-breakdown slot note
-/// ([`slot_note`], when the OS total strictly exceeds the SPD sum),
-/// and the UCLK:MCLK sync mode ([`sync_mode`] — `Synchronous 1:1`
-/// amber, `Asynchronous 1:2` crimson, `N/A` dim). The capacity + clock
-/// segments honor the frozen unit knobs. No telemetry degrades to the
-/// dim `RAM: —` placeholder (never a panic).
+/// <channel> | <note> | <ecc> | Mode: <sync>` — the total capacity
+/// in the selected capacity unit (`settings.capacity_gib`), the
+/// per-DIMM breakdown ([`dimm_summary`], with the rank word), the max
+/// SPD speed (omitted when no module carries one), the channel mode
+/// (hardware-preferred — the Intel `MAD_INTER_CHANNEL` / the AMD UMC
+/// mode; the SPD-count [`channel_mode`] when neither readout carries
+/// one), the total-vs-breakdown slot note ([`slot_note`], when the OS
+/// total strictly exceeds the SPD sum), the ECC status
+/// ([`ecc_label`] — the platform [`EccStatus`] label, the honest
+/// `N/A` when unreadable / absent), and the UCLK:MCLK sync mode
+/// ([`sync_mode`] — `Synchronous 1:1`
+/// amber, `Asynchronous 1:2` crimson, `N/A` dim). The capacity +
+/// clock segments honor the frozen unit knobs. No telemetry degrades
+/// to the dim `RAM: —` placeholder (never a panic).
 fn header_line3(state: &AppState) -> Line<'static> {
     let Some(telemetry) = &state.telemetry else {
         return Line::from(Span::styled("RAM: —", Style::default().fg(DIM)));
@@ -488,6 +493,7 @@ fn header_line3(state: &AppState) -> Line<'static> {
         state.settings.capacity_gib,
         state.settings.clock_mhz,
     );
+    let ecc = ecc_label(telemetry);
     let value = Style::default().fg(CYAN);
     let label = Style::default().fg(DIM);
     let mut spans = vec![
@@ -504,6 +510,8 @@ fn header_line3(state: &AppState) -> Line<'static> {
         spans.push(Span::styled(" | ", label));
         spans.push(Span::styled(note, Style::default().fg(AMBER)));
     }
+    spans.push(Span::styled(" | ", label));
+    spans.push(Span::styled(ecc, value));
     spans.push(Span::styled(" | Mode: ", label));
     spans.push(Span::styled(mode, Style::default().fg(mode_color)));
     Line::from(spans)
@@ -590,10 +598,11 @@ fn dimm_summary(sizes: &[Section<f64>], spd: &[SpdModule], capacity_gib: bool) -
 /// `channel_mode` mirror, D-C8): 1 / 2 / 4 → Single- / Dual- /
 /// Quad-Channel; any other count (0, odd) degrades to `N/A`.
 ///
-/// This is the **fallback** label: on Intel the header prefers the
-/// hardware `MAD_INTER_CHANNEL` channel mode (an SPD count alone cannot
-/// tell a Flex-Mode box's `Dual-Channel (Flex)` from `Single-Channel`);
-/// AMD and the no-mode Intel states use this count-derived label.
+/// This is the **fallback** label: the header prefers the hardware
+/// channel mode — the Intel `MAD_INTER_CHANNEL` (an SPD count alone
+/// cannot tell a Flex-Mode box's `Dual-Channel (Flex)` from
+/// `Single-Channel`), else the AMD UMC-synthesized mode; only the
+/// no-readout states use this count-derived label.
 fn channel_mode(dimm_count: usize) -> String {
     match dimm_count {
         1 => "Single-Channel".to_owned(),
@@ -691,10 +700,12 @@ fn intel_mode(t: &SystemMemoryTelemetry) -> Option<(String, Color)> {
 /// [`header_line3`]: the total (selected capacity unit), the
 /// breakdown, the optional speed segment (the max SPD speed; the
 /// platform MCLK×2 fallback when no module carries one —
-/// [`mclk_derived_speed`]), the channel mode (hardware-preferred on
-/// Intel, the SPD-count [`channel_mode`] elsewhere), the optional
-/// slot note, and the mode segment (text + color; the Intel hardware
-/// mode takes the slot over the AMD sync mode).
+/// [`mclk_derived_speed`]), the channel mode (hardware-preferred —
+/// the Intel `MAD_INTER_CHANNEL` mode, else the AMD UMC
+/// [`MemoryChannelMode`]; the SPD-count [`channel_mode`] when neither
+/// readout carries one), the optional slot note, and the mode
+/// segment (text + color; the Intel hardware mode takes the slot over
+/// the AMD sync mode).
 fn ram_line3_parts(
     t: &SystemMemoryTelemetry,
     capacity_gib: bool,
@@ -725,13 +736,20 @@ fn ram_line3_parts(
         .or_else(|| mclk_derived_speed(t));
     // Hardware-preferred channel label: the Intel `MAD_INTER_CHANNEL`
     // mode (a Flex-Mode box can be Dual-Flex with one bound SPD), the
-    // SPD-count label elsewhere (AMD / no-mode Intel).
-    let channel = t
-        .intel
-        .value()
-        .and_then(|ro| ro.channel_mode)
-        .map(|m| m.label().to_owned())
-        .unwrap_or_else(|| channel_mode(t.dimm_sizes.len()));
+    // AMD UMC-synthesized mode (its `Unknown` degradation renders the
+    // honest `N/A`), the SPD-count label only when neither readout
+    // carries one.
+    let channel = match (t.intel.value(), t.amd.value()) {
+        (Some(ro), _) => ro
+            .channel_mode
+            .map(|m| m.label().to_owned())
+            .unwrap_or_else(|| channel_mode(t.dimm_sizes.len())),
+        (None, Some(ro)) => match ro.channel_mode {
+            MemoryChannelMode::Unknown => "N/A".to_owned(),
+            m => m.label().to_owned(),
+        },
+        (None, None) => channel_mode(t.dimm_sizes.len()),
+    };
     let note = slot_note(&t.total_capacity, &t.dimm_sizes);
     // The Intel hardware mode takes the "Mode:" slot; the AMD sync mode
     // (and the honest `N/A`) fill it otherwise.
@@ -763,14 +781,33 @@ fn mclk_derived_speed(t: &SystemMemoryTelemetry) -> Option<String> {
     Some(format!("{:.0} MT/s", mclk * 2.0))
 }
 
+/// Line 3's ECC segment (the GUI `ecc_label` mirror): the platform
+/// ECC status (the readouts are mutually exclusive per platform,
+/// Intel probed first) as display text — the enum label, the honest
+/// `N/A` for the unreadable / absent state.
+fn ecc_label(t: &SystemMemoryTelemetry) -> String {
+    match t
+        .intel
+        .value()
+        .map(|ro| ro.ecc_status)
+        .or_else(|| t.amd.value().map(|ro| ro.ecc_status))
+        .unwrap_or(EccStatus::Unknown)
+    {
+        EccStatus::Unknown => "N/A".to_owned(),
+        s => s.label().to_owned(),
+    }
+}
+
 /// Line 3's non-mode part (the GUI `ram_line_prefix` mirror, C6-20/
 /// C9-01): the total capacity in the selected capacity unit, the
 /// per-DIMM breakdown (with the rank word), the speed segment (the max
 /// SPD speed; the platform MCLK×2 fallback when no module carries one
 /// — [`mclk_derived_speed`]; omitted only when neither is available),
-/// the channel mode (hardware-preferred on Intel, the SPD-count label
-/// elsewhere), the slot note when the OS total strictly exceeds the
-/// SPD sum, and the `Mode: ` lead-in the mode segment completes.
+/// the channel mode (hardware-preferred — the Intel
+/// `MAD_INTER_CHANNEL` / the AMD UMC mode; the SPD-count label when
+/// neither readout carries one), the slot note when the OS total
+/// strictly exceeds the SPD sum, the ECC status ([`ecc_label`]),
+/// and the `Mode: ` lead-in the mode segment completes.
 ///
 /// Test-only: [`header_line3`] builds its per-segment-coloured spans
 /// from [`ram_line3_parts`] directly; this flat-text form exists so the
@@ -778,6 +815,7 @@ fn mclk_derived_speed(t: &SystemMemoryTelemetry) -> Option<String> {
 #[cfg(test)]
 fn ram_line_prefix(t: &SystemMemoryTelemetry, capacity_gib: bool) -> String {
     let (total, summary, speed, channel, note, _) = ram_line3_parts(t, capacity_gib, true);
+    let ecc = ecc_label(t);
     let mut line = format!("RAM: {total} ({summary})");
     if let Some(speed) = speed {
         line.push_str(&format!(" {speed}"));
@@ -786,6 +824,7 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, capacity_gib: bool) -> String {
     if let Some(note) = note {
         line.push_str(&format!(" | {note}"));
     }
+    line.push_str(&format!(" | {ecc}"));
     line.push_str(" | Mode: ");
     line
 }
@@ -2423,7 +2462,9 @@ mod tests {
     /// breakdown / SPD speed / channel / sync mode).
     #[test]
     fn header_is_three_lines_with_values() {
-        let text = draw(&representative());
+        // 125 cols: the composed line 3 (the channel + ECC segments)
+        // is ~119 chars, beyond the 100-col default.
+        let text = draw_at(&representative(), 125, 30);
         let lines = text.split('\n').take(3).collect::<Vec<_>>();
         assert_eq!(lines.len(), 3, "the header occupies the top three rows");
         let l1 = &lines[0];
@@ -2440,12 +2481,13 @@ mod tests {
             lines[1]
         );
         // Line 3 (TUI-11): the composed RAM summary — the 16 GiB total,
-        // the single Dual-Rank 16 GiB DIMM, the 3200 MT/s SPD speed, the
-        // Single-Channel mode (one bound module), and the Asynchronous
-        // 1:2 UCLK:MCLK (the fixture's div mode).
+        // the single Dual-Rank 16 GiB DIMM, the 3200 MT/s SPD speed,
+        // the hardware Dual-Channel (Symmetric) mode (the UMC decode
+        // beats the one-bound-module SPD count), the ECC status, and
+        // the Asynchronous 1:2 UCLK:MCLK (the fixture's div mode).
         assert_eq!(
             lines[2],
-            "RAM: 16 GiB (1x16 GiB Dual-Rank) 3200 MT/s | Single-Channel | Mode: Asynchronous 1:2",
+            "RAM: 16 GiB (1x16 GiB Dual-Rank) 3200 MT/s | Dual-Channel (Symmetric) | ECC: Capable (disabled) | Mode: Asynchronous 1:2",
             "{}",
             lines[2]
         );
@@ -2857,7 +2899,20 @@ mod tests {
         }));
         assert_eq!(
             ram_line_prefix(&flex, true),
-            "RAM: 16 GiB (1x16 GiB) | Dual-Channel (Flex) | Mode: "
+            "RAM: 16 GiB (1x16 GiB) | Dual-Channel (Flex) | N/A | Mode: "
+        );
+
+        // The same Flex-Box with the ECC capability decode (the
+        // CAPID0_A / UmcCapHi value) → the enum label rides the ECC
+        // segment.
+        let flex_ecc = one_dimm(Section::Value(IntelReadout {
+            channels: Vec::new(),
+            channel_mode: Some(ChannelMode::DualFlex),
+            ecc_status: EccStatus::CapableButDisabled,
+        }));
+        assert_eq!(
+            ram_line_prefix(&flex_ecc, true),
+            "RAM: 16 GiB (1x16 GiB) | Dual-Channel (Flex) | ECC: Capable (disabled) | Mode: "
         );
 
         // No hardware mode (the /dev/mem fallback) → the SPD-count label.
@@ -2868,14 +2923,67 @@ mod tests {
         }));
         assert_eq!(
             ram_line_prefix(&no_mode, true),
-            "RAM: 16 GiB (1x16 GiB) | Single-Channel | Mode: "
+            "RAM: 16 GiB (1x16 GiB) | Single-Channel | N/A | Mode: "
         );
 
         // AMD (intel Na) → the SPD-count label, unchanged.
         let amd = one_dimm(Section::na(NaReason::UnsupportedHardware));
         assert_eq!(
             ram_line_prefix(&amd, true),
-            "RAM: 16 GiB (1x16 GiB) | Single-Channel | Mode: "
+            "RAM: 16 GiB (1x16 GiB) | Single-Channel | N/A | Mode: "
+        );
+    }
+
+    /// (o4) The header channel label is hardware-preferred on AMD
+    /// too: the UMC-synthesized [`MemoryChannelMode`] beats the
+    /// one-bound-DIMM SPD-count label (the live 5950X box: one bound
+    /// SPD, dual-channel silicon), and the platform [`EccStatus`]
+    /// label rides the ECC segment (`N/A` for the unreadable / absent
+    /// state — the non-root daemon's all-`Unknown` decode).
+    #[test]
+    fn amd_channel_mode_hardware_preferred() {
+        // Helper: an AMD telemetry with the given channel mode + ECC
+        // state (the fixture readout's other cells; the MCLK nulled so
+        // no derived-speed segment rides the line) + one bound
+        // 16 GiB DIMM (the SPD-count label would read
+        // "Single-Channel").
+        fn amd_t(mode: MemoryChannelMode, ecc: EccStatus) -> SystemMemoryTelemetry {
+            let mut readout = fixture_amd();
+            readout.channel_mode = mode;
+            readout.ecc_status = ecc;
+            readout.clocks.mclk_mhz = Section::na(NaReason::NotApplicable);
+            SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Amd(AmdZen::Zen3),
+                    brand: "synthetic".to_owned(),
+                },
+                amd: Section::Value(readout),
+                intel: Section::na(NaReason::UnsupportedHardware),
+                spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                    motherboard: Section::na(NaReason::NotApplicable),
+                    bios: Section::na(NaReason::NotApplicable),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::Value(16.0),
+                dimm_sizes: vec![Section::Value(16.0)],
+            }
+        }
+        // The hardware mode beats the one-bound-DIMM SPD count.
+        assert_eq!(
+            ram_line_prefix(
+                &amd_t(MemoryChannelMode::DualSymmetric, EccStatus::CapableButDisabled),
+                true,
+            ),
+            "RAM: 16 GiB (1x16 GiB) | Dual-Channel (Symmetric) | ECC: Capable (disabled) | Mode: "
+        );
+        // The all-`Unknown` decode (the non-root daemon) → the honest
+        // N/A in both the channel and the ECC segment.
+        assert_eq!(
+            ram_line_prefix(&amd_t(MemoryChannelMode::Unknown, EccStatus::Unknown), true),
+            "RAM: 16 GiB (1x16 GiB) | N/A | N/A | Mode: "
         );
     }
 
@@ -2936,7 +3044,7 @@ mod tests {
         );
         assert_eq!(
             ram_line_prefix(&t, true),
-            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | Mode: "
+            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | N/A | Mode: "
         );
         // No module carries a speed: the segment is omitted entirely.
         let no_speed = telemetry(
@@ -2946,7 +3054,7 @@ mod tests {
         );
         assert_eq!(
             ram_line_prefix(&no_speed, true),
-            "RAM: 32 GiB (2x16 GiB) | Dual-Channel | Mode: "
+            "RAM: 32 GiB (2x16 GiB) | Dual-Channel | N/A | Mode: "
         );
         // A single Na DIMM still counts as one bound module (the
         // channel is the count, not the sizes): Single-Channel.
@@ -2957,19 +3065,19 @@ mod tests {
         );
         assert_eq!(
             ram_line_prefix(&degraded, true),
-            "RAM: N/A (N/A) | Single-Channel | Mode: "
+            "RAM: N/A (N/A) | Single-Channel | N/A | Mode: "
         );
         // No bound modules at all: every segment degrades to N/A.
         let empty = telemetry(Section::na(NaReason::NotApplicable), Vec::new(), Vec::new());
         assert_eq!(
             ram_line_prefix(&empty, true),
-            "RAM: N/A (N/A) | N/A | Mode: "
+            "RAM: N/A (N/A) | N/A | N/A | Mode: "
         );
         // The GB knob: 32 GiB → 34.4 GB total, 16 GiB → 17.2 GB per
         // group.
         assert_eq!(
             ram_line_prefix(&t, false),
-            "RAM: 34.4 GB (2x17.2 GB) 3200 MT/s | Dual-Channel | Mode: "
+            "RAM: 34.4 GB (2x17.2 GB) 3200 MT/s | Dual-Channel | N/A | Mode: "
         );
         // The live-host shape: single-rank modules + the OS total
         // (62.68 GiB) above the SPD sum (32 GiB) → the rank word in
@@ -2982,7 +3090,7 @@ mod tests {
         );
         assert_eq!(
             ram_line_prefix(&ranked, true),
-            "RAM: 62.7 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | 2 of 4 slots SPD-visible | Mode: "
+            "RAM: 62.7 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | 2 of 4 slots SPD-visible | N/A | Mode: "
         );
         // The rank word with total ≤ the SPD sum: no note (no false
         // alarm).
@@ -2994,7 +3102,7 @@ mod tests {
         );
         assert_eq!(
             ram_line_prefix(&balanced, true),
-            "RAM: 32 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | Mode: "
+            "RAM: 32 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | N/A | Mode: "
         );
     }
 
@@ -3027,7 +3135,7 @@ mod tests {
         };
         assert_eq!(
             ram_line_prefix(&amd, true),
-            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | Mode: "
+            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel (Symmetric) | ECC: Capable (disabled) | Mode: "
         );
         // The Intel branch: the max channel MCLK wins (the Na-MCLK
         // second channel is skipped).
@@ -3067,7 +3175,7 @@ mod tests {
         };
         assert_eq!(
             ram_line_prefix(&intel, true),
-            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | Mode: "
+            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | N/A | Mode: "
         );
     }
 
@@ -3137,23 +3245,24 @@ mod tests {
             }
         }
         // A wide surface — the composed 1:1 line with the MCLK is
-        // ~108 columns, beyond the 100-col default.
-        let text = draw_at(&state, 130, 30);
+        // ~144 columns (the channel + ECC segments), beyond the
+        // 100-col default.
+        let text = draw_at(&state, 150, 30);
         let lines = text.split('\n').take(3).collect::<Vec<_>>();
         assert_eq!(
             lines[2],
-            "RAM: 16 GiB (1x16 GiB Dual-Rank) 3200 MT/s | Single-Channel | Mode: Synchronous 1:1 (UCLK = MCLK = 1800 MHz)",
+            "RAM: 16 GiB (1x16 GiB Dual-Rank) 3200 MT/s | Dual-Channel (Symmetric) | ECC: Capable (disabled) | Mode: Synchronous 1:1 (UCLK = MCLK = 1800 MHz)",
             "{}",
             lines[2]
         );
         // The GB capacity knob + the GHz clock knob.
         state.settings.capacity_gib = false;
         state.settings.clock_mhz = false;
-        let text = draw_at(&state, 130, 30);
+        let text = draw_at(&state, 150, 30);
         let lines = text.split('\n').take(3).collect::<Vec<_>>();
         assert_eq!(
             lines[2],
-            "RAM: 17.2 GB (1x17.2 GB Dual-Rank) 3200 MT/s | Single-Channel | Mode: Synchronous 1:1 (UCLK = MCLK = 1.8 GHz)",
+            "RAM: 17.2 GB (1x17.2 GB Dual-Rank) 3200 MT/s | Dual-Channel (Symmetric) | ECC: Capable (disabled) | Mode: Synchronous 1:1 (UCLK = MCLK = 1.8 GHz)",
             "{}",
             lines[2]
         );

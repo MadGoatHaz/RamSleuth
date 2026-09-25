@@ -134,7 +134,7 @@ use ramsleuth_gui::{
     GuiError, GuiSettings, ProbeResult, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
-use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
+use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode, EccStatus, MemoryChannelMode};
 use ramsleuth_telemetry::cpuid::CpuVendor;
 use ramsleuth_telemetry::error::Section;
 use ramsleuth_telemetry::intel_readout::ChannelMode;
@@ -1021,10 +1021,11 @@ fn dimm_summary(sizes: &[Section<f64>], spd: &[SpdModule], units: &Units) -> Str
 /// 4 → Single- / Dual- / Quad-Channel; any other count (0, odd)
 /// degrades to `N/A`.
 ///
-/// This is the **fallback** label: on Intel the header prefers the
-/// hardware `MAD_INTER_CHANNEL` channel mode (an SPD count alone cannot
-/// tell a Flex-Mode box's `Dual-Channel (Flex)` from `Single-Channel`);
-/// AMD and the no-mode Intel states use this count-derived label.
+/// This is the **fallback** label: the header prefers the hardware
+/// channel mode — the Intel `MAD_INTER_CHANNEL` (an SPD count alone
+/// cannot tell a Flex-Mode box's `Dual-Channel (Flex)` from
+/// `Single-Channel`), else the AMD UMC-synthesized mode; only the
+/// no-readout states use this count-derived label.
 fn channel_mode(dimm_count: usize) -> String {
     match dimm_count {
         1 => "Single-Channel".to_owned(),
@@ -1072,19 +1073,22 @@ fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String> {
 }
 
 /// Line 3's non-mode part (the mockup's `RAM: 64.0 GB (2x32GB)
-/// DDR5-6000 MT/s | Dual-Channel | Mode: `): the total capacity in
-/// the selected capacity unit (C7-11: `format_capacity` — the
-/// default GiB keeps the carried wire value, the GB arm converts
-/// × 1.073741824), the per-DIMM breakdown (C9-01, D-1: with the
-/// rank word from the parallel SPD list — `2x16 GiB Single-Rank`),
-/// the speed segment (the max SPD speed; the platform MCLK×2
-/// fallback when no module carries one — [`mclk_derived_speed`];
-/// omitted only when neither is available), the channel mode
-/// (hardware-preferred on Intel — the
-/// `MAD_INTER_CHANNEL` mode; the SPD-count [`channel_mode`] elsewhere),
-/// the total-vs-breakdown slot note when the OS total strictly exceeds
-/// the SPD sum (C9-01, D-1: `2 of 4 slots SPD-visible`), and the
-/// `Mode: ` lead-in the mode segment completes.
+/// DDR5-6000 MT/s | Dual-Channel | ECC: … | Mode: `): the total
+/// capacity in the selected capacity unit (C7-11:
+/// `format_capacity` — the default GiB keeps the carried wire value,
+/// the GB arm converts × 1.073741824), the per-DIMM breakdown
+/// (C9-01, D-1: with the rank word from the parallel SPD list —
+/// `2x16 GiB Single-Rank`), the speed segment (the max SPD speed; the
+/// platform MCLK×2 fallback when no module carries one —
+/// [`mclk_derived_speed`]; omitted only when neither is available),
+/// the channel mode (hardware-preferred — the Intel
+/// `MAD_INTER_CHANNEL` mode, else the AMD UMC mode; the SPD-count
+/// [`channel_mode`] when neither readout carries one), the
+/// total-vs-breakdown slot note when the OS total strictly exceeds the
+/// SPD sum (C9-01, D-1: `2 of 4 slots SPD-visible`), the ECC
+/// status ([`ecc_label`] — the platform [`EccStatus`] label, the
+/// honest `N/A` when unreadable / absent), and the `Mode: ` lead-in
+/// the mode segment completes.
 fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
     let total = match t.total_capacity.value() {
         Some(gib) => format_capacity(*gib, units),
@@ -1105,17 +1109,25 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
     }
     // Hardware-preferred channel label: the Intel `MAD_INTER_CHANNEL`
     // mode (a Flex-Mode box can be Dual-Flex with one bound SPD), the
-    // SPD-count label elsewhere (AMD / no-mode Intel).
-    let channel = t
-        .intel
-        .value()
-        .and_then(|ro| ro.channel_mode)
-        .map(|m| m.label().to_owned())
-        .unwrap_or_else(|| channel_mode(t.dimm_sizes.len()));
+    // AMD UMC-synthesized mode (its `Unknown` degradation renders the
+    // honest `N/A`), the SPD-count label only when neither readout
+    // carries one.
+    let channel = match (t.intel.value(), t.amd.value()) {
+        (Some(ro), _) => ro
+            .channel_mode
+            .map(|m| m.label().to_owned())
+            .unwrap_or_else(|| channel_mode(t.dimm_sizes.len())),
+        (None, Some(ro)) => match ro.channel_mode {
+            MemoryChannelMode::Unknown => "N/A".to_owned(),
+            m => m.label().to_owned(),
+        },
+        (None, None) => channel_mode(t.dimm_sizes.len()),
+    };
     line.push_str(&format!(" | {channel}"));
     if let Some(note) = slot_note(&t.total_capacity, &t.dimm_sizes) {
         line.push_str(&format!(" | {note}"));
     }
+    line.push_str(&format!(" | {}", ecc_label(t)));
     line.push_str(" | Mode: ");
     line
 }
@@ -1142,6 +1154,23 @@ fn mclk_derived_speed(t: &SystemMemoryTelemetry) -> Option<String> {
             }),
     }?;
     Some(format!("{:.0} MT/s", mclk * 2.0))
+}
+
+/// Line 3's ECC segment (the TUI `ecc_label` mirror): the platform
+/// ECC status (the readouts are mutually exclusive per platform,
+/// Intel probed first) as display text — the enum label, the honest
+/// `N/A` for the unreadable / absent state.
+fn ecc_label(t: &SystemMemoryTelemetry) -> String {
+    match t
+        .intel
+        .value()
+        .map(|ro| ro.ecc_status)
+        .or_else(|| t.amd.value().map(|ro| ro.ecc_status))
+        .unwrap_or(EccStatus::Unknown)
+    {
+        EccStatus::Unknown => "N/A".to_owned(),
+        s => s.label().to_owned(),
+    }
 }
 
 /// Line 3's mode segment (D-C8): the UCLK:MCLK ratio from the AMD
@@ -1203,9 +1232,10 @@ impl RamSleuthApp {
     /// tooltip — C6-30) and a right-anchored button cluster (the
     /// `Probe`, `Setup`, `Settings`, and `Graphs` toggles — the
     /// latter C7-21, D-3; the `Setup` toggle C18, D-18.5); line 2
-    /// the CPU + platform identity; line 3 the RAM summary,
-    /// channel, and sync mode (the capacity + clock segments
-    /// render in the live `units` knob's units — C7-11) — plus
+    /// the CPU + platform identity; line 3 the RAM summary
+    /// (capacity / breakdown / speed / channel / ECC) and sync mode
+    /// (the capacity + clock segments render in the live `units`
+    /// knob's units — C7-11) — plus
     /// the transient notice line (the last F2 / F3 result) while
     /// one is showing. No telemetry yet (never polled) → the
     /// placeholder lines (a missing daemon never crashes the GUI,
@@ -2488,7 +2518,7 @@ mod tests {
     use ramsleuth_bench::BenchmarkGrid;
     use ramsleuth_gui::{BenchState, CapacityUnit, ClockUnit, DEFAULT_POLL_INTERVAL_MS};
     use ramsleuth_telemetry::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
-    use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode, map_amd};
+    use ramsleuth_telemetry::amd_readout::{AmdReadout, ClockReadout, DivMode, map_amd};
     use ramsleuth_telemetry::amd_readout::EccStatus;
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
@@ -3183,8 +3213,8 @@ mod tests {
 
     /// (h5c) The header channel label is hardware-preferred: a Flex-Mode
     /// box (one bound SPD, Dual-Flex) shows `Dual-Channel (Flex)` — not
-    /// the SPD-count `Single-Channel`; AMD / no-mode Intel keep the
-    /// SPD-count label.
+    /// the SPD-count `Single-Channel`; no-mode Intel and the
+    /// no-readout states keep the SPD-count label.
     #[test]
     fn channel_label_hardware_preferred() {
         // Helper: a telemetry with the given intel section + one bound
@@ -3219,7 +3249,19 @@ mod tests {
         }));
         assert_eq!(
             ram_line_prefix(&flex, &Units::default()),
-            "RAM: 16 GiB (1x16 GiB) | Dual-Channel (Flex) | Mode: "
+            "RAM: 16 GiB (1x16 GiB) | Dual-Channel (Flex) | N/A | Mode: "
+        );
+
+        // The same Flex-Box with the ECC capability decode (the
+        // CAPID0_A value) → the enum label rides the ECC segment.
+        let flex_ecc = one_dimm(Section::Value(IntelReadout {
+            channels: Vec::new(),
+            channel_mode: Some(ChannelMode::DualFlex),
+            ecc_status: EccStatus::CapableButDisabled,
+        }));
+        assert_eq!(
+            ram_line_prefix(&flex_ecc, &Units::default()),
+            "RAM: 16 GiB (1x16 GiB) | Dual-Channel (Flex) | ECC: Capable (disabled) | Mode: "
         );
 
         // No hardware mode (the /dev/mem fallback) → the SPD-count label.
@@ -3230,14 +3272,98 @@ mod tests {
         }));
         assert_eq!(
             ram_line_prefix(&no_mode, &Units::default()),
-            "RAM: 16 GiB (1x16 GiB) | Single-Channel | Mode: "
+            "RAM: 16 GiB (1x16 GiB) | Single-Channel | N/A | Mode: "
         );
 
-        // AMD (intel Na) → the SPD-count label, unchanged.
+        // No readout at all (AMD Na + Intel Na) → the SPD-count
+        // label, unchanged.
         let amd = one_dimm(Section::na(NaReason::NotApplicable));
         assert_eq!(
             ram_line_prefix(&amd, &Units::default()),
-            "RAM: 16 GiB (1x16 GiB) | Single-Channel | Mode: "
+            "RAM: 16 GiB (1x16 GiB) | Single-Channel | N/A | Mode: "
+        );
+    }
+
+    /// (h5d) The header channel label is hardware-preferred on AMD
+    /// too: the UMC-synthesized [`MemoryChannelMode`] beats the
+    /// one-bound-DIMM SPD-count label (the live 5950X box: one bound
+    /// SPD, dual-channel silicon), and the platform [`EccStatus`]
+    /// label rides the ECC segment (`N/A` for the unreadable / absent
+    /// state — the non-root daemon's all-`Unknown` decode).
+    #[test]
+    fn amd_channel_mode_hardware_preferred() {
+        // A PM-snapshot-mapped readout (the MCLK at 0 → Na, so no
+        // derived-speed segment rides the line) with the channel mode
+        // + ECC state overridden to the case under test.
+        fn amd_readout(mode: MemoryChannelMode, ecc: EccStatus) -> AmdReadout {
+            let mut readout = map_amd(&AmdPmSnapshot {
+                version: 0x0007_0B02,
+                mclk_mhz: 0,
+                uclk_mhz: 1600,
+                fclk_mhz: 1600,
+                div_mode: 0,
+                gdm: 1,
+                pdm: 0,
+                command_rate: 0,
+                timings: AmdPmTimings {
+                    cl: 16, rcwdwr: 16, rcdrd: 16, rp: 16, ras: 32, rc: 48, rrds: 4,
+                    rrld: 4, faw: 16, wtrs: 8, wtrl: 8, wr: 8, rfc1: 160, rfc2: 160,
+                    rfcsb: 160, cwl: 16, rtp: 8, rdwr: 8, wrrd: 4, rdrd_sd: 100,
+                    rdrd_dd: 101, rdrd_scl: 102, rdrd_sc: 103, wrwr_sd: 104,
+                    wrwr_dd: 105, wrwr_scl: 106, wrwr_sc: 107,
+                },
+                cad_bus: AmdPmCadBus {
+                    proc_odt: 5, rtt_nom: 2, rtt_wr: 0, rtt_park: 4, clk_drv: 6,
+                    addr_cmd_drv: 8, cs_odt_drv: 10, cke_drv: 12,
+                },
+                voltages: AmdPmVoltages {
+                    vddcr_soc_mv: 1150, vddio_mem_mv: 1350, vdd_misc_mv: 1000,
+                    vpp_mv: 1800, vcore_mv: 1150,
+                },
+            });
+            readout.channel_mode = mode;
+            readout.ecc_status = ecc;
+            readout
+        }
+        // Helper: an AMD telemetry with the given readout + one bound
+        // 16 GiB DIMM (the SPD-count label would read
+        // "Single-Channel").
+        fn amd_t(mode: MemoryChannelMode, ecc: EccStatus) -> SystemMemoryTelemetry {
+            SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Amd(AmdZen::Zen3),
+                    brand: "synthetic".to_owned(),
+                },
+                amd: Section::Value(amd_readout(mode, ecc)),
+                intel: Section::na(NaReason::UnsupportedHardware),
+                spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                    motherboard: Section::na(NaReason::NotApplicable),
+                    bios: Section::na(NaReason::NotApplicable),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::Value(16.0),
+                dimm_sizes: vec![Section::Value(16.0)],
+            }
+        }
+        // The hardware mode beats the one-bound-DIMM SPD count.
+        assert_eq!(
+            ram_line_prefix(
+                &amd_t(MemoryChannelMode::DualSymmetric, EccStatus::CapableButDisabled),
+                &Units::default(),
+            ),
+            "RAM: 16 GiB (1x16 GiB) | Dual-Channel (Symmetric) | ECC: Capable (disabled) | Mode: "
+        );
+        // The all-`Unknown` decode (the non-root daemon) → the honest
+        // N/A in both the channel and the ECC segment.
+        assert_eq!(
+            ram_line_prefix(
+                &amd_t(MemoryChannelMode::Unknown, EccStatus::Unknown),
+                &Units::default(),
+            ),
+            "RAM: 16 GiB (1x16 GiB) | N/A | N/A | Mode: "
         );
     }
 
@@ -3260,7 +3386,7 @@ mod tests {
         );
         assert_eq!(
             ram_line_prefix(&t, &Units::default()),
-            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | Mode: "
+            "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel | N/A | Mode: "
         );
 
         let no_speed = fixture_telemetry(
@@ -3270,7 +3396,7 @@ mod tests {
         );
         assert_eq!(
             ram_line_prefix(&no_speed, &Units::default()),
-            "RAM: 32 GiB (2x16 GiB) | Dual-Channel | Mode: "
+            "RAM: 32 GiB (2x16 GiB) | Dual-Channel | N/A | Mode: "
         );
 
         // A single Na DIMM still counts as one bound module (the
@@ -3282,7 +3408,7 @@ mod tests {
         );
         assert_eq!(
             ram_line_prefix(&degraded, &Units::default()),
-            "RAM: N/A (N/A) | Single-Channel | Mode: "
+            "RAM: N/A (N/A) | Single-Channel | N/A | Mode: "
         );
 
         // No bound modules at all: every segment degrades to N/A.
@@ -3293,7 +3419,7 @@ mod tests {
         );
         assert_eq!(
             ram_line_prefix(&empty, &Units::default()),
-            "RAM: N/A (N/A) | N/A | Mode: "
+            "RAM: N/A (N/A) | N/A | N/A | Mode: "
         );
 
         // The GB knob (C7-11): 32 GiB → 34.4 GB total, 16 GiB →
@@ -3301,7 +3427,7 @@ mod tests {
         let gb = Units { capacity: CapacityUnit::GB, ..Units::default() };
         assert_eq!(
             ram_line_prefix(&t, &gb),
-            "RAM: 34.4 GB (2x17.2 GB) 3200 MT/s | Dual-Channel | Mode: "
+            "RAM: 34.4 GB (2x17.2 GB) 3200 MT/s | Dual-Channel | N/A | Mode: "
         );
 
         // C9-01 (D-1): the live host shape — single-rank modules
@@ -3319,7 +3445,7 @@ mod tests {
         );
         assert_eq!(
             ram_line_prefix(&ranked, &Units::default()),
-            "RAM: 62.7 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | 2 of 4 slots SPD-visible | Mode: "
+            "RAM: 62.7 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | 2 of 4 slots SPD-visible | N/A | Mode: "
         );
 
         // The rank word with total ≤ the SPD sum: no note (no
@@ -3331,7 +3457,7 @@ mod tests {
         );
         assert_eq!(
             ram_line_prefix(&balanced, &Units::default()),
-            "RAM: 32 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | Mode: "
+            "RAM: 32 GiB (2x16 GiB Single-Rank) 3200 MT/s | Dual-Channel | N/A | Mode: "
         );
     }
 
@@ -3409,7 +3535,7 @@ mod tests {
         t.amd = Section::Value(map_amd(&amd_snapshot(1200)));
         assert_eq!(
             ram_line_prefix(&t, &Units::default()),
-            "RAM: 32 GiB (2x16 GiB) 2400 MT/s | Dual-Channel | Mode: "
+            "RAM: 32 GiB (2x16 GiB) 2400 MT/s | N/A | N/A | Mode: "
         );
         // An out-of-band MCLK (0 → Na) keeps the pre-fallback omission.
         let mut na = fixture_telemetry(
@@ -3420,7 +3546,7 @@ mod tests {
         na.amd = Section::Value(map_amd(&amd_snapshot(0)));
         assert_eq!(
             ram_line_prefix(&na, &Units::default()),
-            "RAM: 32 GiB (2x16 GiB) | Dual-Channel | Mode: "
+            "RAM: 32 GiB (2x16 GiB) | N/A | N/A | Mode: "
         );
     }
 
