@@ -11,13 +11,18 @@
 //!   ramsleuth-client P3-21 / ramsleuth-tui P3-24 precedent).
 //! - **App** — a 968×600 eframe window carrying the dark-slate
 //!   [`build_style`]: the spec's 3-line header (Grand Design §3.1,
-//!   C6-20) — line 1 the `RamSleuth v2.1.0` title, the platform tag,
-//!   the daemon status (naming the live settings socket — C6-30),
-//!   the `Settings` toggle, the `Graphs` window toggle (C7-21,
-//!   D-3), and the `[F2] snapshot · [F3] export · [Q] quit`
-//!   legend; line 2 the CPU and platform identity; line 3
-//!   the RAM summary, channel, and sync mode — plus a transient
-//!   export notice. The `Settings` toggle opens the C6-26 settings
+//!   C6-20) — line 1 a left anchor (the `RamSleuth v<version>`
+//!   title, the platform badge — the CPU vendor's short `AMD` /
+//!   `Intel` / `Unknown` pill — and the compact daemon status: a
+//!   colored dot, `Daemon OK` connected / `Daemon` disconnected,
+//!   the live settings socket on the hover tooltip — C6-30) plus a
+//!   right-anchored button cluster (the `Probe`, `Setup`,
+//!   `Settings`, and `Graphs` toggles — the latter C7-21, D-3);
+//!   line 2 the CPU and platform identity; line 3 the RAM summary,
+//!   channel, and sync mode — plus a transient export notice (the
+//!   `[F2] snapshot · [F3] export · [Q] quit` key legend lives in
+//!   the status zone's actions row, not the header). The
+//!   `Settings` toggle opens the C6-26 settings
 //!   panel as its own top strip below the header (C6-30). Over the
 //!   three zones: the telemetry matrix on the left, the benchmark
 //!   grid stacked over the hardware / SPD status on the right — the
@@ -130,7 +135,7 @@ use ramsleuth_gui::{
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode};
-use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
+use ramsleuth_telemetry::cpuid::CpuVendor;
 use ramsleuth_telemetry::error::Section;
 use ramsleuth_telemetry::intel_readout::ChannelMode;
 use ramsleuth_telemetry::probe::render_probe_report_md;
@@ -186,6 +191,14 @@ const COLUMN_GAP: f32 = 8.0;
 const OUTER_MARGIN: f32 = 8.0;
 /// The header strip's stroke (a dim line over the SLATE fill).
 const HEADER_STROKE: egui::Color32 = egui::Color32::from_rgb(0x34, 0x34, 0x40);
+/// The header's compact daemon-status dot colors: GREEN for a
+/// connected + healthy daemon, RED for a disconnected / errored one
+/// (the short `Daemon OK` / `Daemon` label rides the same state).
+const DAEMON_OK_GREEN: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
+const DAEMON_DOWN_RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 80);
+/// The header's platform badge pill fill (a muted step above the
+/// SLATE header fill).
+const BADGE_BG: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x2A, 0x33);
 
 /// The window-embed icon (C21-26): the C21-25 committed hicolor
 /// master — 256×256 RGBA8 (covers any title-bar DPI).
@@ -395,18 +408,22 @@ fn seed_settings(args: &GuiArgs) -> GuiSettings {
     }
 }
 
-/// The header's daemon-status color: CYAN when connected and healthy
-/// (no recorded error), CRIMSON otherwise — the status zone's
-/// `daemon_status_color` rule (that helper is private to the zone, so
-/// the header keeps this copy for the top strip).
-fn header_status_color(data: &TelemetryData) -> egui::Color32 {
+/// The header's compact daemon-status indicator: the dot color
+/// (GREEN when connected and healthy — no recorded error; RED
+/// otherwise — the status zone's `daemon_status_color` rule, copied
+/// here for the top strip) + the short label (`Daemon OK` /
+/// `Daemon`). The socket path is not rendered inline (the former
+/// verbose `Daemon: Connected (IPC: …)` line drove the header's
+/// text collision at the 968 px default width) — it rides the
+/// label's hover tooltip.
+fn daemon_status_indicator(data: &TelemetryData) -> (egui::Color32, &'static str) {
     let healthy = !data.daemon_status.is_empty()
         && data.daemon_status.starts_with("connected")
         && data.error.is_none();
     if healthy {
-        CYAN
+        (DAEMON_OK_GREEN, "Daemon OK")
     } else {
-        CRIMSON
+        (DAEMON_DOWN_RED, "Daemon")
     }
 }
 
@@ -877,34 +894,16 @@ impl eframe::App for RamSleuthApp {
 // clock segments honor the live `units` knob (C7-11).
 // ---------------------------------------------------------------------
 
-/// Line 1's platform tag (the mockup's `[AMD AM5 Platform]`): the
-/// CPU vendor + a best-effort socket family from [`CpuVendor`] — the
-/// Zen generations map to their socket family (Zen 1–3 → `AM4`,
-/// Zen 4/5 → `AM5`), Intel maps to its generic `LGA` family (a
-/// generation does not identify a socket number unambiguously —
-/// mobile and desktop share generations), and an unrecognized vendor
-/// carries no family at all (an honest bare `Platform`).
-fn platform_tag(vendor: &CpuVendor) -> String {
+/// Line 1's platform badge (the small muted pill): the CPU vendor's
+/// short word — `AMD` / `Intel` / `Unknown` — a far narrower take on
+/// the former `[AMD AM5 Platform]` tag (whose socket-family detail
+/// the CPU brand on line 2 already carries; the extra width drove
+/// the header's text collision at the 968 px default).
+fn platform_badge(vendor: &CpuVendor) -> &'static str {
     match vendor {
-        CpuVendor::Amd(AmdZen::Zen1 | AmdZen::Zen2 | AmdZen::Zen3) => "AMD AM4 Platform".to_owned(),
-        CpuVendor::Amd(AmdZen::Zen4 | AmdZen::Zen5) => "AMD AM5 Platform".to_owned(),
-        CpuVendor::Intel(_) => "Intel LGA Platform".to_owned(),
-        CpuVendor::Unknown => "Platform".to_owned(),
-    }
-}
-
-/// Line 1's daemon status (the mockup's `Daemon: Connected
-/// (IPC: /run/ramsleuth)`): a successful last poll names the
-/// configured socket, the never-polled (empty-status) state shows
-/// `Disconnected` + the socket we are trying, and any other recorded
-/// status degrades to a bare `Disconnected`.
-fn daemon_status_text(data: &TelemetryData, socket: &Path) -> String {
-    if data.daemon_status.starts_with("connected") {
-        format!("Daemon: Connected (IPC: {})", socket.display())
-    } else if data.daemon_status.is_empty() {
-        format!("Daemon: Disconnected (IPC: {})", socket.display())
-    } else {
-        "Daemon: Disconnected".to_owned()
+        CpuVendor::Amd(_) => "AMD",
+        CpuVendor::Intel(_) => "Intel",
+        CpuVendor::Unknown => "Unknown",
     }
 }
 
@@ -1162,18 +1161,20 @@ fn intel_mode(t: &SystemMemoryTelemetry) -> Option<(String, Option<egui::Color32
 
 impl RamSleuthApp {
     /// The header strip (Grand Design §3.1): the spec's 3-line
-    /// header — line 1 the `RamSleuth v2.1.0` title, the platform
-    /// tag, the daemon status (naming the live settings socket —
-    /// C6-30), the `Settings` toggle, the `Setup` requirements
-    /// toggle (C18, D-18.5), the `Graphs` window toggle (C7-21,
-    /// D-3), and the `[F2] snapshot · [F3] export · [Q]
-    /// quit` legend; line 2 the CPU + platform identity; line 3
-    /// the RAM summary, channel, and sync mode (the capacity +
-    /// clock segments render in the live `units` knob's units —
-    /// C7-11) — plus the transient notice line (the last F2 / F3
-    /// result) while one is showing. No
-    /// telemetry yet (never polled) → the placeholder lines (a
-    /// missing daemon never crashes the GUI, plan D5).
+    /// header — line 1 a left anchor (the `RamSleuth v<version>`
+    /// title, the platform badge — the CPU vendor's short pill,
+    /// the compact daemon-status dot + `Daemon OK` / `Daemon`
+    /// label, the live settings socket on the label's hover
+    /// tooltip — C6-30) and a right-anchored button cluster (the
+    /// `Probe`, `Setup`, `Settings`, and `Graphs` toggles — the
+    /// latter C7-21, D-3; the `Setup` toggle C18, D-18.5); line 2
+    /// the CPU + platform identity; line 3 the RAM summary,
+    /// channel, and sync mode (the capacity + clock segments
+    /// render in the live `units` knob's units — C7-11) — plus
+    /// the transient notice line (the last F2 / F3 result) while
+    /// one is showing. No telemetry yet (never polled) → the
+    /// placeholder lines (a missing daemon never crashes the GUI,
+    /// plan D5).
     ///
     /// An associated function (no `self`): it needs only the
     /// snapshot + the `settings_open` toggle (the `Settings` button
@@ -1203,15 +1204,18 @@ impl RamSleuthApp {
             }
             None => ("CPU: —".to_owned(), "RAM: —".to_owned(), String::new(), None),
         };
-        let tag = data
+        // Line 1's left anchor: the badge is the CPU vendor's short
+        // word (`Unknown` when no poll has landed yet); the daemon
+        // status is the dot + label pair. The live settings socket
+        // (C6-30) — the panel's `Socket` field, seeded from the CLI
+        // `--socket` at startup and read live by the poller — rides
+        // the label's hover tooltip, built in place below.
+        let badge = data
             .telemetry
             .as_ref()
-            .map(|t| platform_tag(&t.cpu.vendor))
-            .unwrap_or_else(|| "Platform".to_owned());
-        // The live settings socket (C6-30): the panel's `Socket`
-        // field is the single source (seeded from the CLI `--socket`
-        // at startup; the poller reads it live).
-        let status = daemon_status_text(data, Path::new(&data.settings.socket));
+            .map(|t| platform_badge(&t.cpu.vendor))
+            .unwrap_or("Unknown");
+        let (dot, daemon_label) = daemon_status_indicator(data);
         // The "Probe" button's click edge (chunk probe-3): captured in
         // the closure, reported as the function's return value.
         let mut probe_clicked = false;
@@ -1222,16 +1226,39 @@ impl RamSleuthApp {
                     .stroke(egui::Stroke::new(1.0_f32, HEADER_STROKE)),
             )
             .show(ctx, |ui| {
-                // Line 1: title + platform tag + daemon status + legend.
+                // Line 1: the left anchor (the title, the platform
+                // badge, the compact daemon status) + the
+                // right-anchored button cluster — the two ends of
+                // the row never meet at the 968 px default (the
+                // former verbose daemon string + the hotkey legend
+                // collided there).
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
                     ui.label(
-                        egui::RichText::new(format!("RamSleuth v{}", env!("CARGO_PKG_VERSION"))).strong().color(CYAN).size(20.0),
+                        egui::RichText::new(format!("RamSleuth v{}", env!("CARGO_PKG_VERSION")))
+                            .strong()
+                            .color(CYAN)
+                            .size(20.0),
                     );
                     ui.separator();
-                    ui.label(egui::RichText::new(format!("[{tag}]")));
+                    // The platform badge: the vendor's short word
+                    // in a small muted pill.
+                    egui::Frame::default()
+                        .fill(BADGE_BG)
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(badge).small().weak());
+                        });
                     ui.separator();
-                    ui.label(egui::RichText::new(&status).color(header_status_color(data)));
+                    // The compact daemon status: the colored dot +
+                    // the short label — the full socket path rides
+                    // the hover tooltip.
+                    let (dot_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().circle(dot_rect.center(), 6.0, dot, egui::Stroke::NONE);
+                    ui.label(daemon_label)
+                        .on_hover_text(format!("IPC: {}", data.settings.socket));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(10.0);
                         // The Graphs window (C7-21, D-3): the
@@ -1281,10 +1308,6 @@ impl RamSleuthApp {
                         {
                             probe_clicked = true;
                         }
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("[F2] snapshot · [F3] export · [Q] quit").weak(),
-                        );
                     });
                 });
                 // Line 2: the CPU + platform identity.
@@ -2636,30 +2659,42 @@ mod tests {
         );
     }
 
-    /// `header_status_color`: CYAN only when connected + healthy;
-    /// CRIMSON for an error, a disconnected status, or a never-polled
-    /// (empty) status.
+    /// `daemon_status_indicator`: GREEN + `Daemon OK` only when
+    /// connected + healthy; RED + `Daemon` for an error, a
+    /// disconnected status, or a never-polled (empty) status.
     #[test]
-    fn header_status_color_semantics() {
+    fn daemon_status_indicator_semantics() {
         let healthy = TelemetryData {
             daemon_status: "connected: /tmp/x".to_owned(),
             error: None,
             ..Default::default()
         };
-        assert_eq!(header_status_color(&healthy), CYAN);
+        assert_eq!(
+            daemon_status_indicator(&healthy),
+            (DAEMON_OK_GREEN, "Daemon OK")
+        );
 
         let errored = TelemetryData {
             daemon_status: "connected: /tmp/x".to_owned(),
             error: Some("boom".to_owned()),
             ..Default::default()
         };
-        assert_eq!(header_status_color(&errored), CRIMSON);
+        assert_eq!(
+            daemon_status_indicator(&errored),
+            (DAEMON_DOWN_RED, "Daemon")
+        );
 
         let disconnected =
             TelemetryData { daemon_status: "disconnected".to_owned(), ..Default::default() };
-        assert_eq!(header_status_color(&disconnected), CRIMSON);
+        assert_eq!(
+            daemon_status_indicator(&disconnected),
+            (DAEMON_DOWN_RED, "Daemon")
+        );
 
-        assert_eq!(header_status_color(&TelemetryData::default()), CRIMSON);
+        assert_eq!(
+            daemon_status_indicator(&TelemetryData::default()),
+            (DAEMON_DOWN_RED, "Daemon")
+        );
     }
 
     /// `notice_color`: a written file reads CYAN, a failed export
@@ -2754,47 +2789,19 @@ mod tests {
         }
     }
 
-    /// (h1) `platform_tag`: the vendor → socket-family map — Zen 1–3
-    /// → AM4, Zen 4/5 → AM5, Intel → LGA, unknown → the honest bare
-    /// `Platform`.
+    /// (h1) `platform_badge`: the vendor's short word — any AMD Zen
+    /// → `AMD`, any Intel → `Intel`, the unrecognized vendor →
+    /// `Unknown`.
     #[test]
-    fn platform_tag_maps_every_vendor() {
-        assert_eq!(platform_tag(&CpuVendor::Amd(AmdZen::Zen1)), "AMD AM4 Platform");
-        assert_eq!(platform_tag(&CpuVendor::Amd(AmdZen::Zen2)), "AMD AM4 Platform");
-        assert_eq!(platform_tag(&CpuVendor::Amd(AmdZen::Zen3)), "AMD AM4 Platform");
-        assert_eq!(platform_tag(&CpuVendor::Amd(AmdZen::Zen4)), "AMD AM5 Platform");
-        assert_eq!(platform_tag(&CpuVendor::Amd(AmdZen::Zen5)), "AMD AM5 Platform");
+    fn platform_badge_maps_every_vendor() {
+        for zen in [AmdZen::Zen1, AmdZen::Zen2, AmdZen::Zen3, AmdZen::Zen4, AmdZen::Zen5] {
+            assert_eq!(platform_badge(&CpuVendor::Amd(zen)), "AMD");
+        }
         assert_eq!(
-            platform_tag(&CpuVendor::Intel(IntelGen::AlderLake)),
-            "Intel LGA Platform"
+            platform_badge(&CpuVendor::Intel(IntelGen::AlderLake)),
+            "Intel"
         );
-        assert_eq!(platform_tag(&CpuVendor::Unknown), "Platform");
-    }
-
-    /// (h2) `daemon_status_text`: a successful poll names the
-    /// configured socket, the never-polled (empty) state shows
-    /// `Disconnected` + the socket we are trying, and a recorded
-    /// failure is a bare `Disconnected`.
-    #[test]
-    fn daemon_status_text_arms() {
-        let socket = Path::new("/run/ramsleuth/ramsleuth.sock");
-        let connected = TelemetryData {
-            daemon_status: "connected: /run/ramsleuth/ramsleuth.sock".to_owned(),
-            ..Default::default()
-        };
-        assert_eq!(
-            daemon_status_text(&connected, socket),
-            "Daemon: Connected (IPC: /run/ramsleuth/ramsleuth.sock)"
-        );
-
-        assert_eq!(
-            daemon_status_text(&TelemetryData::default(), socket),
-            "Daemon: Disconnected (IPC: /run/ramsleuth/ramsleuth.sock)"
-        );
-
-        let down =
-            TelemetryData { daemon_status: "disconnected".to_owned(), ..Default::default() };
-        assert_eq!(daemon_status_text(&down, socket), "Daemon: Disconnected");
+        assert_eq!(platform_badge(&CpuVendor::Unknown), "Unknown");
     }
 
     /// (h3) `cpu_line_text`: the spec's line 2 — brand + the clock in
