@@ -428,6 +428,12 @@ what the probe report collects + the explicit no-personal-information
 note. */
 const PROBE_CONSENT_BODY: &str = "RamSleuth can gather the following system information to help the developers improve the app:\n\n\u{2022} CPU brand, detected generation, PCI host-bridge ID\n\u{2022} Kernel version, OS, architecture\n\u{2022} RamSleuth version, telemetry source\n\u{2022} The decoded memory readout (MCLK, MT/s, timings, SPD)\n\u{2022} The raw IMC register values\n\u{2022} N/A reasons\n\n**Not collected:** username, hostname, IP address, MAC address, serial numbers, file paths.\n\nDo you allow RamSleuth to gather this information?";
 
+/// The header's transient notice after [Open GitHub Issue] (chunk
+/// probe-3): the full report is in the clipboard — the user pastes
+/// it into the issue body (the body does not ride the URL — see
+/// [`probe_issue_url`]).
+const PROBE_ISSUE_COPY_NOTICE: &str = "Report copied to clipboard — paste it into the issue body.";
+
 /// The header's per-frame action (the header buttons that need
 /// app-level dispatch): `None` when nothing was clicked this frame,
 /// `Probe` when the "Probe" button was clicked (chunk probe-3 — the
@@ -504,13 +510,16 @@ fn probe_issue_title(report: &ProbeReport) -> String {
 }
 
 /// The pre-filled GitHub issue URL (chunk probe-3): the repo's
-/// `issues/new` form with the title + the rendered markdown body, both
-/// percent-encoded (RFC 3986).
-fn probe_issue_url(title: &str, body: &str) -> String {
+/// `issues/new` form with the title only, percent-encoded (RFC 3986).
+/// The markdown body deliberately does NOT ride the URL — a full
+/// report (4–5 KB raw, 8–12 KB percent-encoded) exceeds GitHub's
+/// issue-form length limit (the 404); the clipboard carries it
+/// instead (the "Open GitHub Issue" click copies it and flashes the
+/// paste-into-the-body notice in the header).
+fn probe_issue_url(title: &str) -> String {
     format!(
-        "https://github.com/MadGoat/RamSleuth/issues/new?title={}&body={}",
-        url_encode(title),
-        url_encode(body)
+        "https://github.com/MadGoat/RamSleuth/issues/new?title={}",
+        url_encode(title)
     )
 }
 
@@ -1809,11 +1818,14 @@ impl RamSleuthApp {
     /// the dimmed full-screen block + the centered "Probe Report
     /// Preview" box. The body is a scrollable read-only
     /// `TextEdit::multiline` over the rendered markdown;
-    /// [Open GitHub Issue] (the primary CYAN fill) opens the
-    /// pre-filled `issues/new` URL (the title + the markdown body,
-    /// percent-encoded) in the OS browser + moves the flow to
-    /// `Done`; [Copy to Clipboard] copies the markdown (the dialog
-    /// stays open); [Cancel] returns to `Idle`.
+    /// [Open GitHub Issue] (the primary CYAN fill) copies the full
+    /// markdown report to the clipboard, opens the pre-filled
+    /// `issues/new` URL (the title only — the body would exceed
+    /// GitHub's issue-form limit, the 404) in the OS browser,
+    /// flashes the "paste it into the issue body" notice in the
+    /// header, + moves the flow to `Done`; [Copy to Clipboard]
+    /// copies the markdown (the dialog stays open); [Cancel]
+    /// returns to `Idle`.
     fn render_probe_preview_dialog(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
         egui::Area::new(egui::Id::new("ramsleuth_probe_preview_block"))
@@ -1876,8 +1888,11 @@ impl RamSleuthApp {
                             ui.horizontal(|ui| {
                                 // Primary (the wizard button's
                                 // precedent): the CYAN fill + the
-                                // SLATE text — open the pre-filled
-                                // GitHub issue + end the flow.
+                                // SLATE text — copy the report to
+                                // the clipboard, open the
+                                // pre-filled (title-only) GitHub
+                                // issue, flash the paste notice,
+                                // end the flow.
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -1887,9 +1902,22 @@ impl RamSleuthApp {
                                     )
                                     .clicked()
                                 {
+                                    // The full report rides the
+                                    // clipboard (a 4–5 KB markdown
+                                    // body exceeds GitHub's
+                                    // issue-form URL limit — the
+                                    // 404); the copy precedes the
+                                    // URL open so the text is in
+                                    // place before the browser
+                                    // takes focus.
+                                    ctx.copy_text(md.clone());
+                                    self.notice = Some((
+                                        PROBE_ISSUE_COPY_NOTICE.to_owned(),
+                                        Instant::now(),
+                                    ));
                                     if let Some(title) = self.probe_title.clone() {
                                         ctx.open_url(egui::OpenUrl::same_tab(
-                                            probe_issue_url(&title, &md),
+                                            probe_issue_url(&title),
                                         ));
                                     }
                                     self.probe_state.apply(ProbeEvent::Submit);
@@ -4254,7 +4282,9 @@ mod tests {
 
     /// (q2) The GitHub issue URL construction: the title form
     /// (`[Probe] <brand> · <gen> · <os> · v<version>`) + the
-    /// `issues/new` URL with the percent-encoded title + body.
+    /// `issues/new` URL with the percent-encoded title only (the
+    /// body deliberately absent — a full report exceeds GitHub's
+    /// issue-form limit; the clipboard carries it).
     #[test]
     fn probe_issue_title_and_url_construction() {
         let report = fixture_probe_report();
@@ -4270,20 +4300,16 @@ mod tests {
             url_encode(&title),
             "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.2"
         );
-        // The URL (the issues/new form, both fields percent-encoded).
-        let body = "# RamSleuth Probe Report\n\nsome body";
-        let url = probe_issue_url(&title, body);
-        assert!(
-            url.starts_with("https://github.com/MadGoat/RamSleuth/issues/new?title="),
-            "the URL must be the issues/new form: {url}"
+        // The URL (the issues/new form, title only — the body must
+        // NOT ride the query string: it would exceed GitHub's limit).
+        let url = probe_issue_url(&title);
+        assert_eq!(
+            url,
+            "https://github.com/MadGoat/RamSleuth/issues/new?title=%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.2"
         );
         assert!(
-            url.contains("title=%5BProbe%5D%20Test%20CPU"),
-            "the title must be percent-encoded in the URL: {url}"
-        );
-        assert!(
-            url.contains("body=%23%20RamSleuth%20Probe%20Report%0A%0Asome%20body"),
-            "the body must be percent-encoded in the URL: {url}"
+            !url.contains("body="),
+            "the body must not ride the URL: {url}"
         );
     }
 
@@ -4531,6 +4557,102 @@ mod tests {
             app.probe_state,
             ProbeState::Idle,
             "a press + release on Cancel must return to Idle"
+        );
+
+        fs::remove_dir_all(out_dir).expect("cleanup");
+    }
+
+    /// (q5b) The preview dialog's [Open GitHub Issue] copies the
+    /// full markdown report to the clipboard (a 4–5 KB body would
+    /// exceed GitHub's issue-form URL limit — the 404), opens the
+    /// title-only `issues/new` URL, flashes the paste-into-the-body
+    /// notice in the header, and moves the flow to `Done`.
+    #[test]
+    fn preview_dialog_open_issue_copies_report_and_notices() {
+        let mut app = probe_test_app("preview-issue");
+        let report = fixture_probe_report();
+        let md = render_probe_report_md(&report);
+        app.probe_state = ProbeState::Preview(md.clone());
+        app.probe_title = Some(probe_issue_title(&report));
+        let out_dir = app.out_dir.clone();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(968.0, 600.0));
+        let frame_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let frame = |events: Vec<egui::Event>, app: &mut RamSleuthApp| {
+            ctx.run(frame_input(events), |ctx| {
+                app.render_probe_preview_dialog(ctx);
+            })
+        };
+
+        frame(Vec::new(), &mut app);
+        let first = frame(Vec::new(), &mut app);
+        // The [Open GitHub Issue] label's center (the graph.rs
+        // text-click idiom).
+        let open = first
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Open GitHub Issue" => {
+                    Some(egui::pos2(
+                        text.pos.x + text.galley.size().x / 2.0,
+                        text.pos.y + text.galley.size().y / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .expect("the Open GitHub Issue button's label must be painted");
+        let click = |pressed: bool| egui::Event::PointerButton {
+            pos: open,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Press + release → the clipboard copy + the notice + the
+        // title-only URL open + the Done transition (the click
+        // completes on the release frame).
+        frame(vec![click(true)], &mut app);
+        let out = frame(vec![click(false)], &mut app);
+        assert_eq!(
+            app.probe_state,
+            ProbeState::Done,
+            "a press + release on Open GitHub Issue must end the flow in Done"
+        );
+        // The full report is in the clipboard (egui's copied_text
+        // output — eframe forwards it to the OS clipboard).
+        assert_eq!(
+            out.platform_output.copied_text.as_str(),
+            md.as_str(),
+            "the full markdown report must be copied to the clipboard"
+        );
+        // The title-only issues/new URL opens (no body param).
+        let Some(open_url) = out.platform_output.open_url else {
+            panic!("the title-only issues/new URL must open");
+        };
+        assert!(
+            !open_url.new_tab,
+            "the URL must open in the same tab (the same_tab call)"
+        );
+        assert!(
+            open_url
+                .url
+                .starts_with("https://github.com/MadGoat/RamSleuth/issues/new?title="),
+            "the URL must be the issues/new form: {}",
+            open_url.url
+        );
+        assert!(
+            !open_url.url.contains("body="),
+            "the body must not ride the URL: {}",
+            open_url.url
+        );
+        // The header notice tells the user to paste it into the body.
+        assert_eq!(
+            app.notice.as_ref().map(|(text, _)| text.as_str()),
+            Some(PROBE_ISSUE_COPY_NOTICE),
+            "the paste-into-the-body notice must be set"
         );
 
         fs::remove_dir_all(out_dir).expect("cleanup");
