@@ -70,7 +70,7 @@ conflicts=('ramsleuth' 'ramsleuth-bin')
 # wave. Before this first AUR submission the source tracked the moving
 # v2-development branch (the pre-v2.4.5 integrity-gap class, closed for the
 # siblings in the v2.4.5 re-cut).
-_gitcommit=445acada45c385d8f777021e7dc1758ad5ec5695
+_gitcommit=e0890b65ea49399400c18d0ebede47ed05d7deda
 source=("ramsleuth::git+https://github.com/MadGoatHaz/RamSleuth.git#tag=v2.4.7")
 
 package() {
