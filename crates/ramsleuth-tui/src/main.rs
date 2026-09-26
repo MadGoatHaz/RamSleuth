@@ -71,11 +71,11 @@
 //!   frame gaps far exceed the client's 5 s transport default). It
 //!   stops on the quit flag (or the channel disconnecting — the
 //!   session is ending) and is joined (bounded) before exit.
-//! - **Main loop** — each tick: the requirements strip's
-//!   auto-open-until-closed rule (TUI-22: while `diagnose` reports a
-//!   requirement and the `[d]` key has not dismissed it, the
+//! - **Main loop** — each tick: the `[d]` screen's (the requirements
+//!   strip's) auto-open-until-closed rule (TUI-22: while `diagnose`
+//!   reports a requirement and the `[d]` key has not dismissed it, the
 //!   `requirements_open` flag is force-true — a new requirement
-//!   re-opens the strip on its own; a dismissed strip stays closed
+//!   re-opens the screen on its own; a dismissed screen stays closed
 //!   until the user toggles it open again), then
 //!   `terminal.draw(render)` (the P3-23 three-zone dashboard over
 //!   the shared state) + `events::poll_event(250 ms)` → the frozen
@@ -83,9 +83,11 @@
 //!   the state-only actions mutate the shared state under one brief
 //!   write scope (no I/O while the lock is held, C14-03) — the
 //!   `[g]`/`[t]`/`[d]` toggles write the `settings.*_open` flags
-//!   (the `[d]` key also drives the `requirements_dismissed` latch —
-//!   closing the strip dismisses the auto-open, reopening clears
-//!   it), the `[p]` poll / `[w]` window cycles advance the presets
+//!   (the `[d]` key toggles the info screen — the requirements strip,
+//!   presence-driven, + the About block — and drives the
+//!   `requirements_dismissed` latch: closing the screen dismisses the
+//!   auto-open, reopening clears it), the `[p]` poll / `[w]` window
+//!   cycles advance the presets
 //!   (the renderer reads `settings.graph_window_min` — the `[w]`
 //!   cycle is where that value is supplied), the `[u]`/`[k]` unit +
 //!   the `[a]` refresh toggles flip, the `[b]`/`[m]`/`[x]` run keys
@@ -285,7 +287,7 @@ const USAGE: &str = concat!(
     "  [E]xport         write { telemetry, bench } JSON to $HOME\n",
     "  [G]raphs         toggle the graphs overlay panel\n",
     "  [T]settings      toggle the settings strip\n",
-    "  [D]requirements  toggle the setup requirements strip\n",
+    "  [D]info          toggle the requirements + about screen\n",
     "  [P]oll           cycle the poll interval (100 ms → 60 s, wrap)\n",
     "  [U]nits          toggle the capacity units (GiB ↔ GB)\n",
     "  [K]lock          toggle the clock units (MHz ↔ GHz)\n",
@@ -1777,15 +1779,19 @@ fn apply_requirements_auto_open(state: &RwLock<AppState>, dismissed: bool) {
     }
 }
 
-/// The strip visibility the [`render`] draws (the ghosting guard's
-/// predicate, the main loop's transition check): the requirements strip
-/// is presence-driven — its `requirements_open` flag AND a non-empty
-/// [`ramsleuth_tui::requirements::diagnose`] (the strip auto-vanishes on
-/// the daemon-connect transition — `diagnose` empties — so the flag
-/// alone would miss it) — and the settings strip its `settings_open`
-/// flag alone.
-fn strip_visibility(state: &AppState) -> (bool, bool) {
+/// The `[d]` screen's + the settings strip's visibility the
+/// [`render`] draws (the ghosting guard's predicate, the main loop's
+/// transition check): the About block its `requirements_open` flag
+/// alone (the screen's informational companion — drawn while the
+/// screen is open, regardless of the strip's presence), the
+/// requirements strip presence-driven — its `requirements_open` flag
+/// AND a non-empty [`ramsleuth_tui::requirements::diagnose`] (the
+/// strip auto-vanishes on the daemon-connect transition — `diagnose`
+/// empties — so the flag alone would miss it) — and the settings strip
+/// its `settings_open` flag alone.
+fn strip_visibility(state: &AppState) -> (bool, bool, bool) {
     (
+        state.settings.requirements_open,
         !ramsleuth_tui::requirements::diagnose(state).is_empty() && state.settings.requirements_open,
         state.settings.settings_open,
     )
@@ -1832,10 +1838,12 @@ fn run(args: TuiArgs) -> ExitCode {
     // The ghosting guard (the startup clear's continuation): a strip
     // leaves the layout tree when it closes, so a strip drawn one frame
     // and gone the next would leave its stale pixels (the yellow SETUP
-    // box, the settings line) where the re-laid-out frame does not
-    // overwrite them — the screen is cleared on any visible→hidden
-    // transition. Both strips start closed (`false`); the previous-frame
-    // values are advanced after each draw.
+    // box, the About block, the settings line) where the re-laid-out
+    // frame does not overwrite them — the screen is cleared on any
+    // visible→hidden transition. All three surfaces start closed
+    // (`false`); the previous-frame values are advanced after each
+    // draw.
+    let mut prev_about_shown = false;
     let mut prev_requirements_shown = false;
     let mut prev_settings_shown = false;
 
@@ -1854,17 +1862,20 @@ fn run(args: TuiArgs) -> ExitCode {
         // closed until the user toggles it open again).
         apply_requirements_auto_open(&state, requirements_dismissed);
 
-        // The ghosting guard: the strip visibility the render draws this
-        // tick (the requirements strip is presence-driven — its flag AND a
-        // non-empty `diagnose`; the settings strip its flag alone). A
-        // visible→hidden transition clears the screen before the draw —
-        // the closing strip's stale pixels would otherwise linger where
-        // the re-laid-out frame does not reach them.
-        let (requirements_shown, settings_shown) = {
+        // The ghosting guard: the surfaces' visibility the render draws
+        // this tick (the About block the `[d]` flag alone; the
+        // requirements strip presence-driven — its flag AND a non-empty
+        // `diagnose`; the settings strip its flag alone). A
+        // visible→hidden transition of any of them clears the screen
+        // before the draw — the closing surface's stale pixels would
+        // otherwise linger where the re-laid-out frame does not reach
+        // them.
+        let (about_shown, requirements_shown, settings_shown) = {
             let app = state.read().unwrap();
             strip_visibility(&app)
         };
-        if (prev_requirements_shown && !requirements_shown)
+        if (prev_about_shown && !about_shown)
+            || (prev_requirements_shown && !requirements_shown)
             || (prev_settings_shown && !settings_shown)
         {
             let _ = terminal.clear();
@@ -1884,6 +1895,7 @@ fn run(args: TuiArgs) -> ExitCode {
 
         // Advance the ghosting guard's previous-frame visibility (the
         // next tick's transition check compares against this frame).
+        prev_about_shown = about_shown;
         prev_requirements_shown = requirements_shown;
         prev_settings_shown = settings_shown;
 
@@ -4585,7 +4597,7 @@ mod tests {
             "[E]xport",
             "[G]raphs",
             "[T]settings",
-            "[D]requirements",
+            "[D]info",
             "[P]oll",
             "[U]nits",
             "[K]lock",
@@ -4993,30 +5005,33 @@ mod tests {
         assert_eq!(scroll_of(&state), 0, "the top must never be undershot");
     }
 
-    /// (qa) The ghosting guard's visibility predicate: the
-    /// requirements strip is presence-driven — its flag AND a non-empty
-    /// `diagnose` (the daemon-connect auto-vanish: a connected clean
-    /// state hides the strip even with the flag open) — and the
-    /// settings strip its flag alone.
+    /// (qa) The ghosting guard's visibility predicate: the About block
+    /// its `requirements_open` flag alone, the requirements strip
+    /// presence-driven — its flag AND a non-empty `diagnose` (the
+    /// daemon-connect auto-vanish: a connected clean state hides the
+    /// strip even with the flag open, while the About block stays
+    /// shown on the flag) — and the settings strip its flag alone.
     #[test]
     fn strip_visibility_is_presence_driven() {
         // The daemon-less default: the daemon-down requirement is
-        // present. Closed flag → hidden; open flag → shown.
+        // present. Closed flag → the whole `[d]` screen hidden; open
+        // flag → shown (the About block on the flag, the strip on the
+        // presence rule).
         let mut state = AppState::default();
-        assert_eq!(strip_visibility(&state), (false, false));
+        assert_eq!(strip_visibility(&state), (false, false, false));
         state.settings.requirements_open = true;
-        assert_eq!(strip_visibility(&state), (true, false));
+        assert_eq!(strip_visibility(&state), (true, true, false));
 
         // The settings strip: its flag alone.
         state.settings.settings_open = true;
-        assert_eq!(strip_visibility(&state), (true, true));
+        assert_eq!(strip_visibility(&state), (true, true, true));
 
         // The daemon-connect transition (the ghosting case): connected,
         // no telemetry, no error → `diagnose` empties → the
-        // requirements strip auto-vanishes even with its flag open,
-        // while the settings strip stays shown on its flag.
+        // requirements strip auto-vanishes, while the About block stays
+        // shown on its flag and the settings strip on its.
         state.daemon_status = "connected: /run/ramsleuth/ramsleuth.sock".to_owned();
-        assert_eq!(strip_visibility(&state), (false, true));
+        assert_eq!(strip_visibility(&state), (true, false, true));
     }
 
     /// The current preview scroll offset (the test assertion helper;

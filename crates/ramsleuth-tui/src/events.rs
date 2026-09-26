@@ -25,7 +25,7 @@
 //! | `c` / `C`   | [`Action::Cancel`]             | cancel the in-flight run (`CancelBenchmark`)   |
 //! | `g` / `G`   | [`Action::ToggleGraphs`]       | toggle the graphs panel                        |
 //! | `t` / `T`   | [`Action::ToggleSettings`]     | toggle the settings strip                      |
-//! | `d` / `D`   | [`Action::ToggleRequirements`] | toggle the requirements strip                  |
+//! | `d` / `D`   | [`Action::ToggleRequirements`] | toggle the info screen (requirements + about)  |
 //! | `e` / `E`   | [`Action::ExportJson`]         | write `{ telemetry, bench }` JSON to `$HOME`   |
 //! | `p` / `P`   | [`Action::CyclePoll`]          | cycle poll interval (100 ms → 60 s, wrap)      |
 //! | `u` / `U`   | [`Action::ToggleCapacity`]     | toggle capacity GiB ↔ GB                       |
@@ -71,7 +71,9 @@ pub enum Action {
     ToggleGraphs,
     /// Toggle the settings strip (poll interval, units, refresh, socket).
     ToggleSettings,
-    /// Toggle the requirements strip (setup prerequisites, presence-driven).
+    /// Toggle the info screen: the requirements strip (setup
+    /// prerequisites, presence-driven) + the About block (always shown
+    /// while the screen is open).
     ToggleRequirements,
     /// Write a `{ telemetry, bench }` JSON export to `$HOME` (F3 parity).
     ExportJson,

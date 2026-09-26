@@ -50,7 +50,10 @@
 //! chain adds over these zones (TUI-10…16): the 3-line header, the
 //! settings strip (`settings.settings_open`), the requirements strip
 //! (`settings.requirements_open` — driven by the TUI-08 diagnose
-//! presence rule), the graphs overlay (`settings.graphs_open`, drawn
+//! presence rule), the About block (the same `requirements_open` flag
+//! — the `[d]` screen's informational companion, drawn while the
+//! screen is open regardless of the strip's presence), the graphs
+//! overlay (`settings.graphs_open`, drawn
 //! over the zone area from `graph`), and the probe-report overlay
 //! (`probe` — the consent / preview modal, chunk probe-4, drawn last
 //! + topmost over the whole frame from `crate::probe`).
@@ -279,8 +282,12 @@ pub struct AppState {
 /// `settings.requirements_open` — the presence-driven auto-vanish; its
 /// fixed height is the border + one 3-line block per requirement + the
 /// footer, drawn by
-/// [`crate::requirements::render_requirements_strip`]), then the three
-/// zones side by side in the `Fill(1)` remainder. Every zone is a
+/// [`crate::requirements::render_requirements_strip`]), then the
+/// **About block** (the `[d]` screen's informational companion — its
+/// fixed [`crate::requirements::ABOUT_BLOCK_HEIGHT`] rows, drawn while
+/// `settings.requirements_open` regardless of the strip's presence, by
+/// [`crate::requirements::render_about_block`]), then the three zones
+/// side by side in the `Fill(1)` remainder. Every zone is a
 /// titled `Block` on a slate background; content that does not fit is
 /// clipped, never wrapped or scrolled. While `settings.graphs_open`,
 /// [`crate::graphs::render_graphs_panel`] is drawn **last** over the
@@ -301,13 +308,18 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     // The top region's rows, in paint order: the header (3 lines), the
     // settings strip (1 line while open), the requirements strip (its
     // border + 3 lines per requirement + the footer, while open +
-    // present), the zones (the `Fill(1)` remainder).
+    // present), the About block (its fixed height, while the `[d]`
+    // screen is open — independent of the strip's presence), the zones
+    // (the `Fill(1)` remainder).
     let mut constraints = vec![Constraint::Length(3)];
     if state.settings.settings_open {
         constraints.push(Constraint::Length(1));
     }
     if requirements_open {
         constraints.push(Constraint::Length(3 * requirements.len() as u16 + 3));
+    }
+    if state.settings.requirements_open {
+        constraints.push(Constraint::Length(crate::requirements::ABOUT_BLOCK_HEIGHT));
     }
     constraints.push(Constraint::Fill(1));
     let outer = Layout::default()
@@ -335,6 +347,10 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     }
     if requirements_open {
         crate::requirements::render_requirements_strip(frame, &requirements, outer[row]);
+        row += 1;
+    }
+    if state.settings.requirements_open {
+        crate::requirements::render_about_block(frame, outer[row]);
         row += 1;
     }
 
@@ -854,7 +870,7 @@ fn platform_tag(vendor: Option<&CpuVendor>) -> String {
 fn key_legend(budget: usize) -> String {
     const ENTRIES: &[&str] = &[
         "R refresh", "S snapshot", "Q quit", "B bench", "M memory", "X burn-in",
-        "C cancel", "E export", "G graphs", "T settings", "D reqs", "P poll",
+        "C cancel", "E export", "G graphs", "T settings", "D info", "P poll",
         "U cap", "K clock", "A auto", "W window", "F probe-report",
     ];
     let mut text = String::new();
@@ -2299,8 +2315,9 @@ mod tests {
         // TUI-16: every new surface open at once over the default
         // state — the settings strip, the presence-driven
         // requirements strip (the daemon-less default yields the
-        // single daemon requirement), and the graphs overlay (the
-        // empty ring) — renders without panicking.
+        // single daemon requirement), the About block (the screen's
+        // informational companion), and the graphs overlay (the empty
+        // ring) — renders without panicking.
         let open = AppState {
             settings: TuiSettings {
                 settings_open: true,
@@ -2313,8 +2330,35 @@ mod tests {
         let text = draw(&open);
         assert!(text.contains("Settings: Poll 2 s [p]"), "{text}");
         assert!(text.contains("SETUP — requirements"), "{text}");
+        assert!(text.contains("ABOUT — RamSleuth"), "{text}");
         assert!(text.contains("GRAPHS (last 5 min"), "{text}");
         assert!(text.contains("Status: Idle"), "{text}");
+    }
+
+    /// (b') The `[d]` screen (the requirements strip + the About
+    /// block) renders without panicking at small / degenerate terminal
+    /// sizes (the no-panic contract, D5): the fixed strip heights +
+    /// the `Fill(1)` zones degrade gracefully — a 40×12 and an 80×24
+    /// surface with every surface open (settings, the presence-driven
+    /// strip, the About block, the graphs overlay) draw, as do the
+    /// 1×1 / 80×3 extremes (the zero-area guards inside the blocks).
+    #[test]
+    fn tiny_terminal_all_surfaces_open_no_panic() {
+        let open = || AppState {
+            settings: TuiSettings {
+                settings_open: true,
+                requirements_open: true,
+                graphs_open: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // The daemon-less default yields the single daemon requirement
+        // (the strip is present) + the About block.
+        draw_at(&open(), 40, 12);
+        draw_at(&open(), 80, 24);
+        draw_at(&open(), 1, 1);
+        draw_at(&open(), 80, 3);
     }
 
     /// (c) A running bench renders the grid's live overlay — the
@@ -4340,13 +4384,16 @@ mod tests {
 
         // A connected, clean state: `diagnose` is empty — the strip
         // vanishes on its own (the toggle stays open, the presence
-        // rule drives it).
+        // rule drives it), while the About block stays shown on the
+        // flag alone.
         let mut clean = AppState {
             daemon_status: "connected: /tmp/ramsleuth.sock".to_owned(),
             ..Default::default()
         };
         clean.settings.requirements_open = true;
-        assert!(!draw(&clean).contains("SETUP — requirements"));
+        let text = draw(&clean);
+        assert!(!text.contains("SETUP — requirements"), "{text}");
+        assert!(text.contains("ABOUT — RamSleuth"), "{text}");
     }
 
     /// (ap) The graphs overlay paints over the zones: with
