@@ -50,11 +50,10 @@
 #                                 (C21-08/09: SUMS-verified, zero network)
 #
 # sha256sums pins that exact asset. AUR requires a real sha256 (no SKIP):
-# the pin below is a PLACEHOLDER — the real sha256 of the published v2.4.5
-# release tarball, kept until the v2.4.6 tarball is cut and the standing
-# process re-pins it to the v2.4.6 asset (the v2.4.5 pin replaced the v2.2.1
-# pin, finalized in C21-24b; that replaced the v2.1.1 pin, finalized in
-# C20-06). The three new
+# the pin below is the real sha256 of the published v2.4.6 release tarball,
+# re-cut to the v2.4.6 asset (the v2.4.5 pin, re-cut at the v2.4.5 release,
+# is replaced by this re-cut; it replaced the v2.2.1 pin, finalized in
+# C21-24b; that replaced the v2.1.1 pin, finalized in C20-06). The three new
 # top-level entries (ramsleuth-setup.sh, 90-ramsleuth-setup.policy,
 # icons/) are in the v2.4.6 tarball by the C21-17/C21-27 contract;
 # package() installs them
@@ -85,12 +84,12 @@ arch=(x86_64)
 url="https://github.com/MadGoatHaz/RamSleuth"
 license=(MIT GPL-2.0-only)
 source=("https://github.com/MadGoatHaz/RamSleuth/releases/download/v$pkgver/ramsleuth-$pkgver-x86_64.tar.zst")
-# PLACEHOLDER (the v2.4.5 asset's real sha256, independently verified by
-# download + sha256sum at its re-cut): AUR requires a real sha256 (no SKIP),
-# so the pin carries the previous release's hash until the v2.4.6 tarball is
-# published, when the standing process re-pins it (cf. the v2.4.5 re-cut).
+# Re-cut to v2.4.6: the real sha256 of the published v2.4.6 release asset,
+# independently verified by download + sha256sum (sidecar match; the pin is
+# the asset hash itself; the v2.4.5 placeholder pin is replaced — that
+# asset predates the bundled ryzen_smu vendor tree).
 #
-sha256sums=('1378a2030e99ac5a76b5e11d7958f3f63d59c788cacdc4f78dd2c6f7cfb367c6')
+sha256sums=('ef062e0b0d673030e1aec346c30313ba6f0a0474ce34fc0c0b26784fc34b2818')
 install=ramsleuth-bin.install
 # The in-repo ramsleuth_intel DKMS source ships bundled (package() step (12))
 # and would file-conflict with the standalone ramsleuth-intel-dkms extra, so the
