@@ -12,17 +12,38 @@
 # guarded; any failure prints a clear message + exits non-zero, never leaving
 # DKMS in a silent half-state. Never touches ramsleuth state.
 #
-# Source resolution order (C21-08, vendor-first):
-#   1. RYZEN_SMU_URL / RYZEN_SMU_PIN env overrides — honored by the git
-#      path (an override selects a specific upstream commit; the vendor,
-#      which carries only the default pin, is then skipped).
-#   2. Local vendored source (offline, zero network): the repo's
-#      packaging/ryzen-smu-dkms/vendor/ryzen-smu (dev checkout) or the
-#      installed /usr/share/ryzen-smu-dkms/vendor/ryzen-smu (C21-09) — every
-#      file verified against vendor/SUMS.sha256 before staging; a mismatch
-#      dies (no silent fallback).
-#   3. Pinned git clone (the unchanged fallback when no vendor tree is
-#      present, e.g. the ramsleuth-bin tarball install) —
+# Secure Boot (SB-aware, never-mysterious): on a Secure Boot host the kernel
+# refuses an UNSIGNED out-of-tree module, so when this helper detects Secure
+# Boot EARLY (mokutil --sb-state, else the EFI + kernel-lockdown fallback) it
+# (1) generates a persistent signing key pair ONCE (idempotent, 10-year) at
+# /var/lib/ramsleuth/ryzen-smu-signing/ (key.pem + cert.pem — NOT
+# package-owned: it survives reinstalls + upgrades), (2) signs the built .ko
+# with it via a per-module /etc/dkms/framework.conf.d/ entry (the signing
+# mechanism the installed DKMS 3.x reads — it does NOT support per-module
+# SIGN/KEY_* options in dkms.conf, verified against the installed dkms),
+# (3) stages the cert for the one-time MOK enrollment (mokutil --import),
+# and (4) when the load is pending that one-time reboot, prints the clear
+# one-time guidance and exits 10 — a DISTINCT non-fatal code (the GUI renders
+# it as an amber "one step left" state, not a failure; build + install
+# succeeded). A non-Secure-Boot host takes EXACTLY the pre-SB-aware flow: no
+# key, no drop-in, no enrollment, exit 0 on success (a stale drop-in is
+# removed then — self-heal).
+#
+# Source resolution (C21-08, vendor-first):
+#   1. Local vendored source — the PRIMARY path, offline, zero network: the
+#      repo's packaging/ryzen-smu-dkms/vendor/ryzen-smu (dev checkout) or
+#      the installed /usr/share/ryzen-smu-dkms/vendor/ryzen-smu (bundled in
+#      the v2.4.6+ release assets by both main packages, C21-09) — every
+#      file verified against the sibling vendor/SUMS.sha256 before staging;
+#      a mismatch dies (no silent fallback). Since v2.4.6 the bundled tree
+#      is ALWAYS present on a packaged install, so the in-app one-click
+#      never needs the network — a failed git clone (the 2.4.5-era failure
+#      mode) is not reachable from it.
+#   2. Pinned git clone — a FALLBACK only: used when no vendor tree is
+#      present (pre-2.4.6 assets, e.g. a ramsleuth-bin tarball install from
+#      before the re-cut) or when RYZEN_SMU_URL / RYZEN_SMU_PIN env
+#      overrides are set (an override selects a specific upstream commit;
+#      the vendor, which carries only the default pin, is then skipped).
 #      RYZEN_SMU_FORCE_REMOTE=1 forces this path even when a vendor tree
 #      is present.
 
@@ -55,6 +76,78 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"    # this scr
 # --- Helpers -----------------------------------------------------------------
 log() { printf '[ryzen-smu-dkms] %s\n' "$*"; }
 die() { printf '[ryzen-smu-dkms] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Secure Boot detection (read-only): prints "enabled" or "disabled".
+# Primary: `mokutil --sb-state` (the authoritative UEFI-side answer: "SecureBoot
+# enabled" / "SecureBoot disabled"). Fallback (mokutil absent): an EFI system
+# whose active kernel lockdown is neither None/off (no lockdown) nor Integrity
+# (module loads still permitted) — i.e. Confidentiality — refuses unsigned
+# module loads, which is the case that needs signing + MOK.
+detect_secure_boot() {
+  local sb_out="" lockdown=""
+  if command -v mokutil >/dev/null 2>&1; then
+    sb_out="$(mokutil --sb-state 2>/dev/null || true)"
+  fi
+  case "${sb_out}" in
+    *"SecureBoot enabled"*)  printf 'enabled\n'; return 0 ;;
+    *"SecureBoot disabled"*) printf 'disabled\n'; return 0 ;;
+  esac
+  if [[ -d /sys/firmware/efi && -r /sys/kernel/security/lockdown ]]; then
+    lockdown="$(awk 'match($0, /\[[^]]*\]/) { s = substr($0, RSTART + 1, RLENGTH - 2); gsub(/[[:space:]]/, "", s); print s; exit }' /sys/kernel/security/lockdown)"
+  fi
+  case "${lockdown}" in
+    ""|none|None|off|OFF|integrity|Integrity) printf 'disabled\n' ;;
+    *)                                        printf 'enabled\n' ;;
+  esac
+  return 0
+}
+
+# Classify a failed `modprobe` as a Secure Boot / lockdown rejection (an
+# unsigned or un-enrolled-key module): true when SB was detected, or when the
+# recent dmesg names the module with a rejection marker (catches the
+# SB-on-but-detection-missed case — mokutil absent at detect time, a UEFI
+# change since the prior run).
+sb_load_rejected() {
+  if [[ "${SB_STATE}" == "enabled" ]]; then
+    return 0
+  fi
+  local dmesg_tail
+  dmesg_tail="$(dmesg 2>/dev/null | grep -iE "${MODULE}|lockdown|key was rejected|executive|module verification" || true)"
+  [[ -n "${dmesg_tail}" ]] \
+    && grep -qiE 'lockdown|key was rejected|rejected by service|module verification failed|is not signed|unsigned' <<<"${dmesg_tail}"
+}
+
+# The clear one-time instruction block (stdout for the terminal, plus a SINGLE
+# stderr line carrying the reason for the GUI's structured tail). The
+# non-fatal exit (10) is done by the caller.
+print_secure_boot_guidance() {
+  if command -v mokutil >/dev/null 2>&1; then
+    log "================================  Secure Boot  ===================================="
+    log "Secure Boot is enabled on this host. The ${MODULE} module was BUILT + INSTALLED"
+    log "and signed with the persistent RamSleuth key (generated once, idempotent, kept"
+    log "across reinstalls): ${SB_SIGN_DIR}/cert.pem"
+    log ""
+    log "ONE-TIME (no hoops afterwards):"
+    log "  1. Reboot now."
+    log "  2. At the blue MOK screen choose 'Enroll MOK key(s)' → 'Continue' → 'Yes'"
+    log "     (set/confirm the MOK password when prompted)."
+    log "  3. After the reboot, re-click 'Set up RamSleuth' (or re-run this helper) —"
+    log "     the driver loads; every later run (incl. after kernel updates) is a no-op."
+    log "Prefer not to reboot? Disable Secure Boot in UEFI, then re-click Setup —"
+    log "the signed module loads without the MOK step."
+    log "===================================================================================="
+    printf '[ryzen-smu-dkms] ERROR: Secure Boot is on — ONE-TIME: reboot, at the blue MOK screen choose Enroll MOK key(s) → Continue → Yes, then re-click Setup (driver built + installed + signed; only the one-time MOK enrollment is pending); alternative: disable Secure Boot in UEFI and re-click Setup\n' >&2
+  else
+    log "================================  Secure Boot  ===================================="
+    log "Secure Boot is enabled on this host, but mokutil is not installed, so the signed"
+    log "key (${SB_SIGN_DIR}/cert.pem) cannot be MOK-enrolled automatically. The ${MODULE}"
+    log "module was BUILT + INSTALLED + signed."
+    log "Fix: disable Secure Boot in UEFI, then re-click 'Set up RamSleuth' — the"
+    log "module loads without the MOK step."
+    log "===================================================================================="
+    printf '[ryzen-smu-dkms] ERROR: Secure Boot is on and mokutil is absent — the signed key cannot be enrolled; disable Secure Boot in UEFI, then re-click Setup (driver built + installed)\n' >&2
+  fi
+}
 # Fallback dkms.conf (P5-03; dual-location, P5-04-fix): first existing of the
 # repo-relative path (run from the repo) or the installed /usr/share path (the
 # P5-05 package installs this helper to /usr/bin, where REPO_ROOT resolves to
@@ -98,6 +191,12 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exec sudo "$0" "$@"
 fi
 
+# --- Secure Boot detection (EARLY — before any build; the flow branches on it) ---
+SB_STATE="$(detect_secure_boot)"
+if [[ "${SB_STATE}" == "enabled" ]]; then
+  log "Secure Boot: ENABLED on this host — the module will be signed with the persistent RamSleuth key + staged for the one-time MOK enrollment (a NON-FATAL one-time step: exit 10 until it is done, not a hard failure)"
+fi
+
 # --- Step 1: prereqs + kernel build tree ---------------------------------------
 log "Installing build tooling: dkms + base-devel (pacman, idempotent)..."
 pacman -S --needed dkms base-devel
@@ -107,9 +206,7 @@ if [[ ! -d "/lib/modules/${KERNEL}/build" ]]; then
   log "Kernel build tree MISSING for ${KERNEL} — candidate headers packages:"
   CANDIDATES="$(pacman -Qs headers 2>/dev/null | grep -iE 'cachyos|custom|linux-headers' || true)"
   [[ -n "${CANDIDATES}" ]] && printf '%s\n' "${CANDIDATES}"
-  die "cannot determine the ${KERNEL} headers package automatically. Install it
- manually (e.g. the matching 'linux-headers' / cachyos-custom package),
- then re-run this script."
+  die "cannot determine the ${KERNEL} headers package automatically — install the matching 'linux-headers' / cachyos-custom package, then re-run this script"
 fi
 log "Kernel build tree OK: /lib/modules/${KERNEL}/build"
 
@@ -147,10 +244,19 @@ fi
 if [[ "${USE_VENDOR}" -eq 0 ]]; then
   if [[ -d "${SRC_DIR}/.git" ]]; then
     # Existing tree: skip the fetch when already at the pin (idempotent +
-    # offline-tolerant), else fetch + checkout the pin.
-    if [[ "$(git -C "${SRC_DIR}" rev-parse HEAD)" == "${UPSTREAM_PIN}" ]]; then
+    # offline-tolerant). A prior run may have died mid-clone leaving a
+    # BROKEN .git (rev-parse fails on it) — that cannot reliably fetch /
+    # checkout, so wipe it and start a fresh clone (self-heal).
+    head="$(git -C "${SRC_DIR}" rev-parse HEAD 2>/dev/null || true)"
+    if [[ "${head}" == "${UPSTREAM_PIN}" ]]; then
       log "Source tree already at the pinned commit — skipping fetch"
     else
+      if [[ -z "${head}" ]]; then
+        log "Existing ${SRC_DIR} has a broken/partial .git (a prior run died mid-clone) — wiping and re-cloning"
+        rm -rf "${SRC_DIR}"
+        git clone --depth 1 "${UPSTREAM_URL}" "${SRC_DIR}" \
+          || die "git clone of ${UPSTREAM_URL} failed — verify the URL (and network) and retry"
+      fi
       git -C "${SRC_DIR}" fetch --depth 1 origin "${UPSTREAM_PIN}" \
         || die "git fetch of pinned commit ${UPSTREAM_PIN:0:7} from ${UPSTREAM_URL} failed — verify the network (and that the pin still exists upstream) and retry"
       git -C "${SRC_DIR}" checkout -q "${UPSTREAM_PIN}" \
@@ -244,15 +350,79 @@ else
   log "No TTY (scripted context) — continuing with the pinned source without an interactive confirm"
 fi
 
-# --- Step 4: dkms add + build + install -----------------------------------------
+# --- Step 4a (Secure Boot only): persistent signing key + the DKMS signing entry ---
+# The installed DKMS (verified 3.4.3) signs from /etc/dkms/framework.conf +
+# framework.conf.d/*.conf (try_sign_modules / mok_signing_key /
+# mok_certificate) — it does NOT read per-module SIGN/KEY_* options from
+# dkms.conf — so the signing config is a per-module drop-in pointing at the
+# persistent key. The entry is written ONLY on an SB run (and removed on a
+# non-SB run — self-heal), so a non-SB build is signed by nobody:
+# byte-for-byte the pre-SB-aware behavior. Both vendor helpers write separate
+# drop-ins; a host runs at most one (the CPU vendor decides which helper is
+# invoked).
+SB_SIGN_DIR="/var/lib/ramsleuth/ryzen-smu-signing"
+SB_DROPIN="/etc/dkms/framework.conf.d/ramsleuth-${MODULE}.conf"
+if [[ "${SB_STATE}" == "enabled" ]]; then
+  if [[ -f "${SB_SIGN_DIR}/key.pem" && -f "${SB_SIGN_DIR}/cert.pem" ]]; then
+    log "Secure Boot: reusing the persistent signing key at ${SB_SIGN_DIR}/ (generated once — idempotent)"
+  else
+    install -d -m 0700 "${SB_SIGN_DIR}"
+    openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout "${SB_SIGN_DIR}/key.pem" -out "${SB_SIGN_DIR}/cert.pem" \
+      -subj "/CN=RamSleuth ${MODULE} signing/" \
+      || die "Secure Boot: openssl key generation in ${SB_SIGN_DIR} failed — is openssl installed?"
+    chmod 0600 "${SB_SIGN_DIR}/key.pem"
+    log "Secure Boot: generated the persistent signing key pair in ${SB_SIGN_DIR}/ (key.pem + cert.pem, 10 years, reused on every later run)"
+  fi
+  install -d /etc/dkms/framework.conf.d
+  printf '%s\n' \
+    "# RamSleuth ${MODULE}: sign the out-of-tree module with the persistent" \
+    "# RamSleuth key (Secure Boot). DKMS 3.x reads signing from framework.conf" \
+    "# (+ framework.conf.d/*.conf) — NOT from dkms.conf." \
+    "try_sign_modules=true" \
+    "mok_signing_key=${SB_SIGN_DIR}/key.pem" \
+    "mok_certificate=${SB_SIGN_DIR}/cert.pem" > "${SB_DROPIN}"
+  log "Secure Boot: DKMS will sign the module with ${SB_SIGN_DIR}/cert.pem (drop-in: ${SB_DROPIN})"
+else
+  if [[ -f "${SB_DROPIN}" ]]; then
+    rm -f "${SB_DROPIN}"
+    log "Secure Boot off: removed the stale signing drop-in ${SB_DROPIN} (self-heal — the build is unsigned, as before)"
+  fi
+fi
+
+# --- Step 4: dkms self-heal + add + build + install ------------------------------
+# Self-heal: clear every stale DKMS registration of this module BEFORE the
+# add — `dkms add <module>/<version>` FAILS if the module/version is already
+# registered (the state a prior partial/failed run, an older module version,
+# or a previous kernel leaves behind), and a stale registration can carry a
+# broken build. `dkms status`-driven: each registered version of THIS module
+# only is removed with `--all` (all kernels) + `--no-depmod`, then re-added
+# below from the freshly staged source. First runs (nothing registered) are
+# an untouched no-op; foreign modules are never touched.
+DKMS_STATUS="$(dkms status 2>/dev/null || true)"
+if grep -qE "^${MODULE}/" <<<"${DKMS_STATUS}"; then
+  while IFS= read -r entry; do
+    [[ -n "${entry}" ]] || continue
+    reg="${entry%%,*}"
+    if dkms remove "${reg}" --all --no-depmod 2>/dev/null; then
+      log "self-heal: removed stale DKMS registration ${reg} (re-adding ${MODULE}/${PKGVER} below)"
+    fi
+  done < <(grep -E "^${MODULE}/" <<<"${DKMS_STATUS}")
+fi
 # `dkms add <module>/<version>` now finds the staged /usr/src tree above.
 if ! dkms add "${MODULE}/${PKGVER}"; then
   dkms status | grep -q "${MODULE}/${PKGVER}" \
     && log "${MODULE}/${PKGVER} already registered with DKMS — continuing" \
     || die "dkms add ${MODULE}/${PKGVER} failed — run 'dkms status' to inspect"
 fi
-dkms build "${MODULE}/${PKGVER}" -k "${KERNEL}" \
-  || die "dkms build ${MODULE} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect build errors"
+if ! dkms build "${MODULE}/${PKGVER}" -k "${KERNEL}"; then
+  MAKE_LOG="/var/lib/dkms/${MODULE}/${PKGVER}/${KERNEL}/build/make.log"
+  if [[ -f "${MAKE_LOG}" ]]; then
+    log "dkms build failed — last 40 lines of ${MAKE_LOG}:"
+    tail -n 40 "${MAKE_LOG}" >&2
+  fi
+  die "dkms build ${MODULE} -k ${KERNEL} failed — compile break (the make.log tail above names the file + line; build dir /var/lib/dkms/${MODULE}/${PKGVER}/${KERNEL}/build/)"
+fi
 if dkms status | grep -qE "^${MODULE}/${PKGVER},[[:space:]]*${KERNEL},[[:space:]]*[^:]*:[[:space:]]*installed[[:space:]]*$"; then
   log "${MODULE}/${PKGVER} already installed for ${KERNEL} — skipping dkms install"
 else
@@ -260,9 +430,32 @@ else
     || die "dkms install ${MODULE}/${PKGVER} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect"
 fi
 
-# --- Step 5: load now + at boot ---------------------------------------------------
-modprobe "${MODULE}" || die "modprobe ${MODULE} failed — run 'dmesg | tail' to inspect load errors"
-printf '%s\n' "${MODULE}" > "/etc/modules-load.d/${MODULE}.conf"   # idempotent overwrite
+# --- Step 5: load now + at boot (Secure Boot aware) --------------------------------
+# SB run: stage the signing cert for the one-time MOK enrollment BEFORE the
+# load (mokutil prompts for the MOK password — expected; first use sets it).
+# Non-fatal: a failed import (no TTY / already pending) only warns.
+if [[ "${SB_STATE}" == "enabled" ]]; then
+  if command -v mokutil >/dev/null 2>&1; then
+    log "Secure Boot: staging the signing key for the one-time MOK enrollment (mokutil --import — a MOK password prompt may appear)"
+    if ! mokutil --import "${SB_SIGN_DIR}/cert.pem"; then
+      log "WARNING: mokutil --import did not complete (no TTY / enrollment already pending) — the MOK step may need a manual pass"
+    fi
+  else
+    log "Secure Boot: mokutil is not installed — automatic MOK enrollment is skipped (disable Secure Boot in UEFI; see the guidance below)"
+  fi
+fi
+if modprobe "${MODULE}"; then
+  printf '%s\n' "${MODULE}" > "/etc/modules-load.d/${MODULE}.conf"   # idempotent overwrite
+else
+  # The load is pending the one-time MOK step (or a detection-missed SB
+  # rejection): build + install succeeded — actionable guidance + the
+  # distinct non-fatal exit 10 (the GUI renders an amber "one step left").
+  if sb_load_rejected; then
+    print_secure_boot_guidance
+    exit 10
+  fi
+  die "modprobe ${MODULE} failed — run 'dmesg | tail' to inspect load errors"
+fi
 
 # --- Step 6: verify ------------------------------------------------------------------
 # Matches the daemon (P5-08): canonical ryzen_smu_drv path first, legacy second.
@@ -271,7 +464,6 @@ if [[ -e "${PM_TABLE}" ]]; then
 elif [[ -e "${PM_TABLE_LEGACY}" ]]; then
   log "SUCCESS: ${MODULE} loaded; legacy ${PM_TABLE_LEGACY} present (daemon prefers ${PM_TABLE})."
 else
-  die "pm_table missing after load (looked for ${PM_TABLE}, then ${PM_TABLE_LEGACY}) — run 'dmesg | tail' + 'dkms status' to inspect. Without the
-module the app still works: N/A (DriverMissing), exit 0, no panic."
+  die "pm_table missing after load (looked for ${PM_TABLE}, then ${PM_TABLE_LEGACY}) — run 'dmesg | tail' + 'dkms status' to inspect; without the module the app works (N/A DriverMissing, exit 0, no panic)"
 fi
 log "Next: start the ramsleuth daemon; ground-truth CLI is now at /usr/bin/monitor_cpu."

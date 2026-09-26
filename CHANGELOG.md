@@ -4,6 +4,16 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project.
 
+## [2.4.7] - 2026-09-26
+
+### Added
+- **Secure-Boot-aware one-click DKMS** (both the AMD `ryzen_smu` and Intel `ramsleuth_intel` helpers): on a Secure Boot host the helper now detects Secure Boot **early** (`mokutil --sb-state`, with an EFI/lockdown fallback), **signs** the built module with a **persistent** RamSleuth key pair (generated once, idempotent, 10-year, at `/var/lib/ramsleuth/<module>-signing/`, wired through a per-module `/etc/dkms/framework.conf.d/` drop-in), **stages the cert for the one-time MOK enrollment** (`mokutil --import`), and exits **10** with **one-step guidance** (reboot → at the blue MOK screen choose `Enroll MOK key(s)` → `Continue` → `Yes` → re-click Setup). After the MOK step the re-click succeeds — the driver is already built + installed + signed, so nothing is rebuilt
+- **Never-mysterious diagnostics**: the one-click flow surfaces the real failure — the GUI renders the first `ERROR:` line on stderr **plus the exit code** (`(exit N)`) verbatim, and maps exit **10** to an amber **"one step left"** state (the Secure Boot MOK enrollment is pending) **instead of a failure**; `ramsleuth-setup` passes the helper's exit codes through verbatim
+
+### Changed
+- **Idempotent, self-healing setup**: `ramsleuth-setup` now clears its own stale prior-run state at the start of **every** invocation — a `FAILED` unit (`reset-failed`), the `ramsleuth` group (ensured *before* the unit starts), the `authorized-users` state file (atomic self-healing overwrite: keep valid users, ensure ours, drop blanks/dups), a stale daemon socket (`restart`), and a stale polkit action pool (`restart`) — so a re-run **always** succeeds with no manual cleanup (the 2.4.5-failed → uninstall → 2.4.6-still-fails class is closed); the DKMS helpers likewise self-heal by removing **every registered version** of the module (`dkms remove … --all --no-depmod`) before re-adding from the freshly staged source
+- **The repo's `ryzen-smu-dkms/dkms.conf` (`DEST=/extra`) now ships on every install path** — the release tarball (27 → **28** artifacts: 6 binaries + 22 auxiliary), both main AUR packages (new guarded `package()` step 14 → `/usr/share/ryzen-smu-dkms/dkms.conf`), and `install.sh` — so the DKMS helper resolves the repo's config (matching its `depmod` override) at its installed location; the vendored copy's `/kernel/drivers/ryzen_smu` is the last-resort fallback only
+
 ## [2.4.6] - 2026-09-26
 
 ### Added

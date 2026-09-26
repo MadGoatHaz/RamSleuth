@@ -1,6 +1,6 @@
 # RamSleuth — User Guide
 
-**Version:** 2.4.6 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
+**Version:** 2.4.7 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
 
 RamSleuth v2 is a live RAM telemetry suite and an AIDA64-style memory benchmark for
 AMD and Intel desktops. It watches your memory system in real time — clocks, the
@@ -233,12 +233,12 @@ yay -S ramsleuth-intel-dkms  # Intel — live Intel subtimings (Section 10.5)
 The two **core** packages are deliberately distinct:
 
 - **`ramsleuth` — STABLE source.** Builds the workspace from the official
-  git tag `v$pkgver` (currently `v2.4.6`). A tag is a reproducible,
+  git tag `v$pkgver` (currently `v2.4.7`). A tag is a reproducible,
   auditable snapshot — this is the **default recommendation for production
   installs**. It compiles only the pinned repository (`--locked`), with no
   third-party code in the build.
 - **`ramsleuth-bin` — PRECOMPILED.** Downloads the release binary tarball
-  `ramsleuth-2.4.6-x86_64.tar.zst` from the official GitHub Release (pinned
+  `ramsleuth-2.4.7-x86_64.tar.zst` from the official GitHub Release (pinned
   by its `sha256sums`) and installs it as-is — **no build, no makedepends**.
   This is the **fastest install path**.
 
@@ -288,7 +288,7 @@ can build and install either package directly from the `packaging/`
 directories:
 
 ```sh
-cd packaging/ramsleuth      # STABLE source (builds from the v2.4.6 tag)
+cd packaging/ramsleuth      # STABLE source (builds from the v2.4.7 tag)
 # cd packaging/ramsleuth-bin   # PRECOMPILED (downloads the release tarball)
 makepkg -si
 ```
@@ -446,11 +446,21 @@ and a **"Setup complete"** modal appears with two choices:
   picks up the persisted group state cleanly).
 
 If the helper fails, no modal appears — the strip shows
-`failed: <diagnostic>` and the manual `sudo` pointer, and the per-row Copy
-buttons remain as the polkit-less fallback. The strip also has a
-**`Got it — keep using RamSleuth`** button to hide it; it reappears on its
-own whenever a requirement exists and can be reopened any time with the
-header's **Setup** button.
+`failed: <diagnostic>` (the helper's own single-line reason — the
+`[ryzen-smu-dkms] ERROR:` / `[intel-dkms] ERROR:` line the delegated
+driver helper printed, with its exit code, not a fragment) and the manual
+`sudo` pointer, and the per-row Copy buttons remain as the polkit-less
+fallback. The strip also has a **`Got it — keep using RamSleuth`** button
+to hide it; it reappears on its own whenever a requirement exists and can
+be reopened any time with the header's **Setup** button.
+
+On a **Secure Boot** host the driver arm has one more twist: the kernel
+refuses unsigned modules, so the helper signs the module with a persistent
+RamSleuth key and stages the one-time MOK enrollment. There the strip
+shows an amber **`one step left: …`** line (the MOK guidance — *not* a red
+failure; the module is built + installed + signed) and no modal appears —
+after the one-time reboot + MOK enrollment, re-click **Set up RamSleuth**
+and it reads `done` (Section 10.6).
 
 **The group + ACL model, in plain terms.** The daemon's socket
 (`/run/ramsleuth/ramsleuth.sock`) is created mode `0660`, owned by
@@ -498,7 +508,7 @@ shows `Disconnected` with a hint, and the dashboard stays responsive.
 
 ### 4.1 The 3-line header
 
-**Line 1** — the title **`RamSleuth v2.4.6`**, a **platform tag**
+**Line 1** — the title **`RamSleuth v2.4.7`**, a **platform tag**
 (`[AMD AM4 Platform]` for Zen 1–3, `[AMD AM5 Platform]` for Zen 4/5,
 `[Intel LGA Platform]`, or a bare `[Platform]` when the vendor is unknown),
 the **daemon status** (`Daemon: Connected (IPC: /run/ramsleuth/ramsleuth.sock)`
@@ -1328,14 +1338,66 @@ ramsleuth-client status                          # Intel: ok
 No daemon restart is needed — it re-reads on every telemetry pass, so the
 Intel section fills in on the next poll once the kobject appears (the
 `/dev/mem` fallback keeps working meanwhile). Two operational notes: the
-module is **Intel-only by design** (on an AMD host it loads, stays idle, and
+the module is **Intel-only by design** (on an AMD host it loads, stays idle, and
 no kobject appears — the helper exits 0 with a note), and, like the
-`ryzen_smu` extra, it carries the **Secure Boot / lockdown limitation** —
-on a UEFI Secure Boot (integrity-lockdown) host the kernel blocks both
-`/dev/mem` *and* unsigned out-of-tree modules, so the only way to load it
-there is to MOK-enroll `ramsleuth_intel.ko` first
-(`mokutil --import ramsleuth_intel.ko`). When it cannot be loaded, the Intel
-section reads `N/A (DriverMissing)`, exit 0, no panic.
+`ryzen_smu` extra, it meets the **Secure Boot** case — on a UEFI Secure
+Boot (lockdown) host the kernel blocks both `/dev/mem` *and* unsigned
+out-of-tree modules; the helper now handles that automatically (it signs
+the module with a persistent RamSleuth key and stages the one-time MOK
+enrollment — Section 10.6; the manual `mokutil --import ramsleuth_intel.ko`
+is no longer the only path). When it cannot be loaded, the Intel section
+reads `N/A (DriverMissing)`, exit 0, no panic.
+
+---
+
+## 10.6 Secure Boot — the one-time MOK step (both drivers)
+
+On a UEFI **Secure Boot** host the kernel refuses to load *unsigned*
+out-of-tree modules, so the first driver install on such a machine takes
+**one extra, one-time step** — and the one-click setup walks you through
+it automatically (no manual `mokutil` command, no re-install).
+
+**What the helper does on a Secure Boot host.** It detects Secure Boot
+early — `mokutil --sb-state` where available, else the EFI + kernel
+lockdown state — before any build, and then:
+
+1. **Generates a persistent signing key once** — `key.pem` + `cert.pem`
+   (a 10-year self-signed `RamSleuth … signing` key) at
+   `/var/lib/ramsleuth/ryzen-smu-signing/` (AMD) or
+   `/var/lib/ramsleuth/ramsleuth-intel-signing/` (Intel). The key is
+   reused on every later run (idempotent) and is **not package-owned** —
+   it survives reinstalls and upgrades.
+2. **Signs the module** — the built `.ko` is signed with that key, via a
+   per-module entry in `/etc/dkms/framework.conf.d/` (the signing
+   mechanism the installed DKMS reads).
+3. **Stages the key for the one-time MOK enrollment**
+   (`mokutil --import`) — the first time you are asked to set a MOK
+   password; that prompt is expected.
+
+**The one-time step (once per machine, not per driver):**
+
+1. **Reboot.**
+2. At the blue **MOK** screen: choose **`Enroll MOK key(s)`** →
+   **`Continue`** → **`Yes`** (confirm the MOK password you set).
+3. After the reboot, **re-click `Set up RamSleuth`** (or re-run
+   `sudo ramsleuth-setup --with-dkms`) — the driver loads, the SETUP
+   strip reads `done`, and every later run (including after kernel
+   updates, which DKMS rebuilds) is a no-op fast path. The key is already
+   enrolled, so the MOK screen never appears again for RamSleuth.
+
+**The GUI shows this as an amber `one step left: …` status line — not a
+red failure** (the module was built + installed + signed; only the
+reboot/enroll step is outstanding).
+
+**Prefer not to reboot / enroll?** Disable **Secure Boot** in the UEFI
+setup, then re-click Setup — the signed module loads without the MOK
+step, and the helper drops its signing configuration on the next run (no
+residue).
+
+If the host lacks `mokutil`, automatic enrollment is skipped and the
+guidance points you at the disable-Secure-Boot alternative instead. On a
+**non-Secure-Boot** host nothing changes: the driver builds and loads
+exactly as before — no key, no reboot.
 
 ---
 
@@ -1374,6 +1436,12 @@ ls /sys/kernel/ryzen_smu_drv/pm_table   # confirm it is live
 Then re-open the GUI / re-run `ramsleuth-client status` — the AMD section
 fills in on the next poll (no app restart needed; the daemon re-reads on
 every telemetry pass).
+
+**Secure Boot host:** if the one-click stops at the amber
+`one step left: …` line instead of `done`, the module is built +
+installed + signed and only the one-time MOK enrollment is pending —
+reboot, enroll at the blue MOK screen, and re-run the one-click
+(Section 10.6).
 
 **Intel counterpart** — if the Intel subtimings read **`N/A
 (DriverMissing)`** (e.g. after a kernel update left the `ramsleuth_intel`
@@ -1545,7 +1613,7 @@ And if the **Intel `ramsleuth_intel` module** was installed, remove it:
 
 ```sh
 sudo rmmod ramsleuth_intel
-sudo dkms remove ramsleuth_intel/2.4.6   # the installed DKMS version (list with: dkms status)
+sudo dkms remove ramsleuth_intel/2.4.7   # the installed DKMS version (list with: dkms status)
 sudo rm /etc/modules-load.d/ramsleuth_intel.conf
 sudo rm -rf /usr/src/ramsleuth_intel-*
 # and, if you had the standalone Intel extra (mutually exclusive with the core packages):
@@ -1560,6 +1628,6 @@ group, no socket, no driver.
 
 ---
 
-*This guide describes RamSleuth v2.4.6. For the technical design, see
+*This guide describes RamSleuth v2.4.7. For the technical design, see
 `Docs/Architecture.md`; for the packaging operator guide, see
 `packaging/README.md`.*

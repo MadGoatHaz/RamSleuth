@@ -23,6 +23,10 @@ name: Release
 #       the 6 module sources frozen at d298366 + SUMS.sha256 + NOTICE.md;
 #       the AMD DKMS offline one-click path — the main packages' package()
 #       step 13 bundles them to /usr/share/ryzen-smu-dkms/vendor/),
+#       packaging/ryzen-smu-dkms/dkms.conf (the repo's DKMS config —
+#       DEST=/extra, matching the helper's depmod override; the main
+#       packages install it to /usr/share/ryzen-smu-dkms/dkms.conf, the
+#       helper's installed-location resolution),
 #       install.sh, LICENSE, RamSleuth.desktop,
 #       ramsleuth-setup.sh, 90-ramsleuth-setup.policy,
 #       assets/icons/ (the hicolor tree, 8 sizes — one artifact; C21-27)
@@ -117,6 +121,7 @@ jobs:
             packaging/ryzen-smu-dkms/vendor/ryzen-smu/smu.h \
             packaging/ryzen-smu-dkms/vendor/SUMS.sha256 \
             packaging/ryzen-smu-dkms/vendor/NOTICE.md \
+            packaging/ryzen-smu-dkms/dkms.conf \
             install.sh \
             LICENSE \
             scripts/ramsleuth-setup.sh \
@@ -132,14 +137,15 @@ jobs:
             missing=1
           fi
           [ "$missing" -eq 0 ] || { echo "Refusing to publish: release artifacts missing"; exit 1; }
-          echo "All 27 release artifacts present (6 binaries + 21 auxiliary)"
+          echo "All 28 release artifacts present (6 binaries + 22 auxiliary)"
           # NOTE (C21-27 / INTEL-14 / AMD-vendor): the assets/icons hicolor
           # tree is staged into the tarball by the Stage step below; the
-          # release-artifact count is 27 (6 binaries + 21 auxiliary: the 8
+          # release-artifact count is 28 (6 binaries + 22 auxiliary: the 8
           # pre-Intel auxiliary files + the Intel DKMS helper + the 4
           # kernel/ramsleuth-intel module source files + the 8 vendored
-          # ryzen-smu files (the 6 module sources + SUMS.sha256 + NOTICE.md);
-          # the hicolor tree ships as a bundle).
+          # ryzen-smu files (the 6 module sources + SUMS.sha256 + NOTICE.md)
+          # + the repo's ryzen-smu-dkms dkms.conf; the hicolor tree ships as
+          # a bundle).
 
       - name: Stage artifacts
         run: |
@@ -168,6 +174,7 @@ jobs:
           done
           cp packaging/ryzen-smu-dkms/vendor/SUMS.sha256 "$S/packaging/ryzen-smu-dkms/vendor/"
           cp packaging/ryzen-smu-dkms/vendor/NOTICE.md "$S/packaging/ryzen-smu-dkms/vendor/"
+          cp packaging/ryzen-smu-dkms/dkms.conf "$S/packaging/ryzen-smu-dkms/"
           chmod +x "$S/bin/"* "$S/scripts/"*.sh "$S/install.sh" "$S/ramsleuth-setup.sh"
           find stage -type f | sort
 

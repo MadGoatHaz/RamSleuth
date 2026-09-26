@@ -143,6 +143,7 @@ transparency_block() {
   step "icon name      → RamSleuth.png in the same hicolor + pixmaps dirs  (the app_id direct-icon-name fallback; C21-45)"
   step "system group   → 'ramsleuth'  (groupadd -r; the unit runs as Group=ramsleuth)"
   step "shared helper  → /usr/bin/ramsleuth-install-ryzen-smu-dkms"
+  step "DKMS config    → /usr/share/ryzen-smu-dkms/dkms.conf  (the repo's config — DEST=/extra, matching the helper's depmod override; guarded)"
   step "Intel helper   → /usr/bin/ramsleuth-install-intel-dkms  (the shared Intel DKMS helper; guarded — skipped if absent in a pre-Intel checkout)"
   step "setup helper   → /usr/bin/ramsleuth-setup   (one-click privileged setup; pkexec-able)"
   step "polkit policy  → /usr/share/polkit-1/actions/90-ramsleuth-setup.policy"
@@ -248,6 +249,16 @@ do_install() {
   # The two shipped transparency artifacts (re-runnable + auditable post-install).
   install -Dm755 "scripts/install-ryzen-smu-dkms.sh" "/usr/bin/ramsleuth-install-ryzen-smu-dkms"
   ok "/usr/bin/ramsleuth-install-ryzen-smu-dkms  (the shared pinned helper)"
+  # The repo's ryzen_smu DKMS config (DEST=/extra — matches the helper's
+  # depmod override; the helper resolves it at /usr/share/ryzen-smu-dkms/
+  # on an installed run). GUARDED like the Intel helper: absent in a
+  # pre-dkms.conf checkout -> clean skip, never a hard fail.
+  if [[ -f "packaging/ryzen-smu-dkms/dkms.conf" ]]; then
+    install -Dm644 "packaging/ryzen-smu-dkms/dkms.conf" "/usr/share/ryzen-smu-dkms/dkms.conf"
+    ok "/usr/share/ryzen-smu-dkms/dkms.conf  (the repo's DKMS config — DEST=/extra)"
+  else
+    warn "/usr/share/ryzen-smu-dkms/dkms.conf skipped — packaging/ryzen-smu-dkms/dkms.conf absent in this checkout (pre-dkms.conf); the helper falls back to the vendored dkms.conf"
+  fi
   # The Intel DKMS helper (INTEL-11; INTEL-06 source scripts/install-intel-dkms.sh).
   # GUARDED — the same no-panic contract the AUR mirrors (INTEL-09/10): absent in a
   # pre-Intel checkout -> clean skip with a note, never a hard fail. install(1)

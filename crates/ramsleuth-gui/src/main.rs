@@ -2353,52 +2353,89 @@ fn sudo_setup_command(user: &str, with_dkms: bool) -> String {
     }
 }
 
-/// The stderr tail for the `failed:` status line (the frozen C21-01
-/// contract: a hard failure prints the structured
-/// `[ramsleuth-setup] ERROR:` line on stderr): the last such line,
-/// else the last non-empty stderr line, else the generic manual
-/// pointer (plan risk 1). Pure, zero I/O.
-fn setup_stderr_tail(stderr: &str) -> String {
-    const ERROR_MARKER: &str = "[ramsleuth-setup] ERROR:";
+/// The trailing diagnostic for the setup status line: the FIRST
+/// stderr line containing `ERROR:` — any helper tag, not just the
+/// setup helper's own `[ramsleuth-setup] ERROR:`: the `pkexec
+/// ramsleuth-setup` run is `exec`-replaced by the delegated vendor
+/// helper (the `--with-dkms` path), and that helper dies with
+/// `[ryzen-smu-dkms] ERROR:` / `[intel-dkms] ERROR:` — its line is
+/// the structured reason, and a later unstructured line (a `dmesg`
+/// tail, a depmod note) must never mask it. Else the last non-empty
+/// stderr line, else the generic manual pointer (plan risk 1). The
+/// process exit code is appended — one line, since the GUI shows a
+/// single line. Pure, zero I/O.
+const GENERIC_FAILURE_POINTER: &str =
+    "the setup helper failed — run `sudo ramsleuth-setup --user <you>` in a terminal";
+
+fn setup_stderr_tail(stderr: &str, exit_code: i32) -> String {
     let lines: Vec<&str> = stderr
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect();
-    lines
+    let chosen = lines
         .iter()
-        .rev()
-        .find(|line| line.contains(ERROR_MARKER))
-        .map(|line| (*line).trim().to_owned())
-        .or_else(|| lines.last().map(|line| (*line).trim().to_owned()))
-        .unwrap_or_else(|| {
-            "the setup helper failed — run `sudo ramsleuth-setup --user <you>` in a terminal"
-                .to_owned()
-        })
+        .find(|line| line.contains("ERROR:"))
+        .or_else(|| lines.last())
+        .map(|line| line.trim().to_owned())
+        .unwrap_or_else(|| GENERIC_FAILURE_POINTER.to_owned());
+    format!("{chosen} (exit {exit_code})")
 }
+
+/// The Secure Boot one-time-step pending code (the vendor helper's
+/// distinct NON-fatal exit): the driver is built + installed +
+/// signed; only the one-time MOK enrollment (reboot) is left.
+/// Rendered as the actionable amber `one step left:` state — NOT a
+/// `failed:` state.
+const SECURE_BOOT_PENDING_EXIT: i32 = 10;
+
+/// The built-in one-time-step guidance, rendered when the helper
+/// exits `SECURE_BOOT_PENDING_EXIT` without its own usable stderr
+/// line.
+const SECURE_BOOT_PENDING_GUIDANCE: &str = "Secure Boot is on — the driver is built + installed + signed. ONE-TIME: reboot, at the blue MOK screen choose 'Enroll MOK key(s)' → 'Continue' → 'Yes', then re-click Setup (or disable Secure Boot in UEFI and re-click).";
 
 /// Map the helper's exit code into the [`SetupOutcome`] the status
 /// line renders (the frozen C21-01 contract: 0 = success/no-op,
 /// 1 = hard failure with the [`setup_stderr_tail`], 2 = usage —
-/// should not happen via the GUI; any other value, including the
-/// worker's `-1` for a signal-killed helper, is a hard failure
-/// too): pure, zero I/O — the worker is its only caller.
+/// should not happen via the GUI; 10 = the Secure Boot one-time
+/// step pending — actionable amber, not a failure; any other value,
+/// including the worker's `-1` for a signal-killed helper, is a hard
+/// failure too): pure, zero I/O — the worker is its only caller.
 fn map_setup_exit(code: i32, stderr: &str) -> SetupOutcome {
+    // The Secure Boot one-time step (exit 10): build + install
+    // succeeded; only the one-time MOK enrollment (reboot) is
+    // pending. The helper's own single-line reason wins; without one
+    // (empty stderr), the built-in guidance.
+    if code == SECURE_BOOT_PENDING_EXIT {
+        let tail = setup_stderr_tail(stderr, code);
+        let message = if tail.starts_with(GENERIC_FAILURE_POINTER) {
+            SECURE_BOOT_PENDING_GUIDANCE.to_owned()
+        } else {
+            tail
+        };
+        return SetupOutcome {
+            running: false,
+            done: false,
+            failure: None,
+            secure_boot_pending: Some(message),
+        };
+    }
     let failure = match code {
         0 => None,
         2 => Some(
             "the setup helper rejected its arguments (usage, exit 2 — this should \
-                 not happen via the GUI) — run `sudo ramsleuth-setup --user <you>` in a \
-                 terminal"
+                  not happen via the GUI) — run `sudo ramsleuth-setup --user <you>` in a \
+                  terminal"
                 .to_owned(),
         ),
         // Exit 1 (and any other non-zero code, incl. `-1`): the
         // structured stderr tail.
-        _ => Some(setup_stderr_tail(stderr)),
+        _ => Some(setup_stderr_tail(stderr, code)),
     };
     SetupOutcome {
         running: false,
         done: code == 0,
         failure,
+        ..Default::default()
     }
 }
 
@@ -2428,6 +2465,7 @@ fn spawn_setup_worker(setup: Arc<RwLock<SetupOutcome>>, with_dkms: bool, user: S
                      manually (sudo is the floor, plan risk 1)",
                     sudo_setup_command(&user, with_dkms)
                 )),
+                secure_boot_pending: None,
             },
         };
         // The one brief write-lock hand-off (the sanctioned D6
@@ -4456,10 +4494,12 @@ mod tests {
 
     /// (s1) The exit-code → [`SetupOutcome`] mapping (the frozen
     /// C21-01 contract, headless): exit 0 = done with no failure;
-    /// exit 1 = the structured `[ramsleuth-setup] ERROR:` tail (the
-    /// last such line wins, else the last non-empty line, else the
-    /// generic `sudo` pointer); exit 2 = the usage note; a signal
-    /// death (the worker's `-1`) degrades to the tail — no panic.
+    /// exit 1 = the structured tail — the FIRST stderr line
+    /// containing `ERROR:` (any helper tag: `[ramsleuth-setup]`,
+    /// `[ryzen-smu-dkms]`, `[intel-dkms]`), else the last non-empty
+    /// line, else the generic `sudo` pointer — with the process exit
+    /// code appended; exit 2 = the usage note; a signal death (the
+    /// worker's `-1`) degrades to the tail — no panic.
     #[test]
     fn setup_exit_code_maps_to_the_outcome() {
         // Exit 0: success / no-op.
@@ -4471,33 +4511,52 @@ mod tests {
         assert!(outcome.done, "exit 0 must set done");
         assert!(outcome.failure.is_none(), "exit 0 must carry no failure");
 
-        // Exit 1: the structured ERROR line (the last one wins).
-        let stderr = "step 1: daemon enabled\n[ramsleuth-setup] ERROR: usermod failed (exit 3)\n\
+        // Exit 1: the FIRST structured "ERROR:" line wins (a later
+        // line must not mask it) + the process exit code.
+        let stderr = "step 1: daemon enabled\n[ramsleuth-setup] ERROR: usermod failed\n\
                       [ramsleuth-setup] ERROR: step 4 failed";
         let outcome = map_setup_exit(1, stderr);
         assert!(!outcome.done, "exit 1 must not set done");
         assert_eq!(
             outcome.failure.as_deref(),
-            Some("[ramsleuth-setup] ERROR: step 4 failed"),
-            "exit 1 must carry the last structured ERROR line"
+            Some("[ramsleuth-setup] ERROR: usermod failed (exit 1)"),
+            "exit 1 must carry the first structured ERROR line + the exit code"
         );
 
-        // Exit 1 without the marker: the last non-empty line.
+        // Exit 1: the vendor-helper tags match too (the `--with-dkms`
+        // delegation is `exec`-replaced, so the helper's line is the
+        // structured reason).
+        let outcome = map_setup_exit(
+            1,
+            "info\n[ryzen-smu-dkms] ERROR: dkms build failed — compile break\n\
+              tail line",
+        );
+        assert_eq!(
+            outcome.failure.as_deref(),
+            Some("[ryzen-smu-dkms] ERROR: dkms build failed — compile break (exit 1)"),
+        );
+        let outcome = map_setup_exit(1, "info\n[intel-dkms] ERROR: modprobe failed\n");
+        assert_eq!(
+            outcome.failure.as_deref(),
+            Some("[intel-dkms] ERROR: modprobe failed (exit 1)"),
+        );
+
+        // Exit 1 without the marker: the last non-empty line + the
+        // exit code.
         let outcome = map_setup_exit(
             1,
             "info line\nmodprobe: FATAL: Module ryzen_smu_drv not found\n",
         );
         assert_eq!(
             outcome.failure.as_deref(),
-            Some("modprobe: FATAL: Module ryzen_smu_drv not found"),
+            Some("modprobe: FATAL: Module ryzen_smu_drv not found (exit 1)"),
         );
 
-        // Exit 1 with empty stderr: the generic `sudo` pointer.
-        assert!(
-            map_setup_exit(1, "")
-                .failure
-                .as_deref()
-                .is_some_and(|message| message.contains("sudo ramsleuth-setup")),
+        // Exit 1 with empty stderr: the generic `sudo` pointer + the
+        // exit code.
+        assert_eq!(
+            map_setup_exit(1, "").failure.as_deref(),
+            Some(format!("{GENERIC_FAILURE_POINTER} (exit 1)").as_str()),
             "a marker-less empty stderr must point at the manual floor"
         );
 
@@ -4516,7 +4575,43 @@ mod tests {
         // no panic.
         let outcome = map_setup_exit(-1, "killed");
         assert!(!outcome.done);
-        assert_eq!(outcome.failure.as_deref(), Some("killed"));
+        assert_eq!(outcome.failure.as_deref(), Some("killed (exit -1)"));
+    }
+
+    /// (s3) The Secure Boot one-time-step exit (10): NOT a failure —
+    /// the `secure_boot_pending` state carries the helper's own
+    /// single-line guidance (the first `ERROR:` stderr line + the
+    /// exit code), else the built-in MOK guidance; `done` stays false
+    /// (no restart modal) and `running` is cleared.
+    #[test]
+    fn secure_boot_pending_exit_is_actionable_not_failure() {
+        // With the helper's own guidance line on stderr.
+        let stderr = "[ryzen-smu-dkms] ERROR: Secure Boot is on — ONE-TIME: reboot, \
+                      at the blue MOK screen choose Enroll MOK key(s) → Continue → Yes, \
+                      then re-click Setup";
+        let outcome = map_setup_exit(10, stderr);
+        assert!(!outcome.done, "exit 10 must not set done");
+        assert!(!outcome.running, "exit 10 must clear running");
+        assert!(
+            outcome.failure.is_none(),
+            "exit 10 must not be a failure: {:?}",
+            outcome.failure
+        );
+        let expected = format!("{stderr} (exit 10)");
+        assert_eq!(
+            outcome.secure_boot_pending.as_deref(),
+            Some(expected.as_str()),
+            "the helper's own single-line guidance wins"
+        );
+
+        // Without a usable stderr line: the built-in MOK guidance.
+        let outcome = map_setup_exit(10, "");
+        assert!(outcome.failure.is_none());
+        assert_eq!(
+            outcome.secure_boot_pending.as_deref(),
+            Some(SECURE_BOOT_PENDING_GUIDANCE),
+            "an empty stderr falls back to the built-in guidance"
+        );
     }
 
     /// (s2) The manual-floor command (plan risk 1): the `sudo`
@@ -4615,9 +4710,8 @@ mod tests {
             settings_open: false,
             requirements_open: false,
             setup: Arc::new(RwLock::new(SetupOutcome {
-                running: false,
                 done: true,
-                failure: None,
+                ..Default::default()
             })),
             icon: None,
             graphs_open: Arc::new(AtomicBool::new(false)),
@@ -4754,7 +4848,7 @@ mod tests {
                 kernel: "6.6.0-test".to_owned(),
                 os: "Linux / Test".to_owned(),
                 arch: "x86_64".to_owned(),
-                ramsleuth_version: "2.4.6".to_owned(),
+                ramsleuth_version: "2.4.7".to_owned(),
                 telemetry_source: "unavailable".to_owned(),
             },
         }
@@ -4941,20 +5035,20 @@ mod tests {
         let title = probe_issue_title(&report);
         assert_eq!(
             title,
-            "[Probe] Test CPU \u{00b7} Unknown \u{00b7} Linux / Test \u{00b7} v2.4.6"
+            "[Probe] Test CPU \u{00b7} Unknown \u{00b7} Linux / Test \u{00b7} v2.4.7"
         );
         // The title's percent-encoding (the brackets, the spaces, the
         // middot, the slash).
         assert_eq!(
             url_encode(&title),
-            "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.6"
+            "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.7"
         );
         // The URL (the issues/new form, title only — the body must
         // NOT ride the query string: it would exceed GitHub's limit).
         let url = probe_issue_url(&title);
         assert_eq!(
             url,
-            "https://github.com/MadGoatHaz/RamSleuth/issues/new?title=%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.6"
+            "https://github.com/MadGoatHaz/RamSleuth/issues/new?title=%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.7"
         );
         assert!(
             !url.contains("body="),

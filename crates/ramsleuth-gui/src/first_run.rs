@@ -28,7 +28,8 @@
 //! **`Set up RamSleuth`** button (C21 — the one-click wizard; the AMD
 //! `DriverMissing` case labels it `+ AMD driver`) + its dim live status
 //! line (idle / `running…` / `done — restart RamSleuth to activate` /
-//! `failed: <msg>`), one row per requirement (an AMBER `!`, the
+//! `one step left: <msg>` — the Secure Boot one-time MOK step, actionable
+//! amber, not a failure / `failed: <msg>`), one row per requirement (an AMBER `!`, the
 //! summary, the dim detail, the command with a **Copy** button — the
 //! secondary fallback), a `Got it — keep using RamSleuth` button, and
 //! the dim no-panic footer.
@@ -244,9 +245,10 @@ pub fn setup_argv(with_dkms: bool, user: &str) -> Vec<String> {
 /// succeeded or were no-ops) or `failure` (the helper's trailing
 /// diagnostic, exit 1, or the spawn itself failed).
 ///
-/// The strip's dim status line renders the four states: idle (the
+/// The strip's dim status line renders the five states: idle (the
 /// default) / `running…` / `done — restart RamSleuth to activate` /
-/// `failed: <msg>`.
+/// `one step left: <msg>` (the Secure Boot one-time MOK step — actionable
+/// amber, not a failure) / `failed: <msg>`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SetupOutcome {
     /// The setup edge: a button click flips this, and the per-tick
@@ -264,6 +266,11 @@ pub struct SetupOutcome {
     /// The helper failed: the trailing diagnostic for the status line
     /// (`failed: <msg>`).
     pub failure: Option<String>,
+    /// The helper exited with the Secure Boot one-time-step code (10):
+    /// the driver is built + installed + signed; only the one-time MOK
+    /// enrollment (reboot) is pending. Rendered as the actionable amber
+    /// `one step left: <msg>` — NOT a failure (no `failed:`, no modal).
+    pub secure_boot_pending: Option<String>,
 }
 
 /// Decide the `--with-dkms` flag from the diagnosed requirements:
@@ -355,6 +362,8 @@ pub fn render_requirements_strip_with_setup(
                 ("running…".to_owned(), CYAN)
             } else if setup.done {
                 ("done — restart RamSleuth to activate".to_owned(), CYAN)
+            } else if let Some(pending) = &setup.secure_boot_pending {
+                (format!("one step left: {pending}"), AMBER)
             } else if let Some(failure) = &setup.failure {
                 (format!("failed: {failure}"), AMBER)
             } else {
@@ -941,6 +950,75 @@ mod tests {
         assert!(
             texts.contains(&"Set up RamSleuth + Intel driver"),
             "the Intel-labelled primary button must paint: {texts:?}"
+        );
+    }
+
+    /// (k) The Secure Boot one-step-left state: the strip's status line
+    /// paints `one step left: <msg>` (the actionable amber state — NOT the
+    /// `failed:` failure state, and `done` is false so no restart modal
+    /// opens): headless over the two-frame `ctx.run` idiom.
+    #[test]
+    fn first_run_secure_boot_pending_renders() {
+        let requirement = dkms_requirement();
+        let ctx = egui::Context::default();
+        let mut open = true;
+        let mut setup = SetupOutcome {
+            secure_boot_pending: Some(
+                "reboot, enroll the MOK key, then re-click Setup".to_owned(),
+            ),
+            ..Default::default()
+        };
+        let frame_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(968.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        fn show_strip(
+            ctx: &egui::Context,
+            requirement: &Requirement,
+            open: &mut bool,
+            setup: &mut SetupOutcome,
+        ) {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_requirements_strip_with_setup(
+                    ui,
+                    std::slice::from_ref(requirement),
+                    open,
+                    setup,
+                );
+            });
+        }
+        let first = ctx.run(frame_input(Vec::new()), |ctx| {
+            show_strip(ctx, &requirement, &mut open, &mut setup)
+        });
+        let texts: Vec<&str> = first
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("one step left: reboot, enroll the MOK key")),
+            "the one-step-left status line must paint: {texts:?}",
+        );
+        assert!(
+            !texts.iter().any(|t| t.starts_with("failed:")),
+            "a pending state must not paint the failure state: {texts:?}",
+        );
+        assert!(
+            !setup.done,
+            "a pending outcome is not done — the restart modal must never open",
+        );
+        assert!(
+            open,
+            "no click must not close the strip",
         );
     }
 }

@@ -12,6 +12,23 @@
 # is guarded; any failure prints a clear message + exits non-zero, never
 # leaving DKMS in a silent half-state. Never touches ramsleuth state.
 #
+# Secure Boot (SB-aware, never-mysterious): on a Secure Boot host the kernel
+# refuses an UNSIGNED out-of-tree module, so when this helper detects Secure
+# Boot EARLY (mokutil --sb-state, else the EFI + kernel-lockdown fallback) it
+# (1) generates a persistent signing key pair ONCE (idempotent, 10-year) at
+# /var/lib/ramsleuth/ramsleuth-intel-signing/ (key.pem + cert.pem — NOT
+# package-owned: it survives reinstalls + upgrades), (2) signs the built .ko
+# with it via a per-module /etc/dkms/framework.conf.d/ entry (the signing
+# mechanism the installed DKMS 3.x reads — it does NOT support per-module
+# SIGN/KEY_* options in dkms.conf, verified against the installed dkms),
+# (3) stages the cert for the one-time MOK enrollment (mokutil --import),
+# and (4) when the load is pending that one-time reboot, prints the clear
+# one-time guidance and exits 10 — a DISTINCT non-fatal code (the GUI renders
+# it as an amber "one step left" state, not a failure; build + install
+# succeeded). A non-Secure-Boot host takes EXACTLY the pre-SB-aware flow: no
+# key, no drop-in, no enrollment (a stale drop-in is removed then —
+# self-heal).
+#
 # VENDOR-AWARE / NON-INTEL-SAFE: the module is Intel-only by design — it
 # probes the host bridge at PCI 0000:00:00.0 and rejects a non-Intel vendor
 # with a clean -ENODEV before any kobject is created. On a non-Intel host
@@ -34,10 +51,11 @@
 #   installed copy carries no workspace Cargo.toml.
 #
 # --dry-run: performs ONLY the read-only prep (source resolution, version,
-# kernel-build-tree check, host-bridge vendor detection) and previews the
-# privileged commands; it stops BEFORE any privileged op (no sudo, no dkms, no
-# modprobe, no /usr/src, /usr/lib/depmod.d, or /etc/modules-load.d writes) and
-# exits 0. A non-Intel host is predicted from the vendor at dry-run time.
+# kernel-build-tree check, Secure Boot detection, host-bridge vendor
+# detection) and previews the privileged commands; it stops BEFORE any
+# privileged op (no sudo, no dkms, no modprobe, no /usr/src, /usr/lib/depmod.d,
+# or /etc/modules-load.d writes) and exits 0. A non-Intel host is predicted
+# from the vendor at dry-run time; the Secure Boot state is previewed too.
 
 set -euo pipefail
 
@@ -50,6 +68,8 @@ KOBJ="/sys/kernel/${MODULE}"        # kobject path (never created on a non-Intel
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"           # <repo> (or /usr when installed)
 INSTALLED_SRC="/usr/share/ramsleuth-intel-dkms/src"
 STAGE_FILES=(dkms.conf Makefile ramsleuth_intel.c README.md)
+SB_SIGN_DIR="/var/lib/ramsleuth/ramsleuth-intel-signing"
+SB_DROPIN="/etc/dkms/framework.conf.d/ramsleuth-ramsleuth_intel.conf"
 
 # --- CLI ---------------------------------------------------------------------
 DRY_RUN=0
@@ -82,6 +102,78 @@ done
 # --- Helpers -----------------------------------------------------------------
 log() { printf '[intel-dkms] %s\n' "$*"; }
 die() { printf '[intel-dkms] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Secure Boot detection (read-only): prints "enabled" or "disabled".
+# Primary: `mokutil --sb-state` (the authoritative UEFI-side answer: "SecureBoot
+# enabled" / "SecureBoot disabled"). Fallback (mokutil absent): an EFI system
+# whose active kernel lockdown is neither None/off (no lockdown) nor Integrity
+# (module loads still permitted) — i.e. Confidentiality — refuses unsigned
+# module loads, which is the case that needs signing + MOK.
+detect_secure_boot() {
+  local sb_out="" lockdown=""
+  if command -v mokutil >/dev/null 2>&1; then
+    sb_out="$(mokutil --sb-state 2>/dev/null || true)"
+  fi
+  case "${sb_out}" in
+    *"SecureBoot enabled"*)  printf 'enabled\n'; return 0 ;;
+    *"SecureBoot disabled"*) printf 'disabled\n'; return 0 ;;
+  esac
+  if [[ -d /sys/firmware/efi && -r /sys/kernel/security/lockdown ]]; then
+    lockdown="$(awk 'match($0, /\[[^]]*\]/) { s = substr($0, RSTART + 1, RLENGTH - 2); gsub(/[[:space:]]/, "", s); print s; exit }' /sys/kernel/security/lockdown)"
+  fi
+  case "${lockdown}" in
+    ""|none|None|off|OFF|integrity|Integrity) printf 'disabled\n' ;;
+    *)                                        printf 'enabled\n' ;;
+  esac
+  return 0
+}
+
+# Classify a failed `modprobe` as a Secure Boot / lockdown rejection (an
+# unsigned or un-enrolled-key module): true when SB was detected, or when the
+# recent dmesg names the module with a rejection marker (catches the
+# SB-on-but-detection-missed case — mokutil absent at detect time, a UEFI
+# change since the prior run).
+sb_load_rejected() {
+  if [[ "${SB_STATE}" == "enabled" ]]; then
+    return 0
+  fi
+  local dmesg_tail
+  dmesg_tail="$(dmesg 2>/dev/null | grep -iE "${MODULE}|lockdown|key was rejected|executive|module verification" || true)"
+  [[ -n "${dmesg_tail}" ]] \
+    && grep -qiE 'lockdown|key was rejected|rejected by service|module verification failed|is not signed|unsigned' <<<"${dmesg_tail}"
+}
+
+# The clear one-time instruction block (stdout for the terminal, plus a SINGLE
+# stderr line carrying the reason for the GUI's structured tail). The
+# non-fatal exit (10) is done by the caller.
+print_secure_boot_guidance() {
+  if command -v mokutil >/dev/null 2>&1; then
+    log "================================  Secure Boot  ===================================="
+    log "Secure Boot is enabled on this host. The ${MODULE} module was BUILT + INSTALLED"
+    log "and signed with the persistent RamSleuth key (generated once, idempotent, kept"
+    log "across reinstalls): ${SB_SIGN_DIR}/cert.pem"
+    log ""
+    log "ONE-TIME (no hoops afterwards):"
+    log "  1. Reboot now."
+    log "  2. At the blue MOK screen choose 'Enroll MOK key(s)' → 'Continue' → 'Yes'"
+    log "     (set/confirm the MOK password when prompted)."
+    log "  3. After the reboot, re-click 'Set up RamSleuth' (or re-run this helper) —"
+    log "     the driver loads; every later run (incl. after kernel updates) is a no-op."
+    log "Prefer not to reboot? Disable Secure Boot in UEFI, then re-click Setup —"
+    log "the signed module loads without the MOK step."
+    log "===================================================================================="
+    printf '[intel-dkms] ERROR: Secure Boot is on — ONE-TIME: reboot, at the blue MOK screen choose Enroll MOK key(s) → Continue → Yes, then re-click Setup (driver built + installed + signed; only the one-time MOK enrollment is pending); alternative: disable Secure Boot in UEFI and re-click Setup\n' >&2
+  else
+    log "================================  Secure Boot  ===================================="
+    log "Secure Boot is enabled on this host, but mokutil is not installed, so the signed"
+    log "key (${SB_SIGN_DIR}/cert.pem) cannot be MOK-enrolled automatically. The ${MODULE}"
+    log "module was BUILT + INSTALLED + signed."
+    log "Fix: disable Secure Boot in UEFI, then re-click 'Set up RamSleuth' — the"
+    log "module loads without the MOK step."
+    log "===================================================================================="
+    printf '[intel-dkms] ERROR: Secure Boot is on and mokutil is absent — the signed key cannot be enrolled; disable Secure Boot in UEFI, then re-click Setup (driver built + installed)\n' >&2
+  fi
+}
 
 # Source resolution (AMD pattern): first EXISTING of the repo-relative in-repo
 # tree (dev checkout — readlink -f canonicalizes a symlinked invocation) or the
@@ -176,6 +268,12 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   else
     log "DRY-RUN: WARNING: kernel build tree MISSING for ${KERNEL} — the real build would fail; install the matching headers package first"
   fi
+  DRY_SB="$(detect_secure_boot)"
+  if [[ "${DRY_SB}" == "enabled" ]]; then
+    log "DRY-RUN: Secure Boot is ON — the real run would sign the module with the persistent key (${SB_SIGN_DIR}/), stage the one-time MOK enrollment, and exit 10 with the one-time guidance if the load is pending it"
+  else
+    log "DRY-RUN: Secure Boot off — the real run would build + load unchanged"
+  fi
   VENDOR="$(detect_vendor || true)"
   VENDOR_NORM="$(normalize_vendor "${VENDOR}")"
   if [[ -n "${VENDOR_NORM}" && "${VENDOR_NORM}" == "8086" ]]; then
@@ -186,7 +284,7 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "DRY-RUN: host bridge vendor at 0000:00:00.0 unreadable — the real run would classify the modprobe outcome at load time"
   fi
   log "DRY-RUN: the real run would execute:"
-  log "  dkms remove ${MODULE}/${VERSION} -k ${KERNEL} --no-depmod   (safe no-op on a first run)"
+  log "  dkms remove <each registered ${MODULE}/<version>> --all --no-depmod   (self-heal: clear stale registrations; a no-op on a first run)"
   log "  dkms add ${MODULE}/${VERSION}"
   log "  dkms build ${MODULE}/${VERSION} -k ${KERNEL}"
   log "  dkms install ${MODULE}/${VERSION} -k ${KERNEL}"
@@ -202,6 +300,12 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exec sudo "$0" "$@"
 fi
 
+# --- Secure Boot detection (EARLY — before any build; the flow branches on it) ---
+SB_STATE="$(detect_secure_boot)"
+if [[ "${SB_STATE}" == "enabled" ]]; then
+  log "Secure Boot: ENABLED on this host — the module will be signed with the persistent RamSleuth key + staged for the one-time MOK enrollment (a NON-FATAL one-time step: exit 10 until it is done, not a hard failure)"
+fi
+
 # --- Step 1: prereqs + kernel build tree ---------------------------------------
 log "Installing build tooling: dkms + base-devel (pacman, idempotent)..."
 pacman -S --needed dkms base-devel
@@ -211,9 +315,7 @@ if ! kernel_tree_present; then
   log "Kernel build tree MISSING for ${KERNEL} — candidate headers packages:"
   CANDIDATES="$(pacman -Qs headers 2>/dev/null | grep -iE 'cachyos|custom|linux-headers' || true)"
   [[ -n "${CANDIDATES}" ]] && printf '%s\n' "${CANDIDATES}"
-  die "cannot determine the ${KERNEL} headers package automatically. Install it
-  manually (e.g. the matching 'linux-headers' / cachyos-custom package),
-  then re-run this script."
+  die "cannot determine the ${KERNEL} headers package automatically — install the matching 'linux-headers' / cachyos-custom package, then re-run this script"
 fi
 log "Kernel build tree OK: /lib/modules/${KERNEL}/build"
 
@@ -269,17 +371,69 @@ else
   log "No TTY (scripted context) — continuing without an interactive confirm"
 fi
 
-# --- Step 4: dkms add + build + install ----------------------------------------
+# --- Step 4a (Secure Boot only): persistent signing key + the DKMS signing entry ---
+# The installed DKMS (verified 3.4.3) signs from /etc/dkms/framework.conf +
+# framework.conf.d/*.conf (try_sign_modules / mok_signing_key /
+# mok_certificate) — it does NOT read per-module SIGN/KEY_* options from
+# dkms.conf — so the signing config is a per-module drop-in pointing at the
+# persistent key. The entry is written ONLY on an SB run (and removed on a
+# non-SB run — self-heal), so a non-SB build is signed by nobody:
+# byte-for-byte the pre-SB-aware behavior. Both vendor helpers write separate
+# drop-ins; a host runs at most one (the CPU vendor decides which helper is
+# invoked).
+if [[ "${SB_STATE}" == "enabled" ]]; then
+  if [[ -f "${SB_SIGN_DIR}/key.pem" && -f "${SB_SIGN_DIR}/cert.pem" ]]; then
+    log "Secure Boot: reusing the persistent signing key at ${SB_SIGN_DIR}/ (generated once — idempotent)"
+  else
+    install -d -m 0700 "${SB_SIGN_DIR}"
+    openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout "${SB_SIGN_DIR}/key.pem" -out "${SB_SIGN_DIR}/cert.pem" \
+      -subj "/CN=RamSleuth ${MODULE} signing/" \
+      || die "Secure Boot: openssl key generation in ${SB_SIGN_DIR} failed — is openssl installed?"
+    chmod 0600 "${SB_SIGN_DIR}/key.pem"
+    log "Secure Boot: generated the persistent signing key pair in ${SB_SIGN_DIR}/ (key.pem + cert.pem, 10 years, reused on every later run)"
+  fi
+  install -d /etc/dkms/framework.conf.d
+  printf '%s\n' \
+    "# RamSleuth ${MODULE}: sign the out-of-tree module with the persistent" \
+    "# RamSleuth key (Secure Boot). DKMS 3.x reads signing from framework.conf" \
+    "# (+ framework.conf.d/*.conf) — NOT from dkms.conf." \
+    "try_sign_modules=true" \
+    "mok_signing_key=${SB_SIGN_DIR}/key.pem" \
+    "mok_certificate=${SB_SIGN_DIR}/cert.pem" > "${SB_DROPIN}"
+  log "Secure Boot: DKMS will sign the module with ${SB_SIGN_DIR}/cert.pem (drop-in: ${SB_DROPIN})"
+else
+  if [[ -f "${SB_DROPIN}" ]]; then
+    rm -f "${SB_DROPIN}"
+    log "Secure Boot off: removed the stale signing drop-in ${SB_DROPIN} (self-heal — the build is unsigned, as before)"
+  fi
+fi
+
+# --- Step 4: dkms self-heal + add + build + install -----------------------------
 # `dkms add <module>/<version>` finds the staged /usr/src tree above. We capture
 # `dkms status` once and match it via here-string grep (no pipe -> no SIGPIPE
 # under pipefail).
 DKMS_STATUS="$(dkms status 2>/dev/null || true)"
 status_registered() { grep -qE "^${MODULE}/${VERSION}," <<<"${DKMS_STATUS}"; }
 status_installed()  { grep -qE "^${MODULE}/${VERSION},[[:space:]]*${KERNEL}.*:[[:space:]]*installed[[:space:]]*$" <<<"${DKMS_STATUS}"; }
-# Clear any prior registration first: on a re-run the version is already
-# registered, and without this `dkms build` below would be a no-op on the
-# freshly-staged source. `|| true` keeps first runs (nothing registered) safe.
-dkms remove "${MODULE}/${VERSION}" -k "${KERNEL}" --no-depmod 2>/dev/null || true
+# Self-heal: clear every prior registration of this module BEFORE the add —
+# not just the current version: a prior partial/failed run, an older module
+# version, or a previous kernel can leave registered builds behind, `dkms add`
+# fails on an already-registered module/version, and a stale registration can
+# carry a broken build (a `dkms build` on it would be a no-op on the
+# freshly-staged source). Each is removed with `--all` (all kernels) +
+# `--no-depmod`, then re-added below from the freshly staged source. First
+# runs (nothing registered) are an untouched no-op; foreign modules are never
+# touched.
+if grep -qE "^${MODULE}/" <<<"${DKMS_STATUS}"; then
+  while IFS= read -r entry; do
+    [[ -n "${entry}" ]] || continue
+    reg="${entry%%,*}"
+    if dkms remove "${reg}" --all --no-depmod 2>/dev/null; then
+      log "self-heal: removed stale DKMS registration ${reg} (re-adding ${MODULE}/${VERSION} below)"
+    fi
+  done < <(grep -E "^${MODULE}/" <<<"${DKMS_STATUS}")
+fi
 if ! dkms add "${MODULE}/${VERSION}"; then
   if status_registered; then
     log "${MODULE}/${VERSION} already registered with DKMS — continuing"
@@ -287,8 +441,14 @@ if ! dkms add "${MODULE}/${VERSION}"; then
     die "dkms add ${MODULE}/${VERSION} failed — run 'dkms status' to inspect"
   fi
 fi
-dkms build "${MODULE}/${VERSION}" -k "${KERNEL}" \
-  || die "dkms build ${MODULE} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect build errors"
+if ! dkms build "${MODULE}/${VERSION}" -k "${KERNEL}"; then
+  MAKE_LOG="/var/lib/dkms/${MODULE}/${VERSION}/${KERNEL}/build/make.log"
+  if [[ -f "${MAKE_LOG}" ]]; then
+    log "dkms build failed — last 40 lines of ${MAKE_LOG}:"
+    tail -n 40 "${MAKE_LOG}" >&2
+  fi
+  die "dkms build ${MODULE} -k ${KERNEL} failed — compile break (the make.log tail above names the file + line; build dir /var/lib/dkms/${MODULE}/${VERSION}/${KERNEL}/build/)"
+fi
 DKMS_STATUS="$(dkms status 2>/dev/null || true)"     # refresh after the build
 if status_installed; then
   log "${MODULE}/${VERSION} already installed for ${KERNEL} — skipping dkms install"
@@ -306,6 +466,19 @@ fi
 # Unload the resident .ko (if any) so modprobe loads the freshly-built one
 # (modprobe is a no-op on an already-loaded module). `|| true` keeps the
 # not-loaded case safe.
+# SB run: stage the signing cert for the one-time MOK enrollment BEFORE the
+# load (mokutil prompts for the MOK password — expected; first use sets it).
+# Non-fatal: a failed import (no TTY / already pending) only warns.
+if [[ "${SB_STATE}" == "enabled" ]]; then
+  if command -v mokutil >/dev/null 2>&1; then
+    log "Secure Boot: staging the signing key for the one-time MOK enrollment (mokutil --import — a MOK password prompt may appear)"
+    if ! mokutil --import "${SB_SIGN_DIR}/cert.pem"; then
+      log "WARNING: mokutil --import did not complete (no TTY / enrollment already pending) — the MOK step may need a manual pass"
+    fi
+  else
+    log "Secure Boot: mokutil is not installed — automatic MOK enrollment is skipped (disable Secure Boot in UEFI; see the guidance below)"
+  fi
+fi
 rmmod "${MODULE}" 2>/dev/null || true
 if modprobe "${MODULE}"; then
   if verify_kobject; then
@@ -316,6 +489,13 @@ if modprobe "${MODULE}"; then
     exit 0
   fi
   die "modprobe ${MODULE} succeeded but ${KOBJ}/mchbar_enabled is missing — run 'dmesg | tail' + 'dkms status' to inspect"
+fi
+# modprobe failed: a Secure Boot / lockdown rejection is the one-time MOK
+# case — actionable (the distinct non-fatal exit 10; the GUI renders an
+# amber "one step left" state), NOT a hard failure (built + installed OK).
+if sb_load_rejected; then
+  print_secure_boot_guidance
+  exit 10
 fi
 # modprobe failed: classify the outcome by the host-bridge vendor.
 VENDOR="$(detect_vendor || true)"
