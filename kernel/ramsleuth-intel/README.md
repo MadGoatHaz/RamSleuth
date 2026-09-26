@@ -3,9 +3,10 @@
 An original, in-repo RamSleuth creation (no upstream project): an
 out-of-tree kernel module for RamSleuth's live Intel memory controller
 (IMC) telemetry. It probes the host bridge (PCI `0000:00:00.0`), decodes
-**MCHBAR** from PCI config space, maps the 64 KiB window, and publishes
-the raw IMC registers as world-readable (`0444`) sysfs attributes under
-`/sys/kernel/ramsleuth_intel/`.
+**MCHBAR** from PCI config space, maps the MCHBAR window (64 KiB for
+the Tier 1/2 host bridges; 256 KiB for the Tier-3, 12th-gen+ device
+IDs), and publishes the raw IMC registers as world-readable (`0444`)
+sysfs attributes under `/sys/kernel/ramsleuth_intel/`.
 
 The module does **no decoding**: every register attribute is the raw
 32-bit value (little-endian, one line, `0x%08x`). The RamSleuth
@@ -21,7 +22,8 @@ The kobject is created **only on a fully successful probe**:
    (vendor `0x8086`),
 2. **MCHBAR_EN** is set (bit 0 of config dword `0x48`),
 3. the masked MCHBAR base (`raw & 0x0000007F_FFFF_F000`) is non-zero,
-4. the 64 KiB `ioremap` succeeds.
+4. the MCHBAR window `ioremap` succeeds (64 KiB; 256 KiB for the
+   Tier-3, 12th-gen+ device IDs).
 
 Any failure leaves **no kobject** behind and a clean `-E*` return.
 **On non-Intel hardware (e.g. an AMD dev box) a load failure is
@@ -54,7 +56,7 @@ kernel updates automatically. `dkms status` shows the bookkeeping.
 
 ## Frozen sysfs interface
 
-24 attributes, all read-only (`0444`), under `/sys/kernel/ramsleuth_intel/`.
+25 attributes, all read-only (`0444`), under `/sys/kernel/ramsleuth_intel/`.
 This list is the frozen contract the Rust reader (INTEL-03) parses:
 name, source, and line format are stable.
 
@@ -84,6 +86,7 @@ name, source, and line format are stable.
 | `mad_intra_ch1` | MCHBAR + `0x5008` | `0x%08x` |
 | `mad_dimm_ch0` | MCHBAR + `0x500C` | `0x%08x` |
 | `mad_dimm_ch1` | MCHBAR + `0x5010` | `0x%08x` |
+| `capid0a` | host-bridge PCI cfg `0xE4` (the raw `CAPID0_A` 32-bit word; read in-kernel — the `/sys` config space is 64-byte truncated) | `0x%08x` (`0xffffffff` sentinel on unreadable — the ECC-decode input) |
 
 Channel 1 mirrors channel 0 across the `0x400` dual-controller stride;
 the turnaround quartet sits at `+0x20`…`+0x2C` inside each channel
@@ -91,7 +94,11 @@ block. The five `mad_*` attributes are global (not per-channel)
 IMC registers: `mad_inter_channel` (channel mode / interleave
 configuration), `mad_intra_ch0`/`mad_intra_ch1` (channel 0/1
 rank/geometry), and `mad_dimm_ch0`/`mad_dimm_ch1` (channel 0/1 DIMM
-capacity).
+capacity). The single `capid0a` attribute is read from PCI config
+space rather than the MCHBAR window: the raw `CAPID0_A` 32-bit word
+(bit 17 = `ECC_DIS`), read in-kernel because the `/sys` config space is
+64-byte truncated, with the `0xffffffff` sentinel on unreadable — the
+input to the userspace ECC decode.
 
 ## Known limitation: Secure Boot / lockdown
 
