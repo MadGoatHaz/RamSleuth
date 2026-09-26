@@ -6,9 +6,11 @@
 //! 60 FPS window:
 //!
 //! - **CLI** — the pure [`parse_args`]: `--socket <path>` (default
-//!   [`DEFAULT_SOCKET_PATH`]); an unknown flag / positional / missing
-//!   value is a `String` error (exit 2 — the ramsleuth-daemon P3-17 /
-//!   ramsleuth-client P3-21 / ramsleuth-tui P3-24 precedent).
+//!   [`DEFAULT_SOCKET_PATH`]); `--help`/`-h` and `--version`/`-V`
+//!   short-circuit in `main` before parsing (exit 0); an unknown flag
+//!   / positional / missing value is a `String` error (exit 2 — the
+//!   ramsleuth-daemon P3-17 / ramsleuth-client P3-21 / ramsleuth-tui
+//!   P3-24 precedent).
 //! - **App** — a 968×600 eframe window carrying the dark-slate
 //!   [`build_style`]: the spec's 3-line header (Grand Design §3.1,
 //!   C6-20) — line 1 a left anchor (the `RamSleuth v<version>`
@@ -113,6 +115,8 @@
 //! Options:
 //!   --socket <path>   Daemon Unix socket
 //!                     (default: /run/ramsleuth/ramsleuth.sock)
+//!   -h, --help        Print this help and exit
+//!   -V, --version     Print the version and exit
 //!
 //! Keys: [F2] snapshot  [F3] export  [Q] quit
 //! Exit codes: 0 quit, 1 eframe/display failure, 2 usage error
@@ -250,23 +254,75 @@ fn window_icon() -> Option<Arc<egui::IconData>> {
     }
 }
 
-/// Usage text printed on parse errors (exit 2) — the ramsleuth-daemon
-/// P3-17 / ramsleuth-client P3-21 / ramsleuth-tui P3-24 precedent. The
-/// default socket path is the protocol's frozen `DEFAULT_SOCKET_PATH`
-/// value (P3-10) as a literal: `concat!` only accepts literals, and
-/// the protocol freeze test pins the string.
+/// Usage text printed for `--help`/`-h` and on parse errors (exit 2) —
+/// the ramsleuth-daemon P3-17 / ramsleuth-client P3-21 / ramsleuth-tui
+/// P3-24 precedent. The default socket path is the protocol's frozen
+/// `DEFAULT_SOCKET_PATH` value (P3-10) as a literal: `concat!` only
+/// accepts literals, and the protocol freeze test pins the string.
 const USAGE: &str = concat!(
-    "ramsleuth — the live desktop dashboard (F2/F3/Q)\n",
+    "ramsleuth — the RamSleuth live desktop dashboard (egui)\n",
+    "\n",
+    "Live RAM telemetry (AMD SMU / Intel IMC), SPD module details with\n",
+    "XMP/EXPO profiles, channel mode + ECC status, and the AIDA64-style\n",
+    "memory benchmark. Talks to the privileged ramsleuth-daemon over the\n",
+    "Unix socket (the daemon needs root / CAP_SYS_RAWIO; without it the\n",
+    "privileged fields degrade to N/A).\n",
     "\n",
     "Usage: ramsleuth [OPTIONS]\n",
+    "\n",
+    "Header buttons: Probe (consent-gated diagnostic report), Setup,\n",
+    "Settings, Graphs\n",
+    "Keys: [F2] snapshot  [F3] export  [Q] quit\n",
     "\n",
     "Options:\n",
     "  --socket <path>   Daemon Unix socket\n",
     "                    (default: /run/ramsleuth/ramsleuth.sock)\n",
+    "  -h, --help        Print this help and exit\n",
+    "  -V, --version     Print the version and exit\n",
     "\n",
-    "Keys: [F2] snapshot  [F3] export  [Q] quit\n",
     "Exit codes: 0 quit, 1 eframe/display failure, 2 usage error\n",
 );
+
+/// The `--version`/`-V` output line: `ramSleuth <bin> v<version>` —
+/// the version is the crate's `CARGO_PKG_VERSION` (the workspace
+/// release, so it tracks it automatically).
+fn version_line() -> String {
+    format!("ramSleuth ramsleuth v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The startup short-circuit for a raw argument (checked by `main`
+/// *before* the full [`parse_args`]): `Help` prints the usage text
+/// (exit 0), `Version` prints [`version_line`] (exit 0), `None` means
+/// the full parse proceeds (a genuinely unknown flag stays a usage
+/// error, exit 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortCircuit {
+    /// `--help` / `-h` — print the usage text.
+    Help,
+    /// `--version` / `-V` — print [`version_line`].
+    Version,
+    /// Neither — continue to the full parse.
+    None,
+}
+
+/// Classify a raw argument list (the program name already removed) for
+/// the startup short-circuit: the *first* `--help`/`-h` or
+/// `--version`/`-V`, in argv order, wins; a list without either is
+/// `None`.
+fn short_circuit<I, S>(args: I) -> ShortCircuit
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for arg in args {
+        match arg.as_ref() {
+            "--help" | "-h" => return ShortCircuit::Help,
+            "--version" | "-V" => return ShortCircuit::Version,
+            _ => {}
+        }
+    }
+    ShortCircuit::None
+}
 
 /// The GUI's parsed command line (P3-30).
 ///
@@ -293,6 +349,8 @@ impl Default for GuiArgs {
 /// other flag, any positional argument, or a missing flag value is a
 /// `String` error naming the problem (exit `2` at startup) — the
 /// ramsleuth-client P3-21 / ramsleuth-tui P3-24 precedent.
+/// (`--help`/`-h` and `--version`/`-V` never reach this parser —
+/// `main` short-circuits them first, exit `0`.)
 pub fn parse_args<I, S>(args: I) -> Result<GuiArgs, String>
 where
     I: IntoIterator<Item = S>,
@@ -2393,6 +2451,21 @@ fn apply_refresh_transition(
 }
 
 fn main() -> ExitCode {
+    // 0. `--help`/`-h` and `--version`/`-V` short-circuit before
+    //    parsing (standard, exit 0): help prints the usage text,
+    //    version the [`version_line`].
+    match short_circuit(std::env::args().skip(1)) {
+        ShortCircuit::Help => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        ShortCircuit::Version => {
+            println!("{}", version_line());
+            return ExitCode::SUCCESS;
+        }
+        ShortCircuit::None => {}
+    }
+
     // 1. Parse the command line (usage error → exit 2).
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
@@ -2583,6 +2656,41 @@ mod tests {
         assert!(
             parse_args(["--socket"]).is_err(),
             "a missing --socket value must error"
+        );
+    }
+
+    /// (a) The `--version`/`-V` line is the package version, exactly
+    /// (`env!` — it tracks the workspace release).
+    #[test]
+    fn version_line_is_the_package_version() {
+        assert_eq!(
+            version_line(),
+            format!("ramSleuth ramsleuth v{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// (a) `--help`/`-h` and `--version`/`-V` are the short-circuits:
+    /// the first occurrence, in argv order, wins; anything else
+    /// (including the plain `--socket` list) is `None`.
+    #[test]
+    fn short_circuit_classifies_help_version_and_none() {
+        for h in ["--help", "-h"] {
+            assert_eq!(short_circuit([h]), ShortCircuit::Help, "{h} → Help");
+        }
+        for v in ["--version", "-V"] {
+            assert_eq!(short_circuit([v]), ShortCircuit::Version, "{v} → Version");
+        }
+        assert_eq!(short_circuit(Vec::<&str>::new()), ShortCircuit::None);
+        assert_eq!(short_circuit(["--socket", "/tmp/x"]), ShortCircuit::None);
+        assert_eq!(
+            short_circuit(["--help", "--version"]),
+            ShortCircuit::Help,
+            "the first occurrence wins"
+        );
+        assert_eq!(
+            short_circuit(["--version", "--help"]),
+            ShortCircuit::Version,
+            "the first occurrence wins"
         );
     }
 

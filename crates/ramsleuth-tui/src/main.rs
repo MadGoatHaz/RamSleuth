@@ -127,10 +127,12 @@
 //! `disconnected`) where the status zone shows it, and the loop keeps
 //! running.
 //!
-//! **Exit codes:** `0` a normal quit; `1` the terminal could not be
-//! initialized (friendly message; nothing to restore); `2` a usage error
-//! (unknown flag / positional / missing value, with the usage text — the
-//! ramsleuth-daemon P3-17 / ramsleuth-client P3-21 precedent).
+//! **Exit codes:** `0` a normal quit (`--help`/`-h` and
+//! `--version`/`-V` short-circuit to `0` before parsing too); `1` the
+//! terminal could not be initialized (friendly message; nothing to
+//! restore); `2` a usage error (unknown flag / positional / missing
+//! value, with the usage text — the ramsleuth-daemon P3-17 /
+//! ramsleuth-client P3-21 precedent).
 //!
 //! Manual verification (live TTY, the QA phase): with the dev daemon
 //! running (`cargo run -p ramsleuth-daemon -- --socket /tmp/ramsleuth.sock`),
@@ -148,10 +150,6 @@
 //!
 //! ```text
 //! Usage: ramsleuth-tui [OPTIONS]
-//!
-//! Options:
-//!   --socket <path>   Daemon Unix socket
-//!                     (default: /run/ramsleuth/ramsleuth.sock)
 //!
 //! Keys:
 //!   [R]efresh        force one poll (works with refresh off)
@@ -171,6 +169,13 @@
 //!   [A]uto refresh   toggle the periodic data poll (on ↔ off)
 //!   [W]indow         cycle the graphs window (1 → 5 → 15 → 60 min)
 //!   [F] probe report  consent → preview → write/copy the report
+//!
+//! Options:
+//!   --socket <path>   Daemon Unix socket
+//!                     (default: /run/ramsleuth/ramsleuth.sock)
+//!   -h, --help        Print this help and exit
+//!   -V, --version     Print the version and exit
+//!
 //! Exit codes: 0 quit, 1 terminal init failure, 2 usage error
 //! ```
 
@@ -252,19 +257,22 @@ const JOIN_POLL: Duration = Duration::from_millis(50);
 /// daemon.
 const BENCH_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Usage text printed on parse errors (exit 2) — the ramsleuth-daemon
-/// P3-17 / ramsleuth-client P3-21 precedent. The default socket path is
-/// the protocol's frozen `DEFAULT_SOCKET_PATH` value (P3-10) as a
-/// literal: `concat!` only accepts literals, and the protocol freeze
-/// test pins the string.
+/// Usage text printed for `--help`/`-h` and on parse errors (exit 2) —
+/// the ramsleuth-daemon P3-17 / ramsleuth-client P3-21 precedent. The
+/// default socket path is the protocol's frozen `DEFAULT_SOCKET_PATH`
+/// value (P3-10) as a literal: `concat!` only accepts literals, and
+/// the protocol freeze test pins the string.
 const USAGE: &str = concat!(
-    "ramsleuth-tui — the live terminal dashboard (17-key parity)\n",
+    "ramsleuth-tui — the RamSleuth live terminal dashboard (17-key\n",
+    "parity with the GUI)\n",
+    "\n",
+    "Live RAM telemetry (AMD SMU / Intel IMC), SPD module details with\n",
+    "XMP/EXPO profiles, channel mode + ECC status, and the memory\n",
+    "benchmark. Talks to the privileged ramsleuth-daemon over the Unix\n",
+    "socket (the daemon needs root / CAP_SYS_RAWIO; without it the\n",
+    "privileged fields degrade to N/A).\n",
     "\n",
     "Usage: ramsleuth-tui [OPTIONS]\n",
-    "\n",
-    "Options:\n",
-    "  --socket <path>   Daemon Unix socket\n",
-    "                    (default: /run/ramsleuth/ramsleuth.sock)\n",
     "\n",
     "Keys:\n",
     "  [R]efresh        force one poll (works with refresh off)\n",
@@ -284,8 +292,56 @@ const USAGE: &str = concat!(
     "  [A]uto refresh   toggle the periodic data poll (on ↔ off)\n",
     "  [W]indow         cycle the graphs window (1 → 5 → 15 → 60 min)\n",
     "  [F] probe report  consent → preview → write/copy the report\n",
+    "\n",
+    "Options:\n",
+    "  --socket <path>   Daemon Unix socket\n",
+    "                    (default: /run/ramsleuth/ramsleuth.sock)\n",
+    "  -h, --help        Print this help and exit\n",
+    "  -V, --version     Print the version and exit\n",
+    "\n",
     "Exit codes: 0 quit, 1 terminal init failure, 2 usage error\n",
 );
+
+/// The `--version`/`-V` output line: `ramSleuth <bin> v<version>` —
+/// the version is the crate's `CARGO_PKG_VERSION` (the workspace
+/// release, so it tracks it automatically).
+fn version_line() -> String {
+    format!("ramSleuth ramsleuth-tui v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The startup short-circuit for a raw argument (checked by `main`
+/// *before* the full [`parse_args`]): `Help` prints the usage text
+/// (exit 0), `Version` prints [`version_line`] (exit 0), `None` means
+/// the full parse proceeds (a genuinely unknown flag stays a usage
+/// error, exit 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortCircuit {
+    /// `--help` / `-h` — print the usage text.
+    Help,
+    /// `--version` / `-V` — print [`version_line`].
+    Version,
+    /// Neither — continue to the full parse.
+    None,
+}
+
+/// Classify a raw argument list (the program name already removed) for
+/// the startup short-circuit: the *first* `--help`/`-h` or
+/// `--version`/`-V`, in argv order, wins; a list without either is
+/// `None`.
+fn short_circuit<I, S>(args: I) -> ShortCircuit
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for arg in args {
+        match arg.as_ref() {
+            "--help" | "-h" => return ShortCircuit::Help,
+            "--version" | "-V" => return ShortCircuit::Version,
+            _ => {}
+        }
+    }
+    ShortCircuit::None
+}
 
 /// The TUI's parsed command line (P3-24).
 ///
@@ -313,7 +369,9 @@ impl Default for TuiArgs {
 /// [`DEFAULT_SOCKET_PATH`]); it may repeat (the last value wins). Any
 /// other flag, any positional argument, or a missing flag value is a
 /// `String` error naming the problem (exit `2` at startup) — the
-/// ramsleuth-client P3-21 precedent.
+/// ramsleuth-client P3-21 precedent. (`--help`/`-h` and
+/// `--version`/`-V` never reach this parser — `main` short-circuits
+/// them first, exit `0`.)
 pub fn parse_args<I, S>(args: I) -> Result<TuiArgs, String>
 where
     I: IntoIterator<Item = S>,
@@ -1933,6 +1991,21 @@ fn run(args: TuiArgs) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // `--help`/`-h` and `--version`/`-V` short-circuit before parsing
+    // (standard, exit 0): help prints the usage text, version the
+    // [`version_line`].
+    match short_circuit(std::env::args().skip(1)) {
+        ShortCircuit::Help => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        ShortCircuit::Version => {
+            println!("{}", version_line());
+            return ExitCode::SUCCESS;
+        }
+        ShortCircuit::None => {}
+    }
+
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(message) => {
@@ -4525,6 +4598,51 @@ mod tests {
         assert!(
             USAGE.contains("Exit codes: 0 quit, 1 terminal init failure, 2 usage error"),
             "the exit-code note is unchanged"
+        );
+        // The capability description + the new options surface.
+        for entry in [
+            "17-key",
+            "ramsleuth-daemon over the Unix",
+            "CAP_SYS_RAWIO",
+            "-h, --help",
+            "-V, --version",
+        ] {
+            assert!(USAGE.contains(entry), "the USAGE must list {entry}");
+        }
+    }
+
+    /// (br) The `--version`/`-V` line is the package version, exactly
+    /// (`env!` — it tracks the workspace release).
+    #[test]
+    fn version_line_is_the_package_version() {
+        assert_eq!(
+            version_line(),
+            format!("ramSleuth ramsleuth-tui v{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// (br) `--help`/`-h` and `--version`/`-V` are the short-circuits:
+    /// the first occurrence, in argv order, wins; anything else
+    /// (including the plain `--socket` list) is `None`.
+    #[test]
+    fn short_circuit_classifies_help_version_and_none() {
+        for h in ["--help", "-h"] {
+            assert_eq!(short_circuit([h]), ShortCircuit::Help, "{h} → Help");
+        }
+        for v in ["--version", "-V"] {
+            assert_eq!(short_circuit([v]), ShortCircuit::Version, "{v} → Version");
+        }
+        assert_eq!(short_circuit(Vec::<&str>::new()), ShortCircuit::None);
+        assert_eq!(short_circuit(["--socket", "/tmp/x"]), ShortCircuit::None);
+        assert_eq!(
+            short_circuit(["--help", "--version"]),
+            ShortCircuit::Help,
+            "the first occurrence wins"
+        );
+        assert_eq!(
+            short_circuit(["--version", "--help"]),
+            ShortCircuit::Version,
+            "the first occurrence wins"
         );
     }
 

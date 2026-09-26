@@ -14,11 +14,12 @@
 //!   cell, then the terminal AIDA64-style 4×4 grid);
 //! - `status` → the one-line-per-section health summary.
 //!
-//! **Exit codes:** `0` success; `1` a daemon / client error (connect,
-//! timeout, protocol, or i/o — each with its structured
-//! [`ClientError`] diagnostic); `2` a usage error (unknown subcommand
-//! or flag, a missing flag value, or a bad enum value — with the
-//! usage text).
+//! **Exit codes:** `0` success (`--help`/`-h` and `--version`/`-V`
+//! short-circuit to `0` before parsing too); `1` a daemon / client
+//! error (connect, timeout, protocol, or i/o — each with its
+//! structured [`ClientError`] diagnostic); `2` a usage error (unknown
+//! subcommand or flag, a missing flag value, or a bad enum value —
+//! with the usage text).
 //!
 //! Manual verification (the CORE GATE command): with a daemon running,
 //! `cargo run -p ramsleuth-client -- dump` prints the full hardware
@@ -30,8 +31,11 @@
 //! Usage: ramsleuth-client [SUBCOMMAND] [OPTIONS]
 //!
 //! Subcommands:
-//!   dump     Print the dashboard-style telemetry listing (default)
-//!   bench    Run a streamed benchmark (progress lines + the 4x4 grid)
+//!   dump     Print the dashboard-style telemetry listing (default):
+//!            CPU, the AMD / Intel sections, and the SPD modules with
+//!            XMP/EXPO profiles
+//!   bench    Run a streamed AIDA64-style memory bandwidth / latency
+//!            benchmark (progress lines + the 4x4 grid)
 //!   status   Print the per-section health summary
 //!
 //! Options:
@@ -39,6 +43,8 @@
 //!                                    (default: /run/ramsleuth/ramsleuth.sock)
 //!   --tier <memory|l1|l2|l3|full>    Benchmark tier scope (default: full)
 //!   --mode <full|memory-only>        Benchmark scope (default: full)
+//!   -h, --help                       Print this help and exit
+//!   -V, --version                    Print the version and exit
 //!
 //! Exit codes: 0 success, 1 daemon/client error, 2 usage error
 //! ```
@@ -107,18 +113,26 @@ pub enum Subcommand {
     Status,
 }
 
-/// Usage text printed on parse errors (the ramsleuth-daemon P3-17
-/// precedent). The default socket path is the protocol's frozen
-/// `DEFAULT_SOCKET_PATH` value (P3-10) as a literal: `concat!` only
-/// accepts literals, and the protocol freeze test pins the string.
+/// Usage text printed for `--help`/`-h` and on parse errors (exit 2 —
+/// the ramsleuth-daemon P3-17 precedent). The default socket path is
+/// the protocol's frozen `DEFAULT_SOCKET_PATH` value (P3-10) as a
+/// literal: `concat!` only accepts literals, and the protocol freeze
+/// test pins the string.
 const USAGE: &str = concat!(
-    "ramsleuth-client — the unprivileged ramsleuth CLI (dump / bench / status)\n",
+    "ramsleuth-client — the RamSleuth unprivileged CLI (dump / bench /\n",
+    "status)\n",
+    "\n",
+    "Talks to the privileged ramsleuth-daemon over the Unix socket (the\n",
+    "daemon needs root / CAP_SYS_RAWIO).\n",
     "\n",
     "Usage: ramsleuth-client [SUBCOMMAND] [OPTIONS]\n",
     "\n",
     "Subcommands:\n",
-    "  dump     Print the dashboard-style telemetry listing (default)\n",
-    "  bench    Run a streamed benchmark (progress lines + the 4x4 grid)\n",
+    "  dump     Print the dashboard-style telemetry listing (default):\n",
+    "           CPU, the AMD / Intel sections, and the SPD modules with\n",
+    "           XMP/EXPO profiles\n",
+    "  bench    Run a streamed AIDA64-style memory bandwidth / latency\n",
+    "           benchmark (progress lines + the 4x4 grid)\n",
     "  status   Print the per-section health summary\n",
     "\n",
     "Options:\n",
@@ -126,9 +140,52 @@ const USAGE: &str = concat!(
     "                                   (default: /run/ramsleuth/ramsleuth.sock)\n",
     "  --tier <memory|l1|l2|l3|full>    Benchmark tier scope (default: full)\n",
     "  --mode <full|memory-only>        Benchmark scope (default: full)\n",
+    "  -h, --help                       Print this help and exit\n",
+    "  -V, --version                    Print the version and exit\n",
     "\n",
     "Exit codes: 0 success, 1 daemon/client error, 2 usage error\n",
 );
+
+/// The `--version`/`-V` output line: `ramSleuth <bin> v<version>` —
+/// the version is the crate's `CARGO_PKG_VERSION` (the workspace
+/// release, so it tracks it automatically).
+fn version_line() -> String {
+    format!("ramSleuth ramsleuth-client v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The startup short-circuit for a raw argument (checked by `main`
+/// *before* the full [`parse_cli`]): `Help` prints the usage text
+/// (exit 0), `Version` prints [`version_line`] (exit 0), `None` means
+/// the full parse proceeds (a genuinely unknown flag stays a usage
+/// error, exit 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortCircuit {
+    /// `--help` / `-h` — print the usage text.
+    Help,
+    /// `--version` / `-V` — print [`version_line`].
+    Version,
+    /// Neither — continue to the full parse.
+    None,
+}
+
+/// Classify a raw argument list (the program name already removed) for
+/// the startup short-circuit: the *first* `--help`/`-h` or
+/// `--version`/`-V`, in argv order, wins; a list without either is
+/// `None`.
+fn short_circuit<I, S>(args: I) -> ShortCircuit
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for arg in args {
+        match arg.as_ref() {
+            "--help" | "-h" => return ShortCircuit::Help,
+            "--version" | "-V" => return ShortCircuit::Version,
+            _ => {}
+        }
+    }
+    ShortCircuit::None
+}
 
 /// One subcommand name (the first positional): `dump` / `bench` /
 /// `status`; anything else is an error naming the offending value.
@@ -188,7 +245,8 @@ fn parse_mode(arg: &str) -> Result<BenchMode, String> {
 /// An unknown flag, an unknown subcommand, a second positional, or a
 /// flag missing its value is a `String` error naming the problem (exit
 /// `2` at startup); a valid parse yields [`CliArgs`] with defaults for
-/// every absent piece.
+/// every absent piece. (`--help`/`-h` and `--version`/`-V` never reach
+/// this parser — `main` short-circuits them first, exit `0`.)
 pub fn parse_cli<I, S>(args: I) -> Result<CliArgs, String>
 where
     I: IntoIterator<Item = S>,
@@ -248,6 +306,21 @@ where
 }
 
 fn main() {
+    // `--help`/`-h` and `--version`/`-V` short-circuit before parsing
+    // (standard, exit 0): help prints the usage text, version the
+    // [`version_line`].
+    match short_circuit(std::env::args().skip(1)) {
+        ShortCircuit::Help => {
+            println!("{USAGE}");
+            std::process::exit(0);
+        }
+        ShortCircuit::Version => {
+            println!("{}", version_line());
+            std::process::exit(0);
+        }
+        ShortCircuit::None => {}
+    }
+
     // A parse error is a usage error: the message + the usage text,
     // exit 2 (the ramsleuth-daemon P3-17 precedent).
     let args = match parse_cli(std::env::args().skip(1)) {
@@ -480,5 +553,44 @@ mod tests {
         assert_eq!(parsed.socket, PathBuf::from("/tmp/y.sock"));
         assert_eq!(parsed.target, StreamTarget::Tier(Tier::L2));
         assert_eq!(parsed.mode, BenchMode::MemoryOnly);
+    }
+
+    /// (k) The `--version`/`-V` line is the package version, exactly
+    /// (`env!` — it tracks the workspace release).
+    #[test]
+    fn version_line_is_the_package_version() {
+        assert_eq!(
+            version_line(),
+            format!("ramSleuth ramsleuth-client v{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// (k) `--help`/`-h` and `--version`/`-V` are the short-circuits:
+    /// the first occurrence, in argv order, wins; anything else
+    /// (including the subcommand + flags) is `None`.
+    #[test]
+    fn short_circuit_classifies_help_version_and_none() {
+        for h in ["--help", "-h"] {
+            assert_eq!(short_circuit([h]), ShortCircuit::Help, "{h} → Help");
+        }
+        for v in ["--version", "-V"] {
+            assert_eq!(short_circuit([v]), ShortCircuit::Version, "{v} → Version");
+        }
+        assert_eq!(short_circuit(Vec::<&str>::new()), ShortCircuit::None);
+        assert_eq!(
+            short_circuit(["dump", "--socket", "/tmp/x"]),
+            ShortCircuit::None,
+            "a plain subcommand + flag list is None"
+        );
+        assert_eq!(
+            short_circuit(["--help", "--version"]),
+            ShortCircuit::Help,
+            "the first occurrence wins"
+        );
+        assert_eq!(
+            short_circuit(["--version", "--help"]),
+            ShortCircuit::Version,
+            "the first occurrence wins"
+        );
     }
 }

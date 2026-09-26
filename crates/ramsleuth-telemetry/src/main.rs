@@ -5,8 +5,9 @@
 //! P1-11 precedent). Every section renders as its value's `Debug` text or
 //! a structured `N/A (<reason>)`, so the process **exits 0 even when
 //! everything is N/A** (N/A is a valid, structured outcome, not a
-//! failure). The only non-zero exit is a bad command-line flag (2). No
-//! clap; `std::env::args` only.
+//! failure). `-h`/`--help` and `--version`/`-V` short-circuit (exit
+//! `0`) before the snapshot is rendered; the only non-zero exit is a
+//! bad command-line flag (2). No clap; `std::env::args` only.
 
 use ramsleuth_telemetry::error::Section;
 use ramsleuth_telemetry::{collect, SystemMemoryTelemetry};
@@ -20,29 +21,77 @@ struct Opts {
 
 /// Usage text (printed for `--help` / `-h`).
 const USAGE: &str = "\
-ramsleuth-telemetry — RamSleuth system memory telemetry snapshot
+ramsleuth-telemetry — the standalone RamSleuth system memory telemetry
+snapshot
+
+CPU vendor/brand, the AMD SMU section, the Intel IMC section, and the
+SPD modules (including XMP/EXPO profiles). Reads the hardware directly
+— no daemon needed.
 
 Usage: ramsleuth-telemetry [OPTIONS]
 
 Options:
-  --json      Print the snapshot as a hand-rolled JSON block
-  -h, --help  Print this help and exit
+  --json       Print the snapshot as a hand-rolled JSON block
+  -h, --help   Print this help and exit
+  -V, --version Print the version and exit
 
 Exit codes:
   0  snapshot rendered (even if every section is N/A)
   2  unknown flag
 ";
 
+/// The `--version`/`-V` output line: `ramSleuth <bin> v<version>` —
+/// the version is the crate's `CARGO_PKG_VERSION` (the workspace
+/// release, so it tracks it automatically).
+fn version_line() -> String {
+    format!("ramSleuth ramsleuth-telemetry v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The startup short-circuit for a raw argument (checked by `main`
+/// *before* the full [`parse_opts`]): `Help` prints the usage text
+/// (exit 0), `Version` prints [`version_line`] (exit 0), `None` means
+/// the full parse proceeds (a genuinely unknown flag stays a usage
+/// error, exit 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortCircuit {
+    /// `--help` / `-h` — print the usage text.
+    Help,
+    /// `--version` / `-V` — print [`version_line`].
+    Version,
+    /// Neither — continue to the full parse.
+    None,
+}
+
+/// Classify a raw argument list (the program name already removed) for
+/// the startup short-circuit: the *first* `--help`/`-h` or
+/// `--version`/`-V`, in argv order, wins; a list without either is
+/// `None`.
+fn short_circuit<I, S>(args: I) -> ShortCircuit
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for arg in args {
+        match arg.as_ref() {
+            "--help" | "-h" => return ShortCircuit::Help,
+            "--version" | "-V" => return ShortCircuit::Version,
+            _ => {}
+        }
+    }
+    ShortCircuit::None
+}
+
 /// Parse argv (index 0 is the program name). `--json` sets `json`;
-/// `-h`/`--help` are recognized (not an error — `main` short-circuits
-/// them before parsing); any other argument is an error naming that
-/// argument.
+/// `-h`/`--help` / `-V`/`--version` are recognized (not an error —
+/// `main` short-circuits them before parsing); any other argument is
+/// an error naming that argument.
 pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut opts = Opts { json: false };
     for arg in args.iter().skip(1) {
         match arg.as_str() {
             "--json" => opts.json = true,
-            "-h" | "--help" => {} // recognized; help is handled in `main`
+            // recognized; help / version are handled in `main`
+            "-h" | "--help" | "-V" | "--version" => {}
             bad => return Err(bad.to_owned()),
         }
     }
@@ -129,10 +178,18 @@ fn json_escape(s: &str) -> String {
 /// CLI entry: parse flags, collect the snapshot, render it, exit 0.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // Help short-circuits before parsing: print usage, exit 0.
-    if args.iter().skip(1).any(|a| a == "-h" || a == "--help") {
-        println!("{USAGE}");
-        std::process::exit(0);
+    // Help / version short-circuit before parsing: print the usage /
+    // the version line, exit 0.
+    match short_circuit(args.iter().skip(1)) {
+        ShortCircuit::Help => {
+            println!("{USAGE}");
+            std::process::exit(0);
+        }
+        ShortCircuit::Version => {
+            println!("{}", version_line());
+            std::process::exit(0);
+        }
+        ShortCircuit::None => {}
     }
     match parse_opts(&args) {
         Err(bad) => {
@@ -289,7 +346,48 @@ mod tests {
         let help_args = [prog.clone(), "--help".to_owned()];
         assert_eq!(parse_opts(&help_args), Ok(text));
 
+        let v_args = [prog.clone(), "-V".to_owned()];
+        assert_eq!(parse_opts(&v_args), Ok(text));
+
+        let version_args = [prog.clone(), "--version".to_owned()];
+        assert_eq!(parse_opts(&version_args), Ok(text));
+
         let bogus_args = [prog.clone(), "--bogus".to_owned()];
         assert_eq!(parse_opts(&bogus_args), Err("--bogus".to_owned()));
+    }
+
+    /// (e) The `--version`/`-V` line is the package version, exactly
+    /// (`env!` — it tracks the workspace release).
+    #[test]
+    fn version_line_is_the_package_version() {
+        assert_eq!(
+            version_line(),
+            format!("ramSleuth ramsleuth-telemetry v{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// (f) `--help`/`-h` and `--version`/`-V` are the short-circuits:
+    /// the first occurrence, in argv order, wins; anything else is
+    /// `None`.
+    #[test]
+    fn short_circuit_classifies_help_version_and_none() {
+        for h in ["--help", "-h"] {
+            assert_eq!(short_circuit([h]), ShortCircuit::Help, "{h} → Help");
+        }
+        for v in ["--version", "-V"] {
+            assert_eq!(short_circuit([v]), ShortCircuit::Version, "{v} → Version");
+        }
+        assert_eq!(short_circuit(Vec::<&str>::new()), ShortCircuit::None);
+        assert_eq!(short_circuit(["--json"]), ShortCircuit::None);
+        assert_eq!(
+            short_circuit(["--help", "--version"]),
+            ShortCircuit::Help,
+            "the first occurrence wins"
+        );
+        assert_eq!(
+            short_circuit(["--version", "--help"]),
+            ShortCircuit::Version,
+            "the first occurrence wins"
+        );
     }
 }

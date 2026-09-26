@@ -48,6 +48,7 @@
 //!   --max-age <secs>   telemetry cache TTL in seconds (default: 2)
 //!   --no-spd-autobind  disable the guarded SPD EEPROM auto-bind fallback
 //!   -h, --help         print usage and exit
+//!   -V, --version      print the version and exit
 //! ```
 
 use std::path::PathBuf;
@@ -99,13 +100,20 @@ impl Default for DaemonArgs {
     }
 }
 
-/// Usage text printed for `--help` and on parse errors (the
-/// ramsleuth-bench CLI precedent). The default socket path is the
+/// Usage text printed for `--help`/`--version` and on parse errors
+/// (the ramsleuth-bench CLI precedent). The default socket path is the
 /// protocol's frozen `DEFAULT_SOCKET_PATH` value (P3-10) as a literal:
 /// `concat!` only accepts literals, and the protocol's freeze test
 /// pins the string.
 const USAGE: &str = concat!(
-    "ramsleuth-daemon — the privileged ramsleuth telemetry/benchmark daemon\n",
+    "ramsleuth-daemon — the privileged RamSleuth telemetry/benchmark\n",
+    "daemon\n",
+    "\n",
+    "Requires root (CAP_SYS_RAWIO). Collects the AMD SMU PM tables, the\n",
+    "Intel MCHBAR IMC registers, and the ee1004 SPD EEPROMs, and serves\n",
+    "the ramsleuth GUI / ramsleuth-tui / ramsleuth-client over the Unix\n",
+    "socket. Without CAP_SYS_RAWIO the privileged fields degrade to N/A\n",
+    "(a warning — the daemon keeps serving).\n",
     "\n",
     "Usage: ramsleuth-daemon [OPTIONS]\n",
     "\n",
@@ -117,10 +125,52 @@ const USAGE: &str = concat!(
     "                     fallback (default: enabled; Intel-only,\n",
     "                     root-only, non-fatal)\n",
     "  -h, --help         Print this help and exit\n",
+    "  -V, --version      Print the version and exit\n",
     "\n",
     "Signals: SIGTERM and SIGINT stop the daemon gracefully (stop\n",
     "accepting, remove the socket file, exit 0).\n",
 );
+
+/// The `--version`/`-V` output line: `ramSleuth <bin> v<version>` —
+/// the version is the crate's `CARGO_PKG_VERSION` (the workspace
+/// release, so it tracks it automatically).
+fn version_line() -> String {
+    format!("ramSleuth ramsleuth-daemon v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The startup short-circuit for a raw argument (checked by `main`
+/// *before* the full [`parse_args`]): `Help` prints the usage text
+/// (exit 0), `Version` prints [`version_line`] (exit 0), `None` means
+/// the full parse proceeds (a genuinely unknown flag stays a usage
+/// error, exit 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortCircuit {
+    /// `--help` / `-h` — print the usage text.
+    Help,
+    /// `--version` / `-V` — print [`version_line`].
+    Version,
+    /// Neither — continue to the full parse.
+    None,
+}
+
+/// Classify a raw argument list (the program name already removed) for
+/// the startup short-circuit: the *first* `--help`/`-h` or
+/// `--version`/`-V`, in argv order, wins; a list without either is
+/// `None`.
+fn short_circuit<I, S>(args: I) -> ShortCircuit
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for arg in args {
+        match arg.as_ref() {
+            "--help" | "-h" => return ShortCircuit::Help,
+            "--version" | "-V" => return ShortCircuit::Version,
+            _ => {}
+        }
+    }
+    ShortCircuit::None
+}
 
 /// Parse `--socket <path>`, `--max-age <secs>`, and
 /// `--no-spd-autobind` from `args` (the program name already removed).
@@ -131,6 +181,8 @@ const USAGE: &str = concat!(
 /// `--max-age`, or any unknown argument is a `String` error naming the
 /// problem; a valid parse yields [`DaemonArgs`] with defaults for every
 /// absent flag (the SPD auto-bind fallback defaults to enabled).
+/// (`--help`/`-h` and `--version`/`-V` never reach this parser —
+/// `main` short-circuits them first, exit `0`.)
 pub fn parse_args<I, S>(args: I) -> Result<DaemonArgs, String>
 where
     I: IntoIterator<Item = S>,
@@ -182,11 +234,19 @@ where
 
 #[tokio::main]
 async fn main() {
-    // `--help` is recognized before parsing (the ramsleuth-bench CLI
-    // precedent): print usage and exit 0.
-    if std::env::args().any(|a| a == "--help" || a == "-h") {
-        println!("{USAGE}");
-        return;
+    // `--help`/`-h` and `--version`/`-V` are recognized before
+    // parsing (the ramsleuth-bench CLI precedent): print the usage /
+    // the version line and exit 0.
+    match short_circuit(std::env::args().skip(1)) {
+        ShortCircuit::Help => {
+            println!("{USAGE}");
+            return;
+        }
+        ShortCircuit::Version => {
+            println!("{}", version_line());
+            return;
+        }
+        ShortCircuit::None => {}
     }
 
     let args = match parse_args(std::env::args().skip(1)) {
@@ -438,5 +498,44 @@ mod tests {
         let parsed = parse_args(args).expect("owned String args must parse");
         assert_eq!(parsed.socket_path, PathBuf::from("/tmp/y.sock"));
         assert_eq!(parsed.max_age, Duration::from_secs(4));
+    }
+
+    /// (j) The `--version`/`-V` line is the package version, exactly
+    /// (`env!` — it tracks the workspace release).
+    #[test]
+    fn version_line_is_the_package_version() {
+        assert_eq!(
+            version_line(),
+            format!("ramSleuth ramsleuth-daemon v{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// (j) `--help`/`-h` and `--version`/`-V` are the short-circuits:
+    /// the first occurrence, in argv order, wins; anything else
+    /// (including the plain flags list) is `None`.
+    #[test]
+    fn short_circuit_classifies_help_version_and_none() {
+        for h in ["--help", "-h"] {
+            assert_eq!(short_circuit([h]), ShortCircuit::Help, "{h} → Help");
+        }
+        for v in ["--version", "-V"] {
+            assert_eq!(short_circuit([v]), ShortCircuit::Version, "{v} → Version");
+        }
+        assert_eq!(short_circuit(Vec::<&str>::new()), ShortCircuit::None);
+        assert_eq!(
+            short_circuit(["--socket", "/tmp/x", "--max-age", "4"]),
+            ShortCircuit::None,
+            "a plain flags list is None"
+        );
+        assert_eq!(
+            short_circuit(["--help", "--version"]),
+            ShortCircuit::Help,
+            "the first occurrence wins"
+        );
+        assert_eq!(
+            short_circuit(["--version", "--help"]),
+            ShortCircuit::Version,
+            "the first occurrence wins"
+        );
     }
 }

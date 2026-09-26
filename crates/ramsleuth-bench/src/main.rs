@@ -7,7 +7,7 @@
 //! lives here — all measurement stays in the library.
 //!
 //! ```text
-//! cargo run -p ramsleuth-bench [--avx512] [--json]
+//! cargo run -p ramsleuth-bench [--avx512] [--json] [--help] [--version]
 //! ```
 
 use ramsleuth_bench::{detect, run_all, BenchmarkGrid, CpuFeatures};
@@ -21,30 +21,78 @@ pub(crate) struct Opts {
     pub(crate) json: bool,
 }
 
-/// Usage text printed for `--help`/`-h` and parse errors.
+/// Usage text printed for `--help`/`--version` and parse errors.
 const USAGE: &str = concat!(
-    "ramsleuth-bench — AIDA64-style memory bandwidth & latency grid\n",
+    "ramsleuth-bench — the standalone AIDA64-style memory bandwidth &\n",
+    "latency grid (Memory/L3/L2/L1 × read/write/copy/latency)\n",
+    "\n",
+    "Runs the benchmark directly — no daemon needed.\n",
     "\n",
     "Usage: ramsleuth-bench [OPTIONS]\n",
     "\n",
     "Options:\n",
-    "  --avx512   Force the AVX-512 kernel path (falls back to AVX2 when\n",
-    "             AVX-512F is absent)\n",
-    "  --json     Also print the grid as a JSON object\n",
-    "  -h, --help Print this help and exit\n",
+    "  --avx512     Force the AVX-512 kernel path (falls back to AVX2 when\n",
+    "               AVX-512F is absent)\n",
+    "  --json       Also print the grid as a JSON object\n",
+    "  -h, --help   Print this help and exit\n",
+    "  -V, --version Print the version and exit\n",
 );
+
+/// The `--version`/`-V` output line: `ramSleuth <bin> v<version>` —
+/// the version is the crate's `CARGO_PKG_VERSION` (the workspace
+/// release, so it tracks it automatically).
+pub(crate) fn version_line() -> String {
+    format!("ramSleuth ramsleuth-bench v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The startup short-circuit for a raw argument (checked by `main`
+/// *before* the full [`parse_opts`]): `Help` prints the usage text
+/// (exit 0), `Version` prints [`version_line`] (exit 0), `None` means
+/// the full parse proceeds (a genuinely unknown flag stays a usage
+/// error, exit 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShortCircuit {
+    /// `--help` / `-h` — print the usage text.
+    Help,
+    /// `--version` / `-V` — print [`version_line`].
+    Version,
+    /// Neither — continue to the full parse.
+    None,
+}
+
+/// Classify a raw argument list (the program name already removed) for
+/// the startup short-circuit: the *first* `--help`/`-h` or
+/// `--version`/`-V`, in argv order, wins; a list without either is
+/// `None`.
+pub(crate) fn short_circuit<I, S>(args: I) -> ShortCircuit
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for arg in args {
+        match arg.as_ref() {
+            "--help" | "-h" => return ShortCircuit::Help,
+            "--version" | "-V" => return ShortCircuit::Version,
+            _ => {}
+        }
+    }
+    ShortCircuit::None
+}
 
 /// Parse CLI flags from `args` (program name already removed).
 ///
-/// `--help`/`-h` are recognized here (the entrypoint prints usage);
-/// unknown flags are rejected with an error naming the offending flag.
+/// `--help`/`-h` / `--version`/`-V` are recognized here (the entrypoint
+/// short-circuits them before running); unknown flags are rejected
+/// with an error naming the offending flag.
 pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut opts = Opts { avx512: false, json: false };
     for arg in args {
         match arg.as_str() {
             "--avx512" => opts.avx512 = true,
             "--json" => opts.json = true,
-            "--help" | "-h" => {} // recognized; the entrypoint handles output
+            // recognized; the entrypoint short-circuits them (help →
+            // usage, version → the version line)
+            "--help" | "-h" | "--version" | "-V" => {}
             other => return Err(format!("unknown flag: {other} (see --help)")),
         }
     }
@@ -106,9 +154,16 @@ pub(crate) fn render_grid(grid: &BenchmarkGrid) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{USAGE}");
-        return;
+    match short_circuit(&args) {
+        ShortCircuit::Help => {
+            println!("{USAGE}");
+            return;
+        }
+        ShortCircuit::Version => {
+            println!("{}", version_line());
+            return;
+        }
+        ShortCircuit::None => {}
     }
     let opts = match parse_opts(&args) {
         Ok(opts) => opts,
@@ -214,12 +269,47 @@ mod tests {
             parse_opts(&["--avx512".into(), "--json".into()]).expect("known flags parse");
         assert!(both.avx512 && both.json);
 
-        for help in ["--help", "-h"] {
-            let opts = parse_opts(&[help.into()]).expect("--help/-h is recognized");
+        for help in ["--help", "-h", "--version", "-V"] {
+            let opts = parse_opts(&[help.into()]).expect("--help/-h/--version/-V is recognized");
             assert!(!opts.avx512 && !opts.json);
         }
 
         let err = parse_opts(&["--nope".into()]).expect_err("unknown flag must fail");
         assert!(err.contains("--nope"), "error should name the flag: {err}");
+    }
+
+    /// (d) The `--version`/`-V` line is the package version, exactly
+    /// (`env!` — it tracks the workspace release).
+    #[test]
+    fn version_line_is_the_package_version() {
+        assert_eq!(
+            version_line(),
+            format!("ramSleuth ramsleuth-bench v{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// (e) `--help`/`-h` and `--version`/`-V` are the short-circuits:
+    /// the first occurrence, in argv order, wins; anything else is
+    /// `None`.
+    #[test]
+    fn short_circuit_classifies_help_version_and_none() {
+        for h in ["--help", "-h"] {
+            assert_eq!(short_circuit([h]), ShortCircuit::Help, "{h} → Help");
+        }
+        for v in ["--version", "-V"] {
+            assert_eq!(short_circuit([v]), ShortCircuit::Version, "{v} → Version");
+        }
+        assert_eq!(short_circuit(Vec::<&str>::new()), ShortCircuit::None);
+        assert_eq!(short_circuit(["--avx512", "--json"]), ShortCircuit::None);
+        assert_eq!(
+            short_circuit(["--help", "--version"]),
+            ShortCircuit::Help,
+            "the first occurrence wins"
+        );
+        assert_eq!(
+            short_circuit(["--version", "--help"]),
+            ShortCircuit::Version,
+            "the first occurrence wins"
+        );
     }
 }
