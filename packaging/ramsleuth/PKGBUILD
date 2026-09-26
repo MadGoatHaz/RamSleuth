@@ -83,7 +83,7 @@ license=(MIT GPL-2.0-only)
 # Integrity pin: the v$pkgver release commit (immutable; current makepkg
 # requires VCS sources to resolve to a commit — the #tag= fragment in
 # source= is a human-readable label only).
-_gitcommit=a59fddbc3190dd706df73072319edf3da619cfb0
+_gitcommit=445acada45c385d8f777021e7dc1758ad5ec5695
 # git-tag source: makepkg clones the repo and checks out the pinned commit.
 # The "$pkgname::" rename extracts to $srcdir/ramsleuth (see header note above).
 source=("$pkgname::git+https://github.com/MadGoatHaz/RamSleuth.git#tag=v$pkgver")

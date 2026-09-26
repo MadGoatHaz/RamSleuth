@@ -70,7 +70,7 @@ conflicts=('ramsleuth' 'ramsleuth-bin')
 # Integrity pin: the v$pkgver release commit (immutable; current makepkg
 # requires VCS sources to resolve to a commit — the #tag= fragment in
 # source= is a human-readable label only).
-_gitcommit=a59fddbc3190dd706df73072319edf3da619cfb0
+_gitcommit=445acada45c385d8f777021e7dc1758ad5ec5695
 source=("ramsleuth::git+https://github.com/MadGoatHaz/RamSleuth.git#tag=v$pkgver")
 
 package() {
