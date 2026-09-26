@@ -19,6 +19,10 @@ name: Release
 #       scripts/install-ryzen-smu-dkms.sh, scripts/install-intel-dkms.sh,
 #       kernel/ramsleuth-intel/ (the 4 module source files; the Intel DKMS
 #       one-click path, INTEL-14),
+#       packaging/ryzen-smu-dkms/vendor/ (the 8 vendored ryzen_smu files:
+#       the 6 module sources frozen at d298366 + SUMS.sha256 + NOTICE.md;
+#       the AMD DKMS offline one-click path — the main packages' package()
+#       step 13 bundles them to /usr/share/ryzen-smu-dkms/vendor/),
 #       install.sh, LICENSE, RamSleuth.desktop,
 #       ramsleuth-setup.sh, 90-ramsleuth-setup.policy,
 #       assets/icons/ (the hicolor tree, 8 sizes — one artifact; C21-27)
@@ -105,6 +109,14 @@ jobs:
             kernel/ramsleuth-intel/Makefile \
             kernel/ramsleuth-intel/ramsleuth_intel.c \
             kernel/ramsleuth-intel/README.md \
+            packaging/ryzen-smu-dkms/vendor/ryzen-smu/LICENSE \
+            packaging/ryzen-smu-dkms/vendor/ryzen-smu/Makefile \
+            packaging/ryzen-smu-dkms/vendor/ryzen-smu/dkms.conf \
+            packaging/ryzen-smu-dkms/vendor/ryzen-smu/drv.c \
+            packaging/ryzen-smu-dkms/vendor/ryzen-smu/smu.c \
+            packaging/ryzen-smu-dkms/vendor/ryzen-smu/smu.h \
+            packaging/ryzen-smu-dkms/vendor/SUMS.sha256 \
+            packaging/ryzen-smu-dkms/vendor/NOTICE.md \
             install.sh \
             LICENSE \
             scripts/ramsleuth-setup.sh \
@@ -120,19 +132,21 @@ jobs:
             missing=1
           fi
           [ "$missing" -eq 0 ] || { echo "Refusing to publish: release artifacts missing"; exit 1; }
-          echo "All 19 release artifacts present (6 binaries + 13 auxiliary)"
-          # NOTE (C21-27 / INTEL-14): the assets/icons hicolor tree is
-          # staged into the tarball by the Stage step below; the
-          # release-artifact count is 19 (6 binaries + 13 auxiliary: the 8
+          echo "All 27 release artifacts present (6 binaries + 21 auxiliary)"
+          # NOTE (C21-27 / INTEL-14 / AMD-vendor): the assets/icons hicolor
+          # tree is staged into the tarball by the Stage step below; the
+          # release-artifact count is 27 (6 binaries + 21 auxiliary: the 8
           # pre-Intel auxiliary files + the Intel DKMS helper + the 4
-          # kernel/ramsleuth-intel module source files; the hicolor tree
-          # ships as a bundle).
+          # kernel/ramsleuth-intel module source files + the 8 vendored
+          # ryzen-smu files (the 6 module sources + SUMS.sha256 + NOTICE.md);
+          # the hicolor tree ships as a bundle).
 
       - name: Stage artifacts
         run: |
           set -euo pipefail
           S="stage/ramsleuth-$VER"
-          mkdir -p "$S/bin" "$S/systemd" "$S/scripts" "$S/kernel/ramsleuth-intel"
+          mkdir -p "$S/bin" "$S/systemd" "$S/scripts" "$S/kernel/ramsleuth-intel" \
+          "$S/packaging/ryzen-smu-dkms/vendor/ryzen-smu"
           for b in ramsleuth ramsleuth-tui ramsleuth-client ramsleuth-daemon ramsleuth-bench ramsleuth-telemetry; do
             cp "target/release/$b" "$S/bin/$b"
           done
@@ -149,6 +163,11 @@ jobs:
           for f in dkms.conf Makefile ramsleuth_intel.c README.md; do
             cp "kernel/ramsleuth-intel/$f" "$S/kernel/ramsleuth-intel/"
           done
+          for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
+            cp "packaging/ryzen-smu-dkms/vendor/ryzen-smu/$f" "$S/packaging/ryzen-smu-dkms/vendor/ryzen-smu/"
+          done
+          cp packaging/ryzen-smu-dkms/vendor/SUMS.sha256 "$S/packaging/ryzen-smu-dkms/vendor/"
+          cp packaging/ryzen-smu-dkms/vendor/NOTICE.md "$S/packaging/ryzen-smu-dkms/vendor/"
           chmod +x "$S/bin/"* "$S/scripts/"*.sh "$S/install.sh" "$S/ramsleuth-setup.sh"
           find stage -type f | sort
 

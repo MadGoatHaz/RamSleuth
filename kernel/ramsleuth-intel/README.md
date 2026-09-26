@@ -43,7 +43,7 @@ One-off, manual:
 The recommended path is DKMS (the `ramsleuth-intel-dkms` AUR extra /
 `scripts/install-intel-dkms.sh` helper do this for you). Manual DKMS:
 
-    V=$(git show -s --format=%s /dev/null 2>/dev/null; echo 2.4.5)  # ramsleuth workspace version
+    V=$(git show -s --format=%s /dev/null 2>/dev/null; echo 2.4.6)  # ramsleuth workspace version
     sudo cp -r . /usr/src/ramsleuth_intel-$V
     sudo sed -i "s/@VERSION@/$V/" /usr/src/ramsleuth_intel-$V/dkms.conf
     sudo dkms add -m ramsleuth_intel/$V

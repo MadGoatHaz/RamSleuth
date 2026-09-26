@@ -1,6 +1,6 @@
 # RamSleuth — User Guide
 
-**Version:** 2.4.5 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
+**Version:** 2.4.6 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
 
 RamSleuth v2 is a live RAM telemetry suite and an AIDA64-style memory benchmark for
 AMD and Intel desktops. It watches your memory system in real time — clocks, the
@@ -118,10 +118,11 @@ fields simply show a structured `N/A (<reason>)` and every process exits 0.
 RamSleuth is a pure-Rust Cargo workspace (8 crates: 7 product crates + the
 `tools/gen-icon` dev tool), MIT-licensed, for x86_64 Linux. It is packaged for
 Arch Linux: a two-core AUR package model (`ramsleuth` source +
-`ramsleuth-bin` binary — both of which bundle the in-repo `ramsleuth_intel`
-module source — plus the optional `ryzen-smu-dkms` (AMD) and
-`ramsleuth-intel-dkms` (Intel) vendor DKMS extras; the Intel extra is
-mutually exclusive with the two core packages), a self-contained
+`ramsleuth-bin` binary — both of which bundle **both vendor driver sources**,
+the in-repo `ramsleuth_intel` module source **and** the vendored `ryzen_smu`
+source — plus the two optional **standalone** vendor DKMS extras
+(`ryzen-smu-dkms` AMD, `ramsleuth-intel-dkms` Intel), **each mutually
+exclusive with the two core packages**), a self-contained
 one-command installer, and a plain `makepkg`/`cargo` path for building it
 yourself.
 
@@ -182,9 +183,12 @@ What makes it worth using:
 - **AMD host?** After the install it asks one more question: *Install the
   `ryzen_smu` DKMS module now? [y/N]* — the optional kernel module that
   unlocks live AMD subtimings. The default is `N`; on `y` it hands off to the
-  pinned helper. You can always run `sudo ramsleuth-install-ryzen-smu-dkms`
-  later (or install the
-  [ryzen-smu-dkms extra](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings)).
+  pinned helper, which builds **offline from the vendored source tree that
+  ships in the checkout** (SUMS-verified before any build — zero network).
+  You can always run `sudo ramsleuth-install-ryzen-smu-dkms` later (or
+  install the [ryzen-smu-dkms
+  extra](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings) standalone —
+  it is mutually exclusive with the app, see §2.2).
   **Intel host?** It prints an optional next-step note: the built-in `/dev/mem`
   MCHBAR decode already gives live Intel subtimings on any supported
   generation (Tier 1 – 3, Skylake through Arrow Lake), and the
@@ -219,22 +223,22 @@ works identically):
 ```sh
 yay -S ramsleuth             # STABLE — the default recommendation
 yay -S ramsleuth-bin         # PRECOMPILED — the fastest install
-# optional vendor DKMS extras — install only the one matching your CPU:
+# optional vendor DKMS extras — STANDALONE ONLY: mutually exclusive with the
+# two core packages (they already bundle BOTH driver sources), so do NOT
+# install one alongside the app — installing it removes the app:
 yay -S ryzen-smu-dkms        # AMD — live AMD subtimings (Section 2.5)
-yay -S ramsleuth-intel-dkms  # Intel — the standalone provisioning extra (Section 10.5);
-                             # mutually exclusive with the two core packages
-                             # (they already bundle the Intel module source)
+yay -S ramsleuth-intel-dkms  # Intel — live Intel subtimings (Section 10.5)
 ```
 
 The two **core** packages are deliberately distinct:
 
 - **`ramsleuth` — STABLE source.** Builds the workspace from the official
-  git tag `v$pkgver` (currently `v2.4.5`). A tag is a reproducible,
+  git tag `v$pkgver` (currently `v2.4.6`). A tag is a reproducible,
   auditable snapshot — this is the **default recommendation for production
   installs**. It compiles only the pinned repository (`--locked`), with no
   third-party code in the build.
 - **`ramsleuth-bin` — PRECOMPILED.** Downloads the release binary tarball
-  `ramsleuth-2.4.5-x86_64.tar.zst` from the official GitHub Release (pinned
+  `ramsleuth-2.4.6-x86_64.tar.zst` from the official GitHub Release (pinned
   by its `sha256sums`) and installs it as-is — **no build, no makedepends**.
   This is the **fastest install path**.
 
@@ -251,7 +255,9 @@ Package pages:
 
 Both packages create the `ramsleuth` system group (via their `.install`
 hooks), install the daemon unit + preset, the one-click setup helper + polkit
-policy, and the two pinned DKMS helpers (AMD + Intel), then
+policy, the two pinned DKMS helpers (AMD + Intel), **and both driver
+sources** — the in-repo `ramsleuth_intel` tree and the vendored `ryzen_smu`
+tree (guarded for old assets) — then
 `systemctl enable --now ramsleuth`.
 When the install is invoked under `sudo`, the hooks additionally grant the
 invoking user group membership (persistent) and seed
@@ -264,12 +270,15 @@ packages: `ryzen-smu-dkms` (AMD) — see
 [2.5](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings) — and
 `ramsleuth-intel-dkms` (Intel) — see
 [10.5](#105-intel-live-subtimings-the-ramsleuth_intel-module-optional).
-The AMD extra is independent of the two core packages and installs
-alongside whichever of them you use; the Intel extra is **mutually
-exclusive** with the core packages (they share the bundled
-`/usr/share/ramsleuth-intel-dkms/src/` source tree, so pacman removes a
-core package first if you install it) — and since the cores already bundle
-that source, it is the standalone/redundant Intel path.
+**Both extras are mutually exclusive with the two core packages**: the cores
+bundle both driver sources (the `ramsleuth_intel` tree and the vendored
+`ryzen_smu` tree — guarded for old assets), so pacman removes a core
+package first if you install an extra. **Do not install an extra alongside
+the app** — on a clean `ramsleuth`/`ramsleuth-bin` install the driver is
+**bundled** and the in-app one-click installs it **offline** (no network,
+no manual source step); the extras are the **standalone** provisioning path
+only (for hosts that will not run the app). The first-run SETUP one-click
+(§3) handles the daemon + your group + the driver in one action.
 
 ### 2.3 Manual install from a source checkout (`makepkg`)
 
@@ -279,7 +288,7 @@ can build and install either package directly from the `packaging/`
 directories:
 
 ```sh
-cd packaging/ramsleuth      # STABLE source (builds from the v2.4.5 tag)
+cd packaging/ramsleuth      # STABLE source (builds from the v2.4.6 tag)
 # cd packaging/ramsleuth-bin   # PRECOMPILED (downloads the release tarball)
 makepkg -si
 ```
@@ -338,7 +347,11 @@ it.
 section simply reads `N/A (DriverMissing)` and everything else works
 (see [Section 10](#10-amd-live-subtimings-the-ryzen_smu-requirement)).
 
-Install the provisioning extra from the AUR:
+**Standalone only** — the extra is **mutually exclusive** with the app
+(they share the vendored source), so it is for hosts that do not run the
+RamSleuth packages. On an app host the driver is **bundled** and installed
+**offline** by the in-app one-click (§3). Install the provisioning extra
+from the AUR when you do not have the app:
 
 ```sh
 yay -S ryzen-smu-dkms
@@ -360,11 +373,13 @@ boot.
 
 You do not need this package to get the driver: every ramsleuth install also
 ships the same helper under its own name at
-`/usr/bin/ramsleuth-install-ryzen-smu-dkms`, and the one-click setup can run
-it for you (`sudo ramsleuth-setup --with-dkms`, or the GUI's
-*"Set up RamSleuth + AMD driver"* button). The AUR extra and those built-in
-paths are co-install-safe (the two names never conflict); use whichever one
-your install provided.
+`/usr/bin/ramsleuth-install-ryzen-smu-dkms` **and the vendored source tree**
+at `/usr/share/ryzen-smu-dkms/vendor/`, so the one-click setup runs it for
+you **offline** (`sudo ramsleuth-setup --with-dkms`, or the GUI's
+*"Set up RamSleuth + AMD driver"* button — the in-app one-click installs
+daemon + group + driver in one action). The AUR extra is **mutually
+exclusive** with the app (shared vendored source — installing it removes a
+main package), so it is the standalone path only.
 
 ---
 
@@ -396,6 +411,14 @@ runs, detached and off the render thread:
 ```sh
 pkexec /usr/bin/ramsleuth-setup --user <you>        # … + --with-dkms on the AMD variant
 ```
+
+The prompt that appears is RamSleuth's own branded message (the policy's
+`org.freedesktop.ramsleuth.setup` action — *"Authentication is required to
+set up RamSleuth for this user…"*). If it shows the *generic* polkit text
+("run a program in a different context") instead, a polkitd that predates
+the installed policy is serving a stale action pool: `sudo systemctl
+restart polkit` fixes it — the AUR `.install` hooks and `install.sh` do
+that automatically on install/upgrade.
 
 That helper performs every privileged step in one root session, all
 idempotent:
@@ -475,7 +498,7 @@ shows `Disconnected` with a hint, and the dashboard stays responsive.
 
 ### 4.1 The 3-line header
 
-**Line 1** — the title **`RamSleuth v2.4.5`**, a **platform tag**
+**Line 1** — the title **`RamSleuth v2.4.6`**, a **platform tag**
 (`[AMD AM4 Platform]` for Zen 1–3, `[AMD AM5 Platform]` for Zen 4/5,
 `[Intel LGA Platform]`, or a bare `[Platform]` when the vendor is unknown),
 the **daemon status** (`Daemon: Connected (IPC: /run/ramsleuth/ramsleuth.sock)`
@@ -1200,9 +1223,11 @@ Three ways to get it (all build the same **pinned** upstream source —
    checksums and **pauses for confirmation before any build**, then
    `dkms add/build/install` + `modprobe` — **immediate, no reboot** — and
    persists `/etc/modules-load.d/ryzen_smu.conf` for boot.
-3. **The AUR extra** — `yay -S ryzen-smu-dkms && sudo ryzen-smu-dkms-install`
-   (Section 2.5): the same helper, plus the vendored source shipped with the
-   package, so the build is fully network-free.
+3. **The AUR extra (standalone only)** —
+   `yay -S ryzen-smu-dkms && sudo ryzen-smu-dkms-install` (Section 2.5): the
+   same helper plus the vendored source — fully network-free. It is
+   **mutually exclusive** with the app (shared vendored source), so it is an
+   alternative to the app, not an add-on to it.
 
 Verify it is working:
 
@@ -1342,7 +1367,7 @@ without the DKMS rebuild, never installed, or the module was removed):
 sudo ramsleuth-setup --with-dkms        # one-click: build + load (the GUI button equivalent)
 # or
 sudo ramsleuth-install-ryzen-smu-dkms   # the helper directly
-# or, AUR extra: yay -S ryzen-smu-dkms && sudo ryzen-smu-dkms-install
+# or, the standalone AUR extra (mutually exclusive — removes the app): yay -S ryzen-smu-dkms && sudo ryzen-smu-dkms-install
 ls /sys/kernel/ryzen_smu_drv/pm_table   # confirm it is live
 ```
 
@@ -1459,7 +1484,9 @@ icons, desktop entry, helper scripts, and polkit policy, and runs the
 
 ```sh
 yay -Rns ramsleuth        # or: ramsleuth-bin (whichever you have)
-yay -Rns ryzen-smu-dkms   # only if you installed the AMD extra
+yay -Rns ryzen-smu-dkms   # only if you installed the standalone AMD extra
+                              # (mutually exclusive with the core packages — you can only
+                              # have it *instead of* one of them, not alongside)
 yay -Rns ramsleuth-intel-dkms   # only if you installed the standalone Intel extra
                               # (mutually exclusive with the core packages — you can only
                               # have it *instead of* one of them, not alongside)
@@ -1518,7 +1545,7 @@ And if the **Intel `ramsleuth_intel` module** was installed, remove it:
 
 ```sh
 sudo rmmod ramsleuth_intel
-sudo dkms remove ramsleuth_intel/2.4.5   # the installed DKMS version (list with: dkms status)
+sudo dkms remove ramsleuth_intel/2.4.6   # the installed DKMS version (list with: dkms status)
 sudo rm /etc/modules-load.d/ramsleuth_intel.conf
 sudo rm -rf /usr/src/ramsleuth_intel-*
 # and, if you had the standalone Intel extra (mutually exclusive with the core packages):
@@ -1533,6 +1560,6 @@ group, no socket, no driver.
 
 ---
 
-*This guide describes RamSleuth v2.4.5. For the technical design, see
+*This guide describes RamSleuth v2.4.6. For the technical design, see
 `Docs/Architecture.md`; for the packaging operator guide, see
 `packaging/README.md`.*

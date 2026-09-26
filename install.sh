@@ -274,6 +274,18 @@ do_install() {
   else
     warn "systemd: could not start ramsleuth.service (non-fatal) — try: systemctl enable --now ramsleuth"
   fi
+  # polkit: make a running polkitd serve the policy installed above. Its
+  # inotify hot-reload is not reliable for a file installed while it runs
+  # (observed 2026-09-25: policy installed 3 min after boot, a pkexec 37
+  # min later still hit the generic org.freedesktop.policykit.exec dialog)
+  # — without this restart the GUI's one-click prompt shows the generic
+  # "run a program in a different context" text instead of RamSleuth's
+  # branded message. Guarded, non-fatal (the no-panic install contract).
+  if systemctl restart polkit 2>/dev/null; then
+    ok "polkit restarted (the branded 'Set up RamSleuth' prompt is active)"
+  else
+    warn "polkit: restart failed (non-fatal) — if the GUI's setup prompt shows the generic polkit dialog, run: systemctl restart polkit"
+  fi
 }
 amd_walk() {
   if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then

@@ -457,7 +457,7 @@ mod tests {
     /// A multi-line markdown fixture (the renderer output shape: a
     /// header + a summary + a table).
     fn fixture_markdown() -> String {
-        "# RamSleuth Probe Report\n\n> **TUI Test CPU** — Unknown on Linux / Test (kernel 6.6.0-test), RamSleuth v2.4.5\n\n## System\n\n| Field | Value |\n|---|---|\n| CPU | TUI Test CPU |\n"
+        "# RamSleuth Probe Report\n\n> **TUI Test CPU** — Unknown on Linux / Test (kernel 6.6.0-test), RamSleuth v2.4.6\n\n## System\n\n| Field | Value |\n|---|---|\n| CPU | TUI Test CPU |\n"
             .to_owned()
     }
 

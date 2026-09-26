@@ -16,6 +16,40 @@
     This file is the in-repo source of truth / shared asset for the helper
     itself (scripts/ramsleuth-setup.sh, chunk C21-01).
 
+    HOW pkexec RESOLVES THIS ACTION (verified against polkit 127 source —
+    src/programs/pkexec.c find_action_for_path() — and the pkexec(8) man
+    page, 2026-09-25; the version in Arch base at the time):
+      * pkexec picks the first loaded action whose
+        org.freedesktop.policykit.exec.path annotation equals the program
+        path after realpath() resolution, and — only if that action also
+        carries an org.freedesktop.policykit.exec.argv1 annotation — whose
+        FIRST argument matches it. polkit has NO argument-list key: an
+        'exec.arguments' annotation is not a thing (an empty one is inert
+        dead weight, not a condition — do not add one back; it was removed
+        2026-09-25 after it caused exactly that misdiagnosis).
+      * This action therefore maps EVERY `pkexec /usr/bin/ramsleuth-setup`
+        invocation — bare, with the user-name flag, with the DKMS flag
+        (the C21-01 helper CLI: `user <name>`, `with-dkms`,
+        `with-intel-dkms` in any order) — to the branded message below:
+        auth_admin for any/active/inactive/other. exec.argv1 is
+        deliberately absent: the helper's frozen CLI takes its flags in
+        any order, so the first argument is not stable.
+      * Caveat 1 (path): the match is against the realpath-resolved path,
+        so /usr/bin/ramsleuth-setup must be a regular file (or this
+        exec.path must be set to the symlink's target) — a symlinked
+        helper would silently fall back to the generic
+        org.freedesktop.policykit.exec dialog.
+      * Caveat 2 (stale pool): a polkitd that started BEFORE this file was
+        (re)installed may keep serving a stale action pool — polkit 127's
+        inotify hot-reload did not pick up a freshly installed file in a
+        live observation (2026-09-25: policy installed 3 min after boot; a
+        pkexec 37 min later still authenticated the generic action, per
+        polkitd's own journal line). The AUR packages' .install hooks
+        (packaging/ramsleuth{,-bin}.install) and install.sh therefore run
+        `systemctl restart polkit` after installing this file; a manual
+        copy of the policy needs the same restart (or a reboot) before the
+        branded dialog appears.
+
     Installation: NOT installed here. The packaging chunks copy this file to
     /usr/share/polkit-1/actions/90-ramsleuth-setup.policy:
       - C21-12  packaging/ramsleuth/PKGBUILD
@@ -43,14 +77,13 @@
       <allow_inactive>auth_admin</allow_inactive>
       <allow_other>auth_admin</allow_other>
     </defaults>
-    <!-- Map pkexec to the installed helper: /usr/bin/ramsleuth-setup, any args -->
+    <!-- Map pkexec to the installed helper: /usr/bin/ramsleuth-setup, any
+         arguments. The match is exec.path-only (the realpath-resolved
+         program path) — see the header for the full semantics. Leave
+         exec.argv1 absent on purpose. -->
     <annotate>
       <key>org.freedesktop.policykit.exec.path</key>
       <value>/usr/bin/ramsleuth-setup</value>
-    </annotate>
-    <annotate>
-      <key>org.freedesktop.policykit.exec.arguments</key>
-      <value></value>
     </annotate>
   </action>
 

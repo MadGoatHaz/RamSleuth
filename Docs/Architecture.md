@@ -1,7 +1,7 @@
 # RamSleuth — Architecture
 
 **Document:** `Docs/Architecture.md` (part of the RamSleuth v2 repository-facing documentation)
-**Applies to:** workspace v2.4.5 (branch `v2-development`)
+**Applies to:** workspace v2.4.6 (branch `v2-development`)
 **Audience:** expert readers — kernel-aware systems programmers, packagers, and maintainers who need the full design rationale behind RamSleuth.
 
 Companion documents: [`README.md`](../README.md) (entry point), [`Docs/User_Guide.md`](User_Guide.md) (operational guide), [`packaging/README.md`](../packaging/README.md) (packaging and operator guide).
@@ -199,7 +199,7 @@ power user can run the grid directly, without the daemon, on any machine.
 
 Every privileged read in RamSleuth goes through **one daemon** —
 `ramsleuth-daemon` — which runs as **root** with exactly **one** capability,
-`CAP_SYS_RAWIO` (bit 21), clamped into its bounding set and granted as an
+`CAP_SYS_RAWIO` (bit 17), clamped into its bounding set and granted as an
 ambient capability by its systemd unit. All clients are **unprivileged**: they
 need only membership in the `ramsleuth` group (or a per-user POSIX ACL on the
 socket, granted by the one-click setup — see [§5.3](#53-socket-access-model)) and
@@ -268,7 +268,7 @@ development tool — all inheriting a single version:
 
 | Workspace fact | Value |
 |----------------|-------|
-| Version | **2.4.5** (`[workspace.package].version`) |
+| Version | **2.4.6** (`[workspace.package].version`) |
 | Edition | 2021 |
 | MSRV | **1.75** (`rust-version`) |
 | Resolver | 2 |
@@ -378,7 +378,7 @@ in the workspace. Both a library and the `ramsleuth-daemon` binary.
 |-------------|----------------|
 | `main.rs` | Entry point: CLI (`--socket`, `--max-age`), soft privilege probe, listener setup, the async accept loop, signal handling. |
 | `socket.rs` | Synchronous listener setup: parent-dir creation, stale-socket probe, `0660` mode, best-effort group chown, per-user ACL re-application, `tokio::from_std` hand-off. |
-| `caps.rs` | The soft privilege probe: root + `CAP_SYS_RAWIO` (bit 21 of `CapEff`) with human-readable degradation warnings. |
+| `caps.rs` | The soft privilege probe: root + `CAP_SYS_RAWIO` (bit 17 of `CapEff`) with human-readable degradation warnings. |
 | `cache.rs` | The TTL telemetry cache over an injectable collector (default 2 s), with the cold-cache warm-up double read. |
 | `spd_bind.rs` | The guarded SPD EEPROM auto-bind fallback: as root (the daemon is the only process that may write here), binds the `ee1004` client(s) the kernel missed when bound-SPDs < channel count — via the i2c `new_device` sysfs write, falling back to the driver `bind` file when the write is refused (the address is occupied by a pre-existing, unbound ACPI/DSDT node, `-EBUSY`) — Intel-only, non-fatal, never unbinds, every attempt (accepted or failed) made at most once per process lifetime; disabled by `--no-spd-autobind` (default on). |
 | `dram_spike.rs` | The bounded ~250 ms / 256 MiB DRAM load that pulls the memory controller out of idle before each SMU re-read. |
@@ -475,7 +475,7 @@ Usage: ramsleuth-daemon [OPTIONS]
 1. **CLI parse** — unknown flag / missing value / non-numeric or negative
    `--max-age` → usage text + **exit 2**.
 2. **Soft privilege probe** (`caps.rs`) — reads `CapEff` from
-   `/proc/self/status` and tests bit 21 (`CAP_SYS_RAWIO`); missing root or the
+   `/proc/self/status` and tests bit 17 (`CAP_SYS_RAWIO`); missing root or the
    capability emits stderr *warnings* naming the fields that will degrade, and
    **the daemon continues serving** (no-panic contract).
 3. **Listener setup** (`socket.rs`, synchronous, called from inside the
@@ -1702,25 +1702,28 @@ immediately.
 The full install file set (see `packaging/README.md` for the operator
 reference): 6 binaries → `/usr/bin/`; the unit → `/usr/lib/systemd/system/`
 (+ preset); the `ramsleuth` group (idempotent `groupadd -r` in the `.install`
-hooks); the DKMS helper → `/usr/bin/ramsleuth-install-ryzen-smu-dkms`; the
-Intel DKMS helper → `/usr/bin/ramsleuth-install-intel-dkms` (guarded — the
-v2.4.5 source tree and the re-cut `-bin` tarball carry it, skipped with a
-note only on a pre-2.3.0 asset); **the in-repo `ramsleuth_intel` source
+hooks); the AMD DKMS helper → `/usr/bin/ramsleuth-install-ryzen-smu-dkms`;
+the Intel DKMS helper → `/usr/bin/ramsleuth-install-intel-dkms` (guarded —
+the v2.4.6 source tree and the re-cut `-bin` tarball carry it, skipped with
+a note only on a pre-2.3.0 asset); **the in-repo `ramsleuth_intel` source
 tree → `/usr/share/ramsleuth-intel-dkms/src/`** (guarded the same way —
 the exact path the Intel helper resolves, so the one-click Intel DKMS
 install works from a bare AUR install with no manual source step; the
-published `-bin` tarball (the v2.4.5 re-cut) carries the helper + tree, and
-the existence guard covers only pre-2.4.2 assets); the setup helper →
-`/usr/bin/ramsleuth-setup`; the polkit policy →
+published `-bin` tarball (the v2.4.6 re-cut) carries the helper + tree, and
+the existence guard covers only pre-2.4.2 assets); **the vendored
+`ryzen_smu` source tree → `/usr/share/ryzen-smu-dkms/vendor/`** (guarded
+for pre-vendor tags — the exact path the AMD helper resolves as its
+offline vendored source, so the one-click AMD DKMS install works from a
+bare AUR install with zero network and no manual source step); the setup
+helper → `/usr/bin/ramsleuth-setup`; the polkit policy →
 `/usr/share/polkit-1/actions/`; and `install.sh` →
 `/usr/share/ramsleuth/`. `ramsleuth-protocol` is library-only and is never
 installed. Two optional DKMS extras provision the vendor kernel drivers —
-`ryzen-smu-dkms` (§12.4) and `ramsleuth-intel-dkms` (§12.5). The AMD extra
-is neither a dependency nor a conflict of the two packages (co-install-safe);
-the Intel extra is **mutually exclusive** with them (each declares the other
-in `conflicts=` — they share the bundled source-tree path) and is the
-standalone provisioning path, redundant for Intel once a main package is
-installed.
+`ryzen-smu-dkms` (§12.4) and `ramsleuth-intel-dkms` (§12.5). **Both**
+extras are **mutually exclusive** with the two main packages (each declares
+the other in `conflicts=` — the mains now bundle the same source-tree path
+the extras install), and each is the **standalone provisioning path**,
+redundant for its vendor once a main package is installed.
 
 ### 12.3 The `ramsleuth` group + ACL model
 
@@ -1752,8 +1755,19 @@ fallback.
 - resolution order: **offline-vendored, byte-frozen** copies of the six pinned
   files (installed at `/usr/share/ryzen-smu-dkms/vendor/ryzen-smu`, verified
   against `SUMS.sha256` — a mismatch dies, no silent fallback) first, then a
-  **pinned git clone** with a hard `HEAD == pin` verify (the tarball
-  deliberately excludes the vendor dir for size);
+  **pinned git clone** with a hard `HEAD == pin` verify (the manual
+  fallback — `RYZEN_SMU_FORCE_REMOTE=1`; a dev checkout carries the vendor
+  tree in-repo, so even a bare-checkout install is offline);
+- **both main packages bundle the vendored tree** (to
+  `/usr/share/ryzen-smu-dkms/vendor/` — guarded for pre-vendor tags, which
+  skip cleanly), which is the exact path the helper resolves: the
+  **one-click AMD DKMS install works from a bare AUR install with no network
+  and no manual source step**, symmetric with the Intel module source
+  (§12.5);
+- the extra is therefore **mutually exclusive** with the two main packages
+  (each declares the other in `conflicts=` — the shared vendor tree would
+  file-conflict), and is the **standalone provisioning path** — redundant
+  once a main package is installed;
 - built **only by DKMS** on the target (the `ryzen-smu-dkms` AUR extra is thin
   by design — no module build in the chroot), `modprobe` is immediate (no
   reboot), and the load persists via `/etc/modules-load.d/ryzen_smu.conf`;
@@ -1761,9 +1775,10 @@ fallback.
 - licensing: the driver is **GPL-2.0**, a **separate work** from the MIT
   RamSleuth code — byte-identical and unmodified, carrying its verbatim
   `LICENSE` + `NOTICE.md`, never compiled into, linked with, or bundled in any
-  RamSleuth binary (the vendored source ships *only* via the extra);
-- the same helper script installs under **two names** to stay co-install-safe:
-  `/usr/bin/ramsleuth-install-ryzen-smu-dkms` (all ramsleuth packages +
+  RamSleuth binary;
+- the same helper script installs under **two names** to keep the helper
+  binary itself out of a pacman file conflict:
+  `/usr/bin/ramsleuth-install-ryzen-smu-dkms` (both main packages +
   `install.sh`; the name `ramsleuth-setup --with-dkms` delegates to) and
   `/usr/bin/ryzen-smu-dkms-install` (the standalone extra only).
 
@@ -1775,11 +1790,12 @@ fallback remains available where unblocked. When present:
 
 - the **source is in-repo, never cloned**: the `kernel/ramsleuth-intel/`
   tree (GPL-2.0 — a separate work from the MIT RamSleuth code, byte-verbatim,
-  never compiled into any RamSleuth binary) — unlike the AMD extra's pinned
-  `ryzen_smu` clone, there is no network and no upstream pin;
+  never compiled into any RamSleuth binary) — unlike the AMD module's pinned
+  **vendored** `ryzen_smu` (a clone is the manual fallback only), there is no
+  network and no upstream pin;
 - **both main packages bundle that source tree** (to
   `/usr/share/ramsleuth-intel-dkms/src/` — guarded like the Intel helper:
-  the published `-bin` tarball (the v2.4.5 re-cut) carries it and installs
+  the published `-bin` tarball (the v2.4.6 re-cut) carries it and installs
   it, and the existence guard covers only pre-2.4.2 assets, which ship
   nothing and skip cleanly), which is the exact path the helper resolves as
   its installed copy: the **one-click Intel DKMS install works from a bare

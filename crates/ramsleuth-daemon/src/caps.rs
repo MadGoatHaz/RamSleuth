@@ -9,9 +9,9 @@ use std::fs;
 
 use libc::geteuid;
 
-/// `CAP_SYS_RAWIO` is bit 21 of the kernel capability set — the bit the
+/// `CAP_SYS_RAWIO` is bit 17 of the kernel capability set — the bit the
 /// SMU (`/dev/ryzen_smu`) and `/dev/mem` MCHBAR reads require.
-const CAP_SYS_RAWIO_BIT: u64 = 1 << 21;
+const CAP_SYS_RAWIO_BIT: u64 = 1 << 17;
 
 /// SOFT report of the daemon's privilege state (plan D5). Every field
 /// is populated best-effort: a missing or unreadable source of truth
@@ -23,7 +23,7 @@ pub struct PrivilegeReport {
     /// `true` when the process's effective uid is 0.
     pub is_root: bool,
     /// `true` when `CAP_SYS_RAWIO` is set in the process's effective
-    /// capability set (`CapEff` bit 21).
+    /// capability set (`CapEff` bit 17).
     pub has_cap_sys_rawio: bool,
     /// Human-readable notes on what will degrade (e.g. the non-root
     /// warning when `is_root == false`); empty when fully privileged.
@@ -31,13 +31,13 @@ pub struct PrivilegeReport {
     pub warnings: Vec<String>,
 }
 
-/// Pure parse of a `CapEff` hex capability set: `true` iff bit 21
+/// Pure parse of a `CapEff` hex capability set: `true` iff bit 17
 /// (`CAP_SYS_RAWIO`) is set. Any parse problem — empty input,
 /// non-hex characters, an over-long value, surrounding whitespace,
 /// a sign — degrades to `false`; this function never panics.
 ///
 /// [`probe`] feeds it the `CapEff:` line value from `/proc/self/status`
-/// (a 16-digit hex string, e.g. `0000000000200000`).
+/// (a 16-digit hex string, e.g. `0000000000020000`).
 pub fn cap_sys_rawio_from_cappeff(hex: &str) -> bool {
     match u64::from_str_radix(hex.trim(), 16) {
         Ok(value) => value & CAP_SYS_RAWIO_BIT != 0,
@@ -81,7 +81,7 @@ fn read_cap_eff() -> (bool, Option<String>) {
 ///
 /// - `is_root` via `geteuid() == 0` (libc).
 /// - `has_cap_sys_rawio` via the `CapEff:` line of `/proc/self/status`
-///   ([`cap_sys_rawio_from_cappeff`], bit 21); an unreadable file
+///   ([`cap_sys_rawio_from_cappeff`], bit 17); an unreadable file
 ///   degrades the flag to `false` plus a warning.
 /// - `warnings` names the sections that will report `N/A` (the
 ///   `InsufficientPrivilege`/`DriverMissing` fallbacks the Phase 2
@@ -112,7 +112,7 @@ pub fn probe() -> PrivilegeReport {
         // AmbientCapabilities=CAP_SYS_RAWIO): the non-root warning does
         // not apply, so name the degradation directly.
         warnings.push(
-            "running as root but CAP_SYS_RAWIO is not in the effective set (CapEff bit 21 clear); privileged telemetry fields (SMU/MCHBAR) will report N/A (InsufficientPrivilege)"
+            "running as root but CAP_SYS_RAWIO is not in the effective set (CapEff bit 17 clear); privileged telemetry fields (SMU/MCHBAR) will report N/A (InsufficientPrivilege)"
                 .to_string(),
         );
     }
@@ -129,22 +129,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cappeff_bit_21_set_returns_true() {
-        // Exactly CAP_SYS_RAWIO (bit 21, 2^21 = 0x200000) and nothing else.
-        assert!(cap_sys_rawio_from_cappeff("0000000000200000"));
-        // The full 40-cap set: bit 21 falls inside 0x3fffffffff.
+    fn cappeff_bit_17_set_returns_true() {
+        // Exactly CAP_SYS_RAWIO (bit 17, 2^17 = 0x020000) and nothing else.
+        assert!(cap_sys_rawio_from_cappeff("0000000000020000"));
+        // The full 40-cap set: bit 17 falls inside 0x3fffffffff.
         assert!(cap_sys_rawio_from_cappeff("0000003fffffffff"));
         // The value as it appears after the "CapEff:" prefix — leading
         // whitespace (the tab separator) is trimmed by the parser.
-        assert!(cap_sys_rawio_from_cappeff("\t0000000000200000"));
+        assert!(cap_sys_rawio_from_cappeff("\t0000000000020000"));
     }
 
     #[test]
-    fn cappeff_bit_21_clear_returns_false() {
+    fn cappeff_bit_17_clear_returns_false() {
         // Empty capability set.
         assert!(!cap_sys_rawio_from_cappeff("0000000000000000"));
-        // Bit 22 (0x400000), not bit 21.
-        assert!(!cap_sys_rawio_from_cappeff("0000000000400000"));
+        // Bit 18 (0x40000) — the adjacent position; the parser must
+        // not confuse it with CAP_SYS_RAWIO.
+        assert!(!cap_sys_rawio_from_cappeff("000000000040000"));
+        // The original buggy value: CAP_SYS_ADMIN (bit 21, 0x200000) is
+        // NOT CAP_SYS_RAWIO — pins the fix against the false warning.
+        assert!(!cap_sys_rawio_from_cappeff("0000000000200000"));
         // Bit 37 (0x2000000000) — a distinct position; the parser must
         // not confuse it with CAP_SYS_RAWIO.
         assert!(!cap_sys_rawio_from_cappeff("0000002000000000"));
@@ -158,8 +162,8 @@ mod tests {
         for bad in [
             "",
             "   ",
-            "CapEff:0000000000200000",
-            "000000000020000g",
+            "CapEff:0000000000020000",
+            "000000000002000g",
             "zzzzzzzzzzzzzzzz",
             "000000000020000000000000",
             "-1",

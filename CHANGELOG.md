@@ -4,6 +4,17 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project.
 
+## [2.4.6] - 2026-09-26
+
+### Added
+- The AMD `ryzen_smu` driver source is now **bundled in both main packages** (`ramsleuth`, `ramsleuth-bin` → `/usr/share/ryzen-smu-dkms/vendor/`, SUMS-verified, guarded for pre-vendor tags) — the in-app one-click installs the AMD driver **offline** on a clean install (no git clone, no separate AUR extra), symmetric with the bundled Intel module source
+
+### Changed
+- The `ryzen-smu-dkms` AUR extra is now **mutually exclusive** with the main packages (like `ramsleuth-intel-dkms`): both bundle the same vendored source, so installing the extra removes a main package first — it is the **standalone provisioning path** only
+- The daemon `CAP_SYS_RAWIO` privilege probe checks bit **17** (`CAP_SYS_RAWIO`) instead of bit 21 (`CAP_SYS_ADMIN`) — fixes the false `InsufficientPrivilege` warning on correctly-privileged daemons
+- polkit branded-dialog fix: the inert `exec.arguments` annotation is removed (not a real polkit key), and the install paths (the AUR `.install` hooks + `install.sh`) restart polkit so the `org.freedesktop.ramsleuth.setup` action loads on install — the one-click prompt shows RamSleuth's branded message
+- The release tarball grows to 27 artifacts (6 binaries + 21 auxiliary, including the 8 vendored `ryzen_smu` files); `ryzen-smu-dkms` keeps its own version line (pkgver 1.0, branch-pinned) and does not track the workspace version
+
 ## [2.4.5] - 2026-09-25
 
 ### Added

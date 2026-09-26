@@ -9,8 +9,10 @@
 # configuration (packaging/ryzen-smu-dkms/dkms.conf), (2) the
 # operator-run install helper (scripts/install-ryzen-smu-dkms.sh, as
 # /usr/bin/ryzen-smu-dkms-install — the D-18.4 name distinct from
-# ramsleuth's /usr/bin/ramsleuth-install-ryzen-smu-dkms, so the
-# packages coexist without a pacman file conflict), (3) the VENDED
+# ramsleuth's /usr/bin/ramsleuth-install-ryzen-smu-dkms; the name
+# distinctness avoids a file conflict on that ONE binary only — the
+# packages as a whole cannot coinstall, see the conflict note below),
+# (3) the VENDED
 # pinned ryzen_smu source (packaging/ryzen-smu-dkms/vendor/: the 6
 # files frozen at upstream commit d298366 + SUMS.sha256 + NOTICE.md)
 # to /usr/share/ryzen-smu-dkms/vendor/ — the exact installed path the
@@ -29,6 +31,13 @@
 # module on kernel updates. The ramsleuth systemd unit never loads the
 # module. source: the RamSleuth repo (sibling of ramsleuth).
 #
+# Mutual conflict: the main packages (ramsleuth, ramsleuth-bin) now
+# BUNDLE this same vendored source to /usr/share/ryzen-smu-dkms/vendor/
+# (their package() step 13 — the in-app offline one-click needs no
+# separate extra), so the vendor tree is shared file surface and this
+# extra cannot coinstall with either: conflicts=('ramsleuth'
+# 'ramsleuth-bin'), mutual (the main packages list this package too).
+#
 # License: the package content is the MIT helper + the GPL-2.0 vendored
 # module source (a separate work — vendor/NOTICE.md); license= lists
 # both. `git` is NOT a package dep: the vendored path needs no clone;
@@ -44,6 +53,12 @@ url="https://github.com/MadGoatHaz/RamSleuth"
 license=(MIT GPL-2.0-only)
 depends=(dkms)
 makedepends=()
+# The main packages bundle the same vendored source to
+# /usr/share/ryzen-smu-dkms/vendor/ (their package() step 13 — the in-app
+# offline one-click needs no separate extra), so this extra cannot
+# coinstall with either; the conflict is mutual (the main packages list
+# this package too).
+conflicts=('ramsleuth' 'ramsleuth-bin')
 
 # The installed files come from the RamSleuth repo tree (P5-03 dkms.conf, P5-04 helper,
 # C21-07 vendor/).
