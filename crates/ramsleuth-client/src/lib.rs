@@ -15,18 +15,24 @@
 //!   timeout + retries, send/recv frames, one round-trip `request`,
 //!   structured `ClientError` diagnostics (daemon-down hint, timeouts,
 //!   protocol violations).
-//! - `commands` — P3-20 — the `bench` + `status` commands: `bench`
-//!   streams a benchmark run (a `BenchStarted` ack, one progress line
-//!   per completed cell, the terminal 4×4 grid through the pure
-//!   `render_grid`); `status` is the one-RPC per-section summary. Both
-//!   print their output and return the same text.
+//! - `commands` — P3-20 — the `bench` + `status` + `probe` + `burn`
+//!   commands: `bench` streams a benchmark run (a `BenchStarted` ack,
+//!   one progress line per completed cell, the terminal 4×4 grid
+//!   through the pure `render_grid`); `status` is the one-RPC
+//!   per-section summary; `probe` fetches the consent-gated probe
+//!   report (`GetProbeReport` → the chunk-2 markdown to
+//!   `~/.ramsleuth/probe-report.md` / stdout / raw JSON) and `burn`
+//!   starts the daemon's burn-in soak (`StartBurnIn`, ack + stop
+//!   guidance, then exits). All print their output and return the same
+//!   text.
 //! - `dump` — P3-19 — the `dump` command: the pure dashboard-style
 //!   `render` over a `SystemMemoryTelemetry` snapshot (every cell prints
 //!   its value or `N/A (<reason>)`, never a panic) + the one-RPC `dump`
 //!   (`GetTelemetry` → render → stdout).
 //!
 //! The rewritten binary entry (`main.rs`, P3-21) dispatches `dump` /
-//! `bench` / `status` over the transport this crate exposes.
+//! `bench` / `status` / `probe` / `burn` over the transport this crate
+//! exposes.
 
 pub mod client;
 pub mod commands;
@@ -51,3 +57,11 @@ pub use dump::{dump, render};
 // returned `String` is exactly the text printed (the unit tests assert
 // on it, the bin may ignore it).
 pub use commands::{bench, render_grid, status};
+
+// The TUI `[F]` / `[X]` + GUI parity commands: `probe` (the
+// consent-gated probe report — `GetProbeReport` → the chunk-2 markdown
+// to `~/.ramsleuth/probe-report.md`, `--stdout`, or the raw JSON;
+// `probe_to` + `default_probe_report_path` carry the injectable
+// destination the unit tests drive) and `burn` (the daemon's burn-in
+// soak — `StartBurnIn { Full, minutes }` → the ack + stop guidance).
+pub use commands::{burn, default_probe_report_path, probe, probe_to};

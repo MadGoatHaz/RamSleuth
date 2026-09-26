@@ -29,3 +29,7 @@ path = "src/main.rs"
 ramsleuth-protocol = { path = "../ramsleuth-protocol" }
 ramsleuth-telemetry = { path = "../ramsleuth-telemetry" }
 ramsleuth-bench = { path = "../ramsleuth-bench" }
+# The `probe` subcommand's `--json` flag emits the raw `ProbeReport` as
+# JSON: `serde_json` 1 (1.0.151, declared 1.71 — MSRV-safe, plan D1),
+# the same direct-dep style the TUI (`export json`) and GUI use.
+serde_json = "1"

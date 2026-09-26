@@ -4,15 +4,26 @@
 //! access, unit-tested), a [`Client`] connect to the daemon's Unix
 //! socket (P3-18 — a missing / refused socket is retried, then becomes
 //! the friendly `DaemonDown` "start it with …" hint, never a panic,
-//! plan D5), a per-subcommand read timeout, and dispatch to the three
-//! commands the library exposes (P3-19 / P3-20):
+//! plan D5), a per-subcommand read timeout, and dispatch to the five
+//! commands the library exposes (P3-19 / P3-20 + the TUI/GUI parity
+//! pair):
 //!
 //! - `dump`   → the dashboard-style telemetry listing — the Phase 3
 //!   exit-criterion command: full hardware timings against a running
 //!   daemon;
 //! - `bench`  → a streamed benchmark run (a progress line per completed
 //!   cell, then the terminal AIDA64-style 4×4 grid);
-//! - `status` → the one-line-per-section health summary.
+//! - `status` → the one-line-per-section health summary;
+//! - `probe`  → the consent-gated probe report (the TUI `[F]` / GUI
+//!   Probe parity): `GetProbeReport` → the chunk-2 markdown written to
+//!   `~/.ramsleuth/probe-report.md` (the TUI `[w]` location) by
+//!   default, printed to stdout with `--stdout`, or emitted as the raw
+//!   `ProbeReport` JSON with `--json`;
+//! - `burn`   → the burn-in soak (the TUI `[X]` / GUI Run Burn-In
+//!   parity): `StartBurnIn { Full, --duration minutes }` (`0` =
+//!   infinite) → the start confirmation (the run id, the duration) +
+//!   how to stop it (the daemon's `CancelBenchmark` from any client),
+//!   then exit.
 //!
 //! **Exit codes:** `0` success (`--help`/`-h` and `--version`/`-V`
 //! short-circuit to `0` before parsing too); `1` a daemon / client
@@ -37,12 +48,25 @@
 //!   bench    Run a streamed AIDA64-style memory bandwidth / latency
 //!            benchmark (progress lines + the 4x4 grid)
 //!   status   Print the per-section health summary
+//!   probe    Fetch the probe report from the daemon and write it as
+//!            markdown to ~/.ramsleuth/probe-report.md (--stdout prints
+//!            it; --json emits the raw ProbeReport as JSON)
+//!   burn     Start a burn-in soak on the daemon (a repeated full-grid
+//!            run: --duration <minutes>, 0 = infinite; the run stops
+//!            by itself at the deadline or via the daemon's
+//!            CancelBenchmark from any client, e.g. the TUI [C] key)
 //!
 //! Options:
 //!   --socket <path>                  Daemon Unix socket
 //!                                    (default: /run/ramsleuth/ramsleuth.sock)
 //!   --tier <memory|l1|l2|l3|full>    Benchmark tier scope (default: full)
 //!   --mode <full|memory-only>        Benchmark scope (default: full)
+//!   --stdout                         probe: print the report to stdout
+//!                                    instead of the default file
+//!   --json                           probe: emit the raw ProbeReport as
+//!                                    JSON instead of the markdown
+//!   --duration <minutes>             burn: the soak duration in minutes
+//!                                    (default: 5; 0 = infinite)
 //!   -h, --help                       Print this help and exit
 //!   -V, --version                    Print the version and exit
 //!
@@ -53,7 +77,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ramsleuth_bench::{StreamTarget, Tier};
-use ramsleuth_client::{bench, dump, status, Client, ClientError};
+use ramsleuth_client::{bench, burn, dump, probe, status, Client, ClientError};
 use ramsleuth_protocol::{BenchMode, DEFAULT_SOCKET_PATH};
 
 /// Read timeout for the one-round-trip subcommands (`dump` /
@@ -67,6 +91,14 @@ const FAST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// legitimate gap between frames can far exceed the 5 s transport
 /// default; the deadline only bounds a silently wedged daemon.
 const BENCH_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Read timeout for the one-shot `probe` subcommand: 30 s — the
+/// daemon's `GetProbeReport` arm does a fresh raw acquisition (an
+/// MCHBAR `/dev/mem` mmap on Intel, the `ryzen_smu` SMN/PM section on
+/// AMD) on top of the snapshot, so a slow host can legitimately take
+/// longer than the 10 s fast-command budget; the deadline still bounds
+/// a wedged daemon.
+const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The client's parsed command line (P3-21).
 ///
@@ -87,7 +119,22 @@ pub struct CliArgs {
     /// [`BenchMode::Full`] (all 12 bandwidth cells plus the four
     /// latency passes).
     pub mode: BenchMode,
+    /// `probe` `--stdout`: print the report to stdout instead of the
+    /// default `~/.ramsleuth/probe-report.md` file.
+    pub probe_stdout: bool,
+    /// `probe` `--json`: emit the raw `ProbeReport` as JSON instead of
+    /// the markdown (to stdout).
+    pub probe_json: bool,
+    /// `burn` `--duration <minutes>`: the burn-in soak duration in
+    /// minutes (`0` = infinite — the daemon's wire
+    /// `duration_minutes`); defaults to [`DEFAULT_BURN_MINUTES`] (the
+    /// TUI `[X]` / GUI default).
+    pub burn_duration: u32,
 }
+
+/// The `burn` default duration (minutes): 5 — the TUI `[X]` (the 5-min
+/// burn-in soak) and the GUI knob default (`BURN_IN_MINUTES_DEFAULT`).
+const DEFAULT_BURN_MINUTES: u32 = 5;
 
 impl Default for CliArgs {
     fn default() -> Self {
@@ -96,6 +143,9 @@ impl Default for CliArgs {
             subcommand: Subcommand::Dump,
             target: StreamTarget::Full,
             mode: BenchMode::Full,
+            probe_stdout: false,
+            probe_json: false,
+            burn_duration: DEFAULT_BURN_MINUTES,
         }
     }
 }
@@ -111,6 +161,14 @@ pub enum Subcommand {
     Bench,
     /// Print the per-section health summary.
     Status,
+    /// Fetch the consent-gated probe report (the TUI `[F]` / GUI Probe
+    /// parity): `GetProbeReport` → the chunk-2 markdown (file /
+    /// `--stdout` / `--json`).
+    Probe,
+    /// Start a burn-in soak (the TUI `[X]` / GUI Run Burn-In parity):
+    /// `StartBurnIn { Full, burn_duration }` → the ack + stop guidance,
+    /// then exit.
+    Burn,
 }
 
 /// Usage text printed for `--help`/`-h` and on parse errors (exit 2 —
@@ -120,7 +178,7 @@ pub enum Subcommand {
 /// test pins the string.
 const USAGE: &str = concat!(
     "ramsleuth-client — the RamSleuth unprivileged CLI (dump / bench /\n",
-    "status)\n",
+    "status / probe / burn)\n",
     "\n",
     "Talks to the privileged ramsleuth-daemon over the Unix socket (the\n",
     "daemon needs root / CAP_SYS_RAWIO).\n",
@@ -134,12 +192,25 @@ const USAGE: &str = concat!(
     "  bench    Run a streamed AIDA64-style memory bandwidth / latency\n",
     "           benchmark (progress lines + the 4x4 grid)\n",
     "  status   Print the per-section health summary\n",
+    "  probe    Fetch the probe report from the daemon and write it as\n",
+    "           markdown to ~/.ramsleuth/probe-report.md (--stdout\n",
+    "           prints it; --json emits the raw ProbeReport as JSON)\n",
+    "  burn     Start a burn-in soak on the daemon (a repeated full-grid\n",
+    "           run: --duration <minutes>, 0 = infinite; it stops by\n",
+    "           itself at the deadline, or via the daemon's\n",
+    "           CancelBenchmark from any client, e.g. the TUI [C] key)\n",
     "\n",
     "Options:\n",
     "  --socket <path>                  Daemon Unix socket\n",
     "                                   (default: /run/ramsleuth/ramsleuth.sock)\n",
     "  --tier <memory|l1|l2|l3|full>    Benchmark tier scope (default: full)\n",
     "  --mode <full|memory-only>        Benchmark scope (default: full)\n",
+    "  --stdout                         probe: print the report to stdout\n",
+    "                                   instead of the default file\n",
+    "  --json                           probe: emit the raw ProbeReport as\n",
+    "                                   JSON instead of the markdown\n",
+    "  --duration <minutes>             burn: the soak duration in minutes\n",
+    "                                   (default: 5; 0 = infinite)\n",
     "  -h, --help                       Print this help and exit\n",
     "  -V, --version                    Print the version and exit\n",
     "\n",
@@ -188,14 +259,18 @@ where
 }
 
 /// One subcommand name (the first positional): `dump` / `bench` /
-/// `status`; anything else is an error naming the offending value.
+/// `status` / `probe` / `burn`; anything else is an error naming the
+/// offending value.
 fn parse_subcommand(arg: &str) -> Result<Subcommand, String> {
     match arg {
         "dump" => Ok(Subcommand::Dump),
         "bench" => Ok(Subcommand::Bench),
         "status" => Ok(Subcommand::Status),
+        "probe" => Ok(Subcommand::Probe),
+        "burn" => Ok(Subcommand::Burn),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `dump`, `bench`, or `status`)"
+            "unknown subcommand `{other}` (expected `dump`, `bench`, `status`, `probe`, \
+             or `burn`)"
         )),
     }
 }
@@ -231,22 +306,31 @@ fn parse_mode(arg: &str) -> Result<BenchMode, String> {
 /// Parse the client's command line (the program name already removed).
 ///
 /// Pure and testable: no env access, no I/O, no panic. The first
-/// positional is the subcommand (`dump` | `bench` | `status`; defaults
-/// to `dump` when no positional is given). The three flags all take a
-/// value, may repeat (the last value wins), and may appear in any
-/// order relative to the subcommand:
+/// positional is the subcommand (`dump` | `bench` | `status` | `probe`
+/// | `burn`; defaults to `dump` when no positional is given). The
+/// value-taking flags may repeat (the last value wins) and every flag
+/// may appear in any order relative to the subcommand:
 ///
 /// - `--socket <path>` — the daemon Unix socket (default
 ///   [`DEFAULT_SOCKET_PATH`]);
 /// - `--tier <memory|l1|l2|l3|full>` — the benchmark tier scope
 ///   (default `Full`);
-/// - `--mode <full|memory-only>` — the benchmark scope (default `Full`).
+/// - `--mode <full|memory-only>` — the benchmark scope (default
+///   `Full`);
+/// - `--stdout` — `probe`: print the report to stdout instead of the
+///   default file (a boolean flag — it takes no value);
+/// - `--json` — `probe`: emit the raw `ProbeReport` as JSON (a boolean
+///   flag; `--json --stdout` is a no-op combination — the JSON is
+///   always the stdout form);
+/// - `--duration <minutes>` — `burn`: the soak duration in minutes
+///   (default [`DEFAULT_BURN_MINUTES`] = 5; `0` = infinite).
 ///
-/// An unknown flag, an unknown subcommand, a second positional, or a
-/// flag missing its value is a `String` error naming the problem (exit
-/// `2` at startup); a valid parse yields [`CliArgs`] with defaults for
-/// every absent piece. (`--help`/`-h` and `--version`/`-V` never reach
-/// this parser — `main` short-circuits them first, exit `0`.)
+/// An unknown flag, an unknown subcommand, a second positional, a flag
+/// missing its value, or a non-numeric `--duration` is a `String` error
+/// naming the problem (exit `2` at startup); a valid parse yields
+/// [`CliArgs`] with defaults for every absent piece. (`--help`/`-h`
+/// and `--version`/`-V` never reach this parser — `main` short-circuits
+/// them first, exit `0`.)
 pub fn parse_cli<I, S>(args: I) -> Result<CliArgs, String>
 where
     I: IntoIterator<Item = S>,
@@ -284,10 +368,26 @@ where
                         .ok_or_else(|| "--mode requires a value (full | memory-only)".to_owned())?;
                     parsed.mode = parse_mode(&value)?;
                 }
+                "--stdout" => {
+                    parsed.probe_stdout = true;
+                }
+                "--json" => {
+                    parsed.probe_json = true;
+                }
+                "--duration" => {
+                    let value = iter
+                        .next()
+                        .map(|v| v.as_ref().to_owned())
+                        .ok_or_else(|| {
+                            "--duration requires a value (minutes; 0 = infinite)".to_owned()
+                        })?;
+                    parsed.burn_duration = parse_duration(&value)?;
+                }
                 other => {
                     return Err(format!(
                         "unknown flag `{other}` (expected `--socket <path>`, \
-                         `--tier <memory|l1|l2|l3|full>`, or `--mode <full|memory-only>`)"
+                         `--tier <memory|l1|l2|l3|full>`, `--mode <full|memory-only>`, \
+                         `--stdout`, `--json`, or `--duration <minutes>`)"
                     ));
                 }
             }
@@ -295,7 +395,7 @@ where
             if subcommand_seen {
                 return Err(format!(
                     "unexpected argument `{arg}` (only one subcommand is accepted: \
-                     `dump`, `bench`, or `status`)"
+                     `dump`, `bench`, `status`, `probe`, or `burn`)"
                 ));
             }
             parsed.subcommand = parse_subcommand(arg)?;
@@ -303,6 +403,17 @@ where
         }
     }
     Ok(parsed)
+}
+
+/// One `--duration` value (minutes, for `burn`): a non-negative
+/// integer; `0` means the daemon's infinite soak. A non-numeric value
+/// is an error naming the flag + the offending value.
+fn parse_duration(arg: &str) -> Result<u32, String> {
+    arg.parse::<u32>().map_err(|_| {
+        format!(
+            "invalid --duration value `{arg}` (expected a non-negative integer of minutes; 0 = infinite)"
+        )
+    })
 }
 
 fn main() {
@@ -345,11 +456,14 @@ fn main() {
     };
 
     // The per-subcommand read timeout (the transport default is 5 s):
-    // the one-round-trip commands get 10 s, the streamed benchmark gets
-    // 120 s between frames (a full run streams over minutes).
+    // the one-round-trip commands get 10 s (`probe` gets 30 s — the
+    // daemon's fresh raw acquisition can legitimately run longer), the
+    // streamed benchmark gets 120 s between frames (a full run streams
+    // over minutes).
     let read_timeout = match args.subcommand {
         Subcommand::Bench => BENCH_READ_TIMEOUT,
-        Subcommand::Dump | Subcommand::Status => FAST_READ_TIMEOUT,
+        Subcommand::Probe => PROBE_READ_TIMEOUT,
+        Subcommand::Dump | Subcommand::Status | Subcommand::Burn => FAST_READ_TIMEOUT,
     };
     if let Err(error) = client.set_read_timeout(read_timeout) {
         eprintln!("ramsleuth-client: {error}");
@@ -358,13 +472,18 @@ fn main() {
 
     // Dispatch: `dump` prints the dashboard (P3-19); `bench` streams
     // the progress + the terminal grid (P3-20); `status` prints the
-    // per-section summary (P3-20). `bench` / `status` also *return*
-    // the text they printed (the P3-20 contract) — the bin ignores it.
-    // Success falls through to exit 0; any client/daemon error exits 1.
+    // per-section summary (P3-20); `probe` fetches + writes the probe
+    // report (the TUI `[F]` / GUI parity path); `burn` starts the
+    // daemon's burn-in soak + prints the stop guidance (the TUI `[X]`
+    // / GUI parity path). Every command also *returns* the text it
+    // printed (the P3-20 contract) — the bin ignores it. Success falls
+    // through to exit 0; any client/daemon error exits 1.
     let result: Result<(), ClientError> = match args.subcommand {
         Subcommand::Dump => dump(&mut client),
         Subcommand::Bench => bench(&mut client, args.target, args.mode).map(drop),
         Subcommand::Status => status(&mut client).map(drop),
+        Subcommand::Probe => probe(&mut client, args.probe_stdout, args.probe_json).map(drop),
+        Subcommand::Burn => burn(&mut client, args.burn_duration).map(drop),
     };
     if let Err(error) = result {
         eprintln!("ramsleuth-client: {error}");
@@ -383,7 +502,8 @@ mod tests {
     use super::*;
 
     /// (a) No args → the defaults: subcommand `Dump`, the protocol's
-    /// default socket path, target `Full`, mode `Full`.
+    /// default socket path, target `Full`, mode `Full`, no probe flags,
+    /// and the TUI/GUI default burn duration (5 minutes).
     #[test]
     fn no_args_yields_defaults() {
         let args = parse_cli(Vec::<&str>::new()).expect("no args must parse");
@@ -392,6 +512,9 @@ mod tests {
         assert_eq!(args.socket, PathBuf::from(DEFAULT_SOCKET_PATH));
         assert_eq!(args.target, StreamTarget::Full);
         assert_eq!(args.mode, BenchMode::Full);
+        assert!(!args.probe_stdout, "probe --stdout defaults off");
+        assert!(!args.probe_json, "probe --json defaults off");
+        assert_eq!(args.burn_duration, 5, "the TUI/GUI default burn duration");
     }
 
     /// (b) `dump --socket /tmp/x.sock` → `Dump` with the overridden
@@ -527,11 +650,11 @@ mod tests {
         );
     }
 
-    /// All three value-taking flags reject a missing value with a
+    /// All four value-taking flags reject a missing value with a
     /// message naming the flag.
     #[test]
     fn missing_flag_values_are_rejected() {
-        for flag in ["--socket", "--tier", "--mode"] {
+        for flag in ["--socket", "--tier", "--mode", "--duration"] {
             let err = parse_cli(vec![flag])
                 .expect_err(&format!("{flag} without a value must be rejected"));
             assert!(err.contains(flag), "the error must name the flag: {err}");
@@ -563,6 +686,80 @@ mod tests {
             version_line(),
             format!("ramSleuth ramsleuth-client v{}", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    /// (l) `probe` → `Probe`; no flags set.
+    #[test]
+    fn probe_subcommand_parses() {
+        let args = parse_cli(["probe"]).expect("must parse");
+        assert_eq!(args.subcommand, Subcommand::Probe);
+        assert!(!args.probe_stdout);
+        assert!(!args.probe_json);
+        assert_eq!(args.burn_duration, 5);
+    }
+
+    /// (l2) `burn` → `Burn` with the default 5-minute duration.
+    #[test]
+    fn burn_subcommand_parses_with_default_duration() {
+        let args = parse_cli(["burn"]).expect("must parse");
+        assert_eq!(args.subcommand, Subcommand::Burn);
+        assert_eq!(args.burn_duration, 5);
+    }
+
+    /// (l3) `probe --stdout --json` sets both flags (boolean flags —
+    /// they take no value, so the flags may repeat and appear in any
+    /// order relative to the subcommand).
+    #[test]
+    fn probe_flags_parse_in_any_order() {
+        let args = parse_cli(["probe", "--json", "--stdout"]).expect("must parse");
+        assert_eq!(args.subcommand, Subcommand::Probe);
+        assert!(args.probe_stdout);
+        assert!(args.probe_json);
+
+        let args = parse_cli(["--stdout", "probe", "--json"]).expect("must parse");
+        assert_eq!(args.subcommand, Subcommand::Probe);
+        assert!(args.probe_stdout);
+        assert!(args.probe_json);
+    }
+
+    /// (l4) `burn --duration` takes a minutes value: `0` (infinite) and
+    /// `120` ride the parsed args; an over-large value parses (the
+    /// command clamps it to the GUI's 1440-max before it rides the
+    /// wire).
+    #[test]
+    fn burn_duration_parses() {
+        let args = parse_cli(["burn", "--duration", "0"]).expect("must parse");
+        assert_eq!(args.subcommand, Subcommand::Burn);
+        assert_eq!(args.burn_duration, 0);
+
+        let args = parse_cli(["burn", "--duration", "120"]).expect("must parse");
+        assert_eq!(args.burn_duration, 120);
+
+        let args = parse_cli(["burn", "--duration", "9999"]).expect("must parse");
+        assert_eq!(args.burn_duration, 9999);
+    }
+
+    /// (l5) A non-numeric `--duration` is rejected with a message
+    /// naming the flag and the offending value.
+    #[test]
+    fn bad_duration_value_is_rejected() {
+        let err = parse_cli(["burn", "--duration", "abc"])
+            .expect_err("a non-numeric --duration must be rejected");
+        assert!(
+            err.contains("--duration") && err.contains("abc"),
+            "the error must name the flag and the value: {err}"
+        );
+    }
+
+    /// (l6) `--stdout` / `--json` outside a `probe` subcommand still
+    /// parse (the flags are global in the simple parser; the bin only
+    /// reads them for `probe`).
+    #[test]
+    fn probe_flags_parse_without_probe_subcommand() {
+        let args = parse_cli(["--json", "dump"]).expect("must parse");
+        assert_eq!(args.subcommand, Subcommand::Dump);
+        assert!(args.probe_json);
+        assert!(!args.probe_stdout);
     }
 
     /// (k) `--help`/`-h` and `--version`/`-V` are the short-circuits:

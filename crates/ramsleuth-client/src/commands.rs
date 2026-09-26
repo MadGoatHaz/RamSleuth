@@ -1,4 +1,6 @@
-//! The `bench` + `status` commands over the shared transport (P3-20).
+//! The `bench` + `status` + `probe` + `burn` commands over the shared
+//! transport (P3-20; `probe` / `burn` added for the TUI `[F]` / `[X]` +
+//! GUI parity).
 //!
 //! [`bench`] starts a streamed benchmark run: one `StartBenchmark`
 //! request, then the daemon's reply stream on the same connection (the
@@ -18,16 +20,35 @@
 //! the section holds live data (`ok`) or degraded to `N/A (<reason>)`,
 //! plus the daemon socket line.
 //!
-//! **Print + return:** both commands print their output and return the
+//! [`probe`] fetches the consent-gated "Submit Probe Report" (one
+//! `GetProbeReport` round trip): the `ProbeReport` reply renders to the
+//! chunk-2 markdown (the telemetry crate's `render_probe_report_md` —
+//! the same document the TUI `[w]` and the GUI preview carry) and is
+//! written to `~/.ramsleuth/probe-report.md` (the `$HOME` rule with the
+//! TUI's CWD fallback — [`default_probe_report_path`]) by default,
+//! printed to stdout with `--stdout`, or emitted as the raw `ProbeReport`
+//! JSON with `--json`.
+//!
+//! [`burn`] starts a burn-in soak (one `StartBurnIn { Full,
+//! duration_minutes }` — the daemon's single-flight run class, D-1):
+//! the `BenchStarted { run_id }` ack prints the confirmation (the
+//! duration, the run id) + how the run stops (itself at the finite
+//! deadline, or via the daemon's `CancelBenchmark` from any client —
+//! the TUI `[C]` key / the GUI cancel), then the command exits — the
+//! daemon-side run keeps going without its owner (the TUI-close
+//! precedent), so the CLI need not sit on the tick stream.
+//!
+//! **Print + return:** every command prints its output and returns the
 //! exact same `String` — the unit tests assert on the returned text
 //! (capturing this process's own stdout in a test is not reliable: std
 //! dups fd 1 on first use). The P3-21 bin ignores the return value.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ramsleuth_bench::{BenchmarkGrid, BenchOp, Metric, StreamProgress, StreamTarget, Tier};
 use ramsleuth_protocol::{BenchMode, Request, Response};
 use ramsleuth_telemetry::error::Section;
+use ramsleuth_telemetry::probe::render_probe_report_md;
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 
 use crate::client::{Client, ClientError};
@@ -205,10 +226,8 @@ pub fn bench(
             Response::BurnInProgress(_) => {
                 // A burn-in frame in a normal-bench stream violates the
                 // wire contract (burn-in ticks stream only on the
-                // owning `StartBurnIn` connection, D-1/D-2). The CLI
-                // gains no burn-in subcommand this cycle (a documented
-                // follow-up) — this subcommand only ever starts a
-                // `StartBenchmark`.
+                // owning `StartBurnIn` connection, D-1/D-2); the `burn`
+                // subcommand is the separate `StartBurnIn` path.
                 return Err(ClientError::Protocol(
                     "unexpected burn-in frame during benchmark".to_owned(),
                 ))
@@ -299,6 +318,154 @@ fn section_state<T>(section: &Section<T>) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `probe` — the consent-gated "Submit Probe Report" fetch (the TUI `[F]`
+// / GUI Probe parity path).
+// ---------------------------------------------------------------------------
+
+/// The default `probe` destination: `~/.ramsleuth/probe-report.md` — the
+/// exact `~` location the TUI's `[w]` writes (the `$HOME` rule with the
+/// CWD fallback when `HOME` is unset — the GUI F2/F3 rule; never a
+/// panic).
+pub fn default_probe_report_path() -> PathBuf {
+    let home =
+        std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    home.join(".ramsleuth").join("probe-report.md")
+}
+
+/// The `probe` command: fetch the report and write it to the default
+/// location (or print it, per the flags) — see [`probe_to`] for the
+/// full contract. This convenience is what the bin calls.
+pub fn probe(client: &mut Client, to_stdout: bool, as_json: bool) -> Result<String, ClientError> {
+    probe_to(client, to_stdout, as_json, &default_probe_report_path())
+}
+
+/// One `GetProbeReport` round trip over `client` (the TUI `[F]`
+/// one-shot request class — its own request, not a telemetry poll) and
+/// the `ProbeReport` reply, in the requested form:
+///
+/// - `as_json` → the raw [`ProbeReport`] as pretty-printed JSON,
+///   printed to stdout (the machine-readable form — `--json`);
+/// - `to_stdout` (without `as_json`) → the chunk-2 markdown (the
+///   telemetry crate's [`render_probe_report_md`] — the identical
+///   document the TUI `[w]` and the GUI preview carry), printed to
+///   stdout with the `report printed to stdout` confirmation on stderr
+///   (so the report stays the sole stdout stream) — `--stdout`;
+/// - neither → the same markdown written to `path` (the parent dir
+///   created as needed — the TUI `[w]` file semantics), the
+///   `report written to <path>` confirmation printed to stdout.
+///
+/// Prints the output and returns the same text (`report written to …`
+/// for a file write, the report text itself for a stdout print) — the
+/// P3-20 print + return contract. A structured `Error` reply maps onto
+/// [`ClientError::Protocol`] with the daemon's text, any other reply is
+/// a protocol violation, and a file-write i/o failure is
+/// [`ClientError::Io`] (the no-panic contract, D5).
+pub fn probe_to(
+    client: &mut Client,
+    to_stdout: bool,
+    as_json: bool,
+    path: &Path,
+) -> Result<String, ClientError> {
+    let response = client.request(&Request::GetProbeReport)?;
+    let Response::ProbeReport(report) = response else {
+        return match response {
+            Response::Error(msg) => Err(ClientError::Protocol(msg)),
+            _ => Err(ClientError::Protocol(
+                "expected a probe report reply to GetProbeReport".to_owned(),
+            )),
+        };
+    };
+    let text = if as_json {
+        serde_json::to_string_pretty(&report).map_err(|e| {
+            ClientError::Protocol(format!("failed to encode the probe report as JSON: {e}"))
+        })?
+    } else {
+        render_probe_report_md(&report)
+    };
+    if to_stdout || as_json {
+        println!("{text}");
+        eprintln!("report printed to stdout");
+        Ok(text)
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(ClientError::Io)?;
+        }
+        std::fs::write(path, &text).map_err(ClientError::Io)?;
+        let line = format!("report written to {}", path.display());
+        println!("{line}");
+        Ok(line)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `burn` — the burn-in soak start (the TUI `[X]` / GUI Run Burn-In
+// parity path).
+// ---------------------------------------------------------------------------
+
+/// The burn-in duration clamp (minutes): the GUI's `0..=1440` range
+/// (a `u32` is never negative, so only the upper bound bites; `0` =
+/// infinite) — parity with `burn_in_minutes_clamped`.
+fn burn_in_minutes_clamped(minutes: u32) -> u32 {
+    const BURN_IN_MINUTES_MAX: u32 = 1440;
+    minutes.min(BURN_IN_MINUTES_MAX)
+}
+
+/// Start a burn-in soak (the daemon's multi-pass duration run class,
+/// D-1 — the TUI `[X]` / GUI `Run Burn-In` parity path): sends
+/// `StartBurnIn { Full, duration_minutes }` (the full 4×4 grid, the
+/// same target + the GUI/TUI default-scope burn-in; the minutes are
+/// clamped to `0..=1440` as in the GUI, `0` = infinite), reads the
+/// daemon's first reply, and exits:
+///
+/// - `BenchStarted { run_id }` → the confirmation: `burn-in started
+///   (run {run_id})` with the full grid + the duration (`0` = infinite
+///   — runs until cancelled; a finite `n` — the daemon stops the run
+///   itself at the `n × 60 s` deadline), then how to stop it early:
+///   the daemon's `CancelBenchmark { run_id }` from *any* client (the
+///   TUI `[C]` key / the GUI cancel button) — the run keeps going
+///   daemon-side after this command exits (a closed owner does not
+///   cancel it — the TUI-close-mid-run precedent);
+/// - `Error(msg)` → [`ClientError::Protocol`] with the daemon's text
+///   (the single-flight busy case: `benchmark already running`);
+/// - any other reply → [`ClientError::Protocol`] (a protocol
+///   violation).
+///
+/// Prints the confirmation and returns it (the P3-20 print + return
+/// contract). The CLI does not sit on the tick stream — that is the
+/// dashboard frontends' job; `burn` starts the soak, confirms, and
+/// exits.
+pub fn burn(client: &mut Client, duration_minutes: u32) -> Result<String, ClientError> {
+    let duration_minutes = burn_in_minutes_clamped(duration_minutes);
+    client.send(&Request::StartBurnIn {
+        target: StreamTarget::Full,
+        duration_minutes,
+    })?;
+    let response = client.recv()?;
+    let Response::BenchStarted { run_id } = response else {
+        return match response {
+            Response::Error(msg) => Err(ClientError::Protocol(msg)),
+            _ => Err(ClientError::Protocol(
+                "expected a burn-in start reply to StartBurnIn".to_owned(),
+            )),
+        };
+    };
+    let duration = if duration_minutes == 0 {
+        "infinite (0 — the run stops only when cancelled)".to_owned()
+    } else {
+        let unit = if duration_minutes == 1 { "minute" } else { "minutes" };
+        format!("{duration_minutes} {unit} (the daemon stops it at the deadline)")
+    };
+    let text = format!(
+        "burn-in started (run {run_id}) — full 4x4 grid, {duration}\n\
+         stop it early: cancel run {run_id} from any client (the TUI [C] key or the \
+         GUI cancel button — the daemon's CancelBenchmark); `ramsleuth-client status` \
+         shows the daemon's health"
+    );
+    println!("{text}");
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests run against a real **in-process daemon stand-in**
@@ -319,7 +486,7 @@ mod tests {
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
     use ramsleuth_telemetry::spd_decode::SpdModule;
-    use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
+    use ramsleuth_telemetry::{ProbeReport, ProbeSystem, SystemMemoryTelemetry, SystemPlatform};
 
     use super::*;
 
@@ -740,5 +907,279 @@ mod tests {
         );
         assert!(lines[1].contains("512.00 GB/s"), "the measured cell, got: {text}");
         assert!(lines[1].contains("N/A"), "unmeasured Memory cells, got: {text}");
+    }
+
+    // ------------------------------------------------------------------
+    // `probe` (the TUI `[F]` / GUI Probe parity path) — the stand-in
+    // answers `GetProbeReport` with a canned `ProbeReport`.
+    // ------------------------------------------------------------------
+
+    /// A canned [`ProbeReport`] over the mixed snapshot (Intel branch
+    /// populated, `raw` absent) with a fully-populated system identity
+    /// (host-independent).
+    fn fixture_report() -> ProbeReport {
+        ProbeReport {
+            telemetry: mixed_snapshot(),
+            raw: None,
+            system: ProbeSystem {
+                cpu_brand: "Intel Core i7-12700K".to_owned(),
+                cpu_vendor: "Intel".to_owned(),
+                cpu_gen: "AlderLake".to_owned(),
+                pci_host_bridge: Some("0x8086:0x46F2".to_owned()),
+                kernel: "6.6.0-test".to_owned(),
+                os: "Linux / Arch".to_owned(),
+                arch: "x86_64".to_owned(),
+                ramsleuth_version: "2.4.5".to_owned(),
+                telemetry_source: "ramsleuth_intel".to_owned(),
+            },
+        }
+    }
+
+    /// (p1) `probe_to` in the default (file) form: the `GetProbeReport`
+    /// request rides the wire, the `ProbeReport` reply renders to the
+    /// chunk-2 markdown, the file (a nested temp dir — the `create_dir_all`
+    /// path) is written, and the returned text is the `report written
+    /// to <path>` confirmation.
+    #[test]
+    fn probe_writes_the_markdown_to_the_given_path() {
+        let sock = TempSocket::new("probe-write");
+        let handle = spawn_standin(&sock, Request::GetProbeReport, vec![Response::ProbeReport(fixture_report())]);
+        let dir = std::env::temp_dir().join(format!(
+            "ramsleuth-client-probe-{}-{}",
+            process::id(),
+            "write"
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // stale from a crashed earlier run
+        let path = dir.join("probe-report.md");
+        assert!(!path.exists(), "the nested dir must not exist yet");
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let text = probe_to(&mut client, false, false, &path)
+            .expect("probe must succeed on a ProbeReport reply");
+        handle.join().expect("stand-in thread must not panic");
+
+        assert_eq!(
+            text,
+            format!("report written to {}", path.display()),
+            "the confirmation names the path"
+        );
+        let written = std::fs::read_to_string(&path).expect("the report file must exist");
+        assert!(
+            written.starts_with("# RamSleuth Probe Report"),
+            "the written file is the chunk-2 markdown, got: {written}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (p2) `probe_to --stdout` (without `--json`): the markdown is the
+    /// returned text (the confirmation goes to stderr, so the returned
+    /// text is the report itself) and no file is touched.
+    #[test]
+    fn probe_stdout_returns_the_markdown() {
+        let sock = TempSocket::new("probe-stdout");
+        let handle = spawn_standin(&sock, Request::GetProbeReport, vec![Response::ProbeReport(fixture_report())]);
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let path = std::env::temp_dir().join(format!(
+            "ramsleuth-client-probe-{}-{}",
+            process::id(),
+            "stdout-never-written.md"
+        ));
+        let text = probe_to(&mut client, true, false, &path)
+            .expect("probe must succeed on a ProbeReport reply");
+        handle.join().expect("stand-in thread must not panic");
+
+        assert_eq!(
+            text,
+            render_probe_report_md(&fixture_report()),
+            "--stdout returns the rendered markdown"
+        );
+        assert!(!path.exists(), "--stdout must not write the default file");
+    }
+
+    /// (p3) `probe_to --json`: the raw [`ProbeReport`] is the returned
+    /// text as pretty JSON — it parses back to the exact fixture (the
+    /// serde round trip), and no file is touched.
+    #[test]
+    fn probe_json_returns_the_raw_report_json() {
+        let sock = TempSocket::new("probe-json");
+        let handle = spawn_standin(&sock, Request::GetProbeReport, vec![Response::ProbeReport(fixture_report())]);
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let path = std::env::temp_dir().join(format!(
+            "ramsleuth-client-probe-{}-{}",
+            process::id(),
+            "json-never-written.md"
+        ));
+        let text = probe_to(&mut client, false, true, &path)
+            .expect("probe must succeed on a ProbeReport reply");
+        handle.join().expect("stand-in thread must not panic");
+
+        let back: ProbeReport =
+            serde_json::from_str(&text).expect("the returned text must be the report JSON");
+        assert_eq!(back, fixture_report(), "--json round-trips the ProbeReport");
+        assert!(!path.exists(), "--json must not write the default file");
+    }
+
+    /// (p4) `probe_to` on a structured error reply maps onto
+    /// `ClientError::Protocol` with the daemon's text verbatim.
+    #[test]
+    fn probe_structured_error_reply_is_protocol() {
+        let sock = TempSocket::new("probe-err");
+        let handle = spawn_standin(&sock, Request::GetProbeReport, vec![Response::Error("nope".to_owned())]);
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let err = probe_to(&mut client, false, false, Path::new("/tmp/never"))
+            .expect_err("an Error reply must fail probe");
+        handle.join().expect("stand-in thread must not panic");
+
+        assert_eq!(err, ClientError::Protocol("nope".to_owned()));
+    }
+
+    /// (p5) `probe_to` on a contract-violating reply (a `Telemetry`
+    /// frame where a probe report is due) maps onto
+    /// `ClientError::Protocol` with the guard's text.
+    #[test]
+    fn probe_unexpected_reply_is_protocol() {
+        let sock = TempSocket::new("probe-badreply");
+        let handle =
+            spawn_standin(&sock, Request::GetProbeReport, vec![Response::Telemetry(mixed_snapshot())]);
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let err = probe_to(&mut client, false, false, Path::new("/tmp/never"))
+            .expect_err("a non-ProbeReport reply must fail probe");
+        handle.join().expect("stand-in thread must not panic");
+
+        assert_eq!(
+            err,
+            ClientError::Protocol("expected a probe report reply to GetProbeReport".to_owned())
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `burn` (the TUI `[X]` / GUI Run Burn-In parity path) — the
+    // stand-in asserts the `StartBurnIn` request and answers.
+    // ------------------------------------------------------------------
+
+    /// (b1) `burn` with a finite duration: the `StartBurnIn { Full, 5 }`
+    /// request rides the wire, the `BenchStarted { run_id }` ack yields
+    /// the confirmation (the run id, the duration, and the stop guidance
+    /// — the daemon's `CancelBenchmark` from any client), and the call
+    /// is `Ok`.
+    #[test]
+    fn burn_starts_a_finite_soa() {
+        let sock = TempSocket::new("burn-finite");
+        let handle = spawn_standin(
+            &sock,
+            Request::StartBurnIn {
+                target: StreamTarget::Full,
+                duration_minutes: 5,
+            },
+            vec![Response::BenchStarted { run_id: 3 }],
+        );
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let text = burn(&mut client, 5).expect("burn must succeed on a BenchStarted ack");
+        handle.join().expect("stand-in thread must not panic");
+
+        assert!(text.contains("burn-in started (run 3)"), "the run id, got: {text}");
+        assert!(text.contains("5 minutes"), "the finite duration, got: {text}");
+        assert!(
+            text.contains("cancel run 3"),
+            "the stop guidance names the run, got: {text}"
+        );
+        assert!(
+            text.contains("CancelBenchmark"),
+            "the stop guidance names the daemon's cancel, got: {text}"
+        );
+    }
+
+    /// (b2) `burn` with the infinite duration (`0`): the `StartBurnIn {
+    /// Full, 0 }` request rides the wire, and the confirmation announces
+    /// the infinite run (stops only when cancelled).
+    #[test]
+    fn burn_infinite_soa_announces_the_cancel_path() {
+        let sock = TempSocket::new("burn-infinite");
+        let handle = spawn_standin(
+            &sock,
+            Request::StartBurnIn {
+                target: StreamTarget::Full,
+                duration_minutes: 0,
+            },
+            vec![Response::BenchStarted { run_id: 7 }],
+        );
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let text = burn(&mut client, 0).expect("burn must succeed on a BenchStarted ack");
+        handle.join().expect("stand-in thread must not panic");
+
+        assert!(text.contains("burn-in started (run 7)"), "got: {text}");
+        assert!(text.contains("infinite"), "the infinite duration, got: {text}");
+        assert!(
+            text.contains("cancel run 7"),
+            "an infinite run stops only via the cancel, got: {text}"
+        );
+    }
+
+    /// (b3) `burn` clamps an over-large duration to the GUI's 1440-max
+    /// before it rides the wire (the stand-in asserts the clamped
+    /// request).
+    #[test]
+    fn burn_clamps_an_overlarge_duration() {
+        let sock = TempSocket::new("burn-clamp");
+        let handle = spawn_standin(
+            &sock,
+            Request::StartBurnIn {
+                target: StreamTarget::Full,
+                duration_minutes: 1440,
+            },
+            vec![Response::BenchStarted { run_id: 1 }],
+        );
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let text = burn(&mut client, 9999).expect("burn must succeed on a BenchStarted ack");
+        handle.join().expect("stand-in thread must not panic");
+
+        assert!(
+            text.contains("1440 minutes"),
+            "the clamped duration, got: {text}"
+        );
+    }
+
+    /// (b4) `burn` on a structured error reply (the single-flight busy
+    /// case) maps onto `ClientError::Protocol` with the daemon's text
+    /// verbatim.
+    #[test]
+    fn burn_busy_reply_is_protocol() {
+        let sock = TempSocket::new("burn-busy");
+        let handle = spawn_standin(
+            &sock,
+            Request::StartBurnIn {
+                target: StreamTarget::Full,
+                duration_minutes: 5,
+            },
+            vec![Response::Error("benchmark already running".to_owned())],
+        );
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let err = burn(&mut client, 5).expect_err("an Error reply must fail burn");
+        handle.join().expect("stand-in thread must not panic");
+
+        assert_eq!(
+            err,
+            ClientError::Protocol("benchmark already running".to_owned())
+        );
+    }
+
+    /// (b5) `burn` on a contract-violating reply (a `Telemetry` frame
+    /// where a burn-in start is due) maps onto `ClientError::Protocol`
+    /// with the guard's text.
+    #[test]
+    fn burn_unexpected_reply_is_protocol() {
+        let sock = TempSocket::new("burn-badreply");
+        let handle =
+            spawn_standin(&sock, Request::StartBurnIn {
+                target: StreamTarget::Full,
+                duration_minutes: 5,
+            }, vec![Response::Telemetry(mixed_snapshot())]);
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let err = burn(&mut client, 5).expect_err("a non-BenchStarted reply must fail burn");
+        handle.join().expect("stand-in thread must not panic");
+
+        assert_eq!(
+            err,
+            ClientError::Protocol("expected a burn-in start reply to StartBurnIn".to_owned())
+        );
     }
 }
