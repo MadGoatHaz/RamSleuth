@@ -481,20 +481,26 @@ AGESA string found in the BIOS data, `SMU <v>` for the `ryzen_smu` firmware
 version, or `AGESA N/A` when neither is available.
 
 **Line 3** — the RAM summary: `RAM: <total> (<per-DIMM breakdown>) <max
-module speed> MT/s | <channel mode> | Mode: <sync state>` — for example
-`RAM: 64 GiB (4x16 GiB Dual-Rank) 6000 MT/s | Quad-Channel | Mode:
-Synchronous 1:1 (UCLK = MCLK = 3000 MHz)`. The UCLK:MCLK sync segment is
-colour-coded: **amber** for `Synchronous 1:1` (UCLK = MCLK — the healthy
-memory-clock configuration), **crimson** for `Asynchronous 1:2` (UCLK = MCLK/2
-— the fallback when the fabric cannot keep up), and plain text for an honest
-`N/A`. On **Intel**, both the `<channel mode>` label and the `Mode:`
-slot come from the hardware `MAD_INTER_CHANNEL[1:0]` register (read via the
-`ramsleuth_intel` module when it is loaded) — `Dual-Channel (Symmetric)`,
-`Dual-Channel (Flex)`, or `Single-Channel`; see
-[Section 8.6](#86-channel-mode--the-ram-summary).
-When the OS total exceeds what SPD can see (e.g. four DIMMs installed
-but only two bound to the SPD bus), a slot note is appended —
-`2 of 4 slots SPD-visible`.
+module speed> MT/s | <channel mode> | ECC: <status> | Mode: <sync state>` —
+for example `RAM: 16 GiB (1x16 GiB Dual-Rank) 3200 MT/s | Dual-Channel
+(Symmetric) | ECC: Capable (disabled) | Mode: Asynchronous 1:2`. The
+UCLK:MCLK sync segment is colour-coded: **amber** for `Synchronous 1:1`
+(UCLK = MCLK — the healthy memory-clock configuration), **crimson** for
+`Asynchronous 1:2` (UCLK = MCLK/2 — the fallback when the fabric cannot
+keep up), and plain text for an honest `N/A`. The **`<channel mode>`** label
+is hardware-derived on **both** platforms — Intel from the
+`MAD_INTER_CHANNEL` register (read via the `ramsleuth_intel` module), AMD
+from the memory controller's channel-population registers (read via the
+`ryzen_smu` module) — and falls back to the installed-DIMM count only when
+neither is available; on **Intel** the hardware mode also fills the `Mode:`
+slot (`Interleaved` when symmetric, `Flex` when asymmetric, `N/A` for a
+single channel); see [Section 8.6](#86-channel-mode--the-ram-summary).
+The **`ECC: <status>`** segment (both platforms) reads `Capable (disabled)`
+(the controller supports ECC, but non-ECC DIMMs are installed — the normal
+desktop state), `Enabled`, `ChipKill` (multi-bit mode), `Not Capable`, or an
+honest `N/A` when the status could not be read. When the OS total exceeds
+what SPD can see (e.g. four DIMMs installed but only two bound to the SPD
+bus), a slot note is appended — `2 of 4 slots SPD-visible`.
 
 ### 4.2 The three zones
 
@@ -658,8 +664,8 @@ re-read every frame).
 
 The screen is a **3-line header** (title + platform tag + daemon status +
 key legend; the CPU/platform identity line; the RAM summary line with the
-channel mode and colour-coded UCLK:MCLK sync state — the GUI header's
-mirror), then, while open, the one-line **settings strip**
+channel mode, the ECC status, and the colour-coded UCLK:MCLK sync state —
+the GUI header's mirror), then, while open, the one-line **settings strip**
 (`Settings: <poll> · <capacity> · <clock> · <refresh on/off> · <socket>`) and
 the **requirements strip** (the amber `SETUP — requirements` block: one row
 per diagnosed problem with its exact fix command; it auto-opens while a
@@ -971,13 +977,14 @@ SPD is the serial presence-detect EEPROM on each module, read over `ee1004`
 
 ### 8.6 Channel mode & the RAM summary
 
-The header's RAM line derives the **channel mode** from the installed DIMM
-count: 1 → `Single-Channel`, 2 → `Dual-Channel`, 4 → `Quad-Channel` (other
-counts read `N/A` — an odd configuration the model does not map). Channel
-count is the single biggest bandwidth lever: dual channel roughly doubles
-the theoretical interface width, which is why the summary also shows the
-per-DIMM breakdown (`2x16 GiB Single-Rank`) and, when the OS sees more
-capacity than the SPD bus binds, a slot note (`2 of 4 slots SPD-visible`).
+The header's RAM line labels the **channel mode** from hardware when it
+can, falling back to the installed DIMM count: 1 → `Single-Channel`,
+2 → `Dual-Channel`, 4 → `Quad-Channel` (other counts read `N/A` — an
+odd configuration the model does not map). Channel count is the single
+biggest bandwidth lever: dual channel roughly doubles the theoretical
+interface width, which is why the summary also shows the per-DIMM
+breakdown (`2x16 GiB Single-Rank`) and, when the OS sees more capacity than
+the SPD bus binds, a slot note (`2 of 4 slots SPD-visible`).
 
 On **Intel** the DIMM count is only the fallback. When the
 `ramsleuth_intel` module is loaded, the channel label and the `Mode:`
@@ -991,6 +998,21 @@ not what the DIMM population implies: an asymmetric configuration (e.g.
 `Dual-Channel (Flex)` depending on the BIOS/firmware choice — it is not
 guaranteed to be Flex. Without the module (the `/dev/mem` fallback) the
 label degrades back to the DIMM count above.
+
+On **AMD** the label is synthesized from the memory controller's
+channel-population registers (read via the `ryzen_smu` module): one
+populated channel → `Single-Channel`, both populated with **equal**
+capacity → `Dual-Channel (Symmetric)`, both populated with **unequal**
+capacity (e.g. 8 + 16 GiB) → `Dual-Channel (Flex)`; an unreadable
+population reads `N/A`. Unlike Intel's firmware-programmed label, the AMD
+label follows the installed capacity.
+
+The line also carries the **`ECC:`** status (both platforms):
+`Capable (disabled)` means the controller supports ECC but non-ECC DIMMs are
+installed (or ECC is off in the BIOS) — the normal desktop state;
+`Enabled` means standard single-bit-correct / double-bit-detect ECC is
+active; `ChipKill` is the multi-bit mode; `Not Capable` means the platform
+has no ECC support; and `N/A` means the status could not be read.
 
 ---
 

@@ -112,21 +112,25 @@ no direct MMIO from userspace* — the daemon reads:
   tWRRD, tRDWR, tRFC1/2/SB) read from the SMN register space via the driver's
   `smn` sysfs accessor;
 - **GDM** (global data-path mode) and the **DRAM command rate** (1T/2T), from
-  the SMN `0x50200` word.
+  the SMN `0x50200` word;
+- **channel mode + ECC state** from the UMC channel-population register set
+  (per-channel CS base/mask words + `UmcCapHi`, §10.2).
 
 **Intel.** Two raw sources feed one decode (§10.3). The **primary** is the
 `ramsleuth_intel` kernel module, which maps the host-bridge **MCHBAR** window
-in kernel space and publishes the raw IMC registers as 24 world-readable sysfs
-attributes under `/sys/kernel/ramsleuth_intel/` — no C-side decoding; all
-bit-field semantics live in Rust. The **fallback** is a read-only `mmap` of
+in kernel space and publishes the raw IMC registers as 25 world-readable sysfs
+attributes under `/sys/kernel/ramsleuth_intel/` (including the host-bridge
+`CAPID0_A` word — the ECC-decode input) — no C-side decoding; all bit-field
+semantics live in Rust. The **fallback** is a read-only `mmap` of
 the same window via `/dev/mem` (the operation that forces `CAP_SYS_RAWIO`),
 taken only when the module's kobject is absent. The decode (the
 hardware-verified Tier-1 register map) yields the DRAM core clock from
 `MC_BIOS_REQ` plus the per-channel timing set — tCL, tCWL, the unified tRCD,
 tRP, tRAS, the synthesized tRC, tRRD_S/L, tRTP, tFAW, tWR, tRFC, and the four
-turnaround quartets: 24 of the 27 AMD subtiming slots; the rest of the Intel
-readout (uclk / fclk / gear / GDM / PDM, the CAD bus, the voltage rails) has
-no IMC analog and renders `NotApplicable`.
+turnaround quartets: 24 of the 27 AMD subtiming slots, the ECC capability
+from `CAPID0_A` (bit 17 `ECC_DIS`), and the hardware channel mode; the rest
+of the Intel readout (uclk / fclk / gear / GDM / PDM, the CAD bus, the
+voltage rails) has no IMC analog and renders `NotApplicable`.
 
 **SPD (both vendors, fully unprivileged).** The kernel's `ee1004` I2C EEPROM
 driver exposes each DIMM's full raw image as a world-readable sysfs attribute.
@@ -308,11 +312,11 @@ section is N/A, exit 2 on a bad flag).
 | `error.rs` | The contract types: `TelemetryError` (rich cause: vendor, driver, privilege hint, PM-table version, `io::Error`, parse detail), `NaReason` (the six display reasons, §3.3), `Section<T>` (`Value`/`Na`). |
 | `amd_smu.rs` | The single privileged gateway to the `ryzen_smu` driver: sysfs-first PM-blob acquisition, version sourcing, the char-device fallback, and safe `nix` wrappers (no `unsafe`). |
 | `amd_pm.rs` | Version-guarded parse of the raw PM blob into clocks (MCLK/UCLK/FCLK) and voltages (VDDCR_VDD/VDDCR_SOC). |
-| `amd_smn.rs` | The `smn` accessor protocol plus the verified SMN register table (the 27 subtimings, GDM, command rate). |
+| `amd_smn.rs` | The `smn` accessor protocol plus the verified SMN register tables — the 13-register timing block (the 27 subtimings, GDM, command rate) and the 14-register channel set (per-UMC CS base/mask + `UmcCapHi` → channel mode + ECC). |
 | `amd_readout.rs` | The four vendor-neutral display types (`ClockReadout`, `TimingSet`, `CadBus`, `VoltageSet`) and the AMD mapping onto them, with sanity gating. |
 | `intel_mchbar.rs` | MCHBAR location in PCI config space + the read-only `/dev/mem` RAII window — the fallback source (the one `unsafe` cluster in the crate). |
 | `intel_readout.rs` | The hardware-verified Tier-1 IMC register map (MCHBAR-relative) + the single pure decode core fed by both raw sources, into the same display types. |
-| `intel_sysfs.rs` | The primary raw reader: the `ramsleuth_intel` kobject's 24 attributes (the 19 IMC-register attributes — 2 MCHBAR diagnostics, `MC_BIOS_REQ`, 16 per-channel `TC_*` — plus the 5 MAD channel/geometry) under `/sys/kernel/ramsleuth_intel/` → the raw `IntelImcRegs` set + the MAD words (per-attribute containment: absent / malformed → `None`). |
+| `intel_sysfs.rs` | The primary raw reader: the `ramsleuth_intel` kobject's 25 attributes (the 19 IMC-register attributes — 2 MCHBAR diagnostics, `MC_BIOS_REQ`, 16 per-channel `TC_*` — the 5 MAD channel/geometry, and the host-bridge `CAPID0_A`) under `/sys/kernel/ramsleuth_intel/` → the raw `IntelImcRegs` set + the MAD words + `capid0a` (per-attribute containment: absent / malformed → `None`). |
 | `spd_eeprom.rs` | Unprivileged enumeration + raw-image acquisition of every bound `ee1004` device. |
 | `spd_decode.rs` | Pure decode of the raw image: JEP106 makers, rank/density/speed, part/serial, XMP 2.0 / XMP 3.0-EXPO profiles. |
 | `platform.rs` | The vendor-neutral identity branch: DMI, `/proc/cpuinfo`, `/proc/meminfo`, the `ryzen_smu` version attribute. |
@@ -784,7 +788,10 @@ telemetry crate's `SystemMemoryTelemetry` and the bench crate's
 the single source of truth for each is its owning crate. The snapshot's
 `intel` slot is a `Section<IntelReadout>`, which carries the hardware-derived
 `channel_mode: Option<ChannelMode>` wire field (decoded from
-`MAD_INTER_CHANNEL[1:0]`, §10.3) alongside the raw register set. Every arm is
+`MAD_INTER_CHANNEL[1:0]`, §10.3) and `ecc_status` (the `CAPID0_A` bit-17
+decode, §10.3) alongside the raw register set; the `amd` slot carries its own
+`channel_mode` + `ecc_status` (the UMC population/capability decode, §10.2).
+Every arm is
 bincode-serializable; failures cross the wire as structured payloads, never as
 panics.
 
@@ -1150,6 +1157,20 @@ and a failed SMU read leaves the `0xFFFFFFFF` failed-read sentinel — the
 overlay treats that word as a failed read (per-register containment: its
 fields decode to `0`, never as data).
 
+**Channel mode + ECC (the 14-register channel set).** Complementary to the
+timing block: per UMC channel (base `0x00050000` / `0x00150000` — the fixed
+`+0x00100000` stride, so the `+0x100000` offset rule does *not* apply) the
+four CS base words (bit 0 = CsEn), the two `AddrMask` rank-size words, and
+the `UmcCapHi` capability word. The **channel mode** is synthesized from the
+per-channel population + rank capacity — one active channel → `Single`, both
+active with equal capacity → `DualSymmetric`, both active with unequal
+capacity → `DualFlex` (8 + 16 GiB the worked case), no active channel or an
+unreadable population → `Unknown` (renders `N/A`); the **ECC state** comes
+from the per-channel `UmcCapHi` (bit 30 = EccEn, bit 31 = ChipKillCap) —
+every active channel EccEn → `Enabled` (all of them ChipKillCap too →
+`EnabledChipKill`), any active channel without EccEn → `CapableButDisabled`
+(the desktop silicon retains the capability), otherwise `Unknown`.
+
 **The live-subtimings requirement:** the module must be loaded (`modprobe
 ryzen_smu`, or the DKMS extra, §12.4); the frozen unit never loads it. Absent
 → the AMD branch's subtiming fields report `N/A (DriverMissing)` and the rest
@@ -1169,19 +1190,23 @@ feed **one** pure decode core:
    the main AUR packages — or by the standalone `ramsleuth-intel-dkms`
    extra, §12.5). It probes the host bridge at PCI `0000:00:00.0`, decodes
    the MCHBAR from config space, `ioremap`s the 64 KiB window, and publishes
-   the raw IMC registers as **24 world-readable (`0444`) sysfs attributes**
+   the raw IMC registers as **25 world-readable (`0444`) sysfs attributes**
    under `/sys/kernel/ramsleuth_intel/` — the 19 IMC-register attributes
    (the 2 MCHBAR diagnostics, `MC_BIOS_REQ`, and the 16 per-channel `TC_*`)
-   plus the 5 MAD channel/geometry registers (`0x5000`–`0x5010`) — each
-   register attribute the raw word, one line, `0x%08x` (the MCHBAR
-   diagnostics as `%016llx` and a constant `1`). **No C-side decoding**:
+   plus the 5 MAD channel/geometry registers (`0x5000`–`0x5010`) plus the
+   host-bridge `CAPID0_A` word (config offset `0xE4`, read in-kernel — the
+   host-bridge `/sys/.../config` space is 64-byte-truncated, so the
+   in-kernel read is the only path; an unreadable read prints the
+   `0xffffffff` sentinel, which degrades to `None`) — each register
+   attribute the raw word, one line, `0x%08x` (the MCHBAR diagnostics as
+   `%016llx` and a constant `1`). **No C-side decoding**:
    the module exposes raw values and
    Rust owns the bit-field semantics, so one module spans the supported
    client generations. The kobject exists **only on a fully successful
    probe** (Intel vendor, MCHBAR_EN set, non-zero masked base, `ioremap`
    OK); any probe failure leaves no kobject behind, and on a non-Intel host
    the load fails `-ENODEV` by design — the module is Intel-only. The Rust
-   reader (`intel_sysfs`) takes the 24 attributes with per-attribute
+   reader (`intel_sysfs`) takes the 25 attributes with per-attribute
    containment: an **absent** attribute and a **malformed** payload both
    degrade to `None` for that register only; only a permission / other-I/O
    failure on a present attribute is reported as a structured
@@ -1282,6 +1307,11 @@ registers stay raw in the sysfs attributes), feed `intel_readout::decode`:
   `command_rate` → `Na(NotApplicable)` (AMD-fabric concepts with no IMC
   analog; the gear ratio is Rocket+ / Tier 2), and the CAD bus + voltage
   rails → all `Na(NotApplicable)` (the IMC window exposes neither);
+- **`ecc_status`** ← the `capid0a` attribute (host-bridge config `0xE4`):
+  bit 17 (`ECC_DIS`) set → `NotCapable`, clear → `CapableButDisabled`,
+  absent / unreadable → `Unknown` — keyed off the register bit, never the
+  CPU string (a client CPU such as the i5-6600T is ECC-capable); on the
+  `/dev/mem` fallback (no kobject, no `capid0a`) the state stays `Unknown`;
 - **per-register containment**: an absent / failed register degrades only
   the slots sourced from it to `Na(ParseError)` — never a silent zero,
   never a panic.
@@ -1663,7 +1693,7 @@ fallback remains available where unblocked. When present:
   will be used"); the at-boot load entry
   (`/etc/modules-load.d/ramsleuth_intel.conf`) is written **only** on a
   successful Intel load (a stale one is removed on the non-Intel path);
-- the **frozen kobject contract** is the 24 world-readable attributes under
+- the **frozen kobject contract** is the 25 world-readable attributes under
   `/sys/kernel/ramsleuth_intel/` (§10.3): the module creates the kobject
   only on a fully successful probe, and any probe failure leaves no kobject
   behind;
