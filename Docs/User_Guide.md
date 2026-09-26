@@ -58,9 +58,12 @@ memory controller's own state and shows it in a dense dashboard:
   CPU's live core frequency.
 - **Live DRAM subtimings** — on AMD, all 27 (tCL, tRCD, tRP, tRAS, tRFC, …)
   straight from the SMU PM table; on Intel, the subset its MCHBAR registers
-  expose, decoded per-channel from the memory controller (Section 8.2). Not
-  the values baked into an XMP profile — the values the controller is
-  *actually running right now*.
+  expose, decoded from the memory controller (Section 8.2) — per-channel on
+  the Tier 1 / Tier 2 generations (Skylake through Rocket Lake, the 64 KiB
+  register window) and per-subchannel on the Tier 3 generations (Alder /
+  Raptor / Meteor / Arrow Lake, the 256 KiB window: two subchannels on a
+  DDR4 box, four on a DDR5 one). Not the values baked into an XMP profile —
+  the values the controller is *actually running right now*.
 - **Signal integrity settings** — CAD-bus ODT and driver strengths (in ohms,
   RZQ-relative) and the RTT modes.
 - **Voltages** — the VDDCR_CPU (Vcore), VDDCR_SOC, VDDIO_MEM, VDD_MISC, and
@@ -84,12 +87,17 @@ same spirit as AIDA64's memory benchmark:
 - Runs execute **inside the daemon** (single-flight: one run at a time), so
   you can start one from the GUI, the TUI, or the CLI and watch it stream.
 
+And when something looks wrong, RamSleuth can show its evidence: a
+**consent-gated probe report** — the system identity, the decoded readout,
+the raw register dump, and every `N/A` reason, packaged for bug reporting
+(the GUI's `Probe` button, Section 4.6; the TUI's `[F]` key, Section 5.1).
+
 You can consume all of this from three frontends plus two standalone tools:
 
 | Tool | What it is | Privilege |
 |---|---|---|
 | `ramsleuth` (GUI) | The full desktop dashboard: live telemetry matrix, benchmark grid with Run/Cancel/burn-in, hardware & SPD cards, a dedicated graphs window, settings, and the one-click setup. | none — talks to the daemon over the socket |
-| `ramsleuth-tui` | The same dashboard in your terminal (ratatui): a 16-key control surface, graphs overlay, snapshot & JSON export. | none — talks to the daemon over the socket |
+| `ramsleuth-tui` | The same dashboard in your terminal (ratatui): a 17-key control surface, graphs overlay, snapshot & JSON export. | none — talks to the daemon over the socket |
 | `ramsleuth-client` | The CLI: `dump` (the full telemetry listing), `bench` (a streamed benchmark run), `status` (per-section health). | none — talks to the daemon over the socket |
 | `ramsleuth-bench` | The standalone benchmark verification CLI — runs the 4×4 grid directly on this machine, no daemon. | none (just allocates memory) |
 | `ramsleuth-telemetry` | The standalone telemetry front end — reads the hardware directly and prints the full snapshot. | none (reads what it can without root; privileged fields show `N/A`) |
@@ -178,11 +186,12 @@ What makes it worth using:
   later (or install the
   [ryzen-smu-dkms extra](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings)).
   **Intel host?** It prints an optional next-step note: the built-in `/dev/mem`
-  MCHBAR decode already gives live Intel subtimings on a supported (Tier-1)
-  generation, and the `ramsleuth_intel` DKMS module is the preferred source
-  for them — `sudo ramsleuth-install-intel-dkms` (the built-in helper),
-  one-click `sudo ramsleuth-setup --with-dkms` (which routes by CPU vendor),
-  or `sudo scripts/install-intel-dkms.sh` from a source checkout (Section
+  MCHBAR decode already gives live Intel subtimings on any supported
+  generation (Tier 1 – 3, Skylake through Arrow Lake), and the
+  `ramsleuth_intel` DKMS module is the preferred source for them —
+  `sudo ramsleuth-install-intel-dkms` (the built-in helper), one-click
+  `sudo ramsleuth-setup --with-dkms` (which routes by CPU vendor), or
+  `sudo scripts/install-intel-dkms.sh` from a source checkout (Section
   10.5).
 
 Prerequisites and exit codes:
@@ -471,7 +480,7 @@ shows `Disconnected` with a hint, and the dashboard stays responsive.
 `[Intel LGA Platform]`, or a bare `[Platform]` when the vendor is unknown),
 the **daemon status** (`Daemon: Connected (IPC: /run/ramsleuth/ramsleuth.sock)`
 in cyan, or `Disconnected` in crimson — it names the socket actually in use),
-then, right-aligned, the **Setup**, **Settings**, and **Graphs** toggle
+then, right-aligned, the **Probe**, **Setup**, **Settings**, and **Graphs**
 buttons and the key legend **`[F2] snapshot · [F3] export · [Q] quit`**.
 
 **Line 2** — CPU and platform identity:
@@ -480,10 +489,14 @@ where the AGE token is labelled honestly by source — `AGESA <v>` for a true
 AGESA string found in the BIOS data, `SMU <v>` for the `ryzen_smu` firmware
 version, or `AGESA N/A` when neither is available.
 
-**Line 3** — the RAM summary: `RAM: <total> (<per-DIMM breakdown>) <max
-module speed> MT/s | <channel mode> | ECC: <status> | Mode: <sync state>` —
-for example `RAM: 16 GiB (1x16 GiB Dual-Rank) 3200 MT/s | Dual-Channel
-(Symmetric) | ECC: Capable (disabled) | Mode: Asynchronous 1:2`. The
+**Line 3** — the RAM summary: `RAM: <total> (<per-DIMM breakdown>) <speed>
+MT/s | <channel mode> | [<slot note>] | ECC: <status> | Mode: <sync
+state>` — for example `RAM: 16 GiB (1x16 GiB Dual-Rank) 3200 MT/s |
+Dual-Channel (Symmetric) | ECC: Capable (disabled) | Mode: Asynchronous
+1:2`. The `<speed>` segment is the fastest SPD speed of the bound modules,
+falling back to the platform's derived rate (MCLK × 2, the DDR
+double-pumping rule) when no module carries one; the `[<slot note>]`
+appears only when the OS total exceeds what SPD sees (see below). The
 UCLK:MCLK sync segment is colour-coded: **amber** for `Synchronous 1:1`
 (UCLK = MCLK — the healthy memory-clock configuration), **crimson** for
 `Asynchronous 1:2` (UCLK = MCLK/2 — the fallback when the fabric cannot
@@ -498,9 +511,18 @@ single channel); see [Section 8.6](#86-channel-mode--the-ram-summary).
 The **`ECC: <status>`** segment (both platforms) reads `Capable (disabled)`
 (the controller supports ECC, but non-ECC DIMMs are installed — the normal
 desktop state), `Enabled`, `ChipKill` (multi-bit mode), `Not Capable`, or an
-honest `N/A` when the status could not be read. When the OS total exceeds
-what SPD can see (e.g. four DIMMs installed but only two bound to the SPD
-bus), a slot note is appended — `2 of 4 slots SPD-visible`.
+honest `N/A` when the status could not be read. How each platform *detects*
+it: **AMD** reads the `UmcCapHi` capability word of each active UMC channel
+(bit 30 `EccEn`, bit 31 `ChipKillCap` — the same register set that
+synthesizes the channel mode) via the `ryzen_smu` module; **Intel** reads
+the host-bridge `CAPID0_A` register's bit 17 (`ECC_DIS`, clear = capable)
+via the `ramsleuth_intel` module — with the gotcha that the `/dev/mem`-only
+Intel path has no `CAPID0_A` read, so `ECC:` shows the honest `N/A` even
+when the rest of the Intel section is fully live (Section 10.5). When the
+OS total exceeds what SPD can see (e.g. four DIMMs installed but only two
+bound to the SPD bus), a slot note is **inserted between the channel
+segment and the `ECC:` segment** — `2 of 4 slots SPD-visible` — not
+appended after it.
 
 ### 4.2 The three zones
 
@@ -604,7 +626,42 @@ poll cycle, no restart; note they are not persisted to disk across restarts):
 Keys and buttons are behaviourally identical; a held key fires exactly once
 (key-repeat is filtered).
 
-### 4.6 Day-2 commands
+### 4.6 The Probe button — the consent-gated report
+
+The header's **Probe** button is the GUI's bug-reporting path: it gathers
+the daemon's full telemetry state into a single copy-paste-ready markdown
+document — and it asks first.
+
+**Step 1 — consent.** A modal dialog discloses exactly what the report
+collects:
+
+- CPU brand, detected generation, PCI host-bridge ID;
+- kernel version, OS, architecture;
+- the RamSleuth version and the telemetry source;
+- the decoded memory readout (MCLK, MT/s, timings, SPD);
+- the raw IMC register values;
+- every `N/A` reason.
+
+and states what it does **not** collect: username, hostname, IP address,
+MAC address, serial numbers, file paths. The buttons are **[Allow]** and
+**[Cancel]** (Esc cancels).
+
+**Step 2 — preview.** On Allow, the report is fetched from the daemon and
+shown in a preview dialog with three buttons:
+
+- **Open GitHub Issue** — copies the full report to your clipboard and
+  opens the repository's issue form with the title pre-filled as
+  `[Probe] <CPU brand> · <generation> · <OS> · v<version>`; paste the
+  clipboard contents into the issue body (a full report is too long for
+  the URL, so the body travels via the clipboard — the header flashes a
+  "paste it into the issue body" notice);
+- **Copy to Clipboard** — just the copy, no browser;
+- **Cancel** — Esc does the same.
+
+Every closing path returns to the dashboard, so the button is always
+re-openable. The TUI runs the same flow on `[F]` (Section 5).
+
+### 4.7 Day-2 commands
 
 ```sh
 systemctl status ramsleuth     # is the daemon alive?
@@ -620,7 +677,7 @@ The unit is sandboxed (`CAP_SYS_RAWIO` only, `ProtectSystem=strict`,
 ## 5. Running the TUI (`ramsleuth-tui`)
 
 The TUI is the terminal twin of the GUI: the same three-zone dashboard drawn
-with ratatui, driven by a **16-key control surface**. It is unprivileged and
+with ratatui, driven by a **17-key control surface**. It is unprivileged and
 talks to the daemon over the socket:
 
 ```sh
@@ -634,7 +691,7 @@ shows the cursor) on every exit path** — a normal `q`, an early return, or an
 unwind — so your shell is never left in raw mode. Exit codes: `0` a normal
 quit, `1` terminal init failure, `2` a usage error.
 
-### 5.1 The 16-key table
+### 5.1 The 17-key table
 
 | Key | Action | What it does |
 |---|---|---|
@@ -654,6 +711,7 @@ quit, `1` terminal init failure, `2` a usage error.
 | `k` | **Clock** | Toggle the clock units: **MHz ↔ GHz**. |
 | `a` | **Refresh (auto)** | Toggle the periodic data poll **on ↔ off** (the TUI default is **on** — the continuous live poll; off freezes the view, but `r` and reconnect baselines still fetch). |
 | `w` | **Window** | Cycle the graphs window: **1 → 5 → 15 → 60 min** (default 5). |
+| `f` | **Probe report** | Open the consent-gated probe-report flow: the consent prompt (`[y]`es / `[n]`o) → the scrollable report preview → `[w]` writes the report to **`~/.ramsleuth/probe-report.md`**, `[c]` copies it to the clipboard (`wl-copy` / `xclip` / `xsel`), `[q]` closes the preview (the GUI's Probe-button mirror, Section 4.6). |
 
 Keys are case-insensitive; modifier keys are ignored (a `Ctrl`-prefixed
 action char still maps). Every other key — `Esc`, `Enter`, arrows, function
@@ -696,6 +754,14 @@ The **graphs overlay** (`g`) is drawn topmost over the zone area —
 (CPU FREQ, VDDCR_CPU, VDDCR_SOC, CPU TEMP, MEM BANDWIDTH) as sparkline rows
 over the shared 1800-sample ring (60 min at the 2 s cadence); `w` changes
 the visible window.
+
+The **probe overlay** (`f`) is drawn topmost over the whole frame, the
+same way: first the small centred consent box (`PROBE REPORT — consent`:
+"Submit probe report?" + the no-personal-information note + the `[y]es` /
+`[n]o` answer line), then, after a `[y]`, the full-frame scrollable
+preview (`PROBE REPORT — preview (↑/↓ scroll)`) with the report markdown,
+a notice line, and the `[w] write to file · [c] copy to clipboard · [q]
+quit preview` footer.
 
 The daemon-down state is fully graceful: the header shows `down` /
 `disconnected`, zone 3 carries the daemon-start hint, and the requirements
@@ -851,11 +917,16 @@ language tour.
 ### 8.1 The clocks
 
 - **MCLK** — the *memory clock*: the rate the DRAM interface runs at, in MHz.
-  On Intel it is derived from the controller as **MCLK = CLK_RATIO ×
-  refclk** (no ÷2) — a DDR4-2133 system (refclk 133.3333 MHz, CLK_RATIO 8)
-  runs at MCLK = 1066.67 MHz. As on every DDR platform, the data rate
-  (MT/s) is 2× MCLK (DDR4 "2133 MT/s" at MCLK 1066.67 MHz; DDR5 "6000
-  MT/s" memory runs at MCLK = 3000 MHz).
+  On Intel it is derived from the controller's global `MC_BIOS_REQ` word as
+  **MCLK = CLK_RATIO × refclk** (no ÷2) — a DDR4-2133 system (refclk
+  133.3333 MHz, CLK_RATIO 8) runs at MCLK = 1066.67 MHz. The same word
+  feeds every tier, including the Tier 3 (Alder / Raptor / Meteor / Arrow
+  Lake) decode, where each subchannel's timing registers live in a legacy
+  mirror block that a degenerate mirror falls back out of the native MCL
+  clock blocks (MC0 @ `0xD000`, MC1 @ `0xD800`, inside the 256 KiB
+  window). As on every DDR platform, the data rate (MT/s) is 2× MCLK
+  (DDR4 "2133 MT/s" at MCLK 1066.67 MHz; DDR5 "6000 MT/s" memory runs at
+  MCLK = 3000 MHz).
 - **UCLK** — the *memory-controller (uncore) clock*: the internal clock the
   CPU's memory controller uses. Its relationship to MCLK is the sync mode
   below.
@@ -952,28 +1023,49 @@ single vs dual channel).
 ### 8.5 SPD — what your DIMMs report
 
 SPD is the serial presence-detect EEPROM on each module, read over `ee1004`
-(unprivileged). Per slot you get:
+(unprivileged). The two generations in play are **DDR4** (the SPD5118
+layout, **JESD79-4** — a 512-byte image) and **DDR5** (SPD5378,
+**JESD79-5** — a 1024-byte image); the two share the `0x02 = 0x0C`
+memory-type code and are told apart by image length. Per slot you get:
 
 - **maker** — the module manufacturer (its JEP106 manufacturer ID decoded
   to a name — Samsung, SK hynix, Micron, G.Skill, …; on DDR4 the ID is a
-  two-byte (bank, code) pair, and when a module carries no maker ID the DRAM
-  die maker stands in for it);
+  two-byte (bank, code) pair at `0x140`/`0x141`, on DDR5 an 8-bit vendor
+  nibble + continuation nibble at `0x01`/`0x02`; when a module carries no
+  maker ID the DRAM die maker stands in for it);
 - **dram die** — the DRAM die manufacturer + the density per die
-  (e.g. `SK hynix (16Gb)`);
-- **part** / **serial** — the module part number and serial (on DDR4 the
-  serial is four binary bytes, shown as an 8-char hex value);
+  (e.g. `SK hynix (16Gb)`) — from the DDR4 (bank, code) pair at
+  `0x15E`/`0x15F`, or the DDR5 vendor/continuation nibbles at
+  `0x2E`/`0x2F`;
+- **part** / **serial** — the module part number and serial: the DDR4
+  part is 20 ASCII chars at `0x149`–`0x15C` (falling back to the legacy
+  16-char field at `0x81` when blank), the DDR5 part 32 chars at
+  `0x200`–`0x21F`; the DDR4 serial is four binary bytes
+  (`0x145`–`0x148`), shown as an 8-char hex value, the DDR5 serial 16
+  ASCII chars at `0x91`–`0xA0`;
 - **rank** — how many DRAM ranks the module carries (`Single-Rank` /
-  `Dual-Rank` / …);
+  `Dual-Rank` / …): the DDR4 organization byte `0x0C` (bits 5:3 = ranks −
+  1), or the DDR5 rank-config byte `0x80` (bits 7:4);
+- **width / devices** — the geometry behind the capacity math: DDR4 device
+  width from `0x0C` bits 2:0 (x4 / x8 / x16 / x32) over the bus width from
+  `0x0D` bits 2:0 (3 = the x64 desktop bus); DDR5 device width from
+  `0x81` bits 2:0 (x4 / x8 / x16) with the per-rank device count in the
+  `0x80` nibble; total devices = rank × per-rank (DDR4 per-rank =
+  bus ÷ width) — the figure that feeds the per-DIMM capacity
+  (density × devices);
 - **density** — DRAM density per die (Mbit, shown as Gb);
 - **speed** — the module's rated data rate in MT/s: on DDR4, the first
-  factory profile's (XMP 2.0) rated speed, falling back to the JEDEC minimum
-  guaranteed speed when the module carries no profile; on DDR5, the SPD's
-  minimum data-rate field;
+  factory profile's (XMP 2.0) rated speed, falling back to the JEDEC base
+  speed from `tCKAVGmin` (byte `0x12`, in 125 ps memory-time-base units +
+  the signed fine-timebase companion) when the module carries no profile;
+  on DDR5, the minimum data rate — byte `0x20`, in 100 MT/s units;
 - **profiles** — the factory-validated overclock profiles stored on the
-  module: **XMP 2.0** (DDR4; two slots) or **XMP 3.0 / EXPO** (DDR5; four
-  slots), each rendered as `<speed> MT/s <CL>-<tRCD>-<tRP>-<tRAS> @ <volts>`.
-  Enabling one in BIOS is what moves the live data rate — and the
-  dashboard then shows you *what the controller actually settled on* live.
+  module: **XMP 2.0** (DDR4; two 47-byte profile blocks at `0x189` /
+  `0x1B8`, under the `0x180` header gate) or **XMP 3.0 / EXPO** (DDR5;
+  the 256-byte region at `0x300`, four 32-byte profile blocks), each
+  rendered as `<speed> MT/s <CL>-<tRCD>-<tRP>-<tRAS> @ <volts>`. Enabling
+  one in BIOS is what moves the live data rate — and the dashboard then
+  shows you *what the controller actually settled on* live.
 
 ### 8.6 Channel mode & the RAM summary
 
@@ -989,30 +1081,52 @@ the SPD bus binds, a slot note (`2 of 4 slots SPD-visible`).
 On **Intel** the DIMM count is only the fallback. When the
 `ramsleuth_intel` module is loaded, the channel label and the `Mode:`
 segment come from the memory controller's hardware `MAD_INTER_CHANNEL`
-register instead — its bits `[1:0]` select the mode: **`00b`** =
+register — its bits `[1:0]` select the mode: **`00b`** =
 `Dual-Channel (Symmetric)` (fully interleaved — the normal healthy
-configuration), **`01b`** = `Dual-Channel (Flex)` (asymmetric interleaving),
-**`10b`** = `Single-Channel`. The label is whatever the firmware programmed,
-not what the DIMM population implies: an asymmetric configuration (e.g.
-`16 + 8 GB`) may read **either** `Dual-Channel (Symmetric)` **or**
-`Dual-Channel (Flex)` depending on the BIOS/firmware choice — it is not
-guaranteed to be Flex. Without the module (the `/dev/mem` fallback) the
+configuration), **`01b`** = `Dual-Channel (Flex)` (asymmetric
+interleaving), **`10b`** = `Single-Channel` — **cross-checked against the
+actual DIMM population**: the Skylake-family firmware leaves
+`MAD_INTER_CHANNEL` at the `00b` default in configurations the spec
+encodes differently, so the decode demotes a firmware-`00b` reading to
+`Single-Channel` when exactly one channel has a populated DIMM, and to
+`Dual-Channel (Flex)` when both channels are populated with unequal
+capacities (the `MAD_DIMM_CH0` / `MAD_DIMM_CH1` slot-size registers
+supply the population); a `01b`/`10b` firmware value already matches its
+population and passes through unchanged. The label is thus the firmware
+state *reconciled with what is actually installed* — a live 8 + 16 GiB
+asymmetric box reads `Dual-Channel (Flex)` even when the firmware left
+the register at `00b`. Without the module (the `/dev/mem` fallback) the
 label degrades back to the DIMM count above.
 
-On **AMD** the label is synthesized from the memory controller's
-channel-population registers (read via the `ryzen_smu` module): one
-populated channel → `Single-Channel`, both populated with **equal**
-capacity → `Dual-Channel (Symmetric)`, both populated with **unequal**
-capacity (e.g. 8 + 16 GiB) → `Dual-Channel (Flex)`; an unreadable
-population reads `N/A`. Unlike Intel's firmware-programmed label, the AMD
-label follows the installed capacity.
+On **AMD** the label is synthesized from the memory controller's **SMN
+per-UMC-channel register set** (read via the `ryzen_smu` module): per
+channel (base `0x00050000` / `0x00150000`) the four CS0–CS3 base words
+(bit 0 = `CsEn`) say which DIMMs are populated and the two AddrMask words
+rank-size them — one populated channel → `Single-Channel`, both
+populated with **equal** capacity → `Dual-Channel (Symmetric)`, both
+populated with **unequal** capacity (e.g. 8 + 16 GiB) →
+`Dual-Channel (Flex)`; an unreadable population reads `N/A`. The
+**same register set** carries each channel's `UmcCapHi` capability word
+(bit 30 `EccEn`, bit 31 `ChipKillCap`) — the source of the ECC status
+below. The AMD label is derived the other way from Intel's: from what is
+installed, not from a firmware register.
 
 The line also carries the **`ECC:`** status (both platforms):
 `Capable (disabled)` means the controller supports ECC but non-ECC DIMMs are
 installed (or ECC is off in the BIOS) — the normal desktop state;
 `Enabled` means standard single-bit-correct / double-bit-detect ECC is
 active; `ChipKill` is the multi-bit mode; `Not Capable` means the platform
-has no ECC support; and `N/A` means the status could not be read.
+has no ECC support; and `N/A` means the status could not be read. How it is
+detected: on **AMD**, the `UmcCapHi` word of each active UMC channel —
+every active channel with `EccEn` reads `Enabled` (`ChipKill` when all
+active channels also carry `ChipKillCap`), an active channel without it
+reads `Capable (disabled)`; on **Intel**, the host-bridge `CAPID0_A`
+register's bit 17 (`ECC_DIS`) — clear → capable, set → `Not Capable` —
+read in-kernel by the `ramsleuth_intel` module (the host bridge's config
+space is truncated to 64 bytes in `/sys`, so an in-kernel read is the only
+path). The one gotcha: on the `/dev/mem`-only Intel path (module not
+loaded) there is no `CAPID0_A` read, so `ECC:` shows the honest `N/A` even
+when the rest of the Intel section is fully live.
 
 ---
 
@@ -1032,7 +1146,7 @@ listing and `ramsleuth-telemetry` show a human-readable phrase
 | Reason (as shown) | What it means | What to do |
 |---|---|---|
 | **`DriverMissing`** — *driver missing* | A required kernel driver is not loaded. On **AMD** this is the `ryzen_smu` module absent, so the live AMD subtimings cannot be read. On **Intel** it means the `ramsleuth_intel` module is absent **and** the `/dev/mem` fallback is unavailable — neither `/dev/mem` nor `/dev/fmem` exists (or the host-bridge PCI config device is absent, so MCHBAR cannot even be decoded). | **AMD:** install the driver — `sudo ramsleuth-setup --with-dkms`, `sudo ramsleuth-install-ryzen-smu-dkms`, or the `ryzen-smu-dkms` AUR extra + `sudo ryzen-smu-dkms-install` (Section 10). **Intel:** install the module — `sudo ramsleuth-install-intel-dkms`, the vendor-aware `sudo ramsleuth-setup --with-dkms` (or the Intel-only fast path `sudo ramsleuth-setup --with-intel-dkms`), or the `ramsleuth-intel-dkms` AUR extra + `sudo ramsleuth-intel-dkms-install` (Section 10.5). Everything else in RamSleuth works without it. |
-| **`UnsupportedHardware`** — *unsupported hardware* | The detected hardware is not supported by this telemetry source. On Intel there are two canonical cases: a **virtualized** host whose MCHBAR (BAR5) is unpopulated (`0` — there is no physical memory controller in the VM), and a **non-Tier-1** Intel generation — v1 decodes Skylake through Comet Lake only, and any other generation degrades the whole Intel section before a register is read. A **physical** Intel system of a supported generation works (Section 10.5); non-Intel silicon is rejected by the other branch the same way. | Nothing — this is the expected, honest outcome in that environment (VMs, or silicon outside the supported set). The other sections of the snapshot remain fully live. |
+| **`UnsupportedHardware`** — *unsupported hardware* | The detected hardware is not supported by this telemetry source. On Intel there are two canonical cases: a **virtualized** host whose MCHBAR (BAR5) is unpopulated (`0` — there is no physical memory controller in the VM), and a generation **outside the Tier 1 – 3 profile set** — the unprofiled generations (Ice Lake / Tiger Lake, and anything unrecognized) degrade the whole Intel section before a register is read, while every generation from Skylake through Arrow Lake decodes live (Tier 1: Skylake / Kaby Lake / Coffee Lake / Comet Lake; Tier 2: Rocket Lake; Tier 3: Alder / Raptor / Meteor / Arrow Lake — Section 10.5). A **physical** Intel system of a supported generation works (Section 10.5); non-Intel silicon is rejected by the other branch the same way. | Nothing — this is the expected, honest outcome in that environment (VMs, or silicon outside the supported set). The other sections of the snapshot remain fully live. |
 | **`InsufficientPrivilege`** — *insufficient privilege* | The operation needs more privilege than the caller has (e.g. a `/dev/mem` open/map permission denial, or a `STRICT_DEVMEM` range rejection). | Run the read through the **daemon** (it holds the one capability this needs) — i.e. use the GUI/TUI/`ramsleuth-client` against a running `ramsleuth.service` rather than a bare unprivileged read. |
 | **`UnknownPmTableVersion`** — *unknown PM table version* | The AMD SMU PM-table version the firmware reports is outside the layout set RamSleuth knows how to parse. | Update the **AGESA/firmware** (the table versions move with the SMU firmware) or the `ryzen_smu` driver, and retry. If it persists, it is a genuine "newer firmware than supported" case — report the version word upstream. |
 | **`NotApplicable`** — *not applicable* | This field does not apply to the detected platform by design — e.g. Intel does not expose the CAD bus or voltage rails through MCHBAR, AMD does not report gear mode, Intel voltages are out of the readout's scope. | Nothing — it is a *correct* blank, not a failure. |
@@ -1110,25 +1224,43 @@ stays sandboxed and the driver stays an explicit, audited opt-in.
 ## 10.5 Intel live subtimings: the `ramsleuth_intel` module (optional)
 
 The Intel side mirrors the AMD side, with one important difference: **a
-physical Intel system needs no driver to work.** The built-in fallback reads
-the host-bridge MCHBAR window directly through `/dev/mem`, so a supported
-(Tier-1) Intel generation — Skylake, Kaby Lake, Coffee Lake, Comet Lake
-— gets live per-channel IMC subtimings out of the box, provided the kernel
-exposes `/dev/mem` unblocked (no `STRICT_DEVMEM`, no integrity lockdown).
+physical Intel system needs no driver to work.** The built-in fallback
+reads the host-bridge MCHBAR window directly through `/dev/mem` (64 KiB
+for the Tier 1 / 2 generations, 256 KiB for Tier 3), so any supported
+Intel generation gets live per-subchannel IMC subtimings out of the box,
+provided the kernel exposes `/dev/mem` unblocked (no `STRICT_DEVMEM`, no
+integrity lockdown). The supported set spans three tiers: **Tier 1**
+(Skylake / Kaby Lake / Coffee Lake / Comet Lake) and **Tier 2** (Rocket
+Lake) decode the two-channel register set from the 64 KiB window — Rocket
+Lake additionally decodes the Gear Mode (Gear2) and the controller clock
+from the `MC_BIOS_REQ` word; **Tier 3** (Alder / Raptor / Meteor / Arrow
+Lake) decodes from the 256 KiB window — two subchannels on a DDR4 box,
+four on a DDR5 one (the `MAD_DIMM_CH2` / `CH3` geometry shows the extra
+subchannels populated), each subchannel reading its timing registers from
+the legacy mirror block with a fallback into the native MCL clock blocks
+(MC0 @ `0xD000`, MC1 @ `0xD800`), and the Meteor / Arrow Lake
+tile-routing guard degrading a fully degenerate window to an honest
+`N/A` instead of decoding it.
 
 The optional **`ramsleuth_intel`** DKMS module is the **preferred** source:
-it maps the same MCHBAR window in-kernel and publishes the raw registers as
+it maps the same MCHBAR window in-kernel (64 KiB; 256 KiB for the Tier-3
+host-bridge device IDs it recognizes) and publishes the raw registers as
 world-readable sysfs attributes under `/sys/kernel/ramsleuth_intel/`
-(24 read-only attributes — see `kernel/ramsleuth-intel/README.md`). The
+(25 read-only attributes — see `kernel/ramsleuth-intel/README.md`),
+including the host-bridge `capid0a` attribute (config offset `0xE4`, raw
+`0x%08x`) — the input for the ECC-capability decode (Section 8.6). The
 daemon uses it whenever it is loaded (the sysfs path needs no `/dev/mem` at
 all) and falls back to `/dev/mem` **only** when the module is absent —
 never the other way round: with the module loaded, a `/dev/mem` fault is
 reported as a real fault instead of being masked by a silent source
 switch. The module's `mad_inter_channel` register is what feeds the
 header's hardware channel-mode label (see
-[Section 8.6](#86-channel-mode--the-ram-summary)); with it loaded, an Intel
-box reports its true `Single-` / `Dual-Channel (…)` mode and the `Mode:`
-slot (`Interleaved` / `Flex`), not just the SPD-visible DIMM count.
+[Section 8.6](#86-channel-mode--the-ram-summary)), cross-checked against
+the `mad_dimm_ch0` / `mad_dimm_ch1` DIMM-population registers (a
+firmware-`00b` reading demotes to `Single-Channel` when only one channel
+is populated); with it loaded, an Intel box reports its true
+`Single-` / `Dual-Channel (…)` mode and the `Mode:` slot
+(`Interleaved` / `Flex`), not just the SPD-visible DIMM count.
 
 Three ways to get it (all build the **same in-repo** source,
 `kernel/ramsleuth-intel/` — the project's own original creation, shipped
@@ -1268,7 +1400,8 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   source (Section 10.5). The two honest `N/A (unsupported hardware)` cases
   that remain (Section 9): **virtualized** Intel, where the MCHBAR window is
   unpopulated (there is no physical memory controller in the VM), and
-  **non-Tier-1 generations** (v1 decodes Skylake through Comet Lake only).
+  **generations outside the Tier 1 – 3 profile set** (the unprofiled
+  generations — e.g. Ice Lake / Tiger Lake).
 - **Intel voltages & CAD** are `N/A (not applicable)` by design — the
   MCHBAR window does not expose them the way the AMD SMU does.
 - **SPD sees only bound modules**: if the OS total exceeds the SPD-visible
@@ -1299,6 +1432,20 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   restarts (a documented follow-up); the daemon socket, poll interval, and
   units reset to defaults on each launch (the `--socket` flag is the
   persistent override).
+
+### 11.6 Reporting a bug — the probe report
+
+If a field looks wrong, a section degrades in a way this guide does not
+explain, or you are on an unusual board, the **probe report** is the
+canonical bug-reporting artifact: it packages the system identity (CPU
+brand / generation / PCI host-bridge ID, kernel / OS / arch, version,
+telemetry source), the decoded readout, the raw register dump, and every
+`N/A` reason into one document — and it is consent-gated (you approve
+exactly what is collected; no username, hostname, IP, MAC, serial numbers,
+or file paths). Generate it from the GUI's **Probe** button (Section 4.6)
+or the TUI's **`[F]`** key (Section 5.1): the GUI's *Open GitHub Issue*
+pre-fills the issue title (the report rides the clipboard), and the TUI's
+`[w]` writes `~/.ramsleuth/probe-report.md`.
 
 ---
 
