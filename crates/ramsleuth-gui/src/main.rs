@@ -18,8 +18,9 @@
 //!   `Intel` / `Unknown` pill — and the compact daemon status: a
 //!   colored dot, `Daemon OK` connected / `Daemon` disconnected,
 //!   the live settings socket on the hover tooltip — C6-30) plus a
-//!   right-anchored button cluster (the `Probe`, `Setup`,
-//!   `Settings`, and `Graphs` toggles — the latter C7-21, D-3);
+//!   right-anchored button cluster (the `About`, `Probe`,
+//!   `Setup`, `Settings`, and `Graphs` toggles — the `About`
+//!   modal chunk gui-about; the latter C7-21, D-3);
 //!   line 2 the CPU and platform identity; line 3 the RAM summary,
 //!   channel, and sync mode — plus a transient export notice (the
 //!   `[F2] snapshot · [F3] export · [Q] quit` key legend lives in
@@ -509,14 +510,73 @@ const PROBE_CONSENT_BODY: &str = "RamSleuth can gather the following system info
 /// [`probe_issue_url`]).
 const PROBE_ISSUE_COPY_NOTICE: &str = "Report copied to clipboard — paste it into the issue body.";
 
+/// The About/Help modal's body (chunk gui-about): the user-facing
+/// explanation of what RamSleuth is, how the daemon model works,
+/// what the app can do, the Intel/AMD split, and where the full
+/// guide lives. Pure (the only non-static piece is the package
+/// version, tracked live via `env!`): the render maps each
+/// `(heading, body)` pair to a styled heading + wrapped text, and
+/// the (a1) test pins the content surface.
+fn about_body() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "What RamSleuth is",
+            "Live RAM telemetry + an AIDA64-style memory benchmark \
+             for AMD and Intel desktops. Watch your memory in real \
+             time — clocks, timings, voltages, channel mode, ECC — \
+             and measure how fast your memory subsystem really is.".to_owned(),
+        ),
+        (
+            "How it works",
+            "A small daemon runs as root with only the CAP_SYS_RAWIO \
+             capability. It reads the hardware sources — the AMD SMU \
+             PM tables, the Intel MCHBAR IMC registers, and the SPD \
+             EEPROMs on each DIMM — and serves them to this GUI over \
+             a local Unix socket. This GUI is unprivileged: it only \
+             talks to the daemon.".to_owned(),
+        ),
+        (
+            "What it can do",
+            "\u{2022} Live telemetry: clocks, timings, voltages, the \
+             AMD UCLK / MCLK mode\n\
+             \u{2022} SPD module details: part, serial, rank, speed, \
+             XMP / EXPO profiles\n\
+             \u{2022} Channel mode + ECC status (both platforms)\n\
+             \u{2022} AIDA64-style memory benchmark: read / write / \
+             copy / latency\n\
+             \u{2022} Benchmark burn-in for stress testing\n\
+             \u{2022} Probe report: a consent-gated snapshot for bug \
+             reports (the header's Probe button)".to_owned(),
+        ),
+        (
+            "Intel vs AMD",
+            "Intel: per-channel IMC subtimings decoded from the \
+             MCHBAR registers (Tier 1–3, Skylake → Arrow \
+             Lake).\nAMD: SMU PM clocks, voltages, and the UCLK / MCLK \
+             CAD bus mode via the ryzen-smu driver.".to_owned(),
+        ),
+        (
+            "This build",
+            format!(
+                "RamSleuth v{} — full guide: Docs/User_Guide.md \
+                 (or the README).",
+                env!("CARGO_PKG_VERSION")
+            ),
+        ),
+    ]
+}
+
 /// The header's per-frame action (the header buttons that need
 /// app-level dispatch): `None` when nothing was clicked this frame,
 /// `Probe` when the "Probe" button was clicked (chunk probe-3 — the
-/// app shell opens the consent flow).
+/// app shell opens the consent flow), `About` when the "About"
+/// button was clicked (chunk gui-about — the app shell opens the
+/// About/Help modal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeaderAction {
     None,
     Probe,
+    About,
 }
 
 /// The consent-gated "Submit Probe Report" flow state (chunk probe-3):
@@ -724,6 +784,12 @@ struct RamSleuthApp {
     /// v<version>` — set alongside the `Preview` transition, used to
     /// build the `issues/new` URL.
     probe_title: Option<String>,
+    /// Whether the About/Help modal (chunk gui-about) is open: the
+    /// header's `About` button opens it (a render-thread write — no
+    /// I/O, D6); the dialog's [Close] + the modal's Esc dismiss
+    /// close it — every closing path returns to the dashboard (a
+    /// plain bool, no terminal state).
+    about_open: bool,
 }
 
 impl Drop for RamSleuthApp {
@@ -789,7 +855,7 @@ impl eframe::App for RamSleuthApp {
         // consumes the pointer over the rest of the UI.
         let probe_open =
             matches!(self.probe_state, ProbeState::Consent | ProbeState::Preview(_));
-        let modal_open = prompt_open || probe_open;
+        let modal_open = prompt_open || probe_open || self.about_open;
         // The keyboard (C6-30, the spec's key legend): a fresh
         // key-down — egui marks OS key-repeats `repeat: true`, so a
         // held key fires exactly once, the button's click semantics —
@@ -873,6 +939,12 @@ impl eframe::App for RamSleuthApp {
             if header_action == HeaderAction::Probe {
                 self.probe_state.apply(ProbeEvent::Open);
             }
+            // The header's "About" button (chunk gui-about): open
+            // the About/Help modal (a plain flag — no state machine;
+            // the modal block covers the header while it is open).
+            if header_action == HeaderAction::About {
+                self.about_open = true;
+            }
             self.handle_action(ctx, button_action);
             if let Some(keyed_action) = keyed_action {
                 if keyed_action != button_action {
@@ -881,16 +953,17 @@ impl eframe::App for RamSleuthApp {
             }
         }
 
-        // The probe-flow modal's Esc dismiss (the TUI's close
-        // contract): a fresh, non-repeated Esc key-down while the
-        // probe dialog is open closes it (Consent / Preview → Idle —
-        // every closing path resets the flow, the Probe button is
-        // re-openable). The modal blocks the key legend above; the
-        // probe modal is topmost (it renders last), so it takes the
-        // Esc over the setup prompt.
-        if probe_open
-            && ctx.input(|i| {
-                i.events.iter().any(|event| {
+        // The modals' Esc dismiss (the TUI's close contract): a
+        // fresh, non-repeated Esc key-down closes the topmost open
+        // dialog — the probe modal renders last (topmost), so it
+        // takes the Esc over the setup prompt + the About modal;
+        // with no probe dialog open, the About modal's Esc returns
+        // to the dashboard. Every closing path resets (the buttons
+        // are re-openable); the modals block the key legend above.
+        let esc_down = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|event| {
                     matches!(
                         event,
                         egui::Event::Key {
@@ -901,9 +974,11 @@ impl eframe::App for RamSleuthApp {
                         }
                     )
                 })
-            })
-        {
+        });
+        if probe_open && esc_down {
             self.handle_probe_esc();
+        } else if self.about_open && esc_down {
+            self.about_open = false;
         }
 
         // The Graphs window's telemetry lifecycle (C9-02, D-2): the
@@ -922,11 +997,17 @@ impl eframe::App for RamSleuthApp {
             show_graphs_viewport(ctx, &self.state, &self.graphs_open, &self.icon);
         }
 
-        // The C21-36 modal prompt: allocated last (topmost) so its
-        // full-screen layer covers the header, the strips, and the
-        // central panel.
+        // The C21-36 modal prompt: allocated first of the modals so
+        // its full-screen layer covers the header, the strips, and
+        // the central panel.
         if prompt_open {
             self.render_setup_complete_dialog(ctx);
+        }
+        // The About/Help modal (chunk gui-about): allocated after
+        // the setup prompt, before the probe modal (the probe modal
+        // renders last — topmost — and takes the Esc over it).
+        if self.about_open {
+            self.render_about_dialog(ctx);
         }
         // The probe-flow modal (chunk probe-3): allocated after the
         // setup prompt (topmost) — the consent dialog, then the
@@ -1288,8 +1369,9 @@ impl RamSleuthApp {
     /// the compact daemon-status dot + `Daemon OK` / `Daemon`
     /// label, the live settings socket on the label's hover
     /// tooltip — C6-30) and a right-anchored button cluster (the
-    /// `Probe`, `Setup`, `Settings`, and `Graphs` toggles — the
-    /// latter C7-21, D-3; the `Setup` toggle C18, D-18.5); line 2
+    /// `About`, `Probe`, `Setup`, `Settings`, and `Graphs`
+    /// toggles — the `About` modal chunk gui-about; the latter
+    /// C7-21, D-3; the `Setup` toggle C18, D-18.5); line 2
     /// the CPU + platform identity; line 3 the RAM summary
     /// (capacity / breakdown / speed / channel / ECC) and sync mode
     /// (the capacity + clock segments render in the live `units`
@@ -1339,9 +1421,11 @@ impl RamSleuthApp {
             .map(|t| platform_badge(&t.cpu.vendor))
             .unwrap_or("Unknown");
         let (dot, daemon_label) = daemon_status_indicator(data);
-        // The "Probe" button's click edge (chunk probe-3): captured in
-        // the closure, reported as the function's return value.
+        // The "Probe" (chunk probe-3) and "About" (chunk gui-about)
+        // buttons' click edges: captured in the closure, reported as
+        // the function's return value.
         let mut probe_clicked = false;
+        let mut about_clicked = false;
         egui::TopBottomPanel::top("ramsleuth_header")
             .frame(
                 egui::Frame::default()
@@ -1431,6 +1515,18 @@ impl RamSleuthApp {
                         {
                             probe_clicked = true;
                         }
+                        ui.add_space(8.0);
+                        // The About button (chunk gui-about): the
+                        // leftmost of the right-anchored cluster —
+                        // a click sets the captured edge (reported
+                        // as `HeaderAction::About`; the app shell
+                        // opens the About/Help modal).
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("About")))
+                            .clicked()
+                        {
+                            about_clicked = true;
+                        }
                     });
                 });
                 // Line 2: the CPU + platform identity.
@@ -1455,6 +1551,8 @@ impl RamSleuthApp {
             });
         if probe_clicked {
             HeaderAction::Probe
+        } else if about_clicked {
+            HeaderAction::About
         } else {
             HeaderAction::None
         }
@@ -2138,6 +2236,80 @@ impl RamSleuthApp {
                 );
             });
     }
+
+    /// The About/Help modal (chunk gui-about): the same modal
+    /// pattern as the probe consent dialog — two topmost
+    /// (`Order::Foreground`) areas, the dimmed full-screen block
+    /// (allocated first, consumes every pointer event over the
+    /// dashboard) + the centered "About RamSleuth" box (allocated
+    /// after — its button beats the block). The body is the
+    /// [`about_body`] sections (what the app is, the daemon model,
+    /// the capabilities, the Intel/AMD split, the version, the
+    /// full-guide pointer) in a bounded scroll area (the probe
+    /// preview dialog's sizing convention); [Close] / Esc return
+    /// to the dashboard.
+    fn render_about_dialog(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("ramsleuth_about_block"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.set_max_size(screen.size());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
+                let _ = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+            });
+        egui::Area::new(egui::Id::new("ramsleuth_about"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.set_max_size(screen.size());
+                ui.with_layout(
+                    egui::Layout::from_main_dir_and_cross_align(
+                        egui::Direction::TopDown,
+                        egui::Align::Center,
+                    ),
+                    |ui| {
+                        let frame = egui::Frame::default()
+                            .fill(SLATE)
+                            .stroke(egui::Stroke::new(1.0_f32, CYAN))
+                            .inner_margin(egui::Margin::symmetric(12.0, 10.0));
+                        frame.show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("About RamSleuth")
+                                    .strong()
+                                    .color(CYAN),
+                            );
+                            ui.add_space(4.0);
+                            // The body: the section headings + the
+                            // wrapped text in a bounded scroll
+                            // area (the probe preview dialog's
+                            // sizing convention).
+                            let max_size = egui::vec2(
+                                (screen.size().x - 60.0).max(360.0),
+                                (screen.size().y * 0.65).max(240.0),
+                            );
+                            egui::ScrollArea::vertical()
+                                .max_width(max_size.x)
+                                .max_height(max_size.y)
+                                .show(ui, |ui| {
+                                    for (heading, body) in about_body() {
+                                        ui.label(egui::RichText::new(heading).strong());
+                                        ui.add(egui::Label::new(body).wrap(true));
+                                        ui.add_space(6.0);
+                                    }
+                                });
+                            ui.add_space(8.0);
+                            // Secondary (the `Got it` precedent):
+                            // plain — return to the dashboard.
+                            if ui.add(egui::Button::new("Close")).clicked() {
+                                self.about_open = false;
+                            }
+                        });
+                    },
+                );
+            });
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -2560,6 +2732,7 @@ fn main() -> ExitCode {
                 restart_prompt_dismissed: false,
                 probe_state: ProbeState::default(),
                 probe_title: None,
+                about_open: false,
             })
         }),
     );
@@ -4088,6 +4261,7 @@ mod tests {
                 restart_prompt_dismissed: false,
                 probe_state: ProbeState::default(),
                 probe_title: None,
+                about_open: false,
             };
             let gate = |app: &RamSleuthApp| app.state.read().unwrap().settings.refresh_enabled;
 
@@ -4160,6 +4334,7 @@ mod tests {
                 restart_prompt_dismissed: false,
                 probe_state: ProbeState::default(),
                 probe_title: None,
+                about_open: false,
             };
             let data = TelemetryData::default();
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(w, h));
@@ -4454,6 +4629,7 @@ mod tests {
             restart_prompt_dismissed: false,
             probe_state: ProbeState::default(),
             probe_title: None,
+            about_open: false,
         };
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(968.0, 600.0));
@@ -4607,6 +4783,7 @@ mod tests {
             restart_prompt_dismissed: false,
             probe_state: ProbeState::default(),
             probe_title: None,
+            about_open: false,
         }
     }
 
@@ -5193,5 +5370,219 @@ mod tests {
         );
 
         fs::remove_dir_all(out_dir).expect("cleanup");
+    }
+
+    // -----------------------------------------------------------------
+    // The About/Help modal (chunk gui-about).
+    // -----------------------------------------------------------------
+
+    /// (a1) The About body: the version line carries the live
+    /// `CARGO_PKG_VERSION`; the daemon model, the capabilities, the
+    /// Intel/AMD split, and the full-guide pointer are all present.
+    #[test]
+    fn about_body_carries_the_version_and_capabilities() {
+        let sections = about_body();
+        let bodies: Vec<&str> =
+            sections.iter().map(|(_, body)| body.as_str()).collect();
+        let full = bodies.join("\n");
+        assert!(
+            full.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            "the version line must carry the package version: {full}"
+        );
+        for needle in [
+            "CAP_SYS_RAWIO",
+            "AIDA64-style memory benchmark",
+            "XMP / EXPO",
+            "ECC",
+            "burn-in",
+            "Probe report",
+            "MCHBAR",
+            "UCLK / MCLK",
+            "Docs/User_Guide.md",
+        ] {
+            assert!(
+                full.contains(needle),
+                "the body must mention {needle:?}: {full}"
+            );
+        }
+    }
+
+    /// (a2) The About modal renders headless — the title, the
+    /// version line, the daemon-model line, and the [Close] button
+    /// paint — and a two-frame press / release on [Close] dismisses
+    /// it (the graph.rs text-click idiom; the app's gate, verbatim
+    /// from `update`, is `about_open`).
+    #[test]
+    fn about_dialog_paints_and_close_dismisses_headless() {
+        let mut app = probe_test_app("about-dialog");
+        app.about_open = true;
+        let out_dir = app.out_dir.clone();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(968.0, 600.0));
+        let frame_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let frame = |events: Vec<egui::Event>, app: &mut RamSleuthApp| {
+            ctx.run(frame_input(events), |ctx| {
+                // The app's per-frame gate, verbatim from `update`:
+                // the dialog renders only while `about_open`.
+                if app.about_open {
+                    app.render_about_dialog(ctx);
+                }
+            })
+        };
+
+        // Frame 1: the two areas are new — hidden for exactly one
+        // frame (the first-frame placement heuristic).
+        frame(Vec::new(), &mut app);
+        // Frame 2 (no events): the modal paints (the title, the
+        // body, the button).
+        let first = frame(Vec::new(), &mut app);
+        let texts: Vec<&str> = first
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&"About RamSleuth"),
+            "the title must paint: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+            "the version line must paint: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("CAP_SYS_RAWIO")),
+            "the daemon-model line must paint: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Close"),
+            "the Close button must paint: {texts:?}"
+        );
+        assert!(app.about_open, "no click must not dismiss");
+
+        // The [Close] label's center (the graph.rs text-click idiom).
+        let close = first
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Close" => {
+                    Some(egui::pos2(
+                        text.pos.x + text.galley.size().x / 2.0,
+                        text.pos.y + text.galley.size().y / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .expect("the Close button's label must be painted");
+
+        // Frames 3 + 4: press, then release, on [Close] → the
+        // dialog closes.
+        let click = |pressed: bool| egui::Event::PointerButton {
+            pos: close,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![click(true)], &mut app);
+        frame(vec![click(false)], &mut app);
+        assert!(
+            !app.about_open,
+            "a press + release on Close must dismiss the modal"
+        );
+
+        // Frame 5 (the gate): a dismissed modal repaints no dialog.
+        let last = frame(Vec::new(), &mut app);
+        let texts: Vec<&str> = last
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !texts.contains(&"About RamSleuth"),
+            "a dismissed modal must not repaint the dialog: {texts:?}"
+        );
+
+        fs::remove_dir_all(out_dir).expect("cleanup");
+    }
+
+    /// (a3) The header's About button: the full header renders
+    /// headless, and a two-frame press / release on the "About"
+    /// label reports the `HeaderAction::About` edge (the app shell
+    /// opens the modal); a no-click frame reports `None` (the
+    /// graph.rs click idiom).
+    #[test]
+    fn render_header_about_button_reports_the_click_edge() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(968.0, 600.0));
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut settings_open = false;
+        let mut requirements_open = false;
+        let mut render = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            ctx.begin_frame(input);
+            let action = RamSleuthApp::render_header(
+                &ctx,
+                &TelemetryData::default(),
+                &mut settings_open,
+                &mut requirements_open,
+                &flag,
+                &None,
+            );
+            let out = ctx.end_frame();
+            (action, out)
+        };
+
+        // Frame 1 (no click): the header renders the About button
+        // and reports no edge.
+        let (action, out) = render(Vec::new());
+        assert_eq!(
+            action,
+            HeaderAction::None,
+            "a no-click frame must report no edge"
+        );
+        let about = out
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "About" => {
+                    Some(egui::pos2(
+                        text.pos.x + text.galley.size().x / 2.0,
+                        text.pos.y + text.galley.size().y / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .expect("the About button's label must be painted");
+
+        // Frames 2 + 3: press, then release, on "About" → the click
+        // edge is reported.
+        let click = |pressed: bool| egui::Event::PointerButton {
+            pos: about,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(vec![click(true)]);
+        let (action, _) = render(vec![click(false)]);
+        assert_eq!(
+            action,
+            HeaderAction::About,
+            "a press + release on About must report the click edge"
+        );
     }
 }
