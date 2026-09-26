@@ -320,10 +320,15 @@ else
   sed -i "s/@VERSION@/${PKGVER}/g; s/@CFLGS@//g" "${STAGE_DIR}/dkms.conf"
 fi
 log "Staged ${MODULE} source to ${STAGE_DIR} (version ${PKGVER})"
-# depmod conf so the out-of-tree /extra module resolves cleanly (idempotent overwrite).
-install -d /usr/lib/depmod.d
-printf '%s\n' '# RamSleuth P5-11: resolve the out-of-tree ryzen_smu module from /extra.' \
-  "override ${MODULE} /extra/${MODULE}.ko" > "/usr/lib/depmod.d/${MODULE}.conf"
+# No /usr/lib/depmod.d override is written: on DKMS 3.x the built module
+# deploys to /usr/lib/modules/<kernel>/updates/dkms/ (DEST_MODULE_LOCATION
+# "/extra" is a no-op there) and depmod resolves it from updates/dkms/ — the
+# older helper's `override <mod> /extra/<mod>.ko` line was invalid syntax
+# depmod rejected AND pointless. A stale one is removed (self-heal).
+if [[ -f "/usr/lib/depmod.d/${MODULE}.conf" ]]; then
+  rm -f "/usr/lib/depmod.d/${MODULE}.conf"
+  log "removed the stale /usr/lib/depmod.d/${MODULE}.conf (invalid 'override' line from an older helper; the module resolves via updates/dkms/)"
+fi
 # Userspace CLI (bonus, ground truth): build monitor_cpu; non-fatal if absent — the module install is the priority.
 if [[ -d "${SRC_DIR}/userspace" ]] && make -C "${SRC_DIR}/userspace" && [[ -f "${SRC_DIR}/userspace/monitor_cpu" ]]; then
   install -Dm 700 "${SRC_DIR}/userspace/monitor_cpu" /usr/bin/monitor_cpu \
@@ -395,10 +400,14 @@ fi
 # add — `dkms add <module>/<version>` FAILS if the module/version is already
 # registered (the state a prior partial/failed run, an older module version,
 # or a previous kernel leaves behind), and a stale registration can carry a
-# broken build. `dkms status`-driven: each registered version of THIS module
-# only is removed with `--all` (all kernels) + `--no-depmod`, then re-added
-# below from the freshly staged source. First runs (nothing registered) are
-# an untouched no-op; foreign modules are never touched.
+# broken build. `dkms status`-driven: each registered <module>/<version> of
+# THIS module (parsed from the status line's first field — the form dkms
+# 3.4.3's `remove` requires; a bare <module> is rejected with "Arguments
+# <module> and <module-version> are not specified") is removed with --all
+# (all kernels — the installed dkms 3.4.3 CLI takes --all, not the man
+# page's --all-kernels) + --no-depmod, then re-added below from the freshly
+# staged source. First runs (nothing registered) are an untouched no-op;
+# foreign modules are never touched.
 DKMS_STATUS="$(dkms status 2>/dev/null || true)"
 if grep -qE "^${MODULE}/" <<<"${DKMS_STATUS}"; then
   while IFS= read -r entry; do
@@ -426,7 +435,12 @@ fi
 if dkms status | grep -qE "^${MODULE}/${PKGVER},[[:space:]]*${KERNEL},[[:space:]]*[^:]*:[[:space:]]*installed[[:space:]]*$"; then
   log "${MODULE}/${PKGVER} already installed for ${KERNEL} — skipping dkms install"
 else
-  dkms install "${MODULE}/${PKGVER}" -k "${KERNEL}" \
+  # --force: DKMS 3.4.3's identical-module check ABORTS when a residual .ko of
+  # this module is already in the kernel tree (e.g. the DKMS DB was wiped but
+  # the physical file survived) — "already installed at version <X> … override
+  # by specifying --force". --force overwrites the residual; on a clean first
+  # run there is no residual, so --force is a no-op (no regression).
+  dkms install "${MODULE}/${PKGVER}" -k "${KERNEL}" --force \
     || die "dkms install ${MODULE}/${PKGVER} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect"
 fi
 

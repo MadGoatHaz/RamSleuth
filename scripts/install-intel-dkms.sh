@@ -53,8 +53,8 @@
 # --dry-run: performs ONLY the read-only prep (source resolution, version,
 # kernel-build-tree check, Secure Boot detection, host-bridge vendor
 # detection) and previews the privileged commands; it stops BEFORE any
-# privileged op (no sudo, no dkms, no modprobe, no /usr/src, /usr/lib/depmod.d,
-# or /etc/modules-load.d writes) and exits 0. A non-Intel host is predicted
+# privileged op (no sudo, no dkms, no modprobe; no /usr/src or
+# /etc/modules-load.d writes) and exits 0. A non-Intel host is predicted
 # from the vendor at dry-run time; the Secure Boot state is previewed too.
 
 set -euo pipefail
@@ -63,7 +63,7 @@ set -euo pipefail
 KERNEL="$(uname -r)"
 MODULE="ramsleuth_intel"            # dkms package name + built module (underscore)
 DEFAULT_VERSION="2.2.1"            # ramsleuth workspace version (fallback only)
-EXPECTED_ATTRS=19                  # frozen sysfs interface (README "Frozen sysfs interface")
+EXPECTED_ATTRS=25                  # frozen sysfs interface (README "Frozen sysfs interface")
 KOBJ="/sys/kernel/${MODULE}"        # kobject path (never created on a non-Intel host)
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"           # <repo> (or /usr when installed)
 INSTALLED_SRC="/usr/share/ramsleuth-intel-dkms/src"
@@ -257,7 +257,7 @@ fi
 
 # --- Dry-run: read-only preview, stops BEFORE any privileged op ----------------
 if [[ "${DRY_RUN}" -eq 1 ]]; then
-  log "DRY-RUN: no privileged operations will be performed (no sudo/dkms/modprobe; no writes to /usr/src, /usr/lib/depmod.d, or /etc/modules-load.d)"
+  log "DRY-RUN: no privileged operations will be performed (no sudo/dkms/modprobe; no /usr/src or /etc/modules-load.d writes; a stale /usr/lib/depmod.d/ entry from an older helper would be removed)"
   SRC_DIR="$(resolve_src)" \
     || die "no Intel module source found (expected ${REPO_ROOT}/kernel/ramsleuth-intel or ${INSTALLED_SRC})"
   VERSION="$(resolve_version)"
@@ -287,7 +287,7 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   log "  dkms remove <each registered ${MODULE}/<version>> --all --no-depmod   (self-heal: clear stale registrations; a no-op on a first run)"
   log "  dkms add ${MODULE}/${VERSION}"
   log "  dkms build ${MODULE}/${VERSION} -k ${KERNEL}"
-  log "  dkms install ${MODULE}/${VERSION} -k ${KERNEL}"
+  log "  dkms install ${MODULE}/${VERSION} -k ${KERNEL} --force"
   log "  rmmod ${MODULE}   (safe no-op if the module is not loaded)"
   log "  modprobe ${MODULE}"
   log "  echo ${MODULE} > /etc/modules-load.d/${MODULE}.conf   (only on a successful Intel load)"
@@ -334,12 +334,16 @@ for f in "${STAGE_FILES[@]}"; do
   fi
 done
 
-# --- Step 3: stage source into /usr/src/<module>-<version> + depmod override ----
+# --- Step 3: stage source into /usr/src/<module>-<version> ---------------------
 # DKMS only discovers a module whose source is staged in
 # /usr/src/<module>-<version>/ containing a dkms.conf. The in-repo dkms.conf
 # carries PACKAGE_VERSION="@VERSION@"; we sed it to the ramsleuth workspace
-# version (the documented contract in dkms.conf). DEST_MODULE_LOCATION stays
-# "/extra", so the depmod override below resolves it from /extra.
+# version (the documented contract in dkms.conf). On DKMS 3.x the built module
+# deploys to /usr/lib/modules/<kernel>/updates/dkms/ (DEST_MODULE_LOCATION
+# "/extra" is a no-op there) and depmod resolves it from updates/dkms/ — so NO
+# /usr/lib/depmod.d override is written (the older helper's
+# `override <mod> /extra/<mod>.ko` line was invalid syntax depmod rejected AND
+# pointless); a stale one is removed below (self-heal).
 STAGE_DIR="/usr/src/${MODULE}-${VERSION}"
 install -d "${STAGE_DIR}"
 for f in "${STAGE_FILES[@]}"; do
@@ -349,10 +353,12 @@ done
 [[ -f "${STAGE_DIR}/dkms.conf" ]] || die "staging produced no dkms.conf in ${STAGE_DIR} — inspect the source at ${SRC_DIR}"
 sed -i "s/@VERSION@/${VERSION}/g" "${STAGE_DIR}/dkms.conf"
 log "Staged ${MODULE} source to ${STAGE_DIR} (version ${VERSION})"
-# depmod conf so the out-of-tree /extra module resolves cleanly (idempotent overwrite).
-install -d /usr/lib/depmod.d
-printf '%s\n' '# RamSleuth INTEL-06: resolve the out-of-tree ramsleuth_intel module from /extra.' \
-  "override ${MODULE} /extra/${MODULE}.ko" > "/usr/lib/depmod.d/${MODULE}.conf"
+# Self-heal: remove the stale /usr/lib/depmod.d entry an older helper wrote
+# (depmod rejected its `override` line; the module resolves via updates/dkms/).
+if [[ -f "/usr/lib/depmod.d/${MODULE}.conf" ]]; then
+  rm -f "/usr/lib/depmod.d/${MODULE}.conf"
+  log "removed the stale /usr/lib/depmod.d/${MODULE}.conf (invalid 'override' line from an older helper; the module resolves via updates/dkms/)"
+fi
 
 # --- Verify-pause: confirm the source before the first system mutation ---------
 # The provenance above (the source path + its checksums, the staged copy
@@ -421,10 +427,14 @@ status_installed()  { grep -qE "^${MODULE}/${VERSION},[[:space:]]*${KERNEL}.*:[[
 # version, or a previous kernel can leave registered builds behind, `dkms add`
 # fails on an already-registered module/version, and a stale registration can
 # carry a broken build (a `dkms build` on it would be a no-op on the
-# freshly-staged source). Each is removed with `--all` (all kernels) +
-# `--no-depmod`, then re-added below from the freshly staged source. First
-# runs (nothing registered) are an untouched no-op; foreign modules are never
-# touched.
+# freshly-staged source). Each registered <module>/<version> (parsed from the
+# `dkms status` line's first field — the form dkms 3.4.3's `remove` requires;
+# a bare <module> is rejected with "Arguments <module> and <module-version>
+# are not specified") is removed with --all (all kernels — the installed dkms
+# 3.4.3 CLI takes --all, not the man page's --all-kernels; verified on the
+# Intel test box) + --no-depmod, then re-added below from the freshly staged
+# source. First runs (nothing registered) are an untouched no-op; foreign
+# modules are never touched.
 if grep -qE "^${MODULE}/" <<<"${DKMS_STATUS}"; then
   while IFS= read -r entry; do
     [[ -n "${entry}" ]] || continue
@@ -453,7 +463,12 @@ DKMS_STATUS="$(dkms status 2>/dev/null || true)"     # refresh after the build
 if status_installed; then
   log "${MODULE}/${VERSION} already installed for ${KERNEL} — skipping dkms install"
 else
-  dkms install "${MODULE}/${VERSION}" -k "${KERNEL}" \
+  # --force: DKMS 3.4.3's identical-module check ABORTS when a residual .ko of
+  # this module is already in the kernel tree (e.g. the DKMS DB was wiped but
+  # the physical file survived) — "already installed at version <X> … override
+  # by specifying --force". --force overwrites the residual; on a clean first
+  # run there is no residual, so --force is a no-op (no regression).
+  dkms install "${MODULE}/${VERSION}" -k "${KERNEL}" --force \
     || die "dkms install ${MODULE}/${VERSION} -k ${KERNEL} failed — run 'dmesg | tail' / 'dkms status' to inspect"
 fi
 

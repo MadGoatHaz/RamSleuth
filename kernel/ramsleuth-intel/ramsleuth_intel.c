@@ -352,5 +352,5 @@ module_exit(ramsleuth_intel_exit);
 
 MODULE_AUTHOR("RamSleuth project (MadGoatHaz)");
 MODULE_DESCRIPTION("Raw Intel IMC register reader for RamSleuth (sysfs, no decoding)");
-MODULE_VERSION("1.0.0");
+MODULE_VERSION("2.4.8"); /* should track the RamSleuth release version — bump with the workspace version at each release */
 MODULE_LICENSE("GPL");
