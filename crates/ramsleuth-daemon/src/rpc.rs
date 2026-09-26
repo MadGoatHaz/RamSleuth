@@ -1369,7 +1369,7 @@ mod tests {
             kernel: "6.6.0-1-cachyos".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
-            ramsleuth_version: "2.4.2".to_owned(),
+            ramsleuth_version: "2.4.5".to_owned(),
         }
     }
 
@@ -1436,7 +1436,7 @@ mod tests {
         assert_eq!(report.system.kernel, "6.6.0-1-cachyos");
         assert_eq!(report.system.os, "linux");
         assert_eq!(report.system.arch, "x86_64");
-        assert_eq!(report.system.ramsleuth_version, "2.4.2");
+        assert_eq!(report.system.ramsleuth_version, "2.4.5");
         assert_eq!(report.system.telemetry_source, "sysfs-module");
     }
 

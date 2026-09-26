@@ -4,6 +4,20 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project.
 
+## [2.4.5] - 2026-09-25
+
+### Added
+- ECC detection on **both** platforms: AMD via `UmcCapHi` (bit 30/31) and Intel via `CAPID0_A` (a new `capid0a` sysfs attribute — the 25th — decoded from bit 17)
+- AMD channel-mode detection from the SMN CS-population readout (Single / Dual-Channel (Symmetric) / Dual-Channel (Flex))
+- a 25-attribute `ramsleuth_intel` kernel module (adds `capid0a`)
+
+### Changed
+- SPD decoder re-baselined to **JESD79-4 Annex L**: correct maker / die-maker JEP106, density, rank, width, serial, XMP 2.0 profiles, and JEDEC base speed
+- XMP 2.0 timing decode (tRCD / tRP / tRAS)
+- Intel channel-mode DIMM-population cross-check: a firmware Dual-Symmetric demotes to Flex on asymmetric population
+- SPD EEPROM auto-bind now falls back to the `ee1004` driver `bind` file (one attempt per process lifetime; the per-collect warning loop is gone)
+- TUI/GUI polish: terminal ghosting fix, panel layout, header rework, probe modal, and the title-only GitHub issue URL
+
 ## [2.4.2] - 2026-09-25
 
 ### Added

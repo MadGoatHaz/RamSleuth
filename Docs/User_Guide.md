@@ -1,6 +1,6 @@
 # RamSleuth — User Guide
 
-**Version:** 2.4.2 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
+**Version:** 2.4.5 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
 
 RamSleuth v2 is a live RAM telemetry suite and an AIDA64-style memory benchmark for
 AMD and Intel desktops. It watches your memory system in real time — clocks, the
@@ -220,12 +220,12 @@ yay -S ramsleuth-intel-dkms  # Intel — the standalone provisioning extra (Sect
 The two **core** packages are deliberately distinct:
 
 - **`ramsleuth` — STABLE source.** Builds the workspace from the official
-  git tag `v$pkgver` (currently `v2.4.2`). A tag is a reproducible,
+  git tag `v$pkgver` (currently `v2.4.5`). A tag is a reproducible,
   auditable snapshot — this is the **default recommendation for production
   installs**. It compiles only the pinned repository (`--locked`), with no
   third-party code in the build.
 - **`ramsleuth-bin` — PRECOMPILED.** Downloads the release binary tarball
-  `ramsleuth-2.4.2-x86_64.tar.zst` from the official GitHub Release (pinned
+  `ramsleuth-2.4.5-x86_64.tar.zst` from the official GitHub Release (pinned
   by its `sha256sums`) and installs it as-is — **no build, no makedepends**.
   This is the **fastest install path**.
 
@@ -270,7 +270,7 @@ can build and install either package directly from the `packaging/`
 directories:
 
 ```sh
-cd packaging/ramsleuth      # STABLE source (builds from the v2.4.2 tag)
+cd packaging/ramsleuth      # STABLE source (builds from the v2.4.5 tag)
 # cd packaging/ramsleuth-bin   # PRECOMPILED (downloads the release tarball)
 makepkg -si
 ```
@@ -466,7 +466,7 @@ shows `Disconnected` with a hint, and the dashboard stays responsive.
 
 ### 4.1 The 3-line header
 
-**Line 1** — the title **`RamSleuth v2.4.2`**, a **platform tag**
+**Line 1** — the title **`RamSleuth v2.4.5`**, a **platform tag**
 (`[AMD AM4 Platform]` for Zen 1–3, `[AMD AM5 Platform]` for Zen 4/5,
 `[Intel LGA Platform]`, or a bare `[Platform]` when the vendor is unknown),
 the **daemon status** (`Daemon: Connected (IPC: /run/ramsleuth/ramsleuth.sock)`
@@ -1371,7 +1371,7 @@ And if the **Intel `ramsleuth_intel` module** was installed, remove it:
 
 ```sh
 sudo rmmod ramsleuth_intel
-sudo dkms remove ramsleuth_intel/2.4.2   # the installed DKMS version (list with: dkms status)
+sudo dkms remove ramsleuth_intel/2.4.5   # the installed DKMS version (list with: dkms status)
 sudo rm /etc/modules-load.d/ramsleuth_intel.conf
 sudo rm -rf /usr/src/ramsleuth_intel-*
 # and, if you had the standalone Intel extra (mutually exclusive with the core packages):
@@ -1386,6 +1386,6 @@ group, no socket, no driver.
 
 ---
 
-*This guide describes RamSleuth v2.4.2. For the technical design, see
+*This guide describes RamSleuth v2.4.5. For the technical design, see
 `Docs/Architecture.md`; for the packaging operator guide, see
 `packaging/README.md`.*

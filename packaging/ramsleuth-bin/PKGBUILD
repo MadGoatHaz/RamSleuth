@@ -31,7 +31,7 @@
 #                                   bare + NxN; top-level; C21-27, lands
 #                                   with the v2.2.0 re-cut; C21-42)
 #   kernel/ramsleuth-intel/       — the in-repo ramsleuth_intel DKMS module
-#                                   source tree (GPL-2.0-only; in the v2.4.2
+#                                   source tree (GPL-2.0-only; in the v2.4.5
 #                                   tarball — no re-cut needed; package()
 #                                   step (12) ships it to
 #                                   /usr/share/ramsleuth-intel-dkms/src/)
@@ -60,7 +60,7 @@
 # daemon starts and serves N/A (DriverMissing) sections with exit 0.
 
 pkgname=ramsleuth-bin
-pkgver=2.4.2   # FIXED — the tarball is downloaded from the GitHub Release for this exact version
+pkgver=2.4.5   # FIXED — the tarball is downloaded from the GitHub Release for this exact version
 pkgrel=1
 pkgdesc="Pure-Rust RAM latency/bandwidth telemetry: privileged daemon + unprivileged CLI/TUI/GUI clients (precompiled binary)"
 arch=(x86_64)
@@ -190,7 +190,7 @@ package() {
     # /usr/share/ramsleuth-intel-dkms/src/ — the exact path the Intel helper
     # (step 11) resolves as its installed copy (no network, no upstream pin:
     # the module lives in this repo, unlike the AMD vendored ryzen_smu).
-    # The v2.4.2 release tarball carries kernel/ramsleuth-intel/ (the 4 files
+    # The v2.4.5 release tarball carries kernel/ramsleuth-intel/ (the 4 files
     # dkms.conf/Makefile/ramsleuth_intel.c/README.md). GUARDED with an existence
     # test: a build against an older tarball without the tree skips it cleanly —
     # the no-panic contract; the per-file guard covers 'Makefile if present'.
