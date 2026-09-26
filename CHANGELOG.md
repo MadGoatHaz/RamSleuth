@@ -4,6 +4,15 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project.
 
+## [2.4.8] - 2026-09-26
+
+### Changed
+- **Idempotent one-click DKMS install over a stale residual module** (both the AMD `ryzen_smu` and Intel `ramsleuth_intel` helpers): a re-run over an already-installed module (a residual `.ko` of the same module left by a prior build, or a wiped DKMS DB) previously aborted on DKMS's identical-module check ("already installed at version … override by specifying --force"); both helpers now pass `dkms install --force`, which overwrites the residual (a no-op on a clean first run) — so a re-click **always** succeeds with no manual cleanup
+- **The broken `/usr/lib/depmod.d/<module>.conf` override is removed** from both helpers — the `override <mod> /extra/<mod>.ko` line is invalid syntax `depmod` rejects and is pointless on dkms 3.4.3 (`DEST_MODULE_LOCATION "/extra"` never materializes; the module deploys to `updates/dkms/` and resolves from there) — plus a **self-heal** that removes a stale entry an older helper left behind
+- **The DKMS self-heal removal now uses the valid `dkms remove <module>/<version> --all --no-depmod` cleanup syntax** (verified against the installed dkms 3.4.3 CLI, which rejects `--all-kernels`), so the helper removes every registered version of the module before re-adding from the freshly staged source
+- **The `ramsleuth_intel` module's `MODULE_VERSION` now tracks releases** (was the constant `1.0.0`; now `2.4.8`) with a track-releases note — the AMD vendored `ryzen_smu` module's `MODULE_VERSION` (`0.1.7`) is left untouched (a SUMS-verified frozen upstream copy; its DKMS version is the git-derived PKGVER, not that constant)
+- **The makepkg 7.x source-integrity pin fix is carried forward**: all three git-source AUR packages (`ramsleuth`, `ramsleuth-intel-dkms`, `ryzen-smu-dkms`) keep the standard VCS `#commit=`-fragment source + content-addressed `sha256sums` (the sha256 of the pinned commit's `git archive` tarball) — the form makepkg 7.x generates (`makepkg -g`) and its integrity gate verifies (a bare `-` fails the gate on 7.x; `SKIP` passes only as a no-op)
+
 ## [2.4.7] - 2026-09-26
 
 ### Added

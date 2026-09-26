@@ -4848,7 +4848,7 @@ mod tests {
                 kernel: "6.6.0-test".to_owned(),
                 os: "Linux / Test".to_owned(),
                 arch: "x86_64".to_owned(),
-                ramsleuth_version: "2.4.7".to_owned(),
+                ramsleuth_version: "2.4.8".to_owned(),
                 telemetry_source: "unavailable".to_owned(),
             },
         }
@@ -5035,20 +5035,20 @@ mod tests {
         let title = probe_issue_title(&report);
         assert_eq!(
             title,
-            "[Probe] Test CPU \u{00b7} Unknown \u{00b7} Linux / Test \u{00b7} v2.4.7"
+            "[Probe] Test CPU \u{00b7} Unknown \u{00b7} Linux / Test \u{00b7} v2.4.8"
         );
         // The title's percent-encoding (the brackets, the spaces, the
         // middot, the slash).
         assert_eq!(
             url_encode(&title),
-            "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.7"
+            "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.8"
         );
         // The URL (the issues/new form, title only — the body must
         // NOT ride the query string: it would exceed GitHub's limit).
         let url = probe_issue_url(&title);
         assert_eq!(
             url,
-            "https://github.com/MadGoatHaz/RamSleuth/issues/new?title=%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.7"
+            "https://github.com/MadGoatHaz/RamSleuth/issues/new?title=%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.8"
         );
         assert!(
             !url.contains("body="),
