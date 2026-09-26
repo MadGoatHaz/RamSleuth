@@ -18,6 +18,6 @@ pkgbase = ramsleuth-bin
 	conflicts = ramsleuth
 	conflicts = ramsleuth-intel-dkms
 	source = https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.5/ramsleuth-2.4.5-x86_64.tar.zst
-	sha256sums = 6e0c5d3b127d87aba47fb63d154e12b3da529acacfa319fe270132e9f8eacd3d
+	sha256sums = 1378a2030e99ac5a76b5e11d7958f3f63d59c788cacdc4f78dd2c6f7cfb367c6
 
 pkgname = ramsleuth-bin
