@@ -61,8 +61,11 @@ The architecture is shaped by four standing goals:
    frontend, the CLI, the standalone tools, and even the benchmark workers
    run unprivileged. A
    compromised frontend cannot escalate: it can only speak RPC to a socket
-   gated by group membership or a per-user ACL, and it can only ask for the
-   daemon's three sanctioned operations (telemetry, benchmark, burn-in).
+    gated by group membership or a per-user ACL, and it can only ask for the
+    daemon's four sanctioned operations (telemetry, benchmark, burn-in, and
+    the consent-gated **probe report** — `GetProbeReport`, §7.2: the full
+    snapshot + the vendor raw-register dump + the system identity, no-PII by
+    construction).
 2. **The no-panic contract.** Missing driver, missing privilege, missing
    hardware, malformed payloads, a wedged daemon, a closed connection — none of
    these ever crashes a RamSleuth process. Structured degradation is the only
@@ -123,13 +126,20 @@ attributes under `/sys/kernel/ramsleuth_intel/` (including the host-bridge
 `CAPID0_A` word — the ECC-decode input) — no C-side decoding; all bit-field
 semantics live in Rust. The **fallback** is a read-only `mmap` of
 the same window via `/dev/mem` (the operation that forces `CAP_SYS_RAWIO`),
-taken only when the module's kobject is absent. The decode (the
-hardware-verified Tier-1 register map) yields the DRAM core clock from
-`MC_BIOS_REQ` plus the per-channel timing set — tCL, tCWL, the unified tRCD,
-tRP, tRAS, the synthesized tRC, tRRD_S/L, tRTP, tFAW, tWR, tRFC, and the four
-turnaround quartets: 24 of the 27 AMD subtiming slots, the ECC capability
-from `CAPID0_A` (bit 17 `ECC_DIS`), and the hardware channel mode; the rest
-of the Intel readout (uclk / fclk / gear / GDM / PDM, the CAD bus, the
+taken only when the module's kobject is absent. The decode **dispatches on
+`intel_gen::profile_for`** ("Tier 1 is one case of the dispatcher", §10.3):
+Tier 1 and Rocket Lake decode the 64 KiB register map (Rocket additionally
+decodes `gear_mode` + `uclk_mhz` from `MC_BIOS_REQ[17:16]`, the Gear2 cap),
+and the Tier-3 Alder family decodes the 256 KiB subchannel set (OQ-11's
+DDR5 condition — both `MAD_DIMM_CH2` / `MAD_DIMM_CH3` present and non-zero
+→ four subchannels, else the 2-channel DDR4 default; each subchannel's
+mirror block falls back to the native MCL `0xD000` / `0xD800` via
+`tier3_mcl_for`, and the Gear4 gear cells layer on) — yielding the DRAM core
+clock from `MC_BIOS_REQ` plus the per-channel timing set — tCL, tCWL, the
+unified tRCD, tRP, tRAS, the synthesized tRC, tRRD_S/L, tRTP, tFAW, tWR,
+tRFC, and the four turnaround quartets: 24 of the 27 AMD subtiming slots, the
+ECC capability from `CAPID0_A` (bit 17 `ECC_DIS`), and the hardware channel
+mode; the rest of the Intel readout (fclk / GDM / PDM, the CAD bus, the
 voltage rails) has no IMC analog and renders `NotApplicable`.
 
 **SPD (both vendors, fully unprivileged).** The kernel's `ee1004` I2C EEPROM
@@ -314,12 +324,14 @@ section is N/A, exit 2 on a bad flag).
 | `amd_pm.rs` | Version-guarded parse of the raw PM blob into clocks (MCLK/UCLK/FCLK) and voltages (VDDCR_VDD/VDDCR_SOC). |
 | `amd_smn.rs` | The `smn` accessor protocol plus the verified SMN register tables — the 13-register timing block (the 27 subtimings, GDM, command rate) and the 14-register channel set (per-UMC CS base/mask + `UmcCapHi` → channel mode + ECC). |
 | `amd_readout.rs` | The four vendor-neutral display types (`ClockReadout`, `TimingSet`, `CadBus`, `VoltageSet`) and the AMD mapping onto them, with sanity gating. |
-| `intel_mchbar.rs` | MCHBAR location in PCI config space + the read-only `/dev/mem` RAII window — the fallback source (the one `unsafe` cluster in the crate). |
-| `intel_readout.rs` | The hardware-verified Tier-1 IMC register map (MCHBAR-relative) + the single pure decode core fed by both raw sources, into the same display types. |
+| `intel_gen.rs` | The per-generation decode-profile dispatcher (IG-01/IG-03): `profile_for(IntelGen)` → the static `GenProfile` (window size — 64 KiB for Tier 1 / Rocket Lake, 256 KiB for the Alder family; channel count 2/2/2/4; `GearCap` None / Gear2 / Gear4; `GenMap` family), plus the Tier-3 `ALDER_CHANNELS` subchannel descriptors and the widened DDR5 `ALDER_FIELDS` bit ranges. Pure data, no I/O — the foundation every generational decode dispatches on. |
+| `intel_mchbar.rs` | MCHBAR location in PCI config space + the read-only `/dev/mem` RAII window (profile-sized: 64 KiB Tier 1 / Rocket Lake, 256 KiB the Alder family) — the fallback source (the one `unsafe` cluster in the crate). |
+| `intel_readout.rs` | The hardware-authoritative IMC register maps (MCHBAR-relative: the 64 KiB Tier-1 / Rocket Lake set and the 256 KiB Tier-3 Alder set) + the single pure decode core (`decode`, dispatched on `intel_gen::profile_for`) fed by both raw sources, into the same display types. |
 | `intel_sysfs.rs` | The primary raw reader: the `ramsleuth_intel` kobject's 25 attributes (the 19 IMC-register attributes — 2 MCHBAR diagnostics, `MC_BIOS_REQ`, 16 per-channel `TC_*` — the 5 MAD channel/geometry, and the host-bridge `CAPID0_A`) under `/sys/kernel/ramsleuth_intel/` → the raw `IntelImcRegs` set + the MAD words + `capid0a` (per-attribute containment: absent / malformed → `None`). |
 | `spd_eeprom.rs` | Unprivileged enumeration + raw-image acquisition of every bound `ee1004` device. |
 | `spd_decode.rs` | Pure decode of the raw image: JEP106 makers, rank/density/speed, part/serial, XMP 2.0 / XMP 3.0-EXPO profiles. |
 | `platform.rs` | The vendor-neutral identity branch: DMI, `/proc/cpuinfo`, `/proc/meminfo`, the `ryzen_smu` version attribute. |
+| `probe.rs` | The consent-gated probe-report wire types: `ProbeReport` (the full snapshot + optional `ProbeRaw` + `ProbeSystem`), `ProbeRaw` (the vendor raw registers flattened into a stable nesting-free wire form — the Intel IMC + MAD + MCHBAR diagnostics, the AMD 13-SMN + PM section appended OQ-10), `ProbeSystem` (the operator-facing identity), and `render_probe_report_md` (the pure GitHub-issue / clipboard markdown renderer). |
 | `board_vrm.rs` | DMI-keyed `nct6798` board profiles (the VDDIO_MEM overlay and cross-check rails). |
 | `facade.rs` | `collect()` — the aggregation + per-branch containment (§10.1). |
 | `main.rs` | The standalone `ramsleuth-telemetry` CLI. |
@@ -389,13 +401,13 @@ consumes. Both a library and the CLI binary (`dump` / `bench` / `status`).
 
 ### 4.7 `ramsleuth-tui`
 
-**Role:** the terminal frontend (ratatui + crossterm) — the 16-key dashboard.
+**Role:** the terminal frontend (ratatui + crossterm) — the 17-key dashboard.
 Both a library (the pure pieces: key mapping, render, rings, graphs) and the
 `ramsleuth-tui` binary.
 
 | `src/` file | Responsibility |
 |-------------|----------------|
-| `events.rs` | The frozen 16-key contract: pure `key_to_action` mapping + the single crossterm `poll_event` site. |
+| `events.rs` | The frozen 17-key contract: pure `key_to_action` mapping + the single crossterm `poll_event` site. |
 | `ui.rs` | The three-zone dashboard renderer, `AppState` (wire types verbatim), the semantic palette, the parity strips. |
 | `ring.rs` | The TUI-local bounded FIFO ring (default 300 samples = 10 min at the 2 s poll) — a `std`-only mirror of the GUI core, no egui dependency. |
 | `graphs.rs` | The five-series graphs state (1800-deep ring = 60 min), the Na-guarded record hook, the window filter, the block-bar sparkline panel, and the CPU-temp source scan. |
@@ -761,7 +773,7 @@ never reimplement the layout.
 `Response(Response)` (daemon → client). A client-sent `Response` is a
 protocol violation and closes the connection.
 
-**`Request`** (frozen — the four arms):
+**`Request`** (frozen — the five arms):
 
 | Arm | Payload | Semantics |
 |-----|---------|-----------|
@@ -769,8 +781,9 @@ protocol violation and closes the connection.
 | `StartBenchmark` | `target: StreamTarget`, `mode: BenchMode` | Start a single-pass run. `StreamTarget` = `Full` / `Tier(t)` / `Cell(t, op)`; `BenchMode` = `Full` / `MemoryOnly`. Single-flight — a second start while one is active gets `Response::Error`. |
 | `StartBurnIn` | `target: StreamTarget`, `duration_minutes: u32` | Start a multi-pass burn-in; **`0` means infinite** (stop only via cancel); `n > 0` stops once a pass has completed and the run elapsed is `n × 60` s. A distinct run class sharing the single-flight slot. |
 | `CancelBenchmark` | `run_id: u64` | Stop the active run `run_id` at its next gate (any connection may send it). |
+| `GetProbeReport` | — | Fetch the consent-gated probe report: the full snapshot + the Intel raw-register dump (when available) + the system identity → `Response::ProbeReport` (the `probe.rs` wire types, §10). Append-only (OQ-10) — discriminant 4. |
 
-**`Response`** (frozen — the seven arms):
+**`Response`** (frozen — the eight arms):
 
 | Arm | Payload | Semantics |
 |-----|---------|-----------|
@@ -781,11 +794,13 @@ protocol violation and closes the connection.
 | `BenchResult` | `run_id`, `grid: BenchmarkGrid` | The terminal result grid (for a burn-in, its last completed pass). |
 | `BenchCancelled` | `run_id` | The terminal ack for a cancelled run. |
 | `Error` | `String` | The structured error reply — the wire-safe arm of the no-panic contract. |
+| `ProbeReport` | `ProbeReport` | The consent-gated probe-report payload (the `GetProbeReport` reply, §10): the full snapshot, the vendor raw-register dump (when available), and the system identity. Append-only (OQ-10) — discriminant 7. |
 
 **Payloads are reused, never duplicated**: `Request` / `Response` embed the
-telemetry crate's `SystemMemoryTelemetry` and the bench crate's
-`StreamTarget` / `StreamProgress` / `BenchmarkGrid` / `BurnInTick` verbatim —
-the single source of truth for each is its owning crate. The snapshot's
+telemetry crate's `SystemMemoryTelemetry` (and the probe report's
+`ProbeReport`) and the bench crate's `StreamTarget` / `StreamProgress` /
+`BenchmarkGrid` / `BurnInTick` verbatim — the single source of truth for each
+is its owning crate. The snapshot's
 `intel` slot is a `Section<IntelReadout>`, which carries the hardware-derived
 `channel_mode: Option<ChannelMode>` wire field (decoded from
 `MAD_INTER_CHANNEL[1:0]`, §10.3) and `ecc_status` (the `CAPID0_A` bit-17
@@ -794,6 +809,18 @@ decode, §10.3) alongside the raw register set; the `amd` slot carries its own
 Every arm is
 bincode-serializable; failures cross the wire as structured payloads, never as
 panics.
+
+**The OQ-10 append-only rule.** The vocabulary is append-only: new arms and
+new payload fields are only ever *appended* — no arm is reordered, renamed,
+or re-encumbered. The existing discriminants and wire encodings are
+byte-pinned by unit tests: the `messages.rs` OQ-10 pin asserts that every
+pre-existing arm keeps its leading discriminant bytes unchanged and that the
+two appended arms land at the next discriminants only (`Request::
+GetProbeReport` at 4, `Response::ProbeReport` at 7), and the `cpuid.rs` IG-10
+pin applies the same rule to the wire-riding `IntelGen` enum (`RocketLake`
+appended at discriminant 11 — the eleven pre-existing variants 0–10
+byte-unchanged). An appended arm therefore never shifts a pre-existing
+encoding, so new and old peers stay wire-compatible.
 
 ### 7.3 Frozen constants
 
@@ -807,11 +834,11 @@ can slip into the constant unnoticed.
 ## 8. The TUI
 
 `ramsleuth-tui` (ratatui + crossterm) is a **single non-scrolling, three-zone
-dark dashboard** driven by a **frozen 16-key contract**. All state is shared
+dark dashboard** driven by a **frozen 17-key contract**. All state is shared
 between the render thread and one background poller thread through
 `Arc<RwLock<AppState>>`; the wire types ride verbatim.
 
-### 8.1 The 16-key contract
+### 8.1 The 17-key contract
 
 Case-insensitive, modifiers ignored; every other key (`Esc`, `Enter`, arrows,
 function keys, mouse, resize) maps to nothing — the terminal re-reads the
@@ -836,6 +863,7 @@ lives in one pure function (`events::key_to_action`), unit-tested headlessly:
 | `k` | **Toggle clock** | Clock units MHz ↔ GHz (display conversion; the wire carries MHz). |
 | `a` | **Toggle refresh** | Auto-refresh on ↔ off (a refresh-off TUI still fetches its one-shot baselines and honors `r`). |
 | `w` | **Cycle window** | Cycle the graphs time window — 1 → 5 → 15 → 60 min (default 5). |
+| `f` | **Probe report** | One-shot `GetProbeReport` fetch on a fresh connection → the consent prompt (`[y]` / `[n]`) → the rendered markdown preview (`[w]` writes `~/.ramsleuth/probe-report.md`, `[c]` copies to the clipboard, `[q]` closes). The report is no-PII by construction; the overlay is drawn last / topmost over the whole frame and renders at any rect size (no-panic). |
 
 ### 8.2 The three zones
 
@@ -859,7 +887,8 @@ lives in one pure function (`events::key_to_action`), unit-tested headlessly:
   error line when present.
 
 Over the zones: a 3-line header, the settings strip, the requirements strip
-(presence-driven auto-open), and the graphs overlay drawn topmost. The
+(presence-driven auto-open), the graphs overlay drawn topmost, and the
+probe-report overlay (drawn last, topmost, over the whole frame) while open. The
 semantic palette is exact: values cyan `#00D4FF`, warnings amber `#FFB300`,
 N/A grey `#8A8A94`, alarms crimson `#FF3B30`, background slate `#1E1E24`.
 
@@ -948,13 +977,28 @@ and `png` 0.17 are MSRV-safe as declared.
 - **line 1** — the `RamSleuth v<workspace-version>` title (derived at compile
   time from `CARGO_PKG_VERSION`), the platform tag, the daemon status (naming
   the live settings socket), the `Settings` toggle, the `Graphs` window
-  toggle, and the **`[F2] snapshot · [F3] export · [Q] quit`** legend;
+  toggle, the **`Probe`** button, and the **`[F2] snapshot · [F3] export ·
+  [Q] quit`** legend;
 - **line 2** — CPU brand + live clock, board / BIOS / AGESA;
 - **line 3** — RAM total + per-DIMM sizes + max SPD speed, channel mode, and
   the **UCLK:MCLK sync indicator, color-coded**: `1:1` coupled renders in
   value-cyan, while a `1:2` divide (gear desync) renders in **amber** — the
   two warning conditions in the matrix (the desync and an out-of-spec
   VDDCR_SOC) are the only amber cells; critical alarms use crimson.
+- **the `Probe` button** — the consent-gated "Submit Probe Report" flow,
+  driven by a pure `ProbeState` machine (`Idle` → `Consent` → `Preview`;
+  every closing path returns to `Idle`, so the button is always re-openable):
+  the **consent dialog** discloses exactly what the report collects (CPU
+  brand / detected generation / PCI host-bridge ID, kernel / OS / arch, the
+  RamSleuth version + telemetry source, the decoded memory readout, the raw
+  IMC register values, the N/A reasons) and states the no-PII note — "Not
+  collected: username, hostname, IP, MAC, serial numbers, file paths";
+  **[Allow]** hands the one-shot `GetProbeReport` fetch to the background
+  poller (`request_probe_report`), and the **preview dialog** then offers
+  **[Open GitHub Issue]** (the repo's `issues/new` form with the pre-filled
+  title `[Probe] <brand> · <gen> · <os> · v<ver>` — the markdown body rides
+  the clipboard, not the URL: a header notice tells the user to paste it
+  into the issue body), **[Copy to Clipboard]**, and **[Cancel]**.
 
 ### 9.3 The SETUP requirements strip
 
@@ -1068,10 +1112,13 @@ A vendor branch runs **only on matching silicon**: the AMD branch gates on
 `CpuVendor::Amd(_)` and the Intel branch on `CpuVendor::Intel(_)` *before any
 provider call*, so a non-matching vendor yields `Na(UnsupportedHardware)`
 with **zero I/O** in that branch. The Intel branch additionally gates on the
-v1 Tier-1 generation set (`Skylake` / `KabyLake` / `CoffeeLake` /
-`CometLake`) before either raw source is touched: any other Intel generation
-(Tier 2 / Tier 3 / unrecognized) degrades the whole branch to
-`Na(UnsupportedHardware)` — never garbage from a mismatched register map.
+profile-based **`gen_gate`** (IG-16) before either raw source is touched: it
+passes every generation that resolves to a decode profile — Tier 1
+(`Skylake`–`CometLake`), Rocket Lake (Tier 2), and the Tier-3 Alder family
+(`Alder` / `Raptor` / `Meteor` / `ArrowLake` — profiled IG-03, decoded on the
+Tier-3 subchannel path IG-26) — and **only** the remaining unprofiled
+generations (Ice Lake / Tiger Lake / `Unrecognized`) degrade the whole branch
+to `Na(UnsupportedHardware)` — never garbage from a mismatched register map.
 The SPD and platform branches run on every vendor (unprivileged sysfs / DMI
 + `/proc` reads).
 
@@ -1189,7 +1236,10 @@ feed **one** pure decode core:
    `kernel/ramsleuth-intel/` tree; provisioned from the source bundled by
    the main AUR packages — or by the standalone `ramsleuth-intel-dkms`
    extra, §12.5). It probes the host bridge at PCI `0000:00:00.0`, decodes
-   the MCHBAR from config space, `ioremap`s the 64 KiB window, and publishes
+   the MCHBAR from config space, `ioremap`s the **profile-sized window**
+   (64 KiB for Tier 1 / Rocket Lake; 256 KiB on the Tier-3 Alder family —
+   selected in-kernel by the OQ-14 device-ID table, which ships empty, so
+   every released build maps 64 KiB), and publishes
    the raw IMC registers as **25 world-readable (`0444`) sysfs attributes**
    under `/sys/kernel/ramsleuth_intel/` — the 19 IMC-register attributes
    (the 2 MCHBAR diagnostics, `MC_BIOS_REQ`, and the 16 per-channel `TC_*`)
@@ -1231,10 +1281,14 @@ feed **one** pure decode core:
      `N/A (unsupported hardware)`); a disabled MCHBAR that carries
      address bits, or a short config image → `Parse`;
    - open **`/dev/mem`** (fallback `/dev/fmem`) and `mmap(PROT_READ, MAP_PRIVATE)`
-     the **64 KiB** (`0x10000`) MCHBAR window at that base, owned by an RAII guard whose
-     `Drop` calls `munmap` exactly once. This is the
-     **`CAP_SYS_RAWIO` requirement**: EACCES/EPERM, or a `STRICT_DEVMEM`
-     range rejection surfaced as EIO/ENODATA, → `InsufficientPrivilege`.
+      the **profile-sized** MCHBAR window at that base — **64 KiB**
+      (`0x10000`) for Tier 1 / Rocket Lake, **256 KiB** (`0x40000`) for the
+      Tier-3 Alder family (`window_size_for` equality-checks the profile's
+      `GenProfile::window_size` against the two known page-multiple map
+      sizes) — owned by an RAII guard whose `Drop` calls `munmap` exactly
+      once. This is the **`CAP_SYS_RAWIO` requirement**: EACCES/EPERM, or a
+      `STRICT_DEVMEM` range rejection surfaced as EIO/ENODATA, →
+      `InsufficientPrivilege`.
 
    **Why the module exists:** with `CONFIG_STRICT_DEVMEM` (the stock
    setting on major distros) the kernel rejects the `mmap` of the
@@ -1253,11 +1307,27 @@ page-aligned, and every register read is bounds-checked against the mapped
 window (the module's attributes need none of this: they are plain sysfs
 reads).
 
-**The hardware-authoritative Tier-1 register map (MCHBAR-relative).** Tier 1
-= Skylake / Kaby Lake / Coffee Lake / Comet Lake: one memory controller, two
-channels, DDR4. One global register, two per-channel blocks (channel 0
-at `0x4000`, channel 1 at `0x4400`, stride `0x400`), and the MAD
-channel/geometry block at `0x5000`:
+**The register-map families (MCHBAR-relative).** The decode dispatches on
+the generation's profile, and three register-map families are in play:
+
+- **Tier 1** = Skylake / Kaby Lake / Coffee Lake / Comet Lake: one memory
+  controller, two channels, DDR4, the 64 KiB window — the hardware-
+  authoritative table below (one global register, two per-channel blocks —
+  channel 0 at `0x4000`, channel 1 at `0x4400`, stride `0x400` — and the
+  MAD channel/geometry block at `0x5000`);
+- **Rocket Lake**: the same 64 KiB window and offsets (the shared layout)
+  plus the gear-ratio decoding of `MC_BIOS_REQ[17:16]` (the `Gear2` cap);
+- **the Tier-3 Alder family** = Alder / Raptor / Meteor / Arrow Lake: the
+  256 KiB window (`0x40000`) and the widened DDR5 offset set — the four
+  `ALDER_CHANNELS` subchannel descriptors (MC0 hosts subchannels 0 / 1, MC1
+  hosts 2 / 3: the legacy mirror blocks at `0x4000` / `0x4400` / `0x4800` /
+  `0x4C00`, with the native uncore-MCL fallback bases `0xD000` (MC0) and
+  `0xD800` (MC1) on subchannels 0 and 2 only — subchannels 1 and 3 are
+  mirror-only) and the 22 widened DDR5 timing bitfields of `ALDER_FIELDS`
+  (tCL / tRAS / tWR 8-bit, tRCD / tRP / tWTR_S / tWTR_L / tRTP 7-bit,
+  tRFC1 12-bit, tRFCsb 11-bit, plus the DDR5-specific tPPD).
+
+**The Tier-1 table** (shared with Rocket Lake):
 
 | Offset | Register | Fields decoded (bits) |
 |--------|----------|-----------------------|
@@ -1283,10 +1353,21 @@ ratio 12 @ 100 MHz; `tc_dbp = 0x11110F11` →
 `tc_rfp = 0x000001A4` → tRFC 420; synthesized tRC = 39 + 17 = 56; channel 1
 symmetric).
 
-**The decode (one pure core for both sources).** The 17 raw slots
-(`IntelImcRegs` — 1 global + 2×8 per-channel), plus the raw
+**The OQ-5 tile-routing probe (IG-28).** On Meteor / Arrow Lake, before any
+subchannel decode, a **fully degenerate primary window** — every register
+`None` (failed / unreadable) or a present-but-invalid word (`0x0` untrained,
+`0xFFFF_FFFF` bus-fault readback) — is the runtime signature that the
+physical IMC sits behind the secondary SoC-tile uncore range (`MCHBAR +
+0x180000`) the module does not expose; the whole readout degrades to
+`Na(UnsupportedHardware)` at the generation's channel count — never a decode
+of the empty window, never a value fabricated from the secondary range.
+
+**The decode (one pure core for both sources, dispatched on the profile).**
+`decode` dispatches on `intel_gen::profile_for` — "Tier 1 is one case of the
+dispatcher". On the **Tier 1 / Rocket Lake** profile, the 17 raw slots of
+the 64 KiB map (`IntelImcRegs` — 1 global + 2×8 per-channel), plus the raw
 `mad_inter_channel` word as the decode's third argument (the other four MAD
-registers stay raw in the sysfs attributes), feed `intel_readout::decode`:
+registers stay raw in the sysfs attributes), feed the shared-map decode:
 
 - `mclk_mhz` ← `MC_BIOS_REQ`: `ratio × refclk` (no ÷2; MT/s = 2 × MCLK),
   sanity-gated to [1, 4096] MHz; a ratio of 0 = unconfigured →
@@ -1303,10 +1384,13 @@ registers stay raw in the sysfs attributes), feed `intel_readout::decode`:
   client runs standard single-tRFC scheduling);
 - `tCKE` / `tREFI` are decoded by the core but have no frozen display slot
   (the raw values stay available via the sysfs attributes);
-- `uclk` / `fclk` / `div_mode` / `gear_mode` / `gdm` / `pdm` /
-  `command_rate` → `Na(NotApplicable)` (AMD-fabric concepts with no IMC
-  analog; the gear ratio is Rocket+ / Tier 2), and the CAD bus + voltage
-  rails → all `Na(NotApplicable)` (the IMC window exposes neither);
+- `fclk` / `div_mode` / `gdm` / `pdm` / `command_rate` →
+  `Na(NotApplicable)` (AMD-fabric concepts with no IMC analog), and the CAD
+  bus + voltage rails → all `Na(NotApplicable)` (the IMC window exposes
+  neither); the gear cells are the one exception — `gear_mode` decodes from
+  `MC_BIOS_REQ[17:16]` and `uclk = mclk / gear` on the Rocket Lake (Gear2)
+  and Tier-3 Alder (Gear4) profiles, and stay `Na(NotApplicable)` on Tier 1
+  (no gear register);
 - **`ecc_status`** ← the `capid0a` attribute (host-bridge config `0xE4`):
   bit 17 (`ECC_DIS`) set → `NotCapable`, clear → `CapableButDisabled`,
   absent / unreadable → `Unknown` — keyed off the register bit, never the
@@ -1315,6 +1399,19 @@ registers stay raw in the sysfs attributes), feed `intel_readout::decode`:
 - **per-register containment**: an absent / failed register degrades only
   the slots sourced from it to `Na(ParseError)` — never a silent zero,
   never a panic.
+
+On the **Tier-3 Alder family**, the decode takes the full 51-slot raw set
+(the four `ALDER_CHANNELS` mirror blocks, the two native MCL blocks, and
+the `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws) and decodes the subchannel
+geometry: **OQ-11's DDR5 condition** — both `MAD_DIMM_CH2` / `MAD_DIMM_CH3`
+raws present and non-zero — selects the **four subchannels**, else the
+**2-channel DDR4 default** (subchannels 0 and 2); each subchannel's
+effective registers are the mirror → MCL fallback via `tier3_mcl_for` (a
+disabled-mirror word — `0x0` / `0xFFFF_FFFF` — falls back to the native MCL
+block on subchannels 0 and 2; subchannels 1 and 3 are mirror-only), decoded
+through the widened `ALDER_FIELDS` bitfields (`tRFCsb` lands in a display
+slot the Tier-1 decode leaves not-applicable), with the Gear4 gear cells
+layered on from the shared `MC_BIOS_REQ` word.
 
 **Platform/firmware N/A conditions (not bugs).** Three Intel readout
 fields can legitimately read `N/A` on otherwise healthy hardware:
@@ -1326,18 +1423,27 @@ and **UCLK:MCLK** — `Na` where the uncore ratio is not populated. Each
 is a structured `N/A (<reason>)`, never a silent zero, and none
 indicates a RamSleuth defect.
 
-**The Tier-1 generation gate.** The decode runs only for
-`{Skylake, KabyLake, CoffeeLake, CometLake}`. Any other detected Intel
-generation (Alder / Raptor = Tier 2, dual-MC DDR4/DDR5; Meteor / Arrow =
-Tier 3, DDR5;
-unrecognized) degrades the **whole** readout to `Na(UnsupportedHardware)` —
-never garbage data from a mismatched register map. The channel **count**
-used for SPD enumeration is a function of the detected generation: 2 for
-DDR4-class, 4 for DDR5-class client silicon. The channel-**mode label**
-shown to the user is hardware-derived, not derived from the count: `decode`
-maps `MAD_INTER_CHANNEL[1:0]` onto `IntelReadout.channel_mode` — `00b` =
-Dual-Channel Symmetric (fully interleaved), `01b` = Dual-Channel Flex
-(asymmetric), `10b` = Single-Channel, `11b` = reserved (no label) — and when
+**The profile-based generation gate.** The decode runs for **Tier 1–3**
+(Skylake → Arrow Lake) through the GenProfile dispatcher: Tier 1 (Skylake /
+Kaby Lake / Coffee Lake / Comet Lake) and Rocket Lake (Tier 2) on the
+64 KiB map, and the Tier-3 Alder family (Alder / Raptor / Meteor / Arrow
+Lake — dual-MC, DDR4/DDR5; the tier numbering is the research roadmap's:
+Rocket Lake = Tier 2, the Alder family = Tier 3) on the 256 KiB subchannel
+path. Only the unprofiled generations — Ice Lake / Tiger Lake /
+`Unrecognized` — degrade the **whole** readout to
+`Na(UnsupportedHardware)`, never garbage data from a mismatched register
+map. The channel **count** is the static `GenProfile.channel_count` (Tier 1
+/ Rocket Lake: 2; Alder / Raptor Lake: 2 — the DDR4 default; Meteor / Arrow
+Lake: 4), with OQ-11's decode-time flip to the 4-subchannel geometry when
+both `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws are present and non-zero. The
+channel-**mode field** is hardware-derived, not derived from the count:
+`decode` maps `MAD_INTER_CHANNEL[1:0]` onto `IntelReadout.channel_mode` —
+`00b` = Dual-Channel Symmetric (fully interleaved), `01b` = Dual-Channel
+Flex (asymmetric), `10b` = Single-Channel, `11b` = reserved (no label) —
+and the field is population-conditional: the Tier-1 arm cross-checks it
+against the `MAD_DIMM_CH0/1` DIMM population (`channel_mode_with_population`
+— Skylake-family firmware leaves the `00b` default on single-channel and
+asymmetric boxes, where it is demoted to `Single` / `DualFlex`), and when
 the module is absent the label falls back to the installed-DIMM count.
 
 ### 10.4 The SPD path — fully unprivileged
@@ -1352,7 +1458,11 @@ address becomes the module `index`. Any failure degrades gracefully: driver
 absent → empty list + a warning; one unreadable device → that device skipped;
 a length that is neither 512 nor 1024 → skipped.
 
-The **pure decode** (no I/O at all) yields, per module: **JEP106 maker**
+The **pure decode** (no I/O at all) is a straight transcription of the
+governing JEDEC SPD layouts — **DDR4 = JESD79-4 (SPD5118)** and **DDR5 =
+JESD79-5 (SPD5378)**, with **JEP106** makers (DDR4's 16-bit (bank, code)
+pair, DDR5's 8-bit vendor / continuation nibbles) — and yields, per module:
+**JEP106 maker**
 (DDR4: a 16-bit (bank, code) pair — `bank = (0x140 & 0x7F) + 1`,
 `code = 0x141` — for the module, and the same encoding at `0x15E` / `0x15F`
 for the DRAM die; DDR5: the historical 8-bit vendor/continuation nibbles at
@@ -1593,13 +1703,16 @@ The full install file set (see `packaging/README.md` for the operator
 reference): 6 binaries → `/usr/bin/`; the unit → `/usr/lib/systemd/system/`
 (+ preset); the `ramsleuth` group (idempotent `groupadd -r` in the `.install`
 hooks); the DKMS helper → `/usr/bin/ramsleuth-install-ryzen-smu-dkms`; the
-Intel DKMS helper → `/usr/bin/ramsleuth-install-intel-dkms` (guarded —
-skipped with a note in a pre-Intel checkout); **the in-repo
-`ramsleuth_intel` source tree → `/usr/share/ramsleuth-intel-dkms/src/`**
-(guarded the same way — the exact path the Intel helper resolves, so the
-one-click Intel DKMS install works from a bare AUR install with no manual
-source step); the setup helper → `/usr/bin/ramsleuth-setup`; the polkit
-policy → `/usr/share/polkit-1/actions/`; and `install.sh` →
+Intel DKMS helper → `/usr/bin/ramsleuth-install-intel-dkms` (guarded — the
+v2.4.5 source tree and the re-cut `-bin` tarball carry it, skipped with a
+note only on a pre-2.3.0 asset); **the in-repo `ramsleuth_intel` source
+tree → `/usr/share/ramsleuth-intel-dkms/src/`** (guarded the same way —
+the exact path the Intel helper resolves, so the one-click Intel DKMS
+install works from a bare AUR install with no manual source step; the
+published `-bin` tarball (the v2.4.5 re-cut) carries the helper + tree, and
+the existence guard covers only pre-2.4.2 assets); the setup helper →
+`/usr/bin/ramsleuth-setup`; the polkit policy →
+`/usr/share/polkit-1/actions/`; and `install.sh` →
 `/usr/share/ramsleuth/`. `ramsleuth-protocol` is library-only and is never
 installed. Two optional DKMS extras provision the vendor kernel drivers —
 `ryzen-smu-dkms` (§12.4) and `ramsleuth-intel-dkms` (§12.5). The AMD extra
@@ -1665,11 +1778,13 @@ fallback remains available where unblocked. When present:
   never compiled into any RamSleuth binary) — unlike the AMD extra's pinned
   `ryzen_smu` clone, there is no network and no upstream pin;
 - **both main packages bundle that source tree** (to
-  `/usr/share/ramsleuth-intel-dkms/src/` — guarded like the Intel helper, so
-  a pre-2.4.5 tag / the published v2.2.1 tarball ships nothing and skips
-  cleanly), which is the exact path the helper resolves as its installed
-  copy: the **one-click Intel DKMS install works from a bare AUR install**
-  (either `ramsleuth` or `ramsleuth-bin`) with **no manual source step**;
+  `/usr/share/ramsleuth-intel-dkms/src/` — guarded like the Intel helper:
+  the published `-bin` tarball (the v2.4.5 re-cut) carries it and installs
+  it, and the existence guard covers only pre-2.4.2 assets, which ship
+  nothing and skip cleanly), which is the exact path the helper resolves as
+  its installed copy: the **one-click Intel DKMS install works from a bare
+  AUR install** (either `ramsleuth` or `ramsleuth-bin`) with **no manual
+  source step**;
 - the standalone AUR extra is a **thin provisioning package** (mirroring
   `ryzen-smu-dkms`): it ships the DKMS config, the operator helper, and the
   module source under `/usr/share/ramsleuth-intel-dkms/` — the module is
@@ -1722,7 +1837,16 @@ so the interesting surfaces are pure and testable headlessly:
 - **protocol freeze** — `default_socket_path_is_frozen` pins the
   `DEFAULT_SOCKET_PATH` literal; every `Request` / `Response` / `Message` arm
   round-trips through bincode (including the appended `StartBurnIn` arm over
-  the full target range and the infinite/finite durations); the frame codec
+  the full target range and the infinite/finite durations); the **OQ-10
+  byte-pinning tests** pin the append-only rule (the `messages.rs`
+  `request_response_bincode_byte_pinning_oq10`: `Request::GetProbeReport`
+  must land at discriminant 4 and `Response::ProbeReport` at the appended
+  discriminant 7, with every pre-existing arm's leading discriminant bytes
+  byte-unchanged; the `cpuid.rs` IG-10 serde pin: `IntelGen::RocketLake` at
+  discriminant 11, the eleven pre-existing variants 0–10 unchanged); the
+  `probe.rs` round-trip suite pins the `ProbeReport` / `ProbeRaw` /
+  `ProbeSystem` wire shapes (incl. the OQ-10 AMD section appended after
+  every Intel field); the frame codec
   tests cover the exact `[4-byte LE length][payload]` layout, every
   truncated-buffer cut of a real frame (all `Incomplete`), a hostile
   length prefix (`Oversized` *before* the payload is awaited), a length
@@ -1740,7 +1864,7 @@ so the interesting surfaces are pure and testable headlessly:
   `BenchJobManager` single-flight / cancel / slot-release rules, and the RPC
   loop exercised **over `UnixStream::pair()`** — real frame bytes through a
   real socket pair, no hardware;
-- **TUI** — the whole 16-key contract as pure `key_to_action` mapping tests
+- **TUI** — the whole 17-key contract as pure `key_to_action` mapping tests
   (every key, case pairs, modifier-ignored, and every non-key → `None`), plus
   **headless ratatui `TestBackend` render tests** of the three zones, strips,
   and graphs panel over synthetic snapshots;
@@ -1765,24 +1889,35 @@ to `v2-development`:
   `Cargo.lock` is used as-is; the MSRV leg proves the 1.75 claim on a clean
   runner;
 - **build** — `cargo build --release --workspace` on stable, uploading the
-  **6 release binaries** as a workflow artifact.
+  **6 release binaries** as a workflow artifact;
+- **kernel-module** — independent of the Rust jobs (a kernel build failure
+  never breaks them): builds `kernel/ramsleuth-intel` against the runner's
+  `linux-headers-generic`, asserting a `.ko` is produced with **zero
+  compiler warnings** (the job fails on any warning).
 
 ### 13.3 The release pipeline
 
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) fires on
 a **`v[0-9]*` tag** push (or a manual `workflow_dispatch` with a version
-input). It builds the workspace `--locked`, **verifies all 15 release
-artifacts** (6 binaries + 9 auxiliary: `systemd/ramsleuth.service`,
-`ramsleuth.preset`, `RamSleuth.desktop`,
+input). It builds the workspace `--locked`, **verifies all 19 release
+artifacts** (6 binaries + 13 auxiliary: the 8 pre-Intel auxiliary files —
+`systemd/ramsleuth.service`, `ramsleuth.preset`, `RamSleuth.desktop`,
 `scripts/install-ryzen-smu-dkms.sh`, `install.sh`, `LICENSE`,
-`scripts/ramsleuth-setup.sh`,
-`packaging/polkit/90-ramsleuth-setup.policy`, and the `assets/icons` hicolor
-tree — the tree counts as one artifact), then packages the
-**deterministic tarball `ramsleuth-<ver>-x86_64.tar.zst`** (fixed file order
-`tar --sort=name`, fixed ownership `--owner=0 --group=0 --numeric-owner`,
-fixed mtime `--mtime=@0`) with its **`.sha256` companion**, and publishes
-both as the GitHub Release. **The tarball is the `ramsleuth-bin` download
-source** — the AUR package pins it by `sha256sums`.
+`scripts/ramsleuth-setup.sh`, `packaging/polkit/90-ramsleuth-setup.policy` —
+plus `scripts/install-intel-dkms.sh` and the four `kernel/ramsleuth-intel/`
+module source files `dkms.conf`, `Makefile`, `ramsleuth_intel.c`,
+`README.md`; the `assets/icons` hicolor tree ships as a bundle), then
+packages the **deterministic tarball `ramsleuth-<ver>-x86_64.tar.zst`**
+(fixed file order `tar --sort=name`, fixed ownership `--owner=0 --group=0
+--numeric-owner`, fixed mtime `--mtime=@0`, zstd) with its **`.sha256`
+companion** (sha256sum format), and publishes both as the GitHub Release.
+**The tarball is the `ramsleuth-bin` download source** — the AUR package
+pins it by `sha256sums`. The internal layout (top-level `ramsleuth-<ver>/`,
+mirroring the AUR install): `bin/` (the 6 binaries), `systemd/` (the unit +
+preset), `scripts/` (both DKMS helpers), `kernel/ramsleuth-intel/` (the
+module source tree), and the top-level `install.sh`, `LICENSE`,
+`RamSleuth.desktop`, `ramsleuth-setup.sh`, `90-ramsleuth-setup.policy`, and
+`assets/icons/` hicolor tree.
 
 ### 13.4 Related documentation
 
