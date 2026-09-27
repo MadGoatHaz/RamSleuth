@@ -42,6 +42,12 @@
 //!   before each frame — once set, the run is stopped daemon-side
 //!   with a best-effort `CancelBenchmark` and ends with
 //!   `running` / `burn_in.running = false`;
+//! - consumes the post-setup auto-reconnect edge (the one-click
+//!   setup worker sets `reconnect_requested` after a successful
+//!   run): one immediate [`poll_telemetry`] against the live socket,
+//!   independent of the `refresh_enabled` gate (the C21-36 removal —
+//!   the app picks up the (re)started daemon without a manual
+//!   restart);
 //! - re-reads the live settings knobs (`poll_interval_ms` +
 //!   `refresh_enabled` every tick — C6-27, the `socket` per poll /
 //!   bench cycle — C6-30) — a changed knob takes effect without a
@@ -251,6 +257,17 @@ pub struct TelemetryData {
     /// thread consumes it (the consent → preview transition) and
     /// resets it to `None`.
     pub probe_result: ProbeResult,
+    /// The post-setup auto-reconnect edge (the C21-36 removal): the
+    /// one-click setup worker sets it after a successful helper run
+    /// (the daemon was (re)started by the helper; the helper's
+    /// per-user ACL covers the current session — no re-login, no
+    /// app restart). The background poller consumes it once per
+    /// tick: one immediate [`poll_telemetry`] against the live
+    /// socket, independent of the `refresh_enabled` gate, so the
+    /// app picks up the now-serving daemon on its own (the SETUP
+    /// strip unmounts on its own once the daemon serves — the
+    /// liveness predicate).
+    pub reconnect_requested: bool,
 }
 
 /// One benchmark request from the UI to the background poller (the
@@ -932,23 +949,29 @@ fn clamp_poll_interval(ms: u64) -> Duration {
 /// `cancel` flag to it (the bench zone's Cancel button sets it,
 /// P3-28; each run resets it per run); otherwise re-read the live
 /// settings knobs (C6-27 / C6-30) — the clamped `poll_interval_ms` +
-/// the `refresh_enabled` gate + the `socket` — and: (a) run exactly
-/// one **baseline** [`poll_telemetry`] fetch for a `socket` value the
-/// thread-local `baseline_for` stamp has not seen yet (D-8 —
-/// regardless of `refresh_enabled`, the one-shot startup snapshot; a
-/// socket edit re-triggers exactly one fetch for the new socket, and
-/// a failed baseline never retries on its own — no retry storm: the
-/// stamp is set after the fetch, which cannot panic (D5), so the
-/// next re-trigger is a socket change or the refresh cadence); it
-/// stamps the due clock, so the (b) cadence starts a full interval
-/// after it; (b) else, when the `refresh_enabled` gate is on and the
-/// last poll is ≥ the clamped interval old (the thread-local
-/// `last_poll` stamp, so a flapping daemon polls on the configured
-/// cadence instead of every tick; a disabled refresh idles the loop,
-/// and a changed knob takes effect on the next tick — no restart),
-/// poll telemetry; tick [`POLLER_TICK`] (200 ms, so bench progress
-/// stays responsive); exit when `stop` is set or the channel
-/// disconnects. The `RwLock`'s data fields are written from this
+/// the `refresh_enabled` gate + the `socket` — and the post-setup
+/// auto-reconnect edge (`reconnect_requested`, the one-click setup
+/// worker's successful run — the C21-36 removal), and: (a) when the
+/// edge is set, run one immediate [`poll_telemetry`] poll against
+/// the live socket, independent of `refresh_enabled`, consume the
+/// edge, and stamp the due clock (the (b) one-shot baseline
+/// re-triggers on the next tick — one extra idempotent poll, then
+/// the normal rhythm); (b) else, run exactly one **baseline**
+/// [`poll_telemetry`] fetch for a `socket` value the thread-local
+/// `baseline_for` stamp has not seen yet (D-8 — regardless of
+/// `refresh_enabled`, the one-shot startup snapshot; a socket edit
+/// re-triggers exactly one fetch for the new socket, and a failed
+/// baseline never retries on its own — no retry storm: the stamp is
+/// set after the fetch, which cannot panic (D5), so the next
+/// re-trigger is a socket change or the refresh cadence); it stamps
+/// the due clock, so the (c) cadence starts a full interval after
+/// it; (c) else, when the `refresh_enabled` gate is on and the last
+/// poll is ≥ the clamped interval old (the thread-local `last_poll`
+/// stamp, so a flapping daemon polls on the configured cadence
+/// instead of every tick; a disabled refresh idles the loop, and a
+/// changed knob takes effect on the next tick — no restart), poll
+/// telemetry; tick [`POLLER_TICK`] (200 ms, so bench progress stays
+/// responsive); exit when `stop` is set or the channel disconnects. The `RwLock`'s data fields are written from this
 /// thread only, so the `unwrap` is the workspace's one-writer
 /// precedent (TUI P3-24).
 pub fn spawn_poller(
@@ -1017,19 +1040,39 @@ pub fn spawn_poller(
                     }
                 }
                 Err(TryRecvError::Empty) => {
-                    // The live settings knobs (C6-27 / C6-30): re-read
-                    // every tick — a changed interval (clamped), the
+                    // The live settings knobs (C6-27 / C6-30) + the
+                    // post-setup auto-reconnect edge: re-read every
+                    // tick — a changed interval (clamped), the
                     // refresh gate, or the socket takes effect
                     // without a restart.
-                    let (interval, refresh_enabled, socket) = {
+                    let (interval, refresh_enabled, socket, reconnect_requested) = {
                         let settings = state.read().unwrap();
                         (
                             clamp_poll_interval(settings.settings.poll_interval_ms),
                             settings.settings.refresh_enabled,
                             settings.settings.socket.clone(),
+                            settings.reconnect_requested,
                         )
                     };
-                    if baseline_for.as_deref() != Some(socket.as_str()) {
+                    if reconnect_requested {
+                        // The post-setup auto-reconnect edge (the
+                        // C21-36 removal): the setup worker's
+                        // successful run (re)started the daemon —
+                        // run one immediate poll against the live
+                        // socket, independent of the refresh gate
+                        // (a disabled refresh would idle the loop
+                        // and never pick up the daemon on its
+                        // own). Consume the edge (the clear is a
+                        // separate brief write); the due clock is
+                        // stamped, so the (c) cadence resumes a
+                        // full interval after this poll, and the
+                        // (b) one-shot baseline re-triggers on the
+                        // next tick (one extra idempotent poll,
+                        // then the normal rhythm).
+                        state.write().unwrap().reconnect_requested = false;
+                        last_poll = Instant::now();
+                        let _ = poll_telemetry(Path::new(&socket), &mut state.write().unwrap());
+                    } else if baseline_for.as_deref() != Some(socket.as_str()) {
                         // The one-shot baseline fetch for this socket
                         // value (D-8): exactly one per distinct
                         // socket, regardless of `refresh_enabled` —
@@ -1037,7 +1080,7 @@ pub fn spawn_poller(
                         // + the due clock after the fetch (which cannot
                         // panic, D5) — no retry storm: a failed
                         // baseline is not re-attempted on its own — so
-                        // the (b) cadence starts a full interval after
+                        // the (c) cadence starts a full interval after
                         // it.
                         let _ = poll_telemetry(Path::new(&socket), &mut state.write().unwrap());
                         baseline_for = Some(socket);
@@ -1209,6 +1252,7 @@ mod tests {
         assert!(state.last_update.is_none());
         assert!(state.error.is_none());
         assert!(state.graph.is_empty(), "a fresh state has no graph samples");
+        assert!(!state.reconnect_requested, "a fresh state has no reconnect edge");
     }
 
     /// (a) `poll_telemetry` against a live stand-in (a `GetTelemetry`
@@ -1451,6 +1495,95 @@ mod tests {
         // left in flight.
         let state = state.read().expect("the poller must not poison the lock");
         assert!(!state.bench.running);
+    }
+
+    /// (f') The post-setup auto-reconnect edge (the C21-36 removal):
+    /// with the refresh gate OFF (a disabled refresh idles the loop —
+    /// without the edge the (re)started daemon would never be picked
+    /// up in this process), a `reconnect_requested` set in the
+    /// shared state (the setup worker's successful-run edge) forces
+    /// an immediate poll on the very first tick: the stand-in
+    /// daemon's snapshot lands (the status flips
+    /// `connected: <socket>`), the edge is consumed exactly once,
+    /// and the poller stops on the next tick. The follow-up one-shot
+    /// baseline may or may not run before the stop (load-dependent —
+    /// it re-triggers on the next tick); the stand-in answers BOTH
+    /// polls, so the final state is `connected` in every
+    /// interleaving, and the stand-in thread is detached (it is
+    /// done — or, in the stop-first interleaving, blocked on an
+    /// accept that never comes; a test-process leak, reaped at exit,
+    /// never a join deadlock).
+    #[test]
+    fn reconnect_edge_forces_an_immediate_poll_with_refresh_off() {
+        let sock = TempSocket::new("reconnect-edge");
+        let stand_in = DaemonStandIn::spawn_multi(&sock, 2, |_, mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetTelemetry)) => {}
+                other => panic!("stand-in expected GetTelemetry, got {other:?}"),
+            }
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(
+                mock_snapshot(),
+            )))
+            .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+        // `stand_in` is intentionally NOT joined (the leak rationale
+        // in the test doc): the thread is done in the edge-first
+        // interleaving and blocked in the stop-first one.
+        let _ = stand_in;
+
+        // The setup worker's edge: a successful run, refresh off,
+        // the live socket seeded at the stand-in.
+        let state = Arc::new(RwLock::new(TelemetryData {
+            settings: GuiSettings {
+                refresh_enabled: false,
+                socket: sock.path().display().to_string(),
+                ..Default::default()
+            },
+            reconnect_requested: true,
+            ..Default::default()
+        }));
+        let (_tx, rx) = mpsc::channel::<BenchCmd>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let handle = spawn_poller(state.clone(), rx, stop.clone(), cancel);
+        // Wait for the edge's immediate poll to land (bounded — the
+        // 30 s deadline is generous under full-machine test load:
+        // the poller's tick is 200 ms, so a sane build lands the
+        // edge's poll in well under a second).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let s = state.read().expect("the poller must not poison the lock");
+            if s.daemon_status.starts_with("connected") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the edge's immediate poll never landed (status: {})",
+                s.daemon_status
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("the poller thread must not panic");
+
+        let s = state.read().expect("the poller must not poison the lock");
+        assert!(
+            s.daemon_status.starts_with("connected"),
+            "the edge's poll must report the connection: {}",
+            s.daemon_status
+        );
+        assert!(
+            s.daemon_status.contains(&sock.path().display().to_string()),
+            "the status must name the live socket: {}",
+            s.daemon_status
+        );
+        assert!(
+            s.telemetry.is_some(),
+            "the edge's poll must land the stand-in's snapshot"
+        );
+        assert!(!s.reconnect_requested, "the edge must be consumed exactly once");
     }
 
     /// (f) CANCEL (P3-28): after the `BenchStarted` ack lands in the
@@ -3186,7 +3319,7 @@ mod tests {
                 kernel: "6.6.0-test".to_owned(),
                 os: "Linux / Test".to_owned(),
                 arch: "x86_64".to_owned(),
-                ramsleuth_version: "2.4.10".to_owned(),
+                ramsleuth_version: "2.4.11".to_owned(),
                 telemetry_source: "unavailable".to_owned(),
             },
         }

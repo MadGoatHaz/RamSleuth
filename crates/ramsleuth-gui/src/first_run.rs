@@ -8,8 +8,10 @@
 //! detail carries the status diagnostic + the `systemctl status
 //! ramsleuth` check); (2) the last poll recorded a permission error
 //! (the daemon socket is group-gated — a groupless client) →
-//! `sudo usermod -aG ramsleuth $USER` (a re-login is required after
-//! joining); (3) AMD silicon with the daemon connected and the AMD
+//! `sudo usermod -aG ramsleuth $USER` (the one-click setup also
+//! applies a per-user ACL, so the current session connects
+//! immediately — no re-login; the manual command alone activates at
+//! re-login); (3) AMD silicon with the daemon connected and the AMD
 //! branch `Na(DriverMissing)` (the host's vendor comes from the
 //! existing pure-CPUID detection — the snapshot's `cpu.vendor`, with
 //! [`CpuInfo::detect()`] as the unprivileged fallback that needs no
@@ -24,10 +26,12 @@
 //!
 //! [`render_requirements_strip_with_setup`] paints that list as the
 //! `SETUP` strip the app shell shows on launch (the C18-02
-//! integration): a bold-CYAN title, the primary CYAN
-//! **`Set up RamSleuth`** button (C21 — the one-click wizard; the AMD
-//! `DriverMissing` case labels it `+ AMD driver`) + its dim live status
-//! line (idle / `running…` / `done — restart RamSleuth to activate` /
+//! integration): a bold-CYAN title, the single primary CYAN
+//! **`Set up RamSleuth`** button (C21 — the unified one-click action:
+//! one button over every requirement mix — the `--with-dkms` flag is
+//! decided by the host's CPU vendor, not by the requirement list) +
+//! its dim live status
+//! line (idle / `running…` / `done — reconnecting to the daemon…` /
 //! `one step left: <msg>` — the Secure Boot one-time MOK step, actionable
 //! amber, not a failure / `failed: <msg>`), one row per requirement (an AMBER `!`, the
 //! summary, the dim detail, the command with a **Copy** button — the
@@ -35,16 +39,20 @@
 //! the dim no-panic footer.
 //!
 //! **One-click setup (C21) + the Copy fallback (D-18.5, risk (a)):**
-//! the primary affordance is the `Set up RamSleuth` button — a thin
-//! client over the pkexec-able `ramsleuth-setup` root helper (one
-//! privileged pass: daemon enable+start, group join, the socket ACL —
-//! and on AMD the offline DKMS driver build + `modprobe`; no
-//! re-login, no reboot). The render thread only flips
-//! [`SetupOutcome::running`] (D6: zero I/O on the render thread — the
-//! actual `pkexec` spawn is the setup worker's job, C21-06). The
-//! per-row **Copy** buttons are KEPT as the secondary polkit-less
-//! fallback (the D-18.5 grace line for the `polkit`/`acl`-less edge;
-//! the clipboard path — no terminal spawn, no `sudo` shell-out).
+//! the primary — and only — affordance is the `Set up RamSleuth`
+//! button: a single unified action, a thin client over the pkexec-able
+//! `ramsleuth-setup` root helper (one privileged pass: daemon
+//! enable+start, group join, the socket ACL — and, on AMD/Intel
+//! silicon, the offline DKMS driver build + `modprobe`; the helper
+//! routes `--with-dkms` by the host's CPU vendor; no re-login, no
+//! reboot, no app restart — the poller auto-reconnects to the
+//! (re)started daemon and the strip unmounts on its own). The render
+//! thread only flips [`SetupOutcome::running`] (D6: zero I/O on the
+//! render thread — the actual `pkexec` spawn is the setup worker's
+//! job, C21-06). The per-row **Copy** buttons are KEPT as the
+//! secondary polkit-less fallback (the D-18.5 grace line for the
+//! `polkit`/`acl`-less edge; the clipboard path — no terminal spawn,
+//! no `sudo` shell-out).
 //!
 //! **No-panic contract (plan D5):** [`diagnose`] is pure and total — a
 //! daemon-less [`TelemetryData::default()`] yields the single daemon
@@ -68,7 +76,8 @@
 //! strip between the header and the settings area — presence-driven:
 //! it disappears on its own once every requirement is resolved).
 //! C21-04 adds the one-click setup wizard ([`setup_argv`] +
-//! [`SetupOutcome`] + [`setup_with_dkms`] +
+//! [`SetupOutcome`] + [`setup_with_dkms`] (the host-vendor decision
+//! for the unified `--with-dkms` flag) +
 //! [`render_requirements_strip_with_setup`]); C21-05 re-exports the
 //! wizard symbols, C21-06 wires the app shell's setup worker to the
 //! 4-arg entry (the 3-arg [`render_requirements_strip`] stays as the
@@ -121,12 +130,14 @@ fn daemon_down_requirement(status: &str) -> Requirement {
     }
 }
 
-/// Case 2 — a groupless client: join the `ramsleuth` group (a re-login
-/// is required after joining).
+/// Case 2 — a groupless client: join the `ramsleuth` group (the
+/// one-click setup also applies a per-user ACL, so the current
+/// session connects immediately — no re-login; the manual command
+/// alone activates at re-login).
 fn group_requirement() -> Requirement {
     Requirement {
         summary: "Join the `ramsleuth` group".to_owned(),
-        detail: "the daemon socket is group-gated — a re-login is required after joining"
+        detail: "the daemon socket is group-gated — the one-click setup also applies a per-user ACL, so the current session connects immediately (no re-login; the manual command alone activates at re-login)"
             .to_owned(),
         command: Some("sudo usermod -aG ramsleuth $USER".to_owned()),
     }
@@ -251,7 +262,10 @@ pub fn requirements_strip_visible(requirements_open: bool, data: &TelemetryData)
 /// with the current user's name (`SUDO_USER` may be unset).
 /// `--with-dkms` is the vendor-aware flag (the helper routes it by CPU
 /// vendor: AMD → `ryzen_smu`, Intel → `ramsleuth_intel`) and is passed
-/// for both the AMD and the Intel `DriverMissing` variants.
+/// whenever the host is AMD or Intel silicon (the unified-action
+/// decision, [`setup_with_dkms`]); other/unknown silicon gets the
+/// daemon + group + ACL pass only (the helper hard-fails on the flag
+/// for a non-AMD/Intel vendor).
 pub fn setup_argv(with_dkms: bool, user: &str) -> Vec<String> {
     let mut argv = vec![
         "/usr/bin/ramsleuth-setup".to_owned(),
@@ -277,7 +291,7 @@ pub fn setup_argv(with_dkms: bool, user: &str) -> Vec<String> {
 /// diagnostic, exit 1, or the spawn itself failed).
 ///
 /// The strip's dim status line renders the five states: idle (the
-/// default) / `running…` / `done — restart RamSleuth to activate` /
+/// default) / `running…` / `done — reconnecting to the daemon…` /
 /// `one step left: <msg>` (the Secure Boot one-time MOK step — actionable
 /// amber, not a failure) / `failed: <msg>`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -289,10 +303,11 @@ pub struct SetupOutcome {
     /// (idempotent) helper run.
     pub running: bool,
     /// The helper exited 0 — all requested setup steps succeeded or
-    /// were no-ops. The new session state (the group membership, the
-    /// socket ACL) activates in the *next* app launch — the current
-    /// process's session predates it (no re-login, no reboot); the
-    /// C21-36 modal prompt offers the in-place relaunch.
+    /// were no-ops. No app restart is needed: the helper's per-user
+    /// ACL covers the current session (no re-login, no reboot), and
+    /// the background poller gets a forced immediate re-poll (the
+    /// state's `reconnect_requested` edge) — the strip unmounts on
+    /// its own the moment the (re)started daemon serves.
     pub done: bool,
     /// The helper failed: the trailing diagnostic for the status line
     /// (`failed: <msg>`).
@@ -304,35 +319,40 @@ pub struct SetupOutcome {
     pub secure_boot_pending: Option<String>,
 }
 
-/// Decide the `--with-dkms` flag from the diagnosed requirements:
-/// true iff the AMD `DriverMissing` case (case 3) or the Intel
-/// `DriverMissing` case (case 4) is present (the reused GUI detection:
-/// the `cpuid` vendor + the `Na(DriverMissing)` reason). The one click
-/// then also builds + `modprobe`s the offline vendor driver (the
-/// helper routes `--with-dkms` by CPU vendor); otherwise
-/// daemon/group/ACL only.
-pub fn setup_with_dkms(requirements: &[Requirement]) -> bool {
-    requirements.iter().any(|r| {
-        matches!(
-            r.command.as_deref(),
-            Some(DKMS_INSTALL_CMD) | Some(DKMS_INSTALL_CMD_INTEL)
-        )
-    })
+/// Decide the `--with-dkms` flag of the unified one-click action from
+/// the host's CPU vendor (NOT from the diagnosed requirement list —
+/// that is what made the daemon-down first launch run the helper
+/// without the driver and leave a second, driver-only stage behind):
+/// true iff the host is AMD or Intel silicon — the snapshot's
+/// `cpu.vendor` when it names one (the daemon's own CPUID detection),
+/// else the unprivileged [`CpuInfo::detect()`] fallback (a daemon-down
+/// first launch carries no snapshot). The single click then covers
+/// daemon + group + ACL + the offline vendor driver in one privileged
+/// pass (the helper routes `--with-dkms` by the CPU vendor: AMD →
+/// `ryzen_smu`, Intel → `ramsleuth_intel`); other / unknown silicon
+/// gets the daemon + group + ACL pass only (the helper hard-fails on
+/// the flag for a non-AMD/Intel vendor).
+pub fn setup_with_dkms(data: &TelemetryData) -> bool {
+    let vendor = match &data.telemetry {
+        Some(telemetry) => host_vendor(telemetry),
+        None => CpuInfo::detect().vendor,
+    };
+    matches!(vendor, CpuVendor::Amd(_) | CpuVendor::Intel(_))
 }
 
 /// Render the `SETUP` requirements strip with the one-click setup
 /// wizard into `ui` (the C18-02 panel body + the C21-04 wizard): the
-/// bold-CYAN title, the primary CYAN **`Set up RamSleuth`** button
-/// (the AMD `DriverMissing` case labels it `+ AMD driver` and the
-/// Intel `DriverMissing` case `+ Intel driver` —
-/// [`setup_with_dkms`]), its dim live status line (idle / `running…`
-/// / `done — restart RamSleuth to activate` / `failed: <msg>`), one row
-/// per requirement (an AMBER `!`, the summary, the dim detail, the
-/// command with the **Copy** button — `ui.ctx().copy_text`, the
-/// secondary polkit-less fallback, D-18.5), the `Got it — keep using
-/// RamSleuth` button (it flips `*open` — the render thread's one
-/// permitted write, no I/O, the D6 settings precedent), and the dim
-/// no-panic footer.
+/// bold-CYAN title, the single primary CYAN **`Set up RamSleuth`**
+/// button (one label over every requirement mix — the unified
+/// action; the `--with-dkms` decision is the host-vendor one,
+/// [`setup_with_dkms`]), its dim live status line (idle /
+/// `running…` / `done — reconnecting to the daemon…` /
+/// `failed: <msg>`), one row per requirement (an AMBER `!`, the
+/// summary, the dim detail, the command with the **Copy** button —
+/// `ui.ctx().copy_text`, the secondary polkit-less fallback, D-18.5),
+/// the `Got it — keep using RamSleuth` button (it flips `*open` — the
+/// render thread's one permitted write, no I/O, the D6 settings
+/// precedent), and the dim no-panic footer.
 ///
 /// The wizard's click handler only flips `setup.running` (the render
 /// thread does zero I/O — D6; the `pkexec` spawn is the C21-06
@@ -362,18 +382,10 @@ pub fn render_requirements_strip_with_setup(
         // hidden when there is nothing to set up (no-panic
         // degradation).
         if !requirements.is_empty() {
-            let label = if setup_with_dkms(requirements) {
-                if requirements
-                    .iter()
-                    .any(|r| r.command.as_deref() == Some(DKMS_INSTALL_CMD_INTEL))
-                {
-                    "Set up RamSleuth + Intel driver"
-                } else {
-                    "Set up RamSleuth + AMD driver"
-                }
-            } else {
-                "Set up RamSleuth"
-            };
+            // The unified action: one label over every requirement
+            // mix (the `--with-dkms` flag is the worker's vendor
+            // decision, [`setup_with_dkms`] — not a second button).
+            let label = "Set up RamSleuth";
             let _ = ui.horizontal(|ui| {
                 // The palette's primary accent: CYAN fill + SLATE
                 // text; disabled while the helper runs (no
@@ -392,14 +404,15 @@ pub fn render_requirements_strip_with_setup(
             let (status, color) = if setup.running {
                 ("running…".to_owned(), CYAN)
             } else if setup.done {
-                ("done — restart RamSleuth to activate".to_owned(), CYAN)
+                ("done — reconnecting to the daemon…".to_owned(), CYAN)
             } else if let Some(pending) = &setup.secure_boot_pending {
                 (format!("one step left: {pending}"), AMBER)
             } else if let Some(failure) = &setup.failure {
                 (format!("failed: {failure}"), AMBER)
             } else {
                 (
-                    "one click runs all the privileged setup — no re-login, no reboot".to_owned(),
+                    "One click installs the driver and starts the daemon — no reboot needed."
+                        .to_owned(),
                     NA_GRAY,
                 )
             };
@@ -541,7 +554,7 @@ mod tests {
     /// (b) A groupless client: the last poll hit a permission error
     /// (std's `Permission denied` — case-insensitive match) → the
     /// daemon requirement + the join-the-group requirement (the
-    /// re-login note in the detail).
+    /// no-re-login ACL note in the detail).
     #[test]
     fn diagnose_permission_error() {
         let data = TelemetryData {
@@ -566,8 +579,8 @@ mod tests {
             .expect("the permission error must yield the join-group requirement");
         assert_eq!(group.summary, "Join the `ramsleuth` group");
         assert!(
-            group.detail.contains("re-login"),
-            "a re-login note is required: {}",
+            group.detail.contains("per-user ACL") && group.detail.contains("no re-login"),
+            "the detail must promise the immediate-ACL access (no re-login): {}",
             group.detail
         );
     }
@@ -798,26 +811,108 @@ mod tests {
         );
     }
 
-    /// (h) The `--with-dkms` decision reuses the GUI AMD detection
-    /// (the diagnosed requirements): the DKMS case (3) present → the
-    /// full setup; daemon/group-only → plain; empty → plain.
+    /// (h) The `--with-dkms` decision is the HOST-VENDOR one (the
+    /// unified action): AMD or Intel silicon → the one click carries
+    /// the flag (daemon + group + ACL + driver in a single pass); a
+    /// daemon-down first launch on AMD silicon (the lilgoat case —
+    /// the diagnosed list carries no DKMS case when the daemon is
+    /// down) → the SAME click carries the flag, so no second,
+    /// driver-only stage ever appears. (The unknown-vendor /
+    /// no-snapshot arm falls back to the unprivileged
+    /// `CpuInfo::detect()` — host-dependent, so it is not asserted
+    /// here.)
     #[test]
-    fn setup_with_dkms_decision() {
-        assert!(!setup_with_dkms(&[]));
-        assert!(!setup_with_dkms(&[daemon_down_requirement("disconnected")]));
-        assert!(!setup_with_dkms(&[group_requirement()]));
-        // The AMD `DriverMissing` case.
-        assert!(setup_with_dkms(&[group_requirement(), dkms_requirement()]));
-        // The Intel `DriverMissing` case (the mirror).
-        assert!(setup_with_dkms(&[group_requirement(), intel_dkms_requirement()]));
+    fn setup_with_dkms_is_the_vendor_decision() {
+        // AMD silicon (the snapshot's vendor is authoritative).
+        assert!(setup_with_dkms(&connected(
+            CpuVendor::Amd(AmdZen::Zen3),
+            NaReason::NotApplicable,
+            NaReason::NotApplicable,
+        )));
+        // Intel silicon (the mirror).
+        assert!(setup_with_dkms(&connected(
+            CpuVendor::Intel(IntelGen::Skylake),
+            NaReason::NotApplicable,
+            NaReason::DriverMissing,
+        )));
+        // The daemon-down first launch on AMD silicon (the lilgoat
+        // case): the snapshot names the vendor, the daemon status is
+        // not connected — the unified action must still carry
+        // `--with-dkms` (one click from the very first launch).
+        let first_launch = TelemetryData {
+            telemetry: Some(snapshot(
+                CpuVendor::Amd(AmdZen::Zen3),
+                NaReason::NotApplicable,
+                NaReason::NotApplicable,
+            )),
+            daemon_status: "disconnected".to_owned(),
+            ..Default::default()
+        };
+        assert!(
+            setup_with_dkms(&first_launch),
+            "a daemon-down launch on AMD silicon must carry --with-dkms"
+        );
     }
 
-    /// (i) The wizard over the two-frame `ctx.run` idiom: the primary
-    /// button paints (the AMD label when the DKMS requirement is
-    /// present), the click flips `SetupOutcome::running` (the render
-    /// thread's one permitted write — the status line paints
-    /// `running…` in the same frame), and `Got it` still closes the
-    /// strip (the wizard doesn't steal the existing affordance).
+    /// (h') The unified one-click: exactly ONE setup action exists —
+    /// the single `Set up RamSleuth` button whose argv is the
+    /// polkit-authorized `pkexec /usr/bin/ramsleuth-setup`; the
+    /// `--with-dkms` flag (vendor-decided) is part of that same
+    /// single argv. There is no separate driver-only stage: the AMD /
+    /// Intel `DriverMissing` requirement mix yields the same single
+    /// action (with the flag), never a second one.
+    #[test]
+    fn setup_is_a_single_unified_action() {
+        // The AMD `DriverMissing` mix (the old second stage's input).
+        let data = connected(
+            CpuVendor::Amd(AmdZen::Zen3),
+            NaReason::DriverMissing,
+            NaReason::NotApplicable,
+        );
+        assert!(setup_with_dkms(&data));
+        assert_eq!(
+            setup_argv(setup_with_dkms(&data), "alice"),
+            vec![
+                "/usr/bin/ramsleuth-setup".to_owned(),
+                "--user".to_owned(),
+                "alice".to_owned(),
+                "--with-dkms".to_owned()
+            ],
+            "the DriverMissing mix must yield the single polkit-authorized action with --with-dkms"
+        );
+        // The daemon-down mix (the old first stage's input): on AMD
+        // silicon the same single action (with the flag) — the two
+        // stages are one.
+        let first_launch = TelemetryData {
+            telemetry: Some(snapshot(
+                CpuVendor::Amd(AmdZen::Zen3),
+                NaReason::NotApplicable,
+                NaReason::NotApplicable,
+            )),
+            daemon_status: "disconnected".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            setup_argv(setup_with_dkms(&first_launch), "alice"),
+            vec![
+                "/usr/bin/ramsleuth-setup".to_owned(),
+                "--user".to_owned(),
+                "alice".to_owned(),
+                "--with-dkms".to_owned()
+            ],
+            "the daemon-down launch must carry the driver in the same single action"
+        );
+    }
+
+    /// (i) The wizard over the two-frame `ctx.run` idiom: the single
+    /// unified `Set up RamSleuth` button paints (the same label over
+    /// the DKMS requirement mix — no `+ AMD driver` variant), the
+    /// truthful idle status line paints (no reboot), the click flips
+    /// `SetupOutcome::running` (the render thread's one permitted
+    /// write — the status line paints `running…` in the same frame),
+    /// a `done` outcome paints the auto-reconnect line (no manual
+    /// restart), and `Got it` still closes the strip (the wizard
+    /// doesn't steal the existing affordance).
     #[test]
     fn first_run_setup_wizard_frames() {
         let requirement = dkms_requirement(); // the AMD variant
@@ -848,8 +943,9 @@ mod tests {
             });
         }
 
-        // Frame 1: the layout — the AMD-labelled primary button + the
-        // idle status line paint; no click leaves the outcome idle.
+        // Frame 1: the layout — the unified primary button + the
+        // truthful idle status line paint; no click leaves the
+        // outcome idle.
         let first = ctx.run(frame_input(Vec::new()), |ctx| {
             show_strip(ctx, &requirement, &mut open, &mut setup)
         });
@@ -866,8 +962,18 @@ mod tests {
             })
             .collect();
         assert!(
-            texts.contains(&"Set up RamSleuth + AMD driver"),
-            "the AMD-labelled primary button must paint: {texts:?}"
+            texts.contains(&"Set up RamSleuth"),
+            "the unified primary button must paint: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("+ AMD driver") || t.contains("+ Intel driver")),
+            "no driver-stage label variant may paint: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("no reboot needed")),
+            "the idle status line must make the truthful no-reboot promise: {texts:?}"
         );
 
         // Frame 2: a click on the button's painted label flips
@@ -877,9 +983,7 @@ mod tests {
             .shapes
             .iter()
             .find_map(|clipped| match &clipped.shape {
-                egui::Shape::Text(text)
-                    if text.galley.text() == "Set up RamSleuth + AMD driver" =>
-                {
+                egui::Shape::Text(text) if text.galley.text() == "Set up RamSleuth" => {
                     Some(egui::pos2(
                         text.pos.x + text.galley.size().x / 2.0,
                         text.pos.y + text.galley.size().y / 2.0,
@@ -912,6 +1016,34 @@ mod tests {
             "the status line must paint running…: {texts:?}"
         );
 
+        // Frame 2b: a `done` outcome (the worker clears `running`
+        // and sets `done`) paints the auto-reconnect line — no
+        // manual restart, no modal (the C21-36 removal).
+        setup.running = false;
+        setup.done = true;
+        let done_frame = ctx.run(frame_input(Vec::new()), |ctx| {
+            show_strip(ctx, &requirement, &mut open, &mut setup)
+        });
+        let texts: Vec<&str> = done_frame
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("done — reconnecting to the daemon…")),
+            "the done line must promise the auto-reconnect: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("restart")),
+            "no restart instruction may paint: {texts:?}"
+        );
+        setup.done = false;
+
         // Frame 3: `Got it` still closes the strip.
         let pos = second
             .shapes
@@ -935,11 +1067,12 @@ mod tests {
         assert!(!open, "a click on the Got-it button must close the strip");
     }
 
-    /// (j) The wizard's primary button label for the Intel variant: an
-    /// Intel `DriverMissing` requirement paints the `+ Intel driver`
-    /// label (the AMD one paints `+ AMD driver`).
+    /// (j) The wizard's unified label over the Intel `DriverMissing`
+    /// mix: the SAME single `Set up RamSleuth` button paints (no
+    /// `+ Intel driver` variant — the unified action; the AMD mirror
+    /// is (i)).
     #[test]
-    fn first_run_setup_wizard_intel_label() {
+    fn first_run_setup_wizard_unified_label_intel() {
         let requirement = intel_dkms_requirement(); // the Intel variant
         let ctx = egui::Context::default();
         let mut open = true;
@@ -979,15 +1112,22 @@ mod tests {
             })
             .collect();
         assert!(
-            texts.contains(&"Set up RamSleuth + Intel driver"),
-            "the Intel-labelled primary button must paint: {texts:?}"
+            texts.contains(&"Set up RamSleuth"),
+            "the unified primary button must paint: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("+ Intel driver") || t.contains("+ AMD driver")),
+            "no driver-stage label variant may paint: {texts:?}"
         );
     }
 
-    /// (k) The Secure Boot one-step-left state: the strip's status line
-    /// paints `one step left: <msg>` (the actionable amber state — NOT the
-    /// `failed:` failure state, and `done` is false so no restart modal
-    /// opens): headless over the two-frame `ctx.run` idiom.
+    /// (k) The Secure Boot one-step-left state: the strip's status
+    /// line paints `one step left: <msg>` (the actionable amber state
+    /// — NOT the `failed:` failure state, and `done` is false so no
+    /// auto-reconnect edge fires): headless over the two-frame
+    /// `ctx.run` idiom.
     #[test]
     fn first_run_secure_boot_pending_renders() {
         let requirement = dkms_requirement();
@@ -1045,7 +1185,7 @@ mod tests {
         );
         assert!(
             !setup.done,
-            "a pending outcome is not done — the restart modal must never open",
+            "a pending outcome is not done — no auto-reconnect edge may fire",
         );
         assert!(
             open,

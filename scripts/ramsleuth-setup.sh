@@ -39,10 +39,21 @@
 #   0d. the daemon is restarted so the normalized state file is applied to a
 #       FRESH socket (heals a stale socket/ACL; the daemon removes the
 #       socket on clean shutdown and re-applies the ACLs on creation,
-#       C21-03), and polkit is restarted so the branded
-#       org.freedesktop.ramsleuth.setup action is live (heals a stale
-#       action pool — the .install hook's restart is non-fatal and may
-#       have failed).
+#       C21-03), and polkit is restarted ONLY when the branded
+#       org.freedesktop.ramsleuth.setup action is missing from the
+#       running polkitd's pool AND the policy file is newer than the
+#       running polkitd (the true stale-pool case — the .install
+#       hook's restart is non-fatal and may have failed). The restart
+#       is skipped when the action is already live, and when the
+#       policy is not newer than the running polkitd: a mid-run
+#       polkitd restart drops the desktop session's registered polkit
+#       agent (the agent does not reliably re-register on a rapid
+#       restart), which would break every LATER privileged action in
+#       that session — the 2026-09-27 clean-install two-stage
+#       setup-loop failure. (A polkitd that has gone STUCK on a
+#       policy file it never loads — observed 2026-09-27 on a
+#       CachyOS box, a polkitd quirk cleared by a reboot — gets no
+#       mid-run restart; the note says so.)
 #
 # Steps:
 #   1. `systemctl daemon-reload` + `enable --now ramsleuth.service` (hard —
@@ -323,16 +334,41 @@ else
   log "WARN: setfacl on $SOCKET failed — the daemon re-applies the ACL on its next socket creation"
 fi
 
-# --- Self-heal 0e: polkit restart (idempotent) — a polkitd that started before
-# --- the policy was (re)installed may serve a STALE action pool (its inotify
-# --- hot-reload is unreliable; observed 2026-09-25), which makes the GUI's
-# --- one-click prompt show the generic dialog. The .install hook already tries
-# --- this, but non-fatally; doing it here — inside the privileged run — heals
-# --- it. Guarded: it never fails the setup.
-if systemctl restart polkit 2>/dev/null; then
-  log "polkit: restarted — the branded org.freedesktop.ramsleuth.setup action is live"
+# --- Self-heal 0e: polkit restart — ONLY for the true stale-pool case: the
+# --- branded action is missing from the running polkitd's pool AND the policy
+# --- file is newer than the running polkitd (polkitd started before the policy
+# --- was (re)installed — its inotify hot-reload is unreliable; observed
+# --- 2026-09-25). The .install hook already tries this restart, but
+# --- non-fatally, so doing it here — inside the privileged run — heals it.
+# --- The restart is SKIPPED when the action is already live, and when the
+# --- policy is not newer than the running polkitd: a mid-run polkitd restart
+# --- drops the desktop session's registered polkit agent (the agent does not
+# --- reliably re-register on a rapid restart), which would break every LATER
+# --- privileged action in that session — the 2026-09-27 clean-install
+# --- two-stage setup-loop failure. A polkitd stuck on a policy it never loads
+# --- (a polkitd quirk — observed 2026-09-27 on a CachyOS box, cleared by a
+# --- reboot) gets no mid-run restart (a restart does not help it); the note
+# --- says so. Guarded: it never fails the setup.
+POLICY_FILE="/usr/share/polkit-1/actions/90-ramsleuth-setup.policy"
+policy_newer_than_polkitd() {
+  local ts_file ts_polkit
+  ts_file="$(stat -c %Y "$POLICY_FILE" 2>/dev/null)" || return 1
+  ts_polkit="$(systemctl show polkit -p ActiveEnterTimestamp --value 2>/dev/null | xargs -r -n 1 date +%s 2>/dev/null)" \
+    || return 1
+  [[ -n "$ts_file" && -n "$ts_polkit" ]] || return 1
+  (( ts_file > ts_polkit ))
+}
+if command -v pkaction >/dev/null 2>&1 \
+   && pkaction --verbose 2>/dev/null | grep -q "^org.freedesktop.ramsleuth.setup:"; then
+  log "polkit: the branded org.freedesktop.ramsleuth.setup action is already live (no restart needed)"
+elif policy_newer_than_polkitd; then
+  if systemctl restart polkit 2>/dev/null; then
+    log "polkit: restarted — the policy postdates the running polkitd; the branded org.freedesktop.ramsleuth.setup action should now be live"
+  else
+    log "WARN: polkit restart failed (non-fatal) — if the GUI's setup prompt shows the generic polkit dialog, run: systemctl restart polkit (or reboot)"
+  fi
 else
-  log "WARN: polkit restart failed (non-fatal) — if the GUI's setup prompt shows the generic polkit dialog, run: systemctl restart polkit (or reboot)"
+  log "polkit: the branded action is not in the running pool, but the policy is not newer than this polkitd — a stuck pool (a reboot clears it; a mid-run restart would drop the session's polkit agent, so it is not attempted)"
 fi
 
 # --- Summary + the optional DKMS delegation (vendor-aware: INTEL-08) ----------

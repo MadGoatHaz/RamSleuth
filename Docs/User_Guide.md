@@ -1,6 +1,6 @@
 # RamSleuth — User Guide
 
-**Version:** 2.4.10 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
+**Version:** 2.4.11 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
 
 RamSleuth v2 is a live RAM telemetry suite and an AIDA64-style memory benchmark for
 AMD and Intel desktops. It watches your memory system in real time — clocks, the
@@ -233,12 +233,12 @@ yay -S ramsleuth-intel-dkms  # Intel — live Intel subtimings (Section 10.5)
 The two **core** packages are deliberately distinct:
 
 - **`ramsleuth` — STABLE source.** Builds the workspace from the official
-  git tag `v$pkgver` (currently `v2.4.10`). A tag is a reproducible,
+  git tag `v$pkgver` (currently `v2.4.11`). A tag is a reproducible,
   auditable snapshot — this is the **default recommendation for production
   installs**. It compiles only the pinned repository (`--locked`), with no
   third-party code in the build.
 - **`ramsleuth-bin` — PRECOMPILED.** Downloads the release binary tarball
-  `ramsleuth-2.4.10-x86_64.tar.zst` from the official GitHub Release (pinned
+  `ramsleuth-2.4.11-x86_64.tar.zst` from the official GitHub Release (pinned
   by its `sha256sums`) and installs it as-is — **no build, no makedepends**.
   This is the **fastest install path**.
 
@@ -288,7 +288,7 @@ can build and install either package directly from the `packaging/`
 directories:
 
 ```sh
-cd packaging/ramsleuth      # STABLE source (builds from the v2.4.10 tag)
+cd packaging/ramsleuth      # STABLE source (builds from the v2.4.11 tag)
 # cd packaging/ramsleuth-bin   # PRECOMPILED (downloads the release tarball)
 makepkg -si
 ```
@@ -376,10 +376,10 @@ ships the same helper under its own name at
 `/usr/bin/ramsleuth-install-ryzen-smu-dkms` **and the vendored source tree**
 at `/usr/share/ryzen-smu-dkms/vendor/`, so the one-click setup runs it for
 you **offline** (`sudo ramsleuth-setup --with-dkms`, or the GUI's
-*"Set up RamSleuth + AMD driver"* button — the in-app one-click installs
-daemon + group + driver in one action). The AUR extra is **mutually
-exclusive** with the app (shared vendored source — installing it removes a
-main package), so it is the standalone path only.
+*"Set up RamSleuth"* button — the in-app one-click installs daemon + group
++ driver in one action). The AUR extra is **mutually exclusive** with the
+app (shared vendored source — installing it removes a main package), so it
+is the standalone path only.
 
 ---
 
@@ -399,17 +399,18 @@ handles it in one action.
 account not authorized, or (AMD) the `ryzen_smu` driver absent — the GUI
 shows a cyan-bordered **`SETUP — get the most out of RamSleuth`** strip
 between the header and the dashboard. It lists each problem with the exact
-fix command and a **Copy** button, and its primary button is
-**`Set up RamSleuth`** — labelled **`Set up RamSleuth + AMD driver`** when
-the missing piece is the AMD module (in which case the one click also builds
-and loads the driver).
+fix command and a **Copy** button, and its single primary button is
+**`Set up RamSleuth`** — one unified action: the one polkit prompt runs
+daemon + group + socket ACL together, and on AMD/Intel silicon the same
+action also builds and loads the vendor driver (no second stage, no
+re-login, no reboot, no app restart).
 
 **What one click does.** The button triggers a single **polkit password
 prompt** (the installed `90-ramsleuth-setup.policy`, `auth_admin`) and then
 runs, detached and off the render thread:
 
 ```sh
-pkexec /usr/bin/ramsleuth-setup --user <you>        # … + --with-dkms on the AMD variant
+pkexec /usr/bin/ramsleuth-setup --user <you> --with-dkms   # the flag on AMD/Intel silicon (the vendor decision)
 ```
 
 The prompt that appears is RamSleuth's own branded message (the policy's
@@ -436,14 +437,12 @@ idempotent:
 5. With `--with-dkms` (the AMD variant): delegates to the installed DKMS
    helper — the offline vendored build + `modprobe`, immediate.
 
-The strip's status line then reads `done — restart RamSleuth to activate`,
-and a **"Setup complete"** modal appears with two choices:
-
-- **`Restart now`** — spawns a fresh detached instance of the app and exits
-  the current one, so the new window starts with your membership active;
-- **`Later`** — dismisses it; the current window keeps running as-is (the
-  ACL already gives it socket access, so nothing is lost — the restart only
-  picks up the persisted group state cleanly).
+The strip's status line then reads `done — reconnecting to the daemon…` —
+no modal, no manual restart: the app's background poller runs an immediate
+re-poll (the helper's per-user ACL already gives the current session socket
+access, and the (re)started daemon is live on the other side of it), and
+the moment it connects the SETUP strip unmounts on its own — the dashboard
+goes straight to normal monitoring.
 
 If the helper fails, no modal appears — the strip shows
 `failed: <diagnostic>` (the helper's own single-line reason — the
@@ -508,7 +507,7 @@ shows `Disconnected` with a hint, and the dashboard stays responsive.
 
 ### 4.1 The 3-line header
 
-**Line 1** — the title **`RamSleuth v2.4.10`**, a **platform tag**
+**Line 1** — the title **`RamSleuth v2.4.11`**, a **platform tag**
 (`[AMD AM4 Platform]` for Zen 1–3, `[AMD AM5 Platform]` for Zen 4/5,
 `[Intel LGA Platform]`, or a bare `[Platform]` when the vendor is unknown),
 the **daemon status** (`Daemon: Connected (IPC: /run/ramsleuth/ramsleuth.sock)`
@@ -1223,9 +1222,9 @@ Three ways to get it (all build the same **pinned** upstream source —
 `amkillam/ryzen_smu @ d2983668300dd2a598e5a7dc40e71ce0678cc270`, verified
 2026-08-15 — never a branch HEAD):
 
-1. **One-click, from the GUI** — the SETUP strip's
-   **`Set up RamSleuth + AMD driver`** button (Section 3), or
-   **`sudo ramsleuth-setup --with-dkms`** from a terminal.
+1. **One-click, from the GUI** — the SETUP strip's **`Set up
+   RamSleuth`** button (Section 3), or **`sudo ramsleuth-setup --with-dkms`**
+   from a terminal.
 2. **The built-in helper** — every ramsleuth install ships
    **`sudo ramsleuth-install-ryzen-smu-dkms`**: it verifies the matching
    kernel headers, resolves the source (the offline-vendored tree first, the
@@ -1613,7 +1612,7 @@ And if the **Intel `ramsleuth_intel` module** was installed, remove it:
 
 ```sh
 sudo rmmod ramsleuth_intel
-sudo dkms remove ramsleuth_intel/2.4.10   # the installed DKMS version (list with: dkms status)
+sudo dkms remove ramsleuth_intel/2.4.11   # the installed DKMS version (list with: dkms status)
 sudo rm /etc/modules-load.d/ramsleuth_intel.conf
 sudo rm -rf /usr/src/ramsleuth_intel-*
 # and, if you had the standalone Intel extra (mutually exclusive with the core packages):
@@ -1628,6 +1627,6 @@ group, no socket, no driver.
 
 ---
 
-*This guide describes RamSleuth v2.4.10. For the technical design, see
+*This guide describes RamSleuth v2.4.11. For the technical design, see
 `Docs/Architecture.md`; for the packaging operator guide, see
 `packaging/README.md`.*

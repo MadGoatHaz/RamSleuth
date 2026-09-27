@@ -4,6 +4,14 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project.
 
+## [2.4.11] - 2026-09-27
+
+### Changed
+- **The one-click setup is now genuinely one click**: a single `Set up RamSleuth` action runs `ramsleuth-setup --with-dkms` with the driver decided by the host's CPU vendor (AMD → `ryzen_smu`, Intel → `ramsleuth_intel`, other/unknown → daemon-only) — daemon enable+start, group join, the per-user socket ACL, and the offline DKMS driver build + `modprobe` all in ONE privileged pass on the first click (the requirement-list-based `--with-dkms` decision that left a second, driver-only stage behind on the daemon-down first launch is gone — the flag is now the host-vendor decision)
+- **The GUI auto-reconnects to the daemon after setup (no manual restart)**: the one-click setup worker raises a post-setup reconnect edge that the background poller consumes with one immediate poll — independent of the refresh gate — so the app picks up the (re)started daemon on its own and the setup banner unmounts the moment the daemon serves (the C21-36 "Restart" modal is removed; the per-user ACL means the current session connects with no re-login and no app restart)
+- **The setup script's polkit restart no longer kills a live session's auth agent mid-run**: `ramsleuth-setup` now restarts polkit ONLY when the branded `org.freedesktop.ramsleuth.setup` action is missing from the running polkitd's pool AND the policy file postdates the running polkitd (the true stale-pool case) — a mid-run polkitd restart drops the desktop session's registered polkit agent, which was the root cause of the prior two-stage setup loop (a polkitd stuck on a policy it never loads gets no mid-run restart; a reboot clears it)
+- **The setup copy is now truthful**: the banner says "no reboot needed" and the contradictory re-login line is gone (the one-click setup applies a per-user ACL, so the current session connects immediately — the manual `usermod` command alone still activates at re-login)
+
 ## [2.4.10] - 2026-09-27
 
 ### Changed

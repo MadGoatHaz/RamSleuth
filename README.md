@@ -1,4 +1,4 @@
-# RamSleuth v2.4.10
+# RamSleuth v2.4.11
 
 Live memory-controller telemetry and an AIDA64-style benchmark engine for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
 
@@ -54,7 +54,7 @@ yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest i
 
 **AMD live subtimings:** the driver is **bundled** with the app — the in-app one-click (or `sudo ramsleuth-setup --with-dkms` / `sudo ramsleuth-install-ryzen-smu-dkms`) builds the pinned third-party `ryzen_smu` module **offline** from the vendored source; without it the AMD fields read `N/A (DriverMissing)` and everything else keeps serving. The standalone `ryzen-smu-dkms` AUR extra is **mutually exclusive** with the app packages — full details in the [User Guide](Docs/User_Guide.md).
 
-**Intel live subtimings (optional extra):** `yay -S ramsleuth-intel-dkms` provides RamSleuth's own in-repo `ramsleuth_intel` kernel module — DKMS-built for your running kernel, exposing the raw IMC registers over world-readable sysfs; source and dev-branch installs ship the helper directly (`sudo ramsleuth-install-intel-dkms`), and the one-click setup routes to it automatically on Intel hosts (the v2.4.10 release tarball and the `ramsleuth-bin` binary ship the `ramsleuth_intel` source + the helper). Without it the daemon falls back to the read-only `/dev/mem` MCHBAR map where the kernel permits, and the Intel fields read `N/A (DriverMissing)` where it does not — everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
+**Intel live subtimings (optional extra):** `yay -S ramsleuth-intel-dkms` provides RamSleuth's own in-repo `ramsleuth_intel` kernel module — DKMS-built for your running kernel, exposing the raw IMC registers over world-readable sysfs; source and dev-branch installs ship the helper directly (`sudo ramsleuth-install-intel-dkms`), and the one-click setup routes to it automatically on Intel hosts (the v2.4.11 release tarball and the `ramsleuth-bin` binary ship the `ramsleuth_intel` source + the helper). Without it the daemon falls back to the read-only `/dev/mem` MCHBAR map where the kernel permits, and the Intel fields read `N/A (DriverMissing)` where it does not — everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
 
 **Build from source:** `cargo build --workspace --release` — Rust MSRV 1.75, producing the 6 binaries above; system-library and per-path details in the [User Guide](Docs/User_Guide.md).
 
@@ -62,7 +62,7 @@ yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest i
 
 1. **Install** — the `install.sh` one-liner above, or either AUR package.
 2. **Open the app** — run `ramsleuth` (the GUI, or its desktop-menu entry); `ramsleuth-tui` is the terminal equivalent.
-3. **One click** — on first launch the `SETUP` strip offers **Set up RamSleuth** (on AMD hosts: **Set up RamSleuth + AMD driver**): one polkit password prompt enables + starts the daemon, joins your user to the `ramsleuth` group, and grants a current-session socket ACL — no re-login, no reboot. No desktop? The same one step from a terminal is `sudo ramsleuth-setup` (add `--with-dkms` — AMD: the `ryzen_smu` driver; Intel: the `ramsleuth_intel` module).
+3. **One click** — on first launch the `SETUP` strip offers **Set up RamSleuth**: one polkit password prompt enables + starts the daemon, joins your user to the `ramsleuth` group, grants a current-session socket ACL (no re-login), and — on AMD/Intel silicon — builds + loads the telemetry driver (`ryzen_smu` / `ramsleuth_intel`) in the same action: no reboot, no app restart — the app auto-reconnects and the strip disappears on its own. No desktop? The same one step from a terminal is `sudo ramsleuth-setup --with-dkms` (AMD: the `ryzen_smu` driver; Intel: the `ramsleuth_intel` module).
 4. **Read and run** — the dashboard is live from the first second: telemetry matrix, benchmark grid, and hardware/SPD status; start a benchmark from either frontend, or run the standalone tools.
 
 The full walkthrough — every zone, key, flag, N/A reason, and day-2 troubleshooting — is in the [User Guide](Docs/User_Guide.md).
@@ -74,10 +74,10 @@ The full walkthrough — every zone, key, flag, N/A reason, and day-2 troublesho
 - [Packaging & AUR](packaging/README.md) — the two-package AUR model, the unified version-bump flow, the `ryzen-smu-dkms` extra, and the CI/release artifact contracts.
 - [Changelog](CHANGELOG.md) — release history.
 
-**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.10**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
+**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.11**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
 
 ## License
 
 MIT — the workspace `Cargo.toml` declares `license = "MIT"`. Repository: <https://github.com/MadGoatHaz/RamSleuth>.
 
-RamSleuth v2.4.10 · branch `v2-development`
+RamSleuth v2.4.11 · branch `v2-development`

@@ -1,7 +1,7 @@
 # RamSleuth — Architecture
 
 **Document:** `Docs/Architecture.md` (part of the RamSleuth v2 repository-facing documentation)
-**Applies to:** workspace v2.4.10 (branch `v2-development`)
+**Applies to:** workspace v2.4.11 (branch `v2-development`)
 **Audience:** expert readers — kernel-aware systems programmers, packagers, and maintainers who need the full design rationale behind RamSleuth.
 
 Companion documents: [`README.md`](../README.md) (entry point), [`Docs/User_Guide.md`](User_Guide.md) (operational guide), [`packaging/README.md`](../packaging/README.md) (packaging and operator guide).
@@ -268,7 +268,7 @@ development tool — all inheriting a single version:
 
 | Workspace fact | Value |
 |----------------|-------|
-| Version | **2.4.10** (`[workspace.package].version`) |
+| Version | **2.4.11** (`[workspace.package].version`) |
 | Edition | 2021 |
 | MSRV | **1.75** (`rust-version`) |
 | Resolver | 2 |
@@ -1015,17 +1015,19 @@ the same degradation signals the zones use into actionable rows, each with a
    names the pinned upstream). Intel (built-in MCHBAR decode) and healthy AMD
    → no requirements at all.
 
-The **primary** affordance is the one-click **`Set up RamSleuth`** button
-(labelled `… + AMD driver` when the AMD module is the missing piece): one
-click → **one polkit password prompt** → a *detached*
-`pkexec /usr/bin/ramsleuth-setup --user <you>` worker (the render thread only
-flips a `running` flag — zero I/O; the spawn and the helper run entirely off
-the render thread) → the strip's status line advances `running…` →
-`done — restart RamSleuth to activate` (a failed setup keeps the `failed: …`
-line). Because the *current* process only picks up the new group membership on
-re-exec, a successful setup shows a modal **"Setup complete"** dialog:
-**`Restart now`** spawns a detached new instance of the current executable and
-exits this process; **`Later`** dismisses it.
+The **primary — and only —** affordance is the one-click **`Set up
+RamSleuth`** button (a single unified action over every requirement mix):
+one click → **one polkit password prompt** → a *detached*
+`pkexec /usr/bin/ramsleuth-setup --user <you> [--with-dkms]` worker (the
+`--with-dkms` flag is the host-vendor decision — AMD → `ryzen_smu`, Intel →
+`ramsleuth_intel` — so the one action covers daemon + group + ACL + driver;
+the render thread only flips a `running` flag — zero I/O; the spawn and the
+helper run entirely off the render thread) → the strip's status line
+advances `running…` → `done — reconnecting to the daemon…` (a failed setup
+keeps the `failed: …` line). No manual restart: the worker sets the state's
+`reconnect_requested` edge, the background poller runs one immediate poll
+(independent of the refresh gate), and the strip unmounts on its own the
+moment the (re)started daemon serves (the liveness predicate).
 
 ### 9.4 The settings panel
 
@@ -1704,12 +1706,12 @@ reference): 6 binaries → `/usr/bin/`; the unit → `/usr/lib/systemd/system/`
 (+ preset); the `ramsleuth` group (idempotent `groupadd -r` in the `.install`
 hooks); the AMD DKMS helper → `/usr/bin/ramsleuth-install-ryzen-smu-dkms`;
 the Intel DKMS helper → `/usr/bin/ramsleuth-install-intel-dkms` (guarded —
-the v2.4.10 source tree and the re-cut `-bin` tarball carry it, skipped with
+the v2.4.11 source tree and the re-cut `-bin` tarball carry it, skipped with
 a note only on a pre-2.3.0 asset); **the in-repo `ramsleuth_intel` source
 tree → `/usr/share/ramsleuth-intel-dkms/src/`** (guarded the same way —
 the exact path the Intel helper resolves, so the one-click Intel DKMS
 install works from a bare AUR install with no manual source step; the
-published `-bin` tarball (the v2.4.10 re-cut) carries the helper + tree, and
+published `-bin` tarball (the v2.4.11 re-cut) carries the helper + tree, and
 the existence guard covers only pre-2.4.2 assets); **the vendored
 `ryzen_smu` source tree → `/usr/share/ryzen-smu-dkms/vendor/`** (guarded
 for pre-vendor tags — the exact path the AMD helper resolves as its
@@ -1795,7 +1797,7 @@ fallback remains available where unblocked. When present:
   network and no upstream pin;
 - **both main packages bundle that source tree** (to
   `/usr/share/ramsleuth-intel-dkms/src/` — guarded like the Intel helper:
-  the published `-bin` tarball (the v2.4.10 re-cut) carries it and installs
+  the published `-bin` tarball (the v2.4.11 re-cut) carries it and installs
   it, and the existence guard covers only pre-2.4.2 assets, which ship
   nothing and skip cleanly), which is the exact path the helper resolves as
   its installed copy: the **one-click Intel DKMS install works from a bare

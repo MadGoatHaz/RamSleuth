@@ -929,7 +929,7 @@ mod tests {
                 kernel: "6.6.0-test".to_owned(),
                 os: "Linux / Arch".to_owned(),
                 arch: "x86_64".to_owned(),
-                ramsleuth_version: "2.4.10".to_owned(),
+                ramsleuth_version: "2.4.11".to_owned(),
                 telemetry_source: "ramsleuth_intel".to_owned(),
             },
         }
