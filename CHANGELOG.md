@@ -4,6 +4,12 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project.
 
+## [2.4.9] - 2026-09-26
+
+### Changed
+- **Self-explanatory N/A (GUI + TUI)**: every `N/A` now shows the reason in plain language (e.g. "No data — this CPU doesn't expose the memory-controller registers RamSleuth reads. Expected on this part, not an error") with the daemon status kept **green** — "no data on this part" (unsupported hardware, unloaded driver, privilege, decode) is rendered as a healthy state, never mistaken for a failure
+- **The setup prompt trigger is now a named, tested liveness predicate** (`first_run::requirements_strip_visible`): daemon down → the one-click setup prompt shows (fresh install, stopped daemon, and leftover-partial install all converge on it); daemon up → telemetry (the strip clears the moment the daemon serves, even when the served telemetry is all `N/A`)
+
 ## [2.4.8] - 2026-09-26
 
 ### Changed

@@ -16,10 +16,13 @@
 //!   drive/termination (Ω), voltages (the VDDCR_VDD primary rail
 //!   first). N/A cells are dropped entirely (the all-N/A rows are what
 //!   overflowed the panel on a 2-channel Intel host); the
-//!   section-level `N/A (<reason>)` rows stay. The Intel
-//!   `N/A (unsupported hardware)` row is hidden on non-Intel hosts
-//!   (AMD-platform noise — the AMD row carries the verdict), and the
-//!   AMD section's N/A row is the mirror: hidden on Intel hosts. A
+//!   self-explanatory section-level `N/A (<reason>)` rows stay (the
+//!   N100-class `Intel: N/A (unsupported CPU)` form — muted grey,
+//!   never an error color: the daemon is up, the part simply exposes
+//!   no telemetry). The Intel `N/A (unsupported CPU)` row is hidden
+//!   on non-Intel hosts (AMD-platform noise — the AMD row carries the
+//!   verdict), and the AMD section's N/A row is the mirror: hidden on
+//!   Intel hosts. A
 //!   column that overflows the block is capped to the first rows that
 //!   fit with a dim `...` indicator.
 //! - **Zone 2 — AIDA-style benchmark engine:** the 4×4 grid (tier rows ×
@@ -409,8 +412,10 @@ fn zone_block(title: &'static str) -> Block<'static> {
 /// ([`platform_tag`]) is dim (the honest bare `Platform` without
 /// telemetry); the daemon status keeps the existing color rule (crimson
 /// on error, dim otherwise — the empty-status states degrade to `down`
-/// on error, `—` without); the full §2.2 key legend is dim and truncated
-/// to the `width` budget on entry boundaries ([`key_legend`]).
+/// on error, `—` without; a connected status renders CYAN — the
+/// daemon-UP indicator, the GUI green-dot mirror); the full §2.2 key
+/// legend is dim and truncated to the `width` budget on entry
+/// boundaries ([`key_legend`]).
 fn header_line1(state: &AppState, width: usize) -> Line<'static> {
     let title = format!("RamSleuth v{}", env!("CARGO_PKG_VERSION"));
     let tag = platform_tag(state.telemetry.as_ref().map(|t| &t.cpu.vendor));
@@ -423,7 +428,16 @@ fn header_line1(state: &AppState, width: usize) -> Line<'static> {
     } else {
         state.daemon_status.as_str()
     };
-    let status_color = if state.error.is_some() { CRIMSON } else { DIM };
+    let status_color = if state.error.is_some() {
+        CRIMSON
+    } else if state.daemon_status.is_empty() {
+        DIM
+    } else {
+        // Connected: the daemon-UP indicator (CYAN — the GUI
+        // green-dot mirror): a serving daemon stays visually up even
+        // when every value is N/A.
+        CYAN
+    };
     // The legend budget: the fixed prefix measured in columns (the em
     // dash is the only non-ASCII cell; `chars()` counts it as one) plus
     // the ` · ` separator that precedes the legend.
@@ -1052,14 +1066,17 @@ fn render_zone1(frame: &mut Frame, state: &AppState, area: Rect) {
 /// timings, the CAD bus, and the voltages (plus the channel-level RTL
 /// on Intel).
 ///
-/// A section that degraded whole renders a single `N/A (<reason>)` line
-/// (left column); no telemetry at all renders a single grey
-/// placeholder — never a panic, never an omitted section.
+/// A section that degraded whole renders a single self-explanatory
+/// `N/A (<reason>)` line (left column — the N100-class
+/// `Intel: N/A (unsupported CPU)` form, muted grey: the daemon is up,
+/// the part simply exposes no telemetry); no telemetry at all renders
+/// a single grey placeholder — never a panic, never an omitted
+/// section.
 ///
-/// The Intel section's `N/A (unsupported hardware)` row is meaningful
-/// only on Intel silicon (an unrecognized generation): on a non-Intel
-/// host the AMD row already carries the platform verdict, so the Intel
-/// row is skipped there. The AMD section's N/A row is the mirror —
+/// The Intel section's `N/A (unsupported CPU)` row is meaningful only
+/// on Intel silicon (an unrecognized generation): on a non-Intel host
+/// the AMD row already carries the platform verdict, so the Intel row
+/// is skipped there. The AMD section's N/A row is the mirror —
 /// skipped on an Intel host, where the Intel row carries the platform
 /// verdict.
 fn zone1_columns(
@@ -1749,9 +1766,10 @@ fn render_zone3(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 /// The zone-3 content: the SPD modules (rendered as the bordered
-/// sub-cards) and the footer rows (the no-telemetry / no-SPD
-/// placeholder, the daemon status line, and the crimson error line
-/// when present).
+/// sub-cards) and the footer rows (the no-telemetry placeholder, the
+/// no-SPD [`no_spd_item`] reason note, the daemon status line
+/// (CYAN when connected — the daemon-UP indicator), and the crimson
+/// error line when present).
 fn zone3_content(state: &AppState) -> (Vec<&SpdModule>, Vec<ListItem<'static>>) {
     let mut footer = Vec::new();
     let modules = match &state.telemetry {
@@ -1761,7 +1779,7 @@ fn zone3_content(state: &AppState) -> (Vec<&SpdModule>, Vec<ListItem<'static>>) 
         }
         Some(telemetry) => {
             if telemetry.spd.is_empty() {
-                footer.push(section_na("SPD", &NaReason::DriverMissing));
+                footer.push(no_spd_item());
             }
             telemetry.spd.iter().collect()
         }
@@ -1786,7 +1804,10 @@ fn zone3_content(state: &AppState) -> (Vec<&SpdModule>, Vec<ListItem<'static>>) 
     } else if state.daemon_status.is_empty() {
         AMBER
     } else {
-        DIM
+        // Connected: the daemon-UP indicator (CYAN — the GUI
+        // green-dot mirror): a healthy daemon stays visually up even
+        // when every value below it is N/A.
+        CYAN
     };
     footer.push(text_item(&text, color));
 
@@ -1876,12 +1897,12 @@ fn spd_profile_item(is_ddr5: bool, profile: &SpdProfile) -> ListItem<'static> {
 /// mirror): `<die_maker> (<die_type>, <density>Gb)` with each
 /// parenthetical part dropped when absent — a `Na` die type yields
 /// `<die_maker> (<density>Gb)`, a `Na` density omits the density, and
-/// both absent shows the die maker bare. A `Na` die maker degrades the
-/// whole value to a bare `N/A` (D-4 — the reason stays on the wire).
-/// Never a panic.
+/// both absent shows the die maker bare. A `Na` die maker degrades
+/// the whole value to its terse reason tag (the [`na_text`] form —
+/// the raw reason stays on the wire). Never a panic.
 fn dram_die_line(module: &SpdModule) -> String {
     match &module.die_maker {
-        Section::Na(_) => "N/A".to_owned(),
+        Section::Na(reason) => na_text(reason),
         Section::Value(die_maker) => {
             let mut parts = Vec::new();
             if let Section::Value(die_type) = &module.die_type {
@@ -1923,7 +1944,8 @@ fn row(key: &str, value: &str, color: Color) -> ListItem<'static> {
     ListItem::new(line)
 }
 
-/// A formatted cell: the value in `color`, or a grey `N/A (<reason>)`.
+/// A formatted cell: the value in `color`, or a grey,
+/// self-explanatory `N/A (<reason>)` tag.
 fn cell_row<T>(key: &str, section: &Section<T>, color: Color, fmt: impl Fn(&T) -> String) -> ListItem<'static> {
     match section {
         Section::Value(value) => row(key, &fmt(value), color),
@@ -1994,22 +2016,45 @@ fn na_item(text: &str) -> ListItem<'static> {
     text_item(text, NA_GRAY)
 }
 
-/// A section that degraded whole: one grey `N/A (<reason>)` line.
+/// A section that degraded whole: one grey, self-explanatory
+/// `<section>: <na_text>` reason line (the N100-class
+/// `Intel: N/A (unsupported CPU)` form — muted, never an error
+/// color).
 fn section_na(section: &str, reason: &NaReason) -> ListItem<'static> {
     text_item(&format!("{section}: {}", na_text(reason)), NA_GRAY)
 }
 
-/// The human text of an N/A cell (the dump renderer's form, except
-/// `ParseError` — the bare `N/A`, the GUI's D-4 convention; the detail
-/// stays on the wire; [`NaReason`] carries no `Display`).
+/// The zone-3 no-SPD note (the daemon serves no `ee1004` device):
+/// the self-explanatory form — the SPD EEPROM driver is unavailable
+/// on this system (the daemon is up, the data simply isn't) — the
+/// zone-width-budgeted `No SPD (ee1004 not loaded)` tag (the GUI's
+/// full sentence wraps; the terminal doesn't), muted grey, never an
+/// error color.
+fn no_spd_item() -> ListItem<'static> {
+    text_item("No SPD (ee1004 not loaded)", NA_GRAY)
+}
+
+/// The human text of an N/A cell: the terse, user-friendly reason
+/// tag (the GUI per-cell mirror's form) — `N/A (unsupported CPU)`
+/// (the N100 class — the part exposes no memory-controller
+/// registers; expected, not a fault), `N/A (new PM table)` (the
+/// memory-firmware version is out of the supported set — the
+/// connected daemon line is the driver-is-up indicator),
+/// `N/A (decode failed)` (the raw [`NaReason::ParseError`] detail
+/// stays on the wire), `N/A (driver missing)`,
+/// `N/A (insufficient privilege)` — and the structurally
+/// not-applicable cell's one bare `N/A` (the noise-free form in the
+/// dense zone-1 / zone-3 panels; the tags are zone-width-budgeted —
+/// the full sentences live in the GUI). [`NaReason`] carries no
+/// `Display`; this is the TUI's own display mapping.
 fn na_text(reason: &NaReason) -> String {
     match reason {
-        NaReason::UnsupportedHardware => "N/A (unsupported hardware)".to_owned(),
+        NaReason::UnsupportedHardware => "N/A (unsupported CPU)".to_owned(),
         NaReason::DriverMissing => "N/A (driver missing)".to_owned(),
         NaReason::InsufficientPrivilege => "N/A (insufficient privilege)".to_owned(),
-        NaReason::UnknownPmTableVersion => "N/A (unknown PM table version)".to_owned(),
-        NaReason::NotApplicable => "N/A (not applicable)".to_owned(),
-        NaReason::ParseError(_) => "N/A".to_owned(),
+        NaReason::UnknownPmTableVersion => "N/A (new PM table)".to_owned(),
+        NaReason::NotApplicable => "N/A".to_owned(),
+        NaReason::ParseError(_) => "N/A (decode failed)".to_owned(),
     }
 }
 
@@ -2496,7 +2541,97 @@ mod tests {
         assert!(text.contains("Intel ch 0"), "{text}");
         assert!(text.contains("Intel ch 1"), "{text}");
         assert!(text.contains("1600.00 MHz"), "{text}");
-        assert!(text.contains("SPD: N/A"), "{text}");
+        // The empty SPD list renders the self-explanatory no-SPD note
+        // (the ee1004 driver unavailable — not a bare N/A).
+        assert!(text.contains("No SPD (ee1004 not loaded)"), "{text}");
+    }
+
+    /// (e2) The N100 class (an Intel host whose detected generation is
+    /// unrecognized — both vendor branches `Na(UnsupportedHardware)`):
+    /// the Intel section's whole-branch row carries the terse,
+    /// user-friendly reason tag (the part exposes no
+    /// memory-controller registers — expected, not a fault), the AMD
+    /// section's mirror row is skipped (the Intel host hides it), and
+    /// the daemon line stays the connected-UP indicator (the N/A is
+    /// about data availability, not the daemon being down).
+    #[test]
+    fn unsupported_hardware_renders_the_terse_reason_tag() {
+        let state = AppState {
+            telemetry: Some(SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Intel(IntelGen::Unrecognized),
+                    brand: "Intel N100".to_owned(),
+                },
+                amd: Section::na(NaReason::UnsupportedHardware),
+                intel: Section::na(NaReason::UnsupportedHardware),
+                spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                    motherboard: Section::na(NaReason::NotApplicable),
+                    bios: Section::na(NaReason::NotApplicable),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::na(NaReason::NotApplicable),
+                dimm_sizes: Vec::new(),
+            }),
+            daemon_status: "connected · /run/ramsleuth/ramsleuth.sock".to_owned(),
+            last_update: Some(Instant::now()),
+            ..Default::default()
+        };
+        // 200 cols: the zone-1 left column carries the full section row
+        // (a narrower terminal clips the tail — the zone's known
+        // budget behavior).
+        let text = draw_at(&state, 200, 30);
+
+        // The Intel section row carries the terse reason tag (muted).
+        assert!(text.contains("Intel: N/A (unsupported CPU)"), "{text}");
+        // The AMD section's mirror row is skipped on an Intel host.
+        assert!(!text.contains("AMD: N/A (unsupported CPU)"), "{text}");
+        // The empty-SPD note is the self-explanatory ee1004 tag.
+        assert!(text.contains("No SPD (ee1004 not loaded)"), "{text}");
+        // The daemon line stays the connected-UP indicator.
+        assert!(text.contains("daemon: connected"), "{text}");
+        // No bare "Intel: N/A" row survives (the whole-branch row is
+        // self-explanatory).
+        assert!(!text.contains("Intel: N/A\n"), "{text}");
+    }
+
+    /// (e3) The `Na(UnknownPmTableVersion)` branch (the memory-firmware
+    /// version is outside the supported set — the driver is loaded and
+    /// working) renders its own terse reason tag on the section row.
+    #[test]
+    fn unknown_pm_table_renders_the_terse_reason_tag() {
+        let state = AppState {
+            telemetry: Some(SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Amd(AmdZen::Zen5),
+                    brand: "Ryzen 9 9950X".to_owned(),
+                },
+                amd: Section::na(NaReason::UnknownPmTableVersion),
+                intel: Section::na(NaReason::NotApplicable),
+                spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::Value(3500.0),
+                    motherboard: Section::Value("Test Board".to_owned()),
+                    bios: Section::Value("1.0".to_owned()),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::na(NaReason::NotApplicable),
+                dimm_sizes: Vec::new(),
+            }),
+            daemon_status: "connected · /run/ramsleuth/ramsleuth.sock".to_owned(),
+            last_update: Some(Instant::now()),
+            ..Default::default()
+        };
+        // 200 cols: the zone-1 left column carries the full section row.
+        let text = draw_at(&state, 200, 30);
+
+        // The AMD section row carries the terse reason tag.
+        assert!(text.contains("AMD: N/A (new PM table)"), "{text}");
+        // The Intel section's mirror row is skipped on an AMD host.
+        assert!(!text.contains("Intel: N/A"), "{text}");
     }
 
     /// (f) The 3-line header — line 1 the title + platform tag + daemon
@@ -4275,12 +4410,13 @@ mod tests {
             }),
             "SK hynix"
         );
+        // The Na die maker degrades to its terse reason tag.
         assert_eq!(
             dram_die_line(&SpdModule {
                 die_maker: Section::na(NaReason::DriverMissing),
                 ..fixture_module()
             }),
-            "N/A"
+            "N/A (driver missing)"
         );
     }
 

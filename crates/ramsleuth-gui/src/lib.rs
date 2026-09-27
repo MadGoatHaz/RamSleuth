@@ -149,6 +149,7 @@ pub use settings::{
 // detached `pkexec` spawn over `setup_argv` + the AppState-owned
 // `SetupOutcome`).
 pub use first_run::{
-    diagnose, render_requirements_strip, render_requirements_strip_with_setup, setup_argv,
-    setup_with_dkms, Requirement, SetupOutcome, DKMS_INSTALL_CMD, RYZEN_SMU_PIN_SHORT,
+    diagnose, render_requirements_strip, render_requirements_strip_with_setup,
+    requirements_strip_visible, setup_argv, setup_with_dkms, Requirement, SetupOutcome,
+    DKMS_INSTALL_CMD, RYZEN_SMU_PIN_SHORT,
 };

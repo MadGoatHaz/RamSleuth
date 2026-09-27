@@ -1283,6 +1283,57 @@ mod tests {
         );
     }
 
+    /// (b') The liveness-based setup trigger through the real client
+    /// path: `poll_telemetry` against a missing socket leaves the
+    /// state `disconnected` + the `DaemonDown` error →
+    /// [`requirements_strip_visible`] says PROMPT (the stopped-daemon
+    /// / fresh-install / leftover-partial state — the one-click setup
+    /// must show); against a live stand-in it leaves `connected` + the
+    /// canned all-`Na` snapshot → NO PROMPT (the daemon serving is the
+    /// healthy state — an all-`N/A` part is not a setup case).
+    #[test]
+    fn liveness_decides_the_setup_prompt() {
+        use crate::first_run::requirements_strip_visible;
+
+        // The daemon-down state (a missing socket): the prompt shows.
+        let down = TempSocket::new("liveness-down");
+        let mut state_down = TelemetryData::default();
+        poll_telemetry(down.path(), &mut state_down)
+            .expect("poll_telemetry must not error");
+        assert_eq!(state_down.daemon_status, "disconnected");
+        assert!(
+            requirements_strip_visible(true, &state_down),
+            "daemon down (missing socket) must show the setup prompt"
+        );
+
+        // The daemon-up state (a live stand-in, the canned all-`Na`
+        // snapshot — the gmktec N100 class): no prompt.
+        let up = TempSocket::new("liveness-up");
+        let stand_in = DaemonStandIn::spawn(&up, move |mut stream| {
+            match read_one_message(&mut stream) {
+                Some(Message::Request(Request::GetTelemetry)) => {}
+                other => panic!("stand-in expected GetTelemetry, got {other:?}"),
+            }
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(
+                mock_snapshot(),
+            )))
+            .expect("must encode");
+            stream.write_all(&bytes).expect("stand-in write must not fail");
+        });
+        let mut state_up = TelemetryData::default();
+        poll_telemetry(up.path(), &mut state_up).expect("poll_telemetry must not error");
+        assert!(
+            state_up.daemon_status.starts_with("connected"),
+            "the live stand-in must report connected: {}",
+            state_up.daemon_status
+        );
+        assert!(
+            !requirements_strip_visible(true, &state_up),
+            "a serving daemon must not show the setup prompt (all-N/A is healthy)"
+        );
+        stand_in.join();
+    }
+
     /// (c) `run_bench` against a stand-in (a `StartBenchmark` answered
     /// with `BenchStarted` + one `BenchProgress` + the terminal
     /// `BenchResult`) streams into `state.bench`: exactly the one
@@ -3135,7 +3186,7 @@ mod tests {
                 kernel: "6.6.0-test".to_owned(),
                 os: "Linux / Test".to_owned(),
                 arch: "x86_64".to_owned(),
-                ramsleuth_version: "2.4.8".to_owned(),
+                ramsleuth_version: "2.4.9".to_owned(),
                 telemetry_source: "unavailable".to_owned(),
             },
         }

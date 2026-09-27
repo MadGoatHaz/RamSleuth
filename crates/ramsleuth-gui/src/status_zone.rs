@@ -17,8 +17,11 @@
 //!
 //! **No-panic contract (D5):** the zone reads only a `&TelemetryData`
 //! snapshot: no telemetry renders one gray placeholder, an empty
-//! SPD list renders a gray `driver missing` placeholder, an all-`Na`
-//! module renders every row a bare `N/A` in muted `NA_GRAY` — never a panic.
+//! SPD list renders the gray `No SPD — …` reason note (the
+//! `ee1004` driver unavailable — the daemon is up, the data simply
+//! isn't), an all-`Na` module renders every row a terse N/A reason
+//! tag (the structurally not-applicable fields the bare `N/A`) in
+//! muted `NA_GRAY` — never a panic, never an error color.
 //!
 //! **Pure core:** [`spd_cards`] (+ the daemon-status line/color and
 //! the card value-color pickers) is I/O-free and deterministic (the
@@ -68,12 +71,12 @@ pub enum GuiAction {
 /// <density>Gb)` die line with each absent part dropped, the
 /// `Single-Rank` / `Dual-Rank` / `<n>-Rank` rank label, bare rank,
 /// `… Mbit` density, `… MT/s` speed, the profile line
-/// `<speed> <cl>-<trcd>-<trp>-<tras> @ <volts>`) or a bare `N/A`
-/// for a [`Section::Na`] (the reason stays on the wire as [`NaReason`]
-/// — the GUI drops the parenthetical, D-4); an all-`Na` module
-/// renders every row a bare `N/A` in muted `NA_GRAY` and never
+/// `<speed> <cl>-<trcd>-<trp>-<tras> @ <volts>`) or a terse N/A
+/// reason tag for a [`Section::Na`] (the [`na_text`] form — the raw
+/// reason stays on the wire as [`NaReason`], D-4); an all-`Na`
+/// module renders every row that tag in muted `NA_GRAY` and never
 /// panics. Returns an empty `Vec` when the snapshot carries no SPD
-/// modules (the renderer draws its own placeholder).
+/// modules (the renderer draws its own [`NO_SPD_TEXT`] placeholder).
 pub fn spd_cards(telemetry: &SystemMemoryTelemetry) -> Vec<Vec<(String, String)>> {
     telemetry.spd.iter().map(card_rows).collect()
 }
@@ -111,8 +114,8 @@ fn card_rows(module: &SpdModule) -> Vec<(String, String)> {
 
 /// The product-line row: `<maker> (<part>)` (the spec's "G.Skill …
 /// (F5-…)" form). One `Na` partner renders the other bare (no empty
-/// parens); both `Na` degrades the whole row to the maker's reason
-/// text. Never a panic.
+/// parens); both `Na` degrades the whole row to the maker's terse
+/// reason text. Never a panic.
 fn product_line(maker: &Section<String>, part: &Section<String>) -> String {
     match (maker, part) {
         (Section::Value(maker), Section::Value(part)) => format!("{maker} ({part})"),
@@ -126,7 +129,8 @@ fn product_line(maker: &Section<String>, part: &Section<String>) -> String {
 /// each parenthetical part dropped when absent — a `Na` die type
 /// yields `<die_maker> (<density>Gb)`, a `Na` density omits the
 /// density, and both absent shows the die maker bare. A `Na` die
-/// maker degrades the whole row to its reason text. Never a panic.
+/// maker degrades the whole row to its terse reason text. Never a
+/// panic.
 fn dram_die_line(module: &SpdModule) -> String {
     match &module.die_maker {
         Section::Na(reason) => na_text(reason),
@@ -161,7 +165,8 @@ fn density_gib(mbit: u16) -> String {
 /// The human rank label: `1` → `Single-Rank`, `2` →
 /// `Dual-Rank`, other positive counts → `<n>-Rank` (e.g.
 /// `4-Rank`); a `Na` rank (or a degenerate `0` value) degrades to the
-/// `N/A` reason text. The raw rank number stays on its own row.
+/// terse `N/A` reason text. The raw rank number stays on its own
+/// row.
 fn rank_label(rank: &Section<u8>) -> String {
     match rank {
         Section::Na(reason) => na_text(reason),
@@ -196,8 +201,9 @@ fn profile_row(is_ddr5: bool, profile: &SpdProfile) -> (String, String) {
     )
 }
 
-/// One [`Section`] cell's display: the formatted value, or a bare
-/// `N/A` for an absent one (D-4 — the reason stays on the wire).
+/// One [`Section`] cell's display: the formatted value, or the terse
+/// N/A reason tag for an absent one (the [`na_text`] form — D-4, the
+/// raw reason stays on the wire).
 fn display<T>(section: &Section<T>, fmt: impl Fn(&T) -> String) -> String {
     match section {
         Section::Value(value) => fmt(value),
@@ -205,11 +211,13 @@ fn display<T>(section: &Section<T>, fmt: impl Fn(&T) -> String) -> String {
     }
 }
 
-/// The human text of an absent cell: bare `N/A` (D-4 — the reason
-/// stays on the wire as [`NaReason`]; the GUI drops the parenthetical
-/// as verbose — the zone 1 / TUI precedent).
-fn na_text(_reason: &NaReason) -> String {
-    "N/A".to_owned()
+/// The human text of one absent SPD-card cell: the terse reason tag
+/// (the zone-1 [`crate::telemetry_zone::na_text`] form —
+/// `N/A (driver missing)`, `N/A (decode failed)`, …; the structurally
+/// not-applicable field keeps the bare `N/A`). The raw reason stays
+/// on the wire as [`NaReason`] (D-4).
+fn na_text(reason: &NaReason) -> String {
+    crate::telemetry_zone::na_text(reason)
 }
 
 /// The daemon status line: `daemon: <status>` (an empty status reads
@@ -243,11 +251,19 @@ fn daemon_status_color(data: &TelemetryData) -> egui::Color32 {
     }
 }
 
+/// The empty-SPD placeholder (the zone's one-line `SPD` note when
+/// the daemon serves no `ee1004` device): the self-explanatory form
+/// — the `ee1004` driver is unavailable on this system, the daemon
+/// is up (muted `NA_GRAY`, never an error color).
+pub const NO_SPD_TEXT: &str =
+    "No SPD — the SPD EEPROM driver isn't available on this system.";
+
 /// The semantic color of one card row's display: CYAN for a decoded
-/// value, muted `NA_GRAY` for an absent one (a bare `N/A`, including
-/// a degraded profile field — D-5: unavailable, not a fault).
+/// value, muted `NA_GRAY` for an absent one (the bare / terse-tag
+/// `N/A` — D-5: unavailable, not a fault, including a degraded
+/// profile field).
 fn card_value_color(display: &str) -> egui::Color32 {
-    if display.contains("N/A") {
+    if display.contains("N/A") || display.contains("No SPD") {
         NA_GRAY
     } else {
         CYAN
@@ -299,14 +315,14 @@ pub fn render_status_zone(ui: &mut egui::Ui, data: &TelemetryData) -> GuiAction 
 /// row pairs — 1 DIMM → `1×1` (left cell), 2 → `1×2`,
 /// 3 → `2+1`, 4 → `2×2` balanced — each card allocated
 /// half the available inner width, so the cards fill the column
-/// with no interior void. An empty SPD list renders a gray
-/// `SPD: N/A` placeholder, and no telemetry at all renders one gray
-/// placeholder — never a panic (plan D5).
+/// with no interior void. An empty SPD list renders the gray
+/// [`NO_SPD_TEXT`] reason note, and no telemetry at all renders one
+/// gray placeholder — never a panic (plan D5).
 fn render_spd_cards(ui: &mut egui::Ui, data: &TelemetryData) {
     match &data.telemetry {
         Some(telemetry) => {
             if telemetry.spd.is_empty() {
-                ui.label(egui::RichText::new("SPD: N/A").color(NA_GRAY));
+                ui.label(egui::RichText::new(NO_SPD_TEXT).color(NA_GRAY));
                 return;
             }
             // R1 (D-13.1): row-pair flow — `(n + 1) / 2` rows of up
@@ -594,7 +610,9 @@ mod tests {
     /// (b) No SPD modules → an empty `Vec` (no cards, no panic); the
     /// all-`Na` module → one card whose every row (the product line,
     /// the die line, the rank label, the fields, and the all-`Na`
-    /// EXPO profile line) is a bare `N/A` in muted gray, no panic.
+    /// EXPO profile line) is a terse N/A reason tag (the
+    /// structurally not-applicable fields the bare `N/A`) in muted
+    /// gray, no panic.
     #[test]
     fn spd_cards_handles_no_spd_and_all_na_without_panic() {
         assert!(spd_cards(&no_spd()).is_empty(), "no SPD modules -> no cards");
@@ -607,27 +625,42 @@ mod tests {
                 .all(|(_, display)| display.contains("N/A")),
             "every all-Na row must carry an N/A display: {cards:?}"
         );
+        // The both-Na product line degrades to the maker's terse tag.
         assert_eq!(
             cards[0][0],
-            ("product".to_owned(), "N/A".to_owned())
+            ("product".to_owned(), "N/A (driver missing)".to_owned())
         );
+        // The structurally not-applicable die maker keeps the bare N/A.
         assert_eq!(
             cards[0][1],
             ("dram die".to_owned(), "N/A".to_owned())
         );
         assert_eq!(
             cards[0][2],
-            ("rank label".to_owned(), "N/A".to_owned())
+            ("rank label".to_owned(), "N/A (insufficient privilege)".to_owned())
         );
         assert_eq!(
             cards[0][3],
-            ("maker".to_owned(), "N/A".to_owned())
+            ("maker".to_owned(), "N/A (driver missing)".to_owned())
         );
         assert_eq!(
-            cards[0][4].1,
-            "N/A"
+            cards[0][4],
+            ("part".to_owned(), "N/A (decode failed)".to_owned())
         );
-        // The all-Na EXPO profile line: every field degrades to bare N/A.
+        assert_eq!(
+            cards[0][5],
+            ("rank".to_owned(), "N/A (insufficient privilege)".to_owned())
+        );
+        assert_eq!(
+            cards[0][6],
+            ("density".to_owned(), "N/A (new PM table)".to_owned())
+        );
+        assert_eq!(
+            cards[0][7],
+            ("speed".to_owned(), "N/A (decode failed)".to_owned())
+        );
+        // The all-Na EXPO profile line: every field degrades to bare N/A
+        // (the structurally not-applicable form).
         assert_eq!(cards[0][8].0, "EXPO 0");
         assert_eq!(
             cards[0][8].1,
@@ -649,7 +682,10 @@ mod tests {
         assert_eq!(rank_label(&Section::Value(2)), "Dual-Rank");
         assert_eq!(rank_label(&Section::Value(4)), "4-Rank");
         assert_eq!(rank_label(&Section::Value(0)), "N/A");
-        assert_eq!(rank_label(&Section::na(NaReason::DriverMissing)), "N/A");
+        assert_eq!(
+            rank_label(&Section::na(NaReason::DriverMissing)),
+            "N/A (driver missing)"
+        );
 
         // The product line (the spec's "G.Skill … (F5-…)" form).
         assert_eq!(
@@ -678,7 +714,7 @@ mod tests {
                 &Section::na(NaReason::DriverMissing),
                 &Section::na(NaReason::NotApplicable)
             ),
-            "N/A"
+            "N/A (driver missing)"
         );
 
         // The DRAM-die line: each absent part is dropped (the
@@ -709,7 +745,7 @@ mod tests {
                 die_maker: Section::na(NaReason::DriverMissing),
                 ..fixture_module()
             }),
-            "N/A"
+            "N/A (driver missing)"
         );
 
         // The density conversion: Mbit -> Gb (a non-integer
@@ -799,7 +835,10 @@ mod tests {
         assert_eq!(card_value_color("16384 Mbit"), CYAN);
         assert_eq!(card_value_color("none"), CYAN);
         assert_eq!(card_value_color("N/A"), NA_GRAY);
+        assert_eq!(card_value_color("N/A (driver missing)"), NA_GRAY);
+        assert_eq!(card_value_color("N/A (decode failed)"), NA_GRAY);
         assert_eq!(card_value_color("N/A N/A-N/A-N/A-N/A @ N/A"), NA_GRAY);
+        assert_eq!(card_value_color(NO_SPD_TEXT), NA_GRAY);
     }
 
     /// (g) The C9-07 width + height fill (D-4a + D-4b): the zone
@@ -876,5 +915,59 @@ mod tests {
                 outer.height()
             );
         }
+    }
+
+    /// (h) The empty-SPD state renders the self-explanatory
+    /// [`NO_SPD_TEXT`] reason note (the `ee1004` driver unavailable —
+    /// the daemon is up, the data simply isn't) in muted gray, never
+    /// an error color: the N100-class user reading the empty SPD card
+    /// area gets the why, not a bare `SPD: N/A`.
+    #[test]
+    fn empty_spd_renders_the_no_spd_reason_note() {
+        let data = TelemetryData {
+            telemetry: Some(no_spd()),
+            daemon_status: "connected: /tmp/ramsleuth.sock".to_owned(),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.begin_frame(egui::RawInput::default());
+        egui::CentralPanel::default().show(&ctx, |ui| render_status_zone(ui, &data));
+        let out = ctx.end_frame();
+        // The note's galley paints the exact text.
+        let notes: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text() == NO_SPD_TEXT => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(!notes.is_empty(), "the no-SPD reason note must paint");
+        for note in &notes {
+            let colors: Vec<_> = note
+                .galley
+                .job
+                .sections
+                .iter()
+                .map(|sec| sec.format.color)
+                .collect();
+            assert!(
+                colors.iter().all(|c| *c == NA_GRAY),
+                "the no-SPD note must be muted gray, got {colors:?}"
+            );
+        }
+        // No bare `SPD: N/A` placeholder survives.
+        let texts: Vec<&str> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) => Some(t.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !texts.iter().any(|t| t.contains("SPD: N/A")),
+            "the bare SPD placeholder must be gone, got {texts:?}"
+        );
     }
 }

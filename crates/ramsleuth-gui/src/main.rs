@@ -133,7 +133,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ramsleuth_gui::{
     build_style, diagnose, export_json,
-    first_run::{render_requirements_strip_with_setup, setup_argv, setup_with_dkms, SetupOutcome},
+    first_run::{
+        render_requirements_strip_with_setup, requirements_strip_visible, setup_argv,
+        setup_with_dkms, SetupOutcome,
+    },
     format_capacity, format_clock, render_bench_zone, render_graphs_window, render_settings_panel,
     render_status_zone, render_telemetry_zone, snapshot_png, spawn_poller, BenchCmd, GuiAction,
     GuiError, GuiSettings, ProbeResult, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
@@ -895,21 +898,22 @@ impl eframe::App for RamSleuthApp {
                 &self.notice,
             )
         };
-        // The SETUP requirements strip (C18, D-18.5): while the
-        // header's `Setup` toggle is open, allocate it between the
-        // header and the settings strip only while a requirement is
-        // present — presence-driven, it disappears on its own once
-        // the daemon connects / the driver loads (and can be
-        // re-opened any time; the strip's "Got it" + the toggle
-        // write the same flag, D-C7).
-        if self.requirements_open {
-            let present = {
-                let data = self.state.read().unwrap();
-                !diagnose(&data).is_empty()
-            };
-            if present {
-                self.render_requirements_area(ctx);
-            }
+        // The SETUP requirements strip (C18, D-18.5) — the liveness
+        // trigger: [`requirements_strip_visible`] allocates it
+        // between the header and the settings strip while the
+        // header's `Setup` toggle is open AND a requirement is
+        // present (case 1 = the daemon not serving: never polled,
+        // down, or a groupless client's refused connect), so a
+        // daemon-less launch shows the one-click setup prompt and the
+        // strip disappears on its own once the daemon serves — even
+        // with all-`N/A` telemetry (and it can be re-opened any time;
+        // the strip's "Got it" + the toggle write the same flag, D-C7).
+        let requirements_present = {
+            let data = self.state.read().unwrap();
+            requirements_strip_visible(self.requirements_open, &data)
+        };
+        if requirements_present {
+            self.render_requirements_area(ctx);
         }
         // The one-click setup worker (C21-06): the wizard button's
         // click (the render thread's one permitted write, D6) flips
@@ -4848,7 +4852,7 @@ mod tests {
                 kernel: "6.6.0-test".to_owned(),
                 os: "Linux / Test".to_owned(),
                 arch: "x86_64".to_owned(),
-                ramsleuth_version: "2.4.8".to_owned(),
+                ramsleuth_version: "2.4.9".to_owned(),
                 telemetry_source: "unavailable".to_owned(),
             },
         }
@@ -5035,20 +5039,20 @@ mod tests {
         let title = probe_issue_title(&report);
         assert_eq!(
             title,
-            "[Probe] Test CPU \u{00b7} Unknown \u{00b7} Linux / Test \u{00b7} v2.4.8"
+            "[Probe] Test CPU \u{00b7} Unknown \u{00b7} Linux / Test \u{00b7} v2.4.9"
         );
         // The title's percent-encoding (the brackets, the spaces, the
         // middot, the slash).
         assert_eq!(
             url_encode(&title),
-            "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.8"
+            "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.9"
         );
         // The URL (the issues/new form, title only — the body must
         // NOT ride the query string: it would exceed GitHub's limit).
         let url = probe_issue_url(&title);
         assert_eq!(
             url,
-            "https://github.com/MadGoatHaz/RamSleuth/issues/new?title=%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.8"
+            "https://github.com/MadGoatHaz/RamSleuth/issues/new?title=%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.9"
         );
         assert!(
             !url.contains("body="),

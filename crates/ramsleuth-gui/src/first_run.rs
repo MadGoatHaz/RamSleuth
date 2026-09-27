@@ -52,6 +52,17 @@
 //! [`render_requirements_strip`] panics (no `unwrap` / `expect` /
 //! `panic!` in the production paths).
 //!
+//! **Liveness trigger:** [`requirements_strip_visible`] is the SETUP
+//! strip's visibility decision — the strip shows while the header's
+//! `Setup` toggle is open AND [`diagnose`] reports a requirement.
+//! Case 1 fires on liveness alone (`daemon_status` not `connected*` —
+//! never polled, the daemon down, or a groupless client's refused
+//! connect), so a daemon-less launch shows the one-click setup prompt
+//! (a fresh install, a stopped daemon, or a leftover-partial install
+//! all converge on it), and the strip disappears on its own the moment
+//! the daemon serves — even when the served telemetry is all `N/A`
+//! (unsupported hardware is a healthy state, not a setup prompt).
+//!
 //! **Wiring:** C18-11 declares this module + the root re-exports, and
 //! C18-02 consumes it (the header's `Setup` toggle + the auto-shown
 //! strip between the header and the settings area — presence-driven:
@@ -210,6 +221,26 @@ pub fn diagnose(data: &TelemetryData) -> Vec<Requirement> {
     }
 
     requirements
+}
+
+/// The SETUP strip's visibility decision (the liveness-based trigger):
+/// the strip shows while the header's `Setup` toggle is open
+/// (`requirements_open`) AND [`diagnose`] reports at least one
+/// requirement. Because case 1 fires on liveness alone
+/// (`daemon_status` not `connected*` — never polled, the daemon down,
+/// or a groupless client whose connect the socket refuses), this
+/// predicate is what makes a daemon-less launch show the one-click
+/// setup prompt: a fresh install (no group, no daemon), a stopped
+/// daemon, and a leftover-partial install (the group / the
+/// authorized-users file present from a prior run, the daemon down)
+/// all converge on the daemon-down requirement. The moment the daemon
+/// serves, case 1 clears and — with no other requirement — the
+/// predicate is false, even when the served telemetry is all `N/A`
+/// (an unsupported part reports `N/A (UnsupportedHardware)`, a
+/// healthy state, not a setup case). Pure + total (D5); the app
+/// shell's per-frame allocation decision is its only caller.
+pub fn requirements_strip_visible(requirements_open: bool, data: &TelemetryData) -> bool {
+    requirements_open && !diagnose(data).is_empty()
 }
 
 /// The one-click setup helper's fixed argv (the frozen C21-01
@@ -1019,6 +1050,94 @@ mod tests {
         assert!(
             open,
             "no click must not close the strip",
+        );
+    }
+
+    /// (l) The liveness trigger — the SETUP strip's visibility
+    /// decision: the daemon is down (the poller's `disconnected`
+    /// status + the `DaemonDown` error) and the toggle is open → the
+    /// prompt shows (the stopped-daemon case).
+    #[test]
+    fn strip_visible_daemon_down_prompts() {
+        let data = TelemetryData {
+            daemon_status: "disconnected".to_owned(),
+            error: Some(
+                "cannot connect to /run/ramsleuth/ramsleuth.sock: daemon not running?"
+                    .to_owned(),
+            ),
+            ..Default::default()
+        };
+        assert!(
+            requirements_strip_visible(true, &data),
+            "daemon down + toggle open must show the setup prompt"
+        );
+    }
+
+    /// (l') The liveness trigger — the never-polled first frame (the
+    /// empty status of `TelemetryData::default()`) shows the prompt
+    /// defensively before the startup baseline fetch resolves.
+    #[test]
+    fn strip_visible_never_polled_prompts() {
+        assert!(
+            requirements_strip_visible(true, &TelemetryData::default()),
+            "a never-polled default state must show the setup prompt"
+        );
+    }
+
+    /// (l'') The liveness trigger — the gmktec case: the daemon
+    /// serves on unsupported Intel hardware (both vendor branches
+    /// `Na(UnsupportedHardware)` — the N100's report) → zero
+    /// requirements → NO prompt (a healthy state, not a setup case).
+    #[test]
+    fn strip_visible_daemon_up_unsupported_hardware_no_prompt() {
+        let data = connected(
+            CpuVendor::Intel(IntelGen::Skylake),
+            NaReason::UnsupportedHardware,
+            NaReason::UnsupportedHardware,
+        );
+        assert!(
+            !requirements_strip_visible(true, &data),
+            "a serving daemon must not prompt, even with all-N/A telemetry: {:?}",
+            diagnose(&data)
+        );
+    }
+
+    /// (l''') The liveness trigger — the user's explicit dismissal
+    /// (`Got it — keep using RamSleuth` closed the strip) is respected
+    /// while the daemon stays down: no prompt until the header's
+    /// `Setup` toggle re-opens it.
+    #[test]
+    fn strip_visible_dismissed_daemon_down_no_prompt() {
+        let data = TelemetryData {
+            daemon_status: "disconnected".to_owned(),
+            ..Default::default()
+        };
+        assert!(
+            !requirements_strip_visible(false, &data),
+            "a dismissed strip must stay closed (the header toggle re-opens it)"
+        );
+    }
+
+    /// (l'''') The liveness trigger — the leftover-partial-install
+    /// case: the state (the group, the authorized-users file) is
+    /// present from a prior run and the daemon serves, but THIS user's
+    /// connect is refused (the socket is group-gated — the recorded
+    /// permission error) → the prompt shows (the one-click setup
+    /// heals the group membership + the socket ACL in one pass).
+    #[test]
+    fn strip_visible_permission_denied_prompts() {
+        let data = TelemetryData {
+            daemon_status: "disconnected".to_owned(),
+            error: Some(
+                "cannot connect to /run/ramsleuth/ramsleuth.sock: daemon not running? \
+                 (last error: Permission denied (os error 13))"
+                    .to_owned(),
+            ),
+            ..Default::default()
+        };
+        assert!(
+            requirements_strip_visible(true, &data),
+            "a groupless client's refused connect must show the setup prompt"
         );
     }
 }

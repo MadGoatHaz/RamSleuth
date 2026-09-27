@@ -644,4 +644,23 @@ mod tests {
         assert!(text.contains("Docs/User_Guide.md"), "{text}");
         assert!(text.contains("CAP_SYS_RAWIO"), "{text}");
     }
+
+    /// (j) The gmktec class: the daemon serves on unsupported Intel
+    /// hardware (both vendor branches `Na(UnsupportedHardware)` — the
+    /// N100's report) → zero requirements: a healthy state, not a
+    /// setup prompt (the liveness trigger — the daemon serving is
+    /// what suppresses the strip, no state check involved).
+    #[test]
+    fn diagnose_connected_unsupported_hardware() {
+        let state = connected(
+            CpuVendor::Intel(IntelGen::Skylake),
+            NaReason::UnsupportedHardware,
+            NaReason::UnsupportedHardware,
+        );
+        assert!(
+            diagnose(&state).is_empty(),
+            "a serving daemon on unsupported hardware yields no requirement: {:?}",
+            diagnose(&state)
+        );
+    }
 }

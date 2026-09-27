@@ -10,10 +10,12 @@
 //! subtimings (primary / secondary / tertiary + turnarounds, ticks),
 //! the CAD bus (drive / termination, ohms), the voltages (mV→V) —
 //! each [`Section::Value`] printed in CYAN, each [`Section::Na`]
-//! printed as bare `N/A` in muted gray (NA_GRAY — the reason stays on
-//! the wire, D-4), and the two semantic warnings in AMBER (a 1:2
-//! UCLK:MCLK divide = gear desync; a SOC rail above 1.30 V = out of
-//! spec on AM5). The MCLK / UCLK / FCLK rows follow
+//! printed as a self-explanatory terse reason tag (`N/A
+//! (unsupported CPU)` / `N/A (decode failed)` / … — the structurally
+//! not-applicable cells keep the bare `N/A`) in muted gray
+//! (NA_GRAY — the reason stays on the wire, D-4), and the two
+//! semantic warnings in AMBER (a 1:2 UCLK:MCLK divide = gear
+//! desync; a SOC rail above 1.30 V = out of spec on AM5). The MCLK / UCLK / FCLK rows follow
 //! the settings panel's clock-unit knob (C7-15): the default `MHz`
 //! keeps the two-decimal form, the `GHz` knob re-renders them
 //! through [`format_clock`]'s GHz form (÷1000, trimmed).
@@ -38,11 +40,13 @@
 //! left column without vertical scrolling (C7-12). The vendor
 //! blocks are conditional on the detected CPU (C7-14): an `Amd` host
 //! renders only the AMD block, an `Intel` host only the Intel
-//! per-channel blocks — the off-vendor bare-`N/A` row is omitted
-//! entirely — and an `Unknown` vendor keeps both; a rendered
-//! whole-`Na` branch collapses to a single bare-`N/A` row, and no
-//! telemetry at all renders one gray placeholder — never a panic
-//! (the no-panic contract, plan D5).
+//! per-channel blocks — the off-vendor row is omitted entirely — and
+//! an `Unknown` vendor keeps both; a rendered whole-`Na` branch
+//! collapses to the single friendly reason note ([`na_reason_text`]
+//! — e.g. the N100-class `No data — this CPU doesn't expose …` —
+//! muted gray, never an error color), and no telemetry at all
+//! renders one gray placeholder — never a panic (the no-panic
+//! contract, plan D5).
 //!
 //! **Pure core:** [`timing_cells`] is I/O-free and deterministic (the
 //! unit tests exercise it without an egui context);
@@ -126,9 +130,8 @@ pub struct VendorTiming {
     /// Voltages — the 3×2 layout reads them by column,
     /// [`COLUMN_SECTIONS`]); empty when the block is degraded.
     pub sections: Vec<TimingSection>,
-    /// The whole-block bare `N/A` display (the degraded state — the
-    /// reason stays on the wire, D-4); `None` when the sections are
-    /// present.
+    /// The whole-block friendly reason display ([`na_reason_text`] —
+    /// the degraded state; `None` when the sections are present).
     pub degraded: Option<String>,
 }
 
@@ -138,14 +141,14 @@ pub struct VendorTiming {
 
 /// The zone-1 vendor blocks, filtered by the detected CPU vendor
 /// (C7-14): `CpuVendor::Amd(…)` renders only the AMD block (a
-/// header + the six grouped sections, or one degraded bare-`N/A`
-/// row — an AMD host with a missing driver still shows
+/// header + the six grouped sections, or one degraded friendly
+/// reason note — an AMD host with a missing driver still shows
 /// its own block, never an Intel one); `CpuVendor::Intel(…)` only
 /// the Intel per-channel blocks (one header + section block per
 /// decoded channel, including the channel-level RTL — or one
-/// degraded row for an empty / absent readout); `CpuVendor::Unknown`
+/// degraded note for an empty / absent readout); `CpuVendor::Unknown`
 /// both blocks (the vendor-claim-free behavior — each branch
-/// degrades to its own single N/A row).
+/// degrades to its own single reason note).
 ///
 /// Pure and deterministic: the same snapshot + clock unit always
 /// yields the same `Vec`. Each row's display is the formatted text
@@ -155,18 +158,18 @@ pub struct VendorTiming {
 /// V, bare ticks, `1:1` / `1:2`, `1x`…`4x` (the `gear` row, Intel
 /// only), `on` / `off`, the `GEAR_DOWN` and `CR` row values
 /// (`Enabled` / `Disabled`, `1T` / `2T` — the C8-10 split, D-6),
-/// `RZQ/N (x.x Ω)`) or
-/// bare `N/A` for a [`Section::Na`] (the reason stays on the wire;
-/// [`NaReason`] carries no `Display`, and the GUI drops the
-/// `(<reason>)` parenthetical — D-4). A rendered vendor branch that
-/// degraded whole collapses to one block with empty `sections` + the
-/// N/A display (and an Intel readout with no decoded channels does
-/// the same with `not applicable`), so an all-Na snapshot still
-/// renders the complete matrix and never panics.
+/// `RZQ/N (x.x Ω)`), or — for a [`Section::Na`] cell (the reason
+/// stays on the wire, D-4) — the per-cell [`na_text`] terse reason
+/// tag, with a structurally not-applicable cell keeping the bare
+/// `N/A`. A rendered vendor branch that degraded whole collapses to
+/// one block with empty `sections` + the friendly whole-branch note
+/// ([`na_reason_text`] — an Intel readout with no decoded channels
+/// does the same with [`NaReason::NotApplicable`]), so an all-Na
+/// snapshot still renders the complete matrix and never panics.
 pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<VendorTiming> {
     // The platform-conditional visibility (C7-14, item 3b): each
     // block renders on its own vendor — the off-vendor branch is
-    // omitted even in its degraded bare-`N/A` form
+    // omitted even in its degraded reason-note form
     // — while an `Unknown` vendor (no honest vendor claim) keeps
     // both.
     let show_amd = !matches!(telemetry.cpu.vendor, CpuVendor::Intel(_));
@@ -225,13 +228,13 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<Ven
 }
 
 /// One degraded vendor block: an empty section list + the whole-block
-/// bare N/A display (the single gray row the renderer draws beneath
-/// the bold header, D-5).
+/// friendly reason display ([`na_reason_text`] — the single muted
+/// gray note the renderer draws beneath the bold header, D-5).
 fn degraded_block(header: &str, reason: &NaReason) -> VendorTiming {
     VendorTiming {
         header: header.to_owned(),
         sections: Vec::new(),
-        degraded: Some(na_text(reason)),
+        degraded: Some(na_reason_text(reason)),
     }
 }
 
@@ -385,11 +388,61 @@ fn row(label: &str, display: String) -> (String, String) {
 // GUI matrix reads exactly like the CLI `dump`).
 // ---------------------------------------------------------------------
 
-/// The human text of an absent cell: bare `N/A` (D-4 — the reason
-/// stays on the wire; [`NaReason`] carries no `Display`, and the GUI
-/// drops the verbose `(<reason>)` parenthetical).
-fn na_text(_reason: &NaReason) -> String {
-    "N/A".to_owned()
+/// The human text of one **per-cell** absent [`Section`]: a terse
+/// reason tag — `N/A (unsupported CPU)`, `N/A (driver missing)`,
+/// `N/A (insufficient privilege)`, `N/A (new PM table)`,
+/// `N/A (decode failed)` — so every N/A cell names why, while the
+/// verbose detail (the [`NaReason::ParseError`] payload, the wire
+/// [`NaReason`] itself) stays off the screen (the [`NaReason`] stays
+/// on the wire, D-4). A structurally not-applicable cell
+/// ([`NaReason::NotApplicable`] — e.g. Intel voltages on AMD silicon,
+/// the AMD `gear` row) keeps the one bare `N/A` (explaining every
+/// structurally-absent field would be noise in the dense grid).
+pub(crate) fn na_text(reason: &NaReason) -> String {
+    match reason {
+        NaReason::NotApplicable => "N/A".to_owned(),
+        NaReason::UnsupportedHardware => "N/A (unsupported CPU)".to_owned(),
+        NaReason::DriverMissing => "N/A (driver missing)".to_owned(),
+        NaReason::InsufficientPrivilege => "N/A (insufficient privilege)".to_owned(),
+        NaReason::UnknownPmTableVersion => "N/A (new PM table)".to_owned(),
+        NaReason::ParseError(_) => "N/A (decode failed)".to_owned(),
+    }
+}
+
+/// The human text of a **whole-branch** degraded readout (the single
+/// gray note under the vendor header when the branch is `Na` — the
+/// former bare `N/A` the N100-class user read as "the daemon is
+/// broken"): a plain, self-explanatory one-liner naming the reason
+/// and stating the daemon/driver state when that is the reassuring
+/// fact. The reason stays on the wire as [`NaReason`] (D-4); this
+/// text is the display.
+pub fn na_reason_text(reason: &NaReason) -> String {
+    match reason {
+        NaReason::UnsupportedHardware => {
+            "No data — this CPU doesn't expose the memory-controller registers RamSleuth reads. Expected on this part, not an error."
+                .to_owned()
+        }
+        NaReason::UnknownPmTableVersion => {
+            "No data — this CPU's memory-firmware version isn't in the supported set yet. The driver is loaded and working."
+                .to_owned()
+        }
+        NaReason::ParseError(_) => {
+            "No data — the register values couldn't be decoded on this platform."
+                .to_owned()
+        }
+        NaReason::DriverMissing => {
+            "No data — the required kernel driver isn't loaded. The daemon is up; use the Setup prompt to install it."
+                .to_owned()
+        }
+        NaReason::InsufficientPrivilege => {
+            "No data — this read needs more privilege than the daemon has."
+                .to_owned()
+        }
+        NaReason::NotApplicable => {
+            "No data — this section isn't available on this platform."
+                .to_owned()
+        }
+    }
 }
 
 /// A memory-clock cell in the selected clock unit (C7-15): the
@@ -645,17 +698,20 @@ fn render_section(
         });
 }
 
-/// The semantic color of one grid cell: CYAN for values, muted gray
-/// (NA_GRAY) for absent cells (bare `N/A` — D-5: unavailable, not a
-/// critical fault), AMBER for the two warning conditions — a 1:2
-/// UCLK:MCLK divide (gear desync) and a VDDCR_SOC reading above
+/// The semantic color of one grid cell / degraded-branch note: CYAN
+/// for values, muted gray (NA_GRAY) for absent cells (the bare /
+/// terse-tag `N/A` per-cell form — D-5: unavailable, not a critical
+/// fault) and for the whole-branch [`na_reason_text`] note (its
+/// `No data — ` lead — the N/A reason is a muted secondary note,
+/// never an error color), AMBER for the two warning conditions — a
+/// 1:2 UCLK:MCLK divide (gear desync) and a VDDCR_SOC reading above
 /// [`SOC_MAX_VOLTS`] (out of spec on AM5). The split `GEAR_DOWN` /
-/// `CR` rows (D-6) degrade their own row to bare `N/A` when their
-/// cell is absent — that display hits the `starts_with("N/A")` pick
-/// above; their value rows (`Enabled` / `Disabled` / `1T` / `2T`)
-/// fall through to CYAN.
+/// `CR` rows (D-6) degrade their own row to its absent-cell display
+/// when their cell is absent — that display hits the N/A pick above;
+/// their value rows (`Enabled` / `Disabled` / `1T` / `2T`) fall
+/// through to CYAN.
 fn cell_color(label: &str, display: &str) -> egui::Color32 {
-    if display.starts_with("N/A") {
+    if display.starts_with("N/A") || display.starts_with("No data") {
         return NA_GRAY;
     }
     match label {
@@ -927,7 +983,9 @@ mod tests {
         assert_eq!(displays(&rows, "PDM"), vec!["off"]);
         assert_eq!(displays(&rows, "tCL"), vec!["16"]);
         assert_eq!(displays(&rows, "tFAW"), vec!["16"]);
-        assert_eq!(displays(&rows, "tRFC2"), vec!["N/A"]);
+        // The fixture's rfc2 Na(ParseError) cell: the terse per-cell
+        // reason tag (the detail stays on the wire).
+        assert_eq!(displays(&rows, "tRFC2"), vec!["N/A (decode failed)"]);
         assert_eq!(displays(&rows, "RTT nom"), vec!["RZQ/10 (24.0 Ω)"]);
         assert_eq!(displays(&rows, "RTT wr"), vec!["45.0 Ω"]);
         assert_eq!(displays(&rows, "RTT park"), vec!["N/A"]);
@@ -941,8 +999,8 @@ mod tests {
 
     /// (b) The fully all-Na snapshot with an `Unknown` vendor: one
     /// degraded block per vendor branch (empty sections + the
-    /// whole-block N/A display) — the vendor-claim-free state keeps
-    /// both blocks (C7-14) — no panic.
+    /// friendly whole-block reason note — [`na_reason_text`]) — the
+    /// vendor-claim-free state keeps both blocks (C7-14) — no panic.
     #[test]
     fn all_na_blocks_degrade_to_single_rows_panic_free() {
         let blocks = timing_cells(&all_na(), &Units::default());
@@ -953,10 +1011,16 @@ mod tests {
         );
         assert_eq!(blocks[0].header, "AMD");
         assert!(blocks[0].sections.is_empty());
-        assert_eq!(blocks[0].degraded.as_deref(), Some("N/A"));
+        assert_eq!(
+            blocks[0].degraded.as_deref(),
+            Some("No data — the required kernel driver isn't loaded. The daemon is up; use the Setup prompt to install it.")
+        );
         assert_eq!(blocks[1].header, "Intel");
         assert!(blocks[1].sections.is_empty());
-        assert_eq!(blocks[1].degraded.as_deref(), Some("N/A"));
+        assert_eq!(
+            blocks[1].degraded.as_deref(),
+            Some("No data — this read needs more privilege than the daemon has.")
+        );
         assert!(all_rows(&blocks).is_empty(), "a degraded block carries no section rows");
     }
 
@@ -1049,12 +1113,13 @@ mod tests {
 
         let rows = all_rows(&blocks);
         let mclk = displays(&rows, "MCLK");
-        // channel 0 decodes; channel 1's frequency-ratio read failed.
+        // channel 0 decodes; channel 1's frequency-ratio read failed
+        // (Na(ParseError) — the terse per-cell reason tag).
         assert_eq!(
             mclk,
             vec![
                 "1600.00 MHz",
-                "N/A",
+                "N/A (decode failed)",
             ]
         );
 
@@ -1156,6 +1221,14 @@ mod tests {
             cell_color("CR", "N/A"),
             NA_GRAY,
             "the command-rate row degrades gray (bare N/A)"
+        );
+        assert_eq!(
+            cell_color(
+                "Intel",
+                "No data — this CPU doesn't expose the memory-controller registers RamSleuth reads. Expected on this part, not an error."
+            ),
+            NA_GRAY,
+            "the whole-branch reason note degrades gray (muted, not a fault)"
         );
     }
 
@@ -1314,13 +1387,28 @@ mod tests {
         assert_eq!(displays(&rows, "VDDCR_SOC"), vec!["1.150 V"]);
     }
 
-    /// (k) The bare N/A form (D-4): every `na_text` arm collapses to
-    /// exactly `N/A` (the reason stays on the wire), and no row
-    /// display or degraded whole-block display across all three
-    /// fixture snapshots carries a `N/A (<reason>)` parenthetical.
+    /// (k) The self-explanatory N/A forms: every per-cell [`na_text`]
+    /// arm is a terse reason tag (the structurally not-applicable
+    /// cell keeps the one bare `N/A` — the noise-free form for the
+    /// dense grid), every whole-branch [`na_reason_text`] arm is the
+    /// friendly `No data — ` one-liner, and no raw `ParseError`
+    /// detail survives into any GUI display (the reason stays on the
+    /// wire as [`NaReason`], D-4).
     #[test]
-    fn na_text_arms_and_all_displays_render_bare() {
-        // The six arms of na_text all collapse to the one bare form.
+    fn na_forms_are_terse_tags_and_friendly_notes() {
+        // The six per-cell arms: terse reason tags (one bare form for
+        // the structurally not-applicable cells).
+        assert_eq!(na_text(&NaReason::NotApplicable), "N/A");
+        assert_eq!(na_text(&NaReason::UnsupportedHardware), "N/A (unsupported CPU)");
+        assert_eq!(na_text(&NaReason::DriverMissing), "N/A (driver missing)");
+        assert_eq!(na_text(&NaReason::InsufficientPrivilege), "N/A (insufficient privilege)");
+        assert_eq!(na_text(&NaReason::UnknownPmTableVersion), "N/A (new PM table)");
+        assert_eq!(
+            na_text(&NaReason::ParseError("truncated at 0x1A".to_owned())),
+            "N/A (decode failed)"
+        );
+
+        // The six whole-branch arms: the friendly one-liners.
         for reason in [
             NaReason::UnsupportedHardware,
             NaReason::DriverMissing,
@@ -1329,26 +1417,159 @@ mod tests {
             NaReason::NotApplicable,
             NaReason::ParseError("fixture".to_owned()),
         ] {
-            assert_eq!(na_text(&reason), "N/A", "na_text({reason:?}) must be bare (D-4)");
+            assert!(
+                na_reason_text(&reason).starts_with("No data"),
+                "na_reason_text({reason:?}) must be the friendly note, got {:?}",
+                na_reason_text(&reason)
+            );
         }
 
-        // The full matrix over all three fixture shapes: any display
-        // containing `N/A` is exactly the bare form (no
-        // parenthetical survives into the GUI), and the degraded
-        // whole-block displays are bare too.
+        // The full matrix over all three fixture shapes: no raw
+        // `ParseError` detail survives into any display, and every
+        // degraded whole-block display is the friendly note.
         for snapshot in [representative(), intel_populated(), all_na()] {
             let blocks = timing_cells(&snapshot, &Units::default());
             for (label, display) in all_rows(&blocks) {
                 assert!(
-                    !display.contains("N/A ("),
-                    "the {label} display must not carry an N/A parenthetical (D-4), got {display:?}"
+                    !display.contains("fixture"),
+                    "the {label} display must not carry the raw ParseError detail, got {display:?}"
                 );
             }
             for block in &blocks {
                 if let Some(display) = &block.degraded {
-                    assert_eq!(display, "N/A", "the degraded display must be bare (D-4)");
+                    assert!(
+                        display.starts_with("No data"),
+                        "the degraded display must be the friendly note, got {display:?}"
+                    );
                 }
             }
+        }
+    }
+
+    /// (n) The N100 class (an Intel host whose detected generation is
+    /// unrecognized, both vendor branches `Na(UnsupportedHardware)`):
+    /// the Intel-detected host renders only its own degraded block —
+    /// the friendly one-liner explaining the part exposes no
+    /// memory-controller registers (expected, not an error — the
+    /// daemon is fine) — and the AMD host's
+    /// `Na(UnknownPmTableVersion)` branch renders the
+    /// firmware-version note (the driver is loaded and working).
+    #[test]
+    fn unsupported_and_unknown_pm_table_branches_render_their_reason() {
+        // The N100 shape: both branches `Na(UnsupportedHardware)`.
+        let n100 = SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Intel(IntelGen::Unrecognized),
+                brand: "Intel N100".to_owned(),
+            },
+            amd: Section::na(NaReason::UnsupportedHardware),
+            intel: Section::na(NaReason::UnsupportedHardware),
+            spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
+        };
+        let blocks = timing_cells(&n100, &Units::default());
+        assert_eq!(blocks.len(), 1, "the Intel host renders only the Intel block (C7-14)");
+        assert_eq!(blocks[0].header, "Intel");
+        assert!(blocks[0].sections.is_empty());
+        assert_eq!(
+            blocks[0].degraded.as_deref(),
+            Some(
+                "No data — this CPU doesn't expose the memory-controller registers RamSleuth reads. Expected on this part, not an error."
+            )
+        );
+
+        // The AMD `Na(UnknownPmTableVersion)` branch.
+        let pm = SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Amd(AmdZen::Zen5),
+                brand: "Ryzen 9 9950X".to_owned(),
+            },
+            amd: Section::na(NaReason::UnknownPmTableVersion),
+            intel: Section::na(NaReason::NotApplicable),
+            spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
+        };
+        let blocks = timing_cells(&pm, &Units::default());
+        assert_eq!(blocks.len(), 1, "the AMD host renders only the AMD block (C7-14)");
+        assert_eq!(blocks[0].header, "AMD");
+        assert_eq!(
+            blocks[0].degraded.as_deref(),
+            Some(
+                "No data — this CPU's memory-firmware version isn't in the supported set yet. The driver is loaded and working."
+            )
+        );
+    }
+
+    /// (o) The whole-branch reason note paints in muted gray (NA_GRAY)
+    /// — the N/A is a data-availability note, not a fault: the
+    /// degraded row is never an error color, even on the N100 shape.
+    #[test]
+    fn degraded_branch_note_renders_muted_gray() {
+        let n100 = SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Intel(IntelGen::Unrecognized),
+                brand: "Intel N100".to_owned(),
+            },
+            amd: Section::na(NaReason::UnsupportedHardware),
+            intel: Section::na(NaReason::UnsupportedHardware),
+            spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::na(NaReason::NotApplicable),
+            dimm_sizes: Vec::new(),
+        };
+        let data = TelemetryData {
+            telemetry: Some(n100),
+            daemon_status: "connected: /tmp/ramsleuth.sock".to_owned(),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.begin_frame(egui::RawInput::default());
+        egui::CentralPanel::default().show(&ctx, |ui| render_telemetry_zone(ui, &data));
+        let out = ctx.end_frame();
+        // The friendly note's galley: every section painted NA_GRAY.
+        let notes: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("No data") => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(!notes.is_empty(), "the degraded branch note must paint");
+        for note in &notes {
+            let colors: Vec<_> = note
+                .galley
+                .job
+                .sections
+                .iter()
+                .map(|sec| sec.format.color)
+                .collect();
+            assert!(
+                colors.iter().all(|c| *c == NA_GRAY),
+                "the N/A reason note must be muted gray, got {colors:?}"
+            );
         }
     }
 
