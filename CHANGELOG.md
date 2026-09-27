@@ -4,6 +4,11 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project.
 
+## [2.4.12] - 2026-09-27
+
+### Changed
+- **The TUI info screen (`[d]`) is now a clean CONTROLS reference**: the redundant app description (what RamSleuth is, the daemon model, the capability summary) is removed — that is the docs' job (`Docs/User_Guide.md`) — and the screen now shows the full 17-key set as a responsive `key — action` grid grouped by function (DATA / BENCH / VIEWS), one to three columns by terminal width, so it uses the horizontal space well (the old fixed 10-row ABOUT block is replaced by a width-dependent height: 10 rows at ≥ 87 columns, 14 at 58–86, 22 below; the key set is pinned to the `events` contract by test so the screen and the handler table cannot drift)
+
 ## [2.4.11] - 2026-09-27
 
 ### Changed

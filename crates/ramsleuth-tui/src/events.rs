@@ -72,8 +72,8 @@ pub enum Action {
     /// Toggle the settings strip (poll interval, units, refresh, socket).
     ToggleSettings,
     /// Toggle the info screen: the requirements strip (setup
-    /// prerequisites, presence-driven) + the About block (always shown
-    /// while the screen is open).
+    /// prerequisites, presence-driven) + the controls block (the
+    /// 17-key map, always shown while the screen is open).
     ToggleRequirements,
     /// Write a `{ telemetry, bench }` JSON export to `$HOME` (F3 parity).
     ExportJson,

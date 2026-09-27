@@ -44,13 +44,15 @@
 //!   `history.rs` core re-implemented std-only — the graphs module
 //!   backing store).
 //! - `requirements` — TUI-08 — the SETUP requirements strip + the
-//!   `[d]` screen's About block (the GUI `first_run::diagnose` mirror,
-//!   display-only): the pure no-panic `diagnose(&AppState)` (the four
-//!   prerequisite cases — daemon / group / AMD DKMS / Intel DKMS) +
-//!   `render_requirements_strip` (the amber `SETUP — requirements`
-//!   block with the exact fix commands) + `render_about_block` (the
-//!   compact `ABOUT — RamSleuth` block, the fixed
-//!   `ABOUT_BLOCK_HEIGHT` rows).
+//!   `[d]` screen's controls block (the GUI `first_run::diagnose`
+//!   mirror, display-only): the pure no-panic `diagnose(&AppState)`
+//!   (the four prerequisite cases — daemon / group / AMD DKMS / Intel
+//!   DKMS) + `render_requirements_strip` (the amber
+//!   `SETUP — requirements` block with the exact fix commands) +
+//!   `render_about_block` (the `CONTROLS — RamSleuth` block — the
+//!   full 17-key contract as a responsive one/two/three-column
+//!   `key — action` grid, the width-dependent `about_block_height`
+//!   rows).
 //! - `ui` — P3-23 + TUI-09..16 — the parity dashboard renderer over
 //!   `AppState`: the 3-line header, zone 1 (memory controller + the
 //!   VDDCR_VDD / GEAR_DOWN / CR rows), zone 2 (the live bench grid + the
@@ -105,13 +107,13 @@ pub use graphs::{
     GRAPH_CAPACITY,
 };
 
-// TUI-08: the SETUP requirements strip + the `[d]` screen's About
+// TUI-08: the SETUP requirements strip + the `[d]` screen's controls
 // block, re-exported at the root (workspace re-export style) —
 // `diagnose` is the pure presence rule the render chain (TUI-16) + the
 // `[d]` toggle drive; `render_about_block` is the screen's
-// always-present informational companion.
+// always-present informational companion (the 17-key grid).
 pub use requirements::{
-    ABOUT_BLOCK_HEIGHT, Requirement, diagnose, render_about_block, render_requirements_strip,
+    Requirement, about_block_height, diagnose, render_about_block, render_requirements_strip,
 };
 
 // chunk probe-4: the consent-gated probe-report overlay,

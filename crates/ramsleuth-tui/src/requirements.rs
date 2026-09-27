@@ -38,12 +38,14 @@
 //! requirement is resolved).
 //!
 //! The same `[d]` screen carries the always-present
-//! [`render_about_block`] companion (its fixed height,
-//! [`ABOUT_BLOCK_HEIGHT`]): a compact `ABOUT — RamSleuth` block — what
-//! RamSleuth is, how the daemon model works, the capabilities, the
-//! Intel/AMD split, and the docs pointer. It is drawn while the `[d]`
-//! toggle is open, independent of `diagnose`'s presence (informational,
-//! not a warning — the cyan zone-border style).
+//! [`render_about_block`] companion: the `CONTROLS — RamSleuth` block —
+//! the full 17-key contract as a responsive `key — action` grid (the
+//! DATA / BENCH / VIEWS groups; the width-dependent
+//! [`about_block_height`]). The app description is the docs' job
+//! (`Docs/User_Guide.md`), so the screen shows only the controls. It is
+//! drawn while the `[d]` toggle is open, independent of `diagnose`'s
+//! presence (informational, not a warning — the cyan zone-border
+//! style).
 //!
 //! **Display-only (plan §5.2):** no pkexec, no wizard, no in-app
 //! execution — the TUI user is already in a terminal, so the strip
@@ -69,7 +71,7 @@ use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -87,7 +89,8 @@ const CYAN: Color = Color::Rgb(0x00, 0xD4, 0xFF);
 const SLATE: Color = Color::Rgb(0x1E, 0x1E, 0x24);
 /// Dim grey: the detail lines + the footer.
 const DIM: Color = Color::Rgb(0x8A, 0x8A, 0x96);
-/// Light grey: the About block's title (the zone-block style mirror).
+/// Light grey: the controls block's title + group headings (the
+/// zone-block style mirror).
 const LIGHT_GREY: Color = Color::Rgb(0xC0, 0xC0, 0xCC);
 
 /// The pinned `ryzen_smu` upstream, short sha (D-18.6):
@@ -295,21 +298,167 @@ fn requirements_lines(requirements: &[Requirement]) -> Vec<Line<'static>> {
 }
 
 // ---------------------------------------------------------------------
-// The `[d]` screen's About/Help section: what RamSleuth is, how the
-// daemon model works, the capabilities, the Intel/AMD split, and the
-// docs pointer — the always-present companion to the presence-driven
+// The `[d]` screen's controls block: the full 17-key contract laid
+// out as a responsive `key — action` grid (the app description is the
+// docs' job — `Docs/User_Guide.md` — so the screen shows only the
+// controls). The always-present companion to the presence-driven
 // requirements strip.
 // ---------------------------------------------------------------------
 
-/// The About block's fixed height: the two border rows + the eight
-/// content rows of [`about_lines`].
-pub const ABOUT_BLOCK_HEIGHT: u16 = 10;
+/// One key row of the controls block: the single-char key (lowercase —
+/// the contract is case-insensitive, modifiers ignored) and its
+/// one-line action text (the `User_Guide §5.1` mirror, compact).
+#[derive(Debug, Clone, Copy)]
+struct KeyRow {
+    /// The key, e.g. `r`.
+    key: &'static str,
+    /// The action text, e.g. `Refresh — force poll`.
+    text: &'static str,
+}
 
-/// Render the `ABOUT — RamSleuth` block into `area` (the `[d]`
-/// screen's About/Help section, the requirements strip's companion):
-/// a compact eight-line summary — what RamSleuth is, how the daemon
-/// model works, the capabilities, the Intel/AMD split, and the docs
-/// pointer. Pure (no state read) and no-panic (D5): a zero-size area
+/// A logical group of the 17-key contract: the small heading + its
+/// rows (the groups aid scanning; the rows keep the frozen `events`
+/// table's order within each class).
+#[derive(Debug, Clone, Copy)]
+struct KeyGroup {
+    /// The group heading, e.g. `DATA`.
+    heading: &'static str,
+    /// The group's rows.
+    rows: &'static [KeyRow],
+}
+
+/// The three groups of the 17-key contract: **DATA** (the fetch /
+/// snapshot / export surface — `r` `s` `e` `p` `a` `f`), **BENCH**
+/// (the run class — `b` `m` `x` `c`), **VIEWS** (the display toggles +
+/// the session exit — `g` `t` `d` `u` `k` `w` `q`).
+const KEY_GROUPS: [KeyGroup; 3] = [
+    KeyGroup {
+        heading: "DATA",
+        rows: &[
+            KeyRow { key: "r", text: "Refresh — force poll" },
+            KeyRow { key: "s", text: "Snapshot — .txt → CWD" },
+            KeyRow { key: "e", text: "Export — JSON → $HOME" },
+            KeyRow { key: "p", text: "Poll — 100 ms → 60 s" },
+            KeyRow { key: "a", text: "Auto refresh — on ↔ off" },
+            KeyRow { key: "f", text: "Probe report — consent" },
+        ],
+    },
+    KeyGroup {
+        heading: "BENCH",
+        rows: &[
+            KeyRow { key: "b", text: "Bench — full run" },
+            KeyRow { key: "m", text: "Bench — memory only" },
+            KeyRow { key: "x", text: "Burn-in — 5 min soak" },
+            KeyRow { key: "c", text: "Cancel — in-flight run" },
+        ],
+    },
+    KeyGroup {
+        heading: "VIEWS",
+        rows: &[
+            KeyRow { key: "g", text: "Graphs — 5-series panel" },
+            KeyRow { key: "t", text: "Settings — the strip" },
+            KeyRow { key: "d", text: "Info — this screen" },
+            KeyRow { key: "u", text: "Capacity — GiB ↔ GB" },
+            KeyRow { key: "k", text: "Clock — MHz ↔ GHz" },
+            KeyRow { key: "w", text: "Window — 1 → 60 min" },
+            KeyRow { key: "q", text: "Quit — exit 0" },
+        ],
+    },
+];
+
+/// The inter-column gap (the blank cells between the grid's columns).
+const COLUMN_GAP: u16 = 2;
+
+/// One cell of the grid's row sequence: a group heading or a key row.
+#[derive(Debug, Clone, Copy)]
+enum Cell {
+    /// A group heading, e.g. `DATA` (the bold light-grey row).
+    Heading(&'static str),
+    /// A key row (the cyan `[k]` token + the light-grey text).
+    Row(KeyRow),
+}
+
+/// The widest display row (`[k] text`, chars = cells — the codebase's
+/// width convention): the column-fit thresholds derive from it, so
+/// the grid never wraps at the widths it uses.
+fn max_row_width() -> u16 {
+    KEY_GROUPS
+        .iter()
+        .flat_map(|group| group.rows)
+        .map(|row| 4 + row.text.chars().count() as u16)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The grid's column count for the available inner width: three
+/// columns (one group each) when they fit, two (DATA+BENCH | VIEWS)
+/// next, one below (the very-narrow fallback — the rows clip
+/// gracefully, never a panic, D5).
+fn about_columns(inner: u16) -> usize {
+    let widest = max_row_width();
+    if inner >= 3 * widest + 2 * COLUMN_GAP {
+        3
+    } else if inner >= 2 * widest + COLUMN_GAP {
+        2
+    } else {
+        1
+    }
+}
+
+/// The column group indices for a column count (3 → one group per
+/// column, 2 → DATA+BENCH | VIEWS, 1 → all three stacked).
+fn column_group_indices(columns: usize) -> Vec<Vec<usize>> {
+    match columns {
+        3 => vec![vec![0], vec![1], vec![2]],
+        2 => vec![vec![0, 1], vec![2]],
+        _ => vec![vec![0, 1, 2]],
+    }
+}
+
+/// One column's row sequence: its groups' headings + rows, in order.
+fn column_sequence(columns: usize, column: usize) -> Vec<Cell> {
+    column_group_indices(columns)[column]
+        .iter()
+        .flat_map(|&group_index| {
+            let group = &KEY_GROUPS[group_index];
+            std::iter::once(Cell::Heading(group.heading)).chain(
+                group
+                    .rows
+                    .iter()
+                    .map(|row| Cell::Row(*row)),
+            )
+        })
+        .collect()
+}
+
+/// The controls block's height for the given full width: the two
+/// border rows + the tallest column (its groups' headings + rows).
+/// Replaces the old fixed ten rows: ten at ≥ 87 cols (three columns),
+/// fourteen at 58–86 (two), twenty-two below (one).
+pub fn about_block_height(width: u16) -> u16 {
+    let inner = width.saturating_sub(2);
+    if inner == 0 {
+        return 2;
+    }
+    let columns = about_columns(inner);
+    let tallest = column_group_indices(columns)
+        .iter()
+        .map(|groups| {
+            groups
+                .iter()
+                .map(|&group_index| 1 + KEY_GROUPS[group_index].rows.len() as u16)
+                .sum::<u16>()
+        })
+        .max()
+        .unwrap_or(0);
+    2 + tallest
+}
+
+/// Render the `CONTROLS — RamSleuth` block into `area` (the `[d]`
+/// screen's controls section, the requirements strip's companion): the
+/// full 17-key contract as a responsive `key — action` grid (the
+/// three DATA / BENCH / VIEWS groups in one, two, or three columns by
+/// width). Pure (no state read) and no-panic (D5): a zero-size area
 /// draws nothing; the caller's presence decision (draw at all — the
 /// `[d]` toggle) is the ui.rs render chain's.
 pub fn render_about_block(frame: &mut Frame, area: Rect) {
@@ -319,39 +468,95 @@ pub fn render_about_block(frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(CYAN))
-        .title("ABOUT — RamSleuth")
+        .title("CONTROLS — RamSleuth")
         .title_style(Style::default().fg(LIGHT_GREY))
         .style(Style::default().bg(SLATE));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(about_lines()), inner);
+    frame.render_widget(Paragraph::new(about_lines(area.width)), inner);
 }
 
-/// The About block's eight content lines (compact — the block must
-/// fit at small terminal sizes; every line is pre-wrapped to ≤ 78
-/// cells, the 80-column floor inside the border).
-fn about_lines() -> Vec<Line<'static>> {
-    const ABOUT: &[&str] = &[
-        "Live RAM telemetry + an AIDA64-style memory benchmark for AMD/Intel desktops.",
-        "A root daemon (CAP_SYS_RAWIO only) reads the AMD SMU PM tables, the Intel",
-        "MCHBAR IMC registers, and SPD EEPROMs, serving this TUI over the Unix socket.",
-        "Capabilities: live clocks, timings, voltages + CAD bus; SPD details with",
-        "XMP/EXPO profiles; channel mode + ECC; benchmark [B]; burn-in [X]; probe [F].",
-        "Intel: per-channel IMC subtimings (Tier 1–3, Skylake→Arrow Lake).",
-        "AMD: SMU PM clocks + voltages + CAD bus.",
-        "Full guide: Docs/User_Guide.md (or the README).",
-    ];
-    ABOUT
-        .iter()
-        .map(|line| Line::from(Span::styled(line.to_owned(), Style::default().fg(DIM))))
+/// The controls block's content lines for the given full width: each
+/// row joins the per-column cells (a group heading, or a `[k] text`
+/// row, left-aligned, padded to the column width, gap-separated),
+/// clipped to the column width — a very-narrow surface degrades to
+/// one column of cleanly clipped rows (never a panic, D5).
+fn about_lines(width: u16) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(2);
+    if inner == 0 {
+        return Vec::new();
+    }
+    let columns = about_columns(inner);
+    let column_width = (inner - COLUMN_GAP * (columns - 1) as u16) / columns as u16;
+    let sequences: Vec<Vec<Cell>> = (0..columns)
+        .map(|column| column_sequence(columns, column))
+        .collect();
+    let rows = sequences.iter().map(Vec::len).max().unwrap_or(0);
+    (0..rows)
+        .map(|row| {
+            let mut spans = Vec::new();
+            for (column, sequence) in sequences.iter().enumerate() {
+                if column > 0 {
+                    spans.push(Span::raw(" ".repeat(COLUMN_GAP as usize)));
+                }
+                match sequence.get(row) {
+                    Some(Cell::Heading(heading)) => {
+                        let display = heading.to_owned();
+                        let cells = display.chars().count();
+                        if cells > column_width as usize {
+                            spans.push(Span::raw(
+                                display
+                                    .chars()
+                                    .take(column_width as usize)
+                                    .collect::<String>(),
+                            ));
+                        } else {
+                            spans.push(Span::styled(
+                                display,
+                                Style::default().fg(LIGHT_GREY).add_modifier(Modifier::BOLD),
+                            ));
+                            spans.push(Span::raw(" ".repeat(
+                                column_width as usize - cells,
+                            )));
+                        }
+                    }
+                    Some(Cell::Row(KeyRow { key, text })) => {
+                        let display = format!("[{key}] {text}");
+                        let cells = display.chars().count();
+                        if cells > column_width as usize {
+                            spans.push(Span::raw(
+                                display
+                                    .chars()
+                                    .take(column_width as usize)
+                                    .collect::<String>(),
+                            ));
+                        } else {
+                            spans.push(Span::styled(
+                                format!("[{key}]"),
+                                Style::default().fg(CYAN),
+                            ));
+                            spans.push(Span::styled(
+                                format!(" {text}"),
+                                Style::default().fg(LIGHT_GREY),
+                            ));
+                            spans.push(Span::raw(
+                                " ".repeat(column_width as usize - cells),
+                            ));
+                        }
+                    }
+                    // A shorter column: the rest of the row is blank.
+                    None => spans.push(Span::raw(" ".repeat(column_width as usize))),
+                }
+            }
+            Line::from(spans)
+        })
         .collect()
 }
 
 // ---------------------------------------------------------------------
 // Tests (headless: the six `diagnose` cases from the GUI first_run
-// mirror + the About block's no-panic render + the 80-column floor —
-// the strip's no-panic render over ratatui's in-memory TestBackend,
-// the ui.rs test idiom).
+// mirror + the controls block's 17-key content / width fit / no-panic
+// render over ratatui's in-memory TestBackend, the ui.rs test idiom).
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
@@ -594,27 +799,128 @@ mod tests {
         );
     }
 
-    /// (h) The About block's content stays compact: exactly eight
-    /// lines, each within the 80-column floor (78 cells inside the
-    /// border) — the `[d]` screen must not overflow at small terminal
-    /// sizes (the no-panic contract, D5).
+    /// (h) The controls block lists exactly the frozen 17-key
+    /// contract (the `events::key_to_action` set — the two surfaces
+    /// can't drift): each contract key appears once, every listed key
+    /// maps through the pure `key_to_action` to its action, and the
+    /// three group headings are present in order.
     #[test]
-    fn about_lines_fit_the_80_column_floor() {
-        let lines = about_lines();
-        assert_eq!(lines.len(), 8, "the block's height pins the 8 content lines");
-        for line in &lines {
-            assert_eq!(line.spans.len(), 1, "each about line is one span");
-            assert!(
-                line.spans[0].content.chars().count() <= 78,
-                "an about line must fit the 80-column floor: {:?}",
-                line.spans[0].content
+    fn about_lines_are_the_17_key_contract() {
+        use std::collections::BTreeSet;
+
+        use crate::events::{key_to_action, Action};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // The frozen seventeen action keys (the `events` table).
+        let contract: [(char, Action); 17] = [
+            ('r', Action::Refresh),
+            ('s', Action::Snapshot),
+            ('q', Action::Quit),
+            ('b', Action::BenchFull),
+            ('m', Action::BenchMemory),
+            ('x', Action::BurnIn),
+            ('c', Action::Cancel),
+            ('g', Action::ToggleGraphs),
+            ('t', Action::ToggleSettings),
+            ('d', Action::ToggleRequirements),
+            ('e', Action::ExportJson),
+            ('p', Action::CyclePoll),
+            ('u', Action::ToggleCapacity),
+            ('k', Action::ToggleClock),
+            ('a', Action::ToggleRefresh),
+            ('w', Action::CycleWindow),
+            ('f', Action::ProbeReport),
+        ];
+        // The block's key set is exactly the contract's (each key
+        // once — no duplicates, no omissions).
+        let about_keys: BTreeSet<char> = KEY_GROUPS
+            .iter()
+            .flat_map(|group| group.rows)
+            .map(|row| row.key.chars().next().expect("a key row has a key"))
+            .collect();
+        let contract_keys: BTreeSet<char> = contract
+            .iter()
+            .map(|&(key, _)| key)
+            .collect();
+        assert_eq!(
+            about_keys, contract_keys,
+            "the controls block must list exactly the frozen 17-key contract"
+        );
+        assert_eq!(
+            KEY_GROUPS
+                .iter()
+                .map(|group| group.rows.len())
+                .sum::<usize>(),
+            17,
+            "the full 17-key contract"
+        );
+        // Every listed key maps through the pure contract to its
+        // action (the screen can't advertise a dead key).
+        for (key, action) in contract {
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                Some(action),
+                "the listed key {key} must map to {action:?}"
             );
+        }
+        // The three group headings, in order (the scan aids).
+        assert_eq!(
+            KEY_GROUPS
+                .iter()
+                .map(|group| group.heading)
+                .collect::<Vec<_>>(),
+            vec!["DATA", "BENCH", "VIEWS"]
+        );
+    }
+
+    /// (h') The responsive grid fits its width at every threshold
+    /// crossing: three columns (one group each) from 87 cols, two
+    /// (DATA+BENCH | VIEWS) from 58, one below — the rendered rows
+    /// match the block height (no off-by-one vs the layout
+    /// constraint), and no row overruns the inner width.
+    #[test]
+    fn about_grid_fits_its_width() {
+        // The column thresholds (the widest row is 27 cells).
+        assert_eq!(about_columns(55), 1, "55 < 2×27+2");
+        assert_eq!(about_columns(56), 2, "56 = 2×27+2");
+        assert_eq!(about_columns(84), 2, "84 < 3×27+4");
+        assert_eq!(about_columns(85), 3, "85 = 3×27+4");
+        // The heights: the two border rows + the tallest column.
+        assert_eq!(about_block_height(0), 2);
+        assert_eq!(about_block_height(1), 2);
+        assert_eq!(about_block_height(57), 22, "one column: 20 content rows");
+        assert_eq!(about_block_height(58), 14, "two columns: 12 content rows");
+        assert_eq!(about_block_height(80), 14);
+        assert_eq!(about_block_height(86), 14);
+        assert_eq!(about_block_height(87), 10, "three columns: 8 content rows");
+        assert_eq!(about_block_height(100), 10);
+        // Every rendered row fits its width, and the row count matches
+        // the height, at each sample width.
+        for width in [2u16, 20, 28, 29, 57, 58, 80, 86, 87, 100, 200] {
+            let inner = width.saturating_sub(2);
+            let lines = about_lines(width);
+            assert_eq!(
+                lines.len() as u16,
+                about_block_height(width) - 2,
+                "at {width} cols the rendered rows must match the block height"
+            );
+            for line in &lines {
+                let rendered: usize = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.chars().count())
+                    .sum();
+                assert!(
+                    rendered <= inner as usize,
+                    "a {width}-col row ({rendered} cells) must not overflow the inner width"
+                );
+            }
         }
     }
 
-    /// (i) The About block's no-panic render: a zero-area surface
-    /// draws nothing, and an 80×12 surface paints the title + the
-    /// docs pointer (all eight content lines fit the inner ten rows).
+    /// (i) The controls block's no-panic render: a zero-area surface
+    /// draws nothing, and an 80×16 surface (the two-column width)
+    /// paints the title + the group headings + the key rows.
     #[test]
     fn render_about_block_no_panic() {
         use ratatui::backend::TestBackend;
@@ -626,10 +932,10 @@ mod tests {
             .draw(|f| render_about_block(f, Rect::new(0, 0, 0, 0)))
             .expect("a zero-area render must not panic");
 
-        let backend = TestBackend::new(80, 12);
+        let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).expect("test terminal must init");
         let completed = terminal
-            .draw(|f| render_about_block(f, Rect::new(0, 0, 80, 12)))
+            .draw(|f| render_about_block(f, Rect::new(0, 0, 80, 16)))
             .expect("render must not panic");
         let buffer = completed.buffer;
         let width = usize::from(buffer.area().width);
@@ -640,9 +946,96 @@ mod tests {
             .map(|line| line.trim_end().to_owned())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("ABOUT — RamSleuth"), "{text}");
-        assert!(text.contains("Docs/User_Guide.md"), "{text}");
-        assert!(text.contains("CAP_SYS_RAWIO"), "{text}");
+        assert!(text.contains("CONTROLS — RamSleuth"), "{text}");
+        for heading in ["DATA", "BENCH", "VIEWS"] {
+            assert!(text.contains(heading), "{text}");
+        }
+        assert!(text.contains("[r] Refresh — force poll"), "{text}");
+        assert!(text.contains("[q] Quit — exit 0"), "{text}");
+    }
+
+    /// (i') The exact layout at the two preview widths — 100 cols
+    /// (three columns, 32 cells each + the two 2-cell gaps) and 60
+    /// cols (two columns, 28 cells each + the one gap): the heading
+    /// row + the first key row, byte-for-byte (the operator preview
+    /// pin).
+    #[test]
+    fn about_block_lines_at_preview_widths() {
+        let join = |lines: &[Line]| {
+            lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        // 100 cols: DATA | BENCH | VIEWS (31 + 2 + 31 + 2 + 31 = 97 of
+        // the 98 inner cells).
+        let text = join(&about_lines(100));
+        assert_eq!(
+            text[0],
+            format!(
+                "{}{}  {}{}  {}{}",
+                "DATA",
+                " ".repeat(27),
+                "BENCH",
+                " ".repeat(26),
+                "VIEWS",
+                " ".repeat(26)
+            )
+        );
+        assert_eq!(
+            text[1],
+            format!(
+                "{}{}  {}{}  {}{}",
+                "[r] Refresh — force poll",
+                " ".repeat(7),
+                "[b] Bench — full run",
+                " ".repeat(11),
+                "[g] Graphs — 5-series panel",
+                " ".repeat(4)
+            )
+        );
+        // 60 cols: DATA+BENCH | VIEWS (28 + 2 + 28 = 58).
+        let text = join(&about_lines(60));
+        assert_eq!(
+            text[0],
+            format!("{}{}  {}{}", "DATA", " ".repeat(24), "VIEWS", " ".repeat(23))
+        );
+        assert_eq!(
+            text[1],
+            format!(
+                "{}{}  {}{}",
+                "[r] Refresh — force poll",
+                " ".repeat(4),
+                "[g] Graphs — 5-series panel",
+                " ".repeat(1)
+            )
+        );
+        // The `[c]`/`[q]` pair: the BENCH column's final row | the
+        // VIEWS column's final row.
+        assert_eq!(
+            text[7],
+            format!(
+                "{}{}  {}{}",
+                "BENCH",
+                " ".repeat(23),
+                "[q] Quit — exit 0",
+                " ".repeat(11)
+            )
+        );
+        assert_eq!(
+            text[11],
+            format!(
+                "{}{}  {}",
+                "[c] Cancel — in-flight run",
+                " ".repeat(2),
+                " ".repeat(28)
+            )
+        );
     }
 
     /// (j) The gmktec class: the daemon serves on unsupported Intel
