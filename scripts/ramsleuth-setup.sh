@@ -20,7 +20,11 @@
 # after a failed 2.4.5-era run followed by an uninstall + 2.4.6 install.
 # Any failure prints a structured message (the step, the command, and the
 # reason — on stderr, the last line, so the GUI can show the real cause)
-# + exits non-zero; never a silent half-state.
+# + exits non-zero; never a silent half-state. Every run is ALSO appended,
+# in full (stdout + stderr of every step), to the durable world-readable
+# log /var/lib/ramsleuth/setup.log — the known location the GUI's failure
+# message points at; a broken run is self-documenting (header + state
+# snapshot + the whole transcript).
 #
 # Self-heal (runs on every invocation, before the steps):
 #   0a. `ramsleuth.service` left in a FAILED state (a prior run died mid-
@@ -177,6 +181,68 @@ id -u "$USER_NAME" >/dev/null 2>&1 || die "unknown user: $USER_NAME" 2
 # Keep the line-oriented state file clean (sanity gate on user-supplied input).
 [[ "$USER_NAME" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || die "invalid username: $USER_NAME" 2
 
+# --- Durable, predictable log: every run tees to /var/lib/ramsleuth/setup.log
+# --- (world-readable 0644 — the non-root user can `cat` it): the header
+# --- marks each run, and from here on EVERY line of output (the self-heal
+# --- + all steps, the delegated vendor helper via the inherited pipe, the
+# --- state snapshot, and the final exit) lands in it, so a failure on a
+# --- test machine is self-documenting. If the log cannot be established
+# --- (read-only fs, /var/lib missing), the setup proceeds terminal-only
+# --- (warn only — never fatal). RAMSLEUTH_SETUP_LOG is exported for the
+# --- vendor helper we `exec` below (its own guard tees to it only when
+# --- NOT already inside this stream — inheritance covers the setup case).
+LOG_DIR="/var/lib/ramsleuth"
+LOG="${LOG_DIR}/setup.log"
+SNAPSHOT_DONE=0
+if ! install -d -m 0755 "$LOG_DIR" 2>/dev/null; then
+  log "WARN: cannot create $LOG_DIR — the durable setup log is disabled for this run"
+  LOG=""
+fi
+if [[ -n "$LOG" ]] && ! : >> "$LOG" 2>/dev/null; then
+  log "WARN: cannot write $LOG — the durable setup log is disabled for this run"
+  LOG=""
+fi
+if [[ -n "$LOG" ]]; then
+  chmod 0644 "$LOG" 2>/dev/null || true
+  printf '==== ramsleuth-setup %s user=%s kernel=%s ====
+' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$USER_NAME" "$(uname -r)" >> "$LOG"
+  if ! exec > >(tee -a "$LOG") 2>&1; then
+    log "WARN: cannot tee to $LOG — the durable setup log is disabled for this run"
+    LOG=""
+  fi
+fi
+export RAMSLEUTH_SETUP_LOG="$LOG"
+
+# A state snapshot makes a run self-documenting: the current unit/module/
+# socket/group picture of the host, appended to $LOG (and the terminal, via
+# the tee'd fds) BEFORE the final "done" line — and, via the EXIT trap,
+# after EVERY failure (a `die`), so a broken run ends in the host's state
+# at that moment (the setup-loop diagnostic anchor).
+state_snapshot() {
+  local mod
+  SNAPSHOT_DONE=1
+  {
+    # Every statement is failure-tolerant: the snapshot must never alter
+    # the run's exit code (the EXIT trap runs with `set -e` in force).
+    printf '%s\n' '---- ramsleuth-setup state snapshot ----' || true
+    printf '  systemctl is-active %s: %s\n' "$UNIT" "$(systemctl is-active "$UNIT" 2>/dev/null || true)" || true
+    mod="$(lsmod 2>/dev/null | grep -iE 'ryzen|ramsleuth' || true)"
+    if [[ -n "$mod" ]]; then
+      printf '  lsmod (ryzen|ramsleuth):\n' || true
+      printf '%s\n' "$mod" | sed 's/^/    /' || true
+    else
+      printf '  lsmod (ryzen|ramsleuth): (none)\n' || true
+    fi
+    printf '  ls -la /run/ramsleuth/:\n' || true
+    ls -la /run/ramsleuth/ 2>/dev/null | sed 's/^/    /' || true
+    [[ -d /run/ramsleuth ]] || printf '    (no /run/ramsleuth/ directory)\n'
+    printf '  getent group %s: %s\n' "$GROUP" "$(getent group "$GROUP" 2>/dev/null || true)" || true
+  }
+  return 0
+}
+trap '[[ "$SNAPSHOT_DONE" -eq 1 ]] || state_snapshot' EXIT
+
 # --- Self-heal 0a: a unit left in a FAILED state (a prior partial/failed run,
 # --- or the unit/daemon out of sync during an uninstall + reinstall) --------
 # `systemctl enable --now` below would fail on it; reset-failed clears the
@@ -270,6 +336,9 @@ else
 fi
 
 # --- Summary + the optional DKMS delegation (vendor-aware: INTEL-08) ----------
+# The state snapshot BEFORE the "done" line (a failure before this point is
+# covered by the EXIT trap) — the self-documenting end of the run.
+state_snapshot
 log "done: daemon running; $USER_NAME in group '$GROUP' + authorized for immediate access"
 if [[ "$WITH_DKMS" -ne 1 && "$WITH_INTEL_DKMS" -ne 1 ]]; then
   exit 0

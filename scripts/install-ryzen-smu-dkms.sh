@@ -49,6 +49,27 @@
 
 set -euo pipefail
 
+# --- Durable setup-log capture (no-op standalone) ----------------------------
+# When invoked via `ramsleuth-setup` (which exports RAMSLEUTH_SETUP_LOG and
+# `exec`s us over its tee'd stdout), our output ALREADY reaches the log
+# through the inherited pipe — a re-tee here would duplicate every line, so
+# we tee only when NOT inside that stream (fd1 a pipe/socket = the setup's
+# capture; a terminal/file/null = a manual run with the log env var set).
+# Standalone (env unset — the TUI / operator path) is an exact no-op; a
+# failed redirect falls back to terminal-only output (never breaks the run).
+if [[ -n "${RAMSLEUTH_SETUP_LOG:-}" && -w "${RAMSLEUTH_SETUP_LOG}" ]]; then
+  case "$(readlink -- "/proc/$$/fd/1" 2>/dev/null || true)" in
+    pipe:* | socket:*)
+      # Inside ramsleuth-setup's tee stream: inheritance covers the log.
+      : ;;
+    *)
+      if ! exec > >(tee -a "$RAMSLEUTH_SETUP_LOG") 2>&1; then
+        printf '[ryzen-smu-dkms] WARN: cannot tee to %s — terminal-only output\n' "$RAMSLEUTH_SETUP_LOG" >&2
+      fi
+      ;;
+  esac
+fi
+
 # --- Constants --------------------------------------------------------------
 KERNEL="$(uname -r)"
 MODULE="ryzen_smu"
@@ -199,7 +220,7 @@ fi
 
 # --- Step 1: prereqs + kernel build tree ---------------------------------------
 log "Installing build tooling: dkms + base-devel (pacman, idempotent)..."
-pacman -S --needed dkms base-devel
+pacman -S --needed --noconfirm dkms base-devel
 # DKMS needs a kernel build tree; we never guess a custom-kernel headers
 # package (HANDOVER §7 step 1) — list candidates and stop with instructions.
 if [[ ! -d "/lib/modules/${KERNEL}/build" ]]; then
@@ -242,6 +263,10 @@ if [[ -n "${VENDOR_SRC}" ]]; then
   fi
 fi
 if [[ "${USE_VENDOR}" -eq 0 ]]; then
+  # Non-TTY robustness (the pkexec path has no controlling TTY): never let
+  # git prompt for credentials (a private RYZEN_SMU_URL override would hang
+  # the one-click flow; fail + die cleanly instead).
+  export GIT_TERMINAL_PROMPT=0
   if [[ -d "${SRC_DIR}/.git" ]]; then
     # Existing tree: skip the fetch when already at the pin (idempotent +
     # offline-tolerant). A prior run may have died mid-clone leaving a

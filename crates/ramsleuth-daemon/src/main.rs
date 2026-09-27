@@ -258,6 +258,19 @@ async fn main() {
         }
     };
 
+    // Startup journal line (the unit's default output is the journal —
+    // `journalctl -u ramsleuth`): the version + the resolved args, so
+    // every (re)start is anchored. The socket-bind line below, the
+    // ACL-apply notes (socket.rs), the fatal-error lines, and the
+    // shutdown line already reach the journal via stdout/stderr.
+    println!(
+        "{} starting (socket: {}, max-age: {}s, spd-autobind: {})",
+        version_line(),
+        args.socket_path.display(),
+        args.max_age.as_secs(),
+        args.spd_autobind,
+    );
+
     // SOFT privilege probe (P3-12, plan D5): missing root or
     // `CAP_SYS_RAWIO` only warns — the daemon keeps serving (its
     // privileged fields degrade to `N/A`), so no exit here.

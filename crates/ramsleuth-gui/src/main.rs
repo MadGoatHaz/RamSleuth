@@ -1805,11 +1805,10 @@ impl RamSleuthApp {
                 // degrade to the manual floor (plan risk 1).
                 let mut setup = self.setup.write().unwrap();
                 setup.done = false;
-                setup.failure = Some(
+                setup.failure = Some(with_setup_log_pointer(
                     "cannot resolve the current user for the setup helper — run \
-                     `sudo ramsleuth-setup --user <you>` in a terminal"
-                        .to_owned(),
-                );
+                     `sudo ramsleuth-setup --user <you>` in a terminal",
+                ));
             }
         }
     }
@@ -2371,6 +2370,12 @@ fn sudo_setup_command(user: &str, with_dkms: bool) -> String {
 const GENERIC_FAILURE_POINTER: &str =
     "the setup helper failed — run `sudo ramsleuth-setup --user <you>` in a terminal";
 
+/// The durable, world-readable setup log (the setup helper tees every
+/// line of every run to it; the non-root user can `cat` it): the known
+/// location every setup failure message points at, so a failure on a
+/// test machine is diagnosable off-band.
+const SETUP_LOG_PATH: &str = "/var/lib/ramsleuth/setup.log";
+
 fn setup_stderr_tail(stderr: &str, exit_code: i32) -> String {
     let lines: Vec<&str> = stderr
         .lines()
@@ -2383,6 +2388,14 @@ fn setup_stderr_tail(stderr: &str, exit_code: i32) -> String {
         .map(|line| line.trim().to_owned())
         .unwrap_or_else(|| GENERIC_FAILURE_POINTER.to_owned());
     format!("{chosen} (exit {exit_code})")
+}
+
+/// Append the durable-log pointer as a trailing line to a setup failure
+/// message: `Full log: <SETUP_LOG_PATH>` (the GUI's status label renders
+/// the `\n` as a line break, and it wraps): the existing diagnostic +
+/// exit code stay the first line. Pure, zero I/O.
+fn with_setup_log_pointer(message: &str) -> String {
+    format!("{message}\nFull log: {SETUP_LOG_PATH}")
 }
 
 /// The Secure Boot one-time-step pending code (the vendor helper's
@@ -2425,15 +2438,14 @@ fn map_setup_exit(code: i32, stderr: &str) -> SetupOutcome {
     }
     let failure = match code {
         0 => None,
-        2 => Some(
+        2 => Some(with_setup_log_pointer(
             "the setup helper rejected its arguments (usage, exit 2 — this should \
-                  not happen via the GUI) — run `sudo ramsleuth-setup --user <you>` in a \
-                  terminal"
-                .to_owned(),
-        ),
+              not happen via the GUI) — run `sudo ramsleuth-setup --user <you>` in a \
+              terminal",
+        )),
         // Exit 1 (and any other non-zero code, incl. `-1`): the
-        // structured stderr tail.
-        _ => Some(setup_stderr_tail(stderr, code)),
+        // structured stderr tail + the durable-log pointer.
+        _ => Some(with_setup_log_pointer(&setup_stderr_tail(stderr, code))),
     };
     SetupOutcome {
         running: false,
@@ -2453,6 +2465,18 @@ fn map_setup_exit(code: i32, stderr: &str) -> SetupOutcome {
 /// `pkexec` — plan risk 1: polkit is the GUI's convenience,
 /// `sudo` is the floor) degrades to the `failure` state pointing at
 /// the manual `sudo ramsleuth-setup` command.
+/// The pkexec spawn-failure message (a missing `pkexec` / a fork
+/// failure — plan risk 1: polkit is the GUI's convenience, `sudo` is
+/// the floor): the manual `sudo` command + the durable-log pointer.
+/// Pure, zero I/O (the worker is its only caller).
+fn pkexec_spawn_failure_message(error: &std::io::Error, user: &str, with_dkms: bool) -> String {
+    with_setup_log_pointer(&format!(
+        "`pkexec` could not run the setup helper ({error}) — run `{}` \
+         manually (sudo is the floor, plan risk 1)",
+        sudo_setup_command(user, with_dkms)
+    ))
+}
+
 fn spawn_setup_worker(setup: Arc<RwLock<SetupOutcome>>, with_dkms: bool, user: String) {
     std::thread::spawn(move || {
         let argv = setup_argv(with_dkms, &user);
@@ -2464,11 +2488,7 @@ fn spawn_setup_worker(setup: Arc<RwLock<SetupOutcome>>, with_dkms: bool, user: S
             Err(error) => SetupOutcome {
                 running: false,
                 done: false,
-                failure: Some(format!(
-                    "`pkexec` could not run the setup helper ({error}) — run `{}` \
-                     manually (sudo is the floor, plan risk 1)",
-                    sudo_setup_command(&user, with_dkms)
-                )),
+                failure: Some(pkexec_spawn_failure_message(&error, &user, with_dkms)),
                 secure_boot_pending: None,
             },
         };
@@ -4523,8 +4543,11 @@ mod tests {
         assert!(!outcome.done, "exit 1 must not set done");
         assert_eq!(
             outcome.failure.as_deref(),
-            Some("[ramsleuth-setup] ERROR: usermod failed (exit 1)"),
-            "exit 1 must carry the first structured ERROR line + the exit code"
+            Some(
+                with_setup_log_pointer("[ramsleuth-setup] ERROR: usermod failed (exit 1)").as_str()
+            ),
+            "exit 1 must carry the first structured ERROR line + the exit code \
+             + the durable-log pointer"
         );
 
         // Exit 1: the vendor-helper tags match too (the `--with-dkms`
@@ -4537,12 +4560,19 @@ mod tests {
         );
         assert_eq!(
             outcome.failure.as_deref(),
-            Some("[ryzen-smu-dkms] ERROR: dkms build failed — compile break (exit 1)"),
+            Some(
+                with_setup_log_pointer(
+                    "[ryzen-smu-dkms] ERROR: dkms build failed — compile break (exit 1)"
+                )
+                .as_str(),
+            ),
         );
         let outcome = map_setup_exit(1, "info\n[intel-dkms] ERROR: modprobe failed\n");
         assert_eq!(
             outcome.failure.as_deref(),
-            Some("[intel-dkms] ERROR: modprobe failed (exit 1)"),
+            Some(
+                with_setup_log_pointer("[intel-dkms] ERROR: modprobe failed (exit 1)").as_str()
+            ),
         );
 
         // Exit 1 without the marker: the last non-empty line + the
@@ -4553,15 +4583,21 @@ mod tests {
         );
         assert_eq!(
             outcome.failure.as_deref(),
-            Some("modprobe: FATAL: Module ryzen_smu_drv not found (exit 1)"),
+            Some(
+                with_setup_log_pointer("modprobe: FATAL: Module ryzen_smu_drv not found (exit 1)")
+                    .as_str()
+            ),
         );
 
         // Exit 1 with empty stderr: the generic `sudo` pointer + the
         // exit code.
         assert_eq!(
             map_setup_exit(1, "").failure.as_deref(),
-            Some(format!("{GENERIC_FAILURE_POINTER} (exit 1)").as_str()),
-            "a marker-less empty stderr must point at the manual floor"
+            Some(
+                with_setup_log_pointer(&format!("{GENERIC_FAILURE_POINTER} (exit 1)"))
+                    .as_str()
+            ),
+            "a marker-less empty stderr must point at the manual floor + the log"
         );
 
         // Exit 2: usage (should not happen via the GUI).
@@ -4579,7 +4615,48 @@ mod tests {
         // no panic.
         let outcome = map_setup_exit(-1, "killed");
         assert!(!outcome.done);
-        assert_eq!(outcome.failure.as_deref(), Some("killed (exit -1)"));
+        assert_eq!(
+            outcome.failure.as_deref(),
+            Some(with_setup_log_pointer("killed (exit -1)").as_str())
+        );
+    }
+
+    /// (s4) The durable-log pointer: every setup failure message the GUI
+    /// shows — an exit-1 structured tail, an exit-2 usage, a signal
+    /// death (the worker's `-1`), and a pkexec spawn failure — ends
+    /// with the known log path as a trailing line, so a failure on a
+    /// test machine is diagnosable via `cat /var/lib/ramsleuth/setup.log`
+    /// (the existing diagnostic + exit code stay the first line).
+    #[test]
+    fn setup_failure_messages_carry_the_log_path() {
+        let pointer = format!("\nFull log: {SETUP_LOG_PATH}");
+        for code in [1, 2, -1] {
+            let outcome = map_setup_exit(code, "some stderr line");
+            let message = outcome
+                .failure
+                .as_deref()
+                .expect("a non-zero exit must carry a failure");
+            assert!(
+                message.ends_with(pointer.as_str()),
+                "the exit-{code} failure message must end with the log pointer: {message:?}"
+            );
+        }
+        let spawn = pkexec_spawn_failure_message(
+            &std::io::Error::new(std::io::ErrorKind::NotFound, "no such file or directory"),
+            "alice",
+            true,
+        );
+        assert!(
+            spawn.ends_with(pointer.as_str()),
+            "the pkexec spawn failure must end with the log pointer: {spawn}"
+        );
+        assert!(
+            spawn.contains("sudo ramsleuth-setup --user alice --with-dkms"),
+            "the spawn failure keeps the manual floor: {spawn}"
+        );
+        // A success carries no failure (and no pointer): the log pointer
+        // is only relevant to a broken run.
+        assert!(map_setup_exit(0, "").failure.is_none());
     }
 
     /// (s3) The Secure Boot one-time-step exit (10): NOT a failure —
@@ -4852,7 +4929,7 @@ mod tests {
                 kernel: "6.6.0-test".to_owned(),
                 os: "Linux / Test".to_owned(),
                 arch: "x86_64".to_owned(),
-                ramsleuth_version: "2.4.9".to_owned(),
+                ramsleuth_version: "2.4.10".to_owned(),
                 telemetry_source: "unavailable".to_owned(),
             },
         }
@@ -5039,20 +5116,20 @@ mod tests {
         let title = probe_issue_title(&report);
         assert_eq!(
             title,
-            "[Probe] Test CPU \u{00b7} Unknown \u{00b7} Linux / Test \u{00b7} v2.4.9"
+            "[Probe] Test CPU \u{00b7} Unknown \u{00b7} Linux / Test \u{00b7} v2.4.10"
         );
         // The title's percent-encoding (the brackets, the spaces, the
         // middot, the slash).
         assert_eq!(
             url_encode(&title),
-            "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.9"
+            "%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.10"
         );
         // The URL (the issues/new form, title only — the body must
         // NOT ride the query string: it would exceed GitHub's limit).
         let url = probe_issue_url(&title);
         assert_eq!(
             url,
-            "https://github.com/MadGoatHaz/RamSleuth/issues/new?title=%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.9"
+            "https://github.com/MadGoatHaz/RamSleuth/issues/new?title=%5BProbe%5D%20Test%20CPU%20%C2%B7%20Unknown%20%C2%B7%20Linux%20%2F%20Test%20%C2%B7%20v2.4.10"
         );
         assert!(
             !url.contains("body="),

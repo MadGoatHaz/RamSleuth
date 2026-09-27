@@ -2793,7 +2793,7 @@ mod tests {
     /// whole, never cut mid-token, and the line stays in budget); at a
     /// narrow surface with a short daemon status only the first entry
     /// survives (the measured truncation points: 250 cols → all 16
-    /// entries, 100 cols → `R refresh · S snapshot`, 60 cols →
+    /// entries, 100 cols → `R refresh · S snapshot`, 61 cols →
     /// `R refresh`).
     #[test]
     fn header_legend_truncated_by_width() {
@@ -2812,15 +2812,17 @@ mod tests {
         assert!(!l1.contains("B bench"), "{l1}");
         assert!(l1.chars().count() <= 100, "{}", l1.chars().count());
 
-        // 60 cols with a short daemon status: only the first entry.
+        // 61 cols with a short daemon status: only the first entry (one
+        // col wider than the v2.4.9-era 60: the two-digit minor keeps the
+        // first entry exactly in budget at this narrow surface).
         let mut state = representative();
         state.daemon_status = "up".to_owned();
-        let text = draw_at(&state, 60, 30);
+        let text = draw_at(&state, 61, 30);
         let lines = text.split('\n').take(3).collect::<Vec<_>>();
         let l1 = &lines[0];
         assert!(l1.contains("R refresh"), "{l1}");
         assert!(!l1.contains("S snapshot"), "{l1}");
-        assert!(l1.chars().count() <= 60, "{}", l1.chars().count());
+        assert!(l1.chars().count() <= 61, "{}", l1.chars().count());
     }
 
     // ------------------------------------------------------------------

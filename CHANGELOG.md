@@ -4,6 +4,13 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project.
 
+## [2.4.10] - 2026-09-27
+
+### Changed
+- **One-click setup is now fully non-interactive on a fresh machine**: the DKMS helpers install build tooling with `pacman -S --needed --noconfirm`, so the GUI/pkexec path no longer stalls on a `Proceed? [Y/n]` prompt (the confirmed root cause of the fresh-install setup loop); the ryzen helper's git-clone fallback also sets `GIT_TERMINAL_PROMPT=0`, so a credential prompt can never hang the flow
+- **The setup flow logs its full output + a state snapshot to `/var/lib/ramsleuth/setup.log` (world-readable)**: every run of `ramsleuth-setup` is self-documenting (a run header, the whole stdout + stderr transcript, and a unit/module/socket/group snapshot — appended before the done line and via an EXIT trap after every failure), the vendor helpers inherit the stream (a deduped tee guard), and the app shows that path on any setup failure so problems are diagnosable off-band
+- **Daemon startup is journaled**: every (re)start writes a line to the journal (`journalctl -u ramsleuth`) with the version + the resolved args (socket path, max-age, spd-autobind), anchoring the startup output that already reaches the journal
+
 ## [2.4.9] - 2026-09-26
 
 ### Changed
