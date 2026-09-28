@@ -58,18 +58,17 @@
 #                                 old-tarball reason
 #
 # sha256sums pins that exact asset. AUR requires a real sha256 (no SKIP):
-# the pin below is a PLACEHOLDER — the real sha256 of the published v2.4.12
-# release tarball, kept until the v2.4.13 tarball is cut and the standing
-# process re-pins it to the v2.4.13 asset (the v2.4.12 pin, re-cut at the
-# v2.4.12 release, replaced the v2.4.11 pin, re-cut at the v2.4.11
-# release; it replaced the v2.4.10 pin, re-cut at the v2.4.10
-# release; that replaced the v2.4.9 pin, re-cut at the v2.4.9 release;
-# that replaced the v2.4.8 pin, re-cut at the v2.4.8 release; that
-# replaced the v2.4.7 pin, re-cut at the v2.4.7 release; that replaced
-# the v2.4.6 pin, re-cut at the v2.4.6 release; that replaced the v2.4.5
-# pin, re-cut at the v2.4.5 release; that replaced the v2.2.1 pin,
-# finalized in C21-24b; that replaced the v2.1.1 pin, finalized in
-# C20-06). The three
+# the pin below is the real sha256 of the published v2.4.13 release tarball,
+# re-cut to the v2.4.13 asset (the v2.4.12 pin, re-cut at the v2.4.12
+# release, is replaced by this re-cut; it replaced the v2.4.11 pin,
+# re-cut at the v2.4.11 release; that replaced the v2.4.10 pin, re-cut at
+# the v2.4.10 release; that replaced the v2.4.9 pin, re-cut at the
+# v2.4.9 release; that replaced the v2.4.8 pin, re-cut at the v2.4.8
+# release; that replaced the v2.4.7 pin, re-cut at the v2.4.7 release;
+# that replaced the v2.4.6 pin, re-cut at the v2.4.6 release; that
+# replaced the v2.4.5 pin, re-cut at the v2.4.5 release; that replaced
+# the v2.2.1 pin, finalized in C21-24b; that replaced the v2.1.1 pin,
+# finalized in C20-06). The three
 # new top-level entries (ramsleuth-setup.sh, 90-ramsleuth-setup.policy,
 # icons/) are in the v2.4.13 tarball by the C21-17/C21-27 contract;
 # package() installs them
@@ -100,14 +99,12 @@ arch=(x86_64)
 url="https://github.com/MadGoatHaz/RamSleuth"
 license=(MIT GPL-2.0-only)
 source=("https://github.com/MadGoatHaz/RamSleuth/releases/download/v$pkgver/ramsleuth-$pkgver-x86_64.tar.zst")
-# PLACEHOLDER (the v2.4.12 asset's real sha256, independently verified by
-# download + sha256sum at its re-cut): AUR requires a real sha256 (no SKIP),
-# so the pin carries the previous release's hash until the v2.4.13 tarball
-# is published, when the standing process re-pins it (cf. the v2.4.12
-# placeholder: that asset predates the documentation pass — the
-# 2.4.13 changes).
+# Re-cut to v2.4.13: the real sha256 of the published v2.4.13 release asset,
+# independently verified by download + sha256sum (sidecar match; the pin is
+# the asset hash itself; the v2.4.12 placeholder pin is replaced — that
+# asset predates the documentation pass (the 2.4.13 changes)).
 #
-sha256sums=('7b12c8454491f769c27ea1b523a271d81d3e58fac5d0e1dd2f58fa21823f50e1')
+sha256sums=('eea4d5975c3fed8efdf242f2d323da89be078b549f3372bb0d40973952b1c508')
 install=ramsleuth-bin.install
 # The in-repo ramsleuth_intel DKMS source ships bundled (package() step (12))
 # and would file-conflict with the standalone ramsleuth-intel-dkms extra, so the
