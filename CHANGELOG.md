@@ -2,7 +2,12 @@
 
 All notable per-release changes to RamSleuth. Newest first.
 
-**Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project.
+**Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project — with one deliberate exception: the `ryzen-smu-dkms` extra keeps its own `1.0` pkgver line (re-pinned per release wave via the commit pin + `pkgrel`, not version-bumped) and does not track the workspace version.
+
+## [2.4.13] - 2026-09-27
+
+### Changed
+- **Documentation pass** — the Intel driver README is now a full how-it-works reference (probe sequence, MCHBAR decode, all 25 register semantics, Tier 1/2/3 + the module coverage gap, DKMS build incl. Secure Boot, known hardware limitations); User_Guide / README / Architecture / packaging staleness fixed through 2.4.12; module MODULE_VERSION now tracks releases (2.4.13); dev logs consolidated to one canonical log.
 
 ## [2.4.12] - 2026-09-27
 

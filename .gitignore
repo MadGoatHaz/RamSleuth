@@ -11,6 +11,8 @@
 # Development documentation (cycle plans, research notes, handovers, AUR ops reference) — local dev-doc storage, NOT repo-facing
 Work/
 plans/
+# Active lease board (work/DEV_LOG.md) + scratch (work/scratch/) — local-only; never commit, do NOT `git add -A`
+work/
 
 # Agent state (carries a full origin/master checkout) — never committable
 .kilo/

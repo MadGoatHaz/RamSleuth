@@ -1,7 +1,7 @@
 # RamSleuth — Architecture
 
 **Document:** `Docs/Architecture.md` (part of the RamSleuth v2 repository-facing documentation)
-**Applies to:** workspace v2.4.12 (branch `v2-development`)
+**Applies to:** workspace v2.4.13 (branch `v2-development`)
 **Audience:** expert readers — kernel-aware systems programmers, packagers, and maintainers who need the full design rationale behind RamSleuth.
 
 Companion documents: [`README.md`](../README.md) (entry point), [`Docs/User_Guide.md`](User_Guide.md) (operational guide), [`packaging/README.md`](../packaging/README.md) (packaging and operator guide).
@@ -268,7 +268,7 @@ development tool — all inheriting a single version:
 
 | Workspace fact | Value |
 |----------------|-------|
-| Version | **2.4.12** (`[workspace.package].version`) |
+| Version | **2.4.13** (`[workspace.package].version`) |
 | Edition | 2021 |
 | MSRV | **1.75** (`rust-version`) |
 | Resolver | 2 |
@@ -431,7 +431,7 @@ history, settings, first-run) and the app shell.
 | `graph.rs` | The Graphs window: five-series state + interactive hand-rolled render (hover crosshair, pan, 1/5/15/60-min window, Poll combo). |
 | `history.rs` | The trend ring core (300-sample default) reused by the graphs state. |
 | `settings.rs` | The in-memory `GuiSettings` knobs (socket, poll interval, refresh, units, theme) + the settings panel. |
-| `first_run.rs` | The SETUP requirements strip: `diagnose`, the one-click `Set up RamSleuth` wizard over `pkexec`, the post-setup restart modal. |
+| `first_run.rs` | The SETUP requirements strip: `diagnose`, the one-click `Set up RamSleuth` wizard over `pkexec`, the post-setup auto-reconnect (no modal). |
 | `style.rs` | The dark-slate visual style + the semantic colors (cyan/amber/crimson/slate). |
 | `lib.rs` | Crate root: re-exports for tests and the shell. |
 
@@ -1002,18 +1002,30 @@ and `png` 0.17 are MSRV-safe as declared.
 
 ### 9.3 The SETUP requirements strip
 
-Auto-shown on first launch **while any requirement is present** (it
-disappears on its own once every requirement is resolved). `diagnose` turns
-the same degradation signals the zones use into actionable rows, each with a
-**Copy** button (the polkit-less fallback):
+Shown by the named 2.4.9 liveness predicate
+`first_run::requirements_strip_visible`: the strip is visible while the
+header's `Setup` toggle is open **and** `diagnose()` reports a requirement
+(it unmounts on its own the moment `diagnose()` empties). Case 1 fires on
+**daemon liveness alone** — never polled, the daemon down, or a groupless
+client's refused connect (a fresh install, a stopped daemon, and a
+leftover-partial install all converge on it); a daemon **up** serving
+all-`N/A` telemetry (e.g. the N100 `UnsupportedHardware` class) clears case
+1 and yields **no** prompt. `diagnose` turns the same degradation signals
+the zones use into actionable rows, each with a **Copy** button (the
+polkit-less fallback):
 
 1. **daemon down** (status not `connected*`) → `sudo systemctl enable --now ramsleuth`;
 2. **missing `ramsleuth` group membership** (a permission error on the last
    poll — the socket is group-gated) → `sudo usermod -aG ramsleuth $USER`;
 3. **AMD silicon with the daemon connected and the AMD branch
    `Na(DriverMissing)`** → `sudo ramsleuth-install-ryzen-smu-dkms` (the detail
-   names the pinned upstream). Intel (built-in MCHBAR decode) and healthy AMD
-   → no requirements at all.
+   names the pinned upstream);
+4. **Intel silicon with the daemon connected and the Intel branch
+   `Na(DriverMissing)`** (the module is absent and the `/dev/mem` fallback
+   is blocked) → `sudo ramsleuth-install-intel-dkms` — the mirror of case 3.
+
+Healthy AMD and Intel (the daemon connected, serving decoded telemetry —
+the built-in MCHBAR decode needs no driver) → no requirements at all.
 
 The **primary — and only —** affordance is the one-click **`Set up
 RamSleuth`** button (a single unified action over every requirement mix):
@@ -1297,7 +1309,9 @@ feed **one** pure decode core:
    non-RAM, PCI-MMIO MCHBAR region (e.g. `0xFED10000`) through `/dev/mem`
    outright, and on UEFI Secure-Boot / integrity-lockdown hosts lockdown
    blocks `/dev/mem` too — and unsigned out-of-tree modules, so there the
-   module must be MOK-enrolled first (`mokutil --import ramsleuth_intel.ko`).
+   module must be signed + MOK-enrolled (the one-click does this
+   automatically since 2.4.7: persistent-key signing + `mokutil --import`
+   + the one-time exit-10 guidance, §12.5).
    The kernel-space `ioremap` inside the module is the path that works in
    every state the daemon can reach.
 
@@ -1328,6 +1342,12 @@ the generation's profile, and three register-map families are in play:
   mirror-only) and the 22 widened DDR5 timing bitfields of `ALDER_FIELDS`
   (tCL / tRAS / tWR 8-bit, tRCD / tRP / tWTR_S / tWTR_L / tRTP 7-bit,
   tRFC1 12-bit, tRFCsb 11-bit, plus the DDR5-specific tPPD).
+
+**Coverage honesty (Tier 3):** the module path supplies *less* decode
+coverage than the `/dev/mem` path on Tier-3 hosts — the module exposes
+only the Tier-1-shaped 2-channel surface, so the DDR5 4-subchannel +
+MCL-fallback decode exists only via `/dev/mem` (the module's extra
+attributes are an open work item).
 
 **The Tier-1 table** (shared with Rocket Lake):
 
@@ -1706,12 +1726,12 @@ reference): 6 binaries → `/usr/bin/`; the unit → `/usr/lib/systemd/system/`
 (+ preset); the `ramsleuth` group (idempotent `groupadd -r` in the `.install`
 hooks); the AMD DKMS helper → `/usr/bin/ramsleuth-install-ryzen-smu-dkms`;
 the Intel DKMS helper → `/usr/bin/ramsleuth-install-intel-dkms` (guarded —
-the v2.4.12 source tree and the re-cut `-bin` tarball carry it, skipped with
+the v2.4.13 source tree and the re-cut `-bin` tarball carry it, skipped with
 a note only on a pre-2.3.0 asset); **the in-repo `ramsleuth_intel` source
 tree → `/usr/share/ramsleuth-intel-dkms/src/`** (guarded the same way —
 the exact path the Intel helper resolves, so the one-click Intel DKMS
 install works from a bare AUR install with no manual source step; the
-published `-bin` tarball (the v2.4.12 re-cut) carries the helper + tree, and
+published `-bin` tarball (the v2.4.13 re-cut) carries the helper + tree, and
 the existence guard covers only pre-2.4.2 assets); **the vendored
 `ryzen_smu` source tree → `/usr/share/ryzen-smu-dkms/vendor/`** (guarded
 for pre-vendor tags — the exact path the AMD helper resolves as its
@@ -1797,7 +1817,7 @@ fallback remains available where unblocked. When present:
   network and no upstream pin;
 - **both main packages bundle that source tree** (to
   `/usr/share/ramsleuth-intel-dkms/src/` — guarded like the Intel helper:
-  the published `-bin` tarball (the v2.4.12 re-cut) carries it and installs
+  the published `-bin` tarball (the v2.4.13 re-cut) carries it and installs
   it, and the existence guard covers only pre-2.4.2 assets, which ship
   nothing and skip cleanly), which is the exact path the helper resolves as
   its installed copy: the **one-click Intel DKMS install works from a bare
@@ -1833,12 +1853,19 @@ fallback remains available where unblocked. When present:
 - like the AMD unit contract, the **systemd unit never loads the module** —
   the operator does, via the helper / `modprobe`;
 - **Secure Boot / integrity-lockdown limitation** (the same class the AMD
-  extra carries): on UEFI Secure-Boot hosts the kernel blocks both
-  `/dev/mem` and unsigned out-of-tree modules, so the module must be
-  MOK-enrolled first (`mokutil --import ramsleuth_intel.ko`); a host that
-  can neither load the module nor map the window degrades the Intel section
-  to the corresponding structured N/A (`DriverMissing`, or
-  `InsufficientPrivilege` when the fallback's map is the one blocked).
+  extra carries; the rationale anchored in §10.3, "Why the module exists"):
+  on UEFI Secure-Boot hosts the kernel blocks both `/dev/mem` and unsigned
+  out-of-tree modules, so the module must be signed + MOK-enrolled — but
+  since 2.4.7 the one-click does that **automatically**: it detects Secure
+  Boot early (`mokutil --sb-state`, with an EFI/lockdown fallback), signs
+  the built module with the persistent RamSleuth key pair, stages the cert
+  for the one-time MOK enrollment via `mokutil --import`, and exits **10**
+  with the clear one-step guidance (reboot → `Enroll MOK key(s)` → `Yes` →
+  re-click Setup) — a manual `mokutil --import` is no longer *the*
+  documented path; a host that can neither load the module nor map the
+  window degrades the Intel section to the corresponding structured N/A
+  (`DriverMissing`, or `InsufficientPrivilege` when the fallback's map is
+  the one blocked).
 
 ---
 
@@ -1917,14 +1944,17 @@ to `v2-development`:
 
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) fires on
 a **`v[0-9]*` tag** push (or a manual `workflow_dispatch` with a version
-input). It builds the workspace `--locked`, **verifies all 19 release
-artifacts** (6 binaries + 13 auxiliary: the 8 pre-Intel auxiliary files —
+input). It builds the workspace `--locked`, **verifies all 28 release
+artifacts** (6 binaries + 22 auxiliary: the 8 pre-Intel auxiliary files —
 `systemd/ramsleuth.service`, `ramsleuth.preset`, `RamSleuth.desktop`,
 `scripts/install-ryzen-smu-dkms.sh`, `install.sh`, `LICENSE`,
 `scripts/ramsleuth-setup.sh`, `packaging/polkit/90-ramsleuth-setup.policy` —
-plus `scripts/install-intel-dkms.sh` and the four `kernel/ramsleuth-intel/`
+plus `scripts/install-intel-dkms.sh`, the four `kernel/ramsleuth-intel/`
 module source files `dkms.conf`, `Makefile`, `ramsleuth_intel.c`,
-`README.md`; the `assets/icons` hicolor tree ships as a bundle), then
+`README.md`, the eight vendored `packaging/ryzen-smu-dkms/vendor/`
+`ryzen_smu` files (the 6 module sources + `SUMS.sha256` + `NOTICE.md`), and
+the repo's `packaging/ryzen-smu-dkms/dkms.conf`; the `assets/icons` hicolor
+tree ships as a bundle), then
 packages the **deterministic tarball `ramsleuth-<ver>-x86_64.tar.zst`**
 (fixed file order `tar --sort=name`, fixed ownership `--owner=0 --group=0
 --numeric-owner`, fixed mtime `--mtime=@0`, zstd) with its **`.sha256`

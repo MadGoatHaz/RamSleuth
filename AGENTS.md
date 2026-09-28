@@ -1,6 +1,6 @@
 # RamSleuth — Project Notes
 
-RamSleuth is a Rust Cargo workspace (v2.4.12) providing live RAM telemetry plus an
+RamSleuth is a Rust Cargo workspace (v2.4.13) providing live RAM telemetry plus an
 AIDA64-style memory benchmark for AMD/Intel desktops: a privileged root daemon
 (`CAP_SYS_RAWIO` only, Unix-socket IPC) feeding dual frontends (ratatui TUI + egui
 GUI), with CLI and standalone tools.
@@ -25,6 +25,9 @@ GUI), with CLI and standalone tools.
 
 - `Work/` — the working dev-docs: cycle plans, research notes, handovers, the AUR
   ops reference, and scope tracking. It is NOT repo-facing.
+- `work/` — the lowercase ACTIVE lease board (`work/DEV_LOG.md`) + scratch
+  (`work/scratch/`); gitignored — never `git add -A` it (distinct from the
+  repo-facing `Work/` dev-docs above).
 - `plans/` — local plan files (gitignored).
 - `MASTER_LOG.md`, `DEV_LOG.md`, `.kilo/` — developer log and agent state
   (gitignored; working-tree only).
