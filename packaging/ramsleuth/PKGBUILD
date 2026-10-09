@@ -111,6 +111,29 @@ depends=(libx11 libxkbcommon wayland libxrandr libxi libxcursor libxinerama mesa
 
 build() {
     cd "$srcdir/ramsleuth"
+
+    # 3-tier safe target-cpu probe (research: Rust AUR Target-CPU Optimization).
+    # No manual feature pinning (+sse4a / +avx512f): those opcodes SIGILL on
+    # modern Intel clients. Fallback: native -> x86-64-v2 -> (omit all CPU flags).
+    local target_cpu_flag=""
+    if rustc --print cfg -C target-cpu=native >/dev/null 2>&1; then
+        target_cpu_flag="-C target-cpu=native"
+    elif rustc --print cfg -C target-cpu=x86-64-v2 >/dev/null 2>&1; then
+        target_cpu_flag="-C target-cpu=x86-64-v2"
+    fi
+    # Tier 3: both probes failed (non-x86 / masked VM CPUID) -> flag stays empty.
+
+    # Append to (never replace) any makepkg.conf RUSTFLAGS, without introducing
+    # a leading/trailing/double space when either side is empty.
+    if [ -n "$target_cpu_flag" ]; then
+        if [ -n "${RUSTFLAGS:-}" ]; then
+            RUSTFLAGS="${RUSTFLAGS} ${target_cpu_flag}"
+        else
+            RUSTFLAGS="${target_cpu_flag}"
+        fi
+        export RUSTFLAGS
+    fi
+
     # --locked: build the committed pins verbatim (reproducible).
     cargo build --release --locked
 }
