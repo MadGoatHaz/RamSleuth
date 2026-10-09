@@ -58,7 +58,7 @@ use ramsleuth_telemetry::amd_readout::{
 };
 use ramsleuth_telemetry::cpuid::CpuVendor;
 use ramsleuth_telemetry::error::{NaReason, Section};
-use ramsleuth_telemetry::{RailConfidence, SystemMemoryTelemetry, VoltageTelemetry};
+use ramsleuth_telemetry::{SystemMemoryTelemetry, VoltageTelemetry};
 
 use crate::update::TelemetryData;
 use crate::{format_clock, ClockUnit, Units, AMBER, CYAN, NA_GRAY, SLATE};
@@ -353,7 +353,7 @@ fn readout_sections(
     // direct VRM sense, AMD = the SMU PM-table vCore) is prepended before
     // VDDCR_SOC. It is shown once per readout (the AMD block, or the
     // first Intel channel); a heuristic reading carries the
-    // `[UNVERIFIED]` badge, an `Na` vCore renders bare `N/A` (the D-4
+    // `[est]` badge, an `Na` vCore renders bare `N/A` (the D-4
     // per-row degradation).
     let mut voltage_rows: Vec<(String, String)> = Vec::new();
     if vcore_here {
@@ -569,17 +569,19 @@ fn volts(section: &Section<u16>) -> String {
 /// The vendor-aware vCore display (Chunk 3, the GUI layout matrix): the
 /// snapshot-root's `vcore` field. A measured value renders at mV
 /// precision; a heuristic (vendor-fallback) reading carries the
-/// `[UNVERIFIED]` badge (the channel mapping is inferred from vendor
-/// conventions, not an exact DMI match); a verified reading renders
-/// plain. An `Na` vCore (unknown / enterprise / out-of-bounds) renders
-/// `N/A`.
+/// canonical `[est]` badge (the shared [`RailConfidence::badge`] source
+/// — the same badge the TUI and CLI render: the channel mapping is
+/// inferred from vendor conventions, not an exact DMI match); a verified
+/// reading renders plain. An `Na` vCore (unknown / enterprise /
+/// out-of-bounds) renders `N/A`.
 fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
     match vcore {
         Section::Na(_) => "N/A".to_owned(),
         Section::Value(v) => {
             let mut s = format!("{:.3} V", v.delivered_volts);
-            if v.confidence == RailConfidence::HeuristicDefault {
-                s.push_str(" [UNVERIFIED]");
+            if let Some(badge) = v.confidence.badge() {
+                s.push(' ');
+                s.push_str(badge);
             }
             s
         }
@@ -723,15 +725,16 @@ fn render_section(
         .show(ui, |ui| {
             for (label, display) in &section.rows {
                 ui.add(egui::Label::new(egui::RichText::new(label.as_str())));
-                // The vCore unverified badge (Chunk 3): a heuristic
-                // (vendor-fallback) reading carries the explanatory
-                // tooltip on hover; the other rows render plain.
-                if label == "VDDCR_VDD" && display.contains("[UNVERIFIED]") {
+                // The vCore badge (Chunk 3): a heuristic (vendor-fallback)
+                // reading (the canonical `[est]` badge) carries the
+                // explanatory tooltip on hover; the other rows render
+                // plain.
+                if label == "VDDCR_VDD" && display.contains("[est]") {
                     ui.add(
                         egui::Label::new(egui::RichText::new(display.as_str()).color(AMBER))
                             .sense(egui::Sense::hover()),
                     )
-                    .on_hover_text(crate::style::VCORE_UNVERIFIED_TOOLTIP);
+                    .on_hover_text(crate::style::VCORE_EST_TOOLTIP);
                 } else {
                     ui.add(egui::Label::new(
                         egui::RichText::new(display.as_str())
@@ -772,9 +775,9 @@ fn cell_color(label: &str, display: &str) -> egui::Color32 {
         }
         "VDDCR_VDD" => {
             // The vCore (Chunk 3): a heuristic (vendor-fallback) reading
-            // with the `[UNVERIFIED]` badge is dimmed amber (measured,
-            // not a verified profile); a verified reading is CYAN.
-            if display.contains("[UNVERIFIED]") {
+            // with the `[est]` badge is dimmed amber (measured, not a
+            // verified profile); a verified reading is CYAN.
+            if display.contains("[est]") {
                 AMBER
             } else {
                 CYAN
@@ -801,7 +804,7 @@ mod tests {
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
     use ramsleuth_telemetry::SystemMemoryTelemetry;
-    use ramsleuth_telemetry::SystemPlatform;
+    use ramsleuth_telemetry::{RailConfidence, SystemPlatform};
 
     use super::*;
 
@@ -1067,9 +1070,11 @@ mod tests {
 
     /// (Chunk 3) The vendor-aware vCore row (the snapshot-root's `vcore`
     /// field, the GUI layout matrix): a heuristic (vendor-fallback)
-    /// reading carries the `[UNVERIFIED]` badge; a verified reading
-    /// renders plain at mV precision; an `Na` vCore (unknown /
-    /// enterprise / out-of-bounds) renders bare `N/A`.
+    /// reading carries the canonical `[est]` badge (the shared
+    /// [`RailConfidence::badge`] source, the same badge the TUI / CLI
+    /// render); a verified reading renders plain at mV precision; an
+    /// `Na` vCore (unknown / enterprise / out-of-bounds) renders bare
+    /// `N/A`.
     #[test]
     fn vcore_row_badge_and_display() {
         fn snapshot_with_vcore(vcore: Section<VoltageTelemetry>) -> SystemMemoryTelemetry {
@@ -1080,7 +1085,7 @@ mod tests {
             t
         }
 
-        // Heuristic (vendor-fallback) -> the `[UNVERIFIED]` badge.
+        // Heuristic (vendor-fallback) -> the `[est]` badge.
         let blocks = timing_cells(
             &snapshot_with_vcore(Section::Value(VoltageTelemetry {
                 rail_name: "CPU Vcore".to_owned(),
@@ -1094,8 +1099,8 @@ mod tests {
         let rows = all_rows(&blocks);
         assert_eq!(
             displays(&rows, "VDDCR_VDD"),
-            vec!["1.216 V [UNVERIFIED]"],
-            "a heuristic vCore carries the [UNVERIFIED] badge"
+            vec!["1.216 V [est]"],
+            "a heuristic vCore carries the [est] badge"
         );
 
         // Verified -> plain (no badge), mV precision.

@@ -89,9 +89,7 @@ use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::intel_readout::{ChannelMode, ChannelTrust};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
-use ramsleuth_telemetry::{
-    RailConfidence, SystemMemoryTelemetry, SystemPlatform, VoltageTelemetry,
-};
+use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform, VoltageTelemetry};
 
 use crate::graphs::GraphState;
 use crate::probe::ProbeOverlayState;
@@ -2028,21 +2026,24 @@ fn push_cell<T>(
 /// snapshot-root's `vcore` field (Intel = the board `in0` direct VRM
 /// sense; AMD = the SMU PM-table vCore). A measured value renders at mV
 /// precision; a heuristic (vendor-fallback) reading is dimmed + the
-/// `~ … [Unverified]` badge (the TUI contract: the channel mapping is
-/// inferred from vendor conventions, not an exact DMI match); a verified
-/// reading renders plain. An `Na` vCore is dropped (the TUI's all-Na
-/// drop rule). When a VID is present (never for Intel, but the display
-/// is total), the SVID target + the signed (negative) active drop render
-/// as dimmed indented sub-rows.
+/// canonical `~ … [est]` badge (the shared
+/// [`RailConfidence::badge`] source — the same badge the GUI and CLI
+/// render: the channel mapping is inferred from vendor conventions, not
+/// an exact DMI match); a verified reading renders plain. An `Na` vCore
+/// is dropped (the TUI's all-Na drop rule). When a VID is present (never
+/// for Intel, but the display is total), the SVID target + the signed
+/// (negative) active drop render as dimmed indented sub-rows.
 fn push_vcore(items: &mut Vec<ListItem<'static>>, vcore: &Section<VoltageTelemetry>) {
     let Some(v) = vcore.value() else {
         return; // Na → dropped (the all-Na drop rule).
     };
-    let heuristic = v.confidence == RailConfidence::HeuristicDefault;
-    let color = if heuristic { NA_GRAY } else { CYAN };
+    let color = match v.confidence.badge() {
+        Some(_) => NA_GRAY,
+        None => CYAN,
+    };
     let mut value = format!("{:.3} V", v.delivered_volts);
-    if heuristic {
-        value = format!("~ {value} [Unverified]");
+    if let Some(badge) = v.confidence.badge() {
+        value = format!("~ {value} {badge}");
     }
     items.push(row("VDDCR_VDD", &value, color));
     if let Some(vid) = v.requested_vid {
@@ -2221,6 +2222,7 @@ mod tests {
     //! and assert on its text — no TTY required.
 
     use super::*;
+    use ramsleuth_telemetry::RailConfidence;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use ramsleuth_bench::BenchOp;
@@ -3809,10 +3811,11 @@ mod tests {
 
     /// (u2) The vendor-aware vCore row badges (Chunk 3, the TUI layout
     /// matrix): a heuristic (vendor-fallback) reading renders dimmed +
-    /// the `~ … [Unverified]` badge; a verified reading renders plain;
-    /// and a verified reading with a synthetic VID adds the SVID target
-    /// + the signed (negative) active-drop sub-rows. An `Na` vCore
-    /// drops the row entirely.
+    /// the canonical `~ … [est]` badge (the shared
+    /// [`RailConfidence::badge`] source, the same badge the GUI / CLI
+    /// render); a verified reading renders plain; and a verified reading
+    /// with a synthetic VID adds the SVID target + the signed (negative)
+    /// active-drop sub-rows. An `Na` vCore drops the row entirely.
     #[test]
     fn vcore_row_badge_per_confidence() {
         fn state_with_vcore(vcore: Section<VoltageTelemetry>) -> AppState {
@@ -3822,7 +3825,7 @@ mod tests {
             }
             state
         }
-        // Heuristic (vendor-fallback) -> dimmed `~ … [Unverified]`.
+        // Heuristic (vendor-fallback) -> dimmed `~ … [est]`.
         let state = state_with_vcore(Section::Value(VoltageTelemetry {
             rail_name: "CPU Vcore".to_owned(),
             delivered_volts: 1.216,
@@ -3831,7 +3834,7 @@ mod tests {
             confidence: RailConfidence::HeuristicDefault,
         }));
         let text = draw_at(&state, 200, 62);
-        assert!(text.contains("~ 1.216 V [Unverified]"), "{text}");
+        assert!(text.contains("~ 1.216 V [est]"), "{text}");
 
         // Verified -> plain (no badge).
         let state = state_with_vcore(Section::Value(VoltageTelemetry {
@@ -3843,7 +3846,7 @@ mod tests {
         }));
         let text = draw_at(&state, 200, 62);
         assert!(text.contains("VDDCR_VDD: 1.216 V"), "{text}");
-        assert!(!text.contains("[Unverified]"), "{text}");
+        assert!(!text.contains("[est]"), "{text}");
 
         // Verified + a synthetic VID -> the SVID target + the signed
         // (negative) active drop (1.216 − 1.280 = −64 mV).

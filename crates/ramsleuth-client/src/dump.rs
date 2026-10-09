@@ -37,7 +37,7 @@ use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::intel_readout::{IntelChannel, IntelReadout};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
-use ramsleuth_telemetry::{RailConfidence, SystemMemoryTelemetry, VoltageTelemetry};
+use ramsleuth_telemetry::{SystemMemoryTelemetry, VoltageTelemetry};
 
 use crate::client::{Client, ClientError};
 
@@ -144,16 +144,19 @@ fn volts(section: &Section<u16>) -> String {
 
 /// The single vCore reading (Chunk 3, the snapshot-root's `vcore` field)
 /// as the CLI layout-matrix form: the delivered value at mV precision,
-/// the `[est]` badge for a heuristic (vendor-fallback) reading, the
-/// optional VID + signed delta when a VID is present, and a plain `N/A`
-/// for the absent / enterprise / out-of-bounds states.
+/// the canonical `[est]` badge (the shared
+/// [`ramsleuth_telemetry::RailConfidence::badge`] source) for a
+/// heuristic (vendor-fallback) reading, the optional VID + signed delta
+/// when a VID is present, and a plain `N/A` for the absent / enterprise
+/// / out-of-bounds states.
 fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
     match vcore {
         Section::Na(_) => "N/A".to_owned(),
         Section::Value(v) => {
             let mut s = format!("{:.3} V", v.delivered_volts);
-            if v.confidence == RailConfidence::HeuristicDefault {
-                s.push_str(" [est]");
+            if let Some(badge) = v.confidence.badge() {
+                s.push(' ');
+                s.push_str(badge);
             }
             if let Some(vid) = v.requested_vid {
                 let delta_mv = (v.delivered_volts - vid) * 1000.0;
@@ -519,7 +522,7 @@ mod tests {
     use ramsleuth_telemetry::amd_readout::{CommandRate, EccStatus, MemoryChannelMode};
     use ramsleuth_telemetry::cpuid::{AmdZen, IntelGen};
     use ramsleuth_telemetry::intel_readout::{ChannelMode, decode_channel};
-    use ramsleuth_telemetry::SystemPlatform;
+    use ramsleuth_telemetry::{RailConfidence, SystemPlatform};
 
     use super::*;
 

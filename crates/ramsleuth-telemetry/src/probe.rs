@@ -41,7 +41,7 @@ use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{NaReason, Section};
 use crate::intel_readout::IntelReadout;
 use crate::spd_decode::SpdModule;
-use crate::{RailConfidence, SystemMemoryTelemetry, VoltageTelemetry};
+use crate::{SystemMemoryTelemetry, VoltageTelemetry};
 
 /// The top-level probe report — the `Response::ProbeReport` payload.
 ///
@@ -574,16 +574,18 @@ fn voltages_rows(voltages: &VoltageSet) -> Vec<(&str, String)> {
 
 /// The single vCore reading (Chunk 3, the snapshot-root's `vcore` field)
 /// as the CLI layout-matrix form: the delivered value at mV precision,
-/// the `[est]` badge for a heuristic (vendor-fallback) reading, the
-/// optional VID + signed delta when a VID is present, and a plain `N/A`
-/// for the absent / enterprise / out-of-bounds states.
+/// the canonical `[est]` badge (the shared [`crate::RailConfidence::badge`]
+/// source) for a heuristic (vendor-fallback) reading, the optional VID +
+/// signed delta when a VID is present, and a plain `N/A` for the absent /
+/// enterprise / out-of-bounds states.
 fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
     match vcore {
         Section::Na(_) => "N/A".to_owned(),
         Section::Value(v) => {
             let mut s = format!("{:.3} V", v.delivered_volts);
-            if v.confidence == RailConfidence::HeuristicDefault {
-                s.push_str(" [est]");
+            if let Some(badge) = v.confidence.badge() {
+                s.push(' ');
+                s.push_str(badge);
             }
             if let Some(vid) = v.requested_vid {
                 let delta_mv = (v.delivered_volts - vid) * 1000.0;
@@ -665,20 +667,28 @@ fn render_amd(out: &mut String, section: &Section<AmdReadout>) {
 }
 
 /// The `### Intel` subsection: the readout-level `channel mode` row
-/// (the hardware `MAD_INTER_CHANNEL` mode — `N/A` on the `/dev/mem`
-/// fallback where no mode is carried), then one `#### Channel n` block
-/// per decoded IMC channel, or one `N/A (<reason>)` line when the
-/// branch degraded.
+/// (the trust-resolved mode as the single-source
+/// [`IntelReadout::channel_display_label`] — the exact string the TUI
+/// and GUI render, incl. the DDR5 subchannel form and the
+/// `[unverified]` badge for the L3 / L4 tiers — `N/A` on the
+/// `/dev/mem` fallback where no mode is carried) + the `channel
+/// annotation` row (the L2 / L3 / L4 / terminal reason text — the
+/// diagnostics surface for *why* a trust override fired) when one is
+/// present, then one `#### Channel n` block per decoded IMC channel,
+/// or one `N/A (<reason>)` line when the branch degraded.
 fn render_intel(out: &mut String, section: &Section<IntelReadout>) {
     out.push_str("### Intel\n\n");
     match section {
         Section::Na(reason) => out.push_str(&format!("{}\n\n", na_cell(reason))),
         Section::Value(readout) => {
             let mode = readout
-                .channel_mode
-                .map(|m| m.label().to_owned())
+                .channel_display_label()
                 .unwrap_or_else(|| "N/A".to_owned());
-            md_table(out, "Field", "Value", &[("channel mode", mode)]);
+            let mut rows: Vec<(&str, String)> = vec![("channel mode", mode)];
+            if !readout.channel_annotation.is_empty() {
+                rows.push(("channel annotation", readout.channel_annotation.clone()));
+            }
+            md_table(out, "Field", "Value", &rows);
             if readout.channels.is_empty() {
                 out.push_str("_no channels decoded_\n\n");
                 return;
@@ -1726,6 +1736,90 @@ mod tests {
         assert!(md.contains("`raw (whole dump)` — not captured"), "{md}");
         // The empty SPD list note.
         assert!(md.contains("no modules"), "{md}");
+    }
+
+    /// (9) The Intel section renders the single-source channel label
+    /// (the exact string the TUI / GUI render — the `[unverified]`
+    /// badge for the L3 override / L4 heuristic tiers) and the
+    /// resolution `channel annotation` (the reason text for *why* a
+    /// trust override fired — the probe report is the diagnostics
+    /// surface that renders it; the badges alone leave it invisible,
+    /// release-review #3). A clean L1 readout carries no badge and no
+    /// annotation row.
+    #[test]
+    fn render_probe_report_md_intel_channel_annotation() {
+        fn readout_with(trust: ChannelTrust, annotation: &str) -> IntelReadout {
+            IntelReadout {
+                channels: Vec::new(),
+                channel_mode: Some(ChannelMode::DualSymmetric),
+                ecc_status: EccStatus::Unknown,
+                memory_tech: Some(MemoryTech::Ddr4),
+                channel_trust: Some(trust),
+                channel_annotation: annotation.to_owned(),
+                dimm_count: 2,
+            }
+        }
+        fn report_with(readout: IntelReadout) -> ProbeReport {
+            ProbeReport {
+                telemetry: SystemMemoryTelemetry {
+                    cpu: CpuInfo {
+                        vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                        brand: "Intel(R) Core(TM) i5-12600K CPU @ 3.70GHz".to_owned(),
+                    },
+                    amd: Section::na(NaReason::UnsupportedHardware),
+                    intel: Section::Value(readout),
+                    spd: Vec::new(),
+                    platform: SystemPlatform {
+                        cpu_clock_mhz: Section::Value(3600.0),
+                        motherboard: Section::Value("Test Board".to_owned()),
+                        bios: Section::Value("1.0".to_owned()),
+                        agesa: Section::na(NaReason::NotApplicable),
+                        smu_version: Section::na(NaReason::NotApplicable),
+                    },
+                    total_capacity: Section::Value(32.0),
+                    dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+                    vcore: Section::na(NaReason::NotApplicable),
+                },
+                raw: None,
+                system: ProbeSystem {
+                    cpu_brand: "Intel(R) Core(TM) i5-12600K CPU @ 3.70GHz".to_owned(),
+                    cpu_vendor: "Intel".to_owned(),
+                    cpu_gen: "AlderLake".to_owned(),
+                    pci_host_bridge: None,
+                    kernel: "6.6.0-1-cachyos".to_owned(),
+                    os: "Linux / Arch".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    ramsleuth_version: "2.4.13".to_owned(),
+                    telemetry_source: "ramsleuth_intel".to_owned(),
+                },
+            }
+        }
+
+        // L3 override: the shared label carries the `[unverified]`
+        // badge and the annotation row renders the reason text.
+        let report = report_with(readout_with(
+            ChannelTrust::Override,
+            "[Override: MCHBAR decoded Single-Channel, but SMBIOS Type 17 confirms 2 DIMMs across Channel A/B. Reporting Dual-Channel]",
+        ));
+        let md = render_probe_report_md(&report);
+        assert!(
+            md.contains("| channel mode | Dual-Channel (Symmetric) [unverified] |"),
+            "{md}"
+        );
+        assert!(
+            md.contains(
+                "| channel annotation | [Override: MCHBAR decoded Single-Channel, but SMBIOS Type 17 confirms 2 DIMMs across Channel A/B. Reporting Dual-Channel] |"
+            ),
+            "{md}"
+        );
+
+        // L1 (clean): no badge, no annotation row.
+        let md = render_probe_report_md(&report_with(readout_with(
+            ChannelTrust::VerifiedHardware,
+            "",
+        )));
+        assert!(md.contains("| channel mode | Dual-Channel (Symmetric) |"), "{md}");
+        assert!(!md.contains("channel annotation"), "{md}");
     }
 
     /// An AMD [`ProbeRaw`] fixture: the 13 SMN words (the last a failed

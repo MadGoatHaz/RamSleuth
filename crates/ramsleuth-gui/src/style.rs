@@ -47,12 +47,12 @@ pub const CRIMSON: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x3B, 0x30);
 /// and from the 0xE6E6EC body text.
 pub const NA_GRAY: egui::Color32 = egui::Color32::from_rgb(0x8A, 0x8A, 0x94);
 
-/// The vCore `[UNVERIFIED]` badge tooltip (Chunk 3, the GUI layout
-/// matrix): the explanatory note shown on hover over a heuristic
-/// (vendor-fallback) vCore reading — the value is the measured in-rail
-/// voltage, estimated from the board's Super-I/O sensor routing, not a
-/// verified board profile.
-pub const VCORE_UNVERIFIED_TOOLTIP: &str = "This vCore was estimated from the board's Super-I/O sensor (vendor fallback), not a verified board profile. The value is the measured in-rail voltage — a normal reading, flagged only because the exact board mapping is unconfirmed.";
+/// The vCore `[est]` badge tooltip (Chunk 3, the GUI layout matrix):
+/// the explanatory note shown on hover over a heuristic (vendor-fallback)
+/// vCore reading — the value is the measured in-rail voltage, estimated
+/// from the board's Super-I/O sensor routing, not a verified board
+/// profile.
+pub const VCORE_EST_TOOLTIP: &str = "This vCore was estimated from the board's Super-I/O sensor (vendor fallback), not a verified board profile. The value is the measured in-rail voltage — a normal reading, flagged only because the exact board mapping is unconfirmed.";
 
 /// Build the dark-slate app style: SLATE window/panel fills, light
 /// text, CYAN accents (hover/active strokes, hyperlinks, text cursor,

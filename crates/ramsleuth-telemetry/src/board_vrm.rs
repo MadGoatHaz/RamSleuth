@@ -65,6 +65,22 @@ pub enum RailConfidence {
     Unknown,
 }
 
+impl RailConfidence {
+    /// The canonical vCore confidence badge — the single source every
+    /// frontend (TUI / GUI / CLI) renders, so the badge is presented the
+    /// same way everywhere: `[est]` for the heuristic vendor-fallback
+    /// reading (the board mapping is estimated, not a verified profile),
+    /// `None` for a verified profile (no badge) and the `Unknown` N/A
+    /// state. (release-polish #4: unifies the per-frontend spellings
+    /// `[est]` / `[Unverified]` / `[UNVERIFIED]`.)
+    pub fn badge(&self) -> Option<&'static str> {
+        match self {
+            RailConfidence::HeuristicDefault => Some("[est]"),
+            RailConfidence::VerifiedProfile | RailConfidence::Unknown => None,
+        }
+    }
+}
+
 /// One resolved voltage reading (Chunk 3, research "Voltage reading
 /// payload"): the board-delivered value, the optional VID reference, the
 /// signed load-line delta, and the source-verification confidence.

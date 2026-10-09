@@ -78,6 +78,11 @@
 # listed in makedepends. libxkbcommon is the only strict build-time link
 # dep (xkbcommon-sys); the X11/Wayland/GL entries cover pkgconf probes
 # plus the eframe 0.27 / winit dlopen + fallback runtime surface.
+# Build posture: build() additionally probes a native target-cpu with a
+# 3-tier safe fallback (-C target-cpu=native -> x86-64-v2 -> omit all
+# CPU flags) and appends the winning flag to any makepkg.conf RUSTFLAGS
+# (never replacing it; no manual feature pinning) — see the build()
+# comments below.
 
 pkgname=ramsleuth
 pkgver=2.4.13   # FIXED — taken from the git tag v$pkgver (no pkgver())
@@ -177,9 +182,9 @@ package() {
     install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/ramsleuth/LICENSE"
 
     # (8) the application-menu entry — shared asset next to the preset.
-    # The FILENAME matches the GUI's Wayland app_id ("RamSleuth" — eframe/winit
-    # 0.29 sets app_id = window title), so KWin's app_id -> desktop-file match
-    # resolves the taskbar icon (C21-45).
+    # The FILENAME matches the GUI's Wayland app_id ("RamSleuth" — eframe 0.27
+    # / winit 0.29 sets app_id = window title), so KWin's app_id ->
+    # desktop-file match resolves the taskbar icon (C21-45).
     install -Dm644 "packaging/shared/RamSleuth.desktop" \
         "$pkgdir/usr/share/applications/RamSleuth.desktop"
 
