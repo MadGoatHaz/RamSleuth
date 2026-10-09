@@ -614,6 +614,10 @@ mod tests {
                 )],
                 channel_mode: None,
                 ecc_status: EccStatus::Unknown,
+                memory_tech: None,
+                channel_trust: None,
+                channel_annotation: String::new(),
+                dimm_count: 0,
             }),
             spd: vec![SpdModule {
                 index: 0x50,

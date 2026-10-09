@@ -87,7 +87,7 @@ use ramsleuth_telemetry::amd_readout::{
 };
 use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
-use ramsleuth_telemetry::intel_readout::ChannelMode;
+use ramsleuth_telemetry::intel_readout::{ChannelMode, ChannelTrust};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
 use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
 
@@ -714,20 +714,34 @@ fn sync_mode(t: &SystemMemoryTelemetry, clock_mhz: bool) -> (String, Color) {
     }
 }
 
-/// Line 3's mode segment over an Intel readout (the hardware-preferred
-/// `MAD_INTER_CHANNEL` channel mode): `DualSymmetric` → `Interleaved`
-/// (CYAN, the default), `DualFlex` → `Flex` (AMBER, the asymmetric
-/// configuration worth flagging), `Single` → `N/A` (DIM — a single
-/// channel has no interleave mode; the channel slot carries
-/// `Single-Channel`). A non-Intel / no-mode readout yields `None` and
-/// the caller falls back to the honest `N/A` (DIM).
+/// Line 3's mode segment over an Intel readout (the trust-resolved
+/// `channel_mode`): `DualSymmetric` → `Interleaved` (CYAN, the default),
+/// `DualFlex` → `Flex` (AMBER, the asymmetric configuration worth
+/// flagging), `Single` → `N/A` (DIM — a single channel has no interleave
+/// mode; the channel slot carries `Single-Channel`). The Chunk 2 trust
+/// badge rides the label: the L3 override / L4 heuristic (unverified)
+/// tiers append `(unverified)` and render AMBER; the L2 firmware-verified
+/// tier appends `(firmware)`. A non-Intel / no-mode readout yields
+/// `None` and the caller falls back to the honest `N/A` (DIM).
 fn intel_mode(t: &SystemMemoryTelemetry) -> Option<(String, Color)> {
-    let mode = t.intel.value()?.channel_mode?;
-    Some(match mode {
+    let ro = t.intel.value()?;
+    let mode = ro.channel_mode?;
+    let (mut label, color) = match mode {
         ChannelMode::DualSymmetric => (mode.mode_label().to_owned(), CYAN),
         ChannelMode::DualFlex => (mode.mode_label().to_owned(), AMBER),
         ChannelMode::Single => (mode.mode_label().to_owned(), DIM),
-    })
+    };
+    match ro.channel_trust {
+        Some(ChannelTrust::Override) | Some(ChannelTrust::Heuristic) => {
+            label.push_str(" (unverified)");
+            return Some((label, AMBER));
+        }
+        Some(ChannelTrust::VerifiedFirmware) => {
+            label.push_str(" (firmware)");
+        }
+        _ => {}
+    }
+    Some((label, color))
 }
 
 /// The line-3 pieces — the single source of truth for the flat
@@ -769,15 +783,16 @@ fn ram_line3_parts(
         .max()
         .map(|mts| format!("{mts} MT/s"))
         .or_else(|| mclk_derived_speed(t));
-    // Hardware-preferred channel label: the Intel `MAD_INTER_CHANNEL`
-    // mode (a Flex-Mode box can be Dual-Flex with one bound SPD), the
-    // AMD UMC-synthesized mode (its `Unknown` degradation renders the
-    // honest `N/A`), the SPD-count label only when neither readout
-    // carries one.
+    // Single source of truth (Chunk 2): the Intel readout's trust-resolved
+    // channel label ([`IntelReadout::channel_display_label`] — the mode +
+    // the DDR5 subchannel form + the "unverified" trust badge) — the exact
+    // string the GUI renders, so the two frontends can never disagree. The
+    // SPD-count label only when the Intel readout carries no resolved mode;
+    // the AMD UMC-synthesized mode (its `Unknown` degradation renders the
+    // honest `N/A`) fills it on AMD hosts.
     let channel = match (t.intel.value(), t.amd.value()) {
         (Some(ro), _) => ro
-            .channel_mode
-            .map(|m| m.label().to_owned())
+            .channel_display_label()
             .unwrap_or_else(|| channel_mode(t.dimm_sizes.len())),
         (None, Some(ro)) => match ro.channel_mode {
             MemoryChannelMode::Unknown => "N/A".to_owned(),
@@ -2167,7 +2182,7 @@ mod tests {
         AmdReadout, CommandRate, EccStatus, MemoryChannelMode,
     };
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, IntelGen};
-    use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
+    use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout, MemoryTech};
     use ramsleuth_telemetry::SystemPlatform;
 
     /// Draw `state` into a 100×30 in-memory terminal and return the
@@ -2521,6 +2536,10 @@ mod tests {
                     ],
                     channel_mode: None,
                     ecc_status: EccStatus::Unknown,
+                    memory_tech: None,
+                    channel_trust: None,
+                    channel_annotation: String::new(),
+                    dimm_count: 0,
                 }),
                 spd: Vec::new(),
                 platform: SystemPlatform {
@@ -3018,6 +3037,10 @@ mod tests {
                     channels: Vec::new(),
                     channel_mode: mode,
                     ecc_status: EccStatus::Unknown,
+                    memory_tech: None,
+                    channel_trust: None,
+                    channel_annotation: String::new(),
+                    dimm_count: 0,
                 }),
                 spd: Vec::new(),
                 platform: SystemPlatform {
@@ -3082,6 +3105,10 @@ mod tests {
             channels: Vec::new(),
             channel_mode: Some(ChannelMode::DualFlex),
             ecc_status: EccStatus::Unknown,
+            memory_tech: None,
+            channel_trust: None,
+            channel_annotation: String::new(),
+            dimm_count: 0,
         }));
         assert_eq!(
             ram_line_prefix(&flex, true),
@@ -3095,6 +3122,10 @@ mod tests {
             channels: Vec::new(),
             channel_mode: Some(ChannelMode::DualFlex),
             ecc_status: EccStatus::CapableButDisabled,
+            memory_tech: None,
+            channel_trust: None,
+            channel_annotation: String::new(),
+            dimm_count: 0,
         }));
         assert_eq!(
             ram_line_prefix(&flex_ecc, true),
@@ -3106,6 +3137,10 @@ mod tests {
             channels: Vec::new(),
             channel_mode: None,
             ecc_status: EccStatus::Unknown,
+            memory_tech: None,
+            channel_trust: None,
+            channel_annotation: String::new(),
+            dimm_count: 0,
         }));
         assert_eq!(
             ram_line_prefix(&no_mode, true),
@@ -3118,6 +3153,138 @@ mod tests {
             ram_line_prefix(&amd, true),
             "RAM: 16 GiB (1x16 GiB) | Single-Channel | N/A | Mode: "
         );
+    }
+
+    /// (o5) The DDR5 subchannel label: a dual-channel DDR5 readout renders
+    /// "Dual-Channel (4x 32-bit Subchannels)" in the channel segment —
+    /// never "quad-channel" (research: a 128-bit aggregate bus is
+    /// dual-channel).
+    #[test]
+    fn channel_label_ddr5_subchannels_not_quad() {
+        let t = SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                brand: "synthetic".to_owned(),
+            },
+            amd: Section::na(NaReason::NotApplicable),
+            intel: Section::Value(IntelReadout {
+                channels: Vec::new(),
+                channel_mode: Some(ChannelMode::DualSymmetric),
+                ecc_status: EccStatus::Unknown,
+                memory_tech: Some(MemoryTech::Ddr5),
+                channel_trust: Some(ChannelTrust::VerifiedHardware),
+                channel_annotation: String::new(),
+                dimm_count: 2,
+            }),
+            spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(32.0),
+            dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+        };
+        let (_, _, _, channel, _, _) = ram_line3_parts(&t, true, true);
+        assert_eq!(channel, "Dual-Channel (4x 32-bit Subchannels)");
+    }
+
+    /// (o6) The L3 safety override: an MMIO-single readout that SMBIOS
+    /// overrode to Dual carries the Override trust tier — the channel
+    /// segment shows the "[unverified]" badge and the mode slot shows
+    /// "Interleaved (unverified)" in AMBER.
+    #[test]
+    fn channel_label_l3_override_unverified() {
+        let t = SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                brand: "synthetic".to_owned(),
+            },
+            amd: Section::na(NaReason::NotApplicable),
+            intel: Section::Value(IntelReadout {
+                channels: Vec::new(),
+                channel_mode: Some(ChannelMode::DualSymmetric),
+                ecc_status: EccStatus::Unknown,
+                memory_tech: Some(MemoryTech::Ddr4),
+                channel_trust: Some(ChannelTrust::Override),
+                channel_annotation: "[Override: ...]".to_owned(),
+                dimm_count: 2,
+            }),
+            spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                motherboard: Section::na(NaReason::NotApplicable),
+                bios: Section::na(NaReason::NotApplicable),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(32.0),
+            dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+        };
+        let (_, _, _, channel, _, mode) = ram_line3_parts(&t, true, true);
+        assert_eq!(channel, "Dual-Channel (Symmetric) [unverified]");
+        assert_eq!(mode, ("Interleaved (unverified)".to_owned(), AMBER));
+    }
+
+    /// (o7) TUI-vs-GUI consistency: the TUI's channel segment is exactly
+    /// the single-source [`IntelReadout::channel_display_label`] — the same
+    /// string the GUI renders — so the two frontends can never disagree on
+    /// the channel mode for the same readout.
+    #[test]
+    fn tui_renders_the_shared_channel_label() {
+        for (mode, tech, trust) in [
+            (
+                ChannelMode::DualSymmetric,
+                Some(MemoryTech::Ddr4),
+                Some(ChannelTrust::VerifiedHardware),
+            ),
+            (
+                ChannelMode::DualFlex,
+                Some(MemoryTech::Ddr5),
+                Some(ChannelTrust::Override),
+            ),
+            (
+                ChannelMode::Single,
+                Some(MemoryTech::Ddr4),
+                Some(ChannelTrust::VerifiedHardware),
+            ),
+        ] {
+            let ro = IntelReadout {
+                channels: Vec::new(),
+                channel_mode: Some(mode),
+                ecc_status: EccStatus::Unknown,
+                memory_tech: tech,
+                channel_trust: trust,
+                channel_annotation: String::new(),
+                dimm_count: 2,
+            };
+            let t = SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                    brand: "synthetic".to_owned(),
+                },
+                amd: Section::na(NaReason::NotApplicable),
+                intel: Section::Value(ro.clone()),
+                spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                    motherboard: Section::na(NaReason::NotApplicable),
+                    bios: Section::na(NaReason::NotApplicable),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::Value(32.0),
+                dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            };
+            let (_, _, _, channel, _, _) = ram_line3_parts(&t, true, true);
+            assert_eq!(
+                channel,
+                ro.channel_display_label().expect("a resolved mode has a label"),
+                "the TUI channel segment must equal the shared single-source label"
+            );
+        }
     }
 
     /// (o4) The header channel label is hardware-preferred on AMD
@@ -3347,6 +3514,10 @@ mod tests {
                 ],
                 channel_mode: None,
                 ecc_status: EccStatus::Unknown,
+                memory_tech: None,
+                channel_trust: None,
+                channel_annotation: String::new(),
+                dimm_count: 0,
             }),
             spd: vec![module(Section::na(NaReason::NotApplicable), None)],
             platform: SystemPlatform {
@@ -3774,6 +3945,10 @@ mod tests {
                     ])],
                     channel_mode: None,
                     ecc_status: EccStatus::Unknown,
+                    memory_tech: None,
+                    channel_trust: None,
+                    channel_annotation: String::new(),
+                    dimm_count: 0,
                 }),
                 spd: Vec::new(),
                 platform: SystemPlatform {

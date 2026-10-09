@@ -586,15 +586,18 @@ mod tests {
         }
     }
 
-    /// The 5 global MAD attributes as frozen sysfs payloads (`0x%08x\n`)
-    /// — arbitrary raw fixture values (no decode in this chunk; the
-    /// decode lives in a later `intel_readout` chunk).
+    /// The 5 global MAD attributes as frozen sysfs payloads (`0x%08x\n`) —
+    /// realistic (Chunk 2): `mad_inter_channel` carries `DDR_TYPE` = 000
+    /// (DDR4) in bits `[2:0]`, and `mad_dimm_ch0/1` encode 16 GiB in slot 0
+    /// each (index 32 in the 0.5 GiB layout). No decode in this module —
+    /// the raw values are the fixture's contract (the decode lives in
+    /// `intel_readout`).
     fn write_mad_attrs(k: &TempKobject) {
-        k.write("mad_inter_channel", "0x00000003\n");
+        k.write("mad_inter_channel", "0x00000000\n"); // DDR_TYPE = 000 (DDR4)
         k.write("mad_intra_ch0", "0x00000005\n");
         k.write("mad_intra_ch1", "0x00000007\n");
-        k.write("mad_dimm_ch0", "0x00000008\n");
-        k.write("mad_dimm_ch1", "0x0000000C\n");
+        k.write("mad_dimm_ch0", "0x00000020\n"); // 16 GiB slot 0 (index 32)
+        k.write("mad_dimm_ch1", "0x00000020\n"); // 16 GiB slot 0 (index 32)
     }
 
     /// The Tier-3 extension attributes (IG-23) as frozen sysfs payloads
@@ -684,11 +687,11 @@ mod tests {
                 enabled: Some(true)
             }
         );
-        assert_eq!(out.mad_inter_channel, Some(0x0000_0003));
+        assert_eq!(out.mad_inter_channel, Some(0x0000_0000));
         assert_eq!(out.mad_intra_ch0, Some(0x0000_0005));
         assert_eq!(out.mad_intra_ch1, Some(0x0000_0007));
-        assert_eq!(out.mad_dimm_ch0, Some(0x0000_0008));
-        assert_eq!(out.mad_dimm_ch1, Some(0x0000_000C));
+        assert_eq!(out.mad_dimm_ch0, Some(0x0000_0020));
+        assert_eq!(out.mad_dimm_ch1, Some(0x0000_0020));
     }
 
     /// A pre-24-attr kobject (the core 19 only, no MAD files) degrades
@@ -724,11 +727,11 @@ mod tests {
         k.write("mad_intra_ch1", "not-a-register\n");
         let out = read_from(&k.root).expect("containment -> Ok");
         assert_eq!(out.regs, acceptance_regs());
-        assert_eq!(out.mad_inter_channel, Some(0x0000_0003));
+        assert_eq!(out.mad_inter_channel, Some(0x0000_0000));
         assert_eq!(out.mad_intra_ch0, Some(0x0000_0005));
         assert_eq!(out.mad_intra_ch1, None);
-        assert_eq!(out.mad_dimm_ch0, Some(0x0000_0008));
-        assert_eq!(out.mad_dimm_ch1, Some(0x0000_000C));
+        assert_eq!(out.mad_dimm_ch0, Some(0x0000_0020));
+        assert_eq!(out.mad_dimm_ch1, Some(0x0000_0020));
     }
 
     /// capid0a populates on a build that exposes it and degrades to

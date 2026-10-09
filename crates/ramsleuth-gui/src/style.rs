@@ -531,7 +531,22 @@ fn snapshot_ram_line(t: &SystemMemoryTelemetry) -> String {
         Some(gib) => format!("{gib:.1} GB"),
         None => "N/A".to_owned(),
     };
-    format!("RAM: {} | {}", total, channel_name(t.dimm_sizes.len()))
+    format!("RAM: {total} | {}", intel_channel_label(t))
+}
+
+/// The single-source channel label (Chunk 2): the Intel readout's
+/// trust-resolved [`IntelReadout::channel_display_label`] — the exact
+/// string the TUI renders, so the two frontends can never disagree on the
+/// channel mode. Falls back to the DIMM-count [`channel_name`] only when
+/// there is no Intel readout with a resolved mode (AMD host / Intel Na /
+/// the terminal state).
+fn intel_channel_label(t: &SystemMemoryTelemetry) -> String {
+    if let Some(ro) = t.intel.value() {
+        if let Some(label) = ro.channel_display_label() {
+            return label;
+        }
+    }
+    channel_name(t.dimm_sizes.len())
 }
 
 /// Channel mode from the bound-DIMM count (the C6-20 header rule):
@@ -552,8 +567,10 @@ fn channel_name(dimm_count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
+    use ramsleuth_telemetry::amd_readout::EccStatus;
+    use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
+    use ramsleuth_telemetry::intel_readout::{ChannelMode, ChannelTrust, IntelReadout, MemoryTech};
     use ramsleuth_telemetry::SystemPlatform;
 
     use super::*;
@@ -859,6 +876,65 @@ mod tests {
         assert_eq!(channel_name(4), "Quad-Channel");
         assert_eq!(channel_name(0), "N/A");
         assert_eq!(channel_name(3), "N/A");
+    }
+
+    /// (c2 / Chunk 2) GUI-vs-TUI consistency: the GUI's channel label is
+    /// exactly the single-source [`IntelReadout::channel_display_label`] —
+    /// the same string the TUI renders — so the two frontends agree for the
+    /// same readout (the DDR5 subchannel form + the "unverified" trust
+    /// badge included).
+    #[test]
+    fn gui_renders_the_shared_channel_label() {
+        for (mode, tech, trust) in [
+            (
+                ChannelMode::DualSymmetric,
+                Some(MemoryTech::Ddr4),
+                Some(ChannelTrust::VerifiedHardware),
+            ),
+            (
+                ChannelMode::DualFlex,
+                Some(MemoryTech::Ddr5),
+                Some(ChannelTrust::Override),
+            ),
+            (
+                ChannelMode::Single,
+                Some(MemoryTech::Ddr4),
+                Some(ChannelTrust::VerifiedHardware),
+            ),
+        ] {
+            let ro = IntelReadout {
+                channels: Vec::new(),
+                channel_mode: Some(mode),
+                ecc_status: EccStatus::Unknown,
+                memory_tech: tech,
+                channel_trust: trust,
+                channel_annotation: String::new(),
+                dimm_count: 2,
+            };
+            let t = SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                    brand: "synthetic".to_owned(),
+                },
+                amd: Section::na(NaReason::NotApplicable),
+                intel: Section::Value(ro.clone()),
+                spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                    motherboard: Section::na(NaReason::NotApplicable),
+                    bios: Section::na(NaReason::NotApplicable),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::Value(32.0),
+                dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            };
+            assert_eq!(
+                intel_channel_label(&t),
+                ro.channel_display_label().expect("a resolved mode has a label"),
+                "the GUI channel label must equal the shared single-source label"
+            );
+        }
     }
 
     /// (c2) The wall clock: known epoch seconds format to their UTC

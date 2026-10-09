@@ -5,11 +5,22 @@
  * Probes the host bridge at PCI 0000:00:00.0, decodes MCHBAR from
  * config space (offset 0x48 = low dword, 0x4C = high dword; bit 0 of
  * the low dword = MCHBAR_EN; base = raw & 0x0000007F_FFFF_F000),
- * ioremaps the MCHBAR window (64 KiB by default; 256 KiB for the
- * Tier-3 host-bridge device IDs in the OQ-14 table, currently empty
- * so 64 KiB for every device), and publishes the raw IMC registers as
- * world-readable (0444) sysfs attributes under
+ * ioremaps the MCHBAR window (64 KiB for 6th-11th gen; 256 KiB for the
+ * 12th-gen+ Alder/Raptor/Meteor/Arrow family), and publishes the raw IMC
+ * registers as world-readable (0444) sysfs attributes under
  * /sys/kernel/ramsleuth_intel/.
+ *
+ * Chunk 2 (gen-keyed IMC base): the global MAD channel/geometry registers
+ * (MAD_INTER_CHANNEL / MAD_INTRA_CH0/1 / MAD_DIMM_CH0/1) moved from
+ * MCHBAR + 0x5000 (6th-11th gen) to MCHBAR + 0xd800 (Alder Lake and
+ * later) with the System-Agent/arbiter redesign. This module selects the
+ * base from the CPU *generation* (the effective 8-bit model from
+ * boot_cpu_data, the SDM (ext<<4)|base rule), NOT the overlapping PCI
+ * Device-ID ranges: 12th-gen+ -> 0xd800, everything else -> 0x5000. The
+ * five MAD attribute offsets are therefore computed at probe time (base
+ * relative) and the wider 256 KiB window is mapped for the 12th-gen+
+ * family. On a 12th-gen box the pre-Chunk-2 module read 0x5000 (unmapped
+ * -> 0x0 / 0xFFFF_FFFF) and misreported the channel mode.
  *
  * This module performs no decoding: each register attribute is the raw
  * 32-bit value, little-endian, one line, "0x%08x".  The RamSleuth
@@ -23,6 +34,7 @@
  * fails with -ENODEV by design: no kobject is ever created.
  */
 
+#include <asm/cpuid/api.h>
 #include <linux/errno.h>
 #include <linux/init.h>
 #include <linux/io.h>
@@ -52,11 +64,10 @@
  * 0x5E00). */
 #define IMC_MAP_SIZE_DEFAULT	0x10000
 
-/* Tier 3 (12th/13th/14th gen): the wider 256 KiB window, selected
- * ONLY for the host-bridge device IDs in tier3_device_ids[] (OQ-14).
- * The research docs do not list those IDs, so the table ships as a
- * TODO constant block; while it is empty, every device maps the
- * default 64 KiB window. */
+/* Tier 3 (12th-gen+): the wider 256 KiB window, selected by the CPU
+ * generation (is_12th_gen_plus) — the Alder/Raptor/Meteor/Arrow family
+ * needs it. Chunk 2: keyed on the CPU model, not the Device-ID (the
+ * research Device-ID ranges overlap and are not per-generation). */
 #define IMC_MAP_SIZE_TIER3	0x40000
 
 /* IMC register offsets relative to the MCHBAR base */
@@ -80,18 +91,32 @@
 #define REG_TC_WRRD_CH1	0x4428
 #define REG_TC_WRWR_CH1	0x442C
 
-/* Global (not per-channel) IMC channel-mode / DIMM-geometry
- * registers (raw only; the userspace reader decodes them). */
-#define REG_MAD_INTER_CHANNEL	0x5000
-#define REG_MAD_INTRA_CH0	0x5004
-#define REG_MAD_INTRA_CH1	0x5008
-#define REG_MAD_DIMM_CH0	0x500C
-#define REG_MAD_DIMM_CH1	0x5010
+/* Global (not per-channel) IMC channel-mode / DIMM-geometry registers
+ * (raw only; the userspace reader decodes them). Their MCHBAR-relative
+ * offsets are NOT fixed constants: Chunk 2 makes them base-relative
+ * (imc_base + 0x00/0x04/0x08/0x0C/0x10), where imc_base is 0x5000 for
+ * 6th-11th gen and 0xd800 for the 12th-gen+ family (selected at probe
+ * time in _init; see mad_offs below). */
 
 static u64 mchbar_base;		/* masked MCHBAR physical base */
 static void __iomem *mchbar_mmio;
 static struct pci_dev *host_bridge;
 static struct kobject *ramsleuth_kobj;
+
+/*
+ * Chunk 2: the gen-selected IMC base (0x5000 / 0xd800) and the five
+ * base-relative MAD register offsets, computed at probe time. The
+ * RAW_ATTR macro below takes these as runtime expressions (mchbar_mmio +
+ * mad_offs.<field>), which is valid C for the sysfs show functions.
+ */
+static u32 imc_base;
+static struct {
+	u32 inter;	/* MAD_INTER_CHANNEL = imc_base + 0x00 */
+	u32 intra0;	/* MAD_INTRA_CH0     = imc_base + 0x04 */
+	u32 intra1;	/* MAD_INTRA_CH1     = imc_base + 0x08 */
+	u32 dimm0;	/* MAD_DIMM_CH0      = imc_base + 0x0C */
+	u32 dimm1;	/* MAD_DIMM_CH1      = imc_base + 0x10 */
+} mad_offs;
 
 /*
  * One read-only attribute per raw 32-bit IMC register.  The value is
@@ -126,11 +151,11 @@ RAW_ATTR(ch1_tc_rdrd, REG_TC_RDRD_CH1)
 RAW_ATTR(ch1_tc_rdwr, REG_TC_RDWR_CH1)
 RAW_ATTR(ch1_tc_wrrd, REG_TC_WRRD_CH1)
 RAW_ATTR(ch1_tc_wrwr, REG_TC_WRWR_CH1)
-RAW_ATTR(mad_inter_channel, REG_MAD_INTER_CHANNEL)
-RAW_ATTR(mad_intra_ch0, REG_MAD_INTRA_CH0)
-RAW_ATTR(mad_intra_ch1, REG_MAD_INTRA_CH1)
-RAW_ATTR(mad_dimm_ch0, REG_MAD_DIMM_CH0)
-RAW_ATTR(mad_dimm_ch1, REG_MAD_DIMM_CH1)
+RAW_ATTR(mad_inter_channel, mad_offs.inter)
+RAW_ATTR(mad_intra_ch0, mad_offs.intra0)
+RAW_ATTR(mad_intra_ch1, mad_offs.intra1)
+RAW_ATTR(mad_dimm_ch0, mad_offs.dimm0)
+RAW_ATTR(mad_dimm_ch1, mad_offs.dimm1)
 
 /*
  * MCHBAR physical base, 16 hex digits, no prefix
@@ -208,25 +233,32 @@ static struct attribute_group ramsleuth_group = {
 };
 
 /*
- * OQ-14: verified 12th/13th/14th-gen (Alder / Raptor / Arrow Lake)
- * host-bridge device IDs, 0x0000-terminated.  The research docs do
- * not list the IDs, so the table ships empty (its only element is
- * the terminator): the 256 KiB window is selected for NO device
- * yet.  Add each ID confirmed against a live box before the final
- * 0x0000.
+ * Chunk 2: the 12th-gen+ (Alder Lake and later) CPU model set — the set
+ * whose IMC MAD registers moved to the 0xd800 base. This mirrors the
+ * userspace `is_12th_gen_plus` in intel_readout.rs (Chunk 1's gen set):
+ * the key is the CPU *model*, NOT the PCI Device-ID (the research
+ * Device-ID ranges 0x1900-0x4C00 vs 0x4600-0x7700 overlap and are not
+ * per-generation, so keying on the model is unambiguous).
+ *
+ *   Alder Lake:    0x97, 0x9A, 0xBE
+ *   Raptor Lake:   0xB7, 0xBA, 0xBF
+ *   Meteor Lake:   0xAC, 0xAA
+ *   Arrow Lake:    0xC5, 0xC6, 0xB5
+ *   Lunar Lake:    0xBD
+ *   (Core Series 1 Mobile shares the 0x9A / 0xBA Alder/Raptor models)
  */
-static const u16 tier3_device_ids[] = {
-	0x0000,	/* TODO(OQ-14): confirmed Tier-3 host-bridge device IDs */
-};
-
-static bool is_tier3_device(u16 device)
+static bool is_12th_gen_plus(u32 model)
 {
-	unsigned int i;
-
-	for (i = 0; tier3_device_ids[i] != 0x0000; i++)
-		if (tier3_device_ids[i] == device)
-			return true;
-	return false;
+	switch (model) {
+	case 0x97: case 0x9A: case 0xBE:	/* Alder Lake */
+	case 0xB7: case 0xBA: case 0xBF:	/* Raptor Lake */
+	case 0xAC: case 0xAA:		/* Meteor Lake */
+	case 0xC5: case 0xC6: case 0xB5:	/* Arrow Lake */
+	case 0xBD:				/* Lunar Lake */
+		return true;
+	default:
+		return false;
+	}
 }
 
 static int __init ramsleuth_intel_init(void)
@@ -234,7 +266,8 @@ static int __init ramsleuth_intel_init(void)
 	struct pci_dev *pdev;
 	u32 lo, hi;
 	u64 raw;
-	u16 vendor, device;
+	u32 model;
+	u16 vendor;
 	size_t map_size;
 	int ret;
 
@@ -245,7 +278,6 @@ static int __init ramsleuth_intel_init(void)
 	}
 
 	vendor = pdev->vendor;
-	device = pdev->device;
 	pci_read_config_dword(pdev, MCHBAR_LO_OFF, &lo);
 	pci_read_config_dword(pdev, MCHBAR_HI_OFF, &hi);
 
@@ -274,11 +306,28 @@ static int __init ramsleuth_intel_init(void)
 	}
 
 	/*
-	 * Window size: 256 KiB only for the Tier-3 host-bridge device
-	 * IDs in tier3_device_ids[] (OQ-14; the table is a TODO block
-	 * and currently empty), the default 64 KiB for every other ID.
+	 * Chunk 2: select the IMC base by CPU generation. The effective
+	 * 8-bit model is (ext << 4) | base (the SDM rule, mirroring the
+	 * userspace cpuid.rs). 12th-gen+ -> 0xd800, else 0x5000. The five
+	 * MAD offsets are base-relative (imc_base + 0x00/04/08/0C/10).
 	 */
-	map_size = is_tier3_device(device) ? IMC_MAP_SIZE_TIER3 :
+	{
+		u32 eax1 = cpuid_eax(1);
+		model = (((eax1 >> 16) & 0xF) << 4) | ((eax1 >> 4) & 0xF);
+	}
+	imc_base = is_12th_gen_plus(model) ? 0xD800 : 0x5000;
+	mad_offs.inter = imc_base;
+	mad_offs.intra0 = imc_base + 0x04;
+	mad_offs.intra1 = imc_base + 0x08;
+	mad_offs.dimm0 = imc_base + 0x0C;
+	mad_offs.dimm1 = imc_base + 0x10;
+
+	/*
+	 * Window size: 256 KiB for the 12th-gen+ family (the wider
+	 * Alder/Raptor/Meteor/Arrow map), the default 64 KiB otherwise —
+	 * keyed on the CPU generation (Chunk 2), not the Device-ID.
+	 */
+	map_size = is_12th_gen_plus(model) ? IMC_MAP_SIZE_TIER3 :
 					      IMC_MAP_SIZE_DEFAULT;
 
 	raw = ((u64)hi << 32) | lo;
@@ -331,8 +380,9 @@ static int __init ramsleuth_intel_init(void)
 	}
 
 	pr_info(DRIVER_NAME
-		": MCHBAR base 0x%llx, %zu attributes under /sys/kernel/%s/\n",
+		": MCHBAR base 0x%llx, IMC base 0x%x (model 0x%02x), %zu attributes under /sys/kernel/%s/\n",
 		(unsigned long long)mchbar_base,
+		imc_base, model,
 		ARRAY_SIZE(ramsleuth_attrs) - 1, DRIVER_NAME);
 	return 0;
 }
