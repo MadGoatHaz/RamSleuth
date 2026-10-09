@@ -90,6 +90,29 @@ pub fn collect_platform() -> SystemPlatform {
     }
 }
 
+/// The DMI `board_vendor` string (e.g. `"ASUSTeK COMPUTER INC."`,
+/// `"Dell Inc."`) — the vendor-aware vCore fallback's classification
+/// source (Chunk 3, research §"Fallback Engine Rules").
+///
+/// **No-panic:** a missing / unreadable `/sys/class/dmi/id/board_vendor`
+/// yields `None` (never a panic, never a fabricated string). These are
+/// in-crate helpers (NOT added to the [`SystemPlatform`] wire struct —
+/// the wire shape stays stable); the facade reads them and passes the
+/// vendor to [`crate::board_vrm::read_board_vrm`].
+pub fn dmi_board_vendor() -> Option<String> {
+    read_dmi("board_vendor")
+}
+
+/// The DMI `sys_vendor` string (e.g. `"System vendor"`, `"Hewlett-Packard"`)
+/// — the secondary vendor-aware vCore fallback source (Chunk 3).
+///
+/// **No-panic:** a missing / unreadable `/sys/class/dmi/id/sys_vendor`
+/// yields `None` (never a panic, never a fabricated string). In-crate
+/// helper only (not on the wire).
+pub fn dmi_sys_vendor() -> Option<String> {
+    read_dmi("sys_vendor")
+}
+
 /// Total system memory in GiB, from `/proc/meminfo` `MemTotal` (kB → GiB,
 /// 1024-based).
 ///
@@ -603,6 +626,19 @@ mod tests {
         // A carried clock is in-band (never garbage, never a sentinel).
         if let Section::Value(mhz) = &p.cpu_clock_mhz {
             assert!(mhz.is_finite() && *mhz > 0.0, "clock must be finite positive MHz: {mhz}");
+        }
+    }
+
+    /// (c1′) The DMI vendor helpers (Chunk 3): on any Linux host they
+    /// return a non-empty `Value` string (a real DMI `board_vendor` /
+    /// `sys_vendor`) or an honest `None` (a VM / container with no DMI
+    /// surface) — never a panic, never an empty string.
+    #[test]
+    fn dmi_vendor_helpers_are_value_or_none() {
+        for vendor in [dmi_board_vendor(), dmi_sys_vendor()] {
+            if let Some(text) = &vendor {
+                assert!(!text.trim().is_empty(), "a carried vendor is non-empty: {text:?}");
+            }
         }
     }
 

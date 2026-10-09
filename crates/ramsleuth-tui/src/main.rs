@@ -2053,6 +2053,7 @@ mod tests {
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::SystemMemoryTelemetry;
     use ramsleuth_telemetry::SystemPlatform;
+    use ramsleuth_telemetry::{RailConfidence, VoltageTelemetry};
 
     use super::*;
 
@@ -2105,6 +2106,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -2189,6 +2191,16 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            // The vCore (Chunk 3): the AMD readout's 1150 mV vcore,
+            // promoted to the snapshot-root's `vcore` field (mirroring
+            // the facade's AMD promotion) so the vcore series lands.
+            vcore: Section::Value(VoltageTelemetry {
+                rail_name: "CPU Vcore".to_owned(),
+                delivered_volts: 1.150,
+                requested_vid: None,
+                delta_volts: None,
+                confidence: RailConfidence::VerifiedProfile,
+            }),
         }
     }
 
@@ -3965,13 +3977,14 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         let expected: std::collections::BTreeSet<String> = [
             "amd", "bench", "cpu", "intel", "spd", "platform", "total_capacity", "dimm_sizes",
+            "vcore",
         ]
         .into_iter()
         .map(str::to_owned)
         .collect();
         assert_eq!(
             keys, expected,
-            "the seven telemetry wire keys + the bench key"
+            "the eight telemetry wire keys (vcore appended, Chunk 3) + the bench key"
         );
 
         // The C6-29 `bench` key carries the grid verbatim.

@@ -10,7 +10,7 @@
 //! bad command-line flag (2). No clap; `std::env::args` only.
 
 use ramsleuth_telemetry::error::Section;
-use ramsleuth_telemetry::{collect, SystemMemoryTelemetry};
+use ramsleuth_telemetry::{collect, RailConfidence, SystemMemoryTelemetry, VoltageTelemetry};
 
 /// Command-line options (parsed by hand — no clap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,12 +107,36 @@ pub(crate) fn render_section<T: std::fmt::Debug>(s: &Section<T>) -> String {
     }
 }
 
-/// Render the dashboard listing: one CPU line, one AMD line, one Intel
-/// line, then one line per SPD module (or a single N/A line when the SPD
-/// branch yielded nothing).
+/// The single vCore reading (Chunk 3, the snapshot-root's `vcore` field)
+/// as the CLI layout-matrix form: the delivered value at mV precision,
+/// the `[est]` badge for a heuristic (vendor-fallback) reading, the
+/// optional VID + signed delta when a VID is present, and a plain `N/A`
+/// for the absent / enterprise / out-of-bounds states.
+fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
+    match vcore {
+        Section::Na(_) => "N/A".to_owned(),
+        Section::Value(v) => {
+            let mut s = format!("{:.3} V", v.delivered_volts);
+            if v.confidence == RailConfidence::HeuristicDefault {
+                s.push_str(" [est]");
+            }
+            if let Some(vid) = v.requested_vid {
+                let delta_mv = (v.delivered_volts - vid) * 1000.0;
+                s.push_str(&format!(" (VID: {:.3} V, Δ {:+.0} mV)", vid, delta_mv));
+            }
+            s
+        }
+    }
+}
+
+/// Render the dashboard listing: one CPU line, one vCore line (the
+/// Chunk 3 single source of truth), one AMD line, one Intel line, then
+/// one line per SPD module (or a single N/A line when the SPD branch
+/// yielded nothing).
 pub(crate) fn render_dashboard(t: &SystemMemoryTelemetry) -> String {
     let mut out = String::new();
     out.push_str(&format!("CPU: {:?} — {}\n", t.cpu.vendor, t.cpu.brand));
+    out.push_str(&format!("Vcore: {}\n", vcore_display(&t.vcore)));
     out.push_str(&format!("AMD: {}\n", render_section(&t.amd)));
     out.push_str(&format!("Intel: {}\n", render_section(&t.intel)));
     if t.spd.is_empty() {
@@ -240,6 +264,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -295,6 +320,42 @@ mod tests {
         assert!(out.contains("SPD[0]: SpdModule"));
         assert!(out.contains("SPD[1]: SpdModule"));
         assert!(!out.contains("no SPD data"));
+    }
+
+    /// (b'') The vCore line (Chunk 3): an absent vCore renders `N/A`, a
+    /// heuristic (vendor-fallback) reading renders the mV-precision value
+    /// + the `[est]` badge, and a verified reading with a synthetic VID
+    /// renders the value + the signed (negative) delta.
+    #[test]
+    fn dashboard_vcore_line_renders_per_confidence() {
+        // Absent → N/A.
+        assert!(render_dashboard(&all_na()).contains("Vcore: N/A"));
+
+        // Heuristic (no VID) → the value + the `[est]` badge.
+        let mut t = all_na();
+        t.vcore = Section::Value(VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.216,
+            requested_vid: None,
+            delta_volts: None,
+            confidence: RailConfidence::HeuristicDefault,
+        });
+        let out = render_dashboard(&t);
+        assert!(out.contains("Vcore: 1.216 V [est]"), "{out}");
+
+        // Verified (no badge) + a synthetic VID → the signed negative
+        // delta (1.216 − 1.280 = −64 mV).
+        let mut t = all_na();
+        t.vcore = Section::Value(VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.216,
+            requested_vid: Some(1.280),
+            delta_volts: Some(1.216 - 1.280),
+            confidence: RailConfidence::VerifiedProfile,
+        });
+        let out = render_dashboard(&t);
+        assert!(out.contains("Vcore: 1.216 V (VID: 1.280 V, Δ -64 mV)"), "{out}");
+        assert!(!out.contains("[est]"), "a verified vCore has no badge: {out}");
     }
 
     /// (c) `to_json`: structurally valid — starts with `{`, carries all

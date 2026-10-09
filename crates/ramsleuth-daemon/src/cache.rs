@@ -140,6 +140,7 @@ mod tests {
             },
             total_capacity: Section::Value(32.0),
             dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 

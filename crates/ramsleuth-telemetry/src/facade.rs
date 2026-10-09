@@ -47,7 +47,7 @@ use crate::amd_pm;
 use crate::amd_readout::{self, AmdReadout};
 use crate::amd_smn;
 use crate::amd_smu;
-use crate::board_vrm::{self, BoardVrmReadout};
+use crate::board_vrm::{self, BoardVrmReadout, RailConfidence, VoltageTelemetry};
 use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_mchbar;
@@ -112,6 +112,21 @@ pub struct SystemMemoryTelemetry {
     /// device count, D-2), `Na` when that module's density or
     /// devices is `Na`.
     pub dimm_sizes: Vec<Section<f64>>,
+    /// The single vCore source of truth (Chunk 3, **appended** after
+    /// `dimm_sizes` — the OQ-10 append-only wire pattern): vendor-
+    /// dispatched in [`assemble`]:
+    /// - **Intel** = the board Super-I/O `in0` direct VRM sense (the
+    ///   `board_vrm` readout's resolved [`VoltageTelemetry`] — a curated
+    ///   `VerifiedProfile` or the vendor-aware `HeuristicDefault`
+    ///   fallback);
+    /// - **AMD** = the SMU PM-table vCore (`0x0A0` — the authoritative
+    ///   source) wrapped as a `VerifiedProfile` [`VoltageTelemetry`];
+    /// - **Unknown** / an enterprise board / an out-of-bounds reading =
+    ///   `Na(NotApplicable)`.
+    ///
+    /// TUI / GUI / CLI all read **this** field (they no longer compute
+    /// their own vCore — the single-source-of-truth rule, constraint #2).
+    pub vcore: Section<VoltageTelemetry>,
 }
 
 /// Collect the full [`SystemMemoryTelemetry`] snapshot.
@@ -172,7 +187,10 @@ pub fn collect() -> SystemMemoryTelemetry {
     // 6. Board VRM branch (vendor-independent, C12-03; the DMI-keyed
     //    profile + nct6798 in13 read — every rail degrades to
     //    Na(NotApplicable) on an unknown board / absent device, §9).
-    let board_vrm = board_vrm::read_board_vrm(&platform.motherboard);
+    //    Chunk 3: the DMI `board_vendor` feeds the vendor-aware vCore
+    //    fallback (the in0 → Vcore resolution).
+    let board_vrm =
+        board_vrm::read_board_vrm(&platform.motherboard, platform::dmi_board_vendor().as_deref());
     // 7. Per-DIMM capacities (D-C3/D-C9): parallel to the SPD modules.
     let dimm_sizes = dimm_sizes(&spd);
     // 8. Total capacity (D-3/D-C3): the meminfo `MemTotal` (the OS
@@ -427,14 +445,20 @@ fn assemble(
     dimm_sizes: Vec<Section<f64>>,
     board_vrm: BoardVrmReadout,
 ) -> SystemMemoryTelemetry {
+    let amd_section = section_from(amd);
+    // The single vCore source of truth (Chunk 3): vendor-dispatched
+    // (Intel → the board `in0` direct VRM sense; AMD → the SMU PM-table
+    // vCore) before `cpu` / `amd_section` move into the struct.
+    let vcore = vcore_section(&cpu, &amd_section, &board_vrm);
     let mut telemetry = SystemMemoryTelemetry {
         cpu,
-        amd: section_from(amd),
+        amd: amd_section,
         intel: section_from(intel),
         spd,
         platform,
         total_capacity,
         dimm_sizes,
+        vcore,
     };
     // The C12-04 overlay (D-5): fill-when-Na only — the AMD slot is
     // structurally `Na` from the PM table, so the board profile's in13
@@ -449,6 +473,49 @@ fn assemble(
         _ => {}
     }
     telemetry
+}
+
+/// The single vCore source of truth (Chunk 3, constraint #2): vendor-
+/// dispatched, so TUI / GUI / CLI all read the same `SystemMemoryTelemetry
+/// .vcore` field.
+///
+/// - **Intel** (`CpuVendor::Intel`): the board Super-I/O `in0` direct
+///   VRM sense (the `board_vrm` readout's resolved [`VoltageTelemetry`] —
+///   a curated `VerifiedProfile` or the vendor-aware `HeuristicDefault`
+///   fallback); `Na(NotApplicable)` when the board is unknown /
+///   enterprise / out-of-bounds / no device.
+/// - **AMD** (`CpuVendor::Amd`): the SMU PM-table vCore (`0x0A0` — the
+///   authoritative source) wrapped as a `VerifiedProfile`
+///   [`VoltageTelemetry`]; `Na(NotApplicable)` when the branch degraded
+///   or the slot is `Na`.
+/// - **Unknown**: `Na(NotApplicable)`.
+///
+/// Pure (no I/O); never a panic.
+fn vcore_section(
+    cpu: &CpuInfo,
+    amd: &Section<AmdReadout>,
+    board_vrm: &BoardVrmReadout,
+) -> Section<VoltageTelemetry> {
+    match cpu.vendor {
+        CpuVendor::Intel(_) => match board_vrm.vcore.as_ref() {
+            Some(vcore) => Section::Value(vcore.clone()),
+            None => Section::na(NaReason::NotApplicable),
+        },
+        CpuVendor::Amd(_) => match amd
+            .value()
+            .and_then(|readout| readout.voltages.vcore_mv.value().copied())
+        {
+            Some(mv) => Section::Value(VoltageTelemetry {
+                rail_name: "CPU Vcore".to_owned(),
+                delivered_volts: f64::from(mv) / 1000.0,
+                requested_vid: None,
+                delta_volts: None,
+                confidence: RailConfidence::VerifiedProfile,
+            }),
+            None => Section::na(NaReason::NotApplicable),
+        },
+        CpuVendor::Unknown => Section::na(NaReason::NotApplicable),
+    }
 }
 
 /// Map one vendor-branch result to a `Section`: `Ok` → `Value`,
@@ -858,6 +925,16 @@ mod tests {
                 Section::Value(16.0),
                 Section::na(NaReason::NotApplicable),
             ],
+            // The Chunk 3 vCore (the AMD branch's SMU vCore, 1150 mV,
+            // wrapped as a VerifiedProfile — exercises the `Value` arm
+            // of the new trailing field on the wire).
+            vcore: Section::Value(VoltageTelemetry {
+                rail_name: "CPU Vcore".to_owned(),
+                delivered_volts: 1.150,
+                requested_vid: None,
+                delta_volts: None,
+                confidence: RailConfidence::VerifiedProfile,
+            }),
         };
 
         let bytes = bincode::serialize(&t)
@@ -879,6 +956,7 @@ mod tests {
             platform: fixture_platform(),
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore: Section::na(NaReason::NotApplicable),
         };
         let bytes = bincode::serialize(&all_na)
             .expect("SystemMemoryTelemetry must serialize (no-panic contract)");
@@ -1462,5 +1540,156 @@ mod tests {
             ),
             other => panic!("AMD branch must stay Value: {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // (h) Chunk 3: the single vCore source of truth (vendor-dispatched).
+    // ------------------------------------------------------------------
+
+    /// (h1) The vCore promotion: an Intel box → the vCore comes from the
+    /// board-VRM readout's resolved vCore (a `HeuristicDefault` from the
+    /// synthetic `in0`); an AMD box → the vCore comes from the SMU PM-
+    /// table (`VerifiedProfile`); an unknown box → `Na`. The AMD
+    /// `vddio_mem_mv` fill-when-Na overlay is untouched by this (the
+    /// vCore is an independent field).
+    #[test]
+    fn facade_vcore_overlay_intel_and_amd() {
+        fn intel_cpu() -> CpuInfo {
+            CpuInfo {
+                vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                brand: "Intel Core i5-12600KF".to_owned(),
+            }
+        }
+        fn amd_cpu() -> CpuInfo {
+            CpuInfo {
+                vendor: CpuVendor::Amd(AmdZen::Zen3),
+                brand: "Ryzen 9 5950X".to_owned(),
+            }
+        }
+        fn unknown_cpu() -> CpuInfo {
+            CpuInfo {
+                vendor: CpuVendor::Unknown,
+                brand: "Unknown".to_owned(),
+            }
+        }
+        fn intel_err() -> TelemetryResult<IntelReadout> {
+            Err(TelemetryError::UnsupportedHardware {
+                vendor: "Intel".to_owned(),
+            })
+        }
+        fn amd_err() -> TelemetryResult<AmdReadout> {
+            Err(TelemetryError::UnsupportedHardware {
+                vendor: "AMD".to_owned(),
+            })
+        }
+
+        // Intel: the board-VRM readout carries a HeuristicDefault vCore
+        // (a synthetic in0 → 1.216 V); the facade promotes it to the
+        // snapshot root's `vcore` field.
+        let heuristic_vcore = VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.216,
+            requested_vid: None,
+            delta_volts: None,
+            confidence: RailConfidence::HeuristicDefault,
+        };
+        let board_vrm = BoardVrmReadout {
+            vddio_mem_mv: Section::na(NaReason::NotApplicable),
+            vcore_mv: Section::Value(1216),
+            soc_mv: Section::na(NaReason::NotApplicable),
+            vcore: Some(heuristic_vcore.clone()),
+        };
+        let t = assemble(
+            intel_cpu(),
+            amd_err(),
+            intel_err(),
+            Vec::new(),
+            fixture_platform(),
+            Section::na(NaReason::NotApplicable),
+            Vec::new(),
+            board_vrm,
+        );
+        assert_eq!(t.vcore, Section::Value(heuristic_vcore));
+
+        // AMD: the vCore comes from the SMU PM-table (the fixture's
+        // 1150 mV) wrapped as a VerifiedProfile.
+        let t = assemble(
+            amd_cpu(),
+            Ok(fixture_amd()),
+            intel_err(),
+            Vec::new(),
+            fixture_platform(),
+            Section::na(NaReason::NotApplicable),
+            Vec::new(),
+            BoardVrmReadout::all_na(),
+        );
+        let expected_amd = VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.150,
+            requested_vid: None,
+            delta_volts: None,
+            confidence: RailConfidence::VerifiedProfile,
+        };
+        assert_eq!(t.vcore, Section::Value(expected_amd));
+
+        // Unknown: no vendor → the vCore is an honest Na.
+        let t = assemble(
+            unknown_cpu(),
+            amd_err(),
+            intel_err(),
+            Vec::new(),
+            fixture_platform(),
+            Section::na(NaReason::NotApplicable),
+            Vec::new(),
+            BoardVrmReadout::all_na(),
+        );
+        assert_eq!(t.vcore, Section::na(NaReason::NotApplicable));
+    }
+
+    /// (h2) `vcore_section` is the single vendor-dispatch rule: Intel
+    /// reads the board readout's vCore (an all-Na readout → Na), AMD
+    /// wraps the SMU vCore, and an AMD branch with a `Na` vCore slot →
+    /// Na.
+    #[test]
+    fn vcore_section_dispatches_per_vendor() {
+        // Intel with a resolved (verified) vCore.
+        let verified = VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.216,
+            requested_vid: None,
+            delta_volts: None,
+            confidence: RailConfidence::VerifiedProfile,
+        };
+        let board_vrm = BoardVrmReadout {
+            vddio_mem_mv: Section::na(NaReason::NotApplicable),
+            vcore_mv: Section::Value(1216),
+            soc_mv: Section::na(NaReason::NotApplicable),
+            vcore: Some(verified.clone()),
+        };
+        let intel = CpuInfo {
+            vendor: CpuVendor::Intel(IntelGen::AlderLake),
+            brand: "i5-12600KF".to_owned(),
+        };
+        assert_eq!(
+            vcore_section(&intel, &Section::na(NaReason::UnsupportedHardware), &board_vrm),
+            Section::Value(verified)
+        );
+        // Intel with an all-Na board readout (enterprise / out-of-bounds)
+        // → Na.
+        assert_eq!(
+            vcore_section(&intel, &Section::na(NaReason::UnsupportedHardware), &BoardVrmReadout::all_na()),
+            Section::na(NaReason::NotApplicable)
+        );
+        // AMD with a `Na` vCore slot → Na.
+        let mut amd_na = fixture_amd();
+        amd_na.voltages.vcore_mv = Section::na(NaReason::NotApplicable);
+        let amd = CpuInfo {
+            vendor: CpuVendor::Amd(AmdZen::Zen3),
+            brand: "Ryzen 9 5950X".to_owned(),
+        };
+        assert_eq!(
+            vcore_section(&amd, &Section::Value(amd_na), &BoardVrmReadout::all_na()),
+            Section::na(NaReason::NotApplicable)
+        );
     }
 }

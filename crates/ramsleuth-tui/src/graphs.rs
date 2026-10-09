@@ -157,9 +157,10 @@ fn unix_now() -> f64 {
 ///
 /// - `t` = unix seconds now ([`unix_now`]);
 /// - `cpu_freq_mhz` = `platform.cpu_clock_mhz` (finite or NaN);
-/// - `vddcr_cpu_mv` = `amd.voltages.vcore_mv` (the C12-01 frozen
-///   field, PM table 0x0A0 — a `u16`, so a present cell is always
-///   finite), else NaN;
+/// - `vddcr_cpu_mv` = `vcore.delivered_volts × 1000` (the Chunk 3
+///   snapshot-root's `vcore` field — the vendor-aware single source of
+///   truth: Intel = the board `in0` direct VRM sense, AMD = the SMU
+///   PM-table vCore), else NaN;
 /// - `vddcr_soc_mv` = `amd.voltages.vddcr_soc_mv` (a `u16`, so a
 ///   present cell is always finite), else NaN;
 /// - `cpu_temp_c` = the passed scan value (TUI-06's
@@ -202,14 +203,12 @@ pub fn record_graph_sample(
         {
             soc = f64::from(value);
         }
-        // The C12-01 frozen Vcore field (PM table 0x0A0, board-
-        // agnostic): a `u16`, so a present cell is always finite.
-        if let Some(value) = snapshot
-            .amd
-            .value()
-            .and_then(|readout| readout.voltages.vcore_mv.value().copied())
-        {
-            vcore = f64::from(value);
+        // The Vcore (Chunk 3: the snapshot-root's `vcore` field — the
+        // vendor-aware single source of truth: Intel = the board `in0`
+        // direct VRM sense, AMD = the SMU PM-table vCore). `delivered_volts`
+        // is volts → the sample's mV.
+        if let Some(vcore_telemetry) = snapshot.vcore.value() {
+            vcore = vcore_telemetry.delivered_volts * 1000.0;
         }
     }
     // The no-hole rule: an all-NaN sample never lands in the ring.
@@ -630,7 +629,7 @@ mod tests {
     use ramsleuth_telemetry::amd_readout::{map_amd, AmdReadout};
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
-    use ramsleuth_telemetry::SystemPlatform;
+    use ramsleuth_telemetry::{RailConfidence, SystemPlatform, VoltageTelemetry};
 
     /// An AMD readout with VDDCR_SOC = `soc_mv` + Vcore =
     /// `vcore_mv` (the `u16` voltage mapping: in-band → `Value`,
@@ -700,6 +699,23 @@ mod tests {
     /// all-Na AMD branch when `None`) — every other cell Na
     /// (host-independent).
     fn snapshot(freq_mhz: Option<f64>, amd: Option<AmdReadout>) -> SystemMemoryTelemetry {
+        // The vCore (Chunk 3): derived from the AMD readout's vcore_mv
+        // (mirroring the facade's AMD promotion) so the vcore series
+        // tests see the value; an absent readout / Na vcore → Na.
+        let vcore = amd
+            .as_ref()
+            .and_then(|readout| readout.voltages.vcore_mv.value())
+            .copied()
+            .map(|mv| {
+                Section::Value(VoltageTelemetry {
+                    rail_name: "CPU Vcore".to_owned(),
+                    delivered_volts: f64::from(mv) / 1000.0,
+                    requested_vid: None,
+                    delta_volts: None,
+                    confidence: RailConfidence::VerifiedProfile,
+                })
+            })
+            .unwrap_or_else(|| Section::na(NaReason::NotApplicable));
         SystemMemoryTelemetry {
             cpu: CpuInfo {
                 vendor: CpuVendor::Amd(AmdZen::Zen3),
@@ -723,6 +739,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore,
         }
     }
 

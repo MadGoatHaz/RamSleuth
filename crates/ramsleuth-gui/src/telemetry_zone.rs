@@ -58,7 +58,7 @@ use ramsleuth_telemetry::amd_readout::{
 };
 use ramsleuth_telemetry::cpuid::CpuVendor;
 use ramsleuth_telemetry::error::{NaReason, Section};
-use ramsleuth_telemetry::SystemMemoryTelemetry;
+use ramsleuth_telemetry::{RailConfidence, SystemMemoryTelemetry, VoltageTelemetry};
 
 use crate::update::TelemetryData;
 use crate::{format_clock, ClockUnit, Units, AMBER, CYAN, NA_GRAY, SLATE};
@@ -189,6 +189,8 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<Ven
                         None,
                         false, // D-6: the AMD block omits the `gear` row
                         units,
+                        &telemetry.vcore,
+                        true,
                     ),
                     degraded: None,
                 });
@@ -203,7 +205,7 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<Ven
                 if readout.channels.is_empty() {
                     blocks.push(degraded_block(INTEL, &NaReason::NotApplicable));
                 } else {
-                    for channel in &readout.channels {
+                    for (idx, channel) in readout.channels.iter().enumerate() {
                         blocks.push(VendorTiming {
                             header: format!("{INTEL} ch {}", channel.index),
                             sections: readout_sections(
@@ -214,6 +216,11 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<Ven
                                 Some(&channel.rtl),
                                 true, // D-6: the Intel channels keep the `gear` row
                                 units,
+                                &telemetry.vcore,
+                                // The vCore is a system-level rail (the
+                                // snapshot root's `vcore` field): shown
+                                // once, on the first channel.
+                                idx == 0,
                             ),
                             degraded: None,
                         });
@@ -256,6 +263,7 @@ fn degraded_block(header: &str, reason: &NaReason) -> VendorTiming {
 /// block passes `false` and omits it (D-6). The channel-level RTL
 /// (Intel only — the frozen `TimingSet` has no slot) is appended to
 /// `[Clocks & Ratios]`.
+#[allow(clippy::too_many_arguments)] // the vCore (Chunk 3) + vcore_here are trailing params
 fn readout_sections(
     clocks: &ClockReadout,
     timings: &TimingSet,
@@ -264,6 +272,8 @@ fn readout_sections(
     rtl: Option<&Section<u16>>,
     gear_row: bool,
     units: &Units,
+    vcore: &Section<VoltageTelemetry>,
+    vcore_here: bool,
 ) -> Vec<TimingSection> {
     // The first three stored sections.
     let mut clocks_rows: Vec<(String, String)> = vec![
@@ -338,17 +348,21 @@ fn readout_sections(
         row("CKE drive", ohms(&cad_bus.cke_drv)),
     ];
 
-    // The Vcore row (C12: the C12-01 frozen additive `vcore_mv`
-    // field, SMU PM table 0x0A0 — Vcore is the primary rail) is
-    // prepended before VDDCR_SOC; on Intel it renders bare `N/A`
-    // (the `Na(NotApplicable)` cell, D-4 per-row degradation).
-    let voltage_rows: Vec<(String, String)> = vec![
-        row("VDDCR_VDD", volts(&voltages.vcore_mv)),
-        row("VDDCR_SOC", volts(&voltages.vddcr_soc_mv)),
-        row("VDDIO_MEM", volts(&voltages.vddio_mem_mv)),
-        row("VDD_MISC", volts(&voltages.vdd_misc_mv)),
-        row("VPP", volts(&voltages.vpp_mv)),
-    ];
+    // The Vcore primary rail (Chunk 3: the snapshot-root's `vcore` field
+    // — the vendor-aware single source of truth: Intel = the board `in0`
+    // direct VRM sense, AMD = the SMU PM-table vCore) is prepended before
+    // VDDCR_SOC. It is shown once per readout (the AMD block, or the
+    // first Intel channel); a heuristic reading carries the
+    // `[UNVERIFIED]` badge, an `Na` vCore renders bare `N/A` (the D-4
+    // per-row degradation).
+    let mut voltage_rows: Vec<(String, String)> = Vec::new();
+    if vcore_here {
+        voltage_rows.push(("VDDCR_VDD".to_owned(), vcore_display(vcore)));
+    }
+    voltage_rows.push(row("VDDCR_SOC", volts(&voltages.vddcr_soc_mv)));
+    voltage_rows.push(row("VDDIO_MEM", volts(&voltages.vddio_mem_mv)));
+    voltage_rows.push(row("VDD_MISC", volts(&voltages.vdd_misc_mv)));
+    voltage_rows.push(row("VPP", volts(&voltages.vpp_mv)));
 
     vec![
         TimingSection {
@@ -552,6 +566,26 @@ fn volts(section: &Section<u16>) -> String {
     }
 }
 
+/// The vendor-aware vCore display (Chunk 3, the GUI layout matrix): the
+/// snapshot-root's `vcore` field. A measured value renders at mV
+/// precision; a heuristic (vendor-fallback) reading carries the
+/// `[UNVERIFIED]` badge (the channel mapping is inferred from vendor
+/// conventions, not an exact DMI match); a verified reading renders
+/// plain. An `Na` vCore (unknown / enterprise / out-of-bounds) renders
+/// `N/A`.
+fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
+    match vcore {
+        Section::Na(_) => "N/A".to_owned(),
+        Section::Value(v) => {
+            let mut s = format!("{:.3} V", v.delivered_volts);
+            if v.confidence == RailConfidence::HeuristicDefault {
+                s.push_str(" [UNVERIFIED]");
+            }
+            s
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // The egui surface (compile-checked here; the live render is verified
 // in the QA phase).
@@ -689,10 +723,21 @@ fn render_section(
         .show(ui, |ui| {
             for (label, display) in &section.rows {
                 ui.add(egui::Label::new(egui::RichText::new(label.as_str())));
-                ui.add(egui::Label::new(
-                    egui::RichText::new(display.as_str())
-                        .color(cell_color(label.as_str(), display.as_str())),
-                ));
+                // The vCore unverified badge (Chunk 3): a heuristic
+                // (vendor-fallback) reading carries the explanatory
+                // tooltip on hover; the other rows render plain.
+                if label == "VDDCR_VDD" && display.contains("[UNVERIFIED]") {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(display.as_str()).color(AMBER))
+                            .sense(egui::Sense::hover()),
+                    )
+                    .on_hover_text(crate::style::VCORE_UNVERIFIED_TOOLTIP);
+                } else {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(display.as_str())
+                            .color(cell_color(label.as_str(), display.as_str())),
+                    ));
+                }
                 ui.end_row();
             }
         });
@@ -723,6 +768,16 @@ fn cell_color(label: &str, display: &str) -> egui::Color32 {
             {
                 Some(volts) if volts > SOC_MAX_VOLTS => AMBER,
                 _ => CYAN,
+            }
+        }
+        "VDDCR_VDD" => {
+            // The vCore (Chunk 3): a heuristic (vendor-fallback) reading
+            // with the `[UNVERIFIED]` badge is dimmed amber (measured,
+            // not a verified profile); a verified reading is CYAN.
+            if display.contains("[UNVERIFIED]") {
+                AMBER
+            } else {
+                CYAN
             }
         }
         _ => CYAN,
@@ -863,6 +918,13 @@ mod tests {
             },
             total_capacity: Section::Value(32.0),
             dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            vcore: Section::Value(VoltageTelemetry {
+                rail_name: "CPU Vcore".to_owned(),
+                delivered_volts: 1.150,
+                requested_vid: None,
+                delta_volts: None,
+                confidence: RailConfidence::VerifiedProfile,
+            }),
         }
     }
 
@@ -886,6 +948,7 @@ mod tests {
             },
             total_capacity: Section::Value(32.0),
             dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -908,6 +971,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -999,6 +1063,66 @@ mod tests {
         // `Value(1350)`, and the `volts()` formatter renders `1.350 V`.
         assert_eq!(displays(&rows, "VDDIO_MEM"), vec!["1.350 V"]);
         assert_eq!(displays(&rows, "VPP"), vec!["1.800 V"]);
+    }
+
+    /// (Chunk 3) The vendor-aware vCore row (the snapshot-root's `vcore`
+    /// field, the GUI layout matrix): a heuristic (vendor-fallback)
+    /// reading carries the `[UNVERIFIED]` badge; a verified reading
+    /// renders plain at mV precision; an `Na` vCore (unknown /
+    /// enterprise / out-of-bounds) renders bare `N/A`.
+    #[test]
+    fn vcore_row_badge_and_display() {
+        fn snapshot_with_vcore(vcore: Section<VoltageTelemetry>) -> SystemMemoryTelemetry {
+            // An Intel host with a populated (two-channel) readout: the
+            // vCore row lands on the first channel.
+            let mut t = intel_populated();
+            t.vcore = vcore;
+            t
+        }
+
+        // Heuristic (vendor-fallback) -> the `[UNVERIFIED]` badge.
+        let blocks = timing_cells(
+            &snapshot_with_vcore(Section::Value(VoltageTelemetry {
+                rail_name: "CPU Vcore".to_owned(),
+                delivered_volts: 1.216,
+                requested_vid: None,
+                delta_volts: None,
+                confidence: RailConfidence::HeuristicDefault,
+            })),
+            &Units::default(),
+        );
+        let rows = all_rows(&blocks);
+        assert_eq!(
+            displays(&rows, "VDDCR_VDD"),
+            vec!["1.216 V [UNVERIFIED]"],
+            "a heuristic vCore carries the [UNVERIFIED] badge"
+        );
+
+        // Verified -> plain (no badge), mV precision.
+        let blocks = timing_cells(
+            &snapshot_with_vcore(Section::Value(VoltageTelemetry {
+                rail_name: "CPU Vcore".to_owned(),
+                delivered_volts: 1.216,
+                requested_vid: None,
+                delta_volts: None,
+                confidence: RailConfidence::VerifiedProfile,
+            })),
+            &Units::default(),
+        );
+        let rows = all_rows(&blocks);
+        assert_eq!(
+            displays(&rows, "VDDCR_VDD"),
+            vec!["1.216 V"],
+            "a verified vCore renders plain at mV precision"
+        );
+
+        // Na (unknown / enterprise / out-of-bounds) -> bare N/A.
+        let blocks = timing_cells(
+            &snapshot_with_vcore(Section::na(NaReason::NotApplicable)),
+            &Units::default(),
+        );
+        let rows = all_rows(&blocks);
+        assert_eq!(displays(&rows, "VDDCR_VDD"), vec!["N/A"]);
     }
 
     /// (b) The fully all-Na snapshot with an `Unknown` vendor: one
@@ -1478,6 +1602,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore: Section::na(NaReason::NotApplicable),
         };
         let blocks = timing_cells(&n100, &Units::default());
         assert_eq!(blocks.len(), 1, "the Intel host renders only the Intel block (C7-14)");
@@ -1508,6 +1633,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore: Section::na(NaReason::NotApplicable),
         };
         let blocks = timing_cells(&pm, &Units::default());
         assert_eq!(blocks.len(), 1, "the AMD host renders only the AMD block (C7-14)");
@@ -1542,6 +1668,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore: Section::na(NaReason::NotApplicable),
         };
         let data = TelemetryData {
             telemetry: Some(n100),

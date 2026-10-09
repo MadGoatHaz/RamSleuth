@@ -3020,6 +3020,7 @@ mod tests {
             },
             total_capacity,
             dimm_sizes,
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -3381,6 +3382,7 @@ mod tests {
                 },
                 total_capacity: Section::na(NaReason::NotApplicable),
                 dimm_sizes: vec![Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
             }
         }
         assert_eq!(
@@ -3460,6 +3462,7 @@ mod tests {
                 },
                 total_capacity: Section::Value(16.0),
                 dimm_sizes: vec![Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
             }
         }
 
@@ -3581,6 +3584,7 @@ mod tests {
                 },
                 total_capacity: Section::Value(16.0),
                 dimm_sizes: vec![Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
             }
         }
         // The hardware mode beats the one-bound-DIMM SPD count.

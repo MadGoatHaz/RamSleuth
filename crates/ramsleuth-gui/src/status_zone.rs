@@ -523,6 +523,7 @@ mod tests {
             // module 1 density is Na, so its entry carries the offending source reason.
             total_capacity: Section::Value(16.0),
             dimm_sizes: vec![Section::Value(16.0), Section::na(NaReason::UnknownPmTableVersion)],
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -545,6 +546,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -567,6 +569,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: vec![Section::na(NaReason::UnknownPmTableVersion)],
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 

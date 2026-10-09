@@ -294,14 +294,12 @@ pub fn record_graph_sample(
         {
             soc = f64::from(value);
         }
-        // The C12-01 frozen Vcore field (PM table 0x0A0, board-
-        // agnostic): a `u16`, so a present cell is always finite.
-        if let Some(value) = snapshot
-            .amd
-            .value()
-            .and_then(|readout| readout.voltages.vcore_mv.value().copied())
-        {
-            vcore = f64::from(value);
+        // The Vcore (Chunk 3: the snapshot-root's `vcore` field — the
+        // vendor-aware single source of truth: Intel = the board `in0`
+        // direct VRM sense, AMD = the SMU PM-table vCore).
+        // `delivered_volts` is volts → the sample's mV.
+        if let Some(vcore_telemetry) = snapshot.vcore.value() {
+            vcore = vcore_telemetry.delivered_volts * 1000.0;
         }
     }
     // The no-hole rule: an all-NaN sample never lands in the ring.
@@ -1095,7 +1093,7 @@ mod tests {
     use ramsleuth_telemetry::amd_readout::map_amd;
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
-    use ramsleuth_telemetry::SystemPlatform;
+    use ramsleuth_telemetry::{RailConfidence, SystemPlatform, VoltageTelemetry};
 
     /// Approximate f32 equality (the geometry is exact for the test
     /// values, but the comparison stays robust).
@@ -1183,6 +1181,20 @@ mod tests {
     /// platform when `None`) + the given VDDCR_SOC (or an all-Na AMD
     /// readout when `None`) — every other cell Na.
     fn snapshot(freq_mhz: Option<f64>, soc_mv: Option<u16>) -> SystemMemoryTelemetry {
+        // The vCore (Chunk 3): the AMD readout's vcore_mv (1150 mV in
+        // `readout_with_soc`) → the snapshot-root's `vcore` field; an
+        // absent AMD branch → Na.
+        let vcore = soc_mv
+            .map(|_| {
+                Section::Value(VoltageTelemetry {
+                    rail_name: "CPU Vcore".to_owned(),
+                    delivered_volts: 1.150,
+                    requested_vid: None,
+                    delta_volts: None,
+                    confidence: RailConfidence::VerifiedProfile,
+                })
+            })
+            .unwrap_or_else(|| Section::na(NaReason::NotApplicable));
         SystemMemoryTelemetry {
             cpu: CpuInfo {
                 vendor: CpuVendor::Amd(AmdZen::Zen3),
@@ -1206,6 +1218,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore,
         }
     }
 
