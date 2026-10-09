@@ -366,6 +366,18 @@ mod tests {
         assert_eq!(profile_for(IntelGen::Unrecognized), None);
     }
 
+    /// The chunk-1 appended variants (Sapphire Rapids, Jasper Lake,
+    /// Lunar Lake, Core Series 1 Mobile) carry no decode profile →
+    /// honest `N/A` (research "desktop impact nil" for the mobile / Atom
+    /// / server collapse).
+    #[test]
+    fn non_profiled_appended_variants_resolve_to_none() {
+        assert_eq!(profile_for(IntelGen::SapphireRapids), None);
+        assert_eq!(profile_for(IntelGen::JasperLake), None);
+        assert_eq!(profile_for(IntelGen::LunarLake), None);
+        assert_eq!(profile_for(IntelGen::CoreSeries1Mobile), None);
+    }
+
     /// Alder Lake and Raptor Lake resolve to the shared 2-channel
     /// Tier-3 profile (IG-03): 256 KiB window, the 256 KiB alignment
     /// mask, the DDR4-default channel count, the 4×-gear register set,

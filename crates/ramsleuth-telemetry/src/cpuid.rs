@@ -9,8 +9,10 @@
 //! - Vendor string from leaf 0 (EBX ‖ EDX ‖ ECX) → "AuthenticAMD" /
 //!   "GenuineIntel" / unknown.
 //! - AMD extended family from leaf `0x80000001` → [`AmdZen`].
-//! - Intel family/model from leaf 1 → [`IntelGen`] (the brand string
-//!   disambiguates the shared `0xA5` Comet/Rocket model, OQ-10).
+//! - Intel family/model from leaf 1 → [`IntelGen`]; the brand string
+//!   resolves every model-number collision (research §2: the
+//!   `0x8E`/`0x9E`/`0xA5`/`0x97`/`0x9A`/`0xBA` marketing-generation
+//!   splits, OQ-10).
 //! - Brand string from leaves `0x80000002`–`0x80000004`.
 //!
 //! Non-`x86_64` targets compile to [`CpuVendor::Unknown`] (brand
@@ -71,6 +73,35 @@ pub enum IntelGen {
     /// is 11th gen ([`intel_gen_from_brand`]); a `0xA5` CPU without an
     /// 11th-gen brand hint stays the conservative Comet Lake bucket.
     RocketLake,
+    /// 4th gen Xeon Scalable (Sapphire Rapids, 2023) — server /
+    /// workstation (models `0x8F`).
+    ///
+    /// Appended after [`Self::RocketLake`] (OQ-10 append-only, index 12).
+    /// The coarse pre-fix table mis-bucketed `0x8F` to Coffee Lake; it
+    /// has no [`crate::intel_gen::profile_for`] entry (honest `N/A`).
+    SapphireRapids,
+    /// Jasper Lake (Atom Tremont client, 2021, models `0x9C`).
+    ///
+    /// Appended after [`Self::SapphireRapids`] (OQ-10 append-only,
+    /// index 13). The pre-fix table mis-bucketed `0x9C` to Ice Lake; it
+    /// has no [`crate::intel_gen::profile_for`] entry (honest `N/A`).
+    JasperLake,
+    /// Core Ultra 2 (Lunar Lake, 2024) — Mobile on Package (`0xBD`).
+    ///
+    /// Appended after [`Self::JasperLake`] (OQ-10 append-only, index 14).
+    /// Distinct from [`Self::ArrowLake`]: the brand string alone cannot
+    /// split the two Series-2 lines, so the model field (`0xBD`) does.
+    /// No [`crate::intel_gen::profile_for`] entry (honest `N/A`).
+    LunarLake,
+    /// Core Series 1 Mobile (non-Ultra, 2024) — the `Core N processor
+    /// NNN` refresh line on the Raptor Lake-P / Alder Lake-P dies
+    /// (`0xBA` / `0x9A`).
+    ///
+    /// Appended after [`Self::LunarLake`] (OQ-10 append-only, index 15).
+    /// Distinguished from the `iN-` legacy line by the dropped `i`
+    /// prefix + `Ultra` token; no [`crate::intel_gen::profile_for`]
+    /// entry (honest `N/A`).
+    CoreSeries1Mobile,
 }
 
 /// CPU vendor + generation. The frozen dispatch key for every provider.
@@ -265,110 +296,374 @@ fn amd_zen_from_family(family: u32, ext_family: u32) -> Option<AmdZen> {
 
 /// Map an Intel (family 6) CPUID model number to an [`IntelGen`].
 ///
-/// Best-effort table covering Skylake through Arrow Lake; P2-07 refines the
-/// per-generation IMC register offset tables. `None` → [`IntelGen::Unrecognized`].
+/// The full 8th→14th-gen / Core Ultra / Xeon / Atom `DisplayModel` table
+/// (research: "Intel CPUID Microarchitecture Mapping" §1) plus the
+/// pre-8th-gen Tier-1 line. `None` for an unlisted model →
+/// [`IntelGen::Unrecognized`] via [`intel_gen_from_brand`].
 ///
-/// **OQ (IG-10): the `0xA5` Comet Lake / Rocket Lake split is unresolved
-/// with this helper's model-only input.** Every Rocket Lake (11th-gen
-/// desktop) SKU reports model `0xA5` — the same as Comet Lake — and the
-/// hardware distinguishes the two by stepping/microcode, neither of which
-/// reaches this function (the steppings overlap, e.g. `0x2`/`0x4`; the
-/// microcode revision is an MSR, not a CPUID field). No model number is
-/// unambiguously Rocket Lake, so per the Director decision (OQ-1, option
-/// (a)) this is NOT guessed: `0xA5` keeps its pre-existing
-/// [`IntelGen::CometLake`] bucket and [`IntelGen::RocketLake`] gains no
-/// arm. Disambiguation would require plumbing stepping (and/or the CPUID
-/// brand string) into this helper — a follow-up OQ, not an IG-10 change.
+/// **This table is the *conservative* (brand-absent) assignment.** Where a
+/// `DisplayModel` collides across marketing generations (the 7th/8th/10th
+/// `0x8E`, the 7th/8th/9th `0x9E`, the 10th `0xA5`, the 12th/13th `0x97`
+/// and `0x9A`, the 13th/14th `0xB7` / `0xBA` / `0xBF`), the brand
+/// string's marketing generation breaks the tie in
+/// [`intel_gen_from_brand`] — the model table alone cannot, and
+/// deliberately does not, guess (OQ-10).
+///
+/// **ADL P/E CPUID incoherence (research §4):** pre-release Alder Lake
+/// engineering samples reported *different* Leaf 0x1 models on P-cores
+/// (`0x97`) vs. E-cores (`0xBE` / Atom `0x20`), which broke DRM.
+/// Production microcode unifies Leaf 0x1 across every thread in the socket
+/// (both core clusters report `0x97` for Alder Lake-S, `0x9A` for -P, …),
+/// so the model field this function reads is coherent on all retail
+/// silicon. The per-core native type is available on CPUID Leaf 0x1A
+/// (hybrid sub-leaf: core type `0x20` = Atom / `0x40` = Core) if a future
+/// chunk needs per-core classification — the base generation resolved here
+/// does **not** depend on it.
 fn intel_gen_from_model(model: u32) -> Option<IntelGen> {
     match model {
-        0x4F | 0x56 | 0x5E => Some(IntelGen::Skylake),
-        0x52 | 0x8E | 0x9E => Some(IntelGen::KabyLake),
-        0x8F | 0x9A | 0x9F | 0xCA | 0xCB | 0xCF | 0xD0 => Some(IntelGen::CoffeeLake),
-        // OQ (IG-10): `0xA5` is shared by Comet Lake and Rocket Lake; the
-        // split needs stepping/microcode, which this model-only helper
-        // does not receive — it keeps the conservative Comet Lake bucket.
-        0xA5 | 0xAD | 0xAF | 0xB7 | 0xC2 | 0xC5 => Some(IntelGen::CometLake),
-        0x8C | 0x92 | 0x9B | 0x9C => Some(IntelGen::IceLake),
-        0x88 | 0x97 | 0xA8 => Some(IntelGen::TigerLake),
-        0xA6 | 0xBF | 0xC0 => Some(IntelGen::AlderLake),
-        0xA7 | 0xD4 | 0xD5 => Some(IntelGen::RaptorLake),
-        0xAC | 0xAA | 0xB6 => Some(IntelGen::MeteorLake),
-        0x8A => Some(IntelGen::ArrowLake),
+        // Pre-8th / 6th-gen Tier-1 line (Skylake core; `0x52` Kaby Lake
+        // folds to Skylake — the 64 KiB IMC base is unchanged).
+        0x3F | 0x4F | 0x52 | 0x56 | 0x5E => Some(IntelGen::Skylake),
+        // 7th/8th mobile (Kaby Lake line) — brand refines (0x8E).
+        0x8E => Some(IntelGen::KabyLake),
+        // 8th/9th desktop (Coffee Lake line) + Cannon Lake 8th — brand
+        // refines (0x9E).
+        0x9E | 0x66 => Some(IntelGen::CoffeeLake),
+        // 10th Ice Lake.
+        0x7E => Some(IntelGen::IceLake),
+        // 10th Comet Lake (`0xA6` was Alder Lake → Comet Lake).
+        0xA5 | 0xAD | 0xAF | 0xA6 => Some(IntelGen::CometLake),
+        // 11th Tiger Lake (`0x8C` TGL-U was Ice Lake → Tiger Lake;
+        // `0x8D` TGL-H/B is new).
+        0x8C | 0x8D => Some(IntelGen::TigerLake),
+        // 11th Rocket Lake (was Raptor Lake).
+        0xA7 => Some(IntelGen::RocketLake),
+        // 12th Alder Lake (`0x97` ADL-S was Tiger Lake → Alder Lake [THE
+        // FIX]; `0x9A` ADL-P was Coffee Lake; `0xBE` ADL-N is new).
+        0x97 | 0x9A | 0xBE => Some(IntelGen::AlderLake),
+        // 13th/14th Raptor Lake (`0xB7` was Comet Lake; `0xBA` new;
+        // `0xBF` harvested ADL was Alder Lake).
+        0xB7 | 0xBA | 0xBF => Some(IntelGen::RaptorLake),
+        // Core Ultra 1 (Meteor Lake).
+        0xAC | 0xAA => Some(IntelGen::MeteorLake),
+        // Core Ultra 2 (Arrow Lake; removes the bogus 0x8A placeholder).
+        0xC6 | 0xC5 | 0xB5 => Some(IntelGen::ArrowLake),
+        // Core Ultra 2 Mobile-on-Package (Lunar Lake).
+        0xBD => Some(IntelGen::LunarLake),
+        // Xeon Scalable / W (Sapphire Rapids; was Coffee Lake).
+        0x8F => Some(IntelGen::SapphireRapids),
+        // Atom Tremont client (Jasper Lake; was Ice Lake).
+        0x9C => Some(IntelGen::JasperLake),
+        // ES / prototype silicon (were Ice Lake / Coffee Lake / Alder Lake).
+        0x9B | 0x9F | 0xC0 => Some(IntelGen::Unrecognized),
         _ => None,
     }
 }
 
-/// Extract the Intel marketing generation from a CPUID brand string.
+/// The platform tier a brand-string model token belongs to (research §3).
 ///
-/// The brand string carries the model number (e.g. `i7-11700K`,
-/// `i5-10500`, `W-10905`); its leading digits encode the marketing
-/// generation, a signal the CPUID model field alone does not carry.
-/// This is the general distinguishing input for model-number collisions
-/// (the shared `0xA5` Comet/Rocket case, OQ-10; wired for it by
-/// [`intel_gen_from_brand`]):
-/// - 5-digit model numbers: the first two digits (10th–14th gen,
-///   e.g. `11700` → 11, `10905` → 10);
-/// - 4-digit model numbers: the first digit, but only for Core
-///   `i3`/`i5`/`i7`/`i9` tokens (6th–9th gen, e.g. `8700` → 8) — other
-///   4-digit part numbers (Pentium `G6400`, Xeon `E-2288G`) are not
-///   generation-numbered and yield no hint.
-///
-/// Returns `None` when the brand has no dash-digit model token (AMD
-/// brands, empty strings, …) or the candidate is outside `1..=14`.
-pub fn brand_gen_hint(brand: &str) -> Option<u8> {
-    for token in brand.split_whitespace() {
-        let Some(dash) = token.find('-') else {
-            continue;
-        };
-        let rest = &token[dash + 1..];
-        let dlen = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
-        if dlen == 0 {
+/// The naming schemes a single CPUID model field cannot distinguish;
+/// [`brand_parse`] routes a brand string to exactly one of these, in the
+/// research's cascading order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrandTier {
+    /// Legacy Core `iN-NNxxx` (7th–14th gen desktop + mobile).
+    LegacyCore,
+    /// Core Ultra `N NNN[SFX]` (Series 1 Meteor Lake / Series 2 Arrow &
+    /// Lunar Lake) — the `i` prefix is dropped.
+    CoreUltra,
+    /// Non-Ultra Core Series 1 `N processor NNN[SFX]` — drops both the
+    /// `i` and the `Ultra` token.
+    CoreSeries1,
+    /// Xeon W workstation `W-NNNN`.
+    XeonW,
+    /// Xeon Scalable server `Tier NNNN` (the generation is the 2nd
+    /// digit of the 4-digit SKU).
+    XeonScalable,
+    /// Entry N-series `N100` / `N200` (no generation number).
+    NSeries,
+}
+
+/// A parsed brand-string token: marketing generation + tier + suffix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrandToken {
+    /// The marketing generation: 7–14 for the legacy / Core lines, 1–2
+    /// for the Core Ultra / Series-1 lines, `0` for the N-series (which
+    /// carries no generation number).
+    pub gen: u8,
+    /// The platform tier the token belongs to.
+    pub tier: BrandTier,
+    /// The trailing alphabetic suffix (e.g. `V` for Lunar Lake,
+    /// `H`/`HK` for mobile, `K`/`KF` for desktop). Empty when absent.
+    pub suffix: String,
+}
+
+/// Index of the first token equal to `needle` (case-insensitive).
+fn token_index(toks: &[&str], needle: &str) -> Option<usize> {
+    toks.iter().position(|t| t.eq_ignore_ascii_case(needle))
+}
+
+/// 1. Core Ultra `N NNN[SFX]` (Series 1 / 2) — e.g. `Ultra 7 155H`.
+fn parse_core_ultra(toks: &[&str]) -> Option<BrandToken> {
+    let i = token_index(toks, "Ultra")?;
+    if i + 2 >= toks.len() {
+        return None;
+    }
+    let tier = toks[i + 1].as_bytes();
+    if tier.len() != 1 || !matches!(tier[0], b'5' | b'7' | b'9') {
+        return None;
+    }
+    let sku = toks[i + 2].as_bytes();
+    if sku.len() < 3 {
+        return None;
+    }
+    let gen = sku[0] - b'0';
+    if !matches!(gen, 1 | 2) || !sku[1].is_ascii_digit() || !sku[2].is_ascii_digit() {
+        return None;
+    }
+    let suffix: String = sku[3..]
+        .iter()
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|b| *b as char)
+        .collect();
+    Some(BrandToken { gen, tier: BrandTier::CoreUltra, suffix })
+}
+
+/// 2. Non-Ultra Core Series 1 `N processor NNN[SFX]` — e.g.
+/// `Core 7 processor 150U`.
+fn parse_core_series1(toks: &[&str]) -> Option<BrandToken> {
+    let i = token_index(toks, "processor")?;
+    if i == 0 || i + 1 >= toks.len() {
+        return None;
+    }
+    let tier = toks[i - 1].as_bytes();
+    if tier.len() != 1 || !matches!(tier[0], b'3' | b'5' | b'7') {
+        return None;
+    }
+    let sku = toks[i + 1].as_bytes();
+    if sku.len() < 3 {
+        return None;
+    }
+    let gen = sku[0] - b'0';
+    if !matches!(gen, 1 | 2) || !sku[1].is_ascii_digit() || !sku[2].is_ascii_digit() {
+        return None;
+    }
+    let suffix: String = sku[3..]
+        .iter()
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|b| *b as char)
+        .collect();
+    Some(BrandToken { gen, tier: BrandTier::CoreSeries1, suffix })
+}
+
+/// 3. Legacy Core `iN-NNxxx` — e.g. `i7-11700K`, `i7-8700`, `i7-1165G7`.
+fn parse_legacy_core(toks: &[&str]) -> Option<BrandToken> {
+    for tok in toks {
+        let tb = tok.as_bytes();
+        if tb.len() < 3 || tb[0] != b'i' || !tb[1].is_ascii_digit() || tb[2] != b'-' {
             continue;
         }
-        let digits = rest.as_bytes();
-        let gen: u8 = if dlen == 5 {
-            // Two-digit marketing generation (10th–14th).
-            (digits[0] - b'0') * 10 + (digits[1] - b'0')
-        } else if dlen == 4 {
-            // Single-digit generation (6th–9th): Core i3/i5/i7/i9 only.
-            let prefix = &token[..dash];
-            let is_core_i = prefix.len() >= 2
-                && prefix.as_bytes()[prefix.len() - 2] == b'i'
-                && prefix.as_bytes()[prefix.len() - 1].is_ascii_digit();
-            if !is_core_i {
-                continue;
-            }
-            digits[0] - b'0'
-        } else {
+        let rest = &tb[3..];
+        let dlen = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        if dlen < 4 {
             continue;
+        }
+        // 5-digit SKU → two-digit marketing gen (10th–14th), e.g.
+        // `11700` → 11. A 4-digit SKU → one digit (6th–9th, e.g. `8700`
+        // → 8) UNLESS it starts with `1`, in which case it is a two-digit
+        // mobile gen (10th–14th, e.g. `1165G7` → 11, `1335U` → 13).
+        let gen: u8 = if dlen == 5 || rest[0] == b'1' {
+            (rest[0] - b'0') * 10 + (rest[1] - b'0')
+        } else {
+            rest[0] - b'0'
         };
-        return (1..=14).contains(&gen).then_some(gen);
+        let suffix: String = rest[dlen..]
+            .iter()
+            .filter(|c| c.is_ascii_alphabetic())
+            .map(|b| *b as char)
+            .collect();
+        return Some(BrandToken { gen, tier: BrandTier::LegacyCore, suffix });
     }
     None
+}
+
+/// 4. Xeon W workstation `W-NNNN` — e.g. `W-1290P` (gen = first two
+/// digits). Client-era `W-10xxx`/`W-11xxx` are 10th/11th gen; the
+/// `W-24xx`/`W-34xx` platform-tier SKUs yield `>14` and are clamped away
+/// by [`brand_gen_hint`].
+fn parse_xeon_w(toks: &[&str]) -> Option<BrandToken> {
+    for tok in toks {
+        let tb = tok.as_bytes();
+        if tb.len() < 3 || tb[0] != b'W' || tb[1] != b'-' {
+            continue;
+        }
+        let rest = &tb[2..];
+        let dlen = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        if dlen < 4 {
+            continue;
+        }
+        let gen = (rest[0] - b'0') * 10 + (rest[1] - b'0');
+        let suffix: String = rest[dlen..]
+            .iter()
+            .filter(|c| c.is_ascii_alphabetic())
+            .map(|b| *b as char)
+            .collect();
+        return Some(BrandToken { gen, tier: BrandTier::XeonW, suffix });
+    }
+    None
+}
+
+/// 5. Xeon Scalable server `Tier NNNN` — e.g. `Platinum 8480+` (gen =
+/// the 2nd digit of the 4-digit SKU).
+fn parse_xeon_scalable(toks: &[&str]) -> Option<BrandToken> {
+    let i = toks
+        .iter()
+        .position(|t| matches!(*t, "Platinum" | "Gold" | "Silver" | "Bronze"))?;
+    if i + 1 >= toks.len() {
+        return None;
+    }
+    let sku = toks[i + 1].as_bytes();
+    let dlen = sku.iter().take_while(|b| b.is_ascii_digit()).count();
+    if dlen != 4 {
+        return None;
+    }
+    let gen = sku[1] - b'0';
+    let suffix: String = sku[dlen..]
+        .iter()
+        .copied()
+        .filter(|c| c.is_ascii_alphabetic() || *c == b'+')
+        .map(char::from)
+        .collect();
+    Some(BrandToken { gen, tier: BrandTier::XeonScalable, suffix })
+}
+
+/// 6. Entry N-series `N100` / `N200` — no generation number.
+fn parse_n_series(toks: &[&str]) -> Option<BrandToken> {
+    for tok in toks {
+        let tb = tok.as_bytes();
+        if tb.len() == 4
+            && tb[0] == b'N'
+            && tb[1].is_ascii_digit()
+            && tb[2].is_ascii_digit()
+            && tb[3].is_ascii_digit()
+        {
+            return Some(BrandToken {
+                gen: 0,
+                tier: BrandTier::NSeries,
+                suffix: String::new(),
+            });
+        }
+    }
+    None
+}
+
+/// Parse a CPUID brand string into a [`BrandToken`], routing through the
+/// research §3 five-alternative cascade (Core Ultra → Core Series 1 →
+/// legacy `iN-` → Xeon W → Xeon Scalable → N-series) and returning the
+/// first match.
+///
+/// Returns `None` for engineering samples (`Intel(R) Genuine Processor`,
+/// `Intel(R) 0000`), non-Intel brands, and empty strings — never panics.
+/// Callers fall back to the model table's conservative assignment
+/// ([`intel_gen_from_brand`]).
+pub fn brand_parse(brand: &str) -> Option<BrandToken> {
+    let toks: Vec<&str> = brand.split_whitespace().collect();
+    parse_core_ultra(&toks)
+        .or_else(|| parse_core_series1(&toks))
+        .or_else(|| parse_legacy_core(&toks))
+        .or_else(|| parse_xeon_w(&toks))
+        .or_else(|| parse_xeon_scalable(&toks))
+        .or_else(|| parse_n_series(&toks))
+}
+
+/// Extract the Intel marketing generation from a CPUID brand string.
+///
+/// Thin wrapper over [`brand_parse`] (the research §3 five-alternative
+/// cascade): returns the parsed token's `gen`, clamped to `1..=14` (the
+/// N-series token carries `gen = 0` and therefore yields `None`). This is
+/// the general distinguishing input for model-number collisions (OQ-10),
+/// wired through [`intel_gen_from_brand`]:
+/// - 5-digit model numbers: the first two digits (10th–14th gen,
+///   e.g. `11700` → 11, `10905` → 10);
+/// - 4-digit model numbers: the first digit for desktop (6th–9th, e.g.
+///   `8700` → 8) or two digits when the SKU starts with `1` (10th–14th
+///   mobile, e.g. `1335U` → 13);
+/// - other 4-digit part numbers (Pentium `G6400`, Xeon `E-2288G`) and
+///   non-Intel brands carry no generation and yield no hint.
+///
+/// Returns `None` when the brand has no parseable model token or the
+/// candidate is outside `1..=14`.
+pub fn brand_gen_hint(brand: &str) -> Option<u8> {
+    brand_parse(brand).and_then(|t| (1..=14).contains(&t.gen).then_some(t.gen))
 }
 
 /// Resolve an Intel generation from the CPUID model number, with the
 /// brand string as the general distinguishing signal.
 ///
 /// [`intel_gen_from_model`] is consulted first and its result returned
-/// unchanged for every unambiguous model (the brand is ignored). The one
-/// collision the model field cannot split — `0xA5`, shared by Comet Lake
-/// (10th) and Rocket Lake (11th) (OQ-10) — is resolved by the brand
-/// string's marketing generation: an 11th-gen brand (e.g. `i7-11700K`)
-/// is Rocket Lake; any other (absent, non-Intel, 10th-gen, …) brand
-/// stays the conservative Comet Lake.
+/// unchanged for every non-colliding model (the brand is ignored). The
+/// colliding models — those whose 8-bit signature spans several marketing
+/// generations (research §2) — are resolved by the brand string's
+/// marketing generation via [`brand_parse`]:
 ///
-/// This is the general mechanism: any future model-number collision is
-/// disambiguated by adding a [`brand_gen_hint`] check here.
+/// | model | brand gen        | resolved [`IntelGen`]                 |
+/// |-------|------------------|---------------------------------------|
+/// | 0x8E  | 7 / 8 / 10 / —   | Kaby / Coffee / Comet / Kaby          |
+/// | 0x9E  | 7 / —           | Kaby / Coffee                         |
+/// | 0xA5  | 11 / —          | Rocket / Comet                        |
+/// | 0x97  | 13 / —          | Raptor / **Alder** [the i5-12600KF fix]|
+/// | 0x9A  | S1 / 13 / —     | CoreSeries1Mobile / Raptor / Alder    |
+/// | 0xBA  | S1 / —          | CoreSeries1Mobile / Raptor            |
+///
+/// (`—` = absent / unparseable brand → the model table's conservative
+/// default; `S1` = the non-Ultra Core Series-1 naming.) The remaining
+/// models (0x8C/0x8D Tiger Lake, 0xBE Alder Lake-N, 0xB7/0xBF Raptor
+/// Lake, 0x8F Sapphire Rapids, 0x9C Jasper Lake, 0x9B/0x9F/0xC0
+/// prototype) are non-colliding at this coarse granularity and keep the
+/// model table's assignment. This is the general mechanism: any future
+/// model-number collision is disambiguated by adding an arm here.
 pub fn intel_gen_from_brand(brand: &str, model: u32) -> Option<IntelGen> {
     let from_model = intel_gen_from_model(model);
-    if model == 0xA5 && from_model == Some(IntelGen::CometLake) {
-        match brand_gen_hint(brand) {
+    let tok = brand_parse(brand);
+    match model {
+        // --- Colliding models: the brand string resolves the tie ---
+        0x8E => match tok.as_ref().map(|t| t.gen) {
+            Some(7) => Some(IntelGen::KabyLake),
+            Some(8) => Some(IntelGen::CoffeeLake),
+            Some(10) => Some(IntelGen::CometLake),
+            _ => from_model, // 7th/8th-mobile default: Kaby Lake
+        },
+        0x9E => match tok.as_ref().map(|t| t.gen) {
+            Some(7) => Some(IntelGen::KabyLake),
+            _ => from_model, // 8th/9th / Xeon E default: Coffee Lake
+        },
+        0xA5 => match tok.as_ref().map(|t| t.gen) {
             Some(11) => Some(IntelGen::RocketLake),
-            _ => Some(IntelGen::CometLake),
+            _ => from_model, // 10th default: Comet Lake
+        },
+        0x97 => match tok.as_ref().map(|t| t.gen) {
+            Some(13) => Some(IntelGen::RaptorLake),
+            _ => from_model, // 12th default: Alder Lake [THE i5-12600KF FIX]
+        },
+        0x9A => {
+            if matches!(tok, Some(BrandToken { tier: BrandTier::CoreSeries1, .. })) {
+                Some(IntelGen::CoreSeries1Mobile)
+            } else {
+                match tok.as_ref().map(|t| t.gen) {
+                    Some(13) => Some(IntelGen::RaptorLake),
+                    _ => from_model, // 12th default: Alder Lake
+                }
+            }
         }
-    } else {
-        from_model
+        0xBA => {
+            if matches!(tok, Some(BrandToken { tier: BrandTier::CoreSeries1, .. })) {
+                Some(IntelGen::CoreSeries1Mobile)
+            } else {
+                from_model // 13th default: Raptor Lake
+            }
+        }
+        // --- Non-colliding models: the model table is authoritative ---
+        _ => from_model,
     }
 }
 
@@ -477,7 +772,8 @@ mod tests {
     /// append-only OQ-10 rule, byte-for-byte.
     #[test]
     fn intel_gen_bincode_byte_pinning_oq10() {
-        let pre_existing: [(IntelGen, u32); 11] = [
+        // Indices 0-11 are byte-pinned and must not shift (OQ-10).
+        let pre_existing: [(IntelGen, u32); 12] = [
             (IntelGen::Skylake, 0),
             (IntelGen::KabyLake, 1),
             (IntelGen::CoffeeLake, 2),
@@ -489,6 +785,7 @@ mod tests {
             (IntelGen::MeteorLake, 8),
             (IntelGen::ArrowLake, 9),
             (IntelGen::Unrecognized, 10),
+            (IntelGen::RocketLake, 11),
         ];
         for (gen, expected) in pre_existing {
             let bytes =
@@ -499,10 +796,23 @@ mod tests {
                 "{gen:?} wire encoding must be unchanged (OQ-10)"
             );
         }
-        // The appended variant occupies the next discriminant only.
-        let bytes = bincode::serialize(&IntelGen::RocketLake)
-            .expect("IntelGen::RocketLake must serialize (OQ-10 pin)");
-        assert_eq!(bytes, 11u32.to_le_bytes().to_vec());
+        // The chunk-1 appended variants occupy the next discriminants only
+        // (12-15) — the append-only OQ-10 rule, byte-for-byte.
+        let appended: [(IntelGen, u32); 4] = [
+            (IntelGen::SapphireRapids, 12),
+            (IntelGen::JasperLake, 13),
+            (IntelGen::LunarLake, 14),
+            (IntelGen::CoreSeries1Mobile, 15),
+        ];
+        for (gen, expected) in appended {
+            let bytes =
+                bincode::serialize(&gen).expect("IntelGen must serialize (OQ-10 pin)");
+            assert_eq!(
+                bytes,
+                expected.to_le_bytes().to_vec(),
+                "{gen:?} appended wire encoding (OQ-10)"
+            );
+        }
     }
 
     /// (f) The pre-existing model → generation table is pinned
@@ -511,42 +821,54 @@ mod tests {
     #[test]
     fn intel_gen_from_model_full_table() {
         let table: &[(u32, IntelGen)] = &[
+            // Pre-8th / 6th-gen Tier-1 line.
+            (0x3F, IntelGen::Skylake),
             (0x4F, IntelGen::Skylake),
+            (0x52, IntelGen::Skylake),
             (0x56, IntelGen::Skylake),
             (0x5E, IntelGen::Skylake),
-            (0x52, IntelGen::KabyLake),
+            // 7th/8th mobile.
             (0x8E, IntelGen::KabyLake),
-            (0x9E, IntelGen::KabyLake),
-            (0x8F, IntelGen::CoffeeLake),
-            (0x9A, IntelGen::CoffeeLake),
-            (0x9F, IntelGen::CoffeeLake),
-            (0xCA, IntelGen::CoffeeLake),
-            (0xCB, IntelGen::CoffeeLake),
-            (0xCF, IntelGen::CoffeeLake),
-            (0xD0, IntelGen::CoffeeLake),
+            // 8th/9th desktop + Cannon Lake 8th.
+            (0x9E, IntelGen::CoffeeLake),
+            (0x66, IntelGen::CoffeeLake),
+            // 10th Ice Lake.
+            (0x7E, IntelGen::IceLake),
+            // 10th Comet Lake.
             (0xA5, IntelGen::CometLake),
             (0xAD, IntelGen::CometLake),
             (0xAF, IntelGen::CometLake),
-            (0xB7, IntelGen::CometLake),
-            (0xC2, IntelGen::CometLake),
-            (0xC5, IntelGen::CometLake),
-            (0x8C, IntelGen::IceLake),
-            (0x92, IntelGen::IceLake),
-            (0x9B, IntelGen::IceLake),
-            (0x9C, IntelGen::IceLake),
-            (0x88, IntelGen::TigerLake),
-            (0x97, IntelGen::TigerLake),
-            (0xA8, IntelGen::TigerLake),
-            (0xA6, IntelGen::AlderLake),
-            (0xBF, IntelGen::AlderLake),
-            (0xC0, IntelGen::AlderLake),
-            (0xA7, IntelGen::RaptorLake),
-            (0xD4, IntelGen::RaptorLake),
-            (0xD5, IntelGen::RaptorLake),
+            (0xA6, IntelGen::CometLake),
+            // 11th Tiger Lake.
+            (0x8C, IntelGen::TigerLake),
+            (0x8D, IntelGen::TigerLake),
+            // 11th Rocket Lake.
+            (0xA7, IntelGen::RocketLake),
+            // 12th Alder Lake (0x97 = THE i5-12600KF FIX).
+            (0x97, IntelGen::AlderLake),
+            (0x9A, IntelGen::AlderLake),
+            (0xBE, IntelGen::AlderLake),
+            // 13th/14th Raptor Lake.
+            (0xB7, IntelGen::RaptorLake),
+            (0xBA, IntelGen::RaptorLake),
+            (0xBF, IntelGen::RaptorLake),
+            // Core Ultra 1 (Meteor Lake).
             (0xAC, IntelGen::MeteorLake),
             (0xAA, IntelGen::MeteorLake),
-            (0xB6, IntelGen::MeteorLake),
-            (0x8A, IntelGen::ArrowLake),
+            // Core Ultra 2 (Arrow Lake).
+            (0xC6, IntelGen::ArrowLake),
+            (0xC5, IntelGen::ArrowLake),
+            (0xB5, IntelGen::ArrowLake),
+            // Core Ultra 2 MoP (Lunar Lake).
+            (0xBD, IntelGen::LunarLake),
+            // Xeon SP / W (Sapphire Rapids).
+            (0x8F, IntelGen::SapphireRapids),
+            // Atom Tremont client (Jasper Lake).
+            (0x9C, IntelGen::JasperLake),
+            // ES / prototype silicon.
+            (0x9B, IntelGen::Unrecognized),
+            (0x9F, IntelGen::Unrecognized),
+            (0xC0, IntelGen::Unrecognized),
         ];
         for &(model, gen) in table {
             assert_eq!(
@@ -555,7 +877,7 @@ mod tests {
                 "model {model:#04x} bucket moved"
             );
         }
-        // No widening: unlisted models stay unrecognized.
+        // No widening: unlisted models stay None.
         assert_eq!(intel_gen_from_model(0x00), None);
         assert_eq!(intel_gen_from_model(0xFF), None);
     }
@@ -571,19 +893,24 @@ mod tests {
     /// 11th-gen marketing generation, now plumbed into `detect()`), not
     /// via this model-only function, which stays unchanged below.
     #[test]
-    fn rocket_lake_oq_0xa5_split_unresolvable_from_model() {
-        // Conservative: the shared model keeps its pre-existing bucket.
+    fn rocket_lake_model_and_0xa5_split() {
+        // 0xA7 is now the model-only Rocket Lake (11th-gen desktop).
+        assert_eq!(intel_gen_from_model(0xA7), Some(IntelGen::RocketLake));
+        // The shared 0xA5 keeps its conservative Comet Lake bucket at the
+        // model level; the brand string resolves it in
+        // `intel_gen_from_brand` (11th-gen → Rocket Lake).
         assert_eq!(intel_gen_from_model(0xA5), Some(IntelGen::CometLake));
-        // Coffee Lake is never mislabeled Rocket Lake.
-        assert_eq!(intel_gen_from_model(0x9A), Some(IntelGen::CoffeeLake));
-        // No model number is unambiguously Rocket Lake, so no 8-bit CPUID
-        // model value maps to [`IntelGen::RocketLake`] (exhaustive over
-        // the model field); the variant stays unreachable through this
-        // model-only function — since IG-15 `detect()` resolves the
-        // shared `0xA5` via `intel_gen_from_brand` (the brand string),
-        // not via this one.
+        // Sweep: the ONLY model that maps to Rocket Lake is 0xA7.
         for m in 0..=0xFFu32 {
-            assert_ne!(intel_gen_from_model(m), Some(IntelGen::RocketLake));
+            if m == 0xA7 {
+                assert_eq!(intel_gen_from_model(m), Some(IntelGen::RocketLake));
+            } else {
+                assert_ne!(
+                    intel_gen_from_model(m),
+                    Some(IntelGen::RocketLake),
+                    "model {m:#04x} should not be Rocket Lake"
+                );
+            }
         }
     }
 
@@ -622,41 +949,231 @@ mod tests {
         assert_eq!(brand_gen_hint("i7-8700"), Some(8));
     }
 
-    /// (i) `intel_gen_from_brand` (IG-14): the general
-    /// distinguishing-signal resolver — the model number always wins for
-    /// unambiguous models; only the shared `0xA5` consults the brand.
+    /// (i) `intel_gen_from_brand`: the general distinguishing-signal
+    /// resolver — the model number always wins for non-colliding models;
+    /// the colliding models (research §2) are split by the brand
+    /// string's marketing generation.
     #[test]
-    fn intel_gen_from_brand_resolves_the_shared_0xa5() {
-        // 0xA5 + 11th-gen brand → Rocket Lake.
+    fn intel_gen_from_brand_resolves_all_collisions() {
+        // 0x97 [THE i5-12600KF FIX]: 12th-gen brand → Alder Lake.
         assert_eq!(
-            intel_gen_from_brand("i7-11700K", 0xA5),
-            Some(IntelGen::RocketLake)
-        );
-        // 0xA5 + 10th-gen brand → Comet Lake.
-        assert_eq!(
-            intel_gen_from_brand("i7-10700", 0xA5),
-            Some(IntelGen::CometLake)
-        );
-        // 0xA5 + empty brand → conservative Comet Lake default.
-        assert_eq!(
-            intel_gen_from_brand("", 0xA5),
-            Some(IntelGen::CometLake)
-        );
-        // 0xA5 + non-Intel brand → conservative Comet Lake default.
-        assert_eq!(
-            intel_gen_from_brand("AMD Ryzen 9 5950X", 0xA5),
-            Some(IntelGen::CometLake)
-        );
-        // Unambiguous models: the brand is ignored, the model wins.
-        assert_eq!(
-            intel_gen_from_brand("i7-11700K", 0xA6),
+            intel_gen_from_brand("Intel(R) Core(TM) i5-12600KF CPU @ 3.70GHz", 0x97),
             Some(IntelGen::AlderLake)
         );
+        // 0x97 + 13th-gen brand (rebadged ADL) → Raptor Lake.
         assert_eq!(
-            intel_gen_from_brand("i7-11700K", 0x9A),
+            intel_gen_from_brand("Intel(R) Core(TM) i5-13400 CPU @ 2.50GHz", 0x97),
+            Some(IntelGen::RaptorLake)
+        );
+        // 0x97 + empty / non-Intel brand → conservative Alder Lake.
+        assert_eq!(intel_gen_from_brand("", 0x97), Some(IntelGen::AlderLake));
+        assert_eq!(
+            intel_gen_from_brand("AMD Ryzen 9 5950X", 0x97),
+            Some(IntelGen::AlderLake)
+        );
+        // Genuine Tiger Lake (0x8C) with an 11th-gen mobile brand.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i7-11800H CPU @ 1.90GHz", 0x8C),
+            Some(IntelGen::TigerLake)
+        );
+        // 0x8D (Tiger Lake-H / -B, incl. the "KB" desktop BGA) → Tiger Lake.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i9-11900KB", 0x8D),
+            Some(IntelGen::TigerLake)
+        );
+        // 0xA5: 11th-gen → Rocket Lake; 10th-gen / absent → Comet Lake.
+        assert_eq!(intel_gen_from_brand("i7-11700K", 0xA5), Some(IntelGen::RocketLake));
+        assert_eq!(intel_gen_from_brand("i7-10700", 0xA5), Some(IntelGen::CometLake));
+        assert_eq!(intel_gen_from_brand("", 0xA5), Some(IntelGen::CometLake));
+        // 0xB7: 13th and 14th gen both → Raptor Lake (the coarse enum has
+        // no distinct refresh variant).
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i7-13700K", 0xB7),
+            Some(IntelGen::RaptorLake)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i7-14700K", 0xB7),
+            Some(IntelGen::RaptorLake)
+        );
+        // 0xBF: harvested ADL → Raptor Lake (13th and 14th).
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i5-13400F", 0xBF),
+            Some(IntelGen::RaptorLake)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i5-14400", 0xBF),
+            Some(IntelGen::RaptorLake)
+        );
+        // 0x9A: Series-1 → CoreSeries1Mobile; 13th → Raptor Lake;
+        // 12th → Alder Lake.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) 3 processor 100U", 0x9A),
+            Some(IntelGen::CoreSeries1Mobile)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i5-1335U", 0x9A),
+            Some(IntelGen::RaptorLake)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i5-1240P", 0x9A),
+            Some(IntelGen::AlderLake)
+        );
+        // 0xBA: Series-1 → CoreSeries1Mobile; else → Raptor Lake.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) 7 processor 150U", 0xBA),
+            Some(IntelGen::CoreSeries1Mobile)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i7-13700H", 0xBA),
+            Some(IntelGen::RaptorLake)
+        );
+        // 0x8E: 7th → Kaby Lake; 8th → Coffee Lake; 10th → Comet Lake.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i5-7200U", 0x8E),
+            Some(IntelGen::KabyLake)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i5-8250U", 0x8E),
             Some(IntelGen::CoffeeLake)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i5-10210U", 0x8E),
+            Some(IntelGen::CometLake)
+        );
+        // 0x9E: 7th → Kaby Lake; 8th/9th → Coffee Lake.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i7-7700", 0x9E),
+            Some(IntelGen::KabyLake)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i7-8700K", 0x9E),
+            Some(IntelGen::CoffeeLake)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i9-9900K", 0x9E),
+            Some(IntelGen::CoffeeLake)
+        );
+        // Non-colliding models: the brand is ignored, the model wins.
+        assert_eq!(
+            intel_gen_from_brand("i7-11700K", 0x8F),
+            Some(IntelGen::SapphireRapids)
+        );
+        assert_eq!(
+            intel_gen_from_brand("i7-11700K", 0x9C),
+            Some(IntelGen::JasperLake)
+        );
+        assert_eq!(
+            intel_gen_from_brand("i7-11700K", 0xBD),
+            Some(IntelGen::LunarLake)
+        );
+        assert_eq!(intel_gen_from_brand("i7-11700K", 0xBE), Some(IntelGen::AlderLake));
+        // ES / prototype → Unrecognized.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Genuine Processor", 0x9B),
+            Some(IntelGen::Unrecognized)
         );
         // Unlisted model → None regardless of brand.
         assert_eq!(intel_gen_from_brand("i7-11700K", 0x00), None);
+    }
+
+    /// The reference device: an i5-12600KF (model `0x97`, Alder Lake
+    /// brand) resolves to Alder Lake — which HAS a `profile_for` entry, so
+    /// the Intel branch no longer degrades to `Na(UnsupportedHardware)`.
+    #[test]
+    fn i5_12600kf_resolves_to_alder_lake() {
+        let gen = intel_gen_from_brand("Intel(R) Core(TM) i5-12600KF CPU @ 3.70GHz", 0x97);
+        assert_eq!(gen, Some(IntelGen::AlderLake));
+        // The branch-un-N/A proof: Alder Lake has a decode profile.
+        assert!(crate::intel_gen::profile_for(IntelGen::AlderLake).is_some());
+    }
+
+    /// `brand_parse` (research §3): one case per naming scheme, plus the
+    /// Series-2 Arrow/Lunar `V`-suffix split and the ES / non-Intel /
+    /// empty no-match cases (never panics).
+    #[test]
+    fn brand_parse_five_alternatives() {
+        // Core Ultra Series 1 (Meteor Lake): gen 1.
+        let t = brand_parse("Intel(R) Core(TM) Ultra 7 155H").unwrap();
+        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::CoreUltra, 1, "H"));
+        // Core Ultra Series 2 (Arrow Lake): gen 2, K suffix.
+        let t = brand_parse("Intel(R) Core(TM) Ultra 9 285K").unwrap();
+        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::CoreUltra, 2, "K"));
+        // Core Ultra Series 2 (Lunar Lake): gen 2, V suffix (MoP).
+        let t = brand_parse("Intel(R) Core(TM) Ultra 7 258V").unwrap();
+        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::CoreUltra, 2, "V"));
+        // Non-Ultra Core Series 1: gen 1.
+        let t = brand_parse("Intel(R) Core(TM) 7 processor 150U").unwrap();
+        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::CoreSeries1, 1, "U"));
+        // Legacy Core iN-NNxxx: 5-digit → two-digit gen.
+        let t = brand_parse("Intel(R) Core(TM) i7-11700K CPU @ 3.60GHz").unwrap();
+        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::LegacyCore, 11, "K"));
+        // Legacy 4-digit desktop → single-digit gen.
+        let t = brand_parse("Intel(R) Core(TM) i7-8700").unwrap();
+        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::LegacyCore, 8, ""));
+        // Legacy 4-digit mobile (starts with 1) → two-digit gen.
+        let t = brand_parse("Intel(R) Core(TM) i5-1335U").unwrap();
+        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::LegacyCore, 13, "U"));
+        // Xeon W workstation (gen = first two digits).
+        let t = brand_parse("Intel(R) Xeon(R) W-1290P CPU @ 3.70GHz").unwrap();
+        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::XeonW, 12, "P"));
+        // Xeon Scalable server (gen = 2nd digit).
+        let t = brand_parse("Intel(R) Xeon(R) Platinum 8480+ CPU").unwrap();
+        assert_eq!((t.tier, t.gen), (BrandTier::XeonScalable, 4));
+        // Entry N-series (no generation number).
+        let t = brand_parse("Intel(R) Processor N100").unwrap();
+        assert_eq!((t.tier, t.gen), (BrandTier::NSeries, 0));
+        // ES / non-Intel / empty → None (no panic).
+        assert_eq!(brand_parse("Intel(R) Genuine Processor"), None);
+        assert_eq!(brand_parse("Intel(R) 0000 @ 2.10GHz"), None);
+        assert_eq!(brand_parse("AMD Ryzen 9 5950X"), None);
+        assert_eq!(brand_parse(""), None);
+    }
+
+    /// Every collision model with an empty (unparseable) brand keeps its
+    /// conservative model-table fallback — never `None` for a listed
+    /// model, never a panic.
+    #[test]
+    fn collisions_with_empty_brand_keep_conservative_fallback() {
+        assert_eq!(intel_gen_from_brand("", 0x8E), Some(IntelGen::KabyLake));
+        assert_eq!(intel_gen_from_brand("", 0x9E), Some(IntelGen::CoffeeLake));
+        assert_eq!(intel_gen_from_brand("", 0xA5), Some(IntelGen::CometLake));
+        assert_eq!(intel_gen_from_brand("", 0x97), Some(IntelGen::AlderLake));
+        assert_eq!(intel_gen_from_brand("", 0x9A), Some(IntelGen::AlderLake));
+        assert_eq!(intel_gen_from_brand("", 0xB7), Some(IntelGen::RaptorLake));
+        assert_eq!(intel_gen_from_brand("", 0xBA), Some(IntelGen::RaptorLake));
+        assert_eq!(intel_gen_from_brand("", 0xBF), Some(IntelGen::RaptorLake));
+        // Non-colliding models are unaffected by the (empty) brand.
+        assert_eq!(intel_gen_from_brand("", 0x8C), Some(IntelGen::TigerLake));
+        assert_eq!(intel_gen_from_brand("", 0x8D), Some(IntelGen::TigerLake));
+        assert_eq!(intel_gen_from_brand("", 0xBE), Some(IntelGen::AlderLake));
+        assert_eq!(intel_gen_from_brand("", 0x8F), Some(IntelGen::SapphireRapids));
+        assert_eq!(intel_gen_from_brand("", 0x9C), Some(IntelGen::JasperLake));
+        assert_eq!(intel_gen_from_brand("", 0xBD), Some(IntelGen::LunarLake));
+        assert_eq!(intel_gen_from_brand("", 0x9B), Some(IntelGen::Unrecognized));
+        assert_eq!(intel_gen_from_brand("", 0x9F), Some(IntelGen::Unrecognized));
+        assert_eq!(intel_gen_from_brand("", 0xC0), Some(IntelGen::Unrecognized));
+    }
+
+    /// Exhaustive sweep: every 8-bit model value through both resolvers,
+    /// across a representative brand set, never panics.
+    #[test]
+    fn full_model_sweep_no_panic() {
+        let brands = [
+            "",
+            "Intel(R) Core(TM) i5-12600KF CPU @ 3.70GHz",
+            "Intel(R) Core(TM) Ultra 7 155H",
+            "Intel(R) Core(TM) 7 processor 150U",
+            "Intel(R) Xeon(R) W-1290P CPU @ 3.70GHz",
+            "Intel(R) Xeon(R) Platinum 8480+ CPU",
+            "Intel(R) Processor N100",
+            "Intel(R) Genuine Processor",
+            "AMD Ryzen 9 5950X",
+        ];
+        for m in 0u32..=0xFF {
+            let _ = intel_gen_from_model(m);
+            for brand in brands {
+                let _ = intel_gen_from_brand(brand, m);
+            }
+        }
     }
 }
