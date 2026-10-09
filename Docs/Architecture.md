@@ -1239,7 +1239,7 @@ of the daemon keeps serving.
 
 ### 10.3 The Intel path — the `ramsleuth_intel` module, with the `/dev/mem` MCHBAR fallback
 
-**CPU generation resolution — the full collision-set disambiguation (Chunk 1).** The Intel branch keys every decode on `IntelGen`, resolved by `CpuInfo::detect()` from CPUID leaf 1. A model number **alone** is not a safe generation key: several retail parts share one `0x1` model field across marketing generations (the `0x8E` / `0x9E` / `0xA5` / `0x97` / `0x9A` / `0xBA` / `0xBF` collision set). The pre-Chunk-1 table was model-only and mis-bucketed the collision members — most consequentially `0x97` (Alder Lake-S, the i5-12600KF reference part) as **Tiger Lake**, which has no IMC decode profile and so degraded the whole Intel readout to `Na(UnsupportedHardware)`. The fix resolves every collision against the CPUID **brand string's marketing generation** (`intel_gen_from_brand`): the model table is the conservative base, and for a colliding model the brand's generation token decides — `0x97` + a 13th-gen brand → Raptor Lake, `0x97` + a 12th-gen or absent brand → Alder Lake (the i5-12600KF fix), `0xA5` + an 11th-gen brand → Rocket Lake, a Core-Ultra-Series-1 token on `0x9A` / `0xBA` → Core Series 1 Mobile, and so on; every **non-colliding** model stays model-authoritative. `IntelGen` is **append-only and wire-pinned to indices 0–15**: the original 0–10 (Skylake → Arrow Lake + `Unrecognized`) are byte-pinned, and Rocket Lake / Sapphire Rapids / Jasper Lake / Lunar Lake / Core Series 1 Mobile were **appended** at 11–15, so the frozen wire encoding is never reordered. An unlisted model, or an engineering-sample / non-Intel brand, degrades to `Unrecognized`, and `detect()` never panics.
+**CPU generation resolution — the full collision-set disambiguation (Chunk 1).** The Intel branch keys every decode on `IntelGen`, resolved by `CpuInfo::detect()` from CPUID leaf 1. A model number **alone** is not a safe generation key: several retail parts share one `0x1` model field across marketing generations (the `0x8E` / `0x9E` / `0xA5` / `0x97` / `0x9A` / `0xBA` collision set — the model numbers that span two marketing generations; `0xB7` / `0xBF` Raptor Lake are non-colliding and stay model-authoritative). The pre-Chunk-1 table was model-only and mis-bucketed the collision members — most consequentially `0x97` (Alder Lake-S, the i5-12600KF reference part) as **Tiger Lake**, which has no IMC decode profile and so degraded the whole Intel readout to `Na(UnsupportedHardware)`. The fix resolves every collision against the CPUID **brand string's marketing generation** (`intel_gen_from_brand`): the model table is the conservative base, and for a colliding model the brand's generation token decides — `0x97` + a 13th-gen brand → Raptor Lake, `0x97` + a 12th-gen or absent brand → Alder Lake (the i5-12600KF fix), `0xA5` + an 11th-gen brand → Rocket Lake, a Core-Ultra-Series-1 token on `0x9A` / `0xBA` → Core Series 1 Mobile, and so on; every **non-colliding** model stays model-authoritative. `IntelGen` is **append-only and wire-pinned to indices 0–15**: the original 0–10 (Skylake → Arrow Lake + `Unrecognized`) are byte-pinned, and Rocket Lake / Sapphire Rapids / Jasper Lake / Lunar Lake / Core Series 1 Mobile were **appended** at 11–15, so the frozen wire encoding is never reordered. An unlisted model, or an engineering-sample / non-Intel brand, degrades to `Unrecognized`, and `detect()` never panics.
 
 **MCHBAR, raw-exposes / Rust-decodes, two sources.** The branch is
 vendor-gated on `CpuInfo::detect()` — **on AMD hosts this gate is the entire
@@ -1251,12 +1251,13 @@ feed **one** pure decode core:
    own original work — no upstream project, no pin — in the in-repo
    `kernel/ramsleuth-intel/` tree; provisioned from the source bundled by
    the main AUR packages — or by the standalone `ramsleuth-intel-dkms`
-   extra, §12.5). It probes the host bridge at PCI `0000:00:00.0`, decodes
-   the MCHBAR from config space, `ioremap`s the **profile-sized window**
-   (64 KiB for Tier 1 / Rocket Lake; 256 KiB on the Tier-3 Alder family —
-   selected in-kernel by the OQ-14 device-ID table, which ships empty, so
-   every released build maps 64 KiB), and publishes
-   the raw IMC registers as **25 world-readable (`0444`) sysfs attributes**
+    extra, §12.5). It probes the host bridge at PCI `0000:00:00.0`, decodes
+   the MCHBAR from config space, `ioremap`s the **generation-keyed window**
+   (64 KiB for Tier 1 / Rocket Lake; 256 KiB on the 12th-gen+ family —
+   selected in-kernel from the CPU model the module computes via
+   `cpuid_eax(1)`, the same 12th-gen+ set the userspace decode keys on),
+   and publishes
+    the raw IMC registers as **25 world-readable (`0444`) sysfs attributes**
    under `/sys/kernel/ramsleuth_intel/` — the 19 IMC-register attributes
    (the 2 MCHBAR diagnostics, `MC_BIOS_REQ`, and the 16 per-channel `TC_*`)
    plus the 5 MAD channel/geometry registers (`0x5000`–`0x5010`) plus the

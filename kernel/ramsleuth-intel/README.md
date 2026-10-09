@@ -12,14 +12,19 @@ the `/dev/mem` fallback path remains available where unblocked.
 ## What it is
 
 A read-only out-of-tree module. It maps the Intel host-bridge MCHBAR window
-and exposes the raw IMC/MAD/capability registers as sysfs. The module is
-generation-agnostic (raw words only); all decode (channel mode, ECC,
-subtimings) happens in userspace.
+and exposes the raw IMC/MAD/capability registers as sysfs. The module
+publishes **raw words only** — all decode (channel mode, ECC, subtimings)
+happens in userspace — and it is **generation-aware only at the probe
+level**: the mapped window size and the MAD register base are keyed on the
+CPU generation (see "When it loads" below), so one module spans the
+supported client generations. It requires **Linux ≥ 5.13** (its gen-keyed
+selection includes `<asm/cpuid/api.h>` — see "Building + installing").
 
-The 24 raw register attributes each emit the 32-bit register exactly as read
-— one line, `0x%08x`, little-endian — plus two MCHBAR diagnostic attributes
-and `capid0a` (below). Nothing is ever written to the register space (read-
-only `ioread32`), so the module is safe to load on any Intel client host.
+The raw register attributes each emit the 32-bit register exactly as read
+— one line, `0x%08x`, little-endian — plus the two MCHBAR diagnostic
+attributes and `capid0a` (25 total, listed below). Nothing is ever written
+to the register space (read-only `ioread32`), so the module is safe to load
+on any Intel client host.
 
 ## When it loads (probe sequence)
 
@@ -35,9 +40,19 @@ succeed**; every failure path unmaps/drops refs and leaves no kobject:
    64-byte-truncated).
 4. **Vendor gate**: `vendor == 0x8086` (Intel-only by design; the module
    loads a no-op on AMD — `-ENODEV`, which is expected and correct).
-5. **Window size**: 256 KiB only for device IDs in `tier3_device_ids[]` —
-   a table that ships **empty** (OQ-14), so **every released build maps the
-   default 64 KiB**.
+5. **Window size + IMC base (gen-keyed)**: the module computes the effective
+   8-bit CPU model from `cpuid_eax(1)` (`(ext << 4) | base`, the SDM rule —
+   the same computation the userspace `cpuid.rs` performs) and keys both the
+   mapped window and the MAD register base on it: **12th-gen+** (Alder /
+   Raptor / Meteor / Arrow / Lunar Lake — `is_12th_gen_plus`) → the
+   **256 KiB** window, with the five global MAD channel/geometry registers
+   read at `MCHBAR + 0xd800`; everything else (6th–11th gen) → the
+   **64 KiB** window and `MCHBAR + 0x5000`. (The pre-fix module read
+   `0x5000` on *every* box, so a 12th-gen+ host's MAD registers were
+   unmapped — `0x0` / `0xFFFF_FFFF` — and the channel mode misreported;
+   this is the fix. The base is *not* keyed on the PCI Device-ID: the
+   research Device-ID ranges overlap across generations and are not
+   per-generation, so the CPU model is the unambiguous key.)
 6. **Require `MCHBAR_EN`** (bit 0 of the raw value) set and a nonzero base
    (`raw & 0x7FFFFFF000`, bits 38:16, 64 KiB-aligned); a zero base means
    unpopulated/virtualized → `-ENODEV`.
@@ -81,12 +96,18 @@ are stable):
   - Units = integer DRAM clock cycles. **tRC has no register — userspace
     synthesizes tRC = tRAS + tRP.**
 - `mad_inter_channel` / `mad_intra_ch0` / `mad_intra_ch1` / `mad_dimm_ch0`
-  / `mad_dimm_ch1` @ `+0x5000..+0x5010` (MAD block).
-  **MAD_INTER_CHANNEL**: `[1:0]` channel config (00 dual-symmetric / 01
-  dual-flex / 10 single / 11 reserved), `[2]` CH_L_MAP, `[7:4]`
-  HASH_LSB_MASK. **MAD_DIMM_CH0/1**: slot-size words (DIMM0 = bits `[5:0]`,
-  DIMM1 = bits `[21:16]`, 1 GiB index). Feed the userspace channel-mode
-  population cross-check.
+  / `mad_dimm_ch1` @ the gen-keyed IMC base + `0x00/0x04/0x08/0x0C/0x10`
+  (`MCHBAR + 0x5000` on 6th–11th gen, `MCHBAR + 0xd800` on the 12th-gen+
+  family — step 5).
+  **MAD_INTER_CHANNEL**: `[2:0]` is the **DDR_TYPE** memory-technology field
+  (userspace decodes `000`=DDR4, `001`=DDR3/3L, `010`=LPDDR4, `011`=LPDDR5,
+  `100`=DDR5) — it is **not** a channel-mode selector. **MAD_DIMM_CH0/1**:
+  per-channel slot-size words — `DIMM_L_SIZE` at bits `[6:0]` +
+  `DIMM_S_SIZE` at bits `[22:16]`, each a **7-bit index in 0.5 GiB
+  increments** (a 16 GiB DIMM is index `32` = `32 × 0.5`); a slot index of
+  `0` means unpopulated. Userspace sums the two slots per channel and derives
+  the channel mode from the resulting capacity (the 4-tier trust
+  cross-check), not from a firmware mode bit.
 - `capid0a` — host-bridge **CONFIG** offset `0xE4` (CAPID0_A), read
   in-kernel via `pci_read_config_dword` (because `/sys/.../config` is
   64-byte-truncated). Bit 17 = `ECC_DIS` (set → Not Capable, clear →
@@ -113,11 +134,11 @@ are stable):
 | `ch1_tc_rdwr` | MCHBAR + `0x4424` | `0x%08x` |
 | `ch1_tc_wrrd` | MCHBAR + `0x4428` | `0x%08x` |
 | `ch1_tc_wrwr` | MCHBAR + `0x442C` | `0x%08x` |
-| `mad_inter_channel` | MCHBAR + `0x5000` | `0x%08x` |
-| `mad_intra_ch0` | MCHBAR + `0x5004` | `0x%08x` |
-| `mad_intra_ch1` | MCHBAR + `0x5008` | `0x%08x` |
-| `mad_dimm_ch0` | MCHBAR + `0x500C` | `0x%08x` |
-| `mad_dimm_ch1` | MCHBAR + `0x5010` | `0x%08x` |
+| `mad_inter_channel` | MCHBAR + IMC base + `0x00` (base `0x5000` 6th–11th gen / `0xd800` 12th-gen+) | `0x%08x` |
+| `mad_intra_ch0` | MCHBAR + IMC base + `0x04` | `0x%08x` |
+| `mad_intra_ch1` | MCHBAR + IMC base + `0x08` | `0x%08x` |
+| `mad_dimm_ch0` | MCHBAR + IMC base + `0x0C` | `0x%08x` |
+| `mad_dimm_ch1` | MCHBAR + IMC base + `0x10` | `0x%08x` |
 | `capid0a` | host-bridge PCI cfg `0xE4` (read in-kernel — the `/sys` config space is 64-byte truncated) | `0x%08x` (`0xffffffff` sentinel on unreadable) |
 
 Channel 1 mirrors channel 0 across the `0x400` dual-controller stride; the
@@ -142,14 +163,20 @@ mirror blocks (`0x4800/0x4C00`), the native MCL blocks (`0xD000/0xD800`), or
 `mad_dimm_ch2/3` (`0x5060/0x5064`); userspace defines those extra attributes
 and degrades them to `None` when absent. So on a Tier-3 host a loaded module
 yields **LESS** decode coverage than no module (the DDR5 4-subchannel +
-MCL-fallback path exists only via the `/dev/mem` 256 KiB path). OQ-14: the
-in-kernel 256 KiB device-ID table is empty pending live-box verification, so
-every released build maps 64 KiB.
+MCL-fallback path exists only via the `/dev/mem` 256 KiB path). The module
+*does* map the full 256 KiB window on a 12th-gen+ host (gen-keyed, step 5)
+— it simply exposes the Tier-1-shaped attribute set over it.
 
 ## Building + installing (DKMS)
 
 - `Makefile`: out-of-tree `obj-m`; `KDIR=/lib/modules/$(KVER)/build`;
   auto-detects clang kernels (`CONFIG_CC_IS_CLANG` → `LLVM=1`).
+- **Requires Linux ≥ 5.13:** the gen-keyed IMC-base selection (step 5)
+  includes `<asm/cpuid/api.h>` for `cpuid_eax(1)`, a header that first landed
+  in the 5.13 cpuid-API split — on a ≤ 5.10 kernel the DKMS build fails. The
+  impact is contained: the extra is optional, and the absent-module
+  degradation path (sysfs missing → the `/dev/mem` fallback + the SMBIOS
+  4-tier cross-check, both of which now work standalone) covers it.
 - `dkms.conf`: `PACKAGE_VERSION` sed'd by the helper; `AUTOINSTALL=yes`
   (rebuild on kernel updates); `DEST_MODULE_LOCATION=/extra` is a no-op on
   DKMS 3.x (the module deploys to `updates/dkms/`, no depmod.d override).

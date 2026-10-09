@@ -538,13 +538,15 @@ UCLK:MCLK sync segment is colour-coded: **amber** for `Synchronous 1:1`
 (UCLK = MCLK — the healthy memory-clock configuration), **crimson** for
 `Asynchronous 1:2` (UCLK = MCLK/2 — the fallback when the fabric cannot
 keep up), and plain text for an honest `N/A`. The **`<channel mode>`** label
-is hardware-derived on **both** platforms — Intel from the
-`MAD_INTER_CHANNEL` register (read via the `ramsleuth_intel` module), AMD
-from the memory controller's channel-population registers (read via the
-`ryzen_smu` module) — and falls back to the installed-DIMM count only when
-neither is available; on **Intel** the hardware mode also fills the `Mode:`
-slot (`Interleaved` when symmetric, `Flex` when asymmetric, `N/A` for a
-single channel); see [Section 8.6](#86-channel-mode--the-ram-summary).
+is hardware-derived on **both** platforms — Intel from the memory
+controller's per-channel DIMM-slot capacity registers, cross-checked
+against the unprivileged SMBIOS Type 17 population (read via the
+`ramsleuth_intel` module), AMD from the memory controller's
+channel-population registers (read via the `ryzen_smu` module) — and falls
+back to the installed-DIMM count only when neither is available; on
+**Intel** the hardware mode also fills the `Mode:` slot (`Interleaved` when
+symmetric, `Flex` when asymmetric, `N/A` for a single channel); see
+[Section 8.6](#86-channel-mode--the-ram-summary).
 The **`ECC: <status>`** segment (both platforms) reads `Capable (disabled)`
 (the controller supports ECC, but non-ECC DIMMs are installed — the normal
 desktop state), `Enabled`, `ChipKill` (multi-bit mode), `Not Capable`, or an
@@ -1037,16 +1039,44 @@ cannot honour) is how stability problems start.
   impedance, 240 Ω): e.g. `RZQ/6` = 40 Ω. These are the values motherboard
   tuning affects signal quality at high frequencies.
 - **Voltages** (mV):
-  - **VDDCR_CPU (Vcore)** — the CPU core rail;
-  - **VDDCR_SOC** — the SOC/uncore rail (on AMD this feeds the memory
-    controller);
-  - **VDDIO_MEM** — the memory I/O rail (the DRAM interface itself);
-  - **VDD_MISC** — the misc rail;
-  - **VPP** — the high voltage that enables on-die charge pumps in the
-    DRAM (typically 1.8 V class).
+  - **AMD** — read from the SMU PM table: **VDDCR_CPU (Vcore)** (the CPU
+    core rail), **VDDCR_SOC** (the SOC/uncore rail — this feeds the memory
+    controller), **VDDIO_MEM** (the memory I/O rail — the DRAM interface
+    itself), **VDD_MISC** (the misc rail), and **VPP** (the high voltage
+    that enables on-die charge pumps in the DRAM, typically 1.8 V class).
+  - **Intel** — the IMC window exposes no voltage rails, so those read
+    `N/A`. The one Intel voltage is the **CPU vCore**, which is
+    **board-delivered** — read from the board's Super-I/O, not the
+    processor (the confidence badge is explained below).
 - **CPU temperature (°C)** — `k10temp`/`zenpower` hwmon `temp1_input` first,
   the `cpu_thermal` thermal zone as fallback (a related source, read by the
   client itself — one of the few reads that does not go through the daemon).
+
+**The Intel vCore and its confidence badge.** On Intel the vCore is
+**board-delivered** — it comes from the board's Super-I/O `in0` input (the
+unattenuated, direct read of the voltage-regulator feedback trace), not from
+the processor. The **delivered value is the primary** number you see (e.g.
+`1.216 V`). The processor **VID is optional** — Intel exposes no public VID
+MSR, so it is usually absent — and the small **delta** between the delivered
+value and a target (when one is shown) is a **normal Vdroop / load-line (LLC)
+/ undervolt gap, not a fault**: the rail sags a little under load and that is
+expected. Every reading carries a **confidence badge** so you know how it was
+established:
+
+- **No badge** — the board is a **curated seed** (a high-volume enthusiast /
+  workstation board RamSleuth has verified maps `in0` to Vcore); the value is
+  verified.
+- **`[est]`** (CLI) / **`[Unverified]`** (TUI) / **`[UNVERIFIED]`** (GUI) —
+  no curated match, but the board is a **consumer-vendor** (Asus / ASRock /
+  MSI / Micro-Star / Gigabyte); the value is a vendor-aware **heuristic**
+  estimate.
+- **`N/A`** — the board is an **enterprise / OEM** (Dell / HP / Lenovo /
+  Supermicro — their BMCs route power telemetry away from the Super-I/O), the
+  reading is **out of the 0.200–1.750 V envelope**, or **no Super-I/O is
+  present**; the value is never fabricated.
+
+On AMD the vCore is read from the SMU PM table (the authoritative source) and
+carries no such badge.
 
 ### 8.4 Memory bandwidth
 
@@ -1115,25 +1145,39 @@ interface width, which is why the summary also shows the per-DIMM
 breakdown (`2x16 GiB Single-Rank`) and, when the OS sees more capacity than
 the SPD bus binds, a slot note (`2 of 4 slots SPD-visible`).
 
-On **Intel** the DIMM count is only the fallback. When the
-`ramsleuth_intel` module is loaded, the channel label and the `Mode:`
-segment come from the memory controller's hardware `MAD_INTER_CHANNEL`
-register — its bits `[1:0]` select the mode: **`00b`** =
-`Dual-Channel (Symmetric)` (fully interleaved — the normal healthy
-configuration), **`01b`** = `Dual-Channel (Flex)` (asymmetric
-interleaving), **`10b`** = `Single-Channel` — **cross-checked against the
-actual DIMM population**: the Skylake-family firmware leaves
-`MAD_INTER_CHANNEL` at the `00b` default in configurations the spec
-encodes differently, so the decode demotes a firmware-`00b` reading to
-`Single-Channel` when exactly one channel has a populated DIMM, and to
-`Dual-Channel (Flex)` when both channels are populated with unequal
-capacities (the `MAD_DIMM_CH0` / `MAD_DIMM_CH1` slot-size registers
-supply the population); a `01b`/`10b` firmware value already matches its
-population and passes through unchanged. The label is thus the firmware
-state *reconciled with what is actually installed* — a live 8 + 16 GiB
-asymmetric box reads `Dual-Channel (Flex)` even when the firmware left
-the register at `00b`. Without the module (the `/dev/mem` fallback) the
-label degrades back to the DIMM count above.
+On **Intel** the label is **hardware-derived and cross-checked** — not
+just a DIMM count. The memory controller's per-channel DIMM-slot
+registers (`MAD_DIMM_CH0` / `MAD_DIMM_CH1`) report how much capacity sits
+on each channel, and that capacity *is* the channel mode: both channels
+populated and **equal** → `Dual-Channel (Symmetric)` (the normal healthy
+configuration), both populated and **unequal** (e.g. 8 + 16 GiB) →
+`Dual-Channel (Flex)`, only one channel populated → `Single-Channel`.
+The decode then reconciles that hardware reading against a second,
+independent source — the unprivileged **SMBIOS Type 17** population (the
+DIMMs the firmware reports) — through a **4-tier trust** check, so a kit
+that is really dual-channel is never misreported as single:
+
+- **Clean dual (L1)** — the hardware decode says dual and SMBIOS agrees →
+  the label with **no badge** (the common case).
+- **Override (L3)** — the hardware decode says `Single` but SMBIOS
+  confirms two DIMMs across channels → the readout reports **Dual** with
+  an **`[unverified]`** note (the hardware word is flagged as
+  untrusted — offset drift / a vendor MRC customization / a stale field).
+- **Firmware-only (L2)** — the hardware registers are unreadable → the
+  topology comes from SMBIOS alone (no badge when the population is
+  clean).
+- **Heuristic (L4)** — the hardware registers are unreadable *and* the
+  SMBIOS slot locators are ambiguous → a dual guess, marked
+  **`[unverified]`**.
+
+So a live 8 + 16 GiB asymmetric box reads `Dual-Channel (Flex)`, and a
+symmetric dual kit reads `Dual-Channel (Symmetric)` — even when the
+firmware's register would have said otherwise. On a **DDR5** board the
+label reads **`Dual-Channel (4x 32-bit Subchannels)`**: it is a 128-bit
+dual-channel configuration (four 32-bit subchannels), **not** a
+"quad-channel" server topology. Without the module *and* with the
+`/dev/mem` fallback blocked, the label degrades back to the DIMM count
+above.
 
 On **AMD** the label is synthesized from the memory controller's **SMN
 per-UMC-channel register set** (read via the `ryzen_smu` module): per
@@ -1214,6 +1258,7 @@ everything else stays live and every process still exits `0`:
 | **SPD for a second (or later) DIMM** | The board's DSDT advertises only one slot, so the kernel's `ee1004` driver binds fewer EEPROMs than DIMMs are installed. | See [Section 11.5](#115-a-few-honest-limitations): the daemon's SPD auto-bind (on by default) attempts to bind the missed EEPROMs, and the manual `new_device` workaround is listed there. |
 | **The Intel section** on a **low-power SoC (the N100 class)** | The part exposes no IMC timing registers for the decode — and its SPD EEPROM is often unbound too — so the branch degrades to a clean `N/A (unsupported hardware)`. | Nothing — an expected, honest `N/A` on that class of part; the daemon status stays green, the CPU/platform data keep serving, and every process exits 0. |
 | **The AMD section** on a **Ryzen 5 5625U (Barcelo)** | The SMU PM-table version it reports (`0x0040_0005`) is outside the verified Vermeer/Matisse layout set, so the branch degrades to a clean `N/A (unknown PM table version)` — the driver is loaded and working; its table just isn't in the supported set yet. | Nothing (reporting the version word upstream is welcome) — the daemon status stays green and every other section keeps serving. |
+| **The Intel vCore** (the board-delivered reading) | The board is an **enterprise / OEM** vendor (Dell / HP / Lenovo / Supermicro — their BMCs route power telemetry away from the Super-I/O), the `in0` reading is **out of the 0.200–1.750 V envelope** (a grounded / unpopulated / attenuated channel), or **no Super-I/O is present** on the board. | Nothing — an expected, honest `N/A` (the value is never fabricated); the rest of the Intel section stays live and every process exits 0. See Section 8.3 for the confidence badge. |
 
 The daemon's **`status`** subcommand is the fastest way to see which of the
 four major sections (CPU / AMD / Intel / SPD) is degraded and why — one line
@@ -1302,9 +1347,10 @@ tile-routing guard degrading a fully degenerate window to an honest
 `N/A` instead of decoding it.
 
 The optional **`ramsleuth_intel`** DKMS module is the **preferred** source:
-it maps the same MCHBAR window in-kernel (64 KiB for every released build
-— the 256 KiB Tier-3 selection is wired but dormant on the empty OQ-14
-device-ID table) and publishes the raw registers as
+it maps the same MCHBAR window in-kernel — **64 KiB on the 6th–11th-gen
+parts, 256 KiB on the 12th-gen+ family** (the window *and* the MAD register
+base are keyed on the CPU generation, which the module computes via
+`cpuid_eax(1)`) — and publishes the raw registers as
 world-readable sysfs attributes under `/sys/kernel/ramsleuth_intel/`
 (25 read-only attributes — see `kernel/ramsleuth-intel/README.md`),
 including the host-bridge `capid0a` attribute (config offset `0xE4`, raw
@@ -1313,14 +1359,15 @@ daemon uses it whenever it is loaded (the sysfs path needs no `/dev/mem` at
 all) and falls back to `/dev/mem` **only** when the module is absent —
 never the other way round: with the module loaded, a `/dev/mem` fault is
 reported as a real fault instead of being masked by a silent source
-switch. The module's `mad_inter_channel` register is what feeds the
-header's hardware channel-mode label (see
-[Section 8.6](#86-channel-mode--the-ram-summary)), cross-checked against
-the `mad_dimm_ch0` / `mad_dimm_ch1` DIMM-population registers (a
-firmware-`00b` reading demotes to `Single-Channel` when only one channel
-is populated); with it loaded, an Intel box reports its true
-`Single-` / `Dual-Channel (…)` mode and the `Mode:` slot
-(`Interleaved` / `Flex`), not just the SPD-visible DIMM count.
+switch. The module's per-channel DIMM-slot registers (`mad_dimm_ch0` /
+`mad_dimm_ch1`) are what feed the header's hardware channel-mode label (see
+[Section 8.6](#86-channel-mode--the-ram-summary)): the channel mode is
+derived from the capacity on each channel and cross-checked against the
+unprivileged SMBIOS Type 17 population (a 4-tier trust procedure), so a
+populated dual-channel kit is never misreported as single; with it loaded,
+an Intel box reports its true `Single-` / `Dual-Channel (…)` mode — the
+DDR5 box reading `Dual-Channel (4x 32-bit Subchannels)` — and the `Mode:`
+slot (`Interleaved` / `Flex`), not just the SPD-visible DIMM count.
 
 Three ways to get it (all build the **same in-repo** source,
 `kernel/ramsleuth-intel/` — the project's own original creation, shipped
@@ -1520,8 +1567,12 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   unpopulated (there is no physical memory controller in the VM), and
   **generations outside the Tier 1 – 3 profile set** (the unprofiled
   generations — e.g. Ice Lake / Tiger Lake).
-- **Intel voltages & CAD** are `N/A (not applicable)` by design — the
-  MCHBAR window does not expose them the way the AMD SMU does.
+- **Intel voltage rails & CAD** (other than the vCore) are `N/A (not
+  applicable)` by design — the MCHBAR window does not expose them the way
+  the AMD SMU does. The one Intel voltage, the **vCore**, is now
+  **board-delivered** from the Super-I/O `in0` (not the MCHBAR window), with
+  the confidence badge from Section 8.3 — it reads `N/A` only on enterprise
+  / out-of-bounds / no-Super-I/O boards.
 - **Some Vermeer (Zen 3) boards read the PM-table subtiming block as 0** —
   the 27 subtimings come back zeroed (the firmware leaves the block
   unpopulated) while the clocks, voltages, and SPD all read normally — a
