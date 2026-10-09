@@ -34,7 +34,7 @@
  * fails with -ENODEV by design: no kobject is ever created.
  */
 
-#include <asm/processor.h>
+#include <asm/cpuid/api.h>
 #include <linux/errno.h>
 #include <linux/init.h>
 #include <linux/io.h>
@@ -311,8 +311,10 @@ static int __init ramsleuth_intel_init(void)
 	 * userspace cpuid.rs). 12th-gen+ -> 0xd800, else 0x5000. The five
 	 * MAD offsets are base-relative (imc_base + 0x00/04/08/0C/10).
 	 */
-	model = ((u32)boot_cpu_data.x86_ext_model << 4) |
-	        (boot_cpu_data.x86_model & 0xF);
+	{
+		u32 eax1 = cpuid_eax(1);
+		model = (((eax1 >> 16) & 0xF) << 4) | ((eax1 >> 4) & 0xF);
+	}
 	imc_base = is_12th_gen_plus(model) ? 0xD800 : 0x5000;
 	mad_offs.inter = imc_base;
 	mad_offs.intra0 = imc_base + 0x04;
