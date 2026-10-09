@@ -166,6 +166,7 @@ use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_gen::{AlderChannelMap, ALDER_CHANNELS, ALDER_FIELDS, GearCap, GenMap, profile_for};
 use crate::intel_mchbar::MchBar;
+use crate::intel_smbios::{DerivedMode, SmbiosTopology};
 
 // ---------------------------------------------------------------------------
 // Hardware-authoritative Tier-1 register table (MCHBAR-relative offsets).
@@ -1566,15 +1567,17 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 ///   for the branch-level error; [`tier1_gate`] remains the Tier-1-only
 ///   alias).
 ///
-/// The `channel_mode` slot decodes `MAD_INTER_CHANNEL[1:0]` from
-/// `mad_inter_channel` (`None` → `None`; reserved `11` → `None`); it is
-/// populated on the decoded path (the degradation keeps `None` —
-/// behavior preserved). On the Tier-1 arm the raw mode is additionally
-/// cross-checked against the `MAD_DIMM_CH0/1` DIMM population
-/// ([`channel_mode_with_population`]): the field is
-/// population-conditional, and the Skylake-family firmware leaves it at
-/// the 00b (Dual Symmetric) default on single-channel and asymmetric
-/// (Flex) systems where the spec calls for `10b` / `01b`.
+/// The channel-mode fields are resolved by the **4-tier trust procedure**
+/// ([`resolve_channel`], Chunk 2): the capacity-derived MMIO mode
+/// ([`mmio_channel_mode`] from the `MAD_DIMM_CH0/1` sums — the old
+/// `MAD_INTER_CHANNEL[1:0]` 2-bit decode is gone; `[2:0]` is the
+/// `DDR_TYPE` → [`MemoryTech`]) is cross-checked against the SMBIOS Type 17
+/// topology (`smbios`). The `channel_mode` / `memory_tech` /
+/// `channel_trust` / `channel_annotation` / `dimm_count` slots all carry
+/// the resolution on the decoded path (the all-Na degradation keeps them
+/// empty — behavior preserved). The L3 safety override is the core fix: an
+/// MMIO `Single` decode contradicted by SMBIOS's 2-DIMMs-across-channels is
+/// reported `Dual` (the misreported-single-channel bug).
 ///
 /// Never panics (D5): a `None` register degrades only its sourced fields.
 pub fn decode(
@@ -1583,7 +1586,13 @@ pub fn decode(
     mad_inter_channel: Option<u32>,
     mad_dimm_ch0: Option<u32>,
     mad_dimm_ch1: Option<u32>,
+    smbios: &SmbiosTopology,
 ) -> IntelReadout {
+    // The 4-tier resolution (computed once; shared by the decoded arms).
+    let mmio_mode = mmio_channel_mode(mad_dimm_ch0, mad_dimm_ch1);
+    let mmio_tech = mad_inter_channel.map(MemoryTech::from_mad_bits);
+    let res = resolve_channel(mmio_mode, mmio_tech, smbios);
+
     match profile_for(gen) {
         // Profiled with a live decode path: Tier 1 and Rocket Lake reuse
         // the identical 64 KiB register map; Rocket additionally decodes
@@ -1604,15 +1613,7 @@ pub fn decode(
                 }
                 channels.push(channel);
             }
-            IntelReadout {
-                channels,
-                channel_mode: channel_mode_with_population(
-                    mad_inter_channel.and_then(ChannelMode::from_raw),
-                    mad_dimm_ch0,
-                    mad_dimm_ch1,
-                ),
-                ecc_status: EccStatus::Unknown,
-            }
+            decoded_readout(channels, &res, EccStatus::Unknown)
         }
         // The Tier-3 Alder family (IG-26): OQ-11's DDR5 condition
         // (both MAD_DIMM_CH2 / MAD_DIMM_CH3 raws present and non-zero)
@@ -1639,11 +1640,7 @@ pub fn decode(
                 for ch in 0..count {
                     channels.push(unsupported_channel(ch));
                 }
-                return IntelReadout {
-                    channels,
-                    channel_mode: None,
-                    ecc_status: EccStatus::Unknown,
-                };
+                return all_na_readout(channels);
             }
             let ddr5 = regs.mad_dimm_ch2.is_some_and(|v| v != 0)
                 && regs.mad_dimm_ch3.is_some_and(|v| v != 0);
@@ -1666,11 +1663,7 @@ pub fn decode(
                 channel.clocks.uclk_mhz = uclk.clone();
                 channels.push(channel);
             }
-            IntelReadout {
-                channels,
-                channel_mode: mad_inter_channel.and_then(ChannelMode::from_raw),
-                ecc_status: EccStatus::Unknown,
-            }
+            decoded_readout(channels, &res, EccStatus::Unknown)
         }
         // Unprofiled generations, and any future profiled family whose
         // decode path has not landed (Sandy / Haswell): behavior
@@ -1682,11 +1675,7 @@ pub fn decode(
             for ch in 0..count {
                 channels.push(unsupported_channel(ch));
             }
-            IntelReadout {
-                channels,
-                channel_mode: None,
-                ecc_status: EccStatus::Unknown,
-            }
+            all_na_readout(channels)
         }
     }
 }
@@ -1756,8 +1745,11 @@ fn gear_uclk_cells(
 ///    readout (honest N/A, never garbage — the facade's branch-level
 ///    gate surfaces [`gen_gate`]'s rich detail).
 ///
-/// No I/O happens beyond the bounds-checked [`MchBar::read_u32`].
-pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
+/// No I/O happens beyond the bounds-checked [`MchBar::read_u32`] (and the
+/// SMBIOS read is supplied by the caller, `smbios` — the `/dev/mem` path
+/// benefits from the same 4-tier cross-check as the sysfs path, plan
+/// hard-constraint #5).
+pub fn read_intel(bar: &MchBar, smbios: &SmbiosTopology) -> TelemetryResult<IntelReadout> {
     let info = CpuInfo::detect();
     let gen = intel_gen_gate(&info)?;
     // The /dev/mem read set follows the generation's register-map
@@ -1768,7 +1760,18 @@ pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
         Some(GenMap::Alder) => IntelImcRegs::from_bar_wide(bar),
         _ => IntelImcRegs::from_bar(bar),
     };
-    Ok(decode(&regs, gen, None, None, None))
+    // Chunk 2: read the MAD channel/geometry registers at the
+    // gen-appropriate IMC base (0xd800 for 12th-gen+, 0x5000 otherwise —
+    // [`imc_base_for`], the same base the kernel module selects). This is
+    // the hard-constraint fix: the pre-Chunk-2 fallback passed `None` for
+    // all three MAD inputs, so the channel mode was always `None`.
+    // Per-register containment: an out-of-bounds / failed read degrades to
+    // `None` (never a panic).
+    let base = imc_base_for(gen);
+    let mad_inter = bar.read_u32(base).ok();
+    let mad_dimm0 = bar.read_u32(base + 0x0C).ok();
+    let mad_dimm1 = bar.read_u32(base + 0x10).ok();
+    Ok(decode(&regs, gen, mad_inter, mad_dimm0, mad_dimm1, smbios))
 }
 
 /// Decode a raw register set produced by *any* source (the sysfs path
@@ -1786,17 +1789,16 @@ pub fn read_intel(bar: &MchBar) -> TelemetryResult<IntelReadout> {
 /// directly.
 pub fn read_regs(regs: &IntelImcRegs) -> IntelReadout {
     match intel_gen_gate(&CpuInfo::detect()) {
-        Ok(gen) => decode(regs, gen, None, None, None),
+        // The `read_regs` entry point carries no SMBIOS input (it is a
+        // pure raw-set decode), so it resolves against the empty topology
+        // (the 4-tier degrades to the terminal / MMIO-only states).
+        Ok(gen) => decode(regs, gen, None, None, None, &SmbiosTopology::empty()),
         Err(_) => {
             let mut channels = Vec::with_capacity(2);
             for ch in 0..2u8 {
                 channels.push(unsupported_channel(ch));
             }
-            IntelReadout {
-                channels,
-                channel_mode: None,
-                ecc_status: EccStatus::Unknown,
-            }
+            all_na_readout(channels)
         }
     }
 }
@@ -1832,43 +1834,35 @@ pub struct IntelChannel {
     pub rtl: Section<u16>,
 }
 
-/// The hardware channel / interleave mode, decoded from the global
-/// `MAD_INTER_CHANNEL` register (bits `[1:0]` CHAN_MODE).
+/// The hardware channel / interleave mode.
 ///
-/// Intel exposes the DRAM interleave configuration as a 2-bit field in the
-/// global MAD (memory array descriptor) register set — it is *not*
-/// derivable from the SPD-visible DIMM count. A Flex-Mode box (asymmetric
-/// DIMMs, e.g. 16 + 8 GB) may bind only a single SPD yet run in Dual-Flex,
-/// so the SPD-count label is authoritative only as a frontend fallback.
+/// **Chunk 2 correction:** the mode is *not* a 2-bit field of
+/// `MAD_INTER_CHANNEL` — bits `[2:0]` of that register are the `DDR_TYPE`
+/// (the physical memory technology, see [`MemoryTech`]), not a mode. The
+/// true operating mode is derived from the *capacity* mapped to each
+/// channel: [`channel_mode_from_capacity`] computes it from the two
+/// `MAD_DIMM_CH0/1` register sums (there is no `CH_L_SIZE` field in
+/// `MAD_INTER_CHANNEL`). A Flex-Mode box (asymmetric DIMMs, e.g. 16 + 8 GB)
+/// may bind only a single SPD yet run in Dual-Flex, so the SPD-count label
+/// is authoritative only as a frontend fallback.
 ///
-/// Wire-safe (serde + bincode); the reserved encoding `11` decodes to
-/// `None`. The field is population-conditional, and the
-/// Skylake-family firmware is not reliable in maintaining it (live
-/// 6600T: `00b` on a single-channel and on an 8 + 16 GiB asymmetric
-/// box), so the Tier-1 decode cross-checks it against the
-/// `MAD_DIMM_CH0/1` population ([`channel_mode_with_population`]).
+/// Wire-safe (serde + bincode). The mode is population-conditional, and the
+/// Skylake-family firmware is not reliable in maintaining it, so the decode
+/// cross-checks it against the `MAD_DIMM_CH0/1` population **and** the
+/// SMBIOS Type 17 topology ([`resolve_channel`], the 4-tier trust
+/// procedure — the L3 safety override is the core fix for the
+/// misreported-single-channel bug).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChannelMode {
-    /// `00`: dual-channel, symmetric interleaving.
+    /// Dual-channel, symmetric interleaving (both channels equal capacity).
     DualSymmetric,
-    /// `01`: dual-channel, flex mode (asymmetric DIMMs).
+    /// Dual-channel, flex mode (asymmetric DIMMs).
     DualFlex,
-    /// `10`: single-channel.
+    /// Single-channel.
     Single,
 }
 
 impl ChannelMode {
-    /// Decode bits `[1:0]` of `MAD_INTER_CHANNEL`: `00` = Dual Symmetric,
-    /// `01` = Dual Flex, `10` = Single, `11` = reserved → `None`.
-    pub fn from_raw(raw: u32) -> Option<ChannelMode> {
-        match raw & 0x3 {
-            0 => Some(ChannelMode::DualSymmetric),
-            1 => Some(ChannelMode::DualFlex),
-            2 => Some(ChannelMode::Single),
-            _ => None,
-        }
-    }
-
     /// The full human-readable channel label (the header channel slot).
     pub fn label(&self) -> &'static str {
         match self {
@@ -1886,17 +1880,117 @@ impl ChannelMode {
             ChannelMode::Single => "N/A",
         }
     }
+
+    /// The display label for a channel mode given the active memory
+    /// technology (the single source both frontends render): a DDR5
+    /// dual-channel configuration is **"Dual-Channel (4x 32-bit
+    /// Subchannels)"** — never "quad-channel" (research: a 128-bit
+    /// aggregate bus is dual-channel; true quad-channel is a 256-bit server
+    /// topology). A DDR4 (or unknown-tech) dual keeps its symmetric / flex
+    /// label.
+    pub fn display_label(&self, tech: Option<MemoryTech>) -> String {
+        match (self, tech) {
+            (ChannelMode::DualSymmetric, Some(MemoryTech::Ddr5))
+            | (ChannelMode::DualFlex, Some(MemoryTech::Ddr5)) => {
+                "Dual-Channel (4x 32-bit Subchannels)".to_owned()
+            }
+            _ => self.label().to_owned(),
+        }
+    }
+}
+
+/// The physical DRAM technology the IMC is running (decoded from
+/// `MAD_INTER_CHANNEL[2:0]` — the `DDR_TYPE` field, **not** a channel mode
+/// — or, when MMIO access is blocked, from the SMBIOS Type 17 memory-type
+/// field).
+///
+/// Wire-safe (serde + bincode). [`MemoryTech::Unknown`] is the honest
+/// fallback for a reserved / unrecognizable encoding; [`None`] (on the
+/// [`IntelReadout`]) means no source carried a technology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MemoryTech {
+    /// DDR3 / DDR3L (`001b`).
+    Ddr3,
+    /// DDR4 (`000b`).
+    Ddr4,
+    /// LPDDR4 (`010b`).
+    Lpddr4,
+    /// LPDDR5 (`011b`).
+    Lpddr5,
+    /// DDR5 (`100b`).
+    Ddr5,
+    /// A reserved / unrecognizable encoding.
+    Unknown,
+}
+
+impl MemoryTech {
+    /// Decode the `DDR_TYPE` field (`MAD_INTER_CHANNEL[2:0]`):
+    /// `000`=DDR4, `001`=DDR3/3L, `010`=LPDDR4, `011`=LPDDR5, `100`=DDR5;
+    /// any other (reserved) encoding → [`MemoryTech::Unknown`].
+    pub fn from_mad_bits(bits: u32) -> MemoryTech {
+        match bits & 0x7 {
+            0 => MemoryTech::Ddr4,
+            1 => MemoryTech::Ddr3,
+            2 => MemoryTech::Lpddr4,
+            3 => MemoryTech::Lpddr5,
+            4 => MemoryTech::Ddr5,
+            _ => MemoryTech::Unknown,
+        }
+    }
+
+    /// Decode a SMBIOS Type 17 memory-type byte (offset `0x12`):
+    /// `0x1A`=DDR4, `0x22`=DDR5; anything else → `None` (no recognized
+    /// technology — the caller keeps `None`).
+    pub fn from_smbios_type(t: u8) -> Option<MemoryTech> {
+        match t {
+            0x1A => Some(MemoryTech::Ddr4),
+            0x22 => Some(MemoryTech::Ddr5),
+            _ => None,
+        }
+    }
+}
+
+/// The trust tier of a resolved channel mode (the 4-tier decision
+/// procedure, research "Recommended Multi-Tier Decision Procedure").
+///
+/// Wire-safe (serde + bincode). [`ChannelTrust::None`] (the variant,
+/// carried as `Option<ChannelTrust>` on [`IntelReadout`]) is the terminal
+/// "unresolvable" state — both MMIO and SMBIOS yielded nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ChannelTrust {
+    /// L1 — the MMIO decode is readable, internally consistent, and matches
+    /// SMBIOS. The hardware read is the primary authority.
+    VerifiedHardware,
+    /// L2 — MMIO is inaccessible; the topology is verified from SMBIOS
+    /// Type 17 alone.
+    VerifiedFirmware,
+    /// L3 — SAFETY OVERRIDE: MMIO decoded single-channel but SMBIOS
+    /// confirms two DIMMs across channels; the MMIO read is marked
+    /// untrusted and the result is reported dual-channel.
+    Override,
+    /// L4 — MMIO is inaccessible and the SMBIOS locators are ambiguous; a
+    /// dual-channel heuristic is applied (the "unverified" annotation).
+    Heuristic,
+    /// Terminal — neither MMIO nor SMBIOS identified the topology.
+    None,
 }
 
 /// A channel's reported DIMM capacity (in GiB) from its `MAD_DIMM_CHx`
-/// raw, decoded with the Skylake-family layout the mainline
-/// `ie31200_edac` driver uses for this register pair (`skl_cfg`: DIMM 0
-/// slot size = bits `[5:0]`, DIMM 1 slot size = bits `[21:16]`, each a
-/// 1 GiB granularity index). The sum of both slot sizes is returned;
-/// `None` when the raw is absent.
-fn mad_dimm_capacity_gib(mad_dimm_ch: Option<u32>) -> Option<u32> {
+/// raw, decoded with the **corrected** bit layout (Chunk 2):
+/// `DIMM_L_SIZE` (slot 0) at bits `[6:0]` + `DIMM_S_SIZE` (slot 1) at bits
+/// `[22:16]`, each a 7-bit index in **0.5 GiB** increments (research:
+/// `Value << 29 bytes` = value × 0.5 GiB). The sum of both slot sizes is
+/// returned; `None` when the raw is absent. A slot index of `0` means
+/// unpopulated.
+///
+/// **Correction:** the pre-Chunk-2 decode used a non-existent 1 GiB layout
+/// (`[5:0] + [21:16]`); the real register encodes 0.5 GiB granularity in
+/// 7-bit fields, so a 16 GiB DIMM is index `32` (`32 × 0.5`), not `16`.
+fn mad_dimm_capacity_gib(mad_dimm_ch: Option<u32>) -> Option<f64> {
     let r = mad_dimm_ch?;
-    Some((r & 0x3F) + ((r >> 16) & 0x3F))
+    let dimm_l = (r & 0x7F) as f64; // [6:0]
+    let dimm_s = ((r >> 16) & 0x7F) as f64; // [22:16]
+    Some((dimm_l + dimm_s) * 0.5)
 }
 
 /// Decode the ECC capability from the raw CAPID0_A register (host-bridge
@@ -1915,63 +2009,301 @@ pub fn decode_ecc_status(capid0a: Option<u32>) -> EccStatus {
     }
 }
 
-/// Cross-check a decoded channel mode against DIMM population.
-/// `MAD_INTER_CHANNEL[1:0]` is population-conditional, and the
-/// Skylake-family firmware leaves it at the 00b (Dual Symmetric)
-/// default in configurations where the spec calls for another
-/// encoding: a single populated channel (`10b`) and an asymmetric
-/// dual (Flex, `01b`). Live-verified on the i5-6600T box (24-attr
-/// module): 16 GiB on channel 1 alone → `00b`; 8 + 16 GiB
-/// asymmetric → `00b` (the same box's earlier 16 + 8 GiB
-/// configuration read `01b`). Demote `DualSymmetric` → `Single` when
-/// exactly one channel reports a populated DIMM, and → `DualFlex` when
-/// both report populated DIMMs with unequal capacities. `DualFlex` /
-/// `Single` are already consistent with their population and pass
-/// through unchanged; an absent raw on either channel (no population
-/// evidence) and all-zero size fields keep the decoded value.
-fn channel_mode_with_population(
-    mode: Option<ChannelMode>,
-    mad_dimm_ch0: Option<u32>,
-    mad_dimm_ch1: Option<u32>,
-) -> Option<ChannelMode> {
-    let m = mode?;
-    if m == ChannelMode::DualSymmetric {
-        let (Some(c0), Some(c1)) = (
-            mad_dimm_capacity_gib(mad_dimm_ch0),
-            mad_dimm_capacity_gib(mad_dimm_ch1),
-        ) else {
-            return Some(m);
-        };
-        if c0 == 0 && c1 == 0 {
-            // No population evidence (all sizes zero): keep the decode.
-            return Some(m);
-        }
-        if (c0 > 0) != (c1 > 0) {
-            return Some(ChannelMode::Single);
-        }
-        if c0 != c1 {
-            return Some(ChannelMode::DualFlex);
-        }
+/// Derive the channel mode from the two per-channel capacities (GiB)
+/// (Chunk 2, the capacity-derived model that replaces the old 2-bit
+/// `MAD_INTER_CHANNEL[1:0]` decode):
+///
+/// - `CH_S == 0` → [`ChannelMode::Single`] (all memory on channel L);
+/// - `CH_S > 0 && CH_S == CH_L` → [`ChannelMode::DualSymmetric`];
+/// - `0 < CH_S < CH_L` → [`ChannelMode::DualFlex`] (Intel Flex Memory).
+///
+/// `None` when the pair is ill-formed (a negative / non-finite value, or
+/// `ch_s > ch_l` — the caller must pass `(smaller, larger)`).
+pub fn channel_mode_from_capacity(ch_s_gib: f64, ch_l_gib: f64) -> Option<ChannelMode> {
+    if !ch_s_gib.is_finite() || !ch_l_gib.is_finite() || ch_s_gib < 0.0 || ch_l_gib < 0.0 {
+        return None;
     }
-    Some(m)
+    if ch_s_gib == 0.0 {
+        Some(ChannelMode::Single)
+    } else if ch_s_gib == ch_l_gib {
+        Some(ChannelMode::DualSymmetric)
+    } else if ch_s_gib < ch_l_gib {
+        Some(ChannelMode::DualFlex)
+    } else {
+        None
+    }
+}
+
+/// Compute the MMIO-decoded channel mode from the two `MAD_DIMM_CH0/1`
+/// raws (the capacity-derived model): both sums must be readable and at
+/// least one channel must report capacity — otherwise the MMIO is
+/// "blocked" (`None`), which routes [`resolve_channel`] to the SMBIOS
+/// tiers. `CH_L` / `CH_S` are the larger / smaller of the two channel
+/// sums (there is no `CH_L_SIZE` field in `MAD_INTER_CHANNEL`).
+fn mmio_channel_mode(mad_dimm_ch0: Option<u32>, mad_dimm_ch1: Option<u32>) -> Option<ChannelMode> {
+    let c0 = mad_dimm_capacity_gib(mad_dimm_ch0)?;
+    let c1 = mad_dimm_capacity_gib(mad_dimm_ch1)?;
+    let (ch_l, ch_s) = if c0 >= c1 { (c0, c1) } else { (c1, c0) };
+    if ch_l == 0.0 {
+        return None; // no population evidence -> the MMIO is blocked
+    }
+    channel_mode_from_capacity(ch_s, ch_l)
+}
+
+/// The 12th-gen+ (Alder Lake and later) generation set — the set whose
+/// IMC MAD registers moved to the `0xd800` base (Chunk 1's gen set;
+/// research: key on the CPU generation, NOT the overlapping PCI
+/// Device-ID ranges). The kernel module and this userspace decode must
+/// use the *same* set (plan cross-cutting §7.3 / risk note).
+pub fn is_12th_gen_plus(gen: IntelGen) -> bool {
+    matches!(
+        gen,
+        IntelGen::AlderLake
+            | IntelGen::RaptorLake
+            | IntelGen::MeteorLake
+            | IntelGen::ArrowLake
+            | IntelGen::LunarLake
+            | IntelGen::CoreSeries1Mobile
+    )
+}
+
+/// The MCHBAR-relative IMC base for a generation (Chunk 2): `0xd800` for
+/// the 12th-gen+ set, `0x5000` for everything else (6th–11th gen). The
+/// `/dev/mem` fallback ([`read_intel`]) and the kernel module both key
+/// off this, so the MAD registers are read at the correct location.
+pub fn imc_base_for(gen: IntelGen) -> usize {
+    if is_12th_gen_plus(gen) {
+        0xD800
+    } else {
+        0x5000
+    }
+}
+
+/// The resolved channel topology: the trust-resolved mode, the active
+/// memory technology, the trust tier, a human annotation (the
+/// "untrusted-MMIO mismatch" / "heuristic" note), and the SMBIOS-confirmed
+/// populated DIMM count. Wire-safe fields (see [`IntelReadout`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelResolution {
+    /// The trust-resolved channel mode (`None` for the terminal state).
+    pub mode: Option<ChannelMode>,
+    /// The active memory technology (MMIO `DDR_TYPE` else SMBIOS).
+    pub tech: Option<MemoryTech>,
+    /// The trust tier (`None` for the terminal state).
+    pub trust: Option<ChannelTrust>,
+    /// A human annotation (empty for the clean L1 cases).
+    pub annotation: String,
+    /// The SMBIOS-confirmed populated DIMM count.
+    pub dimm_count: u8,
+}
+
+/// The 4-tier trust procedure (research "Recommended Multi-Tier Decision
+/// Procedure"): reconcile the hardware MMIO decode against the SMBIOS Type
+/// 17 topology.
+///
+/// - **L1** ([`ChannelTrust::VerifiedHardware`]): the MMIO decoded a valid
+///   mode (a dual decode, or a single decode SMBIOS does not contradict) →
+///   the MMIO mode, no annotation. The hardware read is the primary
+///   authority.
+/// - **L3** ([`ChannelTrust::Override`]) — the **safety override** (the
+///   core fix): the MMIO decoded `Single` but SMBIOS confirms ≥ 2
+///   populated DIMMs across channels → report **Dual** (the MMIO read is
+///   marked untrusted — register offset drift / a vendor MRC
+///   customization / a stale field), with an "untrusted-MMIO mismatch"
+///   annotation. This fires even when the module is old/absent, because
+///   the MMIO decode and the SMBIOS cross-check are independent inputs.
+/// - **L2** ([`ChannelTrust::VerifiedFirmware`]): the MMIO is blocked
+///   (`None`) and SMBIOS shows ≥ 2 DIMMs in matched channels (→ Dual) or on
+///   one channel (→ Single), or exactly 1 DIMM (→ Single).
+/// - **L4** ([`ChannelTrust::Heuristic`]): the MMIO is blocked and the
+///   SMBIOS locators are ambiguous (→ a dual heuristic, "unverified").
+/// - **terminal** ([`ChannelTrust::None`]): neither source identified the
+///   topology.
+///
+/// The active memory technology is the MMIO `DDR_TYPE` when present, else
+/// the SMBIOS type. Pure (no I/O) — the facade / `/dev/mem` path supply
+/// the inputs.
+pub fn resolve_channel(
+    mmio: Option<ChannelMode>,
+    mmio_tech: Option<MemoryTech>,
+    smbios: &SmbiosTopology,
+) -> ChannelResolution {
+    let dimm_count = smbios.populated_count;
+    let tech = mmio_tech.or(smbios.memory_type);
+
+    // L1 / L3: the MMIO decode is readable (a valid mode).
+    if let Some(mode) = mmio {
+        return match mode {
+            // L1: a dual decode is the hardware authority.
+            ChannelMode::DualSymmetric | ChannelMode::DualFlex => ChannelResolution {
+                mode: Some(mode),
+                tech,
+                trust: Some(ChannelTrust::VerifiedHardware),
+                annotation: String::new(),
+                dimm_count,
+            },
+            // L3 (override) / L1 (verified single).
+            ChannelMode::Single => {
+                if smbios.populated_count >= 2 && smbios.derived_mode == DerivedMode::Dual {
+                    ChannelResolution {
+                        mode: Some(ChannelMode::DualSymmetric),
+                        tech,
+                        trust: Some(ChannelTrust::Override),
+                        annotation: format!(
+                            "[Override: MCHBAR decoded Single-Channel, but SMBIOS Type 17 confirms {dimm_count} DIMMs across Channel A/B. Reporting Dual-Channel]"
+                        ),
+                        dimm_count,
+                    }
+                } else {
+                    ChannelResolution {
+                        mode: Some(ChannelMode::Single),
+                        tech,
+                        trust: Some(ChannelTrust::VerifiedHardware),
+                        annotation: String::new(),
+                        dimm_count,
+                    }
+                }
+            }
+        };
+    }
+
+    // L2 / L4: the MMIO is blocked (no valid decode) — fall to SMBIOS.
+    if smbios.populated_count >= 2 {
+        return match smbios.derived_mode {
+            // L2: matched channels, firmware-verified.
+            DerivedMode::Dual => ChannelResolution {
+                mode: Some(ChannelMode::DualSymmetric),
+                tech,
+                trust: Some(ChannelTrust::VerifiedFirmware),
+                annotation: "[MMIO Inaccessible: topology verified via SMBIOS Type 17]".to_owned(),
+                dimm_count,
+            },
+            // L4: ambiguous locators, dual heuristic.
+            DerivedMode::Ambiguous => ChannelResolution {
+                mode: Some(ChannelMode::DualSymmetric),
+                tech,
+                trust: Some(ChannelTrust::Heuristic),
+                annotation:
+                    "[Heuristic: 2 DIMMs detected on dual-channel processor; socket locators ambiguous]"
+                        .to_owned(),
+                dimm_count,
+            },
+            // L2 single: multiple DIMMs on the same channel.
+            DerivedMode::Single => ChannelResolution {
+                mode: Some(ChannelMode::Single),
+                tech,
+                trust: Some(ChannelTrust::VerifiedFirmware),
+                annotation: "[Single-Channel: multiple DIMMs installed on identical memory channel]"
+                    .to_owned(),
+                dimm_count,
+            },
+        };
+    }
+    if smbios.populated_count == 1 {
+        return ChannelResolution {
+            mode: Some(ChannelMode::Single),
+            tech,
+            trust: Some(ChannelTrust::VerifiedFirmware),
+            annotation: String::new(),
+            dimm_count,
+        };
+    }
+
+    // Terminal: neither MMIO nor SMBIOS identified the topology.
+    ChannelResolution {
+        mode: None,
+        tech,
+        trust: Some(ChannelTrust::None),
+        annotation: "[Error: unable to identify memory topology via MMIO or SMBIOS]".to_owned(),
+        dimm_count,
+    }
 }
 
 /// The full Intel readout: one [`IntelChannel`] per detected channel.
 ///
-/// Wire-safe (serde + bincode); the struct shape is frozen — only which
-/// cells carry `Value` vs `Na` changes between decode generations.
+/// Wire-safe (serde + bincode); the struct shape is append-only (OQ-10
+/// pattern) — the three original field positions are frozen, and the
+/// Chunk 2 fields (`memory_tech` / `channel_trust` / `channel_annotation`
+/// / `dimm_count`) are appended after `ecc_status`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IntelReadout {
     /// Decoded channels (0-based indices, `channels.len() == channel_count`).
     pub channels: Vec<IntelChannel>,
-    /// Hardware channel mode from `MAD_INTER_CHANNEL[1:0]` (the Tier-1
-    /// decode cross-checks it against the `MAD_DIMM_CH0/1` DIMM
-    /// population — a firmware-`00b` single populated channel reports
-    /// `Single`, an asymmetric `00b` dual reports `DualFlex`); `None` on
-    /// the `/dev/mem` fallback or a pre-24-attr module.
+    /// The trust-resolved channel mode ([`resolve_channel`], the 4-tier
+    /// procedure): the capacity-derived MMIO mode cross-checked against the
+    /// SMBIOS Type 17 topology. `None` on the terminal / all-Na
+    /// degradation.
     pub channel_mode: Option<ChannelMode>,
     /// ECC state (the CAPID0_A bit-17 decode). OQ-10 wire append.
     pub ecc_status: EccStatus,
+    /// The active memory technology (Chunk 2): the MMIO `DDR_TYPE`
+    /// (`MAD_INTER_CHANNEL[2:0]`) else the SMBIOS Type 17 memory type.
+    /// `None` when no source carried a technology.
+    pub memory_tech: Option<MemoryTech>,
+    /// The trust tier of the resolved channel mode (Chunk 2): `L1`
+    /// verified-hardware, `L2` verified-firmware, `L3` override, `L4`
+    /// heuristic, or `None` (terminal). `None` (the `Option` outer) on the
+    /// all-Na degradation.
+    pub channel_trust: Option<ChannelTrust>,
+    /// A human annotation for the resolution (the "untrusted-MMIO
+    /// mismatch" / "heuristic" note); empty for the clean L1 cases.
+    pub channel_annotation: String,
+    /// The SMBIOS-confirmed populated DIMM count.
+    pub dimm_count: u8,
+}
+
+impl IntelReadout {
+    /// The single-source-of-truth channel display label (Chunk 2): the
+    /// trust-resolved [`ChannelMode`] + the DDR5 subchannel form
+    /// ([`ChannelMode::display_label`]) + the "unverified" trust badge for
+    /// the L3 override / L4 heuristic tiers. **Both the TUI and the GUI
+    /// render this exact string**, so they can never disagree on the
+    /// channel mode. `None` when no channel mode resolved.
+    pub fn channel_display_label(&self) -> Option<String> {
+        let mode = self.channel_mode?;
+        let mut label = mode.display_label(self.memory_tech);
+        if matches!(
+            self.channel_trust,
+            Some(ChannelTrust::Override) | Some(ChannelTrust::Heuristic)
+        ) {
+            label.push_str(" [unverified]");
+        }
+        Some(label)
+    }
+}
+
+/// An all-Na (terminal / unsupported) readout: the degraded shape for a
+/// generation the decode does not cover, or a fully degenerate primary
+/// window. Carries no channel claim (mode / tech / trust all `None`).
+fn all_na_readout(channels: Vec<IntelChannel>) -> IntelReadout {
+    IntelReadout {
+        channels,
+        channel_mode: None,
+        ecc_status: EccStatus::Unknown,
+        memory_tech: None,
+        channel_trust: None,
+        channel_annotation: String::new(),
+        dimm_count: 0,
+    }
+}
+
+/// A decoded readout: the resolved channels + the 4-tier channel
+/// resolution (mode / tech / trust / annotation / dimm count) + the ECC
+/// state.
+fn decoded_readout(
+    channels: Vec<IntelChannel>,
+    res: &ChannelResolution,
+    ecc: EccStatus,
+) -> IntelReadout {
+    IntelReadout {
+        channels,
+        channel_mode: res.mode,
+        ecc_status: ecc,
+        memory_tech: res.tech,
+        channel_trust: res.trust,
+        channel_annotation: res.annotation.clone(),
+        dimm_count: res.dimm_count,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2328,13 +2660,19 @@ mod tests {
     /// not-applicable, the CAD bus / voltages not exposed.
     #[test]
     fn acceptance_skylake_readout_pins_the_section_numbers() {
-        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0), None, None);
-        assert_eq!(ro.channels.len(), 2, "Tier 1: two channels");
-        assert_eq!(
-            ro.channel_mode,
-            Some(ChannelMode::DualSymmetric),
-            "MAD_INTER_CHANNEL[1:0] = 00 = dual symmetric"
+        let ro = decode(
+            &acceptance_regs(),
+            IntelGen::Skylake,
+            Some(0),
+            None,
+            None,
+            &SmbiosTopology::empty(),
         );
+        assert_eq!(ro.channels.len(), 2, "Tier 1: two channels");
+        // No `MAD_DIMM_CH0/1` population raws + no SMBIOS -> the 4-tier
+        // terminal state (the acceptance fixture pins the *timings*, not the
+        // channel mode).
+        assert_eq!(ro.channel_mode, None, "no population evidence -> terminal");
         let ch0 = &ro.channels[0];
 
         // --- clocks (v1: mclk only) ------------------------------------
@@ -3505,18 +3843,24 @@ mod tests {
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
         ] {
-            let ro = decode(&tier3_ddr5_condition_regs(), gen, Some(0), None, None);
+            let ro = decode(
+                &tier3_ddr5_condition_regs(),
+                gen,
+                Some(0),
+                None,
+                None,
+                &SmbiosTopology::empty(),
+            );
             assert_eq!(ro.channels.len(), 4, "{gen:?}: DDR5 condition met -> 4 subchannels");
             assert_eq!(
                 ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
                 vec![0, 1, 2, 3],
                 "{gen:?}"
             );
-            assert_eq!(
-                ro.channel_mode,
-                Some(ChannelMode::DualSymmetric),
-                "{gen:?}: MAD_INTER_CHANNEL[1:0] = 00"
-            );
+            // No `MAD_DIMM_CH0/1` population raws + no SMBIOS -> terminal
+            // channel mode (the DDR5 condition drives the *subchannel
+            // geometry*, not the channel mode).
+            assert_eq!(ro.channel_mode, None, "{gen:?}: no population evidence");
             for ch in &ro.channels {
                 // The shared core clock + gear cells (Breakdown §3D,
                 // the profile's GearCap::Gear4).
@@ -3562,17 +3906,26 @@ mod tests {
                 let mut regs = tier3_ddr5_condition_regs();
                 regs.mad_dimm_ch2 = mad2;
                 regs.mad_dimm_ch3 = mad3;
-                let ro = decode(&regs, gen, Some(1), None, None);
+                let ro = decode(
+                    &regs,
+                    gen,
+                    Some(1),
+                    None,
+                    None,
+                    &SmbiosTopology::empty(),
+                );
                 assert_eq!(ro.channels.len(), 2, "{gen:?} ({label}): DDR4 default");
                 assert_eq!(
                     ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
                     vec![0, 2],
                     "{gen:?} ({label}): MC0 subch0 + MC1 subch2"
                 );
+                // No `MAD_DIMM_CH0/1` population raws + no SMBIOS ->
+                // terminal channel mode.
                 assert_eq!(
                     ro.channel_mode,
-                    Some(ChannelMode::DualFlex),
-                    "{gen:?} ({label}): MAD_INTER_CHANNEL[1:0] = 01"
+                    None,
+                    "{gen:?} ({label}): no population evidence"
                 );
                 for ch in &ro.channels {
                     assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?} ({label})");
@@ -3600,7 +3953,7 @@ mod tests {
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
         ] {
-            let ro = decode(&regs, gen, None, None, None);
+            let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
             for ch in &ro.channels {
                 assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
                 assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Four), "{gen:?}");
@@ -3620,7 +3973,7 @@ mod tests {
     /// which cells carry `Value` vs `Na` differs).
     #[test]
     fn decode_tier3_four_channel_readout_bincode_round_trip() {
-        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, Some(0), None, None);
+        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, Some(0), None, None, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 4, "the 4-subchannel DDR5 shape");
         let bytes = bincode::serialize(&ro)
             .expect("IntelReadout must serialize (no-panic contract)");
@@ -3656,7 +4009,7 @@ mod tests {
             Some(0x0001_0012),
             "Example C register settings: 133.3333 MHz base, ratio 18, Gear 2"
         );
-        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, None, None, None);
+        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 4, "DDR5 condition met -> 4 subchannels");
         for ch in &ro.channels {
             // Step 1 (memory clock): 18 x 133.3333 MHz = 2400 MHz.
@@ -3704,7 +4057,7 @@ mod tests {
             },
             ..IntelImcRegs::default()
         };
-        let ro = decode(&regs, IntelGen::AlderLake, None, None, None);
+        let ro = decode(&regs, IntelGen::AlderLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(
             ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
             vec![0, 2],
@@ -3776,7 +4129,7 @@ mod tests {
             mad_dimm_ch3: Some(1),
             ..IntelImcRegs::default()
         };
-        let ro = decode(&regs, IntelGen::AlderLake, None, None, None);
+        let ro = decode(&regs, IntelGen::AlderLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 4, "DDR5 condition met -> 4 subchannels");
         assert_eq!(
             ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
@@ -3883,7 +4236,7 @@ mod tests {
             for (label, fill) in fills {
                 let regs = IntelImcRegs::from_wide_reader(fill);
                 assert!(regs.primary_window_degenerate(), "{gen:?} ({label})");
-                let ro = decode(&regs, gen, None, None, None);
+                let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
                 assert_eq!(ro.channels.len(), 4, "{gen:?} ({label})");
                 for ch in &ro.channels {
                     assert_eq!(
@@ -3946,7 +4299,7 @@ mod tests {
                 }
             });
             assert!(!regs.primary_window_degenerate(), "{gen:?}");
-            let ro = decode(&regs, gen, None, None, None);
+            let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
             assert_eq!(ro.channels.len(), 2, "{gen:?}: DDR4 default (MAD raws zero)");
             for ch in &ro.channels {
                 assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
@@ -3966,7 +4319,7 @@ mod tests {
     /// whole channel to honest `Na` — no panic, no garbage values.
     #[test]
     fn decode_all_absent_degrades_without_panic() {
-        let ro = decode(&IntelImcRegs::default(), IntelGen::Skylake, None, None, None);
+        let ro = decode(&IntelImcRegs::default(), IntelGen::Skylake, None, None, None, &SmbiosTopology::empty());
         for ch in &ro.channels {
             assert!(ch.clocks.mclk_mhz.is_na(), "{:?}", ch.clocks.mclk_mhz);
             for s in [&ch.clocks.uclk_mhz, &ch.clocks.fclk_mhz] {
@@ -4044,7 +4397,7 @@ mod tests {
     fn decode_per_register_containment() {
         let mut regs = acceptance_regs();
         regs.ch0.tc_rap = None;
-        let ro = decode(&regs, IntelGen::Skylake, None, None, None);
+        let ro = decode(&regs, IntelGen::Skylake, None, None, None, &SmbiosTopology::empty());
         let ch0 = &ro.channels[0];
 
         for s in [&ch0.timings.ras, &ch0.timings.rrds, &ch0.timings.rtp, &ch0.timings.faw] {
@@ -4081,7 +4434,7 @@ mod tests {
         regs.ch0.tc_dbp = Some(0);
         regs.ch0.tc_rfp = Some(0);
         regs.ch1.tc_rap = Some(0);
-        let ro = decode(&regs, IntelGen::Skylake, None, None, None);
+        let ro = decode(&regs, IntelGen::Skylake, None, None, None, &SmbiosTopology::empty());
 
         let ch0 = &ro.channels[0];
         for s in [
@@ -4124,7 +4477,7 @@ mod tests {
             (IntelGen::TigerLake, 2),
             (IntelGen::Unrecognized, 2),
         ] {
-            let ro = decode(&regs, gen, None, None, None);
+            let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
             assert_eq!(ro.channels.len(), usize::from(count), "{gen:?}");
             for (i, ch) in ro.channels.iter().enumerate() {
                 assert_eq!(ch.index, i as u8, "{gen:?}");
@@ -4273,10 +4626,10 @@ mod tests {
     /// bit 16 set → gear Two → uclk = mclk / 2.
     #[test]
     fn decode_rocket_lake_is_tier1_map_plus_gear() {
-        let tier1 = decode(&acceptance_regs(), IntelGen::Skylake, None, None, None);
+        let tier1 = decode(&acceptance_regs(), IntelGen::Skylake, None, None, None, &SmbiosTopology::empty());
         let mut regs = acceptance_regs();
         regs.mcbios_req = Some(0x0001_0012); // ratio 18 + bit 16 (gear 2)
-        let rocket = decode(&regs, IntelGen::RocketLake, None, None, None);
+        let rocket = decode(&regs, IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(rocket.channels.len(), 2, "Rocket Lake: two channels");
         for (t, r) in tier1.channels.iter().zip(&rocket.channels) {
             // Every shared-map cell is identical for the same raws.
@@ -4303,12 +4656,12 @@ mod tests {
     /// mclk, gear, and uclk to `Na(ParseError)` (never a bogus clock).
     #[test]
     fn decode_rocket_lake_gear_containment() {
-        let sync = decode(&acceptance_regs(), IntelGen::RocketLake, None, None, None); // 0x12 → 00b
+        let sync = decode(&acceptance_regs(), IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty()); // 0x12 → 00b
         for ch in &sync.channels {
             assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
             assert_eq!(ch.clocks.uclk_mhz, Section::Value(2400.0), "uclk = mclk (gear 1)");
         }
-        let absent = decode(&IntelImcRegs::default(), IntelGen::RocketLake, None, None, None);
+        let absent = decode(&IntelImcRegs::default(), IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
         for ch in &absent.channels {
             assert!(matches!(
                 ch.clocks.mclk_mhz,
@@ -4360,7 +4713,7 @@ mod tests {
     fn tier2_example_a_gear1_100_mhz_base_end_to_end() {
         let mut regs = acceptance_regs();
         regs.mcbios_req = Some(0x0000_0110);
-        let ro = decode(&regs, IntelGen::RocketLake, None, None, None);
+        let ro = decode(&regs, IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
             // §4 Example A numbers, pinned exactly.
@@ -4397,7 +4750,7 @@ mod tests {
     fn tier2_example_d_gear2_100_mhz_base_end_to_end() {
         let mut regs = acceptance_regs();
         regs.mcbios_req = Some(0x0001_011E);
-        let ro = decode(&regs, IntelGen::RocketLake, None, None, None);
+        let ro = decode(&regs, IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
             // §4 Example D numbers, pinned exactly.
@@ -4438,7 +4791,7 @@ mod tests {
         assert_eq!(turnaround_quartet(0x0000_0308), [8, 12, 0, 0], "TC_WRRD");
         assert_eq!(turnaround_quartet(0x0040_C204), [4, 8, 12, 16], "TC_WRWR");
 
-        let ro = decode(&regs, IntelGen::RocketLake, None, None, None);
+        let ro = decode(&regs, IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
             // TC_RDRD: the full sg / dg / dr / dd quartet.
@@ -4463,7 +4816,7 @@ mod tests {
         }
         // Shared-map proof: identical raws decode identically under
         // Tier 1 (only the gear cells differ — pinned above).
-        let tier1 = decode(&regs, IntelGen::Skylake, None, None, None);
+        let tier1 = decode(&regs, IntelGen::Skylake, None, None, None, &SmbiosTopology::empty());
         for (r, t) in ro.channels.iter().zip(&tier1.channels) {
             assert_eq!(r.timings, t.timings, "all shared-map timings identical");
         }
@@ -4556,9 +4909,9 @@ mod tests {
     #[test]
     fn decode_readout_bincode_round_trip() {
         for ro in [
-            decode(&acceptance_regs(), IntelGen::Skylake, Some(1), None, None),
-            decode(&IntelImcRegs::default(), IntelGen::Skylake, None, None, None),
-            decode(&acceptance_regs(), IntelGen::AlderLake, None, None, None),
+            decode(&acceptance_regs(), IntelGen::Skylake, Some(1), None, None, &SmbiosTopology::empty()),
+            decode(&IntelImcRegs::default(), IntelGen::Skylake, None, None, None, &SmbiosTopology::empty()),
+            decode(&acceptance_regs(), IntelGen::AlderLake, None, None, None, &SmbiosTopology::empty()),
         ] {
             let bytes = bincode::serialize(&ro)
                 .expect("IntelReadout must serialize (no-panic contract)");
@@ -5068,6 +5421,10 @@ mod tests {
             channels: vec![a, b],
             channel_mode: None,
             ecc_status: EccStatus::Unknown,
+            memory_tech: None,
+            channel_trust: None,
+            channel_annotation: String::new(),
+            dimm_count: 0,
         };
         assert_eq!(ro.channels.len(), 2);
         assert_eq!(ro.channels[0].index, 0);
@@ -5087,6 +5444,11 @@ mod tests {
             ],
             channel_mode: Some(ChannelMode::DualFlex),
             ecc_status: EccStatus::CapableButDisabled,
+            // The Chunk 2 fields: a DDR4 Flex dual, verified-hardware trust.
+            memory_tech: Some(MemoryTech::Ddr4),
+            channel_trust: Some(ChannelTrust::VerifiedHardware),
+            channel_annotation: String::new(),
+            dimm_count: 2,
         };
 
         let bytes = bincode::serialize(&ro)
@@ -5095,6 +5457,10 @@ mod tests {
             bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
         assert_eq!(ro, back);
         assert_eq!(back.ecc_status, EccStatus::CapableButDisabled);
+        // The Chunk 2 fields round-trip too.
+        assert_eq!(back.memory_tech, Some(MemoryTech::Ddr4));
+        assert_eq!(back.channel_trust, Some(ChannelTrust::VerifiedHardware));
+        assert_eq!(back.dimm_count, 2);
 
         // the fully degraded readout (every channel all-Na) is wire-safe
         // too
@@ -5105,6 +5471,10 @@ mod tests {
             ],
             channel_mode: None,
             ecc_status: EccStatus::Unknown,
+            memory_tech: None,
+            channel_trust: None,
+            channel_annotation: String::new(),
+            dimm_count: 0,
         };
         let bytes = bincode::serialize(&all_na)
             .expect("IntelReadout must serialize (no-panic contract)");
@@ -5129,28 +5499,35 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // ChannelMode (MAD_INTER_CHANNEL[1:0]).
+    // ChannelMode / MemoryTech (the capacity-derived + 4-tier model).
     // -----------------------------------------------------------------
 
-    /// `from_raw` maps the 2-bit CHAN_MODE field to its variants; the
-    /// reserved encoding `11` degrades to `None`; high bits are masked.
+    /// `MemoryTech::from_mad_bits` decodes the `DDR_TYPE` field
+    /// (`MAD_INTER_CHANNEL[2:0]`): 000=DDR4, 001=DDR3, 010=LPDDR4,
+    /// 011=LPDDR5, 100=DDR5; reserved (5-7) → Unknown; high bits masked.
     #[test]
-    fn channel_mode_from_raw_maps_all_encodings() {
-        assert_eq!(ChannelMode::from_raw(0x0), Some(ChannelMode::DualSymmetric));
-        assert_eq!(ChannelMode::from_raw(0x1), Some(ChannelMode::DualFlex));
-        assert_eq!(ChannelMode::from_raw(0x2), Some(ChannelMode::Single));
-        assert_eq!(ChannelMode::from_raw(0x3), None, "11 is reserved");
-        // High bits must be masked away (only bits [1:0] are read).
-        assert_eq!(
-            ChannelMode::from_raw(0xFFFF_FFFE),
-            Some(ChannelMode::Single),
-            "bits [1:0] only"
-        );
-        assert_eq!(
-            ChannelMode::from_raw(0xFFFF_FFFF),
-            None,
-            "reserved, even with high bits set"
-        );
+    fn memory_tech_from_mad_bits() {
+        assert_eq!(MemoryTech::from_mad_bits(0x0), MemoryTech::Ddr4);
+        assert_eq!(MemoryTech::from_mad_bits(0x1), MemoryTech::Ddr3);
+        assert_eq!(MemoryTech::from_mad_bits(0x2), MemoryTech::Lpddr4);
+        assert_eq!(MemoryTech::from_mad_bits(0x3), MemoryTech::Lpddr5);
+        assert_eq!(MemoryTech::from_mad_bits(0x4), MemoryTech::Ddr5);
+        assert_eq!(MemoryTech::from_mad_bits(0x5), MemoryTech::Unknown);
+        assert_eq!(MemoryTech::from_mad_bits(0x6), MemoryTech::Unknown);
+        assert_eq!(MemoryTech::from_mad_bits(0x7), MemoryTech::Unknown);
+        // Only bits [2:0] are read (the rest is masked away).
+        assert_eq!(MemoryTech::from_mad_bits(0xFFFF_FFF4), MemoryTech::Ddr5);
+    }
+
+    /// `MemoryTech::from_smbios_type` decodes the SMBIOS Type 17
+    /// memory-type byte (offset `0x12`): 0x1A=DDR4, 0x22=DDR5; anything
+    /// else → None.
+    #[test]
+    fn memory_tech_from_smbios_type() {
+        assert_eq!(MemoryTech::from_smbios_type(0x1A), Some(MemoryTech::Ddr4));
+        assert_eq!(MemoryTech::from_smbios_type(0x22), Some(MemoryTech::Ddr5));
+        assert_eq!(MemoryTech::from_smbios_type(0x00), None);
+        assert_eq!(MemoryTech::from_smbios_type(0xFF), None);
     }
 
     /// The full channel label + the short "Mode:" label.
@@ -5165,105 +5542,293 @@ mod tests {
         assert_eq!(ChannelMode::Single.mode_label(), "N/A");
     }
 
-    /// The population cross-check decodes the SKL `MAD_DIMM_CHx`
-    /// slot-size fields (the mainline `ie31200` `skl_cfg` layout: DIMM 0
-    /// = bits [5:0], DIMM 1 = bits [21:16], 1 GiB index each) and sums
-    /// them; absent raws stay absent.
+    /// The DDR5 display label: a dual-channel DDR5 config renders
+    /// "Dual-Channel (4x 32-bit Subchannels)" — never "quad-channel"
+    /// (research: a 128-bit aggregate bus is dual-channel). DDR4 / unknown
+    /// / single keep their labels.
     #[test]
-    fn mad_dimm_capacity_gib_decodes_both_slots() {
+    fn channel_mode_display_label_ddr5_subchannels_not_quad() {
+        assert_eq!(
+            ChannelMode::DualSymmetric.display_label(Some(MemoryTech::Ddr5)),
+            "Dual-Channel (4x 32-bit Subchannels)"
+        );
+        assert_eq!(
+            ChannelMode::DualFlex.display_label(Some(MemoryTech::Ddr5)),
+            "Dual-Channel (4x 32-bit Subchannels)"
+        );
+        assert_eq!(
+            ChannelMode::DualSymmetric.display_label(Some(MemoryTech::Ddr4)),
+            "Dual-Channel (Symmetric)"
+        );
+        assert_eq!(
+            ChannelMode::DualSymmetric.display_label(None),
+            "Dual-Channel (Symmetric)"
+        );
+        assert_eq!(
+            ChannelMode::Single.display_label(Some(MemoryTech::Ddr5)),
+            "Single-Channel"
+        );
+    }
+
+    /// The corrected 0.5 GiB DIMM-size layout: `DIMM_L_SIZE [6:0]` +
+    /// `DIMM_S_SIZE [22:16]`, each a 7-bit index × 0.5 GiB (a 16 GiB DIMM
+    /// is index 32, not the pre-Chunk-2 1 GiB index 16).
+    #[test]
+    fn mad_dimm_capacity_gib_0_5gib_layout() {
         assert_eq!(mad_dimm_capacity_gib(None), None);
-        assert_eq!(mad_dimm_capacity_gib(Some(0x0)), Some(0));
-        // 16 GiB in slot 0 (index 16 in the low field).
-        assert_eq!(mad_dimm_capacity_gib(Some(0x10)), Some(16));
-        // 8 GiB in slot 0 + 16 GiB in slot 1 (16 << 16).
-        assert_eq!(mad_dimm_capacity_gib(Some(0x10_0008)), Some(24));
+        assert_eq!(mad_dimm_capacity_gib(Some(0x0)), Some(0.0));
+        // 16 GiB in slot 0 (index 32: 32 * 0.5 = 16 GiB).
+        assert_eq!(mad_dimm_capacity_gib(Some(0x20)), Some(16.0));
+        // 8 GiB slot 0 (index 16) + 16 GiB slot 1 (index 32 << 16).
+        assert_eq!(mad_dimm_capacity_gib(Some(0x20_0010)), Some(24.0));
+        // 32 GiB slot 0 (index 64) alone.
+        assert_eq!(mad_dimm_capacity_gib(Some(0x40)), Some(32.0));
     }
 
-    /// The population cross-check demotes a firmware-`00b`
-    /// `DualSymmetric` to the mode the population actually shows:
-    /// exactly one populated channel → `Single`; both populated with
-    /// unequal capacities → `DualFlex`; equal capacities or no
-    /// population evidence → unchanged. `DualFlex` / `Single` / `None`
-    /// pass through untouched.
+    /// The capacity-derived mode table (Chunk 2): CH_S==0 → Single;
+    /// CH_S>0 && ==CH_L → DualSymmetric; 0<CH_S<CH_L → DualFlex;
+    /// ill-formed (ch_s>ch_l, negative, non-finite) → None.
     #[test]
-    fn channel_mode_with_population_demotes_per_populated_channels() {
-        // 16 GiB on channel 0 alone (the canonical 1-DIMM shape):
+    fn channel_mode_from_capacity_table() {
+        assert_eq!(channel_mode_from_capacity(0.0, 16.0), Some(ChannelMode::Single));
+        assert_eq!(channel_mode_from_capacity(0.0, 32.0), Some(ChannelMode::Single));
         assert_eq!(
-            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(0x10), Some(0x0)),
-            Some(ChannelMode::Single)
-        );
-        // 16 GiB on channel 1 alone:
-        assert_eq!(
-            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(0x0), Some(0x10)),
-            Some(ChannelMode::Single)
-        );
-        // True symmetric dual keeps DualSymmetric:
-        assert_eq!(
-            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(5), Some(5)),
+            channel_mode_from_capacity(16.0, 16.0),
             Some(ChannelMode::DualSymmetric)
         );
-        // The live 6600T asymmetric pair (8 + 16 GiB — this box's actual
-        // 24 GiB configuration): 00b demotes to DualFlex.
         assert_eq!(
-            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(0x8), Some(0x10)),
+            channel_mode_from_capacity(32.0, 32.0),
+            Some(ChannelMode::DualSymmetric)
+        );
+        assert_eq!(channel_mode_from_capacity(8.0, 16.0), Some(ChannelMode::DualFlex));
+        assert_eq!(
+            channel_mode_from_capacity(16.0, 32.0),
             Some(ChannelMode::DualFlex)
         );
-        // No population evidence (both raws zero): keep the decode.
-        assert_eq!(
-            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(0x0), Some(0x0)),
-            Some(ChannelMode::DualSymmetric)
-        );
-        // Absent raw (pre-24-attr module / one bad read): keep the decode.
-        assert_eq!(
-            channel_mode_with_population(Some(ChannelMode::DualSymmetric), None, None),
-            Some(ChannelMode::DualSymmetric)
-        );
-        assert_eq!(
-            channel_mode_with_population(Some(ChannelMode::DualSymmetric), Some(0x10), None),
-            Some(ChannelMode::DualSymmetric)
-        );
-        // DualFlex / Single / None pass through unchanged.
-        assert_eq!(
-            channel_mode_with_population(Some(ChannelMode::DualFlex), Some(5), Some(0)),
-            Some(ChannelMode::DualFlex)
-        );
-        assert_eq!(
-            channel_mode_with_population(Some(ChannelMode::Single), Some(0x10), Some(0x10)),
-            Some(ChannelMode::Single)
-        );
-        assert_eq!(channel_mode_with_population(None, Some(0x10), None), None);
+        assert_eq!(channel_mode_from_capacity(16.0, 8.0), None);
+        assert_eq!(channel_mode_from_capacity(-1.0, 16.0), None);
+        assert_eq!(channel_mode_from_capacity(f64::NAN, 16.0), None);
+        assert_eq!(channel_mode_from_capacity(16.0, f64::INFINITY), None);
     }
 
-    /// End to end: the Tier-1 decode with a firmware-`00b`
-    /// `MAD_INTER_CHANNEL` and the box's live asymmetric raws
-    /// (8 + 16 GiB) reports `DualFlex`; a single populated channel
-    /// reports `Single`; reserved `11` and absent raws keep their
-    /// pre-cross-check values.
+    /// `mmio_channel_mode`: both channel sums readable + at least one
+    /// populated → the capacity-derived mode; both absent or both zero →
+    /// `None` (the MMIO is "blocked" → `resolve_channel` falls to SMBIOS).
     #[test]
-    fn decode_tier1_channel_mode_population_cross_check() {
-        // The live i5-6600T raws (the 24-attr module capture):
-        // 0x8010 → bits [1:0] = 00b; 8 GiB on ch0 + 16 GiB on ch1.
-        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0x8010), Some(0x08), Some(0x10));
+    fn mmio_channel_mode_blocked_and_populated() {
+        // 2×16 GiB (index 32 each) -> DualSymmetric.
         assert_eq!(
-            ro.channel_mode,
-            Some(ChannelMode::DualFlex),
-            "00b + asymmetric 8 + 16 GiB demotes to DualFlex"
+            mmio_channel_mode(Some(0x20), Some(0x20)),
+            Some(ChannelMode::DualSymmetric)
         );
-        // Single populated channel (16 GiB on ch0) → Single:
-        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0x0), Some(0x10), Some(0x0));
+        // 8 + 16 GiB (index 16 + 32) -> DualFlex.
         assert_eq!(
-            ro.channel_mode,
+            mmio_channel_mode(Some(0x10), Some(0x20)),
+            Some(ChannelMode::DualFlex)
+        );
+        // 16 GiB on ch0 alone -> Single.
+        assert_eq!(
+            mmio_channel_mode(Some(0x20), Some(0x0)),
+            Some(ChannelMode::Single)
+        );
+        // Both absent -> blocked (None).
+        assert_eq!(mmio_channel_mode(None, None), None);
+        // Both zero (no population) -> blocked (None).
+        assert_eq!(mmio_channel_mode(Some(0x0), Some(0x0)), None);
+    }
+
+    /// The IMC base selection is keyed on the CPU generation (NOT the
+    /// overlapping PCI Device-ID ranges): 12th-gen+ → 0xd800, 6th-11th
+    /// gen → 0x5000 (the kernel module uses the same set).
+    #[test]
+    fn imc_base_for_selects_by_generation() {
+        for gen in [
+            IntelGen::AlderLake,
+            IntelGen::RaptorLake,
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
+            IntelGen::LunarLake,
+            IntelGen::CoreSeries1Mobile,
+        ] {
+            assert_eq!(imc_base_for(gen), 0xD800, "{gen:?}");
+            assert!(is_12th_gen_plus(gen), "{gen:?}");
+        }
+        for gen in [
+            IntelGen::Skylake,
+            IntelGen::KabyLake,
+            IntelGen::CoffeeLake,
+            IntelGen::CometLake,
+            IntelGen::IceLake,
+            IntelGen::TigerLake,
+            IntelGen::RocketLake,
+            IntelGen::Unrecognized,
+        ] {
+            assert_eq!(imc_base_for(gen), 0x5000, "{gen:?}");
+            assert!(!is_12th_gen_plus(gen), "{gen:?}");
+        }
+    }
+
+    /// A synthetic SMBIOS topology fixture (the 4-tier tests).
+    fn smbios_topology(
+        populated: u8,
+        derived: DerivedMode,
+        tech: Option<MemoryTech>,
+    ) -> SmbiosTopology {
+        SmbiosTopology {
+            populated_count: populated,
+            dimm_sizes: (0..populated).map(|_| 16384).collect(),
+            memory_type: tech,
+            locators: (0..populated).map(|i| format!("Ch{i}")).collect(),
+            derived_mode: derived,
+        }
+    }
+
+    /// The 4-tier trust procedure, one arm per tier (L1 verified-hardware,
+    /// L2 verified-firmware, L3 override, L4 heuristic, terminal):
+    /// `resolve_channel` pins `(mode, trust, annotation)` for each.
+    #[test]
+    fn resolve_channel_four_tiers_l1_l4() {
+        // L1: MMIO dual (the hardware authority), no annotation.
+        let r = resolve_channel(
+            Some(ChannelMode::DualSymmetric),
+            Some(MemoryTech::Ddr4),
+            &smbios_topology(2, DerivedMode::Dual, Some(MemoryTech::Ddr4)),
+        );
+        assert_eq!(r.mode, Some(ChannelMode::DualSymmetric));
+        assert_eq!(r.trust, Some(ChannelTrust::VerifiedHardware));
+        assert_eq!(r.tech, Some(MemoryTech::Ddr4));
+        assert_eq!(r.annotation, "");
+        assert_eq!(r.dimm_count, 2);
+
+        // L3 (the safety override): MMIO single + SMBIOS 2 DIMMs across
+        // channels -> Dual + Override + the untrusted-MMIO annotation.
+        let r = resolve_channel(
             Some(ChannelMode::Single),
-            "00b + one populated channel demotes to Single"
+            None,
+            &smbios_topology(2, DerivedMode::Dual, None),
         );
-        // Symmetric 16 + 16 keeps DualSymmetric:
-        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0x0), Some(0x10), Some(0x10));
+        assert_eq!(r.mode, Some(ChannelMode::DualSymmetric));
+        assert_eq!(r.trust, Some(ChannelTrust::Override));
+        assert!(r.annotation.contains("Override"), "{:?}", r.annotation);
+        assert!(r.annotation.contains("2 DIMMs"), "{:?}", r.annotation);
+
+        // L1 single: MMIO single + SMBIOS agrees (1 DIMM) -> Single, no
+        // override.
+        let r = resolve_channel(
+            Some(ChannelMode::Single),
+            None,
+            &smbios_topology(1, DerivedMode::Single, None),
+        );
+        assert_eq!(r.mode, Some(ChannelMode::Single));
+        assert_eq!(r.trust, Some(ChannelTrust::VerifiedHardware));
+        assert_eq!(r.annotation, "");
+
+        // L2: MMIO blocked (None) + SMBIOS 2 DIMMs across channels -> Dual,
+        // VerifiedFirmware.
+        let r = resolve_channel(
+            None,
+            Some(MemoryTech::Ddr5),
+            &smbios_topology(2, DerivedMode::Dual, Some(MemoryTech::Ddr5)),
+        );
+        assert_eq!(r.mode, Some(ChannelMode::DualSymmetric));
+        assert_eq!(r.trust, Some(ChannelTrust::VerifiedFirmware));
+        assert_eq!(r.tech, Some(MemoryTech::Ddr5));
+        assert!(r.annotation.contains("MMIO Inaccessible"));
+
+        // L2 single: MMIO blocked + SMBIOS 2 DIMMs on the same channel ->
+        // Single, VerifiedFirmware.
+        let r = resolve_channel(None, None, &smbios_topology(2, DerivedMode::Single, None));
+        assert_eq!(r.mode, Some(ChannelMode::Single));
+        assert_eq!(r.trust, Some(ChannelTrust::VerifiedFirmware));
+
+        // L4: MMIO blocked + SMBIOS ambiguous locators -> Dual heuristic.
+        let r = resolve_channel(None, None, &smbios_topology(2, DerivedMode::Ambiguous, None));
+        assert_eq!(r.mode, Some(ChannelMode::DualSymmetric));
+        assert_eq!(r.trust, Some(ChannelTrust::Heuristic));
+        assert!(r.annotation.contains("Heuristic"));
+
+        // Terminal: MMIO blocked + no SMBIOS population -> None mode,
+        // ChannelTrust::None.
+        let r = resolve_channel(None, None, &SmbiosTopology::empty());
+        assert_eq!(r.mode, None);
+        assert_eq!(r.trust, Some(ChannelTrust::None));
+        assert!(r.annotation.contains("Error"));
+    }
+
+    /// The exact user bug, end to end: a dual-channel 2×16 GiB system whose
+    /// (old / mis-located) MMIO decodes Single (16 GiB on ch0, 0 on ch1),
+    /// while SMBIOS Type 17 confirms two populated DIMMs across channels
+    /// A/B. The L3 safety override must report Dual — not Single — with the
+    /// Override trust tier and the single-source display label.
+    #[test]
+    fn decode_l3_override_single_mmio_dual_smbios() {
+        let smbios = smbios_topology(2, DerivedMode::Dual, Some(MemoryTech::Ddr4));
+        // 16 GiB on ch0 (index 32) + 0 on ch1 -> MMIO Single.
+        let ro = decode(
+            &acceptance_regs(),
+            IntelGen::AlderLake,
+            Some(0x0), // DDR_TYPE = DDR4
+            Some(0x20),
+            Some(0x0),
+            &smbios,
+        );
+        assert_eq!(
+            ro.channel_mode,
+            Some(ChannelMode::DualSymmetric),
+            "L3 override: MMIO single + SMBIOS dual -> Dual"
+        );
+        assert_eq!(ro.channel_trust, Some(ChannelTrust::Override));
+        assert_eq!(ro.memory_tech, Some(MemoryTech::Ddr4));
+        assert_eq!(ro.dimm_count, 2);
+        assert!(ro.channel_annotation.contains("Override"));
+        // The single source of truth both frontends render:
+        assert_eq!(
+            ro.channel_display_label(),
+            Some("Dual-Channel (Symmetric) [unverified]".to_owned())
+        );
+    }
+
+    /// End to end (the 4-tier model): the Tier-1 decode resolves the
+    /// channel mode through `resolve_channel`. A dual MMIO decode
+    /// (2×16 GiB) is L1 verified-hardware; a single MMIO decode (16 GiB on
+    /// ch0) with no SMBIOS is L1 verified-single; absent / zero MMIO raws
+    /// with no SMBIOS is the terminal `None`.
+    #[test]
+    fn decode_tier1_channel_mode_4_tier() {
+        // 2×16 GiB (index 32 each) -> DualSymmetric, L1.
+        let ro = decode(
+            &acceptance_regs(),
+            IntelGen::Skylake,
+            Some(0x0),
+            Some(0x20),
+            Some(0x20),
+            &SmbiosTopology::empty(),
+        );
         assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));
-        // Reserved 11 stays None regardless of population:
-        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0x3), Some(0x10), Some(0x0));
-        assert_eq!(ro.channel_mode, None, "reserved encoding is not cross-checked");
-        // Absent raws keep the raw 00b decode (no population evidence):
-        let ro = decode(&acceptance_regs(), IntelGen::Skylake, Some(0x0), None, None);
-        assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));
+        assert_eq!(ro.channel_trust, Some(ChannelTrust::VerifiedHardware));
+
+        // 16 GiB on ch0 alone -> Single, L1 verified-single.
+        let ro = decode(
+            &acceptance_regs(),
+            IntelGen::Skylake,
+            Some(0x0),
+            Some(0x20),
+            Some(0x0),
+            &SmbiosTopology::empty(),
+        );
+        assert_eq!(ro.channel_mode, Some(ChannelMode::Single));
+        assert_eq!(ro.channel_trust, Some(ChannelTrust::VerifiedHardware));
+
+        // Absent MMIO raws + no SMBIOS -> terminal None.
+        let ro = decode(
+            &acceptance_regs(),
+            IntelGen::Skylake,
+            Some(0x0),
+            None,
+            None,
+            &SmbiosTopology::empty(),
+        );
+        assert_eq!(ro.channel_mode, None);
+        assert_eq!(ro.channel_trust, Some(ChannelTrust::None));
     }
 }

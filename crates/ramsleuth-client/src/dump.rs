@@ -577,6 +577,10 @@ mod tests {
             ],
             channel_mode: Some(ChannelMode::DualFlex),
             ecc_status: EccStatus::Unknown,
+            memory_tech: None,
+            channel_trust: None,
+            channel_annotation: String::new(),
+            dimm_count: 0,
         }
     }
 

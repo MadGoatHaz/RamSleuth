@@ -282,12 +282,25 @@ fn intel_branch(cpu: &CpuInfo) -> TelemetryResult<IntelReadout> {
     //    from a mismatched register map).
     intel_readout::gen_gate(gen)?;
 
+    // Chunk 2: the SMBIOS Type 17 topology (the 4-tier trust procedure's
+    // firmware cross-check) — collected once and supplied to the decode on
+    // BOTH the sysfs and the `/dev/mem` fallback arms (the fallback path
+    // benefits from the same cross-check, plan hard-constraint #5).
+    // No-panic: a missing `dmi` dir yields the empty topology.
+    let smbios = crate::intel_smbios::collect();
+
     // 4. Primary: the `ramsleuth_intel` sysfs kobject (plan §3.5).
     match intel_sysfs::acquire() {
         // The raw set feeds the same pure decode core as the fallback.
         Ok(sysfs) => {
-            let mut ro =
-                intel_readout::decode(&sysfs.regs, gen, sysfs.mad_inter_channel, sysfs.mad_dimm_ch0, sysfs.mad_dimm_ch1);
+            let mut ro = intel_readout::decode(
+                &sysfs.regs,
+                gen,
+                sysfs.mad_inter_channel,
+                sysfs.mad_dimm_ch0,
+                sysfs.mad_dimm_ch1,
+                &smbios,
+            );
             // ECC capability from the capid0a attribute (the sysfs-only
             // decode input; the /dev/mem fallback has none -> Unknown).
             ro.ecc_status = intel_readout::decode_ecc_status(sysfs.capid0a);
@@ -298,7 +311,7 @@ fn intel_branch(cpu: &CpuInfo) -> TelemetryResult<IntelReadout> {
         // Any other sysfs outcome is reported as-is.
         Err(TelemetryError::DriverMissing { .. }) => {
             let bar = intel_mchbar::acquire()?;
-            intel_readout::read_intel(&bar)
+            intel_readout::read_intel(&bar, &smbios)
         }
         Err(err) => Err(err),
     }

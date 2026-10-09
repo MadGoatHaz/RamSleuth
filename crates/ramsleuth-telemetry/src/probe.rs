@@ -1456,7 +1456,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     use crate::amd_readout::EccStatus;
-    use crate::intel_readout::{ChannelMode, IntelChannel};
+    use crate::intel_readout::{ChannelMode, ChannelTrust, IntelChannel, MemoryTech};
 
     /// (4) The sample (fully-populated) [`ProbeReport`] renders to the
     /// six issue-template sections with the expected headers + key
@@ -1628,6 +1628,10 @@ mod tests {
                     channels: vec![populated_channel(0), populated_channel(1)],
                     channel_mode: Some(ChannelMode::DualSymmetric),
                     ecc_status: EccStatus::Unknown,
+                    memory_tech: Some(MemoryTech::Ddr4),
+                    channel_trust: Some(ChannelTrust::VerifiedHardware),
+                    channel_annotation: String::new(),
+                    dimm_count: 2,
                 }),
                 spd: Vec::new(),
                 platform: SystemPlatform {

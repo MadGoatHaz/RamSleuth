@@ -143,7 +143,7 @@ use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
 use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode, EccStatus, MemoryChannelMode};
 use ramsleuth_telemetry::cpuid::CpuVendor;
 use ramsleuth_telemetry::error::Section;
-use ramsleuth_telemetry::intel_readout::ChannelMode;
+use ramsleuth_telemetry::intel_readout::{ChannelMode, ChannelTrust};
 use ramsleuth_telemetry::probe::render_probe_report_md;
 use ramsleuth_telemetry::spd_decode::SpdModule;
 use ramsleuth_telemetry::{ProbeReport, SystemMemoryTelemetry, SystemPlatform};
@@ -1227,15 +1227,14 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
     if let Some(speed) = speed {
         line.push_str(&format!(" {speed}"));
     }
-    // Hardware-preferred channel label: the Intel `MAD_INTER_CHANNEL`
-    // mode (a Flex-Mode box can be Dual-Flex with one bound SPD), the
-    // AMD UMC-synthesized mode (its `Unknown` degradation renders the
-    // honest `N/A`), the SPD-count label only when neither readout
-    // carries one.
+    // Single source of truth (Chunk 2): the Intel readout's trust-resolved
+    // channel label ([`IntelReadout::channel_display_label`] — the same
+    // string the TUI renders, so the frontends agree), the AMD
+    // UMC-synthesized mode on AMD hosts, the SPD-count label only when
+    // neither readout carries a resolved mode.
     let channel = match (t.intel.value(), t.amd.value()) {
         (Some(ro), _) => ro
-            .channel_mode
-            .map(|m| m.label().to_owned())
+            .channel_display_label()
             .unwrap_or_else(|| channel_mode(t.dimm_sizes.len())),
         (None, Some(ro)) => match ro.channel_mode {
             MemoryChannelMode::Unknown => "N/A".to_owned(),
@@ -1327,20 +1326,35 @@ fn sync_mode(t: &SystemMemoryTelemetry, units: &Units) -> (String, Option<egui::
     }
 }
 
-/// Line 3's mode segment over an Intel readout (the hardware-preferred
-/// `MAD_INTER_CHANNEL` channel mode): `DualSymmetric` → `Interleaved`
-/// (CYAN, the default), `DualFlex` → `Flex` (AMBER, the asymmetric
-/// configuration worth flagging), `Single` → `N/A` (the default color —
-/// a single channel has no interleave mode; the channel slot carries
-/// `Single-Channel`). A non-Intel / no-mode readout yields `None` and
-/// the caller falls back to the AMD sync mode (or the honest `N/A`).
+/// Line 3's mode segment over an Intel readout (the trust-resolved
+/// `channel_mode`): `DualSymmetric` → `Interleaved` (CYAN, the default),
+/// `DualFlex` → `Flex` (AMBER, the asymmetric configuration worth
+/// flagging), `Single` → `N/A` (the default color — a single channel has
+/// no interleave mode; the channel slot carries `Single-Channel`). The
+/// Chunk 2 trust badge rides the label: the L3 override / L4 heuristic
+/// (unverified) tiers append `(unverified)` and render AMBER; the L2
+/// firmware-verified tier appends `(firmware)`. A non-Intel / no-mode
+/// readout yields `None` and the caller falls back to the AMD sync mode
+/// (or the honest `N/A`).
 fn intel_mode(t: &SystemMemoryTelemetry) -> Option<(String, Option<egui::Color32>)> {
-    let mode = t.intel.value()?.channel_mode?;
-    Some(match mode {
+    let ro = t.intel.value()?;
+    let mode = ro.channel_mode?;
+    let (mut label, color) = match mode {
         ChannelMode::DualSymmetric => (mode.mode_label().to_owned(), Some(CYAN)),
         ChannelMode::DualFlex => (mode.mode_label().to_owned(), Some(AMBER)),
         ChannelMode::Single => (mode.mode_label().to_owned(), None),
-    })
+    };
+    match ro.channel_trust {
+        Some(ChannelTrust::Override) | Some(ChannelTrust::Heuristic) => {
+            label.push_str(" (unverified)");
+            return Some((label, Some(AMBER)));
+        }
+        Some(ChannelTrust::VerifiedFirmware) => {
+            label.push_str(" (firmware)");
+        }
+        _ => {}
+    }
+    Some((label, color))
 }
 
 impl RamSleuthApp {
@@ -3374,6 +3388,10 @@ mod tests {
                 channels: Vec::new(),
                 channel_mode: Some(ChannelMode::DualSymmetric),
                 ecc_status: EccStatus::Unknown,
+                memory_tech: None,
+                channel_trust: None,
+                channel_annotation: String::new(),
+                dimm_count: 0,
             }))),
             Some(("Interleaved".to_owned(), Some(CYAN)))
         );
@@ -3382,6 +3400,10 @@ mod tests {
                 channels: Vec::new(),
                 channel_mode: Some(ChannelMode::DualFlex),
                 ecc_status: EccStatus::Unknown,
+                memory_tech: None,
+                channel_trust: None,
+                channel_annotation: String::new(),
+                dimm_count: 0,
             }))),
             Some(("Flex".to_owned(), Some(AMBER)))
         );
@@ -3390,6 +3412,10 @@ mod tests {
                 channels: Vec::new(),
                 channel_mode: Some(ChannelMode::Single),
                 ecc_status: EccStatus::Unknown,
+                memory_tech: None,
+                channel_trust: None,
+                channel_annotation: String::new(),
+                dimm_count: 0,
             }))),
             Some(("N/A".to_owned(), None))
         );
@@ -3399,6 +3425,10 @@ mod tests {
                 channels: Vec::new(),
                 channel_mode: None,
                 ecc_status: EccStatus::Unknown,
+                memory_tech: None,
+                channel_trust: None,
+                channel_annotation: String::new(),
+                dimm_count: 0,
             }))),
             None
         );
@@ -3439,6 +3469,10 @@ mod tests {
             channels: Vec::new(),
             channel_mode: Some(ChannelMode::DualFlex),
             ecc_status: EccStatus::Unknown,
+            memory_tech: None,
+            channel_trust: None,
+            channel_annotation: String::new(),
+            dimm_count: 0,
         }));
         assert_eq!(
             ram_line_prefix(&flex, &Units::default()),
@@ -3451,6 +3485,10 @@ mod tests {
             channels: Vec::new(),
             channel_mode: Some(ChannelMode::DualFlex),
             ecc_status: EccStatus::CapableButDisabled,
+            memory_tech: None,
+            channel_trust: None,
+            channel_annotation: String::new(),
+            dimm_count: 0,
         }));
         assert_eq!(
             ram_line_prefix(&flex_ecc, &Units::default()),
@@ -3462,6 +3500,10 @@ mod tests {
             channels: Vec::new(),
             channel_mode: None,
             ecc_status: EccStatus::Unknown,
+            memory_tech: None,
+            channel_trust: None,
+            channel_annotation: String::new(),
+            dimm_count: 0,
         }));
         assert_eq!(
             ram_line_prefix(&no_mode, &Units::default()),
