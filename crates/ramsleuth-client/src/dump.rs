@@ -37,7 +37,7 @@ use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::intel_readout::{IntelChannel, IntelReadout};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
-use ramsleuth_telemetry::SystemMemoryTelemetry;
+use ramsleuth_telemetry::{RailConfidence, SystemMemoryTelemetry, VoltageTelemetry};
 
 use crate::client::{Client, ClientError};
 
@@ -140,6 +140,37 @@ fn volts(section: &Section<u16>) -> String {
         }
         Section::Na(reason) => na_cell(reason),
     }
+}
+
+/// The single vCore reading (Chunk 3, the snapshot-root's `vcore` field)
+/// as the CLI layout-matrix form: the delivered value at mV precision,
+/// the `[est]` badge for a heuristic (vendor-fallback) reading, the
+/// optional VID + signed delta when a VID is present, and a plain `N/A`
+/// for the absent / enterprise / out-of-bounds states.
+fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
+    match vcore {
+        Section::Na(_) => "N/A".to_owned(),
+        Section::Value(v) => {
+            let mut s = format!("{:.3} V", v.delivered_volts);
+            if v.confidence == RailConfidence::HeuristicDefault {
+                s.push_str(" [est]");
+            }
+            if let Some(vid) = v.requested_vid {
+                let delta_mv = (v.delivered_volts - vid) * 1000.0;
+                s.push_str(&format!(" (VID: {:.3} V, Δ {:+.0} mV)", vid, delta_mv));
+            }
+            s
+        }
+    }
+}
+
+/// The `=== Vcore ===` section: the single vCore reading (Chunk 3 — the
+/// vendor-aware source of truth: Intel = the board `in0` direct VRM
+/// sense, AMD = the SMU PM-table vCore), one line.
+fn vcore_section(out: &mut String, vcore: &Section<VoltageTelemetry>) {
+    out.push_str("=== Vcore ===\n");
+    out.push_str(&format!("CPU Core Voltage: {}\n", vcore_display(vcore)));
+    out.push('\n');
 }
 
 /// A module data-rate cell in megatransfers per second.
@@ -447,6 +478,7 @@ pub fn render(telemetry: &SystemMemoryTelemetry) -> String {
     out.push('\n');
     out.push('\n');
     cpu_section(&mut out, &telemetry.cpu);
+    vcore_section(&mut out, &telemetry.vcore);
     amd_section(&mut out, &telemetry.amd);
     intel_section(&mut out, &telemetry.intel);
     spd_section(&mut out, &telemetry.spd);
@@ -630,6 +662,13 @@ mod tests {
             },
             total_capacity: Section::Value(32.0),
             dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            vcore: Section::Value(VoltageTelemetry {
+                rail_name: "CPU Vcore".to_owned(),
+                delivered_volts: 1.150,
+                requested_vid: None,
+                delta_volts: None,
+                confidence: RailConfidence::VerifiedProfile,
+            }),
         }
     }
 
@@ -666,6 +705,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: vec![Section::na(NaReason::ParseError("fixture".to_owned()))],
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -688,6 +728,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -877,5 +918,58 @@ mod tests {
         let err = dump(&mut client).expect_err("an Error reply must fail dump");
         assert_eq!(err, ClientError::Protocol("daemon said no".to_owned()));
         handle.join().expect("stand-in thread must not panic");
+    }
+
+    /// (g) The vCore section (Chunk 3, the CLI layout matrix): the
+    /// delivered value at mV precision, the `[est]` badge for a
+    /// heuristic (vendor-fallback) reading, the optional VID + signed
+    /// (negative) delta when a VID is present, and a plain `N/A` for the
+    /// absent / enterprise / out-of-bounds states.
+    #[test]
+    fn vcore_section_layout_matrix() {
+        fn render_vcore(vcore: Section<VoltageTelemetry>) -> String {
+            let mut t = all_na();
+            t.vcore = vcore;
+            render(&t)
+        }
+
+        // Verified (no badge), mV precision.
+        let out = render_vcore(Section::Value(VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.216,
+            requested_vid: None,
+            delta_volts: None,
+            confidence: RailConfidence::VerifiedProfile,
+        }));
+        assert!(out.contains("CPU Core Voltage: 1.216 V"), "{out}");
+        assert!(!out.contains("[est]"), "a verified vCore has no badge: {out}");
+
+        // Heuristic (vendor-fallback) → the `[est]` badge.
+        let out = render_vcore(Section::Value(VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.216,
+            requested_vid: None,
+            delta_volts: None,
+            confidence: RailConfidence::HeuristicDefault,
+        }));
+        assert!(out.contains("CPU Core Voltage: 1.216 V [est]"), "{out}");
+
+        // Heuristic + a synthetic VID → the signed (negative) delta
+        // (1.216 − 1.280 = −64 mV).
+        let out = render_vcore(Section::Value(VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.216,
+            requested_vid: Some(1.280),
+            delta_volts: Some(1.216 - 1.280),
+            confidence: RailConfidence::HeuristicDefault,
+        }));
+        assert!(
+            out.contains("CPU Core Voltage: 1.216 V [est] (VID: 1.280 V, Δ -64 mV)"),
+            "{out}"
+        );
+
+        // Na (absent / enterprise / out-of-bounds) → plain N/A.
+        let out = render_vcore(Section::na(NaReason::NotApplicable));
+        assert!(out.contains("CPU Core Voltage: N/A"), "{out}");
     }
 }

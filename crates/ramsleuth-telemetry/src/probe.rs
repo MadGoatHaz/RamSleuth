@@ -41,7 +41,7 @@ use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{NaReason, Section};
 use crate::intel_readout::IntelReadout;
 use crate::spd_decode::SpdModule;
-use crate::SystemMemoryTelemetry;
+use crate::{RailConfidence, SystemMemoryTelemetry, VoltageTelemetry};
 
 /// The top-level probe report — the `Response::ProbeReport` payload.
 ///
@@ -272,7 +272,7 @@ pub fn render_probe_report_md(report: &ProbeReport) -> String {
     out.push('\n');
     // 3. The decoded telemetry in the dashboard display form.
     out.push_str("## Decoded Telemetry\n\n");
-    render_cpu(&mut out, &report.telemetry.cpu);
+    render_cpu(&mut out, &report.telemetry.cpu, &report.telemetry.vcore);
     render_amd(&mut out, &report.telemetry.amd);
     render_intel(&mut out, &report.telemetry.intel);
     render_spd(&mut out, &report.telemetry.spd);
@@ -559,16 +559,39 @@ fn cad_rows(cad: &CadBus) -> Vec<(&str, String)> {
     ]
 }
 
-/// The five memory-rail rows of a [`VoltageSet`] (volts; the Vcore
-/// primary rail leads, the TUI order).
+/// The four memory-rail rows of a [`VoltageSet`] (volts). The Vcore
+/// primary rail is NOT here — it is the snapshot-root's single
+/// `vcore` field (Chunk 3, the vendor-aware source of truth), rendered
+/// in the `### CPU` subsection via [`vcore_display`].
 fn voltages_rows(voltages: &VoltageSet) -> Vec<(&str, String)> {
     vec![
-        ("VDDCR_VDD (Vcore)", volts(&voltages.vcore_mv)),
         ("VDDCR_SOC", volts(&voltages.vddcr_soc_mv)),
         ("VDDIO_MEM", volts(&voltages.vddio_mem_mv)),
         ("VDD_MISC", volts(&voltages.vdd_misc_mv)),
         ("VPP", volts(&voltages.vpp_mv)),
     ]
+}
+
+/// The single vCore reading (Chunk 3, the snapshot-root's `vcore` field)
+/// as the CLI layout-matrix form: the delivered value at mV precision,
+/// the `[est]` badge for a heuristic (vendor-fallback) reading, the
+/// optional VID + signed delta when a VID is present, and a plain `N/A`
+/// for the absent / enterprise / out-of-bounds states.
+fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
+    match vcore {
+        Section::Na(_) => "N/A".to_owned(),
+        Section::Value(v) => {
+            let mut s = format!("{:.3} V", v.delivered_volts);
+            if v.confidence == RailConfidence::HeuristicDefault {
+                s.push_str(" [est]");
+            }
+            if let Some(vid) = v.requested_vid {
+                let delta_mv = (v.delivered_volts - vid) * 1000.0;
+                s.push_str(&format!(" (VID: {:.3} V, Δ {:+.0} mV)", vid, delta_mv));
+            }
+            s
+        }
+    }
 }
 
 /// One markdown `| <h1> | <h2> |` table (the two-column form the issue
@@ -606,8 +629,11 @@ fn render_display_sets(
 }
 
 /// The `### CPU` subsection: vendor + brand (the snapshot root carries
-/// the detected CPU — always populated).
-fn render_cpu(out: &mut String, cpu: &CpuInfo) {
+/// the detected CPU — always populated) + the single vCore reading
+/// (Chunk 3, the snapshot-root's `vcore` field — the vendor-aware
+/// source of truth: Intel = the board `in0` direct VRM sense, AMD = the
+/// SMU PM-table vCore).
+fn render_cpu(out: &mut String, cpu: &CpuInfo, vcore: &Section<VoltageTelemetry>) {
     out.push_str("### CPU\n\n");
     md_table(
         out,
@@ -616,6 +642,7 @@ fn render_cpu(out: &mut String, cpu: &CpuInfo) {
         &[
             ("vendor", vendor_text(&cpu.vendor)),
             ("brand", cpu.brand.clone()),
+            ("CPU Core Voltage", vcore_display(vcore)),
         ],
     );
 }
@@ -962,10 +989,12 @@ fn timings_sections(timings: &TimingSet) -> [(&str, &Section<u16>); 27] {
     ]
 }
 
-/// The five [`VoltageSet`] cells as (field name, section) pairs.
-fn voltages_sections(voltages: &VoltageSet) -> [(&str, &Section<u16>); 5] {
+/// The four [`VoltageSet`] cells as (field name, section) pairs. The
+/// vCore is not here — it is the snapshot-root's single `vcore` field
+/// (Chunk 3, the vendor-aware source of truth), collected separately in
+/// [`collect_na_reasons`].
+fn voltages_sections(voltages: &VoltageSet) -> [(&str, &Section<u16>); 4] {
     [
-        ("vcore", &voltages.vcore_mv),
         ("vddcr_soc", &voltages.vddcr_soc_mv),
         ("vddio_mem", &voltages.vddio_mem_mv),
         ("vdd_misc", &voltages.vdd_misc_mv),
@@ -1119,6 +1148,9 @@ fn collect_na_reasons(report: &ProbeReport, out: &mut Vec<(String, String)>) {
             }
         }
     }
+    // The single vCore source of truth (Chunk 3) — an `Na` vCore
+    // (unknown / enterprise / out-of-bounds) is reported here.
+    push_na(out, "vcore", &telemetry.vcore);
     for module in &telemetry.spd {
         let prefix = format!("spd[0x{:02X}]", module.index);
         push_na(out, &format!("{prefix}.maker"), &module.maker);
@@ -1359,6 +1391,7 @@ mod tests {
             },
             total_capacity: Section::Value(16.0),
             dimm_sizes: vec![Section::Value(16.0)],
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -1402,6 +1435,7 @@ mod tests {
                 },
                 total_capacity: Section::na(NaReason::NotApplicable),
                 dimm_sizes: Vec::new(),
+                vcore: Section::na(NaReason::NotApplicable),
             },
             raw: None,
             system: ProbeSystem {
@@ -1643,6 +1677,7 @@ mod tests {
                 },
                 total_capacity: Section::Value(32.0),
                 dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
             },
             raw: None,
             system: ProbeSystem {
@@ -1746,6 +1781,7 @@ mod tests {
                 },
                 total_capacity: Section::na(NaReason::NotApplicable),
                 dimm_sizes: Vec::new(),
+                vcore: Section::na(NaReason::NotApplicable),
             },
             raw: Some(amd_fixture_raw()),
             system: ProbeSystem {

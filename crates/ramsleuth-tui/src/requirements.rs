@@ -587,6 +587,7 @@ mod tests {
             },
             total_capacity: Section::na(NaReason::NotApplicable),
             dimm_sizes: Vec::new(),
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 

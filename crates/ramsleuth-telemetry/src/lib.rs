@@ -33,6 +33,12 @@ pub mod probe; // probe-1a — consent-gated "Submit Probe Report" wire types (P
 // P2-10: the crate's public snapshot API, re-exported at the root.
 pub use facade::{collect, SystemMemoryTelemetry};
 // C6-07: the C6-01 platform types, re-exported at the root.
-pub use platform::{SystemPlatform, mem_total_gib};
+pub use platform::{dmi_board_vendor, dmi_sys_vendor, mem_total_gib, SystemPlatform};
+// C12-03 / Chunk 3: the board-VRM vCore wire types (the snapshot root's
+// trailing `vcore` field's payload), re-exported at the root.
+pub use board_vrm::{
+    classify_vendor, vcore_fallback, BoardVrmProfile, BoardVrmReadout, Rail, RailConfidence,
+    VendorClass, VoltageTelemetry,
+};
 pub use probe::{ProbeRaw, ProbeReport, ProbeSystem};
 

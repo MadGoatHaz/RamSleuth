@@ -47,6 +47,13 @@ pub const CRIMSON: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x3B, 0x30);
 /// and from the 0xE6E6EC body text.
 pub const NA_GRAY: egui::Color32 = egui::Color32::from_rgb(0x8A, 0x8A, 0x94);
 
+/// The vCore `[UNVERIFIED]` badge tooltip (Chunk 3, the GUI layout
+/// matrix): the explanatory note shown on hover over a heuristic
+/// (vendor-fallback) vCore reading — the value is the measured in-rail
+/// voltage, estimated from the board's Super-I/O sensor routing, not a
+/// verified board profile.
+pub const VCORE_UNVERIFIED_TOOLTIP: &str = "This vCore was estimated from the board's Super-I/O sensor (vendor fallback), not a verified board profile. The value is the measured in-rail voltage — a normal reading, flagged only because the exact board mapping is unconfirmed.";
+
 /// Build the dark-slate app style: SLATE window/panel fills, light
 /// text, CYAN accents (hover/active strokes, hyperlinks, text cursor,
 /// selection). AMBER/CRIMSON and the muted [`NA_GRAY`] (C8-05: the
@@ -653,6 +660,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         let expected: std::collections::BTreeSet<String> = [
             "amd", "bench", "cpu", "intel", "spd", "platform", "total_capacity", "dimm_sizes",
+            "vcore",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -840,6 +848,7 @@ mod tests {
             },
             total_capacity: total,
             dimm_sizes: dimms,
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -928,6 +937,7 @@ mod tests {
                 },
                 total_capacity: Section::Value(32.0),
                 dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
             };
             assert_eq!(
                 intel_channel_label(&t),

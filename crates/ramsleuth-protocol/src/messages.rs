@@ -175,6 +175,7 @@ mod tests {
             // to `spd`; total = the sum of the `Value` entries.
             total_capacity: Section::Value(16.0),
             dimm_sizes: vec![Section::Value(16.0)],
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 

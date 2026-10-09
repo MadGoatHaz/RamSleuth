@@ -89,7 +89,9 @@ use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::intel_readout::{ChannelMode, ChannelTrust};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
-use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform};
+use ramsleuth_telemetry::{
+    RailConfidence, SystemMemoryTelemetry, SystemPlatform, VoltageTelemetry,
+};
 
 use crate::graphs::GraphState;
 use crate::probe::ProbeOverlayState;
@@ -1119,6 +1121,8 @@ fn zone1_columns(
                 &readout.cad_bus,
                 &readout.voltages,
                 None,
+                &telemetry.vcore,
+                true,
             );
             left.extend(l);
             right.extend(r);
@@ -1132,7 +1136,7 @@ fn zone1_columns(
             if readout.channels.is_empty() {
                 left.push(section_na("Intel", &NaReason::NotApplicable));
             } else {
-                for channel in &readout.channels {
+                for (channel_index, channel) in readout.channels.iter().enumerate() {
                     let label = format!("Intel ch {}", channel.index);
                     let (l, r) = readout_columns(
                         &label,
@@ -1141,6 +1145,11 @@ fn zone1_columns(
                         &channel.cad_bus,
                         &channel.voltages,
                         Some(&channel.rtl),
+                        &telemetry.vcore,
+                        // The vCore is a system-level rail (the snapshot
+                        // root's `vcore` field): shown once, on the
+                        // first channel.
+                        channel_index == 0,
                     );
                     left.extend(l);
                     right.extend(r);
@@ -1165,6 +1174,7 @@ fn zone1_columns(
 /// on a 2-channel Intel host): only measured cells render, the section
 /// subheaders stay unconditionally visible, and a measured cell whose
 /// value displays `disabled` keeps its row (a value, not an N/A).
+#[allow(clippy::too_many_arguments)] // the vCore (Chunk 3) + vcore_here are trailing params
 fn readout_columns(
     label: &str,
     clocks: &ClockReadout,
@@ -1172,6 +1182,8 @@ fn readout_columns(
     cad_bus: &CadBus,
     voltages: &VoltageSet,
     rtl: Option<&Section<u16>>,
+    vcore: &Section<VoltageTelemetry>,
+    vcore_here: bool,
 ) -> (Vec<ListItem<'static>>, Vec<ListItem<'static>>) {
     let mut left = vec![sub_item(label)];
 
@@ -1247,9 +1259,14 @@ fn readout_columns(
     push_cell(&mut right, "CKE drive", &cad_bus.cke_drv, CYAN, fmt_ohms);
 
     right.push(sub_item("voltages"));
-    // The Vcore primary rail (the C12 frozen wire field) leads the
-    // section exactly as the GUI; an absent cell drops the row.
-    push_cell(&mut right, "VDDCR_VDD", &voltages.vcore_mv, CYAN, fmt_volts);
+    // The Vcore primary rail (Chunk 3: the snapshot-root's `vcore` field
+    // — the vendor-aware single source of truth: Intel = the board `in0`
+    // direct VRM sense, AMD = the SMU PM-table vCore) leads the section;
+    // it is shown once per readout (the AMD block, or the first Intel
+    // channel) and an `Na` vCore drops the row (the all-Na-drop rule).
+    if vcore_here {
+        push_vcore(&mut right, vcore);
+    }
     // A SOC rail above 1.30 V is out of spec on AM5 -> amber warning.
     let soc_color = match &voltages.vddcr_soc_mv {
         Section::Value(mv) if f64::from(*mv) > 1300.0 => AMBER,
@@ -2007,6 +2024,35 @@ fn push_cell<T>(
     }
 }
 
+/// The vendor-aware vCore row (Chunk 3, the TUI layout matrix): the
+/// snapshot-root's `vcore` field (Intel = the board `in0` direct VRM
+/// sense; AMD = the SMU PM-table vCore). A measured value renders at mV
+/// precision; a heuristic (vendor-fallback) reading is dimmed + the
+/// `~ … [Unverified]` badge (the TUI contract: the channel mapping is
+/// inferred from vendor conventions, not an exact DMI match); a verified
+/// reading renders plain. An `Na` vCore is dropped (the TUI's all-Na
+/// drop rule). When a VID is present (never for Intel, but the display
+/// is total), the SVID target + the signed (negative) active drop render
+/// as dimmed indented sub-rows.
+fn push_vcore(items: &mut Vec<ListItem<'static>>, vcore: &Section<VoltageTelemetry>) {
+    let Some(v) = vcore.value() else {
+        return; // Na → dropped (the all-Na drop rule).
+    };
+    let heuristic = v.confidence == RailConfidence::HeuristicDefault;
+    let color = if heuristic { NA_GRAY } else { CYAN };
+    let mut value = format!("{:.3} V", v.delivered_volts);
+    if heuristic {
+        value = format!("~ {value} [Unverified]");
+    }
+    items.push(row("VDDCR_VDD", &value, color));
+    if let Some(vid) = v.requested_vid {
+        items.push(row("SVID Target", &format!("{vid:.3} V"), DIM));
+        if let Some(delta) = v.delta_volts {
+            items.push(row("Active Drop", &format!("{:.0} mV", delta * 1000.0), DIM));
+        }
+    }
+}
+
 /// The zone-1 overflow safety net: cap a column to the block's height
 /// — the first `max_rows - 1` rows + a dim `...` indicator at the
 /// bottom; a column that fits is returned untouched.
@@ -2324,6 +2370,7 @@ mod tests {
                 },
                 total_capacity: Section::Value(16.0),
                 dimm_sizes: vec![Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
             }),
             daemon_status: "up · /tmp/ramsleuth.sock".to_owned(),
             last_update: Some(Instant::now()),
@@ -2551,6 +2598,7 @@ mod tests {
                 },
                 total_capacity: Section::na(NaReason::NotApplicable),
                 dimm_sizes: Vec::new(),
+                vcore: Section::na(NaReason::NotApplicable),
             }),
             daemon_status: "up".to_owned(),
             ..Default::default()
@@ -2598,6 +2646,7 @@ mod tests {
                 },
                 total_capacity: Section::na(NaReason::NotApplicable),
                 dimm_sizes: Vec::new(),
+                vcore: Section::na(NaReason::NotApplicable),
             }),
             daemon_status: "connected · /run/ramsleuth/ramsleuth.sock".to_owned(),
             last_update: Some(Instant::now()),
@@ -2644,6 +2693,7 @@ mod tests {
                 },
                 total_capacity: Section::na(NaReason::NotApplicable),
                 dimm_sizes: Vec::new(),
+                vcore: Section::na(NaReason::NotApplicable),
             }),
             daemon_status: "connected · /run/ramsleuth/ramsleuth.sock".to_owned(),
             last_update: Some(Instant::now()),
@@ -2900,6 +2950,7 @@ mod tests {
             },
             total_capacity,
             dimm_sizes,
+            vcore: Section::na(NaReason::NotApplicable),
         }
     }
 
@@ -3052,6 +3103,7 @@ mod tests {
                 },
                 total_capacity: Section::na(NaReason::NotApplicable),
                 dimm_sizes: vec![Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
             }
         }
         assert_eq!(
@@ -3096,6 +3148,7 @@ mod tests {
                 },
                 total_capacity: Section::Value(16.0),
                 dimm_sizes: vec![Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
             }
         }
 
@@ -3186,6 +3239,7 @@ mod tests {
             },
             total_capacity: Section::Value(32.0),
             dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            vcore: Section::na(NaReason::NotApplicable),
         };
         let (_, _, _, channel, _, _) = ram_line3_parts(&t, true, true);
         assert_eq!(channel, "Dual-Channel (4x 32-bit Subchannels)");
@@ -3222,6 +3276,7 @@ mod tests {
             },
             total_capacity: Section::Value(32.0),
             dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            vcore: Section::na(NaReason::NotApplicable),
         };
         let (_, _, _, channel, _, mode) = ram_line3_parts(&t, true, true);
         assert_eq!(channel, "Dual-Channel (Symmetric) [unverified]");
@@ -3277,6 +3332,7 @@ mod tests {
                 },
                 total_capacity: Section::Value(32.0),
                 dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
             };
             let (_, _, _, channel, _, _) = ram_line3_parts(&t, true, true);
             assert_eq!(
@@ -3322,6 +3378,7 @@ mod tests {
                 },
                 total_capacity: Section::Value(16.0),
                 dimm_sizes: vec![Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
             }
         }
         // The hardware mode beats the one-bound-DIMM SPD count.
@@ -3485,6 +3542,7 @@ mod tests {
             },
             total_capacity: Section::Value(32.0),
             dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            vcore: Section::na(NaReason::NotApplicable),
         };
         assert_eq!(
             ram_line_prefix(&amd, true),
@@ -3529,6 +3587,7 @@ mod tests {
             },
             total_capacity: Section::Value(32.0),
             dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            vcore: Section::na(NaReason::NotApplicable),
         };
         assert_eq!(
             ram_line_prefix(&intel, true),
@@ -3731,15 +3790,79 @@ mod tests {
         let text = draw_at(&representative(), 104, 62);
         assert!(!text.contains("VDDCR_VDD"), "{text}");
 
-        // A measured Vcore rail: 1150 mV -> 1.150 V.
+        // A measured Vcore rail: the snapshot-root's `vcore` field
+        // (Chunk 3's single source of truth — 1.150 V) -> the
+        // `VDDCR_VDD: 1.150 V` row.
         let mut state = representative();
         if let Some(ref mut t) = state.telemetry {
-            if let Section::Value(ref mut readout) = t.amd {
-                readout.voltages.vcore_mv = Section::Value(1150);
-            }
+            t.vcore = Section::Value(VoltageTelemetry {
+                rail_name: "CPU Vcore".to_owned(),
+                delivered_volts: 1.150,
+                requested_vid: None,
+                delta_volts: None,
+                confidence: RailConfidence::VerifiedProfile,
+            });
         }
         let text = draw_at(&state, 104, 62);
         assert!(text.contains("VDDCR_VDD: 1.150 V"), "{text}");
+    }
+
+    /// (u2) The vendor-aware vCore row badges (Chunk 3, the TUI layout
+    /// matrix): a heuristic (vendor-fallback) reading renders dimmed +
+    /// the `~ … [Unverified]` badge; a verified reading renders plain;
+    /// and a verified reading with a synthetic VID adds the SVID target
+    /// + the signed (negative) active-drop sub-rows. An `Na` vCore
+    /// drops the row entirely.
+    #[test]
+    fn vcore_row_badge_per_confidence() {
+        fn state_with_vcore(vcore: Section<VoltageTelemetry>) -> AppState {
+            let mut state = representative();
+            if let Some(t) = state.telemetry.as_mut() {
+                t.vcore = vcore;
+            }
+            state
+        }
+        // Heuristic (vendor-fallback) -> dimmed `~ … [Unverified]`.
+        let state = state_with_vcore(Section::Value(VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.216,
+            requested_vid: None,
+            delta_volts: None,
+            confidence: RailConfidence::HeuristicDefault,
+        }));
+        let text = draw_at(&state, 200, 62);
+        assert!(text.contains("~ 1.216 V [Unverified]"), "{text}");
+
+        // Verified -> plain (no badge).
+        let state = state_with_vcore(Section::Value(VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.216,
+            requested_vid: None,
+            delta_volts: None,
+            confidence: RailConfidence::VerifiedProfile,
+        }));
+        let text = draw_at(&state, 200, 62);
+        assert!(text.contains("VDDCR_VDD: 1.216 V"), "{text}");
+        assert!(!text.contains("[Unverified]"), "{text}");
+
+        // Verified + a synthetic VID -> the SVID target + the signed
+        // (negative) active drop (1.216 − 1.280 = −64 mV).
+        let state = state_with_vcore(Section::Value(VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.216,
+            requested_vid: Some(1.280),
+            delta_volts: Some(1.216 - 1.280),
+            confidence: RailConfidence::VerifiedProfile,
+        }));
+        let text = draw_at(&state, 200, 62);
+        assert!(text.contains("VDDCR_VDD: 1.216 V"), "{text}");
+        assert!(text.contains("SVID Target: 1.280 V"), "{text}");
+        assert!(text.contains("Active Drop: -64 mV"), "{text}");
+
+        // Na -> the row is dropped entirely.
+        let state = state_with_vcore(Section::na(NaReason::NotApplicable));
+        let text = draw_at(&state, 200, 62);
+        assert!(!text.contains("VDDCR_VDD"), "{text}");
     }
 
     /// (v) The CR row (the GUI's D-6 form): the command rate's bare
@@ -3883,6 +4006,7 @@ mod tests {
                 },
                 total_capacity: Section::na(NaReason::NotApplicable),
                 dimm_sizes: Vec::new(),
+                vcore: Section::na(NaReason::NotApplicable),
             }),
             daemon_status: "up".to_owned(),
             ..Default::default()
@@ -3960,6 +4084,7 @@ mod tests {
                 },
                 total_capacity: Section::na(NaReason::NotApplicable),
                 dimm_sizes: Vec::new(),
+                vcore: Section::na(NaReason::NotApplicable),
             }),
             daemon_status: "up".to_owned(),
             ..Default::default()
