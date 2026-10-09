@@ -85,7 +85,7 @@
 # comments below.
 
 pkgname=ramsleuth
-pkgver=2.4.13   # FIXED — taken from the git tag v$pkgver (no pkgver())
+pkgver=2.4.14   # FIXED — taken from the git tag v$pkgver (no pkgver())
 pkgrel=1
 pkgdesc="Pure-Rust RAM latency/bandwidth telemetry: privileged daemon + unprivileged CLI/TUI/GUI clients"
 arch=(x86_64)

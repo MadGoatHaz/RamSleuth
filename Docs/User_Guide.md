@@ -1066,7 +1066,7 @@ established:
 - **No badge** — the board is a **curated seed** (a high-volume enthusiast /
   workstation board RamSleuth has verified maps `in0` to Vcore); the value is
   verified.
-- **`[est]`** (CLI) / **`[Unverified]`** (TUI) / **`[UNVERIFIED]`** (GUI) —
+- **`[est]`** (all frontends) —
   no curated match, but the board is a **consumer-vendor** (Asus / ASRock /
   MSI / Micro-Star / Gigabyte); the value is a vendor-aware **heuristic**
   estimate.
