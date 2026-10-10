@@ -72,7 +72,7 @@
 //! through ratatui's in-memory `TestBackend`).
 
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -150,7 +150,12 @@ pub struct BenchState {
 /// cell wins; a non-finite / non-positive reading never counts). While
 /// a burn-in is in flight the 4×4 table renders `latest` as the live
 /// overlay (the dimmed `…` cells — the module-doc zone-2 rule); the
-/// burn-in row also shows `latest`.
+/// burn-in row also shows `latest`. The daemon stamps `elapsed_secs`
+/// only at emit (per completed bandwidth cell / per-tier latency pass —
+/// seconds apart on a Full target), so the **displayed** `m:ss` is the
+/// zone-local burn-in start clock ([`burn_in_elapsed`]), which advances
+/// every 250 ms frame; `elapsed_secs` is the pre-first-frame fallback
+/// (BUG 6).
 ///
 /// Hand-written `Default` (the GUI `update.rs` precedent): no run,
 /// iteration 0, zero elapsed, and a zero grid — `BenchmarkGrid` derives
@@ -162,8 +167,10 @@ pub struct BurnInState {
     /// The 1-based iteration of the newest tick seen this run (0
     /// before the first tick).
     pub iteration: u32,
-    /// The run elapsed, in seconds, from the newest tick (0.0 before
-    /// the first tick).
+    /// The run elapsed, in seconds, from the newest daemon tick (0.0
+    /// before the first tick) — the pre-first-frame fallback; the
+    /// displayed value is the zone-local burn-in start clock
+    /// ([`burn_in_elapsed`]).
     pub elapsed_secs: f64,
     /// The newest per-cell values seen this burn-in.
     pub latest: BenchmarkGrid,
@@ -1511,9 +1518,10 @@ enum StatusState {
     /// line.
     Idle,
     /// A run (a normal bench or a burn-in) is in flight: the CYAN
-    /// running line; `elapsed_secs` is the run's elapsed (the newest
-    /// tick's for a burn-in, the zone's start clock's for a normal
-    /// bench). `burn_in_iteration` is `Some(n)` for a burn-in (the
+    /// running line; `elapsed_secs` is the run's elapsed — the zone's
+    /// start clock for both (the normal bench stamped `now`, the
+    /// burn-in backdated from the newest tick; the live display source
+    /// — BUG 6). `burn_in_iteration` is `Some(n)` for a burn-in (the
     /// `Status: Running… (burn-in <m:ss>, iter <n>)` line) and `None`
     /// for a normal bench (the `Status: Running… <m:ss>` line).
     Running { elapsed_secs: f64, burn_in_iteration: Option<u32> },
@@ -1523,12 +1531,13 @@ enum StatusState {
 }
 
 /// The status state of one run bookkeeping (the GUI `status_state`
-/// mirror): a burn-in in flight → `Running` (the newest tick's elapsed +
-/// iteration — the normal-bench flag stays false for a burn-in, C7-16),
-/// a normal bench in flight → `Running` (the zone's start clock's
-/// elapsed, no burn-in iteration), neither in flight but a terminal
-/// grid or kept streamed progress present → `Done`, the fresh state (no
-/// grid, no progress) → `Idle`. The `Done` corner deliberately includes
+/// mirror): a burn-in in flight → `Running` (the zone's burn-in start
+/// clock's elapsed — the live display source — + iteration; the
+/// normal-bench flag stays false for a burn-in, C7-16), a normal bench
+/// in flight → `Running` (the zone's start clock's elapsed, no burn-in
+/// iteration), neither in flight but a terminal grid or kept streamed
+/// progress present → `Done`, the fresh state (no grid, no progress) →
+/// `Idle`. The `Done` corner deliberately includes
 /// the kept-progress-only shape (a cancelled normal bench with no
 /// terminal grid): a non-empty progress list with no run in flight is a
 /// finished run, not an idle one.
@@ -1602,11 +1611,16 @@ fn status_color(state: StatusState) -> Color {
 
 /// The zone-local start clock for a normal bench run (the GUI
 /// `bench_zone` C7-17 precedent): the moment the zone first saw a normal
-/// bench in flight (a repaint within one frame of the run's start). The
-/// burn-in needs no clock — its newest tick carries the elapsed
-/// (`burn_in.elapsed_secs`). Stamped on the first in-flight frame,
-/// cleared on the terminal; a poisoned lock is recovered in place (the
-/// render thread is the sole user — the no-panic contract).
+/// bench in flight (a repaint within one frame of the run's start). Both
+/// run kinds now keep a zone-local start clock: the normal bench's is
+/// stamped `now` on its first in-flight frame; the burn-in's
+/// ([`BURN_IN_RUN_START`]) is backdated from the newest tick's
+/// `elapsed_secs` on its first frame and is the **display source** for
+/// the burn-in's `m:ss` (the daemon stamps `elapsed_secs` only at emit,
+/// seconds apart on a Full target, so a `now` stamp would reset the
+/// visible elapsed to `0:00` — BUG 6). Stamped on the first in-flight
+/// frame, cleared on the terminal; a poisoned lock is recovered in
+/// place (the render thread is the sole user — the no-panic contract).
 static NORMAL_RUN_START: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Stamp / clear the zone-local normal-run start clock for this frame's
@@ -1622,16 +1636,67 @@ fn track_run_start(running: bool) -> Option<Instant> {
     }
 }
 
+/// The zone-local start clock for a burn-in run: the moment the zone
+/// first saw a burn-in in flight. Verbatim mirror of
+/// [`NORMAL_RUN_START`] / [`track_run_start`] (the render thread is the
+/// sole user — a poisoned lock is recovered in place, the no-panic
+/// contract). The **backdating** (stamping the first frame from the
+/// newest tick's `elapsed_secs` so the displayed `m:ss` continues
+/// smoothly from the daemon's) lives in [`burn_in_elapsed`], not here.
+static BURN_IN_RUN_START: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Stamp / clear the zone-local burn-in start clock for this frame's run
+/// state, returning the start instant while a burn-in is in flight
+/// (`None` outside one — the terminal cleared it). Verbatim mirror of
+/// [`track_run_start`].
+fn track_burn_in_start(running: bool) -> Option<Instant> {
+    let mut guard = BURN_IN_RUN_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if running {
+        Some(*guard.get_or_insert_with(Instant::now))
+    } else {
+        *guard = None;
+        None
+    }
+}
+
+/// The displayed burn-in elapsed (the **single source** for the status
+/// line + the burn-in row, so the two can never disagree): the live
+/// zone-local clock while a burn-in is in flight (advancing every 250 ms
+/// frame, independent of the daemon's per-cell / per-latency-pass tick
+/// cadence — BUG 6). On the first in-flight frame the clock is backdated
+/// from the newest tick's `elapsed_secs` so the value continues smoothly
+/// from the daemon's (the pre-first-frame fallback); a burn-in not in
+/// flight falls back to `elapsed_secs` too.
+fn burn_in_elapsed(burn_in: &BurnInState) -> f64 {
+    // First in-flight frame: backdate the clock from the daemon's latest
+    // elapsed so the client clock continues from it (the pre-first-frame
+    // fallback). A poisoned lock is recovered in place (no-panic).
+    {
+        let mut guard = BURN_IN_RUN_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if burn_in.running && guard.is_none() {
+            *guard = Some(
+                Instant::now() - Duration::from_secs_f64(burn_in.elapsed_secs.max(0.0)),
+            );
+        }
+    }
+    track_burn_in_start(burn_in.running)
+        .map_or(burn_in.elapsed_secs, |start| start.elapsed().as_secs_f64())
+}
+
 /// The bench zone's flat status line (the GUI C7-17 mirror): a single
 /// text line below the grid — `Status: Idle` dim, `Status: Running…
 /// <m:ss>` CYAN (a normal bench — elapsed from the zone's start clock),
-/// `Status: Running… (burn-in <m:ss>, iter <n>)` CYAN (a burn-in — the
-/// newest tick's elapsed + iteration), `Status: Done` in the
-/// zone-local green.
+/// `Status: Running… (burn-in <m:ss>, iter <n>)` CYAN (a burn-in —
+/// elapsed from the zone's burn-in start clock, the live display source,
+/// + the newest tick's iteration), `Status: Done` in the zone-local
+/// green.
 fn bench_status(bench: &BenchState) -> (String, Color) {
     let burn_in = &bench.burn_in;
     let running_elapsed = if burn_in.running {
-        burn_in.elapsed_secs
+        // The live zone-local clock (BUG 6 — advances every frame, not
+        // frozen between the daemon's per-cell / per-latency-pass
+        // ticks); `elapsed_secs` is only the pre-first-frame fallback.
+        burn_in_elapsed(burn_in)
     } else {
         track_run_start(bench.running).map_or(0.0, |start| start.elapsed().as_secs_f64())
     };
@@ -1692,15 +1757,17 @@ fn controls_line(bench: &BenchState) -> Line<'static> {
 }
 
 /// The live burn-in row's flat text (the GUI `burn_in_row` mirror,
-/// C7-18 / TUI-14): the newest tick's bookkeeping + the headline
-/// `latest` values — `Burn-in: iteration <n> · <m:ss> elapsed ·
-/// Memory Read <…> · <latency>`; the cells in the plain grid form
-/// (the [`bench_cell_text`] Terminal arm — unit-less, the zone title
-/// carries the GB/s unit and the `ns/hop` column header the ns one),
-/// a cell not yet streamed (0.0 on the wire) or a non-finite reading
-/// reads `N/A`. `None` when no burn-in is in flight (the row is
-/// absent — its fixed layout slot stays blank, the no-layout-shift
-/// rule).
+/// C7-18 / TUI-14): the run's bookkeeping + the headline `latest`
+/// values — `Burn-in: iteration <n> · <m:ss> elapsed · Memory Read
+/// <…> · <latency>` (the `<m:ss>` is the zone-local burn-in start clock
+/// — the live display source — not the newest tick's frozen
+/// `elapsed_secs`; the iteration is the newest tick's); the cells in
+/// the plain grid form (the [`bench_cell_text`] Terminal arm —
+/// unit-less, the zone title carries the GB/s unit and the `ns/hop`
+/// column header the ns one), a cell not yet streamed (0.0 on the wire)
+/// or a non-finite reading reads `N/A`. `None` when no burn-in is in
+/// flight (the row is absent — its fixed layout slot stays blank, the
+/// no-layout-shift rule).
 ///
 /// Test-only: [`burn_in_row_line`] builds its per-segment-coloured
 /// spans from the same pieces; this flat-text form exists so the
@@ -1718,7 +1785,7 @@ fn burn_in_row_text(burn_in: &BurnInState) -> Option<String> {
     Some(format!(
         "Burn-in: iteration {} · {} elapsed · Memory Read {} · {}",
         burn_in.iteration,
-        format_elapsed(burn_in.elapsed_secs),
+        format_elapsed(burn_in_elapsed(burn_in)),
         read,
         latency
     ))
@@ -1742,7 +1809,7 @@ fn burn_in_row_line(burn_in: &BurnInState) -> Option<Line<'static>> {
             format!(
                 "Burn-in: iteration {} · {} elapsed · Memory Read ",
                 burn_in.iteration,
-                format_elapsed(burn_in.elapsed_secs)
+                format_elapsed(burn_in_elapsed(burn_in))
             ),
             Style::default().fg(DIM),
         ),
@@ -2259,6 +2326,27 @@ mod tests {
             .join("\n")
     }
 
+    // -----------------------------------------------------------------
+    // The zone-local burn-in clock (BUG 6) test helpers.
+    //
+    // Rust runs a module's tests in parallel on shared process statics;
+    // `BURN_IN_RUN_START` is one of them, so the value-asserting tests
+    // must serialize on this lock (each sets / inspects the clock).
+    // -----------------------------------------------------------------
+    static TEST_BURN_CLOCK_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set the zone-local burn-in clock to `secs_ago` seconds in the
+    /// past (standing in for a burn-in that has been running that long).
+    fn set_burn_in_clock(secs_ago: f64) {
+        *super::BURN_IN_RUN_START.lock().unwrap() =
+            Some(Instant::now() - Duration::from_secs_f64(secs_ago));
+    }
+
+    /// Clear the zone-local burn-in clock (the pre-first-frame state).
+    fn clear_burn_in_clock() {
+        *super::BURN_IN_RUN_START.lock().unwrap() = None;
+    }
+
     /// A representative AMD readout: `Value` cells across all four sets
     /// with a few `Na` cells (the AMD-not-applicable gear mode, one
     /// out-of-band refresh timing, one not-applicable RTT park).
@@ -2446,7 +2534,11 @@ mod tests {
         assert!(text.contains("SETUP — requirements"), "{text}");
         assert!(text.contains("CONTROLS — RamSleuth"), "{text}");
         assert!(text.contains("GRAPHS (last 5 min"), "{text}");
-        assert!(text.contains("Status: Idle"), "{text}");
+        // The graphs panel is drawn last + topmost over the whole zone
+        // area and now blanks it (BUG 4 — the zones no longer bleed
+        // through the panel), so a zone-2 element like `Status: Idle`
+        // is covered, not visible, while the panel is open. The zone
+        // content is asserted in the graphs-closed part above.
     }
 
     /// (b') The `[d]` screen (the requirements strip + the About
@@ -4539,8 +4631,11 @@ mod tests {
     /// wire) or a non-finite reading reads `N/A`.
     #[test]
     fn burn_in_row_text_and_na_cells() {
+        let _lock = TEST_BURN_CLOCK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // A burn-in in flight with measured headline cells: the exact
-        // GUI form.
+        // GUI form. The displayed `1:30` is the client clock (BUG 6) —
+        // stood in here by backdating it 90 s (matching the tick).
+        set_burn_in_clock(90.0);
         let burn = BurnInState {
             running: true,
             iteration: 2,
@@ -4564,6 +4659,7 @@ mod tests {
 
         // A fresh tick (no `latest` cells yet): both headline cells
         // read N/A — the row is present (the burn-in is in flight).
+        set_burn_in_clock(5.0);
         let fresh = BurnInState {
             running: true,
             iteration: 1,
@@ -4577,6 +4673,7 @@ mod tests {
 
         // A non-finite reading degrades to N/A too (the plain cell
         // form's guard).
+        set_burn_in_clock(0.0);
         let broken = BurnInState {
             running: true,
             latest: BenchmarkGrid {
@@ -4619,6 +4716,83 @@ mod tests {
         assert!(!text.contains("Burn-in:"), "{text}");
     }
 
+    /// (bi) BUG 6 — the burn-in's displayed `m:ss` is the zone-local
+    /// client clock (advancing every frame), not the daemon's per-tick
+    /// `elapsed_secs` (frozen between ticks). Stand in for a burn-in
+    /// that has been running 30 s (the newest tick only says 7 s),
+    /// render the dashboard, and assert both the status line and the
+    /// burn-in row show `0:30` (the `m:ss` form gives a ≥400 ms
+    /// tolerance window — no flake).
+    #[test]
+    fn burn_in_row_uses_the_client_clock() {
+        let _lock = TEST_BURN_CLOCK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_burn_in_clock(30.0);
+        let state = AppState {
+            bench: BenchState {
+                burn_in: BurnInState {
+                    running: true,
+                    iteration: 3,
+                    elapsed_secs: 7.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // 200 cols: the zone-2 inner is wide enough for the full status
+        // line + the full burn-in row (no width-clip of the `m:ss`).
+        let text = draw_at(&state, 200, 30);
+        assert!(
+            text.contains("Status: Running… (burn-in 0:30, iter 3)"),
+            "the status line must show the client clock's 0:30, not the tick's 0:07:\n{text}"
+        );
+        assert!(
+            text.contains("Burn-in: iteration 3 · 0:30 elapsed"),
+            "the burn-in row must show the same client-clock 0:30:\n{text}"
+        );
+    }
+
+    /// (bj) BUG 6 — the pre-first-frame fallback: before the client
+    /// clock is stamped, the displayed elapsed is the daemon's newest
+    /// tick's `elapsed_secs` (the clock is backdated from it on the
+    /// first frame, so the value continues smoothly from the daemon's).
+    #[test]
+    fn burn_in_elapsed_falls_back_to_the_tick_before_first_frame() {
+        let _lock = TEST_BURN_CLOCK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_burn_in_clock();
+        let burn_in = BurnInState {
+            running: true,
+            elapsed_secs: 7.0,
+            ..Default::default()
+        };
+        let elapsed = burn_in_elapsed(&burn_in);
+        assert!(
+            (elapsed - 7.0).abs() < 0.1,
+            "the pre-first-frame value is the daemon's 7.0 s (got {elapsed})"
+        );
+    }
+
+    /// (bk) BUG 6 — the client clock clears on the terminal: after a
+    /// burn-in ends (`running = false`), the clock is `None`, and the
+    /// next burn-in re-stamps fresh (no stale clock from a previous
+    /// run).
+    #[test]
+    fn burn_in_clock_clears_on_terminal() {
+        let _lock = TEST_BURN_CLOCK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_burn_in_clock();
+        // The first in-flight frame stamps the clock.
+        assert!(track_burn_in_start(true).is_some(), "the first frame stamps the clock");
+        // The terminal clears it.
+        assert!(track_burn_in_start(false).is_none(), "the terminal clears the clock");
+        assert!(
+            super::BURN_IN_RUN_START.lock().unwrap().is_none(),
+            "the clock is None after the terminal"
+        );
+        // The next run re-stamps fresh (not the stale previous clock).
+        assert!(track_burn_in_start(true).is_some(), "the next run re-stamps a fresh clock");
+        clear_burn_in_clock();
+    }
+
     /// (ai) Clipping at a small height (TUI-14 — the zone-2
     /// constraint grows 5 + 1 + 1 + 1 + slack): the dashboard never
     /// panics as the terminal shrinks. The layout solver keeps the
@@ -4629,6 +4803,11 @@ mod tests {
     /// four zone-2 lines render with the full 5-row grid.
     #[test]
     fn zone2_clips_at_small_height() {
+        let _lock = TEST_BURN_CLOCK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // The displayed `1:30` is the client clock (BUG 6) — stood in
+        // here by backdating it 90 s (matching the tick's
+        // `elapsed_secs`).
+        set_burn_in_clock(90.0);
         // An in-flight burn-in (the full zone-2 content: the live
         // grid + the status line + the controls line + the burn-in
         // row) on shrinking surfaces (inner = total - 3 header - 2

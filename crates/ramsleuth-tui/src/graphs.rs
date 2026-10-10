@@ -428,6 +428,21 @@ type Series = (&'static str, fn(&GraphSample) -> f64);
 /// label (all five series labels are ≤ 12 chars).
 const LABEL_CELL: usize = 14;
 
+/// Blank every cell of `area` (symbol `' '` + the panel's bg style):
+/// a `Block` is style-only (borders/title/bg via `set_style` — it never
+/// erases cell symbols) and a `Paragraph` writes only as many cells as
+/// its content, so the zone glyphs painted earlier in the same fresh
+/// frame must be explicitly erased before the panel paints (intra-frame
+/// layering — the fresh-buffer rule; §2.1 of the 2.4.14 plan).
+fn blank_area(buf: &mut ratatui::buffer::Buffer, area: Rect, bg: Color) {
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            buf[(x, y)].set_symbol(" ");
+            buf[(x, y)].set_style(Style::default().bg(bg));
+        }
+    }
+}
+
 /// Render the graphs overlay panel (the `[g]` toggle — TUI-16
 /// draws it last, topmost, over the whole zone area, the C21-36
 /// modal idiom): a titled block on the slate background, one
@@ -472,6 +487,13 @@ pub fn render_graphs_panel(
     if inner.is_empty() {
         return; // the borders consumed the rect: nothing to plot.
     }
+    // Erase the zones painted earlier in this same fresh frame from the
+    // inner area before the rows paint: the panel is drawn last +
+    // topmost over the zone area, and a `Block` never erases symbols
+    // while a `Paragraph` writes only its content width — without this,
+    // the zone glyphs bleed through the `Fill(1)` slack row and every
+    // row tail (BUG 4).
+    blank_area(frame.buffer_mut(), inner, SLATE);
 
     let windowed = window_samples(graph.samples.iter(), window_min);
     // The GUI's fixed series order (plan §2.3).
@@ -1174,6 +1196,61 @@ mod tests {
                 // a zero rect + a rect too small for the borders
                 render_graphs_panel(f, &state, 5, Rect::new(0, 0, 0, 0));
                 render_graphs_panel(f, &state, 5, Rect::new(0, 0, 2, 2));
+            })
+            .expect("render must not panic");
+    }
+
+    /// (s) Intra-frame layering (BUG 4): the zones painted earlier in the
+    /// same fresh frame must be erased from the panel before the rows
+    /// paint. Seed the whole target rect with a distinctive glyph (`'Z'`),
+    /// render the panel over it, and assert no `'Z'` survives anywhere —
+    /// the inner area is blanked first (the `Fill(1)` slack row + every
+    /// row tail a `Paragraph` does not cover), and the block re-drew its
+    /// own borders/title. The panel content (the title + a series label)
+    /// is present, so this is not a vacuous all-blank pass. Pre-fix the
+    /// `'Z'`s survive in the slack row + the row tails.
+    #[test]
+    fn graph_panel_blanks_intra_frame_layering() {
+        let mut state = GraphState::default();
+        state.samples.push(sample(1000.0, 1800.0));
+        let width = 100;
+        let height = 12;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal must init");
+        terminal
+            .draw(|f| {
+                // Seed the whole target rect with 'Z' (simulating the
+                // zones painted earlier in the same fresh frame — the
+                // panel is drawn last, topmost over them).
+                for y in 0..height {
+                    for x in 0..width {
+                        f.buffer_mut()[(x, y)].set_symbol("Z");
+                    }
+                }
+                render_graphs_panel(f, &state, 5, Rect::new(0, 0, width, height));
+                // No seeded zone glyph survives anywhere in the panel.
+                for y in 0..height {
+                    for x in 0..width {
+                        assert_ne!(
+                            f.buffer_mut()[(x, y)].symbol(),
+                            "Z",
+                            "a seeded zone glyph ('Z') survived at ({x}, {y})"
+                        );
+                    }
+                }
+                // The panel content is present (not a vacuous all-blank
+                // pass): the title + a series label survived the blanking.
+                let text: String = f
+                    .buffer_mut()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(text.contains("GRAPHS"), "the panel title must be present: {text}");
+                assert!(
+                    text.contains("CPU FREQ MHz"),
+                    "a series label must be present: {text}"
+                );
             })
             .expect("render must not panic");
     }
