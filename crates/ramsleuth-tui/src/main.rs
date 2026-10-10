@@ -1837,16 +1837,17 @@ fn run(args: TuiArgs) -> ExitCode {
     // after an explicit reopen.
     let mut requirements_dismissed = false;
     // The ghosting guard (the startup clear's continuation): a strip
-    // leaves the layout tree when it closes, so a strip drawn one frame
-    // and gone the next would leave its stale pixels (the yellow SETUP
-    // box, the controls block, the settings line) where the re-laid-out
-    // frame does not overwrite them — the screen is cleared on any
-    // visible→hidden transition. All three surfaces start closed
-    // (`false`); the previous-frame values are advanced after each
-    // draw.
+    // (or the graphs panel) leaves the layout tree when it closes, so a
+    // surface drawn one frame and gone the next would leave its stale
+    // pixels (the yellow SETUP box, the controls block, the settings
+    // line, the graphs panel) where the re-laid-out frame does not
+    // overwrite them — the screen is cleared on any visible→hidden
+    // transition. All four surfaces start closed (`false`); the
+    // previous-frame values are advanced after each draw.
     let mut prev_about_shown = false;
     let mut prev_requirements_shown = false;
     let mut prev_settings_shown = false;
+    let mut prev_graphs_shown = false;
 
     let updater = spawn_updater(
         Arc::clone(&state),
@@ -1871,13 +1872,18 @@ fn run(args: TuiArgs) -> ExitCode {
         // before the draw — the closing surface's stale pixels would
         // otherwise linger where the re-laid-out frame does not reach
         // them.
-        let (about_shown, requirements_shown, settings_shown) = {
+        let (about_shown, requirements_shown, settings_shown, graphs_shown) = {
             let app = state.read().unwrap();
-            strip_visibility(&app)
+            // Read the graphs knob alongside the strips (the `[g]` panel
+            // is the fourth ghosting surface — its `visible→hidden`
+            // transition clears the screen too).
+            let (about, requirements, settings) = strip_visibility(&app);
+            (about, requirements, settings, app.settings.graphs_open)
         };
         if (prev_about_shown && !about_shown)
             || (prev_requirements_shown && !requirements_shown)
             || (prev_settings_shown && !settings_shown)
+            || (prev_graphs_shown && !graphs_shown)
         {
             let _ = terminal.clear();
         }
@@ -1899,6 +1905,7 @@ fn run(args: TuiArgs) -> ExitCode {
         prev_about_shown = about_shown;
         prev_requirements_shown = requirements_shown;
         prev_settings_shown = settings_shown;
+        prev_graphs_shown = graphs_shown;
 
         match events::poll_event(POLL_TIMEOUT) {
             Ok(Some(Event::Key(key))) => {

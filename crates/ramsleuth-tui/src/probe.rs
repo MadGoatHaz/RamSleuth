@@ -18,10 +18,14 @@
 //! - [`render_probe_overlay`] — the overlay paint: drawn **last** by
 //!   [`crate::ui::render`], topmost, over the whole frame (the
 //!   graphs-overlay paint-order idiom — the dashboard renders
-//!   underneath first, the overlay wins the paint). The consent
-//!   prompt is a centered titled block; the preview is a full-frame
-//!   titled block with the markdown as a scrolled [`Paragraph`], the
-//!   notice line, and the key footer.
+//!   underneath first, the overlay wins the paint). While open it is
+//!   **modal**: it first blanks the whole frame to the terminal's
+//!   default surface (erasing the dashboard painted earlier in the
+//!   same fresh frame — a `Block` never erases symbols, §2.1), then
+//!   draws the phase. The consent is a centered 72×8 box whose lines
+//!   are padded to the inner width; the preview is a full-frame titled
+//!   block with the markdown as a scrolled [`Paragraph`], the notice
+//!   line, and the key footer.
 //! - [`preview_max_scroll`] — the preview's scroll clamp (the
 //!   markdown's line count minus the visible text height — the same
 //!   layout the render draws): the main loop clamps the
@@ -162,9 +166,39 @@ pub fn render_probe_overlay(frame: &mut Frame, overlay: &ProbeOverlayState, area
     };
     match overlay {
         ProbeOverlayState::None => {}
-        ProbeOverlayState::Consent { .. } => render_consent(frame, box_area),
+        ProbeOverlayState::Consent { .. } => {
+            // Modal: erase the dashboard painted earlier in this same
+            // fresh frame before the consent box draws (BUG 5 — the
+            // consent no longer floats over the live dashboard; a
+            // `Block` is style-only and never erases symbols).
+            blank_frame(frame, area);
+            render_consent(frame, box_area)
+        }
         ProbeOverlayState::Preview { markdown, notice, scroll } => {
+            // The preview covers the full frame; blanking first keeps
+            // both open phases symmetric (a clean modal surface).
+            blank_frame(frame, area);
             render_preview(frame, markdown, notice, *scroll, box_area)
+        }
+    }
+}
+
+/// Blank the whole `area` to the terminal's default surface (symbol
+/// `' '`, no background — a bare frame): a `Block` is style-only
+/// (borders/title/bg via `set_style` — it never erases cell symbols)
+/// and a `Paragraph` writes only its content width, so the dashboard
+/// painted earlier in this same fresh frame must be explicitly erased
+/// before an open (modal) overlay draws (BUG 5 — the fresh-buffer
+/// intra-frame layering rule, §2.1).
+fn blank_frame(frame: &mut Frame, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            buf[(x, y)].set_symbol(" ");
+            buf[(x, y)].set_style(Style::default());
         }
     }
 }
@@ -221,7 +255,38 @@ fn render_consent(frame: &mut Frame, area: Rect) {
         Span::styled("no", Style::default().fg(LIGHT_GREY)),
     ]));
     lines.push(Line::from(""));
+    // Pad every line to the box's inner width: a `Paragraph` writes
+    // only its content width, so the trailing cells would otherwise
+    // keep whatever the block left behind — the box interior must be
+    // fully ours (BUG 5's defense-in-depth).
+    let lines: Vec<Line> = lines
+        .into_iter()
+        .map(|line| pad_line_to_width(line, inner.width))
+        .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Pad a `Line` to exactly `width` cells: when the line's total content
+/// width is under `width`, extend its last span (or append a bare space
+/// span) with spaces so the trailing cells are explicit. Over-long
+/// lines are left untouched — the `Paragraph` truncates them at the
+/// area edge, so padding is safe.
+fn pad_line_to_width(mut line: Line, width: u16) -> Line {
+    let used: usize = line.spans.iter().map(|span| span.content.chars().count()).sum();
+    if (used as u16) >= width {
+        return line;
+    }
+    let pad = " ".repeat(width as usize - used);
+    match line.spans.last_mut() {
+        Some(last) => {
+            // `Cow<str>` has no `push_str`; rebuild the content as an
+            // owned string with the padding appended.
+            let content = format!("{}{}", last.content, pad);
+            last.content = std::borrow::Cow::Owned(content);
+        }
+        None => line.spans.push(Span::raw(pad)),
+    }
+    line
 }
 
 /// The markdown preview: the full-frame titled block — the report
@@ -591,6 +656,95 @@ mod tests {
                 render_probe_overlay(f, &consent, Rect::new(0, 0, 2, 2));
                 render_probe_overlay(f, &preview, Rect::new(0, 0, 0, 0));
                 render_probe_overlay(f, &preview, Rect::new(0, 0, 2, 2));
+            })
+            .expect("render must not panic");
+    }
+
+    /// (f′) BUG 5 — the consent is modal: the open overlay blanks the
+    /// whole frame (erasing the dashboard painted earlier in the same
+    /// fresh frame) before drawing the centered 72×8 box. Seed the
+    /// buffer with `'D'` glyphs (dashboard simulation), render the
+    /// consent, and assert (a) every cell **outside** the box is `' '`,
+    /// and (b) no `'D'` survives anywhere in the frame.
+    #[test]
+    fn consent_blanks_the_frame_around_the_box() {
+        let width = 100;
+        let height = 30;
+        let overlay = ProbeOverlayState::Consent { markdown: fixture_markdown() };
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal must init");
+        terminal
+            .draw(|f| {
+                // Seed the whole frame with 'D' (dashboard simulation).
+                for y in 0..height {
+                    for x in 0..width {
+                        f.buffer_mut()[(x, y)].set_symbol("D");
+                    }
+                }
+                render_probe_overlay(f, &overlay, Rect::new(0, 0, width, height));
+                // (b) No 'D' survives anywhere in the frame.
+                for y in 0..height {
+                    for x in 0..width {
+                        assert_ne!(
+                            f.buffer_mut()[(x, y)].symbol(),
+                            "D",
+                            "a dashboard glyph ('D') survived at ({x}, {y})"
+                        );
+                    }
+                }
+                // (a) Every cell outside the centered 72×8 box is blank.
+                let consent_box = overlay_area(Rect::new(0, 0, width, height), &overlay)
+                    .expect("the consent box must fit a 100x30 frame");
+                for y in 0..height {
+                    for x in 0..width {
+                        let in_box = (consent_box.x..consent_box.x + consent_box.width).contains(&x)
+                            && (consent_box.y..consent_box.y + consent_box.height).contains(&y);
+                        if !in_box {
+                            assert_eq!(
+                                f.buffer_mut()[(x, y)].symbol(),
+                                " ",
+                                "a non-blank cell survived outside the consent box at ({x}, {y})"
+                            );
+                        }
+                    }
+                }
+            })
+            .expect("render must not panic");
+    }
+
+    /// (f″) BUG 5 — the preview stays a full-frame surface: the open
+    /// overlay blanks the whole frame first (as the consent does), so
+    /// no dashboard glyph survives. Seed `'D'`, render the preview, and
+    /// assert zero `'D'` cells remain.
+    #[test]
+    fn preview_still_covers_the_full_frame() {
+        let width = 100;
+        let height = 30;
+        let overlay = ProbeOverlayState::Preview {
+            markdown: fixture_markdown(),
+            notice: None,
+            scroll: 0,
+        };
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal must init");
+        terminal
+            .draw(|f| {
+                // Seed the whole frame with 'D' (dashboard simulation).
+                for y in 0..height {
+                    for x in 0..width {
+                        f.buffer_mut()[(x, y)].set_symbol("D");
+                    }
+                }
+                render_probe_overlay(f, &overlay, Rect::new(0, 0, width, height));
+                for y in 0..height {
+                    for x in 0..width {
+                        assert_ne!(
+                            f.buffer_mut()[(x, y)].symbol(),
+                            "D",
+                            "a dashboard glyph ('D') survived at ({x}, {y})"
+                        );
+                    }
+                }
             })
             .expect("render must not panic");
     }
