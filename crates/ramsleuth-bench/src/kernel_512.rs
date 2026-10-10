@@ -3,10 +3,16 @@
 //! **Chunk P1-07 — [COUPLED-TO: P1-01].** The 512-bit companions to the
 //! P1-04 / P1-05 / P1-06 AVX2 kernels, reusing their exact shapes at
 //! double width: `_mm512_load_si512` aligned loads (the P1-04 load
-//! shape), `_mm512_stream_si512` non-temporal stores (the P1-05 store
-//! shape — a store that bypasses the cache hierarchy and goes straight
-//! to DRAM), a single trailing `_mm_sfence()` (the P1-05 tail), and the
-//! P1-04 word-sum checksum as the dead-code-elimination sink.
+//! shape), and — for the write/copy store leg — either `_mm512_stream_si512`
+//! **non-temporal** stores (the P1-05 NT shape — bypasses the cache →
+//! the **Memory-tier** path, with a trailing `_mm_sfence()`) or
+//! `_mm512_store_si512` **cache-resident** aligned stores (the
+//! **L1/L2/L3-tier** path, no fence). The P1-04 word-sum checksum is the
+//! dead-code-elimination sink.
+//!
+//! **Per-tier fidelity (BENCH-1/3):** each of the three ops has a
+//! `*_resident` 512-bit companion to its NT form, selected by the
+//! worker on [`Tier`] exactly as the AVX2 layer is.
 //!
 //! **Dispatch (consumes the frozen P1-01 interface):** all three public
 //! fns are *always* callable. On an x86_64 host reporting AVX-512F
@@ -71,15 +77,16 @@
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 use core::arch::x86_64::{
     _mm512_add_epi64, _mm512_castsi512_si256, _mm512_extracti64x4_epi64, _mm512_load_si512,
-    _mm512_set_epi64, _mm512_setzero_si512, _mm512_stream_si512, _mm_add_epi64, _mm256_castsi256_si128,
-    _mm_cvtsi128_si64, _mm256_extracti128_si256, _mm_sfence, _mm_unpackhi_epi64, __m512i,
+    _mm512_set_epi64, _mm512_setzero_si512, _mm512_store_si512, _mm512_stream_si512, _mm_add_epi64,
+    _mm256_castsi256_si128, _mm_cvtsi128_si64, _mm256_extracti128_si256, _mm_sfence,
+    _mm_unpackhi_epi64, __m512i,
 };
 
 #[cfg(feature = "avx512")]
 use crate::features::CpuFeatures;
-use crate::kernel_copy::avx2_copy;
+use crate::kernel_copy::{avx2_copy, avx2_copy_resident};
 use crate::kernel_read::avx2_read;
-use crate::kernel_write::avx2_write;
+use crate::kernel_write::{avx2_write, avx2_write_resident};
 
 /// Stream-read an entire buffer at 512-bit width and return its
 /// checksum: the P1-04 wrapping sum (mod 2^64) of the buffer's
@@ -119,11 +126,12 @@ pub fn avx512_read(src: &[u8]) -> u64 {
     avx2_read(src)
 }
 
-/// Fill an entire buffer with non-temporal 512-bit stores of eight
+/// Fill an entire buffer with **non-temporal** 512-bit stores of eight
 /// little-endian copies of `pattern`, terminated by a single
 /// `_mm_sfence()`, and return the number of bytes written
-/// (`dst.len()`) — the identical return to [`avx2_write`]. See the
-/// module docs for dispatch and the frozen precondition.
+/// (`dst.len()`) — the identical return to [`avx2_write`]. The NT stores
+/// bypass the cache → the **Memory-tier** write path. See the module docs
+/// for dispatch and the frozen precondition.
 ///
 /// # Precondition
 ///
@@ -155,12 +163,50 @@ pub fn avx512_write(dst: &mut [u8], pattern: u64) -> u64 {
     avx2_write(dst, pattern)
 }
 
+/// Fill an entire buffer with **cache-resident** (non-temporal-free)
+/// 512-bit aligned stores of eight little-endian copies of `pattern`, and
+/// return the number of bytes written (`dst.len()`) — the identical
+/// return to [`avx2_write_resident`]. The aligned stores go through the
+/// cache (no `_mm_sfence`) → the **L1/L2/L3-tier** write path (BENCH-1).
+/// See the module docs for dispatch and the frozen precondition.
+///
+/// # Precondition
+///
+/// `dst` must be 64-byte aligned with a length that is a multiple of
+/// 64 bytes (asserted in debug builds; undefined behavior in release
+/// builds otherwise). The kernel does not realign internally.
+pub fn avx512_write_resident(dst: &mut [u8], pattern: u64) -> u64 {
+    debug_assert!(
+        (dst.as_ptr() as usize) % 64 == 0,
+        "avx512_write_resident: dst must be 64-byte aligned",
+    );
+    debug_assert!(
+        dst.len() % 64 == 0,
+        "avx512_write_resident: dst.len() must be a multiple of 64",
+    );
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    {
+        if CpuFeatures::detect().avx512f {
+            // SAFETY: the debug_asserts above (and the documented
+            // precondition) guarantee 64-byte alignment and a
+            // 64-multiple length; the slice keeps the buffer valid for
+            // the writes.
+            return unsafe { avx512_write_resident_simd(dst.as_mut_ptr(), dst.len(), pattern) };
+        }
+    }
+    // Fallback: the AVX2 cache-resident write kernel (which itself falls
+    // back to scalar off-AVX2) fills with identical contents and returns
+    // the same byte count.
+    avx2_write_resident(dst, pattern)
+}
+
 /// Copy the whole of `src` into `dst` at 512-bit width (aligned loads +
-/// non-temporal stores + a single trailing `_mm_sfence()`) and return
+/// **non-temporal** stores + a single trailing `_mm_sfence()`) and return
 /// the checksum of the destination after the copy: the P1-04 wrapping
 /// word-sum (mod 2^64) of `dst`'s little-endian 64-bit words, computed
 /// with the frozen `avx2_read` kernel — the identical semantics to
-/// [`avx2_copy`] (`0` for an empty/zeroed destination). See the module
+/// [`avx2_copy`] (`0` for an empty/zeroed destination). The NT write leg
+/// bypasses the cache → the **Memory-tier** copy path. See the module
 /// docs for dispatch and the frozen precondition.
 ///
 /// # Precondition
@@ -205,6 +251,60 @@ pub fn avx512_copy(src: &[u8], dst: &mut [u8]) -> u64 {
     // scalar off-AVX2) produces byte-identical destination contents and
     // the same P1-04 checksum.
     avx2_copy(src, dst)
+}
+
+/// Copy the whole of `src` into `dst` at 512-bit width (aligned loads +
+/// **cache-resident** aligned stores, no `_mm_sfence`) and return the
+/// checksum of the destination after the copy: the P1-04 wrapping
+/// word-sum (mod 2^64) of `dst`'s little-endian 64-bit words, computed
+/// with the frozen `avx2_read` kernel — the identical semantics to
+/// [`avx2_copy_resident`] (`0` for an empty/zeroed destination). The
+/// cache-resident write leg goes through the cache → the **L1/L2/L3-tier**
+/// copy path (BENCH-3). See the module docs for dispatch and the frozen
+/// precondition.
+///
+/// # Precondition
+///
+/// `src` and `dst` must each be 64-byte aligned, both lengths a
+/// multiple of 64 and equal, and the ranges must not alias (asserted in
+/// debug builds; undefined behavior in release builds otherwise). The
+/// kernel does not realign internally.
+pub fn avx512_copy_resident(src: &[u8], dst: &mut [u8]) -> u64 {
+    debug_assert!(src.len() == dst.len(), "avx512_copy_resident: src.len() must equal dst.len()");
+    debug_assert!(
+        (src.as_ptr() as usize) % 64 == 0,
+        "avx512_copy_resident: src must be 64-byte aligned",
+    );
+    debug_assert!(
+        (dst.as_ptr() as usize) % 64 == 0,
+        "avx512_copy_resident: dst must be 64-byte aligned",
+    );
+    debug_assert!(
+        src.len() % 64 == 0,
+        "avx512_copy_resident: src.len() must be a multiple of 64",
+    );
+    debug_assert!(
+        src.as_ptr() as usize + src.len() <= dst.as_ptr() as usize
+            || dst.as_ptr() as usize + dst.len() <= src.as_ptr() as usize,
+        "avx512_copy_resident: src and dst must not alias",
+    );
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    {
+        if CpuFeatures::detect().avx512f {
+            // SAFETY: the debug_asserts above (and the documented
+            // precondition) guarantee 64-byte alignment on both sides,
+            // equal 64-multiple lengths, and disjoint ranges; `src`
+            // keeps its buffer valid for reads and `dst` for writes.
+            unsafe {
+                avx512_copy_resident_simd(src.as_ptr(), dst.as_mut_ptr(), src.len());
+            }
+            return avx2_read(dst);
+        }
+    }
+    // Fallback: the AVX2 cache-resident copy kernel (which itself falls
+    // back to scalar off-AVX2) produces byte-identical destination
+    // contents and the same P1-04 checksum.
+    avx2_copy_resident(src, dst)
 }
 
 /// AVX-512F body: unrolled 512-bit aligned loads accumulating into a
@@ -307,6 +407,47 @@ unsafe fn avx512_write_simd(ptr: *mut u8, len: usize, pattern: u64) -> u64 {
     len as u64
 }
 
+/// AVX-512F cache-resident body: one 512-bit vector (eight LE copies of
+/// `pattern`) written by unrolled `_mm512_store_si512` aligned stores.
+/// **L1/L2/L3-tier** write path — the stores go through the cache (no
+/// `_mm_sfence`).
+///
+/// # Safety
+///
+/// `ptr` must be 64-byte aligned, valid for writes of `len` bytes, and
+/// `len` a multiple of 64 (enforced by [`avx512_write_resident`]'s debug
+/// asserts and documented precondition); every store writes strictly
+/// inside that span.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[clippy::msrv = "1.89"]
+#[target_feature(enable = "avx512f")]
+unsafe fn avx512_write_resident_simd(ptr: *mut u8, len: usize, pattern: u64) -> u64 {
+    // SAFETY: the caller (`avx512_write_resident`) guarantees `ptr` is
+    // 64-byte aligned, valid for writes of `len` bytes, with
+    // `len % 64 == 0`; each `_mm512_store_si512` below therefore writes
+    // one 64-byte chunk strictly inside the valid, alignment-correct span.
+    let base = ptr as *mut __m512i;
+    let word = pattern as i64;
+    let v = _mm512_set_epi64(word, word, word, word, word, word, word, word);
+    let chunks = len / 64;
+    let mut i = 0;
+    // Unrolled main loop: four aligned (cache-resident) stores per
+    // iteration.
+    while i + 4 <= chunks {
+        _mm512_store_si512(base.add(i), v);
+        _mm512_store_si512(base.add(i + 1), v);
+        _mm512_store_si512(base.add(i + 2), v);
+        _mm512_store_si512(base.add(i + 3), v);
+        i += 4;
+    }
+    // Tail: the remaining 0-3 chunks.
+    while i < chunks {
+        _mm512_store_si512(base.add(i), v);
+        i += 1;
+    }
+    len as u64
+}
+
 /// AVX-512F body: unrolled 512-bit aligned loads from `src`
 /// interleaved with non-temporal 512-bit stores into `dst`, followed by
 /// a single `_mm_sfence()` so every store is globally visible before
@@ -354,6 +495,51 @@ unsafe fn avx512_copy_simd(src: *const u8, dst: *mut u8, len: usize) {
     // before the caller observes `dst` (placed after the last store,
     // mirroring the P1-05 tail).
     _mm_sfence();
+}
+
+/// AVX-512F cache-resident body: unrolled 512-bit aligned loads from
+/// `src` interleaved with **aligned** (cache-resident) 512-bit stores
+/// into `dst` (no `_mm_sfence`). **L1/L2/L3-tier** copy path (BENCH-3).
+///
+/// # Safety
+///
+/// `src` must be 64-byte aligned and valid for reads of `len` bytes;
+/// `dst` must be 64-byte aligned and valid for writes of `len` bytes;
+/// `len` a multiple of 64; and the two spans must not alias (enforced
+/// by [`avx512_copy_resident`]'s debug asserts and documented
+/// precondition). Every load/store touches one 64-byte chunk strictly
+/// inside its span.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[clippy::msrv = "1.89"]
+#[target_feature(enable = "avx512f")]
+unsafe fn avx512_copy_resident_simd(src: *const u8, dst: *mut u8, len: usize) {
+    // SAFETY: the caller (`avx512_copy_resident`) guarantees both pointers
+    // are 64-byte aligned, `len % 64 == 0`, `src` is valid for reads of
+    // `len` bytes, `dst` is valid for writes of `len` bytes, and the
+    // spans are disjoint; each intrinsic below therefore touches one
+    // 64-byte chunk strictly inside its valid, alignment-correct span.
+    let s = src as *const __m512i;
+    let d = dst as *mut __m512i;
+    let chunks = len / 64;
+    let mut i = 0;
+    // Unrolled main loop: four aligned loads and four aligned
+    // (cache-resident) stores per iteration, interleaved chunk by chunk.
+    while i + 4 <= chunks {
+        let v0 = _mm512_load_si512(s.add(i));
+        let v1 = _mm512_load_si512(s.add(i + 1));
+        let v2 = _mm512_load_si512(s.add(i + 2));
+        let v3 = _mm512_load_si512(s.add(i + 3));
+        _mm512_store_si512(d.add(i), v0);
+        _mm512_store_si512(d.add(i + 1), v1);
+        _mm512_store_si512(d.add(i + 2), v2);
+        _mm512_store_si512(d.add(i + 3), v3);
+        i += 4;
+    }
+    // Tail: the remaining 0-3 chunks.
+    while i < chunks {
+        _mm512_store_si512(d.add(i), _mm512_load_si512(s.add(i)));
+        i += 1;
+    }
 }
 
 #[cfg(test)]
@@ -514,6 +700,53 @@ mod tests {
         assert_eq!(buf, src, "destination must be byte-identical to the source");
         dealloc_aligned(ptr, 64);
         dealloc_aligned(src_ptr, 64);
+    }
+
+    /// (e0) The cache-resident 512 write/copy companions agree with the
+    /// NT 512 forms on contents and the P1-04 checksum (only the store
+    /// instruction differs), and fall back to the AVX2 resident kernels
+    /// off-AVX-512F — the per-tier BENCH-1/3 512-bit path.
+    #[test]
+    fn resident_512_matches_nt_and_falls_back_to_avx2() {
+        const LEN: usize = 8 * 1024;
+        let src_ptr = aligned_zeroed(LEN);
+        // SAFETY: `src_ptr` is valid for `LEN` reads/writes (fresh allocation).
+        let src = unsafe { core::slice::from_raw_parts_mut(src_ptr, LEN) };
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let dst_ptr = aligned_zeroed(LEN);
+        // SAFETY: `dst_ptr` is valid for `LEN` writes (fresh allocation).
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, LEN) };
+
+        // Resident write fills with the pattern, same as the NT write.
+        dst.fill(0);
+        assert_eq!(avx512_write_resident(dst, PATTERN), LEN as u64);
+        assert_eq!(&*dst, expected(LEN, PATTERN).as_slice());
+        dst.fill(0);
+        avx512_write(dst, PATTERN);
+        assert_eq!(&*dst, expected(LEN, PATTERN).as_slice(), "NT and resident 512 writes agree");
+
+        // Resident copy is byte-identical to the source and checksums the
+        // same as the NT copy.
+        dst.fill(0);
+        let resident_checksum = avx512_copy_resident(src, dst);
+        assert_eq!(dst, src, "resident 512 copy must be byte-identical");
+        dst.fill(0);
+        let nt_checksum = avx512_copy(src, dst);
+        assert_eq!(resident_checksum, nt_checksum, "resident and NT 512 copy checksums agree");
+
+        // Off-AVX-512F the resident 512 dispatches fall back to the AVX2
+        // resident kernels (verified on a host without AVX-512F).
+        #[cfg(feature = "avx512")]
+        if !CpuFeatures::detect().avx512f {
+            dst.fill(0);
+            assert_eq!(avx512_write_resident(dst, PATTERN), avx2_write_resident(dst, PATTERN));
+            dst.fill(0);
+            assert_eq!(avx512_copy_resident(src, dst), avx2_copy_resident(src, dst));
+        }
+        dealloc_aligned(src_ptr, LEN);
+        dealloc_aligned(dst_ptr, LEN);
     }
 
     /// (e) If the host reports AVX-512F, the `#[target_feature]` 512-bit

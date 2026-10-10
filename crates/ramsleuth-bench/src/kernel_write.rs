@@ -1,21 +1,29 @@
-//! Non-temporal streaming WRITE bandwidth kernel (AVX2, 256-bit NT stores).
+//! Streaming WRITE bandwidth kernels (AVX2, 256-bit).
 //!
-//! **Chunk P1-05 — [COUPLED-TO: P1-01].** A pure write loop over an
-//! already-aligned buffer: every 32-byte chunk is written with one
-//! `_mm256_stream_si256` — a *non-temporal* store that bypasses the cache
-//! hierarchy and goes straight to DRAM (intentional: this kernel
-//! benchmarks DRAM write bandwidth, and skipping the RFO /
-//! read-for-ownership is exactly the signature the orchestrator later
-//! distinguishes) — repeating a single 256-bit vector built from
-//! `pattern` (four little-endian copies of the same u64 word). A single
-//! `_mm_sfence()` issued after the last store makes all the non-temporal
-//! stores globally visible before the caller observes the buffer.
+//! **Chunk P1-05 — [COUPLED-TO: P1-01].** Two write kernels over an
+//! already-aligned buffer, both repeating a single 256-bit vector built
+//! from `pattern` (four little-endian copies of the same u64 word):
+//!
+//! - [`avx2_write`] — **non-temporal** (NT) stores
+//!   (`_mm256_stream_si256`) that bypass the cache hierarchy and go
+//!   straight to DRAM, terminated by a single `_mm_sfence()` making the
+//!   stores globally visible. This is the **Memory-tier** write path.
+//! - [`avx2_write_resident`] — **cache-resident** aligned stores
+//!   (`_mm256_store_si256`) that go through the cache hierarchy (no
+//!   `_mm_sfence`: the cache is coherent). This is the **L1/L2/L3-tier**
+//!   write path.
+//!
+//! **Per-tier fidelity (BENCH-1):** the worker selects the variant by
+//! [`Tier`] (not just `use_avx512`), so each cache tier's "Write" cell
+//! measures that tier's *cache* write bandwidth, and only the Memory
+//! tier measures DRAM write bandwidth. Before this split every tier used
+//! NT stores, so the L1/L2/L3 "Write" cells wrongly measured DRAM.
 //!
 //! **Dispatch (consumes the frozen P1-01 interface):** on an x86_64 host
 //! reporting AVX2 ([`CpuFeatures::detect`]) the SIMD body runs; on
 //! non-x86_64 targets or an x86_64 host without AVX2 the *same* function
 //! falls back to a safe scalar path that fills the buffer with
-//! *identical* contents, so `avx2_write` is always callable and produces
+//! *identical* contents, so both kernels are always callable and produce
 //! the same result on every path.
 //!
 //! **No timing here** — wall-clock measurement belongs to the
@@ -32,20 +40,23 @@
 //! # Precondition (frozen)
 //!
 //! `dst` must be **32-byte aligned** and its **length a multiple of 32
-//! bytes**. The kernel never realigns internally: `avx2_write`
-//! `debug_assert`s both, and violating them in a release build is
-//! undefined behavior. Tests allocate via `Layout::from_size_align(len, 32)`.
+//! bytes**. The kernels never realign internally: each `debug_assert`s
+//! both, and violating them in a release build is undefined behavior.
+//! Tests allocate via `Layout::from_size_align(len, 32)`.
 
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{_mm256_set_epi64x, _mm256_stream_si256, _mm_sfence, __m256i};
+use core::arch::x86_64::{
+    _mm256_set_epi64x, _mm256_store_si256, _mm256_stream_si256, _mm_sfence, __m256i,
+};
 
 use crate::features::CpuFeatures;
 
-/// Fill an entire buffer with non-temporal 256-bit stores of four
+/// Fill an entire buffer with **non-temporal** 256-bit stores of four
 /// little-endian copies of `pattern`, terminated by a single
 /// `_mm_sfence()`, and return the number of bytes written (`dst.len()`).
-/// See the module docs for dispatch, the return definition, and the
-/// frozen precondition.
+/// The NT stores bypass the cache → **Memory-tier** write path. See the
+/// module docs for dispatch, the return definition, and the frozen
+/// precondition.
 ///
 /// # Precondition
 ///
@@ -68,9 +79,10 @@ pub fn avx2_write(dst: &mut [u8], pattern: u64) -> u64 {
     dst.len() as u64
 }
 
-/// AVX2 body: one 256-bit vector (four LE copies of `pattern`) written
-/// by unrolled `_mm256_stream_si256` non-temporal stores, followed by a
-/// single `_mm_sfence()` so the stores are globally visible.
+/// AVX2 non-temporal body: one 256-bit vector (four LE copies of
+/// `pattern`) written by unrolled `_mm256_stream_si256` NT stores,
+/// followed by a single `_mm_sfence()` so the stores are globally
+/// visible. **Memory-tier** write path.
 ///
 /// # Safety
 ///
@@ -105,6 +117,81 @@ unsafe fn avx2_write_simd(ptr: *mut u8, len: usize, pattern: u64) -> u64 {
     // Store fence: make every non-temporal store above globally visible
     // before the caller proceeds (placed after the last store, per plan).
     _mm_sfence();
+    len as u64
+}
+
+/// Fill an entire buffer with **cache-resident** (non-temporal-free) 256-bit
+/// aligned stores of four little-endian copies of `pattern`, and return the
+/// number of bytes written (`dst.len()`). The aligned stores go through the
+/// cache hierarchy — the **L1/L2/L3-tier** write path (BENCH-1). No
+/// `_mm_sfence()` is needed: the cache is coherent, so the stores are visible
+/// to subsequent reads without a fence. See the module docs for dispatch and
+/// the frozen precondition.
+///
+/// # Precondition
+///
+/// `dst` must be 32-byte aligned with a length that is a multiple of 32
+/// bytes (asserted in debug builds; undefined behavior in release builds
+/// otherwise). The kernel does not realign internally.
+pub fn avx2_write_resident(dst: &mut [u8], pattern: u64) -> u64 {
+    debug_assert!(
+        (dst.as_ptr() as usize) % 32 == 0,
+        "avx2_write_resident: dst must be 32-byte aligned"
+    );
+    debug_assert!(
+        dst.len() % 32 == 0,
+        "avx2_write_resident: dst.len() must be a multiple of 32"
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        if CpuFeatures::detect().avx2 {
+            // SAFETY: the debug_asserts above (and the documented
+            // precondition) guarantee 32-byte alignment and a 32-multiple
+            // length; the slice keeps the buffer valid for the writes.
+            return unsafe { avx2_write_resident_simd(dst.as_mut_ptr(), dst.len(), pattern) };
+        }
+    }
+    scalar_write(dst, pattern);
+    dst.len() as u64
+}
+
+/// AVX2 cache-resident body: one 256-bit vector (four LE copies of
+/// `pattern`) written by unrolled `_mm256_store_si256` aligned stores.
+/// **L1/L2/L3-tier** write path — the stores go through the cache (no
+/// `_mm_sfence`).
+///
+/// # Safety
+///
+/// `ptr` must be 32-byte aligned, valid for writes of `len` bytes, and
+/// `len` a multiple of 32 (enforced by [`avx2_write_resident`]'s debug
+/// asserts and documented precondition); every store writes strictly
+/// inside that span.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_write_resident_simd(ptr: *mut u8, len: usize, pattern: u64) -> u64 {
+    // SAFETY: the caller (`avx2_write_resident`) guarantees `ptr` is
+    // 32-byte aligned, valid for writes of `len` bytes, with
+    // `len % 32 == 0`; each `_mm256_store_si256` below therefore writes
+    // one 32-byte chunk strictly inside the valid, alignment-correct span.
+    let base = ptr as *mut __m256i;
+    let word = pattern as i64;
+    let v = _mm256_set_epi64x(word, word, word, word);
+    let chunks = len / 32;
+    let mut i = 0;
+    // Unrolled main loop: four aligned (cache-resident) stores per
+    // iteration.
+    while i + 4 <= chunks {
+        _mm256_store_si256(base.add(i), v);
+        _mm256_store_si256(base.add(i + 1), v);
+        _mm256_store_si256(base.add(i + 2), v);
+        _mm256_store_si256(base.add(i + 3), v);
+        i += 4;
+    }
+    // Tail: the remaining 0-3 chunks.
+    while i < chunks {
+        _mm256_store_si256(base.add(i), v);
+        i += 1;
+    }
     len as u64
 }
 
@@ -217,6 +304,37 @@ mod tests {
         let word = PATTERN.to_le_bytes();
         assert_eq!(&slice[0..8], &word[..], "first 64-bit word must be the LE pattern");
         assert_eq!(&*slice, expected(LEN, PATTERN).as_slice());
+        dealloc_aligned(ptr, LEN);
+    }
+
+    /// (e) The cache-resident variant fills the buffer with the *same*
+    /// contents as the NT variant (only the store instruction differs:
+    /// `_mm256_store_si256` vs `_mm256_stream_si256`), and returns the
+    /// byte count — so a direct SIMD body run agrees on an AVX2 host.
+    #[test]
+    fn resident_write_matches_nt_contents() {
+        const LEN: usize = 4 * 1024;
+        let ptr = aligned_zeroed(LEN);
+        // SAFETY: `ptr` is valid for `LEN` writes (fresh allocation).
+        let slice = unsafe { core::slice::from_raw_parts_mut(ptr, LEN) };
+        let want = expected(LEN, PATTERN);
+        assert_eq!(avx2_write_resident(slice, PATTERN), LEN as u64);
+        assert_eq!(&*slice, want.as_slice(), "resident stores must fill the same bytes");
+        // The NT and resident variants agree on contents for the same input.
+        slice.fill(0);
+        avx2_write(slice, PATTERN);
+        let nt = slice.to_vec();
+        slice.fill(0);
+        avx2_write_resident(slice, PATTERN);
+        assert_eq!(&*slice, &nt, "NT and resident writes must be byte-identical");
+        #[cfg(target_arch = "x86_64")]
+        if CpuFeatures::detect().avx2 {
+            slice.fill(0);
+            // SAFETY: the precondition holds by construction of `slice`.
+            let n = unsafe { avx2_write_resident_simd(slice.as_mut_ptr(), LEN, PATTERN) };
+            assert_eq!(n, LEN as u64);
+            assert_eq!(&*slice, want.as_slice());
+        }
         dealloc_aligned(ptr, LEN);
     }
 

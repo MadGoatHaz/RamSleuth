@@ -66,10 +66,13 @@
 use std::fmt;
 use std::sync::Barrier;
 
-use crate::kernel_512::{avx512_copy, avx512_read, avx512_write};
-use crate::kernel_copy::avx2_copy;
+use crate::kernel_512::{
+    avx512_copy, avx512_copy_resident, avx512_read, avx512_write, avx512_write_resident,
+};
+use crate::kernel_copy::{avx2_copy, avx2_copy_resident};
 use crate::kernel_read::avx2_read;
-use crate::kernel_write::avx2_write;
+use crate::kernel_write::{avx2_write, avx2_write_resident};
+use crate::orchestrator::Tier;
 use crate::topology::CpuTopology;
 
 /// AVX2 kernel block: 32-byte alignment and length granularity
@@ -90,11 +93,93 @@ const WRITE_PATTERN: u64 = 0xA5A5_5AA5_5AA5_A55A;
 pub enum BenchOp {
     /// Stream-read `src`; the checksum covers the read data.
     Read,
-    /// Non-temporal write of a fixed pattern into `dst`; the checksum
-    /// carries the write kernel's byte counter.
+    /// Write of a fixed pattern into `dst` (the store policy is
+    /// tier-aware, BENCH-1); the checksum carries the write kernel's
+    /// byte counter.
     Write,
-    /// Copy `src` into `dst`; the checksum covers `dst` after the copy.
+    /// Copy `src` into `dst` (the write leg is tier-aware, BENCH-3); the
+    /// checksum covers `dst` after the copy.
     Copy,
+}
+
+/// The store policy for a write/copy cell's **store leg** (BENCH-1/3):
+/// cache-resident stores go through the cache hierarchy (the L1/L2/L3
+/// tiers); non-temporal stores bypass it straight to DRAM (the Memory
+/// tier). The read leg is always cache-aligned and tier-correct, so only
+/// the store leg is tier-dependent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreKind {
+    /// Aligned (non-NT) stores through the cache — L1/L2/L3 tiers.
+    CacheResident,
+    /// Non-temporal stores that bypass the cache — the Memory (DRAM) tier.
+    NonTemporal,
+}
+
+/// The specific write kernel [`run_kernel`] selects for a
+/// (tier, SIMD-width) pair (BENCH-1). A pure dispatch decision, so the
+/// tier-aware choice is testable without running the kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKernel {
+    /// AVX2 (256-bit) cache-resident stores.
+    Avx2Resident,
+    /// AVX-512 (512-bit) cache-resident stores.
+    Avx512Resident,
+    /// AVX2 (256-bit) non-temporal stores.
+    Avx2NonTemporal,
+    /// AVX-512 (512-bit) non-temporal stores.
+    Avx512NonTemporal,
+}
+
+/// The specific copy kernel [`run_kernel`] selects for a
+/// (tier, SIMD-width) pair (BENCH-3): the copy's write leg follows the
+/// same tier-aware store policy as the write kernel; its read leg is
+/// always cache-aligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyKernel {
+    /// AVX2 (256-bit) aligned loads + cache-resident stores.
+    Avx2Resident,
+    /// AVX-512 (512-bit) aligned loads + cache-resident stores.
+    Avx512Resident,
+    /// AVX2 (256-bit) aligned loads + non-temporal stores.
+    Avx2NonTemporal,
+    /// AVX-512 (512-bit) aligned loads + non-temporal stores.
+    Avx512NonTemporal,
+}
+
+/// The store policy for a tier's write/copy cell (BENCH-1/3): the cache
+/// tiers (L1/L2/L3) write **through the cache** (cache-resident stores);
+/// the Memory tier writes with **non-temporal** stores (bypass the cache
+/// → true DRAM). This is the single dispatch predicate both the write and
+/// copy legs share.
+pub fn write_store_kind(tier: Tier) -> StoreKind {
+    match tier {
+        Tier::Memory => StoreKind::NonTemporal,
+        Tier::L1 | Tier::L2 | Tier::L3 => StoreKind::CacheResident,
+    }
+}
+
+/// The write kernel [`run_kernel`'s `Write` arm selects for a
+/// (tier, SIMD-width) pair: the tier picks the store policy
+/// ([`write_store_kind`]), `use_avx512` picks the width.
+pub fn select_write_kernel(tier: Tier, use_avx512: bool) -> WriteKernel {
+    match (write_store_kind(tier), use_avx512) {
+        (StoreKind::CacheResident, false) => WriteKernel::Avx2Resident,
+        (StoreKind::CacheResident, true) => WriteKernel::Avx512Resident,
+        (StoreKind::NonTemporal, false) => WriteKernel::Avx2NonTemporal,
+        (StoreKind::NonTemporal, true) => WriteKernel::Avx512NonTemporal,
+    }
+}
+
+/// The copy kernel [`run_kernel`'s `Copy` arm selects for a
+/// (tier, SIMD-width) pair: the copy's write leg follows the same
+/// tier-aware policy as the write kernel ([`write_store_kind`]).
+pub fn select_copy_kernel(tier: Tier, use_avx512: bool) -> CopyKernel {
+    match (write_store_kind(tier), use_avx512) {
+        (StoreKind::CacheResident, false) => CopyKernel::Avx2Resident,
+        (StoreKind::CacheResident, true) => CopyKernel::Avx512Resident,
+        (StoreKind::NonTemporal, false) => CopyKernel::Avx2NonTemporal,
+        (StoreKind::NonTemporal, true) => CopyKernel::Avx512NonTemporal,
+    }
 }
 
 /// Aggregated outcome of one [`run_pinned`] pass over the full buffer.
@@ -274,6 +359,10 @@ fn small_tier_iters(total: usize) -> u32 {
 /// barrier-synced worker per physical core. See the module docs for the
 /// dispatch model, the caller contract, and the no-timing boundary.
 ///
+/// `tier` selects the store policy for the `Write`/`Copy` ops (BENCH-1/3):
+/// the cache tiers (L1/L2/L3) use cache-resident stores, the Memory tier
+/// uses non-temporal stores. `Read` ignores it.
+///
 /// # Errors
 ///
 /// [`WorkerError`] when the caller violates the buffer contract (length
@@ -289,6 +378,7 @@ fn small_tier_iters(total: usize) -> u32 {
 pub fn run_pinned(
     topo: &CpuTopology,
     op: BenchOp,
+    tier: Tier,
     src: &[u8],
     dst: &mut [u8],
     use_avx512: bool,
@@ -392,7 +482,8 @@ pub fn run_pinned(
                 let mut bytes = 0u64;
                 let mut checksum = 0u64;
                 for _ in 0..iters {
-                    let (pass_bytes, pass_checksum) = run_kernel(op, src_slice, dst_slice, use_avx512);
+                    let (pass_bytes, pass_checksum) =
+                        run_kernel(op, tier, src_slice, dst_slice, use_avx512);
                     bytes = bytes.wrapping_add(pass_bytes);
                     checksum = checksum.wrapping_add(pass_checksum);
                 }
@@ -434,26 +525,44 @@ pub fn run_pinned(
 /// `(bytes moved, checksum)`.
 ///
 /// - `Read`: bytes = slice length; checksum = the kernel's word sum.
+///   (The read leg is always cache-aligned — tier-correct, so `tier` is
+///   ignored here.)
 /// - `Write`: bytes = checksum = the kernel's byte counter (the write
-///   kernels' frozen return is `dst.len()`, not a content checksum).
+///   kernels' frozen return is `dst.len()`, not a content checksum). The
+///   kernel is selected by `tier` (BENCH-1): cache-resident stores for
+///   L1/L2/L3, non-temporal for Memory.
 /// - `Copy`: bytes = slice length; checksum = the kernel's word sum of
-///   `dst` after the copy.
-fn run_kernel(op: BenchOp, src: &[u8], dst: &mut [u8], use_avx512: bool) -> (u64, u64) {
+///   `dst` after the copy. The copy's write leg is selected by `tier`
+///   (BENCH-3), pairing with the write kernel's policy; its read leg
+///   stays cache-aligned.
+fn run_kernel(
+    op: BenchOp,
+    tier: Tier,
+    src: &[u8],
+    dst: &mut [u8],
+    use_avx512: bool,
+) -> (u64, u64) {
     match op {
         BenchOp::Read => {
             let checksum = if use_avx512 { avx512_read(src) } else { avx2_read(src) };
             (src.len() as u64, checksum)
         }
         BenchOp::Write => {
-            let written = if use_avx512 {
-                avx512_write(dst, WRITE_PATTERN)
-            } else {
-                avx2_write(dst, WRITE_PATTERN)
+            let written = match select_write_kernel(tier, use_avx512) {
+                WriteKernel::Avx2Resident => avx2_write_resident(dst, WRITE_PATTERN),
+                WriteKernel::Avx512Resident => avx512_write_resident(dst, WRITE_PATTERN),
+                WriteKernel::Avx2NonTemporal => avx2_write(dst, WRITE_PATTERN),
+                WriteKernel::Avx512NonTemporal => avx512_write(dst, WRITE_PATTERN),
             };
             (written, written)
         }
         BenchOp::Copy => {
-            let checksum = if use_avx512 { avx512_copy(src, dst) } else { avx2_copy(src, dst) };
+            let checksum = match select_copy_kernel(tier, use_avx512) {
+                CopyKernel::Avx2Resident => avx2_copy_resident(src, dst),
+                CopyKernel::Avx512Resident => avx512_copy_resident(src, dst),
+                CopyKernel::Avx2NonTemporal => avx2_copy(src, dst),
+                CopyKernel::Avx512NonTemporal => avx512_copy(src, dst),
+            };
             (src.len() as u64, checksum)
         }
     }
@@ -681,7 +790,7 @@ mod tests {
 
         for op in [BenchOp::Read, BenchOp::Write, BenchOp::Copy] {
             for use_avx512 in [false, true] {
-                let res = run_pinned(&topo, op, src, dst_view(), use_avx512)
+                let res = run_pinned(&topo, op, Tier::Memory, src, dst_view(), use_avx512)
                     .unwrap_or_else(|e| panic!("run_pinned {op:?} (512={use_avx512}) failed: {e}"));
                 assert_eq!(res.op, op);
                 assert_eq!(
@@ -743,7 +852,8 @@ mod tests {
         };
 
         let iters = small_tier_iters(LEN);
-        let r32 = run_pinned(&topo, BenchOp::Read, src, dst_view(), false).expect("Read/AVX2");
+        let r32 =
+            run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), false).expect("Read/AVX2");
         assert_eq!(
             r32.total_bytes,
             (LEN as u64).wrapping_mul(iters as u64),
@@ -760,7 +870,8 @@ mod tests {
             "AVX2 aggregate must equal `iters x` the word-sum reference"
         );
 
-        let r512 = run_pinned(&topo, BenchOp::Read, src, dst_view(), true).expect("Read/AVX-512");
+        let r512 =
+            run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), true).expect("Read/AVX-512");
         assert_eq!(
             r512.checksum,
             avx512_read(src).wrapping_mul(iters as u64),
@@ -812,7 +923,7 @@ mod tests {
             let iters = small_tier_iters(len);
 
             for op in [BenchOp::Read, BenchOp::Write, BenchOp::Copy] {
-                let res = run_pinned(&topo, op, src, dst_view(), use_avx512)
+                let res = run_pinned(&topo, op, Tier::Memory, src, dst_view(), use_avx512)
                     .unwrap_or_else(|e| panic!("run_pinned {op:?} (512={use_avx512}) failed: {e}"));
                 assert_eq!(
                     res.total_bytes,
@@ -865,7 +976,8 @@ mod tests {
         };
 
         let iters = small_tier_iters(LEN);
-        let res = run_pinned(&topo, BenchOp::Read, src, dst_view(), false).expect("fallback run");
+        let res =
+            run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), false).expect("fallback run");
         assert!(!res.pinned, "no physical cores → no pinning to report");
         assert_eq!(res.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
         assert_eq!(
@@ -891,7 +1003,7 @@ mod tests {
         let b = unsafe { std::slice::from_raw_parts_mut(b_ptr, 128) };
         assert!(
             matches!(
-                run_pinned(&topo, BenchOp::Read, a, b, false),
+                run_pinned(&topo, BenchOp::Read, Tier::Memory, a, b, false),
                 Err(WorkerError::LengthMismatch { .. })
             )
         );
@@ -905,7 +1017,7 @@ mod tests {
         let c_dst = unsafe { std::slice::from_raw_parts_mut(c_ptr.add(1), 127) };
         assert!(
             matches!(
-                run_pinned(&topo, BenchOp::Read, c_src, c_dst, false),
+                run_pinned(&topo, BenchOp::Read, Tier::Memory, c_src, c_dst, false),
                 Err(WorkerError::Misaligned { buffer: "src", .. })
             )
         );
@@ -919,7 +1031,7 @@ mod tests {
         let e = unsafe { std::slice::from_raw_parts_mut(e_ptr, 120) };
         assert!(
             matches!(
-                run_pinned(&topo, BenchOp::Read, d, e, false),
+                run_pinned(&topo, BenchOp::Read, Tier::Memory, d, e, false),
                 Err(WorkerError::NotBlockMultiple { .. })
             )
         );
@@ -954,7 +1066,8 @@ mod tests {
             std::slice::from_raw_parts_mut(dst_ptr, LEN)
         };
         let iters = small_tier_iters(LEN);
-        let res = run_pinned(&topo, BenchOp::Read, src, dst_view(), false).expect("post-probe run");
+        let res =
+            run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), false).expect("post-probe run");
         assert!(res.pinned, "run must still be fully pinned after the probe");
         assert_eq!(res.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
         assert_eq!(res.checksum, 0, "zeroed buffer checksums to 0 across all inner iterations");
@@ -1002,7 +1115,7 @@ mod tests {
         let expected = word_sum(src);
 
         for op in [BenchOp::Read, BenchOp::Write, BenchOp::Copy] {
-            let res = run_pinned(&topo, op, src, dst_view(), false)
+            let res = run_pinned(&topo, op, Tier::Memory, src, dst_view(), false)
                 .unwrap_or_else(|e| panic!("run_pinned {op:?} failed: {e}"));
             assert_eq!(res.total_bytes, LEN as u64, "{op:?}: one pass only");
             let expected_checksum = match op {
@@ -1041,14 +1154,16 @@ mod tests {
         };
 
         let single_pass = avx2_read(src);
-        let res_read = run_pinned(&topo, BenchOp::Read, src, dst_view(), false).expect("Read");
+        let res_read =
+            run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), false).expect("Read");
         assert_eq!(res_read.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
         assert_eq!(
             res_read.checksum,
             single_pass.wrapping_mul(iters as u64),
             "aggregate = iters x single-pass whole-buffer checksum"
         );
-        let res_write = run_pinned(&topo, BenchOp::Write, src, dst_view(), false).expect("Write");
+        let res_write =
+            run_pinned(&topo, BenchOp::Write, Tier::Memory, src, dst_view(), false).expect("Write");
         assert_eq!(res_write.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
         assert_eq!(res_write.checksum, res_write.total_bytes, "write: checksum == total_bytes");
         dealloc_aligned(src_ptr, LEN);
@@ -1095,5 +1210,55 @@ mod tests {
         let back: Vec<WorkerResult> =
             bincode::deserialize(&bytes).expect("WorkerResult must deserialize");
         assert_eq!(results, back);
+    }
+
+    /// TC-BENCH1 (BENCH-1): the write kernel is tier-aware. The dispatch
+    /// predicate `write_store_kind` returns `CacheResident` for L1/L2/L3
+    /// and `NonTemporal` for Memory; `select_write_kernel` maps that to
+    /// the *chosen kernel fn* (not just a flag) — the Memory tier selects
+    /// the NT kernel, a cache tier selects the cache-resident kernel, for
+    /// both SIMD widths. Pre-fix the write arm keyed on `use_avx512` only
+    /// (every tier → NT), so this fails on the L1/L2/L3 assertions.
+    #[test]
+    fn tc_bench1_write_kernel_is_tier_aware() {
+        // The dispatch predicate: cache tiers → resident, Memory → NT.
+        assert_eq!(write_store_kind(Tier::L1), StoreKind::CacheResident);
+        assert_eq!(write_store_kind(Tier::L2), StoreKind::CacheResident);
+        assert_eq!(write_store_kind(Tier::L3), StoreKind::CacheResident);
+        assert_eq!(write_store_kind(Tier::Memory), StoreKind::NonTemporal);
+
+        // The chosen kernel fn (not just the flag): Memory → NT, L1/L3 →
+        // resident, for both the AVX2 and AVX-512 widths.
+        assert_eq!(select_write_kernel(Tier::Memory, false), WriteKernel::Avx2NonTemporal);
+        assert_eq!(select_write_kernel(Tier::Memory, true), WriteKernel::Avx512NonTemporal);
+        assert_eq!(select_write_kernel(Tier::L1, false), WriteKernel::Avx2Resident);
+        assert_eq!(select_write_kernel(Tier::L1, true), WriteKernel::Avx512Resident);
+        assert_eq!(select_write_kernel(Tier::L2, false), WriteKernel::Avx2Resident);
+        assert_eq!(select_write_kernel(Tier::L3, true), WriteKernel::Avx512Resident);
+    }
+
+    /// TC-BENCH3 (BENCH-3): the copy kernel's write leg is tier-aware
+    /// exactly as the write kernel — `select_copy_kernel` (which shares
+    /// the `write_store_kind` predicate) returns the resident kernel for
+    /// L1/L2/L3 and the NT kernel for Memory, for both SIMD widths. The
+    /// read leg is always cache-aligned (tier-correct). Pre-fix the copy
+    /// used NT stores uniformly (a cache-read + DRAM-write composite).
+    #[test]
+    fn tc_bench3_copy_write_leg_is_tier_aware() {
+        assert_eq!(select_copy_kernel(Tier::L1, false), CopyKernel::Avx2Resident);
+        assert_eq!(select_copy_kernel(Tier::L2, false), CopyKernel::Avx2Resident);
+        assert_eq!(select_copy_kernel(Tier::L3, false), CopyKernel::Avx2Resident);
+        assert_eq!(select_copy_kernel(Tier::Memory, false), CopyKernel::Avx2NonTemporal);
+        assert_eq!(select_copy_kernel(Tier::L1, true), CopyKernel::Avx512Resident);
+        assert_eq!(select_copy_kernel(Tier::Memory, true), CopyKernel::Avx512NonTemporal);
+        // The copy's write leg shares the write kernel's tier-aware
+        // predicate (same `write_store_kind` mapping).
+        for tier in [Tier::Memory, Tier::L1, Tier::L2, Tier::L3] {
+            assert_eq!(
+                select_copy_kernel(tier, false) == CopyKernel::Avx2NonTemporal,
+                write_store_kind(tier) == StoreKind::NonTemporal,
+                "copy write-leg policy must track the write store policy for {tier:?}"
+            );
+        }
     }
 }

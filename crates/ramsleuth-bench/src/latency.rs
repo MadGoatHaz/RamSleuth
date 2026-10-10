@@ -1,30 +1,31 @@
-//! Pointer-chase latency kernel.
+//! Pointer-chase latency kernel — the chase *ring* builder.
 //!
 //! **Chunk P1-09 — [COUPLED-TO: P1-03].** Builds a prefetcher-defeating
-//! pointer-chase *ring* and measures the latency of its dependent
-//! traversal.
+//! pointer-chase *ring* for the benchmark's single latency path.
 //!
 //! The ring is a **single cycle** of `N = size_bytes / 64` slots: slot `i`
 //! stores the index of the *next* hop, so following `ring[i]` from any start
 //! (e.g. `0`) visits every slot in `0..N` exactly once and then returns to
 //! the start. When the orchestrator (P1-10) materializes slot `i` at
-//! physical offset `64 * i` of the [`BufferPlan.latency_ring`] (128 MiB)
-//! buffer, consecutive hops are exactly one cache line (64 B) apart and land
-//! in pseudo-random order — defeating hardware stream/spatial prefetchers so
-//! every hop is a true dependent memory access (L1/L3/DRAM latency, not
-//! prefetch latency).
+//! physical offset `64 * i` of the **tier-sized** chase buffer, consecutive
+//! hops are exactly one cache line (64 B) apart and land in pseudo-random
+//! order — defeating hardware stream/spatial prefetchers so every hop is a
+//! true dependent memory access (L1/L3/DRAM latency, not prefetch latency).
 //!
-//! This chunk is **index-ring + measurement only**: it allocates the compact
-//! `Vec<usize>` ring and provides the timing kernel. The 128 MiB physical
-//! buffer is sized by P1-03 ([`BufferPlan.latency_ring`]) and allocated by the
-//! orchestrator — not here.
+//! This module is **index-ring only**: it allocates the compact `Vec<usize>`
+//! ring. The physical chase buffer is sized to the tier's *bandwidth* size
+//! (the DRAM chase is [`BufferPlan.dram`], sized beyond L3 — BENCH-4 removed
+//! the dead fixed 128 MiB `latency_ring` field) and allocated + chased by the
+//! orchestrator's `chase_materialized` (64-byte stride, the single latency
+//! path — BENCH-5 removed the duplicate compact-ring `chase_latency_ns`,
+//! which fit in L3 and would have misreported L3 as DRAM).
 //!
 //! [`BufferPlan`]: crate::buffers::BufferPlan
 //!
-//! ## Measurement
-//! [`chase_latency_ns`] walks the ring as a strictly dependent load chain
-//! (`idx = ring[idx]` — each load's address is fixed by the previous load's
-//! data, so the CPU cannot overlap or prefetch hops) and times it:
+//! ## Measurement (the orchestrator's `chase_materialized`)
+//! The materialized buffer is chased as a strictly dependent load chain
+//! (`idx = slot[idx]` — each load's address is fixed by the previous load's
+//! data, so the CPU cannot overlap or prefetch hops) and timed:
 //!
 //! - **x86_64:** serialized [`core::arch::x86_64::__rdtscp`] at start and
 //!   end. `RDTSCP` waits for every preceding instruction (the full dependent
@@ -37,23 +38,17 @@
 //!   cycle counter, coarser clock), but still a valid dependent-chase
 //!   latency estimate.
 //!
-//! The hop count is `max(ring.len(), 1_000_000)`: always at least one full
-//! traversal of the cycle, and at least a million hops for a stable average.
-
-use std::hint::black_box;
-use std::time::Instant;
+//! The hop count is a **fixed** `CHASE_HOPS` (1M) for every tier (BENCH-2) —
+//! a partial traversal of a large DRAM ring is fine for latency, and a full
+//! traversal would take ~30 minutes.
 
 /// One cache line: the physical chase stride between consecutive hops (bytes).
 ///
 /// This is a property of how the orchestrator *materializes* the ring (slot
 /// `i` at offset `STRIDE_BYTES * i`), not of the compact `Vec<usize>` ring
-/// this module returns.
+/// this module returns. The single latency path (the orchestrator's
+/// `chase_materialized`) chases at this 64-byte stride.
 pub const STRIDE_BYTES: usize = 64;
-
-/// Minimum number of chase hops for a stable average.
-///
-/// [`chase_latency_ns`] performs `max(ring.len(), HOPS)` hops.
-const HOPS: usize = 1_000_000;
 
 /// Deterministic seed → 64-bit PRNG (SplitMix64).
 ///
@@ -128,110 +123,11 @@ pub fn build_chase_ring(size_bytes: usize, seed: u64) -> Vec<usize> {
     ring
 }
 
-/// Measure the average nanoseconds per hop of a dependent pointer-chase over
-/// `ring`.
-///
-/// `ring` must be a valid chase ring: every entry in `0..ring.len()`. (Rings
-/// from [`build_chase_ring`] satisfy this by construction; a `debug_assert`
-/// guards it.) The chase starts at slot `0` and performs
-/// `max(ring.len(), 1_000_000)` strictly dependent hops
-/// (`idx = ring[idx]`), so no hop can issue before the previous hop's data
-/// has landed — that dependency chain *is* the latency being measured.
-///
-/// Returns the average **ns per hop** (`0.0` for an empty ring).
-///
-/// # Precision
-/// - **x86_64:** `RDTSCP`-based cycle timing, self-calibrated to ns via
-///   `Instant` over the same run (see the module docs). High precision.
-/// - **non-x86_64:** `Instant`-only wall timing — **reduced precision** (no
-///   cycle counter, coarser clock), but a valid dependent-chase estimate.
-pub fn chase_latency_ns(ring: &[usize]) -> f64 {
-    let n = ring.len();
-    if n == 0 {
-        return 0.0;
-    }
-    debug_assert!(
-        ring.iter().all(|&i| i < n),
-        "chase ring must reference only valid indices in [0, {n})"
-    );
-
-    // At least one full traversal of the cycle, and a stable minimum hop
-    // count. `hops` is always `>= n` (a full pass) and `>= HOPS`.
-    let hops = n.max(HOPS);
-    chase(ring, hops)
-}
-
-/// Architecture-specific dependent-chase + timing core. Returns ns/hop.
-fn chase(ring: &[usize], hops: usize) -> f64 {
-    // x86_64: RDTSCP cycle timing, self-calibrated to ns.
-    #[cfg(target_arch = "x86_64")]
-    {
-        let mut aux = 0u32;
-        let mut idx = 0usize;
-
-        // Start timestamp: RDTSCP waits for all preceding setup to complete.
-        let t0 = unsafe {
-            // SAFETY: `aux` is a valid, aligned stack `u32`; `__rdtscp`
-            // writes exactly one 32-bit AUX value through this pointer.
-            core::arch::x86_64::__rdtscp(&mut aux as *mut u32)
-        };
-        let w0 = Instant::now();
-
-        // The dependent chase: each load's address depends on the previous
-        // load's data, so hops serialize and cannot be prefetched/overlapped.
-        //
-        // SAFETY: `idx` stays in `[0, ring.len())` — it starts at `0` and is
-        // only ever reassigned to `ring[idx]`, and every ring entry is a
-        // valid index (checked by the caller's `debug_assert`).
-        // `get_unchecked` performs the same read as `ring[idx]` minus the
-        // bounds check, keeping the hot loop minimal.
-        let _ = unsafe {
-            for _ in 0..hops {
-                idx = *ring.get_unchecked(idx);
-            }
-            // `black_box` defeats dead-store elimination of the chain.
-            black_box(idx)
-        };
-
-        // End timestamp: RDTSCP waits for the entire dependent chain (all
-        // `hops` loads) to complete before reading the TSC.
-        let t1 = unsafe {
-            // SAFETY: same contract as the start-timestamp `__rdtscp` call.
-            core::arch::x86_64::__rdtscp(&mut aux as *mut u32)
-        };
-        let w1 = Instant::now();
-
-        let cycles = t1.wrapping_sub(t0);
-        let wall_ns = w1.duration_since(w0).as_secs_f64() * 1e9;
-        if cycles == 0 || wall_ns <= 0.0 {
-            return 0.0;
-        }
-        // Self-calibrate: TSC cycles per ns over this run (scaling-robust).
-        let cycles_per_ns = cycles as f64 / wall_ns;
-        // ns per hop = (avg cycles per hop) / (cycles per ns).
-        cycles as f64 / hops as f64 / cycles_per_ns
-    }
-
-    // non-x86_64: Instant-only fallback (reduced precision, documented).
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let mut idx = 0usize;
-        let w0 = Instant::now();
-        // SAFETY: same indexing contract as the x86_64 path above.
-        let _ = unsafe {
-            for _ in 0..hops {
-                idx = *ring.get_unchecked(idx);
-            }
-            black_box(idx)
-        };
-        let w1 = Instant::now();
-        let wall_ns = w1.duration_since(w0).as_secs_f64() * 1e9;
-        if wall_ns <= 0.0 {
-            return 0.0;
-        }
-        wall_ns / hops as f64
-    }
-}
+// The single latency path is the orchestrator's `chase_materialized`
+// (64-byte-stride, materialized buffer). The duplicate compact-ring
+// `chase_latency_ns` kernel (which fit in L3 and would have misreported
+// L3 latency as DRAM) was removed in BENCH-5; this module now provides
+// only the prefetcher-defeating ring builder ([`build_chase_ring`]).
 
 #[cfg(test)]
 mod tests {
@@ -263,15 +159,22 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// (c) `chase_latency_ns` on a small ring returns a finite, positive
-    /// value and does not panic. (No exact-ns assertion — hardware
-    /// dependent.)
+    /// (c) BENCH-5: the single latency path chases at the 64-byte stride
+    /// documented in the module docs, and the duplicate compact-ring
+    /// `chase_latency_ns` kernel is gone (compile-level: referencing it
+    /// here would fail to build — this module now exposes only
+    /// [`build_chase_ring`] + `STRIDE_BYTES`).
     #[test]
-    fn chase_latency_ns_small_ring_is_finite_positive() {
+    fn tc_bench5_single_latency_kernel_and_64_byte_stride() {
+        // The documented chase stride is 64 bytes (one cache line).
+        assert_eq!(
+            STRIDE_BYTES, 64,
+            "the module doc's 64-byte chase stride must match the kernel's actual stride"
+        );
+        // The ring builder yields `size / 64` slots — the same 64-byte
+        // stride the single latency path materializes at.
         let ring = build_chase_ring(64 * 1024, 42);
-        let ns = chase_latency_ns(&ring);
-        assert!(ns.is_finite(), "ns {ns} not finite");
-        assert!(ns > 0.0, "ns {ns} not positive");
+        assert_eq!(ring.len(), (64 * 1024) / STRIDE_BYTES);
     }
 
     /// (d) The ring is a *single* cycle: following `ring[i]` from `0` for
@@ -302,11 +205,4 @@ mod tests {
         assert_eq!(one, vec![0]);
     }
 
-    /// The full public-API pair round-trips: build a ring, chase it.
-    #[test]
-    fn build_then_chase_does_not_panic() {
-        let ring = build_chase_ring(256 * 1024, 1234);
-        let ns = chase_latency_ns(&ring);
-        assert!(ns.is_finite() && ns > 0.0);
-    }
 }
