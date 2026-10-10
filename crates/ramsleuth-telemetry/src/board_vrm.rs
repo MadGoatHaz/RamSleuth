@@ -444,6 +444,16 @@ fn read_rails(dir: &Path, profile: &BoardVrmProfile) -> BoardVrmReadout {
 const VCORE_MIN_VOLTS: f64 = 0.200;
 const VCORE_MAX_VOLTS: f64 = 1.750;
 
+/// The **CPU-plausible** vCore band for the no-profile consumer fallback
+/// (TEL-5): tighter than the general [`VCORE_MIN_VOLTS`..=`VCORE_MAX_VOLTS`]
+/// electrical envelope. A desktop CPU vCore idles around 0.6–0.8 V and
+/// peaks near 1.4–1.5 V under load; an auxiliary / DRAM rail that happens
+/// to land inside the general envelope (a grounded ~0.2 V channel, or an
+/// attenuated ~1.7 V VCCIO) is *not* a plausible CPU rail and is rejected
+/// by the fallback. See [`vcore_fallback`].
+const VCORE_CPU_MIN_VOLTS: f64 = 0.600;
+const VCORE_CPU_MAX_VOLTS: f64 = 1.600;
+
 /// The consumer-desktop board vendors (Chunk 3, research §"Fallback
 /// Engine Rules"): the vendor-aware vCore fallback activates ONLY for
 /// these. Matched as a case-insensitive substring of the DMI
@@ -491,10 +501,26 @@ pub fn classify_vendor(vendor: &str) -> VendorClass {
 
 /// The vendor-aware vCore fallback (Chunk 3, research §"Fallback Engine
 /// Rules"): no curated profile match + a **consumer** vendor → bind
-/// `in0 → Vcore` as [`RailConfidence::HeuristicDefault`] (subject to the
-/// 0.200–1.750 V bounds check); an enterprise / unknown vendor, a
-/// missing vendor, a missing reading, or an out-of-bounds reading →
-/// `None` (N/A). Never a fabricated value.
+/// `in0 → Vcore` as [`RailConfidence::HeuristicDefault`] (the `[est]`
+/// badge); an enterprise / unknown vendor, a missing vendor, a missing
+/// reading, or an out-of-bounds reading → `None` (N/A). Never a fabricated
+/// value.
+///
+/// **Tightened (TEL-5):** the no-profile fallback binds `in0 → Vcore` only
+/// when `in0` is plausibly a **CPU** rail — inside the narrower
+/// [`VCORE_CPU_MIN_VOLTS`..=`VCORE_CPU_MAX_VOLTS`] band — not merely the
+/// general electrical envelope. This rejects an auxiliary / DRAM rail that
+/// happens to land in-band (an attenuated ~1.7 V rail, or a grounded
+/// ~0.2–0.5 V channel) that the looser gate would mislabel as vCore.
+///
+/// **Broad assumption (documented):** on a consumer Super-I/O board,
+/// channel `in0` is *usually* the vCore channel, so binding it is a
+/// reasonable heuristic — but voltage alone cannot distinguish vCore from a
+/// coincidentally-in-band DRAM rail (both sit near 1.2 V). The tighter CPU
+/// band rejects the obvious aux/grounded cases; the residual ambiguity is
+/// the documented trade-off of the `[est]`-badged fallback. A curated
+/// profile, when present, is authoritative and bypasses this heuristic
+/// (it applies only the general envelope).
 pub fn vcore_fallback(
     board_vendor: Option<&str>,
     in0_mv: Option<u16>,
@@ -505,8 +531,11 @@ pub fn vcore_fallback(
     }
     let mv = in0_mv?;
     let volts = f64::from(mv) / 1000.0;
-    if !(VCORE_MIN_VOLTS..=VCORE_MAX_VOLTS).contains(&volts) {
-        return None; // grounded / unpopulated / attenuated → N/A.
+    // TEL-5: bind `in0 → Vcore` only for a plausibly-CPU rail (the tighter
+    // CPU band), not merely the general electrical envelope — an aux/DRAM
+    // rail in-band is rejected.
+    if !(VCORE_CPU_MIN_VOLTS..=VCORE_CPU_MAX_VOLTS).contains(&volts) {
+        return None; // grounded / unpopulated / attenuated aux → N/A.
     }
     Some(VoltageTelemetry {
         rail_name: "CPU Vcore".to_owned(),
@@ -872,27 +901,65 @@ mod tests {
         assert_eq!(vcore_fallback(Some("ASUSTeK COMPUTER INC."), None), None);
     }
 
-    /// (C3-3) The vCore electrical bounds check: `in0` at 199 / 1751 mV
-    /// is rejected (grounded / unpopulated / attenuated → `None`); 200 /
-    /// 1200 / 1750 mV is accepted. The bounds check applies on the
-    /// vendor-aware fallback path and the curated-profile path alike.
+    /// (C3-3) The vCore electrical bounds check. The **fallback** path
+    /// binds `in0 → vCore` only within the tighter CPU-plausible band
+    /// (600–1600 mV, TEL-5); outside it — grounded (< 600), attenuated
+    /// (> 1600), or the general-envelope edges (200 / 1750 mV) — the
+    /// reading is rejected (`None`). The curated-profile path (which
+    /// bypasses the heuristic) applies the general 200–1750 mV envelope
+    /// instead.
     #[test]
     fn vcore_electrical_bounds() {
-        // Out-of-bounds → None (the fallback path).
-        for mv in [0u16, 199, 1751, 3000] {
+        // Out of the CPU band → None (the fallback path): grounded,
+        // attenuated, and the general-envelope edges that fall outside
+        // 600–1600 mV.
+        for mv in [0u16, 199, 200, 599, 1601, 1750, 1751, 3000] {
             assert_eq!(
                 vcore_fallback(Some("ASUSTeK COMPUTER INC."), Some(mv)),
                 None,
-                "{mv} mV is out of the 200–1750 mV envelope"
+                "{mv} mV is outside the 600–1600 mV CPU band"
             );
         }
-        // In-bounds (the edges + a mid value) → HeuristicDefault.
-        for mv in [200u16, 1200, 1750] {
+        // In the CPU band (the edges + a mid value) → HeuristicDefault.
+        for mv in [600u16, 1200, 1600] {
             let vcore =
                 vcore_fallback(Some("ASUSTeK COMPUTER INC."), Some(mv)).expect("in-bounds");
             assert_eq!(vcore.confidence, RailConfidence::HeuristicDefault);
             assert!((vcore.delivered_volts - f64::from(mv) / 1000.0).abs() < 1e-9);
         }
+    }
+
+    /// (TC-TEL5) The no-profile consumer vCore fallback binds `in0 → Vcore`
+    /// only for a **plausibly-CPU** rail (the tighter CPU band), not merely
+    /// the general electrical envelope:
+    /// - a plausible CPU rail (in the CPU band) → vCore with the `[est]`
+    ///   badge (`HeuristicDefault`);
+    /// - an auxiliary / DRAM rail in the general envelope but outside the
+    ///   CPU band (attenuated ~1.7 V, or grounded ~0.3 V) → **not** vCore;
+    /// - enterprise / unknown vendor, missing reading, or out-of-envelope
+    ///   → `None` (N/A, unchanged).
+    #[test]
+    fn tc_tel5_fallback_binds_only_a_plausible_cpu_rail() {
+        // A plausible CPU rail (1.20 V, in the CPU band) → vCore [est].
+        let vcore = vcore_fallback(Some("ASUS"), Some(1200))
+            .expect("a plausible CPU rail must bind in0 → vCore");
+        assert_eq!(vcore.rail_name, "CPU Vcore");
+        assert!((vcore.delivered_volts - 1.20).abs() < 1e-9);
+        assert_eq!(vcore.confidence, RailConfidence::HeuristicDefault); // the [est] badge
+
+        // An auxiliary / DRAM rail in the general envelope (0.2–1.75 V) but
+        // OUTSIDE the tighter CPU band (0.6–1.6 V) → NOT labeled vCore.
+        // Attenuated-high aux (~1.70 V, above the 1.60 V CPU max):
+        assert_eq!(vcore_fallback(Some("ASUS"), Some(1700)), None);
+        // Grounded / low aux (~0.30 V, below the 0.60 V CPU min):
+        assert_eq!(vcore_fallback(Some("ASUS"), Some(300)), None);
+
+        // Enterprise / unknown vendor → N/A (unchanged).
+        assert_eq!(vcore_fallback(Some("Dell"), Some(1200)), None);
+        assert_eq!(vcore_fallback(Some("Some Random OEM"), Some(1200)), None);
+        // Missing vendor / missing reading → N/A (unchanged).
+        assert_eq!(vcore_fallback(None, Some(1200)), None);
+        assert_eq!(vcore_fallback(Some("ASUS"), None), None);
     }
 
     /// (C3-4) The new wire types: `RailConfidence` + `VoltageTelemetry`

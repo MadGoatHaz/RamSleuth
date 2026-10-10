@@ -17,22 +17,27 @@
 //! Na). Display mapping (code→Ω, mV→V, ratio computation, sanity
 //! ranges) belongs to P2-05 (`amd_readout.rs`).
 //!
-//! # Version guard (P5-15 reconciliation)
+//! # Version guard (P5-15 reconciliation, generation-first — TEL-2)
 //!
 //! [`SmuContext::version`] is the PM table's **`TableVersionId`** — the
 //! little-endian `u32` the driver publishes in the sibling
 //! `pm_table_version` sysfs attribute (P2-03). The blob itself is a
 //! **headerless** array of little-endian `f32` values (byte offset =
 //! index × 4) and carries no version word of its own.
-//! [`PmLayout::from_version`] guards on the exact accepted
-//! `TableVersionId` sets:
 //!
-//! | `TableVersionId` set                 | layout              | family          |
-//! |--------------------------------------|---------------------|-----------------|
-//! | [`VERMEER_TABLE_VERSIONS`] (10 ids)  | [`PmLayout::Vermeer`] | Zen 3 (5950X) |
-//! | [`MATISSE_TABLE_VERSIONS`] (8 ids)   | [`PmLayout::Matisse`] | Zen 2         |
-//!
-//! Any other version word yields [`TelemetryError::UnknownPmTableVersion`].
+//! The decode is **generation-first** (mirroring
+//! [`crate::intel_gen::profile_for`]): [`PmLayout::from_zen`] keys on the
+//! CPUID-detected [`crate::cpuid::AmdZen`] family as the primary dispatch,
+//! and treats the `TableVersionId` as a **per-generation plausibility
+//! filter** — not a global closed allowlist. The verified generations
+//! (Matisse / Zen 2, Vermeer / Zen 3) carry a major-prefix whitelist
+//! ([`MATISSE_TABLE_VERSIONS`] / [`VERMEER_TABLE_VERSIONS`]); the
+//! unverified generations (Zen 1 / 4 / 5) accept any non-degenerate
+//! version word, so a Zen 4 (`0x1A`) / Zen 5 (`0x1C`) desktop reaches a
+//! **live** decode path instead of degrading to whole-section N/A. Only a
+//! genuinely unrecognized word — a zero sentinel (the legacy all-zero-blob
+//! fallback), or a verified generation whose major prefix mismatches its
+//! CPUID family — yields [`TelemetryError::UnknownPmTableVersion`].
 //!
 //! # Field layout (f32 offsets, verified on 5950X silicon via monitor_cpu)
 //!
@@ -58,6 +63,7 @@
 //! length before reading fields.
 
 use crate::amd_smu::SmuContext;
+use crate::cpuid::AmdZen;
 use crate::error::{TelemetryError, TelemetryResult};
 
 /// Byte offset of the Vcore / VDDCR_VDD voltage (volts) — little-endian
@@ -95,40 +101,96 @@ pub const MATISSE_TABLE_VERSIONS: [u32; 8] = [
     0x24_08_02, 0x24_08_03, 0x24_09_02, 0x24_09_03,
 ];
 
-/// One supported PM-table family (P5-15: exact `TableVersionId` sets).
+/// One PM-table layout, keyed by AMD Zen generation (generation-first —
+/// TEL-2; mirrors [`crate::intel_gen::profile_for`]).
+///
+/// The CPUID-detected [`crate::cpuid::AmdZen`] family is the primary
+/// dispatch; the `TableVersionId` is a per-generation plausibility filter,
+/// not a global closed allowlist. All five generations share one f32 field
+/// layout: the verified generations (Matisse / Zen 2, Vermeer / Zen 3)
+/// were confirmed on silicon, and the unverified generations (Zen 1 / 4 /
+/// 5) reuse that layout as their live decode path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmLayout {
-    /// Vermeer / Zen 3 (e.g. Ryzen 9 5950X, the test host) — the 10
-    /// accepted `TableVersionId`s in [`VERMEER_TABLE_VERSIONS`].
-    Vermeer,
-    /// Matisse / Zen 2 — the 8 accepted `TableVersionId`s in
+    /// Zen 1 (family `0x15`) — no verified AM4 PM layout; the conservative
+    /// live path (unverified).
+    Zen1,
+    /// Matisse / Zen 2 (family `0x17`) — the 8 verified `TableVersionId`s in
     /// [`MATISSE_TABLE_VERSIONS`]; same f32 layout as Vermeer.
     Matisse,
+    /// Vermeer / Zen 3 (family `0x19`; e.g. the Ryzen 9 5950X reference host)
+    /// — the 10 verified `TableVersionId`s in [`VERMEER_TABLE_VERSIONS`].
+    Vermeer,
+    /// Zen 4 (family `0x1A`) — the live decode path (unverified; the
+    /// CPUID family is the dispatch key, not a closed version set).
+    Zen4,
+    /// Zen 5 (family `0x1C`) — the live decode path (unverified; the
+    /// CPUID family is the dispatch key, not a closed version set).
+    Zen5,
 }
 
 impl PmLayout {
-    /// Maps a raw `TableVersionId` to its PM-table family.
+    /// Generation-first dispatch (TEL-2, mirrors
+    /// [`crate::intel_gen::profile_for`]): the CPUID-detected
+    /// [`crate::cpuid::AmdZen`] family is the primary key; the
+    /// `TableVersionId` is a **per-generation plausibility filter**, not a
+    /// global closed allowlist.
     ///
-    /// The version is the driver's sibling `pm_table_version` value
-    /// (P2-03/P5-15), not a word inside the blob. Each accepted id maps
-    /// to its family; anything else (including the legacy 7.11.x / 12.x /
-    /// 13.x major.minor encodings the P2-04 skeleton once matched) yields
-    /// [`TelemetryError::UnknownPmTableVersion`] with the id preserved.
-    pub fn from_version(version: u32) -> TelemetryResult<Self> {
-        if VERMEER_TABLE_VERSIONS.contains(&version) {
-            Ok(Self::Vermeer)
-        } else if MATISSE_TABLE_VERSIONS.contains(&version) {
-            Ok(Self::Matisse)
-        } else {
-            Err(TelemetryError::UnknownPmTableVersion { version })
+    /// A zero version word (the "no version published" sentinel from the
+    /// legacy all-zero-blob fallback) is rejected for every generation.
+    /// Verified generations (Matisse / Vermeer) additionally require the
+    /// version's major byte to match the generation's known prefix — a
+    /// mismatch (e.g. a Zen 3 family reporting a Zen 2 major) is genuinely
+    /// unrecognized firmware → [`TelemetryError::UnknownPmTableVersion`].
+    /// Unverified generations (Zen 1 / 4 / 5) accept any non-zero version
+    /// word, so Zen 4 / Zen 5 desktops reach a live decode path.
+    pub fn from_zen(zen: AmdZen, version: u32) -> TelemetryResult<Self> {
+        if version == 0 {
+            return Err(TelemetryError::UnknownPmTableVersion { version });
+        }
+        let layout = match zen {
+            AmdZen::Zen1 => Self::Zen1,
+            AmdZen::Zen2 => Self::Matisse,
+            AmdZen::Zen3 => Self::Vermeer,
+            AmdZen::Zen4 => Self::Zen4,
+            AmdZen::Zen5 => Self::Zen5,
+        };
+        if !layout.version_is_plausible(version) {
+            return Err(TelemetryError::UnknownPmTableVersion { version });
+        }
+        Ok(layout)
+    }
+
+    /// The per-generation `TableVersionId` plausibility filter (TEL-2).
+    ///
+    /// Verified generations key on the version's major byte (bits 23:16 —
+    /// the `0xXX_YY_ZZ` encodings are 24-bit, i.e. `0x00XX_YYZZ`, so the
+    /// family prefix is the second byte from the top): Matisse (Zen 2) =
+    /// `0x24`; Vermeer (Zen 3) = `0x2D` / `0x38` (the prefixes of
+    /// [`MATISSE_TABLE_VERSIONS`] / [`VERMEER_TABLE_VERSIONS`]).
+    /// Unverified generations (Zen 1 / 4 / 5) accept any non-zero version
+    /// word — the CPUID family is the authoritative dispatch key, and no
+    /// closed version set is verified for them.
+    fn version_is_plausible(self, version: u32) -> bool {
+        if version == 0 {
+            return false;
+        }
+        let major = (version >> 16) & 0xFF;
+        match self {
+            Self::Matisse => major == 0x24,
+            Self::Vermeer => matches!(major, 0x2D | 0x38),
+            Self::Zen1 | Self::Zen4 | Self::Zen5 => true,
         }
     }
 
     /// Short layout name for diagnostics.
     pub fn name(self) -> &'static str {
         match self {
-            Self::Vermeer => "Vermeer (Zen 3)",
+            Self::Zen1 => "Zen 1",
             Self::Matisse => "Matisse (Zen 2)",
+            Self::Vermeer => "Vermeer (Zen 3)",
+            Self::Zen4 => "Zen 4",
+            Self::Zen5 => "Zen 5",
         }
     }
 }
@@ -310,11 +372,13 @@ fn to_u16(v: f32) -> u16 {
 /// Parses the raw PM-table blob in `ctx` into a structured
 /// [`AmdPmSnapshot`] (frozen public API, P2-04).
 ///
-/// Version-guarded flow (P5-15):
+/// Generation-first flow (P5-15, TEL-2):
 ///
-/// 1. [`PmLayout::from_version`] maps the `TableVersionId` (the sibling
-///    `pm_table_version` value, not a word inside the blob) to a family;
-///    an unrecognized id → [`TelemetryError::UnknownPmTableVersion`].
+/// 1. [`PmLayout::from_zen`] dispatches on the CPUID [`AmdZen`] family
+///    (the primary key, mirroring
+///    [`crate::intel_gen::profile_for`]) and validates the `TableVersionId`
+///    against the generation's plausibility filter; a genuinely
+///    unrecognized word → [`TelemetryError::UnknownPmTableVersion`].
 /// 2. The blob (a headerless f32 array) must be at least [`MIN_LEN`]
 ///    bytes (shorter → [`TelemetryError::Parse`]); every field read is
 ///    additionally bounds-checked via [`read_f32le`], so the parse is
@@ -330,8 +394,8 @@ fn to_u16(v: f32) -> u16 {
 ///
 /// Pure: no I/O, no `unsafe`, no panic on any input (non-finite floats
 /// and negative values degrade to `0`).
-pub fn parse(ctx: &SmuContext) -> TelemetryResult<AmdPmSnapshot> {
-    let layout = PmLayout::from_version(ctx.version)?;
+pub fn parse(ctx: &SmuContext, zen: AmdZen) -> TelemetryResult<AmdPmSnapshot> {
+    let layout = PmLayout::from_zen(zen, ctx.version)?;
     let pm = &ctx.pm;
 
     // Minimum-length gate: the blob is a headerless f32 array — there is
@@ -519,48 +583,122 @@ mod tests {
         }
     }
 
-    /// (a) Every accepted Vermeer `TableVersionId` maps to
-    /// [`PmLayout::Vermeer`].
+    /// (a) Every verified Vermeer `TableVersionId` (major prefix `0x2D` /
+    /// `0x38`) resolves to [`PmLayout::Vermeer`] under its Zen 3 family —
+    /// generation-first (TEL-2).
     #[test]
-    fn from_version_accepts_every_vermeer_id() {
+    fn from_zen_vermeer_major_accepted() {
         for v in VERMEER_TABLE_VERSIONS {
             assert_eq!(
-                PmLayout::from_version(v),
+                PmLayout::from_zen(AmdZen::Zen3, v),
                 Ok(PmLayout::Vermeer),
                 "{v:#010x}"
             );
         }
     }
 
-    /// (a) Every accepted Matisse `TableVersionId` maps to
-    /// [`PmLayout::Matisse`].
+    /// (a) Every verified Matisse `TableVersionId` (major prefix `0x24`)
+    /// resolves to [`PmLayout::Matisse`] under its Zen 2 family.
     #[test]
-    fn from_version_accepts_every_matisse_id() {
+    fn from_zen_matisse_major_accepted() {
         for v in MATISSE_TABLE_VERSIONS {
             assert_eq!(
-                PmLayout::from_version(v),
+                PmLayout::from_zen(AmdZen::Zen2, v),
                 Ok(PmLayout::Matisse),
                 "{v:#010x}"
             );
         }
     }
 
-    /// (c) Out-of-set version words — including the legacy 7.11.x / 12.x /
-    /// 13.x major.minor encodings the P2-04 skeleton once matched — yield
-    /// `Err(UnknownPmTableVersion { version })` with the id preserved.
+    /// (TC-TEL2) The unverified generations reach a **live** decode path —
+    /// the closed-allowlist bug they used to hit is gone. A Zen 4 (`0x1A`) /
+    /// Zen 5 (`0x1C`) / Zen 1 (`0x15`) family with a representative
+    /// `TableVersionId` (a major prefix that is in NO verified set, so the
+    /// old `from_version` returned `UnknownPmTableVersion` → whole-section
+    /// N/A) now resolves to its live [`PmLayout`], and the full [`parse`]
+    /// succeeds end to end.
     #[test]
-    fn from_version_rejects_out_of_set_ids() {
-        for version in [
-            0x0007_0B02u32, // legacy 7.11.2 major.minor encoding
-            0x000C_0001,    // legacy 12.0.1
-            0x000D_0001,    // legacy 13.0.1
-            0x38_00_06,      // near-miss (not in the Vermeer set)
-            0x24_08_04,      // near-miss (not in the Matisse set)
-            0x0000_0000,
-            0xFFFF_FFFF,
+    fn tc_tel2_new_generations_reach_live_path() {
+        // `from_zen`: each unverified generation resolves to its live layout.
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen4, 0x40_00_01),
+            Ok(PmLayout::Zen4),
+        );
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen5, 0x42_00_01),
+            Ok(PmLayout::Zen5),
+        );
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen1, 0x18_00_01),
+            Ok(PmLayout::Zen1),
+        );
+        // A fresh major prefix (in no old closed set) is accepted for an
+        // unverified generation — the pre-fix `Na(UnknownPmTableVersion)`
+        // case now decodes live.
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen5, 0x99_00_00),
+            Ok(PmLayout::Zen5),
+        );
+
+        // End to end: a Zen 4 / Zen 5 `SmuContext` parses to a live
+        // snapshot (not `UnknownPmTableVersion`).
+        for (zen, version) in [(AmdZen::Zen4, 0x40_00_01), (AmdZen::Zen5, 0x42_00_01)] {
+            let ctx = SmuContext {
+                version,
+                pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.35),
+            };
+            let snap = parse(&ctx, zen).expect("Zen 4/5 must reach a live decode (TEL-2)");
+            assert_eq!(snap.version, version);
+            assert_eq!(snap.mclk_mhz, 1800);
+            assert_eq!(snap.voltages.vcore_mv, 1350);
+        }
+    }
+
+    /// (c) A zero `TableVersionId` — the "no version published" sentinel
+    /// from the legacy all-zero-blob fallback — is rejected for **every**
+    /// generation (genuinely unrecognized firmware → `UnknownPmTableVersion`).
+    #[test]
+    fn from_zen_rejects_zero_for_all_generations() {
+        for zen in [
+            AmdZen::Zen1,
+            AmdZen::Zen2,
+            AmdZen::Zen3,
+            AmdZen::Zen4,
+            AmdZen::Zen5,
         ] {
             assert_eq!(
-                PmLayout::from_version(version),
+                PmLayout::from_zen(zen, 0x0000_0000),
+                Err(TelemetryError::UnknownPmTableVersion { version: 0 }),
+                "{zen:?}"
+            );
+        }
+    }
+
+    /// (c) A **verified** generation whose version major prefix belongs to a
+    /// *different* generation is genuinely unrecognized firmware →
+    /// `UnknownPmTableVersion` (the per-generation plausibility filter
+    /// catches the cross-family mismatch the closed allowlist could not).
+    #[test]
+    fn from_zen_rejects_verified_major_mismatch() {
+        // Zen 3 family, but a Zen 2 (`0x24`) major → mismatch.
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen3, 0x24_09_03),
+            Err(TelemetryError::UnknownPmTableVersion {
+                version: 0x24_09_03
+            }),
+        );
+        // Zen 2 family, but a Zen 3 (`0x38`) major → mismatch.
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen2, 0x38_08_05),
+            Err(TelemetryError::UnknownPmTableVersion {
+                version: 0x38_08_05
+            }),
+        );
+        // Legacy majors (`0x00`-encoded 7.11.x / 12.x / 13.x) on a verified
+        // family → mismatch (the encodings the P2-04 skeleton once matched).
+        for version in [0x0007_0B02u32, 0x000C_0001, 0x000D_0001] {
+            assert_eq!(
+                PmLayout::from_zen(AmdZen::Zen3, version),
                 Err(TelemetryError::UnknownPmTableVersion { version }),
                 "{version:#010x}"
             );
@@ -577,7 +715,7 @@ mod tests {
             pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.35),
         };
         assert_eq!(
-            parse(&ctx),
+            parse(&ctx, AmdZen::Zen3),
             Ok(known_snapshot(V_VERMEER, 1800, 1800, 1800, 0, 1050, 1350))
         );
     }
@@ -593,7 +731,7 @@ mod tests {
         // fclk 1792.8 → 1793, uclk 800.4 → 800, mclk 1600.6 → 1601,
         // 0.95 V → 950 mV, 1.2 V → 1200 mV (Vcore), div mode 1:2.
         assert_eq!(
-            parse(&ctx),
+            parse(&ctx, AmdZen::Zen3),
             Ok(known_snapshot(V_VERMEER, 1601, 800, 1793, 1, 950, 1200))
         );
     }
@@ -606,7 +744,7 @@ mod tests {
             pm: synthetic_blob(1200.0, 1200.0, 1200.0, 0.9, 1.1),
         };
         assert_eq!(
-            parse(&ctx),
+            parse(&ctx, AmdZen::Zen2),
             Ok(known_snapshot(V_MATISSE, 1200, 1200, 1200, 0, 900, 1100))
         );
     }
@@ -620,7 +758,7 @@ mod tests {
             version: V_VERMEER,
             pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.05),
         };
-        let snap = parse(&ctx).expect("synthetic blob must parse");
+        let snap = parse(&ctx, AmdZen::Zen3).expect("synthetic blob must parse");
         assert_eq!(snap.command_rate, 0);
         assert_eq!(snap.gdm, 0);
         assert_eq!(snap.pdm, 0);
@@ -635,7 +773,7 @@ mod tests {
             pm: synthetic_blob(f32::NAN, f32::INFINITY, f32::INFINITY, f32::NAN, f32::NAN),
         };
         // uclk == mclk (both +inf) -> derived 1:1; everything else 0.
-        assert_eq!(parse(&ctx), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 0, 0, 0)));
+        assert_eq!(parse(&ctx, AmdZen::Zen3), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 0, 0, 0)));
     }
 
     /// (e) Negative (but finite) floats degrade to the zero value.
@@ -646,7 +784,7 @@ mod tests {
             pm: synthetic_blob(-1.0, -2.0, -4.0, -0.5, -1.5),
         };
         // -2.0 != -4.0 -> derived 1:2.
-        assert_eq!(parse(&ctx), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 1, 0, 0)));
+        assert_eq!(parse(&ctx, AmdZen::Zen3), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 1, 0, 0)));
     }
 
     /// (b) Truncated blobs — every length from 0 up to one byte short of
@@ -660,7 +798,7 @@ mod tests {
                 version: V_VERMEER,
                 pm: full[..len].to_vec(),
             };
-            let res = parse(&ctx);
+            let res = parse(&ctx, AmdZen::Zen3);
             assert!(
                 matches!(res, Err(TelemetryError::Parse { .. })),
                 "len {len} must be Err(Parse), got {res:?}"
@@ -679,7 +817,7 @@ mod tests {
             pm: blob,
         };
         assert_eq!(
-            parse(&ctx),
+            parse(&ctx, AmdZen::Zen3),
             Ok(known_snapshot(V_VERMEER, 1600, 1600, 1600, 0, 1000, 1200))
         );
     }
@@ -695,7 +833,7 @@ mod tests {
                 version: V_VERMEER,
                 pm: synthetic_blob(1600.0, 1600.0, 1600.0, 1.0, vcore_v),
             };
-            let snap = parse(&ctx).expect("synthetic blob must parse");
+            let snap = parse(&ctx, AmdZen::Zen3).expect("synthetic blob must parse");
             assert_eq!(snap.voltages.vcore_mv, expected_mv);
         }
         // 0.0 V → 0 mV → out of band → Na downstream.
@@ -704,7 +842,7 @@ mod tests {
             pm: synthetic_blob(1600.0, 1600.0, 1600.0, 1.0, 0.0),
         };
         assert_eq!(
-            parse(&ctx).expect("synthetic blob must parse").voltages.vcore_mv,
+            parse(&ctx, AmdZen::Zen3).expect("synthetic blob must parse").voltages.vcore_mv,
             0
         );
     }

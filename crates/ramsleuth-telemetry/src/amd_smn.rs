@@ -96,7 +96,10 @@
 //! (`DriverMissing`) → the whole overlay is a no-op (status quo); any other
 //! per-register failure zeroes only that register's fields; short/empty
 //! reads are `Parse`. No `unwrap` / `expect` on any hardware-derived value;
-//! no `unsafe` (the `nix` wrappers are safe).
+//! **no `unsafe`** (TEL-1) — the `smn` fd is held as an owned
+//! [`std::fs::File`] inside [`read_smn_register_linux`], so every `nix`
+//! call (`write` / `read` / `lseek`) takes a safe `AsFd` / `AsRawFd`
+//! borrow and the file is closed on drop.
 //!
 //! # Platform
 //!
@@ -822,19 +825,20 @@ fn read_all_channel_registers_with<R: FnMut(u32) -> TelemetryResult<u32>>(
 /// Open the first existing `smn` attribute `O_RDWR` (canonical kobject
 /// first, then the legacy name).
 ///
+/// Returns an **owned** [`std::fs::File`] (TEL-1): the `File` owns the fd
+/// and closes it on drop, so the downstream `nix` calls take a **safe**
+/// `AsFd` / `AsRawFd` borrow — no `BorrowedFd::borrow_raw`, no `unsafe`.
+///
 /// NotFound on a candidate skips to the next; a PermissionDenied on an
 /// existing file is reported as [`TelemetryError::InsufficientPrivilege`]
 /// (no fall-through — the attribute is there, the caller just lacks
 /// rights); any other I/O error is reported as [`TelemetryError::Io`].
 /// All candidates absent → [`TelemetryError::DriverMissing`].
-fn open_smn_attr(candidates: &[&str]) -> TelemetryResult<std::os::unix::io::RawFd> {
-    use nix::fcntl::OFlag;
-    use nix::sys::stat::Mode;
-
+fn open_smn_attr(candidates: &[&str]) -> TelemetryResult<std::fs::File> {
     for &path in candidates {
-        match nix::fcntl::open(path, OFlag::O_RDWR, Mode::empty()) {
-            Ok(fd) => return Ok(fd),
-            Err(e) => match classify_io_error(&std::io::Error::from(e)) {
+        match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => return Ok(file),
+            Err(e) => match classify_io_error(&e) {
                 TelemetryError::DriverMissing { .. } => continue,
                 other => return Err(other),
             },
@@ -875,31 +879,36 @@ fn check_smn_read(read: usize) -> TelemetryResult<()> {
 /// each `read(2)` returns the current `smn_result` regardless.
 #[cfg(target_os = "linux")]
 fn read_smn_register_linux(address: u32) -> TelemetryResult<u32> {
-    let fd = open_smn_attr(&SYSFS_SMN_CANDIDATES)?;
-    let _guard = FdGuard(fd);
-    smn_protocol_read(fd, address)
+    // The owned `File` is the RAII guard: it closes the fd on drop (TEL-1 —
+    // the raw-fd `FdGuard` is gone).
+    let file = open_smn_attr(&SYSFS_SMN_CANDIDATES)?;
+    smn_protocol_read(&file, address)
 }
 
-/// Run the write-address → read-value protocol on one open fd.
+/// Run the write-address → read-value protocol on one open file-like fd.
+///
+/// **No `unsafe` (TEL-1):** the argument is a shared reference to any
+/// `AsFd + AsRawFd` owner (production: the owned [`std::fs::File`]; the
+/// hermetic tests: a `UnixStream` transport), so `nix::unistd::write`
+/// takes a **safe** `AsFd` borrow and the `read` / `lseek` calls take
+/// `as_raw_fd()` — the `BorrowedFd::borrow_raw` bridge the raw-fd form
+/// required is gone.
 #[cfg(target_os = "linux")]
-fn smn_protocol_read(
-    fd: std::os::unix::io::RawFd,
+fn smn_protocol_read<T: std::os::unix::io::AsFd + std::os::unix::io::AsRawFd>(
+    file: &T,
     address: u32,
 ) -> TelemetryResult<u32> {
     use nix::unistd::Whence;
-    use std::os::unix::io::BorrowedFd;
+
+    let fd = file.as_raw_fd();
 
     // Tolerated (see the docs): libsmu discards the lseek result, and sysfs
     // attribute files may not support seeking at all.
     let _ = nix::unistd::lseek(fd, 0, Whence::SeekSet);
 
     let addr = address.to_le_bytes();
-    // SAFETY: `fd` was returned by `open(2)` in this call path and is owned
-    // by the caller's `FdGuard` (which closes it exactly once on scope
-    // exit); it is valid for the whole duration of this call and not
-    // aliased by any other `BorrowedFd` while in use.
-    let fd_ref = unsafe { BorrowedFd::borrow_raw(fd) };
-    match nix::unistd::write(fd_ref, &addr) {
+    // `file` is a safe `AsFd` borrow (no `borrow_raw`).
+    match nix::unistd::write(file, &addr) {
         Ok(n) => check_smn_write(n)?,
         Err(e) => return Err(classify_io_error(&std::io::Error::from(e))),
     }
@@ -913,21 +922,6 @@ fn smn_protocol_read(
             Ok(u32::from_le_bytes(buf))
         }
         Err(e) => Err(classify_io_error(&std::io::Error::from(e))),
-    }
-}
-
-/// RAII guard: closes the `smn` fd exactly once on scope exit (a local
-/// copy of the `amd_smu` idiom — that one is private).
-///
-/// `close()` on a valid fd cannot meaningfully fail; its result is
-/// discarded rather than escalated (no-panic contract).
-#[cfg(target_os = "linux")]
-struct FdGuard(std::os::unix::io::RawFd);
-
-#[cfg(target_os = "linux")]
-impl Drop for FdGuard {
-    fn drop(&mut self) {
-        let _ = nix::unistd::close(self.0);
     }
 }
 
@@ -1387,10 +1381,10 @@ mod tests {
 
         match res {
             Err(TelemetryError::InsufficientPrivilege { .. }) => {} // non-root: EACCES classified
-            Ok(fd) => {
-                // Root: the mode bits are bypassed — close the fd and accept
-                // that EACCES cannot be forced here.
-                let _ = nix::unistd::close(fd);
+            Ok(file) => {
+                // Root: the mode bits are bypassed — the owned `File` closes
+                // the fd on drop; accept that EACCES cannot be forced here.
+                drop(file);
             }
             other => panic!("unexpected open result: {other:?}"),
         }
@@ -1404,7 +1398,6 @@ mod tests {
     #[test]
     fn smn_protocol_le_write_read_pinned() {
         use std::io::{Read, Write};
-        use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
 
         let (a, mut b) = UnixStream::pair().expect("unix socket pair");
@@ -1412,7 +1405,7 @@ mod tests {
         b.write_all(&0xDEAD_BEEFu32.to_le_bytes())
             .expect("pre-feed response");
 
-        assert_eq!(smn_protocol_read(a.as_raw_fd(), 0x50200), Ok(0xDEAD_BEEF));
+        assert_eq!(smn_protocol_read(&a, 0x50200), Ok(0xDEAD_BEEF));
 
         // The protocol's write must have been the 4-byte LE address.
         b.set_read_timeout(Some(std::time::Duration::from_secs(2)))
@@ -1429,7 +1422,6 @@ mod tests {
     #[test]
     fn smn_protocol_short_read_is_parse() {
         use std::io::Write;
-        use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
 
         let (a, mut b) = UnixStream::pair().expect("unix socket pair");
@@ -1437,7 +1429,7 @@ mod tests {
         b.shutdown(std::net::Shutdown::Write)
             .expect("close the send direction (read side stays open for the address write)");
 
-        let res = smn_protocol_read(a.as_raw_fd(), 0x50200);
+        let res = smn_protocol_read(&a, 0x50200);
         assert!(
             matches!(res, Err(TelemetryError::Parse { .. })),
             "unexpected: {res:?}"
@@ -1464,16 +1456,58 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn smn_protocol_empty_read_is_parse() {
-        use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
 
         let (a, b) = UnixStream::pair().expect("unix socket pair");
         b.shutdown(std::net::Shutdown::Write).expect("close the send direction");
 
-        let res = smn_protocol_read(a.as_raw_fd(), 0x50200);
+        let res = smn_protocol_read(&a, 0x50200);
         assert!(
             matches!(res, Err(TelemetryError::Parse { .. })),
             "unexpected: {res:?}"
+        );
+    }
+
+    /// (TC-TEL1) The SMN write path is **safe** (no `unsafe` in the module)
+    /// and round-trips a frame over the `smn` protocol: the 4-byte LE
+    /// address goes out, the pre-fed `smn_result` comes back. The module
+    /// doc's "no `unsafe`" claim is verified against the source — a
+    /// re-introduced `unsafe {` block would fail this assertion (making the
+    /// doc false).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tc_tel1_smn_write_path_is_safe_and_round_trips() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        // (a) Round-trip: the address word goes out, the pre-fed result
+        // comes back.
+        let (a, mut b) = UnixStream::pair().expect("unix socket pair");
+        b.write_all(&0x50_20_00u32.to_le_bytes())
+            .expect("pre-feed the smn_result");
+        assert_eq!(smn_protocol_read(&a, 0x50200), Ok(0x50_20_00));
+        b.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("read timeout");
+        let mut got = [0u8; SMN_WORD];
+        let n = b.read(&mut got).unwrap_or(0);
+        assert_eq!(n, SMN_WORD, "the address word must arrive (4 bytes)");
+        assert_eq!(got, 0x50200u32.to_le_bytes());
+
+        // (b) Doc consistency (TEL-1): the module is `unsafe`-free in code.
+        // Scan every NON-comment line for the `unsafe` keyword as a whole
+        // token; comment lines (`//!` / `///` / `//`) are excluded, so the
+        // doc + this assertion's own strings do not trip the check. A
+        // re-introduced `unsafe { … }` block in the SMN path is a failure.
+        let src = include_str!("amd_smn.rs");
+        let offending = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.split_whitespace().any(|tok| tok == "unsafe"))
+            .count();
+        assert_eq!(
+            offending, 0,
+            "amd_smn.rs must have no `unsafe` keyword in code (TEL-1: the \
+             owned-File bridge is safe); the module doc claims `unsafe`-free"
         );
     }
 
