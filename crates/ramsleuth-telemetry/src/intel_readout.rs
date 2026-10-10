@@ -4849,16 +4849,35 @@ mod tests {
     /// physical Intel box): every cell is an honest `Na` — never a
     /// bogus `Value`, never a panic (vendor-conditional, per the
     /// TELEMETRY-CI-FIX precedent).
+    ///
+    /// The decode-time subchannel **indices** are generation-shaped (not
+    /// assumed contiguous): the Tier-3 Alder/Raptor family decodes the
+    /// DDR4-default subchannel set `[0, 2]` (MC0 subch0 + MC1 subch2 —
+    /// `decode`'s OQ-11 dispatch) over an all-absent raw set, while
+    /// Tier 1 / Rocket Lake, the Meteor/Arrow Lake tile-routing
+    /// degenerate early-return, and the unprofiled fallbacks are
+    /// contiguous `0..count`.
     #[test]
     fn read_regs_on_this_host_is_structural_and_panic_free() {
         let ro = read_regs(&IntelImcRegs::default());
-        match CpuInfo::detect().vendor {
+        let expected: Vec<u8> = match CpuInfo::detect().vendor {
             CpuVendor::Intel(gen) => {
                 assert_eq!(
                     ro.channels.len(),
                     usize::from(channel_count(gen)),
                     "Intel host: the channel count follows the detected generation"
                 );
+                if matches!(gen, IntelGen::AlderLake | IntelGen::RaptorLake) {
+                    // The Tier-3 DDR4 default subchannel set (the
+                    // reference 12600KF host shape).
+                    vec![0, 2]
+                } else {
+                    // Tier 1 / Rocket Lake (0..2), the Meteor/Arrow
+                    // Lake tile-routing degenerate early-return (0..4),
+                    // and the unprofiled fallbacks (0..count):
+                    // contiguous.
+                    (0..channel_count(gen)).collect()
+                }
             }
             _ => {
                 assert_eq!(
@@ -4866,10 +4885,11 @@ mod tests {
                     2,
                     "non-Intel host: the degraded readout carries the common two-channel shape"
                 );
+                vec![0, 1]
             }
-        }
+        };
         for (i, ch) in ro.channels.iter().enumerate() {
-            assert_eq!(ch.index, i as u8);
+            assert_eq!(ch.index, expected[i]);
             assert!(
                 ch.clocks.mclk_mhz.is_na(),
                 "absent MC_BIOS_REQ: mclk must be an honest Na: {:?}",
@@ -4920,6 +4940,37 @@ mod tests {
                 assert!(s.is_na(), "{s:?}");
             }
         }
+    }
+
+    /// The L3 firmware override on the real reference topology (BUG 2
+    /// end-to-end, without hardware): the 12600KF / Z690M-ITX/ax SMBIOS
+    /// Type 17 table — 2 × 16 GiB DDR4, both locators
+    /// `Controller<N>-ChannelA-DIMM0` (the channel is the Controller
+    /// index: 0→A, 1→B) → `DerivedMode::Dual` — against an MMIO decode
+    /// of `Single` (the `0xd800` residual) must resolve to
+    /// `DualSymmetric` with the `Override` trust tier, `dimm_count 2`,
+    /// and the non-empty override annotation.
+    #[test]
+    fn resolve_channel_l3_override_on_real_topology() {
+        let smbios = SmbiosTopology {
+            populated_count: 2,
+            dimm_sizes: vec![16384, 16384],
+            memory_type: Some(MemoryTech::Ddr4),
+            locators: vec![
+                "Controller0-ChannelA-DIMM0".to_owned(),
+                "Controller1-ChannelA-DIMM0".to_owned(),
+            ],
+            derived_mode: DerivedMode::Dual,
+        };
+        let res = resolve_channel(Some(ChannelMode::Single), None, &smbios);
+        assert_eq!(res.mode, Some(ChannelMode::DualSymmetric));
+        assert_eq!(res.trust, Some(ChannelTrust::Override));
+        assert_eq!(res.tech, Some(MemoryTech::Ddr4));
+        assert_eq!(res.dimm_count, 2);
+        assert!(
+            !res.annotation.is_empty(),
+            "the L3 override carries the untrusted-MMIO annotation"
+        );
     }
 
     /// The decoded readout (every field type of `IntelChannel`) is

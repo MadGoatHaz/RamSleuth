@@ -235,6 +235,10 @@ pub const ASROCK_Z690_TAICHI: BoardVrmProfile = BoardVrmProfile {
     board_key: "Z690 TAICHI",
     rails: INTEL_VCORE_RAILS,
 };
+pub const ASROCK_Z690M_ITX_AX: BoardVrmProfile = BoardVrmProfile {
+    board_key: "Z690M-ITX/AX",
+    rails: INTEL_VCORE_RAILS,
+};
 pub const MSI_MEG_Z690_ACE: BoardVrmProfile = BoardVrmProfile {
     board_key: "MEG Z690 ACE",
     rails: INTEL_VCORE_RAILS,
@@ -275,6 +279,7 @@ pub const PROFILES: &[BoardVrmProfile] = &[
     ASROCK_Z690_STEEL_LEGEND,
     ASROCK_Z790_STEEL_LEGEND,
     ASROCK_Z690_TAICHI,
+    ASROCK_Z690M_ITX_AX,
     MSI_MEG_Z690_ACE,
     MSI_MEG_Z790_ACE,
     MSI_MPG_Z690_EDGE,
@@ -799,6 +804,31 @@ mod tests {
         // Every seeded board key in PROFILES is an Intel Z690/Z790 (or
         // the AMD Hero) — the seed is small + growable by design.
         assert!(PROFILES.len() >= 18, "the seed + the Hero are all present");
+    }
+
+    /// (C3-5) The reference board (the 12600KF test host): the DMI name
+    /// `Z690M-ITX/ax` resolves to its own curated profile via the
+    /// case-insensitive contains-match (N1: the vCore badge flips from
+    /// `[est]` to the verified-profile form on this board), and the
+    /// ASRock Taichi key must not cross-match it.
+    #[test]
+    fn profile_for_z690m_itx_ax() {
+        let profile = profile_for(&Section::Value("Z690M-ITX/ax".to_owned()))
+            .unwrap_or_else(|| panic!("the reference board must match its own profile"));
+        assert_eq!(profile.board_key, "Z690M-ITX/AX");
+        assert_eq!(profile.rails, INTEL_VCORE_RAILS);
+        // Negative control: the Taichi key does not cross-match the ITX
+        // name (and vice versa).
+        assert_ne!(
+            profile_for(&Section::Value("Z690M-ITX/ax".to_owned())).map(|p| p.board_key),
+            Some("Z690 TAICHI"),
+            "Z690M-ITX/ax must not resolve to the Taichi profile"
+        );
+        assert_ne!(
+            profile_for(&Section::Value("Z690 TAICHI".to_owned())).map(|p| p.board_key),
+            Some("Z690M-ITX/AX"),
+            "Z690 TAICHI must not resolve to the ITX profile"
+        );
     }
 
     /// (C3-2) The vendor-aware fallback classification: a consumer

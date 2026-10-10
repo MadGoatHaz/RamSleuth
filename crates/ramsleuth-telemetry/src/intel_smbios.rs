@@ -14,17 +14,33 @@
 //!
 //! # Source (unprivileged, `std::fs`-only)
 //!
-//! Each raw Type 17 structure is exported by the kernel at
-//! `/sys/firmware/dmi/entries/17-<n>` (one file per physical memory device;
-//! the trailing `<n>` is the structure handle ordinal). The file is the
-//! DMTF Type 17 fixed part (`[0..len]`, `len` = byte `0x01`) followed by the
-//! null-separated string table. Per the research-validated offsets:
+//! The kernel's `dmi` sysfs exports each raw Type 17 structure as a
+//! **directory** `/sys/firmware/dmi/entries/17-<n>` (one directory per
+//! physical memory device; the trailing `<n>` is the structure handle
+//! ordinal) whose payload file **`17-<n>/raw`** (mode `0400 root:root` —
+//! the daemon runs uid 0, so `std::fs` reads it with no extra capability)
+//! is the DMTF Type 17 fixed part (`[0..len]`, `len` = byte `0x01`)
+//! followed by the null-separated string table. The string table starts
+//! at the **first** string (there is no leading empty segment): string
+//! ref `N` = the `N`th string.
 //!
-//! - **capacity** @ `0x28` (4 little-endian bytes, in MiB; `0` = absent /
-//!   not installed);
+//! The real-table layout is SMBIOS **3.5** (verified on the reference
+//! 12600KF / Z690M-ITX/ax dumps: 92-byte fixed part, matching DMTF
+//! DSP0134 3.5.0 Table 76): the classic layout **shifted +2** by the
+//! two-byte `Memory Error Information Handle` field at `0x06-0x07`
+//! (`0xFE 0xFF` = "Not Provided"; the 3.x table has the `Device Locator`
+//! @ `0x10` + `Bank Locator` @ `0x11` pair and no separate
+//! "Memory Device Locator" field). Verified offsets:
+//!
+//! - **capacity** @ `0x0C` (16-bit word; per the spec the magnitude is
+//!   set by bit 15 — **clear = MB unit, set = KB unit**: `0x4000` =
+//!   16384 MB = 16 GiB; the sentinel words `0x7FFF` (≥ 32 GiB − 1 MiB)
+//!   and `0xFFFF` (unknown) point to the extended size);
+//! - **extended capacity** @ `0x1C` (32-bit dword, MiB in bits 30:0 —
+//!   the SMBIOS 3.0+ extended size; zero on the reference board);
 //! - **memory type** @ `0x12` (`0x1A` = DDR4, `0x22` = DDR5);
-//! - **locators**: the "Memory Device Locator" string ref @ `0x06`, with the
-//!   "Device Locator" string ref @ `0x0C` as the fallback.
+//! - **locators**: the "Device Locator" string ref @ `0x10`, with the
+//!   "Bank Locator" string ref @ `0x11` as the fallback.
 //!
 //! # No-panic contract (D5)
 //!
@@ -66,13 +82,16 @@ const DMI_ENTRIES_DIR: &str = "/sys/firmware/dmi/entries";
 /// The file-name prefix of a raw SMBIOS Type 17 structure (`17-<n>`).
 const TYPE17_PREFIX: &str = "17-";
 
-/// Type 17 fixed-part field offsets (research-validated).
+/// Type 17 fixed-part field offsets (the real SMBIOS 3.5 layout — the
+/// classic DMTF table shifted +2 by the `Error Information Handle` at
+/// `0x06-0x07`; verified on the reference 12600KF / Z690M-ITX/ax dumps).
 const OFF_LENGTH: usize = 0x01;
-const OFF_MEM_DEVICE_LOCATOR: usize = 0x06;
-const OFF_DEVICE_LOCATOR: usize = 0x0C;
+const OFF_CAPACITY: usize = 0x0C;
+const CAPACITY_LEN: usize = 2;
+const OFF_MEM_DEVICE_LOCATOR: usize = 0x10;
+const OFF_BANK_LOCATOR: usize = 0x11;
 const OFF_MEMORY_TYPE: usize = 0x12;
-const OFF_CAPACITY: usize = 0x28;
-const CAPACITY_LEN: usize = 4;
+const OFF_CAPACITY_EXTENDED: usize = 0x1C;
 
 /// The channel classification derived from the populated DIMM locators
 /// (research: "matched A/B pairs → Dual; both on one channel → Single;
@@ -164,7 +183,9 @@ pub fn collect_from(root: &Path) -> SmbiosTopology {
         .collect();
     paths.sort();
     for path in paths {
-        let bytes = match std::fs::read(&path) {
+        // The kernel exports each `17-<n>` as a *directory*; the
+        // structure bytes live in the payload file `17-<n>/raw`.
+        let bytes = match std::fs::read(path.join("raw")) {
             Ok(b) => b,
             Err(_) => continue, // unreadable -> skip (no panic)
         };
@@ -197,14 +218,33 @@ fn parse_type17(bytes: &[u8]) -> Option<(u64, Option<MemoryTech>, String)> {
     let fixed = &bytes[..len];
     let table = &bytes[len..];
 
-    // Capacity @ 0x28 (4 LE bytes, MiB); `0` = absent / not installed.
-    let capacity = if fixed.len() >= OFF_CAPACITY + CAPACITY_LEN {
-        let mut buf = [0u8; CAPACITY_LEN];
-        buf.copy_from_slice(&fixed[OFF_CAPACITY..OFF_CAPACITY + CAPACITY_LEN]);
-        u32::from_le_bytes(buf) as u64
-    } else {
-        0
-    };
+    // Capacity: the `0x0C` word — per SMBIOS 3.5 (DSP0134 Table 76) the
+    // magnitude is set by bit 15: **clear = MB, set = KB** (`0x4000` =
+    // 16384 MB = the reference 16 GiB DIMM). The sentinel words
+    // `0x7FFF` (≥ 32 GiB − 1 MiB) and `0xFFFF` (unknown), like a `0`
+    // word, fall through to the `0x1C` Extended Size dword (MiB); both
+    // zero = unpopulated DIMM.
+    let mut capacity: u64 = 0;
+    if fixed.len() >= OFF_CAPACITY + CAPACITY_LEN {
+        let word = u16::from_le_bytes([fixed[OFF_CAPACITY], fixed[OFF_CAPACITY + 1]]);
+        capacity = match word {
+            // Sentinels (and "not installed") -> the extended dword.
+            0x0000 | 0x7FFF | 0xFFFF => 0,
+            _ => {
+                let size = (word & 0x7FFF) as u64;
+                if word & 0x8000 != 0 {
+                    size / 1024 // KB -> MiB (floor)
+                } else {
+                    size // MB
+                }
+            }
+        };
+    }
+    if capacity == 0 && fixed.len() >= OFF_CAPACITY_EXTENDED + 4 {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(&fixed[OFF_CAPACITY_EXTENDED..OFF_CAPACITY_EXTENDED + 4]);
+        capacity = u32::from_le_bytes(buf) as u64; // MiB (bits 30:0)
+    }
     if capacity == 0 {
         return None; // unpopulated DIMM
     }
@@ -216,28 +256,30 @@ fn parse_type17(bytes: &[u8]) -> Option<(u64, Option<MemoryTech>, String)> {
         None
     };
 
-    // Locator: the Memory Device Locator string (0x06), falling back to the
-    // Device Locator string (0x0C) when the former is empty / absent.
+    // Locator: the Memory Device Locator string (0x10), falling back to
+    // the Bank Locator string (0x11) when the former is empty / absent.
     let mem_ref = if fixed.len() > OFF_MEM_DEVICE_LOCATOR {
         fixed[OFF_MEM_DEVICE_LOCATOR]
     } else {
         0
     };
-    let dev_ref = if fixed.len() > OFF_DEVICE_LOCATOR {
-        fixed[OFF_DEVICE_LOCATOR]
+    let bank_ref = if fixed.len() > OFF_BANK_LOCATOR {
+        fixed[OFF_BANK_LOCATOR]
     } else {
         0
     };
     let locator = string_at(table, mem_ref)
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| string_at(table, dev_ref))
+        .or_else(|| string_at(table, bank_ref))
         .unwrap_or_default();
 
     Some((capacity, mem_type, locator))
 }
 
 /// Extract the `ref_idx`-th string from a raw SMBIOS string table
-/// (null-separated; string `0` is the leading empty terminator).
+/// (null-separated). Real SMBIOS string tables start at the **first**
+/// string — there is **no** leading empty segment — so string ref `N`
+/// is the `N`th null-separated segment (`ref 1` = the first).
 ///
 /// # No-panic contract
 ///
@@ -248,21 +290,41 @@ fn string_at(table: &[u8], ref_idx: u8) -> Option<String> {
         return None;
     }
     let parts: Vec<&[u8]> = table.split(|&b| b == 0).collect();
-    // A real string reference points to a non-empty segment; the trailing
-    // null terminator yields an empty segment, which is not a string.
-    parts.get(ref_idx as usize)
+    // String ref `N` = the `N`th segment (no leading empty segment in a
+    // real table); the trailing null terminator yields an empty segment,
+    // which is not a string.
+    parts.get(ref_idx as usize - 1)
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .filter(|s| !s.is_empty())
 }
 
 /// The channel designation (A–D) of a locator string, if one is present.
 ///
-/// A channel letter is recognized when a token (split on non-alphanumeric
-/// runs) is exactly one A–D letter (e.g. `A` in `CPU0_DIMM_A`) or an A–D
-/// letter immediately followed by a digit (e.g. `A1`, `B2`). This
-/// distinguishes a channel designation from an A–D letter that is merely
-/// the start of a word (the `D` in `DIMM` is never a channel).
+/// Two grammars, tried in order:
+///
+/// 1. **`Controller<digit>`** (case-insensitive) — this firmware names
+///    its DIMMs `Controller0-ChannelA-DIMM0` / `Controller1-ChannelA-DIMM0`
+///    — *both* say "ChannelA"; the true channel is the **Controller**
+///    index: `0`→`A`, `1`→`B`, `2`→`C`, `3`→`D` (a digit above `3` is not
+///    a channel designation);
+/// 2. a standalone A–D letter token (e.g. `A` in `CPU0_DIMM_A`) or an A–D
+///    letter immediately followed by a digit (e.g. `A1`, `B2`). This
+///    distinguishes a channel designation from an A–D letter that is
+///    merely the start of a word (the `D` in `DIMM` is never a channel).
 fn channel_of(locator: &str) -> Option<char> {
+    // Pass 1: the `Controller<digit>` grammar (0→A … 3→D).
+    for token in locator.split(|c: char| !c.is_alphanumeric()) {
+        if let Some(digit) = token
+            .to_ascii_lowercase()
+            .as_str()
+            .strip_prefix("controller")
+            .and_then(|rest| rest.parse::<u8>().ok())
+            .filter(|&d| d <= 3)
+        {
+            return Some(char::from(b'A' + digit));
+        }
+    }
+    // Pass 2: the standalone A–D letter rules.
     for token in locator.split(|c: char| !c.is_alphanumeric()) {
         let b = token.as_bytes();
         if b.is_empty() {
@@ -312,8 +374,9 @@ mod tests {
 
     /// Build a raw SMBIOS Type 17 structure: a `len`-byte fixed part (the
     /// caller sets the field bytes) + a null-separated string table
-    /// (`strings[0]` is the leading empty terminator, then one string per
-    /// reference). Returns the full file image the kernel exports.
+    /// (string ref `N` = the `N`th string — **no** leading empty segment,
+    /// exactly like the kernel's real tables). Returns the full image the
+    /// kernel exports at `17-<n>/raw`.
     fn type17_file(
         len: usize,
         fixed: &mut [u8],
@@ -322,8 +385,9 @@ mod tests {
         assert!(fixed.len() >= len, "fixed must be at least `len` bytes");
         fixed[OFF_LENGTH] = len as u8;
         let mut out = fixed.to_vec();
-        // String table: leading empty terminator + each string + terminator.
-        out.push(0);
+        // String table: one string per reference + its null terminator
+        // (real tables start at the first string — no leading empty
+        // segment).
         for s in strings {
             out.extend_from_slice(s.as_bytes());
             out.push(0);
@@ -331,10 +395,14 @@ mod tests {
         out
     }
 
-    /// Write a synthetic `17-<n>` file into `dir`.
+    /// Write a synthetic `17-<n>` entry into `dir`, mirroring the
+    /// kernel's dmi-sysfs layout: a **directory** `17-<n>` whose payload
+    /// file is `17-<n>/raw`.
     fn write_entry(dir: &Path, n: u8, bytes: &[u8]) {
-        let mut f = std::fs::File::create(dir.join(format!("17-{n}"))).expect("entry create");
-        f.write_all(bytes).expect("entry write");
+        let entry = dir.join(format!("17-{n}"));
+        std::fs::create_dir_all(&entry).expect("entry dir create");
+        let mut f = std::fs::File::create(entry.join("raw")).expect("entry raw create");
+        f.write_all(bytes).expect("entry raw write");
     }
 
     /// A temp directory (pid-scoped; removed on drop).
@@ -358,28 +426,70 @@ mod tests {
         }
     }
 
-    /// A populated DDR4 DIMM in slot `A2`, 16 GiB (capacity 16384 MiB).
-    /// String table: [0]=terminator, [1]="Memory Device Locator" value
-    /// (ref 1 = "A2"), [2]="Device Locator" value (ref 2 = "A2").
+    /// A populated DDR4 DIMM, 16 GiB, in the given slot. Real 3.5 layout:
+    /// the `0x0C` capacity word carries `0x4000` (bit 15 clear = MB unit,
+    /// 16384 MB — the same word the reference table uses), the locator
+    /// string refs are `0x10` (Device Locator) / `0x11` (Bank Locator),
+    /// the memory type is `0x12` (`0x1A` = DDR4). String table: ref 1 =
+    /// the device-locator value, ref 2 = the bank-locator value (the
+    /// same locator in both, as on the reference board).
     fn populated_ddr4(locator: &str) -> Vec<u8> {
-        let mut fixed = [0u8; 0x2C];
-        fixed[OFF_MEMORY_TYPE] = 0x1A; // DDR4
+        let mut fixed = [0u8; 0x20];
+        fixed[OFF_CAPACITY..OFF_CAPACITY + CAPACITY_LEN].copy_from_slice(&0x4000u16.to_le_bytes());
         fixed[OFF_MEM_DEVICE_LOCATOR] = 1;
-        fixed[OFF_DEVICE_LOCATOR] = 2;
-        let cap: u32 = 16384; // 16 GiB in MiB
-        fixed[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&cap.to_le_bytes());
-        type17_file(0x2C, &mut fixed, &[locator, locator])
+        fixed[OFF_BANK_LOCATOR] = 2;
+        fixed[OFF_MEMORY_TYPE] = 0x1A; // DDR4
+        type17_file(0x20, &mut fixed, &[locator, locator])
     }
 
-    /// An unpopulated DIMM (capacity 0) — must be skipped.
+    /// An unpopulated DIMM (the `0x0C` word and the `0x1C` extended dword
+    /// are both zero) — must be skipped.
     fn unpopulated() -> Vec<u8> {
-        let mut fixed = [0u8; 0x2C];
+        let mut fixed = [0u8; 0x20];
         fixed[OFF_MEMORY_TYPE] = 0x1A;
         fixed[OFF_MEM_DEVICE_LOCATOR] = 1;
-        fixed[OFF_DEVICE_LOCATOR] = 2;
-        // capacity stays 0
-        type17_file(0x2C, &mut fixed, &["A1", "A1"])
+        fixed[OFF_BANK_LOCATOR] = 2;
+        // capacity (0x0C word + 0x1C dword) stays 0
+        type17_file(0x20, &mut fixed, &["A1", "A1"])
     }
+
+    /// The verbatim 12600KF / Z690M-ITX/ax SMBIOS Type 17 table
+    /// (`17-0/raw`, handle `0x000C`; 183 bytes = the 92-byte SMBIOS 3.5
+    /// fixed part + the string region). Captured byte-for-byte from the
+    /// reference host's `/sys/firmware/dmi/entries` (evidence:
+    /// `work/scratch/DeepSeek Report.md:28-41`).
+const REAL_12600KF_17_0: &[u8] = &[
+        0x11, 0x5C, 0x0C, 0x00, 0x0B, 0x00, 0xFE, 0xFF, 0x40, 0x00, 0x40, 0x00, 0x00, 0x40, 0x09, 0x00,
+        0x01, 0x02, 0x1A, 0x80, 0x00, 0x60, 0x09, 0x03, 0x04, 0x05, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x10, 0x0E, 0xB0, 0x04, 0x46, 0x05, 0xB0, 0x04, 0x03, 0x08, 0x00, 0x00, 0x04, 0xEF, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0x6F, 0x6E, 0x74,
+        0x72, 0x6F, 0x6C, 0x6C, 0x65, 0x72, 0x30, 0x2D, 0x43, 0x68, 0x61, 0x6E, 0x6E, 0x65, 0x6C, 0x41,
+        0x2D, 0x44, 0x49, 0x4D, 0x4D, 0x30, 0x00, 0x42, 0x41, 0x4E, 0x4B, 0x20, 0x30, 0x00, 0x54, 0x65,
+        0x61, 0x6D, 0x20, 0x47, 0x72, 0x6F, 0x75, 0x70, 0x20, 0x49, 0x6E, 0x63, 0x00, 0x30, 0x31, 0x30,
+        0x34, 0x44, 0x38, 0x31, 0x37, 0x00, 0x39, 0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x30,
+        0x00, 0x54, 0x45, 0x41, 0x4D, 0x47, 0x52, 0x4F, 0x55, 0x50, 0x2D, 0x55, 0x44, 0x34, 0x2D, 0x33,
+        0x36, 0x30, 0x30, 0x20, 0x20, 0x00, 0x00,
+    ];
+
+    /// The same real table for handle `0x000D` (`17-1/raw`): the
+    /// `Controller1` locator + serial `0104D816` (evidence: `work/scratch/
+    /// DeepSeek Report.md:43-56`).
+const REAL_12600KF_17_1: &[u8] = &[
+        0x11, 0x5C, 0x0D, 0x00, 0x0B, 0x00, 0xFE, 0xFF, 0x40, 0x00, 0x40, 0x00, 0x00, 0x40, 0x09, 0x00,
+        0x01, 0x02, 0x1A, 0x80, 0x00, 0x60, 0x09, 0x03, 0x04, 0x05, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x10, 0x0E, 0xB0, 0x04, 0x46, 0x05, 0xB0, 0x04, 0x03, 0x08, 0x00, 0x00, 0x04, 0xEF, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0x6F, 0x6E, 0x74,
+        0x72, 0x6F, 0x6C, 0x6C, 0x65, 0x72, 0x31, 0x2D, 0x43, 0x68, 0x61, 0x6E, 0x6E, 0x65, 0x6C, 0x41,
+        0x2D, 0x44, 0x49, 0x4D, 0x4D, 0x30, 0x00, 0x42, 0x41, 0x4E, 0x4B, 0x20, 0x30, 0x00, 0x54, 0x65,
+        0x61, 0x6D, 0x20, 0x47, 0x72, 0x6F, 0x75, 0x70, 0x20, 0x49, 0x6E, 0x63, 0x00, 0x30, 0x31, 0x30,
+        0x34, 0x44, 0x38, 0x31, 0x36, 0x00, 0x39, 0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x30,
+        0x00, 0x54, 0x45, 0x41, 0x4D, 0x47, 0x52, 0x4F, 0x55, 0x50, 0x2D, 0x55, 0x44, 0x34, 0x2D, 0x33,
+        0x36, 0x30, 0x30, 0x20, 0x20, 0x00, 0x00,
+    ];
 
     /// (a) Two populated DDR4 DIMMs in matched slots `A2` + `B2` → the
     /// topology reports 2 DIMMs, both 16 GiB, DDR4, and a `Dual` derived
@@ -476,13 +586,12 @@ mod tests {
     /// (h) A DDR5 memory-type field (`0x22`) decodes to [`MemoryTech::Ddr5`].
     #[test]
     fn ddr5_memory_type_decodes() {
-        let mut fixed = [0u8; 0x2C];
+        let mut fixed = [0u8; 0x20];
         fixed[OFF_MEMORY_TYPE] = 0x22; // DDR5
         fixed[OFF_MEM_DEVICE_LOCATOR] = 1;
-        fixed[OFF_DEVICE_LOCATOR] = 2;
-        let cap: u32 = 16384;
-        fixed[OFF_CAPACITY..OFF_CAPACITY + 4].copy_from_slice(&cap.to_le_bytes());
-        let bytes = type17_file(0x2C, &mut fixed, &["A2", "A2"]);
+        fixed[OFF_BANK_LOCATOR] = 2;
+        fixed[OFF_CAPACITY..OFF_CAPACITY + CAPACITY_LEN].copy_from_slice(&0x4000u16.to_le_bytes());
+        let bytes = type17_file(0x20, &mut fixed, &["A2", "A2"]);
 
         let dmi = TempDmi::new("ddr5");
         write_entry(&dmi.root, 0, &bytes);
@@ -501,30 +610,66 @@ mod tests {
     }
 
     /// (j) The `channel_of` heuristic: a channel designation is recognized
-    /// (single letter, letter+digit) but not an A–D letter that starts a
-    /// word (`DIMM`, `RAM`).
+    /// (the `Controller<digit>` grammar, a single A–D letter,
+    /// letter+digit) but not an A–D letter that starts a word (`DIMM`,
+    /// `RAM`).
     #[test]
     fn channel_of_recognizes_designations_only() {
+        // The `Controller<digit>` grammar (0→A … 3→D) — this firmware
+        // names both DIMMs "ChannelA"; the channel is the Controller
+        // index.
+        assert_eq!(channel_of("Controller0-ChannelA-DIMM0"), Some('A'));
+        assert_eq!(channel_of("Controller1-ChannelA-DIMM0"), Some('B'));
+        assert_eq!(channel_of("Controller2-ChannelA-DIMM0"), Some('C'));
+        assert_eq!(channel_of("Controller3-ChannelA-DIMM0"), Some('D'));
         assert_eq!(channel_of("A2"), Some('A'));
         assert_eq!(channel_of("DIMM A1"), Some('A'));
         assert_eq!(channel_of("CPU0_DIMM_B"), Some('B'));
         assert_eq!(channel_of("Channel A Slot 1"), Some('A'));
-        // No channel designation.
+        // No channel designation (a digit above 3 is not a channel; an
+        // A–D letter that starts a word is not one either).
+        assert_eq!(channel_of("Controller4-ChannelA-DIMM0"), None);
         assert_eq!(channel_of("DIMM 1"), None);
         assert_eq!(channel_of("Slot 1"), None);
         assert_eq!(channel_of("RAM"), None);
         assert_eq!(channel_of(""), None);
     }
 
-    /// (k) `string_at` extracts the right null-separated string and is
-    /// safe on an out-of-range reference (no panic).
+    /// (k) `string_at` extracts the right null-separated string — real
+    /// tables start at the first string (ref 1 = the first segment, no
+    /// leading empty segment) — and is safe on an out-of-range
+    /// reference (no panic).
     #[test]
     fn string_at_extracts_and_bounds() {
-        let table = [0, b'A', b'2', 0, b'B', b'2', 0];
+        let table = [b'A', b'2', 0, b'B', b'2', 0, 0];
         assert_eq!(string_at(&table, 1), Some("A2".to_owned()));
         assert_eq!(string_at(&table, 2), Some("B2".to_owned()));
         assert_eq!(string_at(&table, 0), None);
         assert_eq!(string_at(&table, 3), None);
         assert_eq!(string_at(&table, 99), None);
+    }
+
+    /// The real 12600KF / Z690M-ITX/ax table (SMBIOS 3.5, 92-byte fixed
+    /// part, `17-<n>/raw`): both entries parse to 2 × 16 GiB DDR4 DIMMs
+    /// whose `ControllerN` locators derive `Dual` — the exact topology
+    /// the L3 firmware override consumes.
+    #[test]
+    fn real_12600kf_table_reports_dual() {
+        let dmi = TempDmi::new("real-12600kf");
+        write_entry(&dmi.root, 0, REAL_12600KF_17_0);
+        write_entry(&dmi.root, 1, REAL_12600KF_17_1);
+
+        let t = collect_from(&dmi.root);
+        assert_eq!(t.populated_count, 2);
+        assert_eq!(t.dimm_sizes, vec![16384, 16384]);
+        assert_eq!(t.memory_type, Some(MemoryTech::Ddr4));
+        assert_eq!(
+            t.locators,
+            vec![
+                "Controller0-ChannelA-DIMM0".to_owned(),
+                "Controller1-ChannelA-DIMM0".to_owned()
+            ]
+        );
+        assert_eq!(t.derived_mode, DerivedMode::Dual);
     }
 }
