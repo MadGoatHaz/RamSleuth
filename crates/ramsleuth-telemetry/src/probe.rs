@@ -1283,6 +1283,14 @@ mod tests {
     use crate::platform::SystemPlatform;
     use crate::spd_decode::SpdModule;
 
+    /// The 12600KF anchor through the probe renderer: the corrected
+    /// 1800 MHz MCLK (the Alder Lake half-step decode of the real
+    /// 0x79E00124 word) renders **3600 MT/s** — not the pre-fix 7200.
+    #[test]
+    fn derived_mts_renders_3600_for_the_12600kf_mclk() {
+        assert_eq!(derived_mts(&Section::Value(1800.0)), "3600 MT/s");
+    }
+
     /// A fully-populated [`ProbeRaw`] fixture (representative Intel raw
     /// dump: populated ch0/ch1/ch2 + mcl0/mcl1 + all MAD raws, absent
     /// ch3, MCHBAR base + enable — host-independent).
