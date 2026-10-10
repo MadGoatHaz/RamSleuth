@@ -3066,12 +3066,14 @@ mod tests {
         }
     }
 
-    /// The 12600KF anchor through the GUI summary line: the Intel
-    /// readout carries the corrected 1800 MHz MCLK (the Alder Lake
-    /// half-step decode of the real 0x79E00124 word) and renders
-    /// **3600 MT/s** — not the pre-fix 7200.
+    /// The MCLK-derived MT/s is a **single source** across reporters:
+    /// the GUI's `mclk_derived_speed` mirrors the probe's `derived_mts`
+    /// (MCLK × 2, DDR double-pumping) so the GUI summary line renders
+    /// the SAME value. The 12600KF fixture (the corrected 1800 MHz
+    /// MCLK from the Alder Lake half-step decode of the real
+    /// 0x79E00124 word) renders **3600 MT/s** — not the pre-fix 7200.
     #[test]
-    fn mclk_derived_speed_renders_3600_for_the_12600kf_mclk() {
+    fn mclk_mt_s_is_single_source_across_reporters() {
         fn na<T>() -> Section<T> {
             Section::na(NaReason::NotApplicable)
         }

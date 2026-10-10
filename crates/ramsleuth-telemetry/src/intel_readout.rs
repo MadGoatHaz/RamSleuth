@@ -2895,20 +2895,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // The Alder Lake MC_BIOS_REQ decode anchors (11th-gen-and-later
-    // half-step semantics): the real 12600KF word.
+    // The 11th-gen-plus MC_BIOS_REQ decode anchors (half-step
+    // semantics). Generation-level: the representative fixture is the
+    // documented Alder Lake i5-12600KF word (the hardware-confirmed
+    // reference device); the cross-generation invariance of the
+    // formula is pinned in the two parameterized tests that follow.
     // -----------------------------------------------------------------
 
-    /// Live-hardware anchor (Alder Lake i5-12600KF, DDR4-3600 — the
-    /// reference device): the real `MC_BIOS_REQ` word 0x79E00124
-    /// (ratio 36, bit 8 = 1 → 100 MHz refclk, bits [17:16] = 00b →
-    /// gear 1; the upper PLL-tracking word is ignored by the decode)
-    /// resolves, under the 11th-gen-and-later half-step semantics, to
-    /// the true core clock 36 × 100 / 2 = **1800 MHz** — and the
-    /// reporters' standard DDR × 2 then yields **3600 MT/s** (not the
-    /// pre-fix 7200).
+    /// The 11th-gen-plus half-step anchor. The representative word is
+    /// the **documented Alder Lake i5-12600KF fixture** (the reference
+    /// device — hardware-confirmed): `MC_BIOS_REQ` 0x79E00124 (ratio
+    /// 36, bit 8 = 1 → 100 MHz refclk, bits [17:16] = 00b → gear 1;
+    /// the upper PLL-tracking word is ignored by the decode) resolves,
+    /// under the 11th-gen-and-later half-step semantics, to the true
+    /// core clock 36 × 100 / 2 = **1800 MHz** — and the reporters'
+    /// standard DDR × 2 then yields **3600 MT/s** (not the pre-fix
+    /// 7200). The anchor is generation-level: it pins the half-step
+    /// formula on a confirmed word; the formula's invariance across all
+    /// five 11th-gen+ gens is pinned separately below.
     #[test]
-    fn decode_mclk_alder_12600kf_ddr4_3600_anchor() {
+    fn decode_mclk_11th_gen_plus_half_step_anchor() {
         let mclk = decode_mclk(Some(0x79E0_0124), IntelGen::AlderLake);
         assert_eq!(mclk, Section::Value(1800.0));
         assert_eq!(
@@ -2918,12 +2924,16 @@ mod tests {
         );
     }
 
-    /// The same word through the full [`decode`] dispatch (Alder
+    /// The Alder family-representative word (the documented 12600KF
+    /// fixture 0x79E00124) through the full [`decode`] dispatch (Alder
     /// Lake, the 2-channel DDR4 default): every decoded subchannel
     /// carries 1800 MHz MCLK, gear One, UCLK 1800 — the reporters'
-    /// × 2 yields 3600 MT/s end to end.
+    /// × 2 yields 3600 MT/s end to end. Generation-level: the Alder
+    /// family is the hardware-confirmed anchor for the Tier-3 decode
+    /// path; the sibling 11th-gen+ gens share the same MCLK formula
+    /// (pinned below).
     #[test]
-    fn decode_alder_12600kf_word_end_to_end() {
+    fn decode_alder_family_representative_word_end_to_end() {
         let regs = IntelImcRegs {
             mcbios_req: Some(0x79E0_0124),
             ..IntelImcRegs::default()
@@ -2941,6 +2951,88 @@ mod tests {
             assert_eq!(ch.clocks.mclk_mhz, Section::Value(1800.0));
             assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
             assert_eq!(ch.clocks.uclk_mhz, Section::Value(1800.0));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Cross-generation MCLK anchors: the half-step formula is
+    // generation-invariant across the whole 11th-gen+ set, and the
+    // Tier-1 full-step formula is unchanged as the control.
+    // -----------------------------------------------------------------
+
+    /// The 11th-gen-and-later half-step MCLK formula (`ratio × refclk /
+    /// 2`) is **generation-invariant** across the whole half-step set
+    /// {Rocket, Alder, Raptor, Meteor, Arrow}: one representative
+    /// in-band `MC_BIOS_REQ` word per gen, each decoding to
+    /// `ratio × refclk / 2`.
+    ///
+    /// Provenance (OQ-11 working-assumption pattern): **Alder Lake is
+    /// hardware-confirmed** (the real i5-12600KF word 0x79E00124 from
+    /// the reference device). **Rocket / Raptor / Meteor / Arrow Lake
+    /// carry documented representative words only — PENDING hardware
+    /// confirmation** on a real host of each gen. The generalization of
+    /// the half-step formula to the full 11th-gen+ set is therefore
+    /// explicit, not silent; the works-cited are community/forum
+    /// sources, not Intel datasheets (see the Alder Lake MC_BIOS_REQ
+    /// decode research note).
+    #[test]
+    fn decode_mclk_11th_gen_plus_half_step_is_generation_invariant() {
+        // One in-band representative word per gen. Provenance (OQ-11
+        // working assumption): Alder is hardware-confirmed (the real
+        // 12600KF word); Rocket/Raptor/Meteor/Arrow are documented
+        // representatives PENDING hardware confirmation.
+        let cases = [
+            (IntelGen::RocketLake, 0x0000_0120), // ratio 32 @ 100 → 1600 MHz (pending HW)
+            (IntelGen::AlderLake, 0x79E0_0124), // ratio 36 @ 100 → 1800 MHz (CONFIRMED: real 12600KF)
+            (IntelGen::RaptorLake, 0x0001_012C), // ratio 44 @ 100 → 2200 MHz (pending HW)
+            (IntelGen::MeteorLake, 0x0002_0130), // ratio 48 @ 100 → 2400 MHz (pending HW)
+            (IntelGen::ArrowLake, 0x0003_0134), // ratio 52 @ 100 → 2600 MHz (pending HW)
+        ];
+        for (gen, word) in cases {
+            let ratio = f64::from(word & 0xFF);
+            let refclk = if word & 0x0100 != 0 {
+                REF_CLK_100_MHZ
+            } else {
+                REF_CLK_133_MHZ
+            };
+            let expected = ratio * refclk / 2.0; // the half-step formula
+            assert_eq!(
+                decode_mclk(Some(word), gen),
+                Section::Value(expected),
+                "{gen:?} {word:#010x}: half-step ratio × refclk / 2 = {expected}"
+            );
+        }
+    }
+
+    /// The Tier-1 (Skylake–Comet Lake, 6th–10th gen) **full-step**
+    /// MCLK formula (`ratio × refclk` — the legacy physical-clock
+    /// multiplier, no halving) is unchanged across the set {Skylake,
+    /// Kaby, Coffee, Comet}: the control proving the 11th-gen+
+    /// half-step restructure did not leak into the legacy generations.
+    /// One representative in-band word per gen, each decoding to
+    /// `ratio × refclk`.
+    #[test]
+    fn decode_mclk_tier1_full_step_is_unchanged() {
+        // One in-band representative word per gen (133.3333 MHz ref).
+        let cases = [
+            (IntelGen::Skylake, 0x0000_0012), // ratio 18 @ 133.3333 → 2400 MHz
+            (IntelGen::KabyLake, 0x0000_0012), // ratio 18 @ 133.3333 → 2400 MHz
+            (IntelGen::CoffeeLake, 0x0000_0010), // ratio 16 @ 133.3333 → 2133.33 MHz
+            (IntelGen::CometLake, 0x0000_0010), // ratio 16 @ 133.3333 → 2133.33 MHz
+        ];
+        for (gen, word) in cases {
+            let ratio = f64::from(word & 0xFF);
+            let refclk = if word & 0x0100 != 0 {
+                REF_CLK_100_MHZ
+            } else {
+                REF_CLK_133_MHZ
+            };
+            let expected = ratio * refclk; // the full-step formula (unchanged)
+            assert_eq!(
+                decode_mclk(Some(word), gen),
+                Section::Value(expected),
+                "{gen:?} {word:#010x}: full-step ratio × refclk = {expected}"
+            );
         }
     }
 

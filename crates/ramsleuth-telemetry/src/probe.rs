@@ -1283,11 +1283,14 @@ mod tests {
     use crate::platform::SystemPlatform;
     use crate::spd_decode::SpdModule;
 
-    /// The 12600KF anchor through the probe renderer: the corrected
-    /// 1800 MHz MCLK (the Alder Lake half-step decode of the real
+    /// The MCLK-derived MT/s is a **single source** across reporters:
+    /// the probe's `derived_mts` is the one place the MCLK → MT/s
+    /// (× 2, DDR double-pumping) display value is computed, and the
+    /// probe renderer reads it. The 12600KF fixture (the corrected
+    /// 1800 MHz MCLK from the Alder Lake half-step decode of the real
     /// 0x79E00124 word) renders **3600 MT/s** — not the pre-fix 7200.
     #[test]
-    fn derived_mts_renders_3600_for_the_12600kf_mclk() {
+    fn mclk_mt_s_is_single_source_across_reporters() {
         assert_eq!(derived_mts(&Section::Value(1800.0)), "3600 MT/s");
     }
 
