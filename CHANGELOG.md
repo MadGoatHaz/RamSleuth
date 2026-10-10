@@ -14,9 +14,7 @@ All notable per-release changes to RamSleuth. Newest first.
 - **TUI probe-report consent is a proper modal** — `render_probe_overlay` now blanks the whole frame (default surface) for both open phases before dispatching, and `render_consent` pads each line to the box inner width, so the consent/preview text is fully readable instead of floating over the live dashboard (`consent_blanks_the_frame_around_the_box` + `preview_still_covers_the_full_frame`)
 - **Burn-in `m:ss` elapsed counter frozen between daemon ticks** — the counter now ticks live from a zone-local client clock (`BURN_IN_RUN_START`, the existing `NORMAL_RUN_START` pattern): latched on the burn-in start, rendered every 250 ms frame, backdated from the newest tick before the first frame, and cleared on terminal (`burn_in_row_uses_the_client_clock` + the fallback/clear tests; the status line and the burn-in row share the single source, so they can never disagree)
 - **vCore `[est]` on the ASRock Z690M-ITX/AX** — a curated `ASROCK_Z690M_ITX_AX` VRM profile (key `Z690M-ITX/AX`, `INTEL_VCORE_RAILS`) + registry line (with a match/negative-control test) lands the reference board in the verified-seed tier, so its badge flips `[est]` → verified via the existing single-source `RailConfidence::badge()` (no display change)
-
-### Known issues
-- **Intel MCLK reported doubled** — on Intel the memory clock is still shown doubled (a DDR4-3600 kit reads `7200 MT/s`); the `MC_BIOS_REQ` decode that would correct it is not yet confirmed, so the value ships as-is pending a follow-up patch.
+- **Intel MCLK/MT/s doubling FIXED** — `decode_mclk` is now generation-keyed (11th-gen+ half-step ratio×refclk/2); DDR4-3600 now correctly reports 3600 MT/s across TUI/GUI/CLI; Skylake/Rocket decode anchors preserved
 
 ## [2.4.14] - 2026-10-09
 
