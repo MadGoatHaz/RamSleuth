@@ -76,6 +76,25 @@ use ramsleuth_bench::{
 };
 use ramsleuth_protocol::BenchMode;
 
+/// The maximum sanctioned burn-in duration, in minutes (DAEMON-4): 24
+/// hours. The client's `burn` command clamps to this range as a
+/// convenience, but the **privileged daemon re-clamps** the wire value it
+/// acts on — a hostile client cannot push a `u32::MAX` duration onto the
+/// run (which the bench crate's `duration_deadline` would turn into a
+/// ~138-year deadline). `0` stays `0` (infinite, cancel-only);
+/// `> 1440` is capped at `1440`.
+const MAX_BURN_IN_MINUTES: u32 = 1440;
+
+/// Re-clamp a client-supplied burn-in duration to the sanctioned
+/// `0..=1440` range (DAEMON-4): the server enforces its own invariant on
+/// a wire value it acts on (the client clamp is convenience only).
+/// `0` is infinite (cancel-only) and passes through unchanged; a value
+/// above [`MAX_BURN_IN_MINUTES`] is capped. Pure and total (no I/O, no
+/// panic) — unit-testable.
+pub(crate) fn clamp_burn_in_duration(minutes: u32) -> u32 {
+    minutes.min(MAX_BURN_IN_MINUTES)
+}
+
 /// The single-flight slot: the active run's id + its cancel flag, or
 /// `None` while no run is active.
 type ActiveSlot = Option<(u64, Arc<AtomicBool>)>;
@@ -298,6 +317,12 @@ impl BenchJobManager {
         duration_minutes: u32,
         threads: usize,
     ) -> Result<JobHandle, JobError> {
+        // DAEMON-4: the privileged daemon re-clamps the client-supplied
+        // duration to the sanctioned `0..=1440` range *before* it acts on
+        // it (the client clamp is convenience only) — a hostile `u32::MAX`
+        // cannot become a ~138-year burn-in deadline. `0` stays `0`
+        // (infinite, cancel-only).
+        let duration_minutes = clamp_burn_in_duration(duration_minutes);
         let (run_id, cancel) = self.claim_slot()?;
         let options = BurnInOptions {
             target,
@@ -677,9 +702,14 @@ mod tests {
         let run_id = handle.run_id;
 
         // Let the run complete at least one iteration (L1 passes are
-        // fast), then cancel it: the infinite run is still active, so
-        // the cancel must land.
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // fast), then cancel it: the infinite run is still active, so the
+        // cancel must land. The sleep is 1.5 s (not 1.0 s) so the FE-1
+        // ~1 s elapsed-update timer's *first* send (at ~1.0 s) is
+        // guaranteed to land **before** the cancel — cancelling at exactly
+        // 1.0 s raced the timer under load (the run could stop and set
+        // `finished` before the timer's 1 s check, dropping the tick),
+        // which made the `!elapsed.is_empty()` assertion flaky.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(mgr.cancel(run_id), "the active burn-in must be cancellable");
 
         let events = collect(handle).await;
@@ -969,5 +999,25 @@ mod tests {
         assert!(matches!(spawn.clone(), JobError::Spawn(_)));
         let as_err: &dyn std::error::Error = &JobError::Busy;
         assert_eq!(as_err.to_string(), "benchmark already running");
+    }
+
+    /// TC-DAEMON4: the privileged daemon re-clamps a client-supplied
+    /// burn-in duration to the sanctioned `0..=1440` range (the client
+    /// clamp is convenience only — the server enforces its own invariant
+    /// on a wire value it acts on). `u32::MAX` is capped to `1440` (not
+    /// a ~138-year deadline); `0` stays `0` (infinite / cancel-only); a
+    /// normal value is unchanged.
+    #[test]
+    fn tc_daemon4_burn_in_duration_is_reclamped_in_the_daemon() {
+        // A hostile value is capped to the sanctioned maximum.
+        assert_eq!(clamp_burn_in_duration(u32::MAX), 1440);
+        assert_eq!(clamp_burn_in_duration(1441), 1440);
+        assert_eq!(clamp_burn_in_duration(MAX_BURN_IN_MINUTES + 1), 1440);
+        // `0` is infinite (cancel-only) and passes through unchanged.
+        assert_eq!(clamp_burn_in_duration(0), 0);
+        // Normal values are unchanged.
+        assert_eq!(clamp_burn_in_duration(1), 1);
+        assert_eq!(clamp_burn_in_duration(60), 60);
+        assert_eq!(clamp_burn_in_duration(1440), 1440);
     }
 }

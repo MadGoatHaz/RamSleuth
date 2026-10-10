@@ -52,7 +52,7 @@
 //! ```
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ramsleuth_daemon::{
@@ -288,7 +288,7 @@ async fn main() {
     // cache over the real no-panic collector (the `--max-age` is the
     // cache TTL) + the P3-15 single-flight benchmark job manager.
     let ctx = Arc::new(DaemonContext {
-        cache: Arc::new(Mutex::new(TelemetryCache::new(
+        cache: Arc::new(TelemetryCache::new(
             move || {
                 // First line (before the spike + settle + collect): the
                 // guarded SPD auto-bind fallback — a freshly bound
@@ -306,7 +306,7 @@ async fn main() {
                 ramsleuth_telemetry::collect()
             },
             args.max_age,
-        ))),
+        )),
         jobs: Arc::new(BenchJobManager::new()),
     });
 

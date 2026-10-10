@@ -4,9 +4,10 @@
 //! [`Message::Request`], and write the matching
 //! [`Message::Response`] frame(s) back:
 //!
-//! - [`Request::GetTelemetry`] → the P3-14 TTL cache: `get` takes
-//!   `&mut self` and may call the **slow** collector, so it runs on the
-//!   blocking pool behind the shared mutex → [`Response::Telemetry`];
+//! - [`Request::GetTelemetry`] → the P3-14 TTL cache: `get` is `&self`
+//!   (the internal RwLock, DAEMON-3) and a re-collect may call the
+//!   **slow** collector, so it runs on the blocking pool →
+//!   [`Response::Telemetry`];
 //! - [`Request::StartBenchmark { target, mode }`] → the P3-15
 //!   single-flight [`BenchJobManager`] (`threads = 0`: auto, the P3-09
 //!   contract) → reply [`Response::BenchStarted { run_id }] and become
@@ -45,10 +46,11 @@
 //!
 //! **Connection lifecycle:** [`handle_connection`] returns `Ok(())` on
 //! clean EOF (the client closed) and [`RpcError`] on I/O failure or a
-//! protocol violation (`Oversized` / `Decode` frame — the connection
-//! is closed). A dying owner tears down nothing shared: single-flight
-//! state lives in the [`BenchJobManager`] (D6), and an unfinished run
-//! simply runs to its terminal and releases the slot.
+//! protocol violation (`Oversized` / `VersionMismatch` / `Decode` frame
+//! — the connection is closed). A dying owner tears down nothing
+//! shared: single-flight state lives in the [`BenchJobManager`] (D6),
+//! and an unfinished run simply runs to its terminal and releases the
+//! slot.
 //!
 //! **No panics (plan D5):** poisoned locks are recovered (the
 //! P3-15 `BenchJobManager` precedent), a run channel that closes
@@ -74,15 +76,18 @@ use crate::{BenchJobManager, JobEvent, TelemetryCache};
 /// The daemon's shared per-connection state, handed (cloned `Arc`) to
 /// every [`handle_connection`] by the P3-17 accept loop:
 ///
-/// - `cache`: the P3-14 TTL telemetry cache behind a `Mutex` —
-///   `get` is `&mut self` and may call the slow collector, so access
-///   is serialized across connections and each RPC takes the lock
-///   only inside `spawn_blocking`;
+/// - `cache`: the P3-14 TTL telemetry cache with its **internal**
+///   read/write split (DAEMON-3) — `get` is `&self`: a fresh snapshot
+///   is a cheap shared read (many frontends at once), and only the
+///   re-collect takes the exclusive write lock. The daemon shares one
+///   `Arc<TelemetryCache>` across connections; each RPC calls `get`
+///   inside `spawn_blocking` (the re-collect may run the slow
+///   `spike()` + `CLOCK_SETTLE` + `collect()`);
 /// - `jobs`: the P3-15 single-flight [`BenchJobManager`] (inherently
 ///   share-safe: all of its state is `Arc`-backed; a dying owner
 ///   strands nothing — the run releases its own slot, plan D6).
 pub struct DaemonContext {
-    pub cache: Arc<Mutex<TelemetryCache>>,
+    pub cache: Arc<TelemetryCache>,
     pub jobs: Arc<BenchJobManager>,
 }
 
@@ -200,6 +205,15 @@ pub async fn handle_connection(
                     "frame payload length exceeds the 16 MiB maximum".to_owned(),
                 ));
             }
+            // A cross-schema-generation peer (DAEMON-1): the frame's
+            // protocol version differs from this daemon's. Reject loudly
+            // (the connection closes) — never silently mis-parse a
+            // payload whose layout we do not share.
+            Err(FrameError::VersionMismatch { expected, found }) => {
+                return Err(RpcError::Protocol(format!(
+                    "frame protocol version mismatch: expected {expected}, found {found}"
+                )));
+            }
             Err(FrameError::Decode(msg)) => {
                 return Err(RpcError::Protocol(format!("frame failed to decode: {msg}")));
             }
@@ -222,18 +236,15 @@ async fn dispatch(
 ) -> Result<(), RpcError> {
     match message {
         Message::Request(Request::GetTelemetry) => {
-            // `get` is `&mut self` and may call the (slow) collector:
-            // take the shared mutex inside the pool, never on a
-            // runtime worker. A poisoned lock is recovered (the
-            // collector is no-panic by the Phase 2 contract, so this
-            // is defensive only — plan D5).
+            // `get` is `&self` (the cache's internal RwLock, DAEMON-3):
+            // a fresh snapshot is a cheap shared read, a re-collect the
+            // exclusive write. Run it inside the pool (the re-collect
+            // may call the slow `spike()` + `CLOCK_SETTLE` +
+            // `collect()`), never on a runtime worker.
             let cache = Arc::clone(&ctx.cache);
-            let telemetry = tokio::task::spawn_blocking(move || {
-                let mut c = cache.lock().unwrap_or_else(PoisonError::into_inner);
-                c.get()
-            })
-            .await
-            .map_err(|e| RpcError::Join(e.to_string()))?;
+            let telemetry = tokio::task::spawn_blocking(move || cache.get())
+                .await
+                .map_err(|e| RpcError::Join(e.to_string()))?;
             write_frame(writer, &Message::Response(Response::Telemetry(telemetry))).await
         }
         Message::Request(Request::StartBenchmark { target, mode }) => {
@@ -399,8 +410,7 @@ async fn dispatch(
             // never sends a partial / malformed payload.
             let cache = Arc::clone(&ctx.cache);
             let report = tokio::task::spawn_blocking(move || {
-                let mut c = cache.lock().unwrap_or_else(PoisonError::into_inner);
-                let telemetry = c.get();
+                let telemetry = cache.get();
                 build_probe_report(&telemetry, acquire_raw(), SystemIdentity::detect())
             })
             .await
@@ -857,7 +867,7 @@ mod tests {
     fn mock_ctx() -> Arc<DaemonContext> {
         let cache = TelemetryCache::new(mock_snapshot, Duration::from_secs(5));
         Arc::new(DaemonContext {
-            cache: Arc::new(Mutex::new(cache)),
+            cache: Arc::new(cache),
             jobs: Arc::new(BenchJobManager::new()),
         })
     }
@@ -1209,10 +1219,11 @@ mod tests {
 
         let mut frame = encode_frame(&Message::Request(Request::GetTelemetry))
             .expect("the frame must encode");
+        // The payload begins at the end of the 8-byte header.
         // `Message::Request(GetTelemetry)` serializes to two variant
-        // bytes; the first payload byte (offset 4) at 0xFF is not a
+        // bytes; the first payload byte (offset 8) at 0xFF is not a
         // variant of `Message`, so Bincode rejects the frame.
-        frame[4] = 0xFF;
+        frame[8] = 0xFF;
         let mut conn = Conn::new(client);
         conn.stream.write_all(&frame).await.expect("test write must succeed");
         conn.stream.flush().await.expect("test flush must succeed");
@@ -1225,6 +1236,35 @@ mod tests {
         assert!(
             msg.contains("decode"),
             "the Protocol error must name the decode failure: {msg}"
+        );
+    }
+
+    /// (e2) Protocol violation (DAEMON-1): a frame whose protocol
+    /// version differs from the daemon's is rejected with a
+    /// `VersionMismatch` `RpcError::Protocol` — the connection closes
+    /// loudly (no silent mis-parse of a cross-generation payload).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn version_mismatch_closes_with_protocol_error() {
+        let ctx = mock_ctx();
+        let (client, server) = tokio::net::UnixStream::pair().expect("pair must connect");
+        let task = tokio::spawn(handle_connection(server, Arc::clone(&ctx)));
+
+        let mut frame = encode_frame(&Message::Request(Request::GetTelemetry))
+            .expect("the frame must encode");
+        // Flip the version word (bytes [4..8]) to a foreign generation.
+        frame[4..8].copy_from_slice(&0u32.to_le_bytes());
+        let mut conn = Conn::new(client);
+        conn.stream.write_all(&frame).await.expect("test write must succeed");
+        conn.stream.flush().await.expect("test flush must succeed");
+
+        let result = task.await.expect("handle_connection must join");
+        let RpcError::Protocol(msg) = result.as_ref().expect_err("the mismatched frame must fail the connection")
+        else {
+            panic!("expected a Protocol error, got {result:?}")
+        };
+        assert!(
+            msg.contains("version mismatch"),
+            "the Protocol error must name the version mismatch: {msg}"
         );
     }
 
