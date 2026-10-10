@@ -71,8 +71,7 @@
 //! or the default [`AppState`] draws without panicking (the tests assert
 //! through ratatui's in-memory `TestBackend`).
 
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -81,15 +80,18 @@ use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Tab
 use ratatui::Frame;
 
 use ramsleuth_bench::{BenchOp, BenchmarkGrid, Metric, StreamProgress, Tier};
+use ramsleuth_display::{
+    age_fragment, cell_text, channel_mode, dimm_summary, ecc_label, format_capacity,
+    format_clock, format_elapsed, mclk_derived_speed, na_cell_text, na_section_text, slot_note,
+};
 use ramsleuth_telemetry::amd_readout::{
-    CadBus, ClockReadout, CommandRate, DivMode, EccStatus, MemoryChannelMode, RttValue,
-    TimingSet, VoltageSet,
+    CadBus, ClockReadout, CommandRate, DivMode, MemoryChannelMode, RttValue, TimingSet, VoltageSet,
 };
 use ramsleuth_telemetry::cpuid::{AmdZen, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::intel_readout::{ChannelMode, ChannelTrust};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
-use ramsleuth_telemetry::{SystemMemoryTelemetry, SystemPlatform, VoltageTelemetry};
+use ramsleuth_telemetry::{SystemMemoryTelemetry, VoltageTelemetry};
 
 use crate::graphs::GraphState;
 use crate::probe::ProbeOverlayState;
@@ -139,6 +141,13 @@ pub struct BenchState {
     /// The live burn-in state: a burn-in in flight, the newest tick's
     /// iteration / elapsed, and the newest per-cell values.
     pub burn_in: BurnInState,
+    /// The normal-bench run's start instant (FE-9: the clock lives in
+    /// this state, stamped by the updater when a normal bench is first
+    /// seen in flight — **not** a process-global `static` the render
+    /// pass mutates, so [`render`] stays a pure function of `&AppState`).
+    /// `None` outside a normal-bench run. The burn-in's clock is the
+    /// daemon-sourced [`BurnInState::elapsed_secs`] (FE-1), not this.
+    pub run_started: Option<Instant>,
 }
 
 /// The live burn-in state (the zone-2 burn-in row): a burn-in run in
@@ -150,12 +159,12 @@ pub struct BenchState {
 /// cell wins; a non-finite / non-positive reading never counts). While
 /// a burn-in is in flight the 4×4 table renders `latest` as the live
 /// overlay (the dimmed `…` cells — the module-doc zone-2 rule); the
-/// burn-in row also shows `latest`. The daemon stamps `elapsed_secs`
-/// only at emit (per completed bandwidth cell / per-tier latency pass —
-/// seconds apart on a Full target), so the **displayed** `m:ss` is the
-/// zone-local burn-in start clock ([`burn_in_elapsed`]), which advances
-/// every 250 ms frame; `elapsed_secs` is the pre-first-frame fallback
-/// (BUG 6).
+/// burn-in row also shows `latest`. **`elapsed_secs` is the daemon's
+/// clock (FE-1, the single source):** the daemon streams it on every
+/// per-cell / per-latency tick *and* on a ~1 s elapsed-update tick, so
+/// the displayed `m:ss` reads `elapsed_secs` directly (the same field
+/// the GUI renders — TUI and GUI can never disagree). There is no
+/// zone-local client clock.
 ///
 /// Hand-written `Default` (the GUI `update.rs` precedent): no run,
 /// iteration 0, zero elapsed, and a zero grid — `BenchmarkGrid` derives
@@ -164,13 +173,13 @@ pub struct BenchState {
 pub struct BurnInState {
     /// A burn-in run is in flight.
     pub running: bool,
-    /// The 1-based iteration of the newest tick seen this run (0
-    /// before the first tick).
+    /// The 1-based iteration of the newest **data** tick seen this run
+    /// (0 before the first data tick; the ~1 s elapsed-update ticks do
+    /// not advance it).
     pub iteration: u32,
     /// The run elapsed, in seconds, from the newest daemon tick (0.0
-    /// before the first tick) — the pre-first-frame fallback; the
-    /// displayed value is the zone-local burn-in start clock
-    /// ([`burn_in_elapsed`]).
+    /// before the first tick) — the **displayed** `m:ss` source
+    /// (FE-1: the daemon's clock, streamed on every tick).
     pub elapsed_secs: f64,
     /// The newest per-cell values seen this burn-in.
     pub latest: BenchmarkGrid,
@@ -559,155 +568,26 @@ fn header_line3(state: &AppState) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The binary → decimal capacity conversion factor (1 GiB =
-/// 1.073741824 GB; the GUI `GIB_TO_GB` mirror).
-const GIB_TO_GB: f64 = 1.073741824;
+// The capacity / rank / DIMM-summary / channel-mode / slot-note / ECC /
+// sync-mode / AGESA / MCLK formatters (and the N/A text maps) are the
+// shared `ramsleuth-display` presentation layer (WS-A, C3 single-source) —
+// imported at the top of this file, so the TUI and the GUI can never
+// render the same value + the same `NaReason` differently.
 
-/// One capacity readout (the carried GiB wire value) as display text in
-/// the selected capacity unit (the GUI `format_capacity`/`trim` mirror,
-/// C7-11): the GiB arm keeps the value (`16 GiB`), the GB arm converts
-/// × [`GIB_TO_GB`] (`17.2 GB`); a whole number renders without
-/// decimals, one decimal otherwise; a non-finite value degrades to the
-/// honest `N/A`.
-fn format_capacity(gib: f64, capacity_gib: bool) -> String {
-    if !gib.is_finite() {
-        return "N/A".to_owned();
-    }
-    let trim = |v: f64| {
-        if (v - v.round()).abs() < 0.05 {
-            format!("{v:.0}")
-        } else {
-            format!("{v:.1}")
-        }
-    };
-    if capacity_gib {
-        format!("{} GiB", trim(gib))
-    } else {
-        format!("{} GB", trim(gib * GIB_TO_GB))
-    }
-}
-
-/// The rank word for the header breakdown (the GUI `rank_word` mirror,
-/// C9-01/D-1): `1` → `Single-Rank`, `2` → `Dual-Rank`, `n > 0` →
-/// `<n>-Rank`; a `Na`/`0` rank yields `None` (the word is omitted from
-/// the group, never printed as `N/A`).
-fn rank_word(rank: &Section<u8>) -> Option<String> {
-    match rank {
-        Section::Value(0) | Section::Na(_) => None,
-        Section::Value(1) => Some("Single-Rank".to_owned()),
-        Section::Value(2) => Some("Dual-Rank".to_owned()),
-        Section::Value(other) => Some(format!("{other}-Rank")),
-    }
-}
-
-/// The per-DIMM capacity summary (the GUI `dimm_summary` mirror,
-/// C9-01/D-1): one `<count>x<size>` group per distinct carried
-/// `(size, rank word)` (first-seen order, ` + `-joined, the size in the
-/// selected capacity unit — [`format_capacity`]); the rank word from
-/// the parallel `spd` slice (positionally aligned with `sizes`, the
-/// facade contract) is appended when present (`2x16 GiB Single-Rank`);
-/// a `Na` size contributes nothing; an all-`Na` / empty list degrades
-/// to `N/A`.
-fn dimm_summary(sizes: &[Section<f64>], spd: &[SpdModule], capacity_gib: bool) -> String {
-    let mut groups: Vec<(f64, Option<String>, usize)> = Vec::new();
-    for (slot, cell) in sizes.iter().enumerate() {
-        if let Some(gib) = cell.value() {
-            let rank = spd.get(slot).and_then(|module| rank_word(&module.rank));
-            match groups
-                .iter_mut()
-                .find(|(value, word, _)| (value - gib).abs() < 0.05 && *word == rank)
-            {
-                Some(group) => group.2 += 1,
-                None => groups.push((*gib, rank, 1)),
-            }
-        }
-    }
-    if groups.is_empty() {
-        "N/A".to_owned()
-    } else {
-        groups
-            .iter()
-            .map(|(gib, rank, count)| match rank {
-                Some(word) => format!("{count}x{} {word}", format_capacity(*gib, capacity_gib)),
-                None => format!("{count}x{}", format_capacity(*gib, capacity_gib)),
-            })
-            .collect::<Vec<_>>()
-            .join(" + ")
-    }
-}
-
-/// The channel mode from the SPD-visible DIMM count (the GUI
-/// `channel_mode` mirror, D-C8): 1 / 2 / 4 → Single- / Dual- /
-/// Quad-Channel; any other count (0, odd) degrades to `N/A`.
-///
-/// This is the **fallback** label: the header prefers the hardware
-/// channel mode — the Intel `MAD_INTER_CHANNEL` (an SPD count alone
-/// cannot tell a Flex-Mode box's `Dual-Channel (Flex)` from
-/// `Single-Channel`), else the AMD UMC-synthesized mode; only the
-/// no-readout states use this count-derived label.
-fn channel_mode(dimm_count: usize) -> String {
-    match dimm_count {
-        1 => "Single-Channel".to_owned(),
-        2 => "Dual-Channel".to_owned(),
-        4 => "Quad-Channel".to_owned(),
-        _ => "N/A".to_owned(),
-    }
-}
-
-/// The total-vs-breakdown slot note (the GUI `slot_note` mirror,
-/// C9-01/D-1): the OS total can strictly exceed the SPD-visible sum
-/// when the host installs more DIMMs than the SPD bus binds (the live
-/// host: 4×16 GiB installed, 2 bound). A uniform per-module size whose
-/// quotient `total / u` lands within a tenth of a module of an integer
-/// `n` above the visible count → `<visible> of <n> slots SPD-visible`
-/// (the OS reserves a fraction of the installed capacity, so the
-/// quotient sits just below the integer); any other excess → `SPD sees
-/// <visible> of the installed capacity`. A `Na` / non-finite total, no
-/// visible modules, or `total ≤ sum` → `None` (no false alarm).
-/// Unit-agnostic: counts, not GiB.
-fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String> {
-    let total = total.value().copied().filter(|value| value.is_finite())?;
-    let visible: Vec<f64> = sizes.iter().filter_map(|cell| cell.value().copied()).collect();
-    if visible.is_empty() {
-        return None;
-    }
-    let sum = visible.iter().sum::<f64>();
-    if total <= sum {
-        return None;
-    }
-    let uniform = visible.iter().all(|value| (value - visible[0]).abs() < 0.05);
-    if uniform {
-        let unit = visible[0];
-        if unit > 0.0 {
-            let quotient = total / unit;
-            let slots = quotient.round();
-            if (quotient - slots).abs() <= 0.1 && slots > visible.len() as f64 {
-                return Some(format!("{} of {slots:.0} slots SPD-visible", visible.len()));
-            }
-        }
-    }
-    Some(format!("SPD sees {} of the installed capacity", visible.len()))
-}
-
-/// Line 3's mode segment over one clock readout (the GUI
-/// `sync_mode_from_clocks` mirror, D-C8): the UCLK:MCLK ratio + its
-/// semantic color — AMBER for `Synchronous 1:1` (with the MCLK in the
-/// selected clock unit when it carries one — [`format_clock`]),
-/// CRIMSON for `Asynchronous 1:2`, and DIM for the honest `N/A`.
+/// Line 3's mode segment over one clock readout (D-C8): the UCLK:MCLK
+/// ratio **text** comes from the shared `ramsleuth-display`
+/// (the single source the GUI renders too); the semantic color is
+/// TUI-local — AMBER for `Synchronous 1:1` (with the MCLK in the
+/// selected clock unit when it carries one), CRIMSON for
+/// `Asynchronous 1:2`, and DIM for the honest `N/A`.
 fn sync_mode_from_clocks(clocks: &ClockReadout, clock_mhz: bool) -> (String, Color) {
-    match clocks.div_mode.value() {
-        Some(DivMode::OneToOne) => {
-            let text = match clocks.mclk_mhz.value() {
-                Some(mhz) => {
-                    format!("Synchronous 1:1 (UCLK = MCLK = {})", format_clock(*mhz, clock_mhz))
-                }
-                None => "Synchronous 1:1".to_owned(),
-            };
-            (text, AMBER)
-        }
-        Some(DivMode::OneToTwo) => ("Asynchronous 1:2".to_owned(), CRIMSON),
-        None => ("N/A".to_owned(), DIM),
-    }
+    let text = ramsleuth_display::sync_mode_from_clocks(clocks, clock_mhz);
+    let color = match clocks.div_mode.value() {
+        Some(DivMode::OneToOne) => AMBER,
+        Some(DivMode::OneToTwo) => CRIMSON,
+        None => DIM,
+    };
+    (text, color)
 }
 
 /// Line 3's mode segment over a whole snapshot (the GUI `sync_mode`
@@ -722,32 +602,24 @@ fn sync_mode(t: &SystemMemoryTelemetry, clock_mhz: bool) -> (String, Color) {
 }
 
 /// Line 3's mode segment over an Intel readout (the trust-resolved
-/// `channel_mode`): `DualSymmetric` → `Interleaved` (CYAN, the default),
-/// `DualFlex` → `Flex` (AMBER, the asymmetric configuration worth
-/// flagging), `Single` → `N/A` (DIM — a single channel has no interleave
-/// mode; the channel slot carries `Single-Channel`). The Chunk 2 trust
-/// badge rides the label: the L3 override / L4 heuristic (unverified)
-/// tiers append `(unverified)` and render AMBER; the L2 firmware-verified
-/// tier appends `(firmware)`. A non-Intel / no-mode readout yields
-/// `None` and the caller falls back to the honest `N/A` (DIM).
+/// `channel_mode`): the label **text** (the mode + the Chunk 2 trust
+/// badge — `(unverified)` for the L3 override / L4 heuristic tiers,
+/// `(firmware)` for the L2 verified tier) comes from the shared
+/// `ramsleuth-display` (the single source the GUI renders too); the
+/// semantic color is TUI-local — `DualSymmetric` → `Interleaved` (CYAN,
+/// the default), `DualFlex` → `Flex` (AMBER), `Single` → `N/A` (DIM), and
+/// the unverified trust tier forces AMBER. A non-Intel / no-mode readout
+/// yields `None` and the caller falls back to the AMD sync mode.
 fn intel_mode(t: &SystemMemoryTelemetry) -> Option<(String, Color)> {
     let ro = t.intel.value()?;
     let mode = ro.channel_mode?;
-    let (mut label, color) = match mode {
-        ChannelMode::DualSymmetric => (mode.mode_label().to_owned(), CYAN),
-        ChannelMode::DualFlex => (mode.mode_label().to_owned(), AMBER),
-        ChannelMode::Single => (mode.mode_label().to_owned(), DIM),
+    let label = ramsleuth_display::intel_mode_text(t)?;
+    let color = match (mode, ro.channel_trust) {
+        (_, Some(ChannelTrust::Override) | Some(ChannelTrust::Heuristic)) => AMBER,
+        (ChannelMode::DualFlex, _) => AMBER,
+        (ChannelMode::Single, _) => DIM,
+        (ChannelMode::DualSymmetric, _) => CYAN,
     };
-    match ro.channel_trust {
-        Some(ChannelTrust::Override) | Some(ChannelTrust::Heuristic) => {
-            label.push_str(" (unverified)");
-            return Some((label, AMBER));
-        }
-        Some(ChannelTrust::VerifiedFirmware) => {
-            label.push_str(" (firmware)");
-        }
-        _ => {}
-    }
     Some((label, color))
 }
 
@@ -812,47 +684,6 @@ fn ram_line3_parts(
     // (and the honest `N/A`) fill it otherwise.
     let mode = intel_mode(t).unwrap_or_else(|| sync_mode(t, clock_mhz));
     (total, summary, speed, channel, note, mode)
-}
-
-/// The summary-line speed fallback when no bound SPD module carries a
-/// speed: the platform's derived MT/s = MCLK × 2 (the DDR
-/// double-pumping rule — the probe renderer's `derived_mts` idiom),
-/// from the AMD readout's MCLK, else the max Intel channel MCLK
-/// (`None` when no channel carries one). `None` overall when neither
-/// branch yields an MCLK (the segment is omitted — the pre-fallback
-/// behavior).
-fn mclk_derived_speed(t: &SystemMemoryTelemetry) -> Option<String> {
-    let mclk = match t.amd.value() {
-        Some(readout) => readout.clocks.mclk_mhz.value().copied(),
-        None => t
-            .intel
-            .value()
-            .and_then(|readout| {
-                readout
-                    .channels
-                    .iter()
-                    .filter_map(|c| c.clocks.mclk_mhz.value().copied())
-                    .reduce(|a, b| if b > a { b } else { a })
-            }),
-    }?;
-    Some(format!("{:.0} MT/s", mclk * 2.0))
-}
-
-/// Line 3's ECC segment (the GUI `ecc_label` mirror): the platform
-/// ECC status (the readouts are mutually exclusive per platform,
-/// Intel probed first) as display text — the enum label, the honest
-/// `N/A` for the unreadable / absent state.
-fn ecc_label(t: &SystemMemoryTelemetry) -> String {
-    match t
-        .intel
-        .value()
-        .map(|ro| ro.ecc_status)
-        .or_else(|| t.amd.value().map(|ro| ro.ecc_status))
-        .unwrap_or(EccStatus::Unknown)
-    {
-        EccStatus::Unknown => "N/A".to_owned(),
-        s => s.label().to_owned(),
-    }
 }
 
 /// Line 3's non-mode part (the GUI `ram_line_prefix` mirror, C6-20/
@@ -927,54 +758,6 @@ fn key_legend(budget: usize) -> String {
         text = candidate;
     }
     text
-}
-
-/// One clock readout (the carried MHz wire value) as display text in
-/// the selected clock unit (the GUI `format_clock`/`trim` mirror,
-/// C7-11): the MHz arm keeps the value (`3500 MHz`), the GHz arm ÷1000
-/// (`3.5 GHz`); a whole number renders without decimals, one decimal
-/// otherwise; a non-finite value degrades to the honest `N/A`.
-fn format_clock(mhz: f64, clock_mhz: bool) -> String {
-    if !mhz.is_finite() {
-        return "N/A".to_owned();
-    }
-    let trim = |v: f64| {
-        if (v - v.round()).abs() < 0.05 {
-            format!("{v:.0}")
-        } else {
-            format!("{v:.1}")
-        }
-    };
-    if clock_mhz {
-        format!("{} MHz", trim(mhz))
-    } else {
-        format!("{} GHz", trim(mhz / 1000.0))
-    }
-}
-
-/// One `Section<String>` cell as display text (the header's honest
-/// degradation rule): the contained value, or `N/A`.
-fn cell_text(cell: &Section<String>) -> String {
-    match cell {
-        Section::Value(v) => v.clone(),
-        Section::Na(_) => "N/A".to_owned(),
-    }
-}
-
-/// Line 2's AGESA/SMU provenance fragment (the GUI `age_fragment`
-/// mirror, C8-11/D-1): the header labels the value by where it came
-/// from — a true AGESA token (the DMI BIOS string scan) renders
-/// `AGESA <v>` and suppresses the SMU value (the D-1 precedence); else
-/// a shape-checked `ryzen_smu` firmware version renders under its own
-/// `SMU` label (never the reported `AGESA <smu value>` mislabel); else
-/// the honest `AGESA N/A`. One value, one true label — no hybrid, never
-/// fabricated.
-fn age_fragment(platform: &SystemPlatform) -> String {
-    match (&platform.agesa, &platform.smu_version) {
-        (Section::Value(v), _) => format!("AGESA {v}"),
-        (Section::Na(_), Section::Value(v)) => format!("SMU {v}"),
-        (Section::Na(_), Section::Na(_)) => "AGESA N/A".to_owned(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1566,15 +1349,6 @@ fn status_state(
     }
 }
 
-/// One run's elapsed in the status line's `m:ss` form (the GUI
-/// `format_elapsed` mirror — the plan's `0:42`): the minutes un-padded,
-/// the seconds two-digit; a non-finite / non-positive reading renders
-/// `0:00` (a bad elapsed never panics the line, the no-panic contract).
-fn format_elapsed(secs: f64) -> String {
-    let total = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
-    format!("{}:{:02}", total / 60, total % 60)
-}
-
 /// The flat status line's text (the GUI `status_text` mirror):
 /// `Status: Idle`, `Status: Running… <m:ss>` (a normal bench — the `…`
 /// kept static, the repaint animates the elapsed), `Status: Running…
@@ -1609,96 +1383,25 @@ fn status_color(state: StatusState) -> Color {
     }
 }
 
-/// The zone-local start clock for a normal bench run (the GUI
-/// `bench_zone` C7-17 precedent): the moment the zone first saw a normal
-/// bench in flight (a repaint within one frame of the run's start). Both
-/// run kinds now keep a zone-local start clock: the normal bench's is
-/// stamped `now` on its first in-flight frame; the burn-in's
-/// ([`BURN_IN_RUN_START`]) is backdated from the newest tick's
-/// `elapsed_secs` on its first frame and is the **display source** for
-/// the burn-in's `m:ss` (the daemon stamps `elapsed_secs` only at emit,
-/// seconds apart on a Full target, so a `now` stamp would reset the
-/// visible elapsed to `0:00` — BUG 6). Stamped on the first in-flight
-/// frame, cleared on the terminal; a poisoned lock is recovered in
-/// place (the render thread is the sole user — the no-panic contract).
-static NORMAL_RUN_START: Mutex<Option<Instant>> = Mutex::new(None);
-
-/// Stamp / clear the zone-local normal-run start clock for this frame's
-/// run state, returning the start instant while a normal bench is in
-/// flight (`None` outside one — the terminal cleared it).
-fn track_run_start(running: bool) -> Option<Instant> {
-    let mut guard = NORMAL_RUN_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if running {
-        Some(*guard.get_or_insert_with(Instant::now))
-    } else {
-        *guard = None;
-        None
-    }
-}
-
-/// The zone-local start clock for a burn-in run: the moment the zone
-/// first saw a burn-in in flight. Verbatim mirror of
-/// [`NORMAL_RUN_START`] / [`track_run_start`] (the render thread is the
-/// sole user — a poisoned lock is recovered in place, the no-panic
-/// contract). The **backdating** (stamping the first frame from the
-/// newest tick's `elapsed_secs` so the displayed `m:ss` continues
-/// smoothly from the daemon's) lives in [`burn_in_elapsed`], not here.
-static BURN_IN_RUN_START: Mutex<Option<Instant>> = Mutex::new(None);
-
-/// Stamp / clear the zone-local burn-in start clock for this frame's run
-/// state, returning the start instant while a burn-in is in flight
-/// (`None` outside one — the terminal cleared it). Verbatim mirror of
-/// [`track_run_start`].
-fn track_burn_in_start(running: bool) -> Option<Instant> {
-    let mut guard = BURN_IN_RUN_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if running {
-        Some(*guard.get_or_insert_with(Instant::now))
-    } else {
-        *guard = None;
-        None
-    }
-}
-
-/// The displayed burn-in elapsed (the **single source** for the status
-/// line + the burn-in row, so the two can never disagree): the live
-/// zone-local clock while a burn-in is in flight (advancing every 250 ms
-/// frame, independent of the daemon's per-cell / per-latency-pass tick
-/// cadence — BUG 6). On the first in-flight frame the clock is backdated
-/// from the newest tick's `elapsed_secs` so the value continues smoothly
-/// from the daemon's (the pre-first-frame fallback); a burn-in not in
-/// flight falls back to `elapsed_secs` too.
-fn burn_in_elapsed(burn_in: &BurnInState) -> f64 {
-    // First in-flight frame: backdate the clock from the daemon's latest
-    // elapsed so the client clock continues from it (the pre-first-frame
-    // fallback). A poisoned lock is recovered in place (no-panic).
-    {
-        let mut guard = BURN_IN_RUN_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if burn_in.running && guard.is_none() {
-            *guard = Some(
-                Instant::now() - Duration::from_secs_f64(burn_in.elapsed_secs.max(0.0)),
-            );
-        }
-    }
-    track_burn_in_start(burn_in.running)
-        .map_or(burn_in.elapsed_secs, |start| start.elapsed().as_secs_f64())
-}
-
 /// The bench zone's flat status line (the GUI C7-17 mirror): a single
 /// text line below the grid — `Status: Idle` dim, `Status: Running…
-/// <m:ss>` CYAN (a normal bench — elapsed from the zone's start clock),
-/// `Status: Running… (burn-in <m:ss>, iter <n>)` CYAN (a burn-in —
-/// elapsed from the zone's burn-in start clock, the live display source,
+/// <m:ss>` CYAN (a normal bench — elapsed from the run's start instant
+/// held in [`BenchState::run_started`]), `Status: Running… (burn-in
+/// <m:ss>, iter <n>)` CYAN (a burn-in — elapsed from the
+/// **daemon-sourced** [`BurnInState::elapsed_secs`], the single source,
 /// + the newest tick's iteration), `Status: Done` in the zone-local
-/// green.
+/// green. The render reads only `&BenchState` — no process-global
+/// `static` is mutated here (FE-9: the clock lives in the state).
 fn bench_status(bench: &BenchState) -> (String, Color) {
     let burn_in = &bench.burn_in;
     let running_elapsed = if burn_in.running {
-        // The live zone-local clock (BUG 6 — advances every frame, not
-        // frozen between the daemon's per-cell / per-latency-pass
-        // ticks); `elapsed_secs` is only the pre-first-frame fallback.
-        burn_in_elapsed(burn_in)
+        // The daemon's clock (FE-1): streamed on every tick, so the
+        // `m:ss` advances smoothly — no zone-local client clock.
+        burn_in.elapsed_secs
     } else {
-        track_run_start(bench.running).map_or(0.0, |start| start.elapsed().as_secs_f64())
+        // A normal bench's clock is the run's start instant held in the
+        // state (FE-9) — stamped by the updater, read here (pure).
+        bench.run_started.map_or(0.0, |start| start.elapsed().as_secs_f64())
     };
     let state = status_state(
         bench.running,
@@ -1785,7 +1488,7 @@ fn burn_in_row_text(burn_in: &BurnInState) -> Option<String> {
     Some(format!(
         "Burn-in: iteration {} · {} elapsed · Memory Read {} · {}",
         burn_in.iteration,
-        format_elapsed(burn_in_elapsed(burn_in)),
+        format_elapsed(burn_in.elapsed_secs),
         read,
         latency
     ))
@@ -1809,7 +1512,7 @@ fn burn_in_row_line(burn_in: &BurnInState) -> Option<Line<'static>> {
             format!(
                 "Burn-in: iteration {} · {} elapsed · Memory Read ",
                 burn_in.iteration,
-                format_elapsed(burn_in_elapsed(burn_in))
+                format_elapsed(burn_in.elapsed_secs)
             ),
             Style::default().fg(DIM),
         ),
@@ -1972,15 +1675,15 @@ fn spd_profile_item(is_ddr5: bool, profile: &SpdProfile) -> ListItem<'static> {
     let scheme = if is_ddr5 { "EXPO" } else { "XMP" };
     let speed = match &profile.speed_mts {
         Section::Value(v) => fmt_mts(v),
-        Section::Na(reason) => na_text(reason),
+        Section::Na(reason) => na_cell_text(reason),
     };
     let tick = |s: &Section<u8>| match s {
         Section::Value(v) => v.to_string(),
-        Section::Na(reason) => na_text(reason),
+        Section::Na(reason) => na_cell_text(reason),
     };
     let voltage = match &profile.voltage {
         Section::Value(v) => fmt_volts(v),
-        Section::Na(reason) => na_text(reason),
+        Section::Na(reason) => na_cell_text(reason),
     };
     text_item(
         &format!(
@@ -2004,7 +1707,7 @@ fn spd_profile_item(is_ddr5: bool, profile: &SpdProfile) -> ListItem<'static> {
 /// the raw reason stays on the wire). Never a panic.
 fn dram_die_line(module: &SpdModule) -> String {
     match &module.die_maker {
-        Section::Na(reason) => na_text(reason),
+        Section::Na(reason) => na_cell_text(reason),
         Section::Value(die_maker) => {
             let mut parts = Vec::new();
             if let Section::Value(die_type) = &module.die_type {
@@ -2051,7 +1754,7 @@ fn row(key: &str, value: &str, color: Color) -> ListItem<'static> {
 fn cell_row<T>(key: &str, section: &Section<T>, color: Color, fmt: impl Fn(&T) -> String) -> ListItem<'static> {
     match section {
         Section::Value(value) => row(key, &fmt(value), color),
-        Section::Na(reason) => row(key, &na_text(reason), NA_GRAY),
+        Section::Na(reason) => row(key, &na_cell_text(reason), NA_GRAY),
     }
 }
 
@@ -2151,11 +1854,14 @@ fn na_item(text: &str) -> ListItem<'static> {
 }
 
 /// A section that degraded whole: one grey, self-explanatory
-/// `<section>: <na_text>` reason line (the N100-class
-/// `Intel: N/A (unsupported CPU)` form — muted, never an error
-/// color).
+/// `<section>: <na_section_text>` reason line (the N100-class
+/// `Intel: No data — …` form — muted, never an error color). The
+/// section-level N/A text is the shared `ramsleuth-display`
+/// [`na_section_text`] (FE-6): the verbose, self-explanatory form the
+/// GUI renders too, so the same [`NaReason`] reads the same in both
+/// frontends (width-wrapped here by the terminal).
 fn section_na(section: &str, reason: &NaReason) -> ListItem<'static> {
-    text_item(&format!("{section}: {}", na_text(reason)), NA_GRAY)
+    text_item(&format!("{section}: {}", na_section_text(reason)), NA_GRAY)
 }
 
 /// The zone-3 no-SPD note (the daemon serves no `ee1004` device):
@@ -2168,29 +1874,12 @@ fn no_spd_item() -> ListItem<'static> {
     text_item("No SPD (ee1004 not loaded)", NA_GRAY)
 }
 
-/// The human text of an N/A cell: the terse, user-friendly reason
-/// tag (the GUI per-cell mirror's form) — `N/A (unsupported CPU)`
-/// (the N100 class — the part exposes no memory-controller
-/// registers; expected, not a fault), `N/A (new PM table)` (the
-/// memory-firmware version is out of the supported set — the
-/// connected daemon line is the driver-is-up indicator),
-/// `N/A (decode failed)` (the raw [`NaReason::ParseError`] detail
-/// stays on the wire), `N/A (driver missing)`,
-/// `N/A (insufficient privilege)` — and the structurally
-/// not-applicable cell's one bare `N/A` (the noise-free form in the
-/// dense zone-1 / zone-3 panels; the tags are zone-width-budgeted —
-/// the full sentences live in the GUI). [`NaReason`] carries no
-/// `Display`; this is the TUI's own display mapping.
-fn na_text(reason: &NaReason) -> String {
-    match reason {
-        NaReason::UnsupportedHardware => "N/A (unsupported CPU)".to_owned(),
-        NaReason::DriverMissing => "N/A (driver missing)".to_owned(),
-        NaReason::InsufficientPrivilege => "N/A (insufficient privilege)".to_owned(),
-        NaReason::UnknownPmTableVersion => "N/A (new PM table)".to_owned(),
-        NaReason::NotApplicable => "N/A".to_owned(),
-        NaReason::ParseError(_) => "N/A (decode failed)".to_owned(),
-    }
-}
+// The per-cell N/A text is the shared `ramsleuth-display` [`na_cell_text`]
+// (imported at the top): the terse reason tag — `N/A (unsupported CPU)`,
+// `N/A (driver missing)`, `N/A (insufficient privilege)`,
+// `N/A (new PM table)`, `N/A (decode failed)` — and the bare `N/A` for a
+// structurally not-applicable cell. One implementation, shared with the
+// GUI (C3).
 
 /// The display name of a grid tier row (`Mem` — the AIDA64 grid
 /// convention, which also fits the column budget).
@@ -2429,27 +2118,6 @@ mod tests {
             .map(|line| line.trim_end().to_owned())
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    // -----------------------------------------------------------------
-    // The zone-local burn-in clock (BUG 6) test helpers.
-    //
-    // Rust runs a module's tests in parallel on shared process statics;
-    // `BURN_IN_RUN_START` is one of them, so the value-asserting tests
-    // must serialize on this lock (each sets / inspects the clock).
-    // -----------------------------------------------------------------
-    static TEST_BURN_CLOCK_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Set the zone-local burn-in clock to `secs_ago` seconds in the
-    /// past (standing in for a burn-in that has been running that long).
-    fn set_burn_in_clock(secs_ago: f64) {
-        *super::BURN_IN_RUN_START.lock().unwrap() =
-            Some(Instant::now() - Duration::from_secs_f64(secs_ago));
-    }
-
-    /// Clear the zone-local burn-in clock (the pre-first-frame state).
-    fn clear_burn_in_clock() {
-        *super::BURN_IN_RUN_START.lock().unwrap() = None;
     }
 
     /// A representative AMD readout: `Value` cells across all four sets
@@ -2819,14 +2487,16 @@ mod tests {
 
     /// (e2) The N100 class (an Intel host whose detected generation is
     /// unrecognized — both vendor branches `Na(UnsupportedHardware)`):
-    /// the Intel section's whole-branch row carries the terse,
-    /// user-friendly reason tag (the part exposes no
-    /// memory-controller registers — expected, not a fault), the AMD
-    /// section's mirror row is skipped (the Intel host hides it), and
-    /// the daemon line stays the connected-UP indicator (the N/A is
-    /// about data availability, not the daemon being down).
+    /// the Intel section's whole-branch row carries the **verbose,
+    /// self-explanatory** section note (FE-6: the shared
+    /// `ramsleuth-display` `na_section_text` — the same meaning the GUI
+    /// renders, so the two frontends agree), width-wrapped in the
+    /// zone-1 column; the AMD section's mirror row is skipped (the
+    /// Intel host hides it), and the daemon line stays the
+    /// connected-UP indicator (the N/A is about data availability, not
+    /// the daemon being down).
     #[test]
-    fn unsupported_hardware_renders_the_terse_reason_tag() {
+    fn unsupported_hardware_renders_the_verbose_section_note() {
         let state = AppState {
             telemetry: Some(SystemMemoryTelemetry {
                 cpu: CpuInfo {
@@ -2856,24 +2526,23 @@ mod tests {
         // budget behavior).
         let text = draw_at(&state, 200, 30);
 
-        // The Intel section row carries the terse reason tag (muted).
-        assert!(text.contains("Intel: N/A (unsupported CPU)"), "{text}");
+        // The Intel section row carries the verbose section note (muted)
+        // — the `na_section_text` form (FE-6).
+        assert!(text.contains("Intel: No data —"), "{text}");
         // The AMD section's mirror row is skipped on an Intel host.
-        assert!(!text.contains("AMD: N/A (unsupported CPU)"), "{text}");
+        assert!(!text.contains("AMD: No data —"), "{text}");
         // The empty-SPD note is the self-explanatory ee1004 tag.
         assert!(text.contains("No SPD (ee1004 not loaded)"), "{text}");
         // The daemon line stays the connected-UP indicator.
         assert!(text.contains("daemon: connected"), "{text}");
-        // No bare "Intel: N/A" row survives (the whole-branch row is
-        // self-explanatory).
-        assert!(!text.contains("Intel: N/A\n"), "{text}");
     }
 
     /// (e3) The `Na(UnknownPmTableVersion)` branch (the memory-firmware
     /// version is outside the supported set — the driver is loaded and
-    /// working) renders its own terse reason tag on the section row.
+    /// working) renders its own **verbose** section note (FE-6: the
+    /// shared `na_section_text`) on the section row.
     #[test]
-    fn unknown_pm_table_renders_the_terse_reason_tag() {
+    fn unknown_pm_table_renders_the_verbose_section_note() {
         let state = AppState {
             telemetry: Some(SystemMemoryTelemetry {
                 cpu: CpuInfo {
@@ -2901,10 +2570,10 @@ mod tests {
         // 200 cols: the zone-1 left column carries the full section row.
         let text = draw_at(&state, 200, 30);
 
-        // The AMD section row carries the terse reason tag.
-        assert!(text.contains("AMD: N/A (new PM table)"), "{text}");
+        // The AMD section row carries the verbose section note (FE-6).
+        assert!(text.contains("AMD: No data —"), "{text}");
         // The Intel section's mirror row is skipped on an AMD host.
-        assert!(!text.contains("Intel: N/A"), "{text}");
+        assert!(!text.contains("Intel: No data —"), "{text}");
     }
 
     /// (f) The 3-line header — line 1 the title + platform tag + daemon
@@ -3182,16 +2851,28 @@ mod tests {
         assert_eq!(format_capacity(f64::INFINITY, false), "N/A");
     }
 
-    /// (m) `rank_word` (the GUI C9-01/D-1 mirror): `1` → Single-Rank,
-    /// `2` → Dual-Rank, `n > 0` → `<n>-Rank`; a `Na`/`0` rank yields
-    /// `None` (the word is omitted, never `N/A`).
+    /// (m) `rank_word` (the shared `ramsleuth-display` form, C9-01/D-1):
+    /// `1` → Single-Rank, `2` → Dual-Rank, `n > 0` → `<n>-Rank`; a
+    /// `Na`/`0` rank yields `None` (the word is omitted, never `N/A`).
     #[test]
     fn rank_word_arms() {
-        assert_eq!(rank_word(&Section::Value(1)), Some("Single-Rank".to_owned()));
-        assert_eq!(rank_word(&Section::Value(2)), Some("Dual-Rank".to_owned()));
-        assert_eq!(rank_word(&Section::Value(4)), Some("4-Rank".to_owned()));
-        assert_eq!(rank_word(&Section::Value(0)), None);
-        assert_eq!(rank_word(&Section::na(NaReason::NotApplicable)), None);
+        assert_eq!(
+            ramsleuth_display::rank_word(&Section::Value(1)),
+            Some("Single-Rank".to_owned())
+        );
+        assert_eq!(
+            ramsleuth_display::rank_word(&Section::Value(2)),
+            Some("Dual-Rank".to_owned())
+        );
+        assert_eq!(
+            ramsleuth_display::rank_word(&Section::Value(4)),
+            Some("4-Rank".to_owned())
+        );
+        assert_eq!(ramsleuth_display::rank_word(&Section::Value(0)), None);
+        assert_eq!(
+            ramsleuth_display::rank_word(&Section::na(NaReason::NotApplicable)),
+            None
+        );
     }
 
     /// (n) `dimm_summary`: distinct-size grouping in the selected
@@ -4736,11 +4417,9 @@ mod tests {
     /// wire) or a non-finite reading reads `N/A`.
     #[test]
     fn burn_in_row_text_and_na_cells() {
-        let _lock = TEST_BURN_CLOCK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // A burn-in in flight with measured headline cells: the exact
-        // GUI form. The displayed `1:30` is the client clock (BUG 6) —
-        // stood in here by backdating it 90 s (matching the tick).
-        set_burn_in_clock(90.0);
+        // GUI form. The displayed `1:30` is the daemon's `elapsed_secs`
+        // (FE-1: the single source — no client clock).
         let burn = BurnInState {
             running: true,
             iteration: 2,
@@ -4764,7 +4443,6 @@ mod tests {
 
         // A fresh tick (no `latest` cells yet): both headline cells
         // read N/A — the row is present (the burn-in is in flight).
-        set_burn_in_clock(5.0);
         let fresh = BurnInState {
             running: true,
             iteration: 1,
@@ -4778,7 +4456,6 @@ mod tests {
 
         // A non-finite reading degrades to N/A too (the plain cell
         // form's guard).
-        set_burn_in_clock(0.0);
         let broken = BurnInState {
             running: true,
             latest: BenchmarkGrid {
@@ -4821,23 +4498,23 @@ mod tests {
         assert!(!text.contains("Burn-in:"), "{text}");
     }
 
-    /// (bi) BUG 6 — the burn-in's displayed `m:ss` is the zone-local
-    /// client clock (advancing every frame), not the daemon's per-tick
-    /// `elapsed_secs` (frozen between ticks). Stand in for a burn-in
-    /// that has been running 30 s (the newest tick only says 7 s),
-    /// render the dashboard, and assert both the status line and the
-    /// burn-in row show `0:30` (the `m:ss` form gives a ≥400 ms
-    /// tolerance window — no flake).
+    /// (bi) FE-1 — the burn-in's displayed `m:ss` is the **daemon's**
+    /// `elapsed_secs` (the single source the GUI renders too), not a
+    /// client-side clock. Stand in for a burn-in the daemon reports as
+    /// 30 s elapsed, render the dashboard, and assert both the status
+    /// line and the burn-in row show `0:30` (read straight from
+    /// `elapsed_secs`). Pre-fix this failed: the TUI fabricated a
+    /// zone-local client clock (the `BURN_IN_RUN_START` static) that
+    /// backdated from the newest tick and advanced every frame — it
+    /// could diverge from the daemon's value (and from the GUI).
     #[test]
-    fn burn_in_row_uses_the_client_clock() {
-        let _lock = TEST_BURN_CLOCK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        set_burn_in_clock(30.0);
+    fn burn_in_row_uses_the_daemon_elapsed() {
         let state = AppState {
             bench: BenchState {
                 burn_in: BurnInState {
                     running: true,
                     iteration: 3,
-                    elapsed_secs: 7.0,
+                    elapsed_secs: 30.0,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4849,53 +4526,61 @@ mod tests {
         let text = draw_at(&state, 200, 30);
         assert!(
             text.contains("Status: Running… (burn-in 0:30, iter 3)"),
-            "the status line must show the client clock's 0:30, not the tick's 0:07:\n{text}"
+            "the status line must show the daemon's 0:30 (elapsed_secs):\n{text}"
         );
         assert!(
             text.contains("Burn-in: iteration 3 · 0:30 elapsed"),
-            "the burn-in row must show the same client-clock 0:30:\n{text}"
+            "the burn-in row must show the same daemon-sourced 0:30:\n{text}"
         );
     }
 
-    /// (bj) BUG 6 — the pre-first-frame fallback: before the client
-    /// clock is stamped, the displayed elapsed is the daemon's newest
-    /// tick's `elapsed_secs` (the clock is backdated from it on the
-    /// first frame, so the value continues smoothly from the daemon's).
+    /// TC-FE9 (the FE-9 confirming test): the frame render is a **pure
+    /// function of `&AppState`** — rendering the same state twice yields
+    /// identical output. Pre-fix this failed: the render pass stamped
+    /// the process-global `BURN_IN_RUN_START` / `NORMAL_RUN_START`
+    /// clock `static`s (mutating global state during render), so the
+    /// second render's `m:ss` differed from the first. With the client
+    /// clocks deleted (FE-1) and the normal-bench clock moved into
+    /// `BenchState.run_started` (stamped by the *updater*, never the
+    /// render), the render touches no global.
     #[test]
-    fn burn_in_elapsed_falls_back_to_the_tick_before_first_frame() {
-        let _lock = TEST_BURN_CLOCK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_burn_in_clock();
-        let burn_in = BurnInState {
-            running: true,
-            elapsed_secs: 7.0,
+    fn tc_fe9_render_is_pure_over_app_state() {
+        // A normal bench in flight: the clock is `run_started` (in
+        // state), read by the render. Two renders a few µs apart both
+        // format to the same `m:ss` (1 s granularity) → identical.
+        let normal = AppState {
+            bench: BenchState {
+                running: true,
+                run_started: Some(Instant::now() - std::time::Duration::from_secs(42)),
+                ..Default::default()
+            },
             ..Default::default()
         };
-        let elapsed = burn_in_elapsed(&burn_in);
-        assert!(
-            (elapsed - 7.0).abs() < 0.1,
-            "the pre-first-frame value is the daemon's 7.0 s (got {elapsed})"
+        assert_eq!(
+            draw_at(&normal, 200, 30),
+            draw_at(&normal, 200, 30),
+            "rendering the same normal-bench state twice must be identical"
         );
-    }
 
-    /// (bk) BUG 6 — the client clock clears on the terminal: after a
-    /// burn-in ends (`running = false`), the clock is `None`, and the
-    /// next burn-in re-stamps fresh (no stale clock from a previous
-    /// run).
-    #[test]
-    fn burn_in_clock_clears_on_terminal() {
-        let _lock = TEST_BURN_CLOCK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_burn_in_clock();
-        // The first in-flight frame stamps the clock.
-        assert!(track_burn_in_start(true).is_some(), "the first frame stamps the clock");
-        // The terminal clears it.
-        assert!(track_burn_in_start(false).is_none(), "the terminal clears the clock");
-        assert!(
-            super::BURN_IN_RUN_START.lock().unwrap().is_none(),
-            "the clock is None after the terminal"
+        // A burn-in in flight: the clock is the daemon-sourced
+        // `elapsed_secs` (in state) — equally pure.
+        let burn = AppState {
+            bench: BenchState {
+                burn_in: BurnInState {
+                    running: true,
+                    iteration: 3,
+                    elapsed_secs: 125.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            draw_at(&burn, 200, 30),
+            draw_at(&burn, 200, 30),
+            "rendering the same burn-in state twice must be identical"
         );
-        // The next run re-stamps fresh (not the stale previous clock).
-        assert!(track_burn_in_start(true).is_some(), "the next run re-stamps a fresh clock");
-        clear_burn_in_clock();
     }
 
     /// (ai) Clipping at a small height (TUI-14 — the zone-2
@@ -4908,11 +4593,6 @@ mod tests {
     /// four zone-2 lines render with the full 5-row grid.
     #[test]
     fn zone2_clips_at_small_height() {
-        let _lock = TEST_BURN_CLOCK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // The displayed `1:30` is the client clock (BUG 6) — stood in
-        // here by backdating it 90 s (matching the tick's
-        // `elapsed_secs`).
-        set_burn_in_clock(90.0);
         // An in-flight burn-in (the full zone-2 content: the live
         // grid + the status line + the controls line + the burn-in
         // row) on shrinking surfaces (inner = total - 3 header - 2

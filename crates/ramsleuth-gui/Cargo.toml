@@ -69,5 +69,9 @@ serde = { workspace = true }
 serde_json = "1"
 ramsleuth-bench = { path = "../ramsleuth-bench" }
 ramsleuth-client = { path = "../ramsleuth-client" }
+# WS-A (C3 single-source): the shared presentation layer — the formatters,
+# the N/A text maps, and the CPU-temp scan the zones render through, so the
+# GUI and the TUI can never diverge on the same value / reason.
+ramsleuth-display = { path = "../ramsleuth-display" }
 ramsleuth-protocol = { path = "../ramsleuth-protocol" }
 ramsleuth-telemetry = { path = "../ramsleuth-telemetry" }

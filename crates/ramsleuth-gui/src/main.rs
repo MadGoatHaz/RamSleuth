@@ -129,6 +129,12 @@ use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// WS-A (C3 single-source): the shared presentation layer — the atomic
+// formatters the header lines render through (the same ones the TUI
+// uses, so the two frontends can never diverge on the same value).
+use ramsleuth_display::{
+    age_fragment, cell_text, channel_mode, ecc_label, mclk_derived_speed, slot_note,
+};
 use ramsleuth_gui::{
     build_style, diagnose, export_json,
     first_run::{
@@ -136,17 +142,18 @@ use ramsleuth_gui::{
         setup_with_dkms, SetupOutcome,
     },
     format_capacity, format_clock, render_bench_zone, render_graphs_window, render_settings_panel,
-    render_status_zone, render_telemetry_zone, snapshot_png, spawn_poller, BenchCmd, GuiAction,
-    GuiError, GuiSettings, ProbeResult, TelemetryData, Units, AMBER, CRIMSON, CYAN, SLATE,
+    render_status_zone, render_telemetry_zone, snapshot_png, spawn_poller, BenchCmd, CapacityUnit,
+    ClockUnit, GuiAction, GuiError, GuiSettings, ProbeResult, TelemetryData, Units, AMBER, CRIMSON,
+    CYAN, SLATE,
 };
 use ramsleuth_protocol::DEFAULT_SOCKET_PATH;
-use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode, EccStatus, MemoryChannelMode};
+use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode, MemoryChannelMode};
 use ramsleuth_telemetry::cpuid::CpuVendor;
 use ramsleuth_telemetry::error::Section;
 use ramsleuth_telemetry::intel_readout::{ChannelMode, ChannelTrust};
 use ramsleuth_telemetry::probe::render_probe_report_md;
 use ramsleuth_telemetry::spd_decode::SpdModule;
-use ramsleuth_telemetry::{ProbeReport, SystemMemoryTelemetry, SystemPlatform};
+use ramsleuth_telemetry::{ProbeReport, SystemMemoryTelemetry};
 
 /// How long a transient header notice (an F2 / F3 export result) stays
 /// visible before it fades.
@@ -1027,16 +1034,6 @@ fn platform_badge(vendor: &CpuVendor) -> &'static str {
     }
 }
 
-/// One [`Section`] cell as display text: the contained value, or
-/// `N/A` (the header's honest-degradation rule — a missing cell
-/// renders `N/A`, never a panic).
-fn cell_text<T: std::fmt::Display>(cell: &Section<T>) -> String {
-    match cell {
-        Section::Value(v) => v.to_string(),
-        Section::Na(_) => "N/A".to_owned(),
-    }
-}
-
 /// Line 2 (the mockup's `CPU: AMD Ryzen 9 7950X 16-Core @ 5.70 GHz |
 /// Motherboard: … (BIOS: …, AGESA …)`): the CPUID brand + the
 /// platform clock in the selected clock unit (C7-11: `format_clock`
@@ -1062,39 +1059,6 @@ fn cpu_line_text(t: &SystemMemoryTelemetry, units: &Units) -> String {
     )
 }
 
-/// Line 2's AGESA/SMU provenance fragment (C8-11, D-1): the header
-/// labels the value by where it came from — a true AGESA token (the
-/// DMI BIOS string scan, e.g. `ComboAm4v2 PI 1.2.0.12`) renders
-/// `AGESA <v>`; when no true AGESA is available (common — the real
-/// AGESA string is root-gated in the raw DMI table) but the
-/// `ryzen_smu` driver publishes a shape-checked firmware version, it
-/// renders `SMU <v>` under its own label (never the reported
-/// `AGESA <smu value>` mislabel); when neither is available the
-/// honest `AGESA N/A`. One value, one true label: no hybrid, no
-/// fabricated string.
-fn age_fragment(platform: &SystemPlatform) -> String {
-    match (&platform.agesa, &platform.smu_version) {
-        (Section::Value(v), _) => format!("AGESA {v}"),
-        (Section::Na(_), Section::Value(v)) => format!("SMU {v}"),
-        (Section::Na(_), Section::Na(_)) => "AGESA N/A".to_owned(),
-    }
-}
-
-/// The rank word for the header breakdown (C9-01, D-1): mirrors the
-/// SPD cards' rank label — `1` → `Single-Rank`, `2` → `Dual-Rank`,
-/// `n > 0` → `<n>-Rank` — but returns `None` for a `Na`/`0` rank:
-/// the compact header omits the word entirely (never prints `N/A`).
-/// The rank is the C8-03 wire field (`SpdModule.rank`), read, never
-/// written — no wire change this cycle.
-fn rank_word(rank: &Section<u8>) -> Option<String> {
-    match rank {
-        Section::Value(0) | Section::Na(_) => None,
-        Section::Value(1) => Some("Single-Rank".to_owned()),
-        Section::Value(2) => Some("Dual-Rank".to_owned()),
-        Section::Value(other) => Some(format!("{other}-Rank")),
-    }
-}
-
 /// The per-DIMM capacity summary (the mockup's `2x32GB`): one
 /// `<count>x<size>` group per distinct carried size (first-seen
 /// order, ` + `-joined) with the size rendered in the selected
@@ -1106,90 +1070,10 @@ fn rank_word(rank: &Section<u8>) -> Option<String> {
 /// `Na`/`0` rank omits the word, degrading to the bare `2x16 GiB`);
 /// the `Na` size entries contribute nothing, and an all-`Na` /
 /// empty list degrades to `N/A`.
+/// The grouping logic is the shared `ramsleuth-display` `dimm_summary`
+/// (WS-A, C3) — this is a thin adapter over the GUI's `Units` knob.
 fn dimm_summary(sizes: &[Section<f64>], spd: &[SpdModule], units: &Units) -> String {
-    let mut groups: Vec<(f64, Option<String>, usize)> = Vec::new();
-    for (slot, cell) in sizes.iter().enumerate() {
-        if let Some(gib) = cell.value() {
-            // A slot beyond the SPD list (the degradation path — the
-            // facade keeps the two equal-length) or a `Na`/`0` rank
-            // carries no word.
-            let rank = spd.get(slot).and_then(|module| rank_word(&module.rank));
-            match groups
-                .iter_mut()
-                .find(|(value, word, _)| (value - gib).abs() < 0.05 && *word == rank)
-            {
-                Some(group) => group.2 += 1,
-                None => groups.push((*gib, rank, 1)),
-            }
-        }
-    }
-    if groups.is_empty() {
-        "N/A".to_owned()
-    } else {
-        groups
-            .iter()
-            .map(|(gib, rank, count)| match rank {
-                Some(word) => format!("{count}x{} {word}", format_capacity(*gib, units)),
-                None => format!("{count}x{}", format_capacity(*gib, units)),
-            })
-            .collect::<Vec<_>>()
-            .join(" + ")
-    }
-}
-
-/// The channel mode from the SPD-visible DIMM count (D-C8): 1 / 2 /
-/// 4 → Single- / Dual- / Quad-Channel; any other count (0, odd)
-/// degrades to `N/A`.
-///
-/// This is the **fallback** label: the header prefers the hardware
-/// channel mode — the Intel `MAD_INTER_CHANNEL` (an SPD count alone
-/// cannot tell a Flex-Mode box's `Dual-Channel (Flex)` from
-/// `Single-Channel`), else the AMD UMC-synthesized mode; only the
-/// no-readout states use this count-derived label.
-fn channel_mode(dimm_count: usize) -> String {
-    match dimm_count {
-        1 => "Single-Channel".to_owned(),
-        2 => "Dual-Channel".to_owned(),
-        4 => "Quad-Channel".to_owned(),
-        _ => "N/A".to_owned(),
-    }
-}
-
-/// The total-vs-breakdown slot note (C9-01, D-1): the OS total
-/// (`total_capacity`, MemTotal-preferred — C8-04) can strictly
-/// exceed the SPD-visible sum when the host installs more DIMMs
-/// than the SPD bus binds (the live host: 4×16 GiB installed, 2
-/// bound). A uniform per-module size `u` whose quotient
-/// `total / u` lands within a tenth of a module of an integer
-/// `n` above the visible count → `<visible> of <n> slots
-/// SPD-visible` (the OS reserves a fraction of the installed
-/// capacity, so the quotient sits just below the integer); any
-/// other excess → the generic `SPD sees <visible> of the
-/// installed capacity`. A `Na` / non-finite total, no visible
-/// modules, or `total ≤ sum` → `None` (no false alarm).
-/// Unit-agnostic: counts, not GiB.
-fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String> {
-    let total = total.value().copied().filter(|value| value.is_finite())?;
-    let visible: Vec<f64> = sizes.iter().filter_map(|cell| cell.value().copied()).collect();
-    if visible.is_empty() {
-        return None;
-    }
-    let sum = visible.iter().sum::<f64>();
-    if total <= sum {
-        return None;
-    }
-    let uniform = visible.iter().all(|value| (value - visible[0]).abs() < 0.05);
-    if uniform {
-        let unit = visible[0];
-        if unit > 0.0 {
-            let quotient = total / unit;
-            let slots = quotient.round();
-            if (quotient - slots).abs() <= 0.1 && slots > visible.len() as f64 {
-                return Some(format!("{} of {slots:.0} slots SPD-visible", visible.len()));
-            }
-        }
-    }
-    Some(format!("SPD sees {} of the installed capacity", visible.len()))
+    ramsleuth_display::dimm_summary(sizes, spd, units.capacity == CapacityUnit::GiB)
 }
 
 /// Line 3's non-mode part (the mockup's `RAM: 64.0 GB (2x32GB)
@@ -1251,66 +1135,23 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
     line
 }
 
-/// The summary-line speed fallback when no bound SPD module carries a
-/// speed (the GUI mirror of the TUI `mclk_derived_speed`): the
-/// platform's derived MT/s = MCLK × 2 (the DDR double-pumping rule —
-/// the probe renderer's `derived_mts` idiom), from the AMD readout's
-/// MCLK, else the max Intel channel MCLK (`None` when no channel
-/// carries one). `None` overall when neither branch yields an MCLK
-/// (the segment is omitted — the pre-fallback behavior).
-fn mclk_derived_speed(t: &SystemMemoryTelemetry) -> Option<String> {
-    let mclk = match t.amd.value() {
-        Some(readout) => readout.clocks.mclk_mhz.value().copied(),
-        None => t
-            .intel
-            .value()
-            .and_then(|readout| {
-                readout
-                    .channels
-                    .iter()
-                    .filter_map(|c| c.clocks.mclk_mhz.value().copied())
-                    .reduce(|a, b| if b > a { b } else { a })
-            }),
-    }?;
-    Some(format!("{:.0} MT/s", mclk * 2.0))
-}
-
-/// Line 3's ECC segment (the TUI `ecc_label` mirror): the platform
-/// ECC status (the readouts are mutually exclusive per platform,
-/// Intel probed first) as display text — the enum label, the honest
-/// `N/A` for the unreadable / absent state.
-fn ecc_label(t: &SystemMemoryTelemetry) -> String {
-    match t
-        .intel
-        .value()
-        .map(|ro| ro.ecc_status)
-        .or_else(|| t.amd.value().map(|ro| ro.ecc_status))
-        .unwrap_or(EccStatus::Unknown)
-    {
-        EccStatus::Unknown => "N/A".to_owned(),
-        s => s.label().to_owned(),
-    }
-}
-
-/// Line 3's mode segment (D-C8): the UCLK:MCLK ratio from the AMD
-/// clock readout + its semantic color — AMBER for `Synchronous 1:1`
-/// (with the MCLK in the selected clock unit when it carries one —
-/// C7-11: `format_clock`), CRIMSON for `Asynchronous 1:2`, and
-/// `None` (the default text color) for the honest `N/A`.
+/// Line 3's mode segment (D-C8): the UCLK:MCLK ratio **text** from the
+/// shared `ramsleuth-display` (the single source the TUI renders too) +
+/// its semantic color (GUI-local) — AMBER for `Synchronous 1:1` (with
+/// the MCLK in the selected clock unit when it carries one), CRIMSON for
+/// `Asynchronous 1:2`, and `None` (the default text color) for the
+/// honest `N/A`.
 fn sync_mode_from_clocks(clocks: &ClockReadout, units: &Units) -> (String, Option<egui::Color32>) {
-    match clocks.div_mode.value() {
-        Some(DivMode::OneToOne) => {
-            let text = match clocks.mclk_mhz.value() {
-                Some(mhz) => {
-                    format!("Synchronous 1:1 (UCLK = MCLK = {})", format_clock(*mhz, units))
-                }
-                None => "Synchronous 1:1".to_owned(),
-            };
-            (text, Some(AMBER))
-        }
-        Some(DivMode::OneToTwo) => ("Asynchronous 1:2".to_owned(), Some(CRIMSON)),
-        None => ("N/A".to_owned(), None),
-    }
+    let text = ramsleuth_display::sync_mode_from_clocks(
+        clocks,
+        units.clock == ClockUnit::MHz,
+    );
+    let color = match clocks.div_mode.value() {
+        Some(DivMode::OneToOne) => Some(AMBER),
+        Some(DivMode::OneToTwo) => Some(CRIMSON),
+        None => None,
+    };
+    (text, color)
 }
 
 /// Line 3's mode segment over a whole snapshot: the AMD branch must
@@ -1339,21 +1180,16 @@ fn sync_mode(t: &SystemMemoryTelemetry, units: &Units) -> (String, Option<egui::
 fn intel_mode(t: &SystemMemoryTelemetry) -> Option<(String, Option<egui::Color32>)> {
     let ro = t.intel.value()?;
     let mode = ro.channel_mode?;
-    let (mut label, color) = match mode {
-        ChannelMode::DualSymmetric => (mode.mode_label().to_owned(), Some(CYAN)),
-        ChannelMode::DualFlex => (mode.mode_label().to_owned(), Some(AMBER)),
-        ChannelMode::Single => (mode.mode_label().to_owned(), None),
+    // The label (the mode + the Chunk 2 trust badge) is the shared
+    // `ramsleuth-display` `intel_mode_text` (the single source the TUI
+    // renders too); the semantic color is GUI-local.
+    let label = ramsleuth_display::intel_mode_text(t)?;
+    let color = match (mode, ro.channel_trust) {
+        (_, Some(ChannelTrust::Override) | Some(ChannelTrust::Heuristic)) => Some(AMBER),
+        (ChannelMode::DualFlex, _) => Some(AMBER),
+        (ChannelMode::Single, _) => None,
+        (ChannelMode::DualSymmetric, _) => Some(CYAN),
     };
-    match ro.channel_trust {
-        Some(ChannelTrust::Override) | Some(ChannelTrust::Heuristic) => {
-            label.push_str(" (unverified)");
-            return Some((label, Some(AMBER)));
-        }
-        Some(ChannelTrust::VerifiedFirmware) => {
-            label.push_str(" (firmware)");
-        }
-        _ => {}
-    }
     Some((label, color))
 }
 
@@ -3387,17 +3223,29 @@ mod tests {
         );
     }
 
-    /// (h4b) `rank_word` (C9-01, D-1): the SPD cards' rank label
-    /// for the compact header — `1` → `Single-Rank`, `2` →
-    /// `Dual-Rank`, `n > 0` → `<n>-Rank` — with a `Na`/`0` rank
-    /// yielding `None` (the word is omitted, never `N/A`).
+    /// (h4b) `rank_word` (the shared `ramsleuth-display` form, C9-01,
+    /// D-1): the SPD cards' rank label for the compact header — `1` →
+    /// `Single-Rank`, `2` → `Dual-Rank`, `n > 0` → `<n>-Rank` — with a
+    /// `Na`/`0` rank yielding `None` (the word is omitted, never `N/A`).
     #[test]
     fn rank_word_arms() {
-        assert_eq!(rank_word(&Section::Value(1)), Some("Single-Rank".to_owned()));
-        assert_eq!(rank_word(&Section::Value(2)), Some("Dual-Rank".to_owned()));
-        assert_eq!(rank_word(&Section::Value(4)), Some("4-Rank".to_owned()));
-        assert_eq!(rank_word(&Section::Value(0)), None);
-        assert_eq!(rank_word(&Section::na(NaReason::NotApplicable)), None);
+        assert_eq!(
+            ramsleuth_display::rank_word(&Section::Value(1)),
+            Some("Single-Rank".to_owned())
+        );
+        assert_eq!(
+            ramsleuth_display::rank_word(&Section::Value(2)),
+            Some("Dual-Rank".to_owned())
+        );
+        assert_eq!(
+            ramsleuth_display::rank_word(&Section::Value(4)),
+            Some("4-Rank".to_owned())
+        );
+        assert_eq!(ramsleuth_display::rank_word(&Section::Value(0)), None);
+        assert_eq!(
+            ramsleuth_display::rank_word(&Section::na(NaReason::NotApplicable)),
+            None
+        );
     }
 
     /// (h4c) `slot_note` (C9-01, D-1): the total-vs-breakdown

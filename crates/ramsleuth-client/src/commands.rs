@@ -308,13 +308,15 @@ fn summarize(telemetry: &SystemMemoryTelemetry, socket_path: &Path) -> String {
 }
 
 /// One vendor section's state line: `ok` when the branch holds a
-/// `Value`, `N/A (<reason>)` when it degraded (the reason's variant
-/// name in its `Debug` form — `DriverMissing`, `UnsupportedHardware`,
-/// `InsufficientPrivilege`, …).
+/// `Value`, `N/A (<reason>)` when it degraded (the reason's **stable**
+/// display phrase (DAEMON-2) — `driver missing`, `unsupported CPU`,
+/// `insufficient privilege`, …) — the same phrase the `ramsleuth-display`
+/// `na_cell_text` map renders, so a variant rename is a pinned test
+/// failure, not a silent `Debug` drift.
 fn section_state<T>(section: &Section<T>) -> String {
     match section {
         Section::Value(_) => "ok".to_owned(),
-        Section::Na(reason) => format!("N/A ({reason:?})"),
+        Section::Na(reason) => format!("N/A ({reason})"),
     }
 }
 
@@ -821,7 +823,7 @@ mod tests {
         handle.join().expect("stand-in thread must not panic");
 
         assert!(text.contains("CPU: ok"), "got: {text}");
-        assert!(text.contains("AMD: N/A (DriverMissing)"), "got: {text}");
+        assert!(text.contains("AMD: N/A (driver missing)"), "got: {text}");
         assert!(text.contains("Intel: ok"), "got: {text}");
         assert!(text.contains("SPD: ok (1 module)"), "got: {text}");
         let path = sock.path().to_string_lossy().into_owned();
@@ -844,8 +846,8 @@ mod tests {
         handle.join().expect("stand-in thread must not panic");
 
         assert!(text.contains("CPU: ok"), "got: {text}");
-        assert!(text.contains("AMD: N/A (DriverMissing)"), "got: {text}");
-        assert!(text.contains("Intel: N/A (InsufficientPrivilege)"), "got: {text}");
+        assert!(text.contains("AMD: N/A (driver missing)"), "got: {text}");
+        assert!(text.contains("Intel: N/A (insufficient privilege)"), "got: {text}");
         assert!(text.contains("SPD: N/A (no modules)"), "got: {text}");
     }
 

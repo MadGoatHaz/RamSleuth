@@ -17,6 +17,18 @@
 //! benchmark run, one [`JobEvent::BurnInTick`] (the C7-06
 //! [`BurnInTick`] verbatim) per completed cell / per-tier latency pass
 //! of each burn-in iteration, and exactly one terminal event —
+//!
+//! **Burn-in cadence (FE-1, single-source clock):** the daemon is the
+//! authoritative source of the burn-in elapsed clock. In addition to the
+//! per-cell / per-latency ticks, a ~1 s timer emits an **elapsed-update**
+//! [`BurnInTick`] (both `bandwidth` and `latency_ns` `None` — the marker
+//! an owner uses to tell it from a data tick) carrying the run's
+//! `elapsed_secs` stamped from the daemon's own start instant. The ticks
+//! are forwarded to the owner **in real time** (a forwarder streams the
+//! run's tick channel as it lands, not a final burst), so the frontends'
+//! burn-in clock advances smoothly even when no cell completes for a
+//! while — the owner renders `m:ss` from `elapsed_secs`, never a
+//! client-side clock.
 //! [`JobEvent::Result`] (the measured [`BenchmarkGrid`] — for a
 //! burn-in, its last completed pass), [`JobEvent::Cancelled`] (the
 //! run's cancel flag was set at a gate), or [`JobEvent::Error`] (a
@@ -56,6 +68,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use ramsleuth_bench::{
     run_burn_in, run_streamed, BenchmarkGrid, BurnInOptions, BurnInTick, StreamError,
@@ -81,7 +94,10 @@ pub enum JobEvent {
     /// One burn-in tick (the C7-06 [`BurnInTick`] verbatim — the
     /// protocol wraps it in its `BurnInProgress` arm, D-2): one per
     /// completed bandwidth cell and per completed per-tier latency
-    /// pass of each burn-in iteration.
+    /// pass of each burn-in iteration, **plus** the ~1 s elapsed-update
+    /// tick (FE-1: both `bandwidth` and `latency_ns` `None`, carrying
+    /// only the daemon's `elapsed_secs`) that keeps the owner's clock
+    /// smooth between cell completions.
     BurnInTick(BurnInTick),
     /// Terminal: the run completed; `grid` holds the measured cells
     /// (unrequested cells stay `0.0`, P3-09 contract; for a burn-in,
@@ -290,27 +306,85 @@ impl BenchJobManager {
             cancel: Arc::clone(&cancel),
         };
 
-        // Two channels, one owner (the same drain-then-terminal
-        // pattern as `start`): the C7-06 tick channel carries
-        // `BurnInTick` into `run_burn_in`; the job pumps it into the
-        // owner's `JobEvent` channel (in order) and then sends the
-        // single terminal, so the terminal is always last.
+        // Three producers, one owner channel (`tx`): (1) `run_burn_in`
+        // on a blocking thread sends the per-cell / per-latency ticks
+        // into `tick_tx`; (2) a forwarder streams `tick_rx` into `tx` in
+        // real time (the owner sees the live grid, not a final burst);
+        // (3) a ~1 s elapsed-update timer (FE-1) sends an
+        // `elapsed_secs`-only tick so the owner's clock advances
+        // smoothly between cell completions. The terminal is sent last,
+        // after the run, the forwarder, and the timer have all stopped.
         let (tx, rx) = mpsc::channel::<JobEvent>();
         let (tick_tx, tick_rx) = mpsc::channel::<BurnInTick>();
 
         let active = Arc::clone(&self.active);
         let busy = Arc::clone(&self.busy);
 
+        // The run's start instant: the daemon's burn-in clock source
+        // (FE-1) — the elapsed-update timer stamps `elapsed_secs` from
+        // it, so the clock is the daemon's, never a client's.
+        let run_start = Instant::now();
+
         tokio::spawn(async move {
-            let outcome =
-                tokio::task::spawn_blocking(move || run_burn_in(&options, Some(tick_tx)))
-                    .await;
-            // `run_burn_in` has returned, so its tick sender is
-            // dropped: drain every buffered tick (FIFO order) into the
-            // owner channel before the terminal.
-            while let Ok(tick) = tick_rx.recv() {
-                let _ = tx.send(JobEvent::BurnInTick(tick));
-            }
+            // `finished` is set once `run_burn_in` has returned (its
+            // tick sender dropped); the timer + forwarder stop on it so
+            // the terminal is always last.
+            let finished = Arc::new(AtomicBool::new(false));
+
+            // (1) The per-cell / per-latency ticks from `run_burn_in`.
+            let run_task =
+                tokio::task::spawn_blocking(move || run_burn_in(&options, Some(tick_tx)));
+
+            // (2) Real-time forwarder: stream `tick_rx` into `tx` as the
+            // ticks land. It exits when `tick_tx` is dropped (the run
+            // finished), having flushed every buffered tick. The daemon
+            // is the single source of the burn-in clock (FE-1): each
+            // per-cell tick's `elapsed_secs` is re-stamped from
+            // `run_start` (the bench crate stamps it from its own,
+            // slightly-later start) so the whole stream is monotonic by
+            // construction.
+            let forwarder = tokio::spawn({
+                let tx = tx.clone();
+                async move {
+                    while let Ok(mut tick) = tick_rx.recv() {
+                        tick.elapsed_secs = (Instant::now() - run_start).as_secs_f64();
+                        let _ = tx.send(JobEvent::BurnInTick(tick));
+                    }
+                }
+            });
+
+            // (3) The ~1 s elapsed-update timer (FE-1 smooth cadence):
+            // each fire sends an `elapsed_secs`-only tick (both
+            // `bandwidth` and `latency_ns` `None`) stamped from
+            // `run_start`. It stops on `finished`.
+            let timer = tokio::spawn({
+                let tx = tx.clone();
+                let finished = Arc::clone(&finished);
+                async move {
+                    let mut iv = tokio::time::interval(Duration::from_secs(1));
+                    iv.tick().await; // the first tick fires immediately
+                    loop {
+                        if finished.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        iv.tick().await;
+                        if finished.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let elapsed = (Instant::now() - run_start).as_secs_f64();
+                        let _ = tx.send(JobEvent::BurnInTick(elapsed_update_tick(
+                            elapsed,
+                        )));
+                    }
+                }
+            });
+
+            let outcome = run_task.await;
+            // The run is over: stop the timer, let the forwarder flush
+            // the remaining buffered ticks, then send the terminal last.
+            finished.store(true, Ordering::Relaxed);
+            let _ = forwarder.await;
+            let _ = timer.await;
             let terminal = match outcome {
                 Ok(Ok(grid)) => JobEvent::Result(grid),
                 Ok(Err(StreamError::Cancelled)) => JobEvent::Cancelled,
@@ -406,6 +480,23 @@ fn mapped_target(target: StreamTarget, mode: BenchMode) -> StreamTarget {
             StreamTarget::Full | StreamTarget::Tier(_) => StreamTarget::Tier(Tier::Memory),
             StreamTarget::Cell(_, op) => StreamTarget::Cell(Tier::Memory, op),
         },
+    }
+}
+
+/// The ~1 s **elapsed-update** burn-in tick (FE-1): carries only the
+/// daemon's `elapsed_secs` (stamped from the run's start instant) with
+/// both `bandwidth` and `latency_ns` `None` — the marker an owner uses to
+/// tell it from a data tick. The `iteration` / `tier` are dummies (the
+/// owner ignores them for an elapsed-update tick and updates only its
+/// clock). No new wire field: this is the C7-06 [`BurnInTick`] verbatim,
+/// just a new emission cadence.
+fn elapsed_update_tick(elapsed_secs: f64) -> BurnInTick {
+    BurnInTick {
+        iteration: 0,
+        elapsed_secs,
+        tier: Tier::Memory,
+        bandwidth: None,
+        latency_ns: None,
     }
 }
 
@@ -566,17 +657,16 @@ mod tests {
         );
     }
 
-    /// (g) A burn-in (C7-07/D-1) streams its ticks and ends with the
-    /// `Cancelled` terminal when cancelled: `duration_minutes = 0` is
-    /// infinite (cancel-only stop). The drain-then-terminal contract
-    /// buffers every tick until the run ends, so the test cancels the
-    /// run itself (a short async sleep — no worker is blocked) and
-    /// then collects the whole stream: the buffered ticks (≥ one
-    /// completed iteration on any sane host) in order, then the
-    /// `Cancelled` terminal, then the released slot. The
-    /// `Result`-terminal mapping is the shared code exercised by (a);
-    /// a burn-in duration terminal needs ≥ 1 minute of wall time at
-    /// the wire's minute granularity, so it is not unit-tested here.
+    /// (g) A burn-in (C7-07/D-1) streams its ticks in real time and ends
+    /// with the `Cancelled` terminal when cancelled: `duration_minutes = 0`
+    /// is infinite (cancel-only stop). The test cancels the run itself
+    /// (a short async sleep — no worker is blocked) and then collects the
+    /// whole stream: the data ticks (≥ one completed iteration on any sane
+    /// host) + the ~1 s elapsed-update ticks (FE-1) in order, then the
+    /// `Cancelled` terminal, then the released slot. The `Result`-terminal
+    /// mapping is the shared code exercised by (a); a burn-in duration
+    /// terminal needs ≥ 1 minute of wall time at the wire's minute
+    /// granularity, so it is not unit-tested here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_burn_in_streams_ticks_then_cancelled() {
         let mgr = BenchJobManager::new();
@@ -604,17 +694,36 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // The stream carries two tick kinds: the data ticks (exactly one
+        // of `bandwidth` / `latency_ns` `Some`) and the ~1 s
+        // elapsed-update ticks (both `None` — the FE-1 marker).
+        let data: Vec<&BurnInTick> = ticks
+            .iter()
+            .copied()
+            .filter(|t| t.bandwidth.is_some() != t.latency_ns.is_some())
+            .collect();
+        let elapsed: Vec<&BurnInTick> = ticks
+            .iter()
+            .copied()
+            .filter(|t| t.bandwidth.is_none() && t.latency_ns.is_none())
+            .collect();
+
         assert!(
-            !ticks.is_empty(),
-            "a second of L1 iterations must stream ticks: {events:?}"
+            !data.is_empty(),
+            "a second of L1 iterations must stream data ticks: {events:?}"
         );
-        assert_eq!(ticks[0].iteration, 1, "the first tick must be iteration 1");
-        for t in &ticks {
+        assert!(
+            !elapsed.is_empty(),
+            "the ~1 s timer must stream elapsed-update ticks (FE-1): {events:?}"
+        );
+
+        // The data ticks: a tier target only ticks its tier, exactly one
+        // of bandwidth / latency, iterations 1-based and non-decreasing.
+        for t in &data {
             assert_eq!(t.tier, Tier::L1, "a tier target only ticks its tier");
-            assert_eq!(
-                t.bandwidth.is_some(),
-                t.latency_ns.is_none(),
-                "exactly one of bandwidth / latency per tick"
+            assert!(
+                t.bandwidth.is_some() != t.latency_ns.is_some(),
+                "exactly one of bandwidth / latency per data tick"
             );
             assert!(t.iteration >= 1, "iterations are 1-based");
             assert!(
@@ -623,11 +732,101 @@ mod tests {
                 t.elapsed_secs
             );
         }
-        for w in ticks.windows(2) {
-            assert!(w[1].iteration >= w[0].iteration, "iterations must not decrease");
+        for w in data.windows(2) {
+            assert!(
+                w[1].iteration >= w[0].iteration,
+                "iterations must not decrease"
+            );
+        }
+        // The elapsed-update ticks: both `None`, the daemon's clock —
+        // finite, non-negative, and non-decreasing (the forwarder
+        // re-stamps from `run_start`, so the whole stream is monotonic).
+        for t in &elapsed {
+            assert!(
+                t.bandwidth.is_none() && t.latency_ns.is_none(),
+                "an elapsed-update tick carries no data"
+            );
+            assert!(
+                t.elapsed_secs.is_finite() && t.elapsed_secs >= 0.0,
+                "elapsed must be finite and non-negative: {}",
+                t.elapsed_secs
+            );
+        }
+        for w in elapsed.windows(2) {
             assert!(
                 w[1].elapsed_secs + 0.001 >= w[0].elapsed_secs,
-                "elapsed must not decrease"
+                "elapsed-update must not decrease"
+            );
+        }
+        // After the terminal the slot is released: cancel is false.
+        assert!(
+            !mgr.cancel(run_id),
+            "after the terminal the slot is released: cancel must be false"
+        );
+    }
+
+    /// TC-FE1 (daemon cadence, the FE-1 confirming test): a burn-in over
+    /// the slow Memory tier (no cell completes for >2 s) still emits the
+    /// elapsed stream at ≤1 s cadence — the ~1 s elapsed-update timer
+    /// fills the gaps the sparse per-cell ticks leave. Over a ~3 s run:
+    /// (a) at least two elapsed-update ticks (both `bandwidth` and
+    /// `latency_ns` `None`) land, and (b) the whole stream's
+    /// `elapsed_secs` advances (non-decreasing, a small jitter allowance
+    /// for the two-producer send-order race) with bounded (≤ ~1.5 s)
+    /// deltas — the smooth clock the frontends render from one field.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tc_fe1_burn_in_elapsed_cadence_is_bounded() {
+        let mgr = BenchJobManager::new();
+        // The Memory tier is the slow target: a full pass (3 bandwidth
+        // cells over ≥256 MiB + the latency chase) takes several seconds,
+        // so no cell completes for >2 s — exactly the gap the FE-1
+        // elapsed-update timer must fill.
+        let handle = mgr
+            .start_burn_in(StreamTarget::Tier(Tier::Memory), 0, 1)
+            .await
+            .expect("first burn-in on a fresh manager must succeed");
+        let run_id = handle.run_id;
+
+        // Run ~3 s (enough for ≥2 elapsed-update fires at the 1 s
+        // cadence), then cancel.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert!(mgr.cancel(run_id), "the active burn-in must be cancellable");
+
+        let events = collect(handle).await;
+        let ticks: Vec<&BurnInTick> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                JobEvent::BurnInTick(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+
+        // (a) At least two elapsed-update ticks (both `None`) in the
+        // ~3 s window.
+        let elapsed_updates: Vec<&BurnInTick> = ticks
+            .iter()
+            .copied()
+            .filter(|t| t.bandwidth.is_none() && t.latency_ns.is_none())
+            .collect();
+        assert!(
+            elapsed_updates.len() >= 2,
+            "a ~3 s run must emit ≥2 elapsed-update ticks (the 1 s cadence): {events:?}"
+        );
+
+        // (b) The whole stream's `elapsed_secs` advances (non-decreasing,
+        // a 50 ms jitter allowance for the two-producer send-order race)
+        // with bounded (≤ ~1.5 s) deltas — the smooth clock.
+        for w in ticks.windows(2) {
+            assert!(
+                w[1].elapsed_secs + 0.05 >= w[0].elapsed_secs,
+                "elapsed must not decrease (beyond 50 ms jitter): {} -> {}",
+                w[0].elapsed_secs,
+                w[1].elapsed_secs
+            );
+            let gap = w[1].elapsed_secs - w[0].elapsed_secs;
+            assert!(
+                gap <= 1.5,
+                "consecutive tick elapsed gap must be ≤ ~1.5 s (the 1 s cadence + jitter): {gap}"
             );
         }
         // After the terminal the slot is released: cancel is false.

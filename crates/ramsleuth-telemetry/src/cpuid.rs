@@ -36,6 +36,25 @@ pub enum AmdZen {
     Zen5,
 }
 
+/// The stable, human-readable name of an AMD Zen generation (DAEMON-2):
+/// the single source for the `cpu_gen` wire string, the TUI/GUI/CLI
+/// display, and the probe report. A variant rename now changes a
+/// **pinned** string (the `TC-DAEMON2` byte-pin), not a silent `Debug`
+/// drift. Display-only — the wire encoding (bincode discriminant) is
+/// unchanged.
+impl std::fmt::Display for AmdZen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Zen1 => "Zen 1",
+            Self::Zen2 => "Zen 2",
+            Self::Zen3 => "Zen 3",
+            Self::Zen4 => "Zen 4",
+            Self::Zen5 => "Zen 5",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Intel microarchitecture generation, for MCHBAR IMC decoding (P2-07).
 ///
 /// Best-effort model table covering Skylake through Arrow Lake.
@@ -102,6 +121,36 @@ pub enum IntelGen {
     /// prefix + `Ultra` token; no [`crate::intel_gen::profile_for`]
     /// entry (honest `N/A`).
     CoreSeries1Mobile,
+}
+
+/// The stable, human-readable name of an Intel generation (DAEMON-2):
+/// the single source for the `cpu_gen` wire string, the TUI/GUI/CLI
+/// display, and the probe report. A variant rename now changes a
+/// **pinned** string (the `TC-DAEMON2` byte-pin), not a silent `Debug`
+/// drift. Display-only — the wire encoding (bincode discriminant) is
+/// unchanged.
+impl std::fmt::Display for IntelGen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Skylake => "Skylake",
+            Self::KabyLake => "Kaby Lake",
+            Self::CoffeeLake => "Coffee Lake",
+            Self::CometLake => "Comet Lake",
+            Self::IceLake => "Ice Lake",
+            Self::TigerLake => "Tiger Lake",
+            Self::AlderLake => "Alder Lake",
+            Self::RaptorLake => "Raptor Lake",
+            Self::MeteorLake => "Meteor Lake",
+            Self::ArrowLake => "Arrow Lake",
+            Self::Unrecognized => "Unrecognized",
+            Self::RocketLake => "Rocket Lake",
+            Self::SapphireRapids => "Sapphire Rapids",
+            Self::JasperLake => "Jasper Lake",
+            Self::LunarLake => "Lunar Lake",
+            Self::CoreSeries1Mobile => "Core Series 1 Mobile",
+        };
+        f.write_str(name)
+    }
 }
 
 /// CPU vendor + generation. The frozen dispatch key for every provider.

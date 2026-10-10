@@ -123,10 +123,15 @@ fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
                 s.push(' ');
                 s.push_str(badge);
             }
-            if let Some(vid) = v.requested_vid {
-                let delta_mv = (v.delivered_volts - vid) * 1000.0;
-                s.push_str(&format!(" (VID: {:.3} V, Δ {:+.0} mV)", vid, delta_mv));
-            }
+        if let Some(vid) = v.requested_vid {
+            // CLI-2: the delta is the wire's `delta_volts` when
+            // present (the single source — the daemon computed it),
+            // falling back to the identity `delivered − vid` only when
+            // the wire omits it (an older daemon). The recompute no
+            // longer masks the wire value.
+            let delta_mv = v.delta_volts.unwrap_or(v.delivered_volts - vid) * 1000.0;
+            s.push_str(&format!(" (VID: {:.3} V, Δ {:+.0} mV)", vid, delta_mv));
+        }
             s
         }
     }

@@ -150,28 +150,20 @@ fn trim(value: f64) -> String {
 
 /// One clock readout (a carried MHz wire value) as display text in
 /// the selected clock unit — `3600 MHz` or `3.6 GHz`. A non-finite
-/// input degrades to the honest `N/A` (never a panic, D5).
+/// input degrades to the honest `N/A` (never a panic, D5). The logic is
+/// the shared `ramsleuth-display` `format_clock` (WS-A, C3) — this is a
+/// thin adapter over the GUI's `Units` knob.
 pub fn format_clock(mhz: f64, units: &Units) -> String {
-    if !mhz.is_finite() {
-        return "N/A".to_owned();
-    }
-    match units.clock {
-        ClockUnit::MHz => format!("{} MHz", trim(mhz)),
-        ClockUnit::GHz => format!("{} GHz", trim(mhz / 1000.0)),
-    }
+    ramsleuth_display::format_clock(mhz, matches!(units.clock, ClockUnit::MHz))
 }
 
 /// One capacity readout (a carried GiB wire value) as display text in
 /// the selected capacity unit — `64 GiB` or `68.7 GB`. A non-finite
-/// input degrades to the honest `N/A` (never a panic, D5).
+/// input degrades to the honest `N/A` (never a panic, D5). The logic is
+/// the shared `ramsleuth-display` `format_capacity` (WS-A, C3) — a thin
+/// adapter over the GUI's `Units` knob.
 pub fn format_capacity(gib: f64, units: &Units) -> String {
-    if !gib.is_finite() {
-        return "N/A".to_owned();
-    }
-    match units.capacity {
-        CapacityUnit::GiB => format!("{} GiB", trim(gib)),
-        CapacityUnit::GB => format!("{} GB", trim(gib * GIB_TO_GB)),
-    }
+    ramsleuth_display::format_capacity(gib, matches!(units.capacity, CapacityUnit::GiB))
 }
 
 /// One bandwidth readout (a carried GiB/s wire value, the benchmark

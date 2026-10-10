@@ -1,0 +1,19 @@
+[package]
+name = "ramsleuth-display"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The shared RamSleuth presentation layer: pure formatters, N/A text maps, and the CPU-temp scan every frontend (TUI / GUI / CLI) renders through, so the same value + the same N/A reason can never diverge (C3 single-source)."
+
+[dependencies]
+# Both are leaves (no tokio, no UI framework), so depending on them is
+# cycle-free: telemetry -> (nix, serde), bench -> (libc, serde).
+ramsleuth-telemetry = { path = "../ramsleuth-telemetry" }
+ramsleuth-bench = { path = "../ramsleuth-bench" }
+
+[lib]
+# A pure presentation library: no binary, no UI-framework dependency.
+name = "ramsleuth_display"

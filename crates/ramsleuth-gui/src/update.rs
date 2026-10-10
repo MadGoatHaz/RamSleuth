@@ -505,7 +505,7 @@ fn record_graph_sample(state: &mut TelemetryData) {
     crate::graph::record_graph_sample(
         &mut state.graph,
         &state.telemetry,
-        crate::graph::read_cpu_temp_c(),
+        crate::read_cpu_temp_c(),
         bandwidth_gbps,
     );
 }

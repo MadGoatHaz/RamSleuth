@@ -675,12 +675,16 @@ fn cpu_vendor_string(vendor: &CpuVendor) -> String {
     }
 }
 
-/// The CPU generation as its variant name (e.g. "RocketLake", "Zen5";
-/// "Unknown" for an unrecognized vendor).
+/// The CPU generation as its **stable** display name (DAEMON-2): the
+/// [`std::fmt::Display`] impl on the generation enum (e.g. "Rocket Lake",
+/// "Zen 5") — the single source the probe report, the TUI/GUI header, and
+/// the CLI share. A variant rename now changes a **pinned** string (the
+/// `TC-DAEMON2` byte-pin), not a silent `Debug` drift. "Unknown" for an
+/// unrecognized vendor.
 fn cpu_gen_string(vendor: &CpuVendor) -> String {
     match vendor {
-        CpuVendor::Intel(gen) => format!("{gen:?}"),
-        CpuVendor::Amd(zen) => format!("{zen:?}"),
+        CpuVendor::Intel(gen) => gen.to_string(),
+        CpuVendor::Amd(zen) => zen.to_string(),
         CpuVendor::Unknown => "Unknown".to_owned(),
     }
 }
@@ -1433,7 +1437,7 @@ mod tests {
             "Intel(R) Core(TM) i7-11700K CPU @ 3.60GHz"
         );
         assert_eq!(report.system.cpu_vendor, "Intel");
-        assert_eq!(report.system.cpu_gen, "RocketLake");
+        assert_eq!(report.system.cpu_gen, "Rocket Lake");
         assert_eq!(report.system.pci_host_bridge, Some("0x066C".to_owned()));
         assert_eq!(report.system.kernel, "6.6.0-1-cachyos");
         assert_eq!(report.system.os, "linux");
@@ -1454,7 +1458,7 @@ mod tests {
         assert_eq!(report.raw, None);
         assert_eq!(report.system.telemetry_source, "unavailable");
         assert_eq!(report.system.cpu_vendor, "Intel");
-        assert_eq!(report.system.cpu_gen, "RocketLake");
+        assert_eq!(report.system.cpu_gen, "Rocket Lake");
     }
 
     /// (i3) The built report (raw `Some`) is wire-safe: the
