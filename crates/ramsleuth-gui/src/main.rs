@@ -2690,11 +2690,13 @@ mod tests {
     use ramsleuth_bench::BenchmarkGrid;
     use ramsleuth_gui::{BenchState, CapacityUnit, ClockUnit, DEFAULT_POLL_INTERVAL_MS};
     use ramsleuth_telemetry::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
-    use ramsleuth_telemetry::amd_readout::{AmdReadout, ClockReadout, DivMode, map_amd};
+    use ramsleuth_telemetry::amd_readout::{
+        AmdReadout, CadBus, ClockReadout, DivMode, GearMode, TimingSet, VoltageSet, map_amd,
+    };
     use ramsleuth_telemetry::amd_readout::EccStatus;
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
-    use ramsleuth_telemetry::intel_readout::{ChannelMode, IntelReadout};
+    use ramsleuth_telemetry::intel_readout::{ChannelMode, IntelChannel, IntelReadout};
     use ramsleuth_telemetry::spd_decode::SpdModule;
     use ramsleuth_telemetry::{ProbeSystem, SystemMemoryTelemetry, SystemPlatform};
 
@@ -3062,6 +3064,107 @@ mod tests {
             pdm: Section::na(NaReason::NotApplicable),
             command_rate: Section::na(NaReason::NotApplicable),
         }
+    }
+
+    /// The 12600KF anchor through the GUI summary line: the Intel
+    /// readout carries the corrected 1800 MHz MCLK (the Alder Lake
+    /// half-step decode of the real 0x79E00124 word) and renders
+    /// **3600 MT/s** — not the pre-fix 7200.
+    #[test]
+    fn mclk_derived_speed_renders_3600_for_the_12600kf_mclk() {
+        fn na<T>() -> Section<T> {
+            Section::na(NaReason::NotApplicable)
+        }
+        let t = SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                brand: "Intel(R) Core(TM) i5-12600KF CPU @ 3.50GHz".to_owned(),
+            },
+            amd: na(),
+            intel: Section::Value(IntelReadout {
+                channels: vec![IntelChannel {
+                    index: 0,
+                    clocks: ClockReadout {
+                        mclk_mhz: Section::Value(1800.0),
+                        uclk_mhz: Section::Value(1800.0),
+                        fclk_mhz: na(),
+                        div_mode: na(),
+                        gear_mode: Section::Value(GearMode::One),
+                        gdm: na(),
+                        pdm: na(),
+                        command_rate: na(),
+                    },
+                    timings: TimingSet {
+                        cl: na(),
+                        rcwdwr: na(),
+                        rcdrd: na(),
+                        rp: na(),
+                        ras: na(),
+                        rc: na(),
+                        rrds: na(),
+                        rrld: na(),
+                        faw: na(),
+                        wtrs: na(),
+                        wtrl: na(),
+                        wr: na(),
+                        rfc1: na(),
+                        rfc2: na(),
+                        rfcsb: na(),
+                        cwl: na(),
+                        rtp: na(),
+                        rdwr: na(),
+                        wrrd: na(),
+                        rdrd_sd: na(),
+                        rdrd_dd: na(),
+                        rdrd_scl: na(),
+                        rdrd_sc: na(),
+                        wrwr_sd: na(),
+                        wrwr_dd: na(),
+                        wrwr_scl: na(),
+                        wrwr_sc: na(),
+                    },
+                    cad_bus: CadBus {
+                        proc_odt: na(),
+                        rtt_nom: na(),
+                        rtt_wr: na(),
+                        rtt_park: na(),
+                        clk_drv: na(),
+                        addr_cmd_drv: na(),
+                        cs_odt_drv: na(),
+                        cke_drv: na(),
+                    },
+                    voltages: VoltageSet {
+                        vddcr_soc_mv: na(),
+                        vddio_mem_mv: na(),
+                        vdd_misc_mv: na(),
+                        vpp_mv: na(),
+                        vcore_mv: na(),
+                    },
+                    rtl: na(),
+                }],
+                channel_mode: None,
+                ecc_status: EccStatus::Unknown,
+                memory_tech: None,
+                channel_trust: None,
+                channel_annotation: String::new(),
+                dimm_count: 2,
+            }),
+            spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: na(),
+                motherboard: na(),
+                bios: na(),
+                agesa: na(),
+                smu_version: na(),
+            },
+            total_capacity: na(),
+            dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            vcore: na(),
+        };
+        assert_eq!(
+            super::mclk_derived_speed(&t),
+            Some("3600 MT/s".to_owned())
+        );
     }
 
     /// (h1) `platform_badge`: the vendor's short word — any AMD Zen

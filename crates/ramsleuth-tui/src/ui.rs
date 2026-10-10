@@ -2294,11 +2294,114 @@ mod tests {
     use ratatui::Terminal;
     use ramsleuth_bench::BenchOp;
     use ramsleuth_telemetry::amd_readout::{
-        AmdReadout, CommandRate, EccStatus, MemoryChannelMode,
+        AmdReadout, CommandRate, EccStatus, GearMode, MemoryChannelMode,
     };
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, IntelGen};
-    use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout, MemoryTech};
+    use ramsleuth_telemetry::intel_readout::{
+        decode_channel, IntelChannel, IntelReadout, MemoryTech,
+    };
     use ramsleuth_telemetry::SystemPlatform;
+
+    /// The 12600KF anchor through the TUI summary line: the Intel
+    /// readout carries the corrected 1800 MHz MCLK (the Alder Lake
+    /// half-step decode of the real 0x79E00124 word) and renders
+    /// **3600 MT/s** — not the pre-fix 7200.
+    #[test]
+    fn mclk_derived_speed_renders_3600_for_the_12600kf_mclk() {
+        fn na<T>() -> Section<T> {
+            Section::na(NaReason::NotApplicable)
+        }
+        let t = SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                brand: "Intel(R) Core(TM) i5-12600KF CPU @ 3.50GHz".to_owned(),
+            },
+            amd: na(),
+            intel: Section::Value(IntelReadout {
+                channels: vec![IntelChannel {
+                    index: 0,
+                    clocks: ClockReadout {
+                        mclk_mhz: Section::Value(1800.0),
+                        uclk_mhz: Section::Value(1800.0),
+                        fclk_mhz: na(),
+                        div_mode: na(),
+                        gear_mode: Section::Value(GearMode::One),
+                        gdm: na(),
+                        pdm: na(),
+                        command_rate: na(),
+                    },
+                    timings: TimingSet {
+                        cl: na(),
+                        rcwdwr: na(),
+                        rcdrd: na(),
+                        rp: na(),
+                        ras: na(),
+                        rc: na(),
+                        rrds: na(),
+                        rrld: na(),
+                        faw: na(),
+                        wtrs: na(),
+                        wtrl: na(),
+                        wr: na(),
+                        rfc1: na(),
+                        rfc2: na(),
+                        rfcsb: na(),
+                        cwl: na(),
+                        rtp: na(),
+                        rdwr: na(),
+                        wrrd: na(),
+                        rdrd_sd: na(),
+                        rdrd_dd: na(),
+                        rdrd_scl: na(),
+                        rdrd_sc: na(),
+                        wrwr_sd: na(),
+                        wrwr_dd: na(),
+                        wrwr_scl: na(),
+                        wrwr_sc: na(),
+                    },
+                    cad_bus: CadBus {
+                        proc_odt: na(),
+                        rtt_nom: na(),
+                        rtt_wr: na(),
+                        rtt_park: na(),
+                        clk_drv: na(),
+                        addr_cmd_drv: na(),
+                        cs_odt_drv: na(),
+                        cke_drv: na(),
+                    },
+                    voltages: VoltageSet {
+                        vddcr_soc_mv: na(),
+                        vddio_mem_mv: na(),
+                        vdd_misc_mv: na(),
+                        vpp_mv: na(),
+                        vcore_mv: na(),
+                    },
+                    rtl: na(),
+                }],
+                channel_mode: None,
+                ecc_status: EccStatus::Unknown,
+                memory_tech: Some(MemoryTech::Ddr4),
+                channel_trust: None,
+                channel_annotation: String::new(),
+                dimm_count: 2,
+            }),
+            spd: Vec::new(),
+            platform: SystemPlatform {
+                cpu_clock_mhz: na(),
+                motherboard: na(),
+                bios: na(),
+                agesa: na(),
+                smu_version: na(),
+            },
+            total_capacity: na(),
+            dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+            vcore: na(),
+        };
+        assert_eq!(
+            super::mclk_derived_speed(&t),
+            Some("3600 MT/s".to_owned())
+        );
+    }
 
     /// Draw `state` into a 100×30 in-memory terminal and return the
     /// rendered buffer as text (one line per row, trailing spaces

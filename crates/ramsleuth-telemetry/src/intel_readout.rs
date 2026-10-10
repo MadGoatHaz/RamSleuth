@@ -46,13 +46,22 @@
 //! the Skylake §6.1 acceptance fixture (ratio 18 @ 133.3333 MHz →
 //! 2400 MHz MCLK / 4800 MT/s) in the tests below and cross-referenced
 //! against coreboot NRI / Libre-FSP and the
-//! kernel EDAC driver.
+//! kernel EDAC driver. The `CLK_RATIO` semantics are generation-
+//! dependent (the Alder Lake MC_BIOS_REQ decode): Skylake–Comet Lake
+//! store a physical DRAM-clock multiplier, while 11th gen (Rocket
+//! Lake) and later store the effective DDR data rate in half-cycle
+//! steps — the 12600KF DDR4-3600 word 0x79E00124 (36 @ 100 MHz) →
+//! 1800 MHz MCLK / 3600 MT/s is pinned in the tests below.
 //!
 //! # Mapping into the frozen display types (v1 Tier 1)
 //!
-//! - `mclk_mhz` ← `MC_BIOS_REQ`: `ratio × refclk` (the analog DRAM
-//!   clock MCLK — e.g. ratio 18 × 133.3333 = **2400 MHz**; for DDR,
-//!   MT/s = MCLK × 2), sanity-gated to [1, 4096] MHz; a ratio of 0 =
+//! - `mclk_mhz` ← `MC_BIOS_REQ`: the analog DRAM clock MCLK,
+//!   generation-dependent — Skylake–Comet Lake: `ratio × refclk`
+//!   (e.g. ratio 18 × 133.3333 = **2400 MHz**); 11th gen and later:
+//!   `ratio × refclk / 2` (the ratio is the effective DDR data-rate
+//!   multiplier in half-cycle steps — e.g. the 12600KF DDR4-3600 word
+//!   0x79E00124: 36 × 100 MHz / 2 = **1800 MHz**); for DDR, MT/s =
+//!   MCLK × 2. Sanity-gated to [1, 4096] MHz; a ratio of 0 =
 //!   unconfigured → `Na(ParseError)`.
 //! - `uclk_mhz` ← `MC_BIOS_REQ`: `mclk / gear` (gears 1/2/4, Breakdown
 //!   §3D) on the Rocket Lake profile; `Na(NotApplicable)` on Tier 1
@@ -958,16 +967,31 @@ pub fn turnaround_quartet(reg: u32) -> [u16; 4] {
     ]
 }
 
-/// The `MC_BIOS_REQ` analog DRAM clock (MCLK) in MHz: `ratio × refclk`
-/// (the DRAM clock is the ratio multiple of the reference clock —
-/// e.g. ratio 18 × 133.3333 = 2400 MHz; for DDR, MT/s = MCLK × 2 = 4800),
-/// sanity-gated to [1, 4096] MHz.
+/// The `MC_BIOS_REQ` analog DRAM clock (MCLK) in MHz — the ratio
+/// semantics are generation-dependent (the Alder Lake MC_BIOS_REQ
+/// decode):
+///
+/// - **Skylake–Comet Lake (6th–10th gen)**: `CLK_RATIO` (bits [7:0])
+///   is a physical DRAM-clock multiplier → `mclk = ratio × refclk`
+///   (e.g. ratio 18 × 133.3333 = 2400 MHz; for DDR, MT/s = MCLK × 2
+///   = 4800).
+/// - **11th gen (Rocket Lake) and later**: Intel redefined
+///   `CLK_RATIO` as the effective DDR data-rate multiplier in
+///   half-cycle steps (one step = one data transfer beat — the
+///   restructuring that lets every bin on both reference clocks map
+///   to a whole integer), so the true core clock is `mclk = ratio ×
+///   refclk / 2` (e.g. the 12600KF DDR4-3600 word 0x79E00124:
+///   36 × 100 MHz / 2 = 1800 MHz → 3600 MT/s).
+///
+/// The bit-8 reference-clock select is unchanged across generations
+/// (1 = 100 MHz, 0 = 133.3333 MHz — the PLL base inputs); the result
+/// is sanity-gated to [1, 4096] MHz.
 ///
 /// Containment: an absent register → `Na(ParseError)`; a ratio of 0 =
 /// unconfigured → `Na(ParseError)`; the GEAR_RATIO bits (17:16,
 /// Rocket+ only) do not affect the MCLK decode — on the Rocket Lake
 /// profile they feed the gear cells via [`mcbios_gear`], not MCLK.
-fn decode_mclk(reg: Option<u32>) -> Section<f64> {
+fn decode_mclk(reg: Option<u32>, gen: IntelGen) -> Section<f64> {
     match reg {
         None => Section::na(NaReason::ParseError(
             "MC_BIOS_REQ: register read failed".to_owned(),
@@ -984,9 +1008,36 @@ fn decode_mclk(reg: Option<u32>) -> Section<f64> {
             } else {
                 REF_CLK_133_MHZ
             };
-            clock_section(f64::from(ratio) * refclk)
+            let product = f64::from(ratio) * refclk;
+            // 11th gen and later: the ratio is the data-rate
+            // multiplier (half-cycle steps) — halve it to the true
+            // core clock (the Alder Lake MC_BIOS_REQ decode).
+            let mclk = if mclk_half_step(gen) {
+                product / 2.0
+            } else {
+                product
+            };
+            clock_section(mclk)
         }
     }
+}
+
+/// The 11th-gen (Rocket Lake) and later `CLK_RATIO` semantics: the
+/// field is the effective DDR data-rate multiplier in half-cycle
+/// steps (the Alder Lake MC_BIOS_REQ decode), so the true MCLK is
+/// half the `ratio × refclk` product. Skylake–Comet Lake keep the
+/// legacy physical-clock multiplier (the full product); the unprofiled
+/// generations never reach [`decode_mclk`] from [`decode`] (they
+/// degrade all-Na before any MCLK decode).
+fn mclk_half_step(gen: IntelGen) -> bool {
+    matches!(
+        gen,
+        IntelGen::RocketLake
+            | IntelGen::AlderLake
+            | IntelGen::RaptorLake
+            | IntelGen::MeteorLake
+            | IntelGen::ArrowLake
+    )
 }
 
 /// The `MC_BIOS_REQ` reference-clock select (bit 8): `true` = 100 MHz,
@@ -1531,12 +1582,14 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 /// - **Tier 1 + Rocket Lake**: both channels decode from the verified
 ///   64 KiB register map (identical offsets — Tier 1 and Rocket share
 ///   it): the shared `MC_BIOS_REQ` core clock plus the per-channel
-///   `TC_*` blocks (per-register containment; the frozen [1, 2048]
-///   tick / [1, 4096] MHz sanity gates). Rocket Lake additionally
+///   `TC_*` blocks (per-register containment; the frozen [1, 4096] MHz
+///   sanity gate). Rocket Lake additionally
 ///   decodes `gear_mode` + `uclk_mhz` from `MC_BIOS_REQ[17:16]`
 ///   (Breakdown §3D, Gear2 cap). Breakdown §3B's Rocket Lake
 ///   CLK_RATIO widening is a no-op in code: [`decode_mclk`] already
-///   masks `[7:0]`.
+///   masks `[7:0]`. The MCLK ratio semantics inside [`decode_mclk`]
+///   are generation-keyed (the Alder Lake MC_BIOS_REQ decode): Tier 1
+///   = `ratio × refclk`, Rocket = `ratio × refclk / 2`.
 /// - **the Tier-3 Alder family** (`AlderLake` / `RaptorLake` /
 ///   `MeteorLake` / `ArrowLake` — IG-26): the decode-time subchannel
 ///   set is picked by OQ-11's DDR5 condition — **4 subchannels** when
@@ -1546,7 +1599,9 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 ///   descriptor; its effective [`MclRegs`] is the Research-line-329
 ///   mirror → MCL fallback ([`tier3_mcl_for`]); the widened DDR5
 ///   fields decode through [`decode_tier3_channel`] (per-register
-///   containment; the same [1, 2048] tick / [1, 4096] MHz gates); the
+///   containment; the same [1, 4096] MHz gates); the MCLK is the
+///   11th-gen-and-later half-step decode (`ratio × refclk / 2` — the
+///   Alder Lake MC_BIOS_REQ decode); the
 ///   gear cells layer on from `MC_BIOS_REQ[17:16]` on the profile's
 ///   `GearCap::Gear4` (Breakdown §3D: gear 4 on Alder / Meteor /
 ///   Arrow for LPDDR5X and high-speed DDR5; Research line 145:
@@ -1602,7 +1657,7 @@ pub fn decode(
         // the identical 64 KiB register map; Rocket additionally decodes
         // the gear cells.
         Some(p) if matches!(p.map, GenMap::Tier1 | GenMap::Rocket) => {
-            let mclk = decode_mclk(regs.mcbios_req);
+            let mclk = decode_mclk(regs.mcbios_req, gen);
             let mut channels = Vec::with_capacity(usize::from(p.channel_count));
             for i in 0..p.channel_count {
                 let per = match i {
@@ -1653,7 +1708,7 @@ pub fn decode(
             } else {
                 &[0, 2]
             };
-            let mclk = decode_mclk(regs.mcbios_req);
+            let mclk = decode_mclk(regs.mcbios_req, gen);
             // The gear cells are shared across subchannels (the same
             // MC_BIOS_REQ word): decode once, layer on every channel
             // (GearCap::Gear4 — the Alder profile; Breakdown §3D).
@@ -2632,12 +2687,13 @@ mod tests {
         }
     }
 
-    /// §6.1 step 4: `mcbios_req = 0x00000012` → ratio 18 × 133.3333 MHz
+    /// §6.1 step 4 (Tier 1 — the legacy physical-multiplier
+    /// semantics): `mcbios_req = 0x00000012` → ratio 18 × 133.3333 MHz
     /// = **2400 MHz** MCLK, **4800 MT/s** (for DDR, MT/s = MCLK × 2) —
     /// pinned exactly.
     #[test]
     fn acceptance_mcbios_req_decodes_2400_mhz_4800_mts() {
-        let mclk = decode_mclk(Some(0x0000_0012));
+        let mclk = decode_mclk(Some(0x0000_0012), IntelGen::Skylake);
         assert_eq!(mclk, Section::Value(2400.0));
         assert_eq!(
             mclk.value().copied().map(|v| v * 2.0),
@@ -2652,7 +2708,7 @@ mod tests {
     /// DDR4-2133) — within 0.01 MHz of the decimal value.
     #[test]
     fn decode_mclk_live_ddr4_2133_anchor() {
-        let mclk = decode_mclk(Some(0x0000_0008));
+        let mclk = decode_mclk(Some(0x0000_0008), IntelGen::Skylake);
         assert_eq!(mclk, Section::Value(8.0 * REF_CLK_133_MHZ));
         let mhz = mclk.value().copied().expect("ratio 8 decodes in-band");
         assert!((mhz - 1066.67).abs() < 0.01, "MCLK ≈ 1066.67 MHz, got {mhz}");
@@ -2762,24 +2818,33 @@ mod tests {
     // [1, 4096] MHz sanity gate.
     // -----------------------------------------------------------------
 
-    /// REF_CLK = 1 (100 MHz): ratio 18 × 100 = 1800 MHz, exact.
+    /// REF_CLK = 1 (100 MHz), Tier 1 (the legacy physical multiplier —
+    /// e.g. pre-Alder DDR4-3600 runs 18 × 100 MHz = 1800 MHz core):
+    /// ratio 18 × 100 = 1800 MHz, exact.
     #[test]
     fn decode_mclk_refclk_100_mhz() {
-        assert_eq!(decode_mclk(Some(0x0112)), Section::Value(1800.0));
+        assert_eq!(
+            decode_mclk(Some(0x0112), IntelGen::CoffeeLake),
+            Section::Value(1800.0)
+        );
         // ratio 31 with the 100 MHz ref: 3100.0 MHz (in-band, exact).
-        assert_eq!(decode_mclk(Some(0x011F)), Section::Value(3100.0));
+        assert_eq!(
+            decode_mclk(Some(0x011F), IntelGen::CoffeeLake),
+            Section::Value(3100.0)
+        );
     }
 
     /// A ratio of 0 is unconfigured → `Na(ParseError)`, never a 0 MHz
     /// value; an absent register degrades the same way.
     #[test]
     fn decode_mclk_zero_ratio_and_absent_register() {
+        // The containment is generation-independent (both Na).
         assert!(matches!(
-            decode_mclk(Some(0)),
+            decode_mclk(Some(0), IntelGen::Skylake),
             Section::Na(NaReason::ParseError(_))
         ));
         assert!(matches!(
-            decode_mclk(None),
+            decode_mclk(None, IntelGen::Skylake),
             Section::Na(NaReason::ParseError(_))
         ));
     }
@@ -2788,7 +2853,10 @@ mod tests {
     /// not affect the v1 mclk decode.
     #[test]
     fn decode_mclk_ignores_reserved_gear_bits_in_v1() {
-        assert_eq!(decode_mclk(Some(0x0003_0012)), Section::Value(2400.0));
+        assert_eq!(
+            decode_mclk(Some(0x0003_0012), IntelGen::Skylake),
+            Section::Value(2400.0)
+        );
     }
 
     /// The [1, 4096] MHz sanity gate bounds the displayed mclk: ratio 31
@@ -2799,24 +2867,81 @@ mod tests {
     /// stay in-band.
     #[test]
     fn decode_mclk_sanity_gate() {
+        // Tier 1 (the legacy full product sets the [1, 4096] bounds).
         assert!(matches!(
-            decode_mclk(Some(31)),
+            decode_mclk(Some(31), IntelGen::Skylake),
             Section::Na(NaReason::ParseError(_))
         ));
         assert!(matches!(
-            decode_mclk(Some(0x0129)),
+            decode_mclk(Some(0x0129), IntelGen::Skylake),
             Section::Na(NaReason::ParseError(_))
         ));
         assert!(matches!(
-            decode_mclk(Some(0x00FF)),
+            decode_mclk(Some(0x00FF), IntelGen::Skylake),
             Section::Na(NaReason::ParseError(_))
         ));
         assert!(matches!(
-            decode_mclk(Some(0x01FF)),
+            decode_mclk(Some(0x01FF), IntelGen::Skylake),
             Section::Na(NaReason::ParseError(_))
         ));
-        assert!(matches!(decode_mclk(Some(30)), Section::Value(_)));
-        assert!(matches!(decode_mclk(Some(0x0128)), Section::Value(_)));
+        assert!(matches!(
+            decode_mclk(Some(30), IntelGen::Skylake),
+            Section::Value(_)
+        ));
+        assert!(matches!(
+            decode_mclk(Some(0x0128), IntelGen::Skylake),
+            Section::Value(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // The Alder Lake MC_BIOS_REQ decode anchors (11th-gen-and-later
+    // half-step semantics): the real 12600KF word.
+    // -----------------------------------------------------------------
+
+    /// Live-hardware anchor (Alder Lake i5-12600KF, DDR4-3600 — the
+    /// reference device): the real `MC_BIOS_REQ` word 0x79E00124
+    /// (ratio 36, bit 8 = 1 → 100 MHz refclk, bits [17:16] = 00b →
+    /// gear 1; the upper PLL-tracking word is ignored by the decode)
+    /// resolves, under the 11th-gen-and-later half-step semantics, to
+    /// the true core clock 36 × 100 / 2 = **1800 MHz** — and the
+    /// reporters' standard DDR × 2 then yields **3600 MT/s** (not the
+    /// pre-fix 7200).
+    #[test]
+    fn decode_mclk_alder_12600kf_ddr4_3600_anchor() {
+        let mclk = decode_mclk(Some(0x79E0_0124), IntelGen::AlderLake);
+        assert_eq!(mclk, Section::Value(1800.0));
+        assert_eq!(
+            mclk.value().copied().map(|v| v * 2.0),
+            Some(3600.0),
+            "DDR: two transfers per DRAM clock = 3600 MT/s"
+        );
+    }
+
+    /// The same word through the full [`decode`] dispatch (Alder
+    /// Lake, the 2-channel DDR4 default): every decoded subchannel
+    /// carries 1800 MHz MCLK, gear One, UCLK 1800 — the reporters'
+    /// × 2 yields 3600 MT/s end to end.
+    #[test]
+    fn decode_alder_12600kf_word_end_to_end() {
+        let regs = IntelImcRegs {
+            mcbios_req: Some(0x79E0_0124),
+            ..IntelImcRegs::default()
+        };
+        let ro = decode(
+            &regs,
+            IntelGen::AlderLake,
+            Some(0),
+            None,
+            None,
+            &SmbiosTopology::empty(),
+        );
+        assert_eq!(ro.channels.len(), 2, "Alder Lake DDR4: two subchannels");
+        for ch in &ro.channels {
+            assert_eq!(ch.clocks.mclk_mhz, Section::Value(1800.0));
+            assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
+            assert_eq!(ch.clocks.uclk_mhz, Section::Value(1800.0));
+        }
     }
 
     // -----------------------------------------------------------------
@@ -2854,15 +2979,24 @@ mod tests {
         assert_eq!(mcbios_gear(0x0003_0000, GearCap::Gear4), Some(GearMode::Two), "11b (Gear4)");
     }
 
-    /// Breakdown §4 example A: DDR4-3200, gear 1 on a 100 MHz base —
-    /// `mcbios_req = 0x00000110` (ratio 16, REF_CLK = 100 MHz, bits
-    /// [17:16] = 00b) → gear One; mclk = 16 × 100 = 1600 MHz; uclk =
-    /// mclk (the 1:1 synchronous clock).
+    /// Breakdown §4 example A, re-pinned per the Alder Lake
+    /// MC_BIOS_REQ decode: DDR4-3200, gear 1 on a 100 MHz base on an
+    /// 11th-gen-and-later IMC (Rocket Lake) — `mcbios_req =
+    /// 0x00000020` (ratio 32 = 3200 / 100, REF_CLK = 100 MHz, bits
+    /// [17:16] = 00b) → gear One; mclk = 32 × 100 / 2 = 1600 MHz;
+    /// uclk = mclk (the 1:1 synchronous clock). The original
+    /// Breakdown word (ratio 16, `0x00000110`) was the
+    /// pre-restructure full-step encoding — on 11th-gen-and-later
+    /// hardware it decodes to 800 MHz / 1600 MT/s, so the DDR4-3200
+    /// configuration carries ratio 32.
     #[test]
     fn breakdown_example_a_gear1_100_mhz_base() {
-        let raw = 0x0000_0110;
+        let raw = 0x0000_0120;
         assert_eq!(mcbios_gear(raw, GearCap::Gear2), Some(GearMode::One));
-        let mclk = decode_mclk(Some(raw)).value().copied().expect("ratio 16 @ 100 MHz in-band");
+        let mclk = decode_mclk(Some(raw), IntelGen::RocketLake)
+            .value()
+            .copied()
+            .expect("ratio 32 @ 100 MHz in-band");
         let uclk = decode_uclk(mclk, &Section::Value(GearMode::One));
         assert!((mclk - 1600.0).abs() < 0.01, "mclk = 1600 MHz, got {mclk}");
         assert!(
@@ -2871,17 +3005,22 @@ mod tests {
         );
     }
 
-    /// Breakdown §4 example B: DDR4-3200, gear 1 on a 133.3333 MHz base
-    /// — `mcbios_req = 0x0000000C` (ratio 12, REF_CLK = 133.3333 MHz) →
-    /// gear One; mclk = 12 × 133.3333 = 1600 MHz; uclk = mclk.
+    /// Breakdown §4 example B, re-pinned per the Alder Lake
+    /// MC_BIOS_REQ decode: DDR4-3200, gear 1 on a 133.3333 MHz base on
+    /// an 11th-gen-and-later IMC (Rocket Lake) — `mcbios_req =
+    /// 0x00000018` (ratio 24 = 3200 / 133.3333, REF_CLK = 133.3333
+    /// MHz) → gear One; mclk = 24 × 133.3333 / 2 = 1600 MHz; uclk =
+    /// mclk. The original Breakdown word (ratio 12) is the
+    /// pre-restructure full-step encoding (800 MHz / 1600 MT/s on
+    /// 11th-gen-and-later hardware).
     #[test]
     fn breakdown_example_b_gear1_133_mhz_base() {
-        let raw = 0x0000_000C;
+        let raw = 0x0000_0018;
         assert_eq!(mcbios_gear(raw, GearCap::Gear2), Some(GearMode::One));
-        let mclk = decode_mclk(Some(raw))
+        let mclk = decode_mclk(Some(raw), IntelGen::RocketLake)
             .value()
             .copied()
-            .expect("ratio 12 @ 133.3333 in-band");
+            .expect("ratio 24 @ 133.3333 in-band");
         let uclk = decode_uclk(mclk, &Section::Value(GearMode::One));
         assert!((mclk - 1600.0).abs() < 0.01, "mclk = 1600 MHz, got {mclk}");
         assert!(
@@ -2890,18 +3029,22 @@ mod tests {
         );
     }
 
-    /// Breakdown §4 example C: DDR5-4800, gear 2 on a 133.3333 MHz base
-    /// — `mcbios_req = 0x00010012` (ratio 18, REF_CLK = 133.3333 MHz,
-    /// bit 16 = 1b) → gear Two; mclk = 18 × 133.3333 = 2400 MHz;
-    /// uclk = 2400 / 2 = 1200 MHz.
+    /// Breakdown §4 example C, re-pinned per the Alder Lake
+    /// MC_BIOS_REQ decode: DDR5-4800, gear 2 on a 133.3333 MHz base on
+    /// an Alder Lake IMC — `mcbios_req = 0x00010024` (ratio 36 = 4800
+    /// / 133.3333, REF_CLK = 133.3333 MHz, bit 16 = 1b) → gear Two;
+    /// mclk = 36 × 133.3333 / 2 = 2400 MHz; uclk = 2400 / 2 = 1200
+    /// MHz. The original Breakdown word (ratio 18) is the
+    /// pre-restructure full-step encoding (1200 MHz MCLK / 2400 MT/s
+    /// on 12th-gen-and-later hardware).
     #[test]
     fn breakdown_example_c_gear2_133_mhz_base() {
-        let raw = 0x0001_0012;
+        let raw = 0x0001_0024;
         assert_eq!(mcbios_gear(raw, GearCap::Gear4), Some(GearMode::Two));
-        let mclk = decode_mclk(Some(raw))
+        let mclk = decode_mclk(Some(raw), IntelGen::AlderLake)
             .value()
             .copied()
-            .expect("ratio 18 @ 133.3333 in-band");
+            .expect("ratio 36 @ 133.3333 in-band");
         let uclk = decode_uclk(mclk, &Section::Value(GearMode::Two));
         assert!((mclk - 2400.0).abs() < 0.01, "mclk = 2400 MHz, got {mclk}");
         assert!(
@@ -2910,39 +3053,50 @@ mod tests {
         );
     }
 
-    /// Breakdown §4 example D, pinned raw word `mcbios_req = 0x0003001E`:
-    /// bits [17:16] = 11b → the bit-16 rule = gear **Two** (not Four);
-    /// ratio 30, REF_CLK = 133.3333 MHz → mclk = 30 × 133.3333 = 4000
-    /// MHz; uclk = mclk / 2 = 2000 MHz.
+    /// Breakdown §4 example D, pinned raw word `mcbios_req =
+    /// 0x0003001E`, re-pinned per the Alder Lake MC_BIOS_REQ decode:
+    /// bits [17:16] = 11b → the bit-16 rule = gear **Two** (not
+    /// Four); ratio 30, REF_CLK = 133.3333 MHz on an Alder Lake IMC →
+    /// mclk = 30 × 133.3333 / 2 = 2000 MHz (data rate 4000 MT/s);
+    /// uclk = mclk / 2 = 1000 MHz. The original Breakdown reading
+    /// (4000 MHz MCLK / 2000 MHz UCLK) was the pre-restructure
+    /// full-step model.
     #[test]
     fn breakdown_example_d_gear2_11b_field() {
         let raw = 0x0003_001E;
         assert_eq!(mcbios_gear(raw, GearCap::Gear4), Some(GearMode::Two), "11b → gear 2");
-        let mclk = decode_mclk(Some(raw))
+        let mclk = decode_mclk(Some(raw), IntelGen::AlderLake)
             .value()
             .copied()
             .expect("ratio 30 @ 133.3333 in-band");
         let uclk = decode_uclk(mclk, &Section::Value(GearMode::Two));
-        assert!((mclk - 4000.0).abs() < 0.01, "mclk = 4000 MHz, got {mclk}");
+        assert!((mclk - 2000.0).abs() < 0.01, "mclk = 2000 MHz, got {mclk}");
         assert!(
             (mclk / 2.0 - uclk.value().copied().unwrap_or(0.0)).abs() < 0.01,
             "uclk = mclk / 2"
         );
         assert!(
-            (uclk.value().copied().unwrap_or(0.0) - 2000.0).abs() < 0.01,
-            "uclk = 2000 MHz"
+            (uclk.value().copied().unwrap_or(0.0) - 1000.0).abs() < 0.01,
+            "uclk = 1000 MHz"
         );
     }
 
     /// Breakdown §4 example D narrative register settings (DDR5-6000,
-    /// gear 2 on a 100 MHz base): `mcbios_req = 0x0003011E` (ratio 30,
-    /// REF_CLK = 100 MHz, bits [17:16] = 11b → gear Two) → mclk = 30 ×
-    /// 100 = 3000 MHz; uclk = 3000 / 2 = 1500 MHz.
+    /// gear 2 on a 100 MHz base), re-pinned per the Alder Lake
+    /// MC_BIOS_REQ decode: `mcbios_req = 0x0003013C` (ratio 60 = 6000
+    /// / 100, REF_CLK = 100 MHz, bits [17:16] = 11b → gear Two) →
+    /// mclk = 60 × 100 / 2 = 3000 MHz; uclk = 3000 / 2 = 1500 MHz.
+    /// The original Breakdown word (`0x0003011E`, ratio 30) is the
+    /// pre-restructure full-step encoding (1500 MHz MCLK on
+    /// 12th-gen-and-later hardware).
     #[test]
     fn breakdown_example_d_narrative_100_mhz_base() {
-        let raw = 0x0003_011E;
+        let raw = 0x0003_013C;
         assert_eq!(mcbios_gear(raw, GearCap::Gear4), Some(GearMode::Two));
-        let mclk = decode_mclk(Some(raw)).value().copied().expect("ratio 30 @ 100 MHz in-band");
+        let mclk = decode_mclk(Some(raw), IntelGen::AlderLake)
+            .value()
+            .copied()
+            .expect("ratio 60 @ 100 MHz in-band");
         let uclk = decode_uclk(mclk, &Section::Value(GearMode::Two));
         assert!((mclk - 3000.0).abs() < 0.01, "mclk = 3000 MHz, got {mclk}");
         assert!(
@@ -3078,7 +3232,10 @@ mod tests {
     #[test]
     fn tier3_ddr5_4800_pins_the_widened_40_class_values() {
         let mcl = tier3_ddr5_4800_mcl();
-        let mclk = decode_mclk(Some(0x0000_0012));
+        // DDR5-4800 on the 133.3333 MHz ref (the 11th-gen-and-later
+        // half-step encoding): ratio 36 = 4800 / 133.3333 →
+        // 36 × 133.3333 / 2 = 2400 MHz MCLK.
+        let mclk = decode_mclk(Some(0x0000_0024), IntelGen::AlderLake);
         assert_eq!(mclk, Section::Value(2400.0), "DDR5-4800: 2400 MHz MCLK");
         let ch = decode_tier3_channel(0, mclk, &mcl, &ALDER_CHANNELS[0]);
         assert_eq!(ch.index, 0);
@@ -3172,7 +3329,12 @@ mod tests {
     /// to honest `Na` — no panic, no garbage values (D5).
     #[test]
     fn tier3_all_absent_degrades_all_na() {
-        let ch = decode_tier3_channel(2, decode_mclk(None), &MclRegs::default(), &ALDER_CHANNELS[2]);
+        let ch = decode_tier3_channel(
+            2,
+            decode_mclk(None, IntelGen::AlderLake),
+            &MclRegs::default(),
+            &ALDER_CHANNELS[2],
+        );
         assert_eq!(ch.index, 2);
         assert!(ch.clocks.mclk_mhz.is_na(), "{:?}", ch.clocks.mclk_mhz);
         assert!(ch.clocks.uclk_mhz.is_na(), "{:?}", ch.clocks.uclk_mhz);
@@ -3229,7 +3391,12 @@ mod tests {
     fn tier3_per_register_containment() {
         let mut mcl = tier3_ddr5_4800_mcl();
         mcl.tc_pre = None;
-        let ch = decode_tier3_channel(1, decode_mclk(Some(0x0000_0012)), &mcl, &ALDER_CHANNELS[1]);
+        let ch = decode_tier3_channel(
+            1,
+            decode_mclk(Some(0x0000_0024), IntelGen::AlderLake),
+            &mcl,
+            &ALDER_CHANNELS[1],
+        );
         assert_eq!(ch.index, 1);
         for s in [
             &ch.timings.rcdrd,
@@ -3264,7 +3431,7 @@ mod tests {
     #[test]
     fn tier3_extraction_is_map_invariant_across_subchannels() {
         let mcl = tier3_ddr5_4800_mcl();
-        let mclk = decode_mclk(Some(0x0000_0012));
+        let mclk = decode_mclk(Some(0x0000_0024), IntelGen::AlderLake);
         let mut decoded = Vec::new();
         for (i, map) in ALDER_CHANNELS.iter().enumerate() {
             let ch = decode_tier3_channel(i as u8, mclk.clone(), &mcl, map);
@@ -3376,7 +3543,12 @@ mod tests {
         // The un-fallen mirror registers (absent here) stay absent.
         assert_eq!(mcl.tc_pre, None);
         // End to end: the decoded channel carries the MCL-sourced tCL.
-        let ch = decode_tier3_channel(0, decode_mclk(Some(0x0000_0012)), &mcl, &ALDER_CHANNELS[0]);
+        let ch = decode_tier3_channel(
+            0,
+            decode_mclk(Some(0x0000_0024), IntelGen::AlderLake),
+            &mcl,
+            &ALDER_CHANNELS[0],
+        );
         assert_eq!(ch.timings.cl, Section::Value(40), "tCL from 0xD004");
     }
 
@@ -3412,8 +3584,12 @@ mod tests {
         };
         let mcl2 = tier3_mcl_for(2, &ALDER_CHANNELS[2], &regs);
         assert_eq!(mcl2.tc_act, Some(0x0018_0410), "0x4804 valid -> mirror wins");
-        let ch =
-            decode_tier3_channel(2, decode_mclk(Some(0x0000_0012)), &mcl2, &ALDER_CHANNELS[2]);
+        let ch = decode_tier3_channel(
+            2,
+            decode_mclk(Some(0x0000_0024), IntelGen::AlderLake),
+            &mcl2,
+            &ALDER_CHANNELS[2],
+        );
         assert_eq!(ch.timings.cl, Section::Value(24), "tCL 24 from the mirror");
     }
 
@@ -3426,7 +3602,12 @@ mod tests {
     fn mirror_and_mcl_both_absent_degrade_to_parse_error() {
         let mcl = tier3_mcl_for(0, &ALDER_CHANNELS[0], &IntelImcRegs::default());
         assert_eq!(mcl, MclRegs::default());
-        let ch = decode_tier3_channel(0, decode_mclk(Some(0x0000_0012)), &mcl, &ALDER_CHANNELS[0]);
+        let ch = decode_tier3_channel(
+            0,
+            decode_mclk(Some(0x0000_0024), IntelGen::AlderLake),
+            &mcl,
+            &ALDER_CHANNELS[0],
+        );
         for s in [
             &ch.timings.cl,
             &ch.timings.rcdrd,
@@ -3815,11 +3996,13 @@ mod tests {
 
     /// The Tier-3 dispatch fixture with OQ-11's DDR5 condition met:
     /// all four mirror blocks populated, both `MAD_DIMM_CH2/CH3` raws
-    /// present and non-zero, `MC_BIOS_REQ = 0x0001_0012` (ratio 18 @
-    /// 133.3333 MHz → 2400 MHz, bit 16 → gear 2).
+    /// present and non-zero, `MC_BIOS_REQ = 0x0001_0024` (the 11th-
+    /// gen-and-later half-step encoding of DDR5-4800 on the 133.3333
+    /// MHz base: ratio 36 = 4800 / 133.3333 → 2400 MHz, bit 16 →
+    /// gear 2 — the Alder Lake MC_BIOS_REQ decode).
     fn tier3_ddr5_condition_regs() -> IntelImcRegs {
         IntelImcRegs {
-            mcbios_req: Some(0x0001_0012),
+            mcbios_req: Some(0x0001_0024),
             ch0: ddr5_mirror_block(),
             ch1: ddr5_mirror_block(),
             ch2: ddr5_mirror_block(),
@@ -3944,13 +4127,14 @@ mod tests {
     /// Gear 4 (Breakdown §3D: Alder / Meteor / Arrow for LPDDR5X and
     /// high-speed DDR5; Research line 145: >7200 MT/s) wires the
     /// `GearCap::Gear4` cap into the Tier-3 dispatch:
-    /// `MC_BIOS_REQ = 0x0002_0012` (ratio 18 @ 133.3333 MHz, bits
+    /// `MC_BIOS_REQ = 0x0002_0024` (ratio 36 @ 133.3333 MHz — the
+    /// 11th-gen-and-later half-step encoding → 2400 MHz, bits
     /// [17:16] = 10b) → gear **Four** → uclk = 2400 / 4 = **600 MHz**
     /// on every decoded subchannel.
     #[test]
     fn decode_tier3_gear4_uclk_is_mclk_over_four() {
         let mut regs = tier3_ddr5_condition_regs();
-        regs.mcbios_req = Some(0x0002_0012); // 10b + ratio 18
+        regs.mcbios_req = Some(0x0002_0024); // 10b + ratio 36
         for gen in [
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
@@ -3995,23 +4179,27 @@ mod tests {
     // arm, and the widened-width degradation arms.
     // -----------------------------------------------------------------
 
-    /// Breakdown §4 Example C, pinned verbatim under AlderLake
-    /// through the full Tier-3 `decode()` dispatch (DoD 3 — the CI
-    /// stand-in for the hardware acceptance): `MC_BIOS_REQ =
-    /// 0x0001_0012` — bit 8 = 0b (133.3333 MHz RefClk), multiplier
-    /// ratio 18 in the widened [7:0] field, bit 16 = 1b (Gear 2):
-    /// Step 1: MCLK = 18 × 133.3333 = **2400.0 MHz**; Step 2: data
+    /// Breakdown §4 Example C, pinned under AlderLake through the full
+    /// Tier-3 `decode()` dispatch (DoD 3 — the CI stand-in for the
+    /// hardware acceptance), re-pinned per the Alder Lake
+    /// MC_BIOS_REQ decode: `MC_BIOS_REQ = 0x0001_0024` — bit 8 = 0b
+    /// (133.3333 MHz RefClk), multiplier ratio 36 (= 4800 / 133.3333)
+    /// in the widened [7:0] field, bit 16 = 1b (Gear 2):
+    /// Step 1: MCLK = 36 × 133.3333 / 2 = **2400.0 MHz**; Step 2: data
     /// transfer rate = 2 × 2400 = **4800 MT/s** (Breakdown §3C);
     /// Step 3: Gear 2 → uclk = 2400 / 2 = **1200.0 MHz** — every
     /// decoded subchannel carries the identical shared cells.
+    /// (The original Breakdown word `0x0001_0012`, ratio 18, is the
+    /// pre-restructure full-step encoding — 1200 MHz MCLK / 2400
+    /// MT/s on 12th-gen-and-later hardware.)
     #[test]
     fn tier3_acceptance_example_c_pinned_under_alderlake() {
         // The dispatch fixture's `mcbios_req` is the Example C word
-        // verbatim (bit 8 = 0, ratio 18, bit 16 = 1).
+        // (bit 8 = 0, ratio 36, bit 16 = 1).
         assert_eq!(
             tier3_ddr5_condition_regs().mcbios_req,
-            Some(0x0001_0012),
-            "Example C register settings: 133.3333 MHz base, ratio 18, Gear 2"
+            Some(0x0001_0024),
+            "Example C register settings: 133.3333 MHz base, ratio 36, Gear 2"
         );
         let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 4, "DDR5 condition met -> 4 subchannels");
@@ -4043,8 +4231,8 @@ mod tests {
     #[test]
     fn tier3_acceptance_widened_fields_via_mcl_fallback() {
         let regs = IntelImcRegs {
-            // The Example C clock word (bit 8 = 0, ratio 18, bit 16 = 1).
-            mcbios_req: Some(0x0001_0012),
+            // The Example C clock word (bit 8 = 0, ratio 36, bit 16 = 1).
+            mcbios_req: Some(0x0001_0024),
             ch0: ChannelRegs {
                 tc_rap: Some(0xFFFF_FFFF), // 0x4004: mirror disabled
                 ..ChannelRegs::default()
@@ -4111,7 +4299,7 @@ mod tests {
             tc_wrwr: Some(0),
         };
         let regs = IntelImcRegs {
-            mcbios_req: Some(0x0001_0012), // the Example C clock word
+            mcbios_req: Some(0x0001_0024), // the Example C clock word
             ch0: ChannelRegs {
                 tc_dbp: Some(0xFFFF_FFFF), // all five paired mirrors disabled
                 tc_rap: Some(0xFFFF_FFFF),
@@ -4297,7 +4485,7 @@ mod tests {
         for gen in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
             let regs = IntelImcRegs::from_wide_reader(|off: usize| {
                 if off == MC_BIOS_REQ_OFFSET {
-                    Some(0x0001_0012)
+                    Some(0x0001_0024)
                 } else {
                     Some(0u32)
                 }
@@ -4639,10 +4827,14 @@ mod tests {
     }
 
     /// Rocket Lake through [`decode`]: the shared 64 KiB map decodes
-    /// identically for the same raws (every mclk / timing / CAD /
+    /// identically for the same ratio raws (every timing / CAD /
     /// voltage cell equal to the Tier-1 result), and the gear cells
     /// layer on from `MC_BIOS_REQ[17:16]` (Breakdown §3D, Gear2 cap):
-    /// bit 16 set → gear Two → uclk = mclk / 2.
+    /// bit 16 set → gear Two → uclk = mclk / 2. The MCLK itself is
+    /// generation-keyed (the Alder Lake MC_BIOS_REQ decode): the same
+    /// ratio 18 @ 133.3333 MHz is 2400 MHz on Tier 1 (the legacy
+    /// physical multiplier) and 1200 MHz on Rocket Lake (the
+    /// 11th-gen-and-later half-step — ratio 18 = 2400 MT/s data rate).
     #[test]
     fn decode_rocket_lake_is_tier1_map_plus_gear() {
         let tier1 = decode(&acceptance_regs(), IntelGen::Skylake, None, None, None, &SmbiosTopology::empty());
@@ -4651,8 +4843,10 @@ mod tests {
         let rocket = decode(&regs, IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(rocket.channels.len(), 2, "Rocket Lake: two channels");
         for (t, r) in tier1.channels.iter().zip(&rocket.channels) {
-            // Every shared-map cell is identical for the same raws.
-            assert_eq!(t.clocks.mclk_mhz, r.clocks.mclk_mhz, "mclk identical");
+            // The ratio cells are generation-keyed (see above); every
+            // other shared-map cell is identical for the same raws.
+            assert_eq!(t.clocks.mclk_mhz, Section::Value(2400.0), "Tier 1: ratio 18 full-step");
+            assert_eq!(r.clocks.mclk_mhz, Section::Value(1200.0), "Rocket: ratio 18 half-step");
             assert_eq!(t.clocks.fclk_mhz, r.clocks.fclk_mhz);
             assert_eq!(t.clocks.div_mode, r.clocks.div_mode);
             assert_eq!(t.clocks.gdm, r.clocks.gdm);
@@ -4666,19 +4860,23 @@ mod tests {
             assert_eq!(t.clocks.gear_mode, Section::na(NaReason::NotApplicable));
             assert_eq!(t.clocks.uclk_mhz, Section::na(NaReason::NotApplicable));
             assert_eq!(r.clocks.gear_mode, Section::Value(GearMode::Two));
-            assert_eq!(r.clocks.uclk_mhz, Section::Value(1200.0), "uclk = 2400 / 2");
+            assert_eq!(r.clocks.uclk_mhz, Section::Value(600.0), "uclk = 1200 / 2");
         }
     }
 
     /// Rocket Lake gear containment: gear bits `00b` → gear One (uclk =
     /// mclk, the synchronous default); an absent `MC_BIOS_REQ` degrades
     /// mclk, gear, and uclk to `Na(ParseError)` (never a bogus clock).
+    /// The 0x12 word (ratio 18 @ 133.3333 MHz) is half-step on
+    /// 11th-gen-and-later hardware: 1200 MHz MCLK (the Alder Lake
+    /// MC_BIOS_REQ decode).
     #[test]
     fn decode_rocket_lake_gear_containment() {
         let sync = decode(&acceptance_regs(), IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty()); // 0x12 → 00b
         for ch in &sync.channels {
+            assert_eq!(ch.clocks.mclk_mhz, Section::Value(1200.0), "ratio 18 half-step");
             assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
-            assert_eq!(ch.clocks.uclk_mhz, Section::Value(2400.0), "uclk = mclk (gear 1)");
+            assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "uclk = mclk (gear 1)");
         }
         let absent = decode(&IntelImcRegs::default(), IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
         for ch in &absent.channels {
@@ -4722,16 +4920,19 @@ mod tests {
     // parity (the 0x4020–0x402C turnaround quartets) is pinned below.
     // -----------------------------------------------------------------
 
-    /// Breakdown §4 Example A, verbatim, end-to-end under Rocket Lake:
-    /// `mcbios_req = 0x00000110` (bit 8 = 1b → 100 MHz RefClk, ratio
-    /// 16, bits [17:16] = 00b → Gear 1) → 16 × 100 = **1600 MHz**
+    /// Breakdown §4 Example A, end-to-end under Rocket Lake, re-pinned
+    /// per the Alder Lake MC_BIOS_REQ decode: `mcbios_req =
+    /// 0x00000120` (bit 8 = 1b → 100 MHz RefClk, ratio 32 = 3200 /
+    /// 100, bits [17:16] = 00b → Gear 1) → 32 × 100 / 2 = **1600 MHz**
     /// MCLK / **3200 MT/s** (DDR: ×2), uclk = mclk = **1600 MHz**
-    /// (the 1:1 synchronous clock) — on both channels, every shared-
-    /// map cell equal to the Tier-1 decode of the identical raws.
+    /// (the 1:1 synchronous clock) — on both channels. (The original
+    /// Breakdown word `0x00000110`, ratio 16, is the pre-restructure
+    /// full-step encoding — 800 MHz MCLK / 1600 MT/s on 11th-gen-and-
+    /// later hardware.)
     #[test]
     fn tier2_example_a_gear1_100_mhz_base_end_to_end() {
         let mut regs = acceptance_regs();
-        regs.mcbios_req = Some(0x0000_0110);
+        regs.mcbios_req = Some(0x0000_0120);
         let ro = decode(&regs, IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
@@ -4755,25 +4956,29 @@ mod tests {
         }
     }
 
-    /// Breakdown §4 Example D, verbatim, end-to-end under Rocket Lake:
-    /// the narrative register settings — bit 8 = 1b (100 MHz RefClk),
-    /// ratio 30, bit 16 = 1b (Gear 2), bit 17 clear — are the raw word
-    /// `mcbios_req = 0x0001011E` → 30 × 100 = **3000 MHz** MCLK /
+    /// Breakdown §4 Example D, end-to-end under Rocket Lake, re-pinned
+    /// per the Alder Lake MC_BIOS_REQ decode: the narrative register
+    /// settings — bit 8 = 1b (100 MHz RefClk), ratio 60 = 6000 / 100,
+    /// bit 16 = 1b (Gear 2), bit 17 clear — are the raw word
+    /// `mcbios_req = 0x0001013C` → 60 × 100 / 2 = **3000 MHz** MCLK /
     /// **6000 MT/s**, gear **Two** (the 01b field on the Gear2 cap),
-    /// uclk = 3000 / 2 = **1500 MHz** (Gear 2). (The 11b field variants
-    /// `0x0003001E` / `0x0003011E` follow the bit-16 rule to the same
-    /// gear Two and stay unit-pinned by IG-11's `breakdown_example_d_*`
-    /// tests; this is the Rocket arm's ratio-≤-32, bit-16-set /
-    /// bit-17-clear word, per plan IG-13.)
+    /// uclk = 3000 / 2 = **1500 MHz** (Gear 2). (The original
+    /// Breakdown word `0x0001011E`, ratio 30, is the pre-restructure
+    /// full-step encoding — 1500 MHz MCLK on 11th-gen-and-later
+    /// hardware; the 11b field variants `0x0003001E` / `0x0003003C`
+    /// follow the bit-16 rule to the same gear Two and stay
+    /// unit-pinned by IG-11's `breakdown_example_d_*` tests; this is
+    /// the Rocket arm's bit-16-set / bit-17-clear word, per plan
+    /// IG-13.)
     #[test]
     fn tier2_example_d_gear2_100_mhz_base_end_to_end() {
         let mut regs = acceptance_regs();
-        regs.mcbios_req = Some(0x0001_011E);
+        regs.mcbios_req = Some(0x0001_013C);
         let ro = decode(&regs, IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
             // §4 Example D numbers, pinned exactly.
-            assert_eq!(ch.clocks.mclk_mhz, Section::Value(3000.0), "mclk = 30 × 100 MHz");
+            assert_eq!(ch.clocks.mclk_mhz, Section::Value(3000.0), "mclk = 60 × 100 / 2");
             assert_eq!(
                 ch.clocks.mclk_mhz.value().copied().map(|v| v * 2.0),
                 Some(6000.0),
@@ -4829,9 +5034,12 @@ mod tests {
             assert_eq!(ch.timings.wrwr_sd, Section::Value(12), "dr");
             assert_eq!(ch.timings.wrwr_dd, Section::Value(16), "dd");
             // The 0x12 word (ratio 18 @ 133.3333 MHz, gear bits 00b)
-            // keeps the synchronous default.
+            // keeps the synchronous default; on 11th-gen-and-later
+            // hardware the ratio is half-step: 1200 MHz MCLK (the
+            // Alder Lake MC_BIOS_REQ decode).
+            assert_eq!(ch.clocks.mclk_mhz, Section::Value(1200.0), "ratio 18 half-step");
             assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
-            assert_eq!(ch.clocks.uclk_mhz, Section::Value(2400.0), "gear 1: uclk = mclk");
+            assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "gear 1: uclk = mclk");
         }
         // Shared-map proof: identical raws decode identically under
         // Tier 1 (only the gear cells differ — pinned above).
