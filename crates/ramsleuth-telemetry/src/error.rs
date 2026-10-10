@@ -165,6 +165,27 @@ pub enum NaReason {
     ParseError(String),
 }
 
+/// The stable, human-readable phrase of an [`NaReason`] (DAEMON-2): the
+/// single source for the N/A display text in the CLI `section_state`,
+/// the `ramsleuth-display` `na_cell_text` / `na_section_text` maps, and
+/// the standalone bin. A variant rename now changes a **pinned** string
+/// (the `TC-DAEMON2` byte-pin), not a silent `Debug` drift. The phrase
+/// is the bare reason (the `N/A (` prefix and the verbose section
+/// sentence are added by the presentation layer, not here).
+impl std::fmt::Display for NaReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let phrase = match self {
+            Self::UnsupportedHardware => "unsupported CPU",
+            Self::DriverMissing => "driver missing",
+            Self::InsufficientPrivilege => "insufficient privilege",
+            Self::UnknownPmTableVersion => "new PM table",
+            Self::NotApplicable => "not applicable",
+            Self::ParseError(_) => "decode failed",
+        };
+        f.write_str(phrase)
+    }
+}
+
 /// A single displayable telemetry cell: a value, or a structured "not
 /// available" reason.
 ///
@@ -456,5 +477,39 @@ mod tests {
         let back: Vec<Section<u16>> =
             bincode::deserialize(&bytes).expect("Section must deserialize");
         assert_eq!(sections, back);
+    }
+
+    /// TC-DAEMON2 (the stable-name byte-pin, telemetry side): the
+    /// [`NaReason`] / [`IntelGen`] / [`AmdZen`] `Display` impls are the
+    /// **stable** names the daemon `cpu_gen` wire string, the TUI/GUI
+    /// header, and the CLI render through (the single source). A variant
+    /// rename now changes a **pinned** string (a test failure), not a
+    /// silent `Debug` drift — `Display` is asserted distinct from
+    /// `Debug` for the spaced-name variants.
+    #[test]
+    fn tc_daemon2_display_is_the_stable_name_not_debug() {
+        use crate::cpuid::{AmdZen, IntelGen};
+        // The pinned stable names.
+        assert_eq!(IntelGen::AlderLake.to_string(), "Alder Lake");
+        assert_eq!(IntelGen::SapphireRapids.to_string(), "Sapphire Rapids");
+        assert_eq!(IntelGen::CoreSeries1Mobile.to_string(), "Core Series 1 Mobile");
+        assert_eq!(AmdZen::Zen5.to_string(), "Zen 5");
+        assert_eq!(NaReason::DriverMissing.to_string(), "driver missing");
+        assert_eq!(NaReason::UnsupportedHardware.to_string(), "unsupported CPU");
+        assert_eq!(NaReason::UnknownPmTableVersion.to_string(), "new PM table");
+        assert_eq!(NaReason::ParseError("x".to_owned()).to_string(), "decode failed");
+        // Display is NOT the Debug form (the silent-drift guard):
+        let ald_debug = format!("{:?}", IntelGen::AlderLake);
+        assert_ne!(
+            IntelGen::AlderLake.to_string(),
+            ald_debug,
+            "the spaced stable name must not equal the CamelCase Debug form"
+        );
+        let zen_debug = format!("{:?}", AmdZen::Zen5);
+        assert_ne!(
+            AmdZen::Zen5.to_string(),
+            zen_debug,
+            "the spaced stable name must not equal the Debug form"
+        );
     }
 }

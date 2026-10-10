@@ -50,19 +50,14 @@ const TITLE: &str = "RamSleuth - system memory telemetry";
 // its formatted value or `N/A (<reason>)` — the no-panic contract (D5).
 // ---------------------------------------------------------------------------
 
-/// The human-readable text of an absent cell: `N/A (<reason>)`.
-///
-/// [`NaReason`] carries no `Display` impl (the telemetry crate shows it via
-/// `Debug`), so the renderer owns this compact, user-presentable form.
+/// The human-readable text of an absent cell (WS-A, C3 single-source):
+/// the shared `ramsleuth-display` `na_cell_text` — the same compact
+/// `N/A (<reason>)` form the TUI/GUI render, so the same [`NaReason`]
+/// reads the same in every frontend (the [`NaReason::NotApplicable`]
+/// cell keeps the one bare `N/A`; the [`NaReason::ParseError`] payload
+/// stays on the wire, never the screen, D-4).
 fn na_cell(reason: &NaReason) -> String {
-    match reason {
-        NaReason::UnsupportedHardware => "N/A (unsupported hardware)".to_owned(),
-        NaReason::DriverMissing => "N/A (driver missing)".to_owned(),
-        NaReason::InsufficientPrivilege => "N/A (insufficient privilege)".to_owned(),
-        NaReason::UnknownPmTableVersion => "N/A (unknown PM table version)".to_owned(),
-        NaReason::NotApplicable => "N/A (not applicable)".to_owned(),
-        NaReason::ParseError(detail) => format!("N/A (parse error: {detail})"),
-    }
+    ramsleuth_display::na_cell_text(reason)
 }
 
 /// A bare displayable cell: the formatted value, or `N/A (<reason>)`.
@@ -159,7 +154,12 @@ fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
                 s.push_str(badge);
             }
             if let Some(vid) = v.requested_vid {
-                let delta_mv = (v.delivered_volts - vid) * 1000.0;
+                // CLI-2: the delta is the wire's `delta_volts` when
+                // present (the single source — the daemon computed it),
+                // falling back to the identity `delivered − vid` only
+                // when the wire omits it (an older daemon). The
+                // recompute no longer masks the wire value.
+                let delta_mv = v.delta_volts.unwrap_or(v.delivered_volts - vid) * 1000.0;
                 s.push_str(&format!(" (VID: {:.3} V, Δ {:+.0} mV)", vid, delta_mv));
             }
             s
@@ -304,11 +304,15 @@ fn voltages_rows(voltages: &VoltageSet) -> [(&str, String); 4] {
 
 /// The CPU vendor as a display string (the telemetry `CpuInfo` carries the
 /// vendor + brand only — family / stepping / feature flags are not part of
-/// the frozen snapshot, so nothing else is printed here).
+/// the frozen snapshot, so nothing else is printed here). The generation is
+/// its **stable** display name (DAEMON-2) — `Alder Lake`, `Zen 5`, … — the
+/// same string the daemon `cpu_gen` wire field, the TUI/GUI header, and the
+/// probe report use (a variant rename is a pinned test failure, not a
+/// silent `Debug` drift).
 fn vendor_text(vendor: &CpuVendor) -> String {
     match vendor {
-        CpuVendor::Amd(zen) => format!("AMD {zen:?}"),
-        CpuVendor::Intel(gen) => format!("Intel {gen:?}"),
+        CpuVendor::Amd(zen) => format!("AMD {zen}"),
+        CpuVendor::Intel(gen) => format!("Intel {gen}"),
         CpuVendor::Unknown => "unknown".to_owned(),
     }
 }
@@ -754,10 +758,13 @@ mod tests {
         assert!(text.contains("1600.00 MHz"));
         assert!(text.contains("1800.00 MHz"));
         assert!(text.contains("1:2"));
-        assert!(text.contains("N/A (not applicable)"));
+        // The AMD-not-applicable gear cell is the bare `N/A` (C3 single-
+        // source: `NotApplicable` keeps the one bare `N/A`, not the
+        // verbose old form).
+        assert!(!text.contains("N/A (not applicable)"));
         // AMD primary + tertiary timings
         assert!(text.contains("tCL     16"));
-        assert!(text.contains("N/A (parse error: fixture)"));
+        assert!(text.contains("N/A (decode failed)"));
         // AMD CAD bus (RZQ code resolved to ohms + a direct-ohms RTT)
         assert!(text.contains("RZQ/10 (24.0 Ω)"));
         assert!(text.contains("45.0 Ω"));
@@ -766,8 +773,8 @@ mod tests {
         assert!(text.contains("1.150 V"));
         assert!(text.contains("1.350 V"));
         assert!(text.contains("1.800 V"));
-        // Intel branch degraded on this AMD host
-        assert!(text.contains("N/A (unsupported hardware)"));
+        // Intel branch degraded on this AMD host (C3: `unsupported CPU`)
+        assert!(text.contains("N/A (unsupported CPU)"));
         // SPD modules (one DDR4 + one DDR5) with their profile lines
         assert!(text.contains("Module 0x52 (DDR4)"));
         assert!(text.contains("Module 0x53 (DDR5)"));
@@ -822,7 +829,7 @@ mod tests {
     fn intel_render_is_per_channel() {
         let text = render(&intel_populated());
 
-        assert!(text.contains("Intel AlderLake"));
+        assert!(text.contains("Intel Alder Lake"));
         // The readout-level channel mode from MAD_INTER_CHANNEL (the
         // fixture is Dual-Flex) leads the section.
         assert!(text.contains("channel mode  Dual-Channel (Flex)"));
@@ -831,7 +838,7 @@ mod tests {
         // channel 0: decoded clocks (ratio 160 → 1600 MHz) + RTL ticks
         assert!(text.contains("1600.00 MHz"));
         assert!(text.contains("1x")); // gear 1 (cmd1 bits 3:2 = 0)
-        assert!(text.contains("N/A (parse error: DRAM frequency ratio absent"));
+        assert!(text.contains("N/A (decode failed)"));
         // channel 0 RTL
         assert!(text.contains("RTL (ticks)  6"));
     }
@@ -974,5 +981,45 @@ mod tests {
         // Na (absent / enterprise / out-of-bounds) → plain N/A.
         let out = render_vcore(Section::na(NaReason::NotApplicable));
         assert!(out.contains("CPU Core Voltage: N/A"), "{out}");
+    }
+
+    /// TC-CLI2 (the CLI-2 confirming test): the vCore delta renders the
+    /// wire's `delta_volts` when present — a deliberately distinct value
+    /// (60 mV) wins over the recomputed `delivered − vid` (50 mV) that
+    /// pre-fix masked the wire value. When the wire omits it (`None`),
+    /// the identity fallback renders. Pre-fix the first two assertions
+    /// fail (the recompute's 50 mV is shown, not the wire's 60 mV).
+    #[test]
+    fn tc_cli2_wire_delta_volts_wins_over_recompute() {
+        // The wire delta (60 mV) is deliberately distinct from the
+        // `delivered − vid` identity (50 mV).
+        let line = vcore_display(&Section::Value(VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.250,
+            requested_vid: Some(1.200),
+            delta_volts: Some(0.060),
+            confidence: RailConfidence::VerifiedProfile,
+        }));
+        assert!(
+            line.contains("Δ +60 mV"),
+            "the wire delta (60 mV) must win over the recompute (50 mV): {line}"
+        );
+        assert!(
+            !line.contains("Δ +50 mV"),
+            "the recomputed 50 mV must not appear: {line}"
+        );
+
+        // The wire value absent (`None`) → the identity fallback (50 mV).
+        let fallback = vcore_display(&Section::Value(VoltageTelemetry {
+            rail_name: "CPU Vcore".to_owned(),
+            delivered_volts: 1.250,
+            requested_vid: Some(1.200),
+            delta_volts: None,
+            confidence: RailConfidence::VerifiedProfile,
+        }));
+        assert!(
+            fallback.contains("Δ +50 mV"),
+            "with no wire delta the identity delivered − vid renders: {fallback}"
+        );
     }
 }

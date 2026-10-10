@@ -2,6 +2,7 @@
 members = [
     "crates/ramsleuth-bench",
     "crates/ramsleuth-telemetry",
+    "crates/ramsleuth-display",
     "crates/ramsleuth-protocol",
     "crates/ramsleuth-daemon",
     "crates/ramsleuth-client",

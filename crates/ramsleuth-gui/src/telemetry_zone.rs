@@ -412,15 +412,10 @@ fn row(label: &str, display: String) -> (String, String) {
 /// ([`NaReason::NotApplicable`] — e.g. Intel voltages on AMD silicon,
 /// the AMD `gear` row) keeps the one bare `N/A` (explaining every
 /// structurally-absent field would be noise in the dense grid).
+/// The text is the shared `ramsleuth-display` `na_cell_text` (WS-A, C3)
+/// — the same compact per-cell form the TUI renders.
 pub(crate) fn na_text(reason: &NaReason) -> String {
-    match reason {
-        NaReason::NotApplicable => "N/A".to_owned(),
-        NaReason::UnsupportedHardware => "N/A (unsupported CPU)".to_owned(),
-        NaReason::DriverMissing => "N/A (driver missing)".to_owned(),
-        NaReason::InsufficientPrivilege => "N/A (insufficient privilege)".to_owned(),
-        NaReason::UnknownPmTableVersion => "N/A (new PM table)".to_owned(),
-        NaReason::ParseError(_) => "N/A (decode failed)".to_owned(),
-    }
+    ramsleuth_display::na_cell_text(reason)
 }
 
 /// The human text of a **whole-branch** degraded readout (the single
@@ -430,33 +425,10 @@ pub(crate) fn na_text(reason: &NaReason) -> String {
 /// and stating the daemon/driver state when that is the reassuring
 /// fact. The reason stays on the wire as [`NaReason`] (D-4); this
 /// text is the display.
+/// The text is the shared `ramsleuth-display` `na_section_text` (WS-A,
+/// C3) — the same verbose, self-explanatory section form the TUI renders.
 pub fn na_reason_text(reason: &NaReason) -> String {
-    match reason {
-        NaReason::UnsupportedHardware => {
-            "No data — this CPU doesn't expose the memory-controller registers RamSleuth reads. Expected on this part, not an error."
-                .to_owned()
-        }
-        NaReason::UnknownPmTableVersion => {
-            "No data — this CPU's memory-firmware version isn't in the supported set yet. The driver is loaded and working."
-                .to_owned()
-        }
-        NaReason::ParseError(_) => {
-            "No data — the register values couldn't be decoded on this platform."
-                .to_owned()
-        }
-        NaReason::DriverMissing => {
-            "No data — the required kernel driver isn't loaded. The daemon is up; use the Setup prompt to install it."
-                .to_owned()
-        }
-        NaReason::InsufficientPrivilege => {
-            "No data — this read needs more privilege than the daemon has."
-                .to_owned()
-        }
-        NaReason::NotApplicable => {
-            "No data — this section isn't available on this platform."
-                .to_owned()
-        }
-    }
+    ramsleuth_display::na_section_text(reason)
 }
 
 /// A memory-clock cell in the selected clock unit (C7-15): the

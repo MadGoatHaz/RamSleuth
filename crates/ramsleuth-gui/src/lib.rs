@@ -93,9 +93,13 @@ pub use style::{
 // and C7-21's child viewport renders `render_graphs_window` over the
 // shared state (a pure reader, D6).
 pub use graph::{
-    read_cpu_temp_c, record_graph_sample, render_graphs_window, GraphSample, GraphState,
-    GRAPH_CAPACITY,
+    record_graph_sample, render_graphs_window, GraphSample, GraphState, GRAPH_CAPACITY,
 };
+// FE-7: the CPU-temperature source scan is the shared
+// `ramsleuth-display` one (re-exported at the root so the poller keeps
+// its `crate::read_cpu_temp_c` path — the same scan the TUI renders
+// through, so the two frontends read the same temperature).
+pub use ramsleuth_display::read_cpu_temp_c;
 
 pub use update::{
     poll_telemetry, request_probe_report, run_bench, spawn_poller, BenchCmd, BenchState,

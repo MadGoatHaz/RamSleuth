@@ -2533,6 +2533,7 @@ name = "ramsleuth-client"
 version = "2.4.15"
 dependencies = [
  "ramsleuth-bench",
+ "ramsleuth-display",
  "ramsleuth-protocol",
  "ramsleuth-telemetry",
  "serde_json",
@@ -2547,6 +2548,14 @@ dependencies = [
  "ramsleuth-protocol",
  "ramsleuth-telemetry",
  "tokio",
+]
+
+[[package]]
+name = "ramsleuth-display"
+version = "2.4.15"
+dependencies = [
+ "ramsleuth-bench",
+ "ramsleuth-telemetry",
 ]
 
 [[package]]
@@ -2566,6 +2575,7 @@ dependencies = [
  "png",
  "ramsleuth-bench",
  "ramsleuth-client",
+ "ramsleuth-display",
  "ramsleuth-protocol",
  "ramsleuth-telemetry",
  "serde",
@@ -2598,6 +2608,7 @@ dependencies = [
  "crossterm",
  "ramsleuth-bench",
  "ramsleuth-client",
+ "ramsleuth-display",
  "ramsleuth-protocol",
  "ramsleuth-telemetry",
  "ratatui",

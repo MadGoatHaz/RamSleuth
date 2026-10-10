@@ -101,11 +101,15 @@ pub use graphs::{
     GraphSample,
     GraphState,
     record_graph_sample,
-    read_cpu_temp_c,
     window_samples,
     render_graphs_panel,
     GRAPH_CAPACITY,
 };
+// FE-7: the CPU-temperature source scan is the shared
+// `ramsleuth-display` one (re-exported at the root so the bin's poller
+// keeps its `ramsleuth_tui::read_cpu_temp_c` path — the same scan the
+// GUI renders through, so the two frontends read the same temperature).
+pub use ramsleuth_display::read_cpu_temp_c;
 
 // TUI-08: the SETUP requirements strip + the `[d]` screen's controls
 // block, re-exported at the root (workspace re-export style) —
