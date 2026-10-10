@@ -194,7 +194,7 @@ MCL-fallback path exists only via the `/dev/mem` 256 KiB path). The module
   the GUI's amber "one step left" (reboot → MOK enroll → re-click).
 - Non-Intel-safe: builds on AMD; load is a no-op (`-ENODEV` vendor gate);
   helper exits 0. CI fails on any compiler warning.
-- **Version:** the module's `MODULE_VERSION` tracks the release (2.4.14);
+- **Version:** the module's `MODULE_VERSION` tracks the release (2.4.15);
   the DKMS version is the workspace version for a source-checkout install
   and the documented `2.2.1` fallback for a package install (the installed
   copy has no workspace `Cargo.toml`).

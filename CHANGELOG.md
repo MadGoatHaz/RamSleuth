@@ -6,6 +6,18 @@ All notable per-release changes to RamSleuth. Newest first.
 
 ## [Unreleased]
 
+## [2.4.15] - 2026-10-09
+
+### Fixed
+- **Intel single-channel misreport (SMBIOS Type 17 read)** — the `intel_smbios` cross-check read the DMI entry *directory* itself (`fs::read` → `EISDIR` → an empty topology, so the L3 firmware override never fired and a populated dual-channel kit was reported `Single-Channel`). It now reads the kernel's `17-<n>/raw` directory layout with the real SMBIOS 3.5 field offsets per DMTF DSP0134 Table 76 (the `Size` word at `0x0C` — bit 15 clear = MB, set = KB, the `0x7FFF`/`0xFFFF` sentinels promoting to the Extended Size dword at `0x1C`; Device Locator `0x10`, Bank Locator `0x11`, Memory Type `0x12`), the 1-based string references (real tables carry no leading empty segment), and the new `Controller<digit>` channel grammar (`0`→`A` … `3`→`D`, tried before the standalone `A`–`D` rules) — so the L3 override now fires **Dual** on real dual-channel hardware. The masked unit tests are unmasked, not weakened: `write_entry` mirrors the kernel dir+raw layout, `type17_file` drops the injected leading empty string, and two verbatim 183-byte 12600KF `17-0`/`17-1` fixtures (from the reference host's `/sys/firmware/dmi/entries`) parse to 2 × 16 GiB DDR4 Dual, with `resolve_channel_l3_override_on_real_topology` proving the override on that real topology
+- **TUI graphs panel leaves stale zone values** — the panel's `inner` Rect is now blanked before the series rows paint (intra-frame layering — a `Block` is style-only and a `Paragraph` writes only its content width, so the zones painted earlier in the same fresh frame must be explicitly erased), and the ghosting guard is extended with `prev_graphs_shown` so the frame also clears on the `[g]` visible→hidden transition (`graph_panel_blanks_intra_frame_layering` proves none of the seeded glyphs survive)
+- **TUI probe-report consent is a proper modal** — `render_probe_overlay` now blanks the whole frame (default surface) for both open phases before dispatching, and `render_consent` pads each line to the box inner width, so the consent/preview text is fully readable instead of floating over the live dashboard (`consent_blanks_the_frame_around_the_box` + `preview_still_covers_the_full_frame`)
+- **Burn-in `m:ss` elapsed counter frozen between daemon ticks** — the counter now ticks live from a zone-local client clock (`BURN_IN_RUN_START`, the existing `NORMAL_RUN_START` pattern): latched on the burn-in start, rendered every 250 ms frame, backdated from the newest tick before the first frame, and cleared on terminal (`burn_in_row_uses_the_client_clock` + the fallback/clear tests; the status line and the burn-in row share the single source, so they can never disagree)
+- **vCore `[est]` on the ASRock Z690M-ITX/AX** — a curated `ASROCK_Z690M_ITX_AX` VRM profile (key `Z690M-ITX/AX`, `INTEL_VCORE_RAILS`) + registry line (with a match/negative-control test) lands the reference board in the verified-seed tier, so its badge flips `[est]` → verified via the existing single-source `RailConfidence::badge()` (no display change)
+
+### Known issues
+- **Intel MCLK reported doubled** — on Intel the memory clock is still shown doubled (a DDR4-3600 kit reads `7200 MT/s`); the `MC_BIOS_REQ` decode that would correct it is not yet confirmed, so the value ships as-is pending a follow-up patch.
+
 ## [2.4.14] - 2026-10-09
 
 ### Added
