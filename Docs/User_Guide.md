@@ -1,6 +1,6 @@
 # RamSleuth — User Guide
 
-**Version:** 2.4.13 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
+**Version:** 2.4.16 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
 
 RamSleuth v2 is a live RAM telemetry suite and a Memory & Latency Benchmark for
 AMD and Intel desktops. It watches your memory system in real time — clocks, the
@@ -74,8 +74,7 @@ memory controller's own state and shows it in a dense dashboard:
   part number, serial, rank, density, base speed, and the factory XMP/EXPO
   profiles stored on each module.
 
-**"How fast is it, really?"** RamSleuth ships a full, native memory & latency benchmark
-engine:
+**"How fast is it, really?"** RamSleuth ships a full, native Memory & Latency Benchmark:
 
 - A **4×4 grid** — tier rows (Memory/DRAM, L1, L2, L3) × metric columns
   (Read, Write, Copy, Latency), with bandwidth in GB/s and latency in
@@ -98,7 +97,7 @@ You can consume all of this from three frontends plus two standalone tools:
 |---|---|---|
 | `ramsleuth` (GUI) | The full desktop dashboard: live telemetry matrix, benchmark grid with Run/Cancel/burn-in, hardware & SPD cards, a dedicated graphs window, settings, and the one-click setup. | none — talks to the daemon over the socket |
 | `ramsleuth-tui` | The same dashboard in your terminal (ratatui): a 17-key control surface, graphs overlay, snapshot & JSON export. | none — talks to the daemon over the socket |
-| `ramsleuth-client` | The CLI: `dump` (the full telemetry listing), `bench` (a streamed benchmark run), `status` (per-section health). | none — talks to the daemon over the socket |
+| `ramsleuth-client` | The CLI: `dump` (the full telemetry listing), `bench` (a streamed benchmark run), `status` (per-section health), **`probe` (the consent-gated report), and `burn` (a burn-in soak)**. | none — talks to the daemon over the socket |
 | `ramsleuth-bench` | The standalone benchmark verification CLI — runs the 4×4 grid directly on this machine, no daemon. | none (just allocates memory) |
 | `ramsleuth-telemetry` | The standalone telemetry front end — reads the hardware directly and prints the full snapshot. | none (reads what it can without root; privileged fields show `N/A`) |
 | `ramsleuth-daemon` | The privileged backend that does the only privileged reads. | root with **`CAP_SYS_RAWIO` only** |
@@ -115,7 +114,7 @@ fields simply show a structured `N/A (<reason>)` and every process exits 0.
 
 ## 2. Installation
 
-RamSleuth is a pure-Rust Cargo workspace (8 crates: 7 product crates + the
+RamSleuth is a pure-Rust Cargo workspace (9 crates: 8 product crates + the
 `tools/gen-icon` dev tool), MIT-licensed, for x86_64 Linux. It is packaged for
 Arch Linux: a two-core AUR package model (`ramsleuth` source +
 `ramsleuth-bin` binary — both of which bundle **both vendor driver sources**,
@@ -133,8 +132,8 @@ unit `systemd/ramsleuth.service`, the systemd preset, the `ramsleuth` system
 group, the app-menu entry, the hicolor icons, the one-click setup helper
 (`ramsleuth-setup` + its polkit policy), and the two pinned vendor-driver
 helpers (`ramsleuth-install-ryzen-smu-dkms` for AMD and
-`ramsleuth-install-intel-dkms` for Intel). The `ramsleuth-protocol` crate is
-library-only and is never installed. The daemon is enabled and started
+`ramsleuth-install-intel-dkms` for Intel). The `ramsleuth-protocol` **and `ramsleuth-display`** crates are
+library-only and are never installed. The daemon is enabled and started
 automatically at the end of every install path.
 
 Choose your method below. If you are on Arch and just want it to work,
@@ -233,12 +232,12 @@ yay -S ramsleuth-intel-dkms  # Intel — live Intel subtimings (Section 10.5)
 The two **core** packages are deliberately distinct:
 
 - **`ramsleuth` — STABLE source.** Builds the workspace from the official
-  git tag `v$pkgver` (currently `v2.4.13`). A tag is a reproducible,
+  git tag `v$pkgver` (currently `v2.4.16`). A tag is a reproducible,
   auditable snapshot — this is the **default recommendation for production
   installs**. It compiles only the pinned repository (`--locked`), with no
   third-party code in the build.
 - **`ramsleuth-bin` — PRECOMPILED.** Downloads the release binary tarball
-  `ramsleuth-2.4.13-x86_64.tar.zst` from the official GitHub Release (pinned
+  `ramsleuth-2.4.16-x86_64.tar.zst` from the official GitHub Release (pinned
   by its `sha256sums`) and installs it as-is — **no build, no makedepends**.
   This is the **fastest install path**.
 
@@ -288,7 +287,7 @@ can build and install either package directly from the `packaging/`
 directories:
 
 ```sh
-cd packaging/ramsleuth      # STABLE source (builds from the v2.4.13 tag)
+cd packaging/ramsleuth      # STABLE source (builds from the v2.4.16 tag)
 # cd packaging/ramsleuth-bin   # PRECOMPILED (downloads the release tarball)
 makepkg -si
 ```
@@ -511,7 +510,7 @@ shows `Disconnected` with a hint, and the dashboard stays responsive.
 
 ### 4.1 The 3-line header
 
-**Line 1** — the title **`RamSleuth v2.4.13`**, a **platform tag**
+**Line 1** — the title **`RamSleuth v2.4.16`**, a **platform tag**
 (`[AMD AM4 Platform]` for Zen 1–3, `[AMD AM5 Platform]` for Zen 4/5,
 `[Intel LGA Platform]`, or a bare `[Platform]` when the vendor is unknown),
 the **daemon status** (`Daemon: Connected (IPC: /run/ramsleuth/ramsleuth.sock)`
@@ -905,6 +904,7 @@ verifying a machine in isolation (another box, a VM, a live USB session).
 ramsleuth-bench
 ramsleuth-bench --avx512        # force the AVX-512F kernel path
 ramsleuth-bench --json          # also print the grid as a JSON object
+ramsleuth-bench --latency       # run the latency pass only (the DRAM pointer-chase, no bandwidth cells)
 ramsleuth-bench -h              # help
 ```
 
@@ -931,8 +931,9 @@ L1                   897.50       823.00       851.50         1.1
 `{"read_gbps":[…],"write_gbps":[…],"copy_gbps":[…],"latency_ns":[…]}`,
 values in tier order Memory, L1, L2, L3.) `--avx512` forces the AVX-512F
 kernel path; on a CPU without AVX-512F it prints a note and **falls back to
-AVX2** — never a failure. Exit codes: `0` success, `1` a topology/benchmark
-failure, `2` an unknown flag.
+AVX2** — never a failure. `--latency` runs the latency-only target — just the
+pointer-chase pass, no bandwidth cells. Exit codes: `0` success, `1` a topology/
+benchmark failure, `2` an unknown flag.
 
 ### 7.2 `ramsleuth-telemetry` — the standalone telemetry front end
 
@@ -1756,6 +1757,6 @@ group, no socket, no driver.
 
 ---
 
-*This guide describes RamSleuth v2.4.13. For the technical design, see
+*This guide describes RamSleuth v2.4.16. For the technical design, see
 `Docs/Architecture.md`; for the packaging operator guide, see
 `packaging/README.md`.*

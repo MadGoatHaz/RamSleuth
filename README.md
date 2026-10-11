@@ -1,12 +1,12 @@
 # RamSleuth v2.4.16
 
-Live memory-controller telemetry and a native memory & latency benchmark engine for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
+Live memory-controller telemetry and a native Memory & Latency Benchmark for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
 
 ![RamSleuth — GUI and TUI](img/RamSleuth.png)
 
 ## What it is
 
-RamSleuth is an 8-crate Rust workspace (7 product crates + the `tools/gen-icon` dev tool) with two layers: **live telemetry** of the memory controller's operating state, and a **native memory & latency benchmark engine** for bandwidth and latency.
+RamSleuth is a 9-crate Rust workspace (8 product crates + the `tools/gen-icon` dev tool) with two layers: **live telemetry** of the memory controller's operating state, and a **native memory & latency benchmark engine** for bandwidth and latency.
 
 Every privileged read flows through a single root daemon that holds only `CAP_SYS_RAWIO` — all clients (the CLI, the TUI, the GUI) run fully unprivileged — and the no-panic contract means a missing driver, privilege, or piece of hardware never crashes anything: the affected fields render as a structured `N/A (<reason>)` and the process exits 0.
 
@@ -27,10 +27,10 @@ Every privileged read flows through a single root daemon that holds only `CAP_SY
 | Binary | What it is |
 | --- | --- |
 | `ramsleuth-daemon` | The privileged service — root with `CAP_SYS_RAWIO` only; serves telemetry, benchmark runs, and burn-in over a Unix socket. |
-| `ramsleuth-client` | The unprivileged CLI — `dump` (the telemetry listing), `bench` (the streamed 4×4 grid), `status` (the per-section health summary). |
+| `ramsleuth-client` | The unprivileged CLI — `dump` (the telemetry listing), `bench` (the streamed 4×4 grid), `status` (the per-section health summary), **`probe` (the consent-gated report), and `burn` (a burn-in soak)**. |
 | `ramsleuth-tui` | The live terminal dashboard (ratatui) — the full GUI in a 17-key terminal UI; the key map lives in the User Guide. |
 | `ramsleuth` | The desktop GUI (egui) — three-zone dashboard, dedicated graphs window, settings panel, and the one-click setup strip. |
-| `ramsleuth-bench` | Standalone benchmark — runs the 4×4 AVX2/AVX-512F grid directly; no daemon required. |
+| `ramsleuth-bench` | Standalone benchmark — runs the 4×4 AVX2/AVX-512F grid directly (**or just the latency pass with `--latency`**); no daemon required. |
 | `ramsleuth-telemetry` | Standalone snapshot — the full telemetry dashboard as one text (or `--json`) listing; no daemon required. |
 
 ## Installation
@@ -54,7 +54,7 @@ yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest i
 
 **AMD live subtimings:** the driver is **bundled** with the app — the in-app one-click (or `sudo ramsleuth-setup --with-dkms` / `sudo ramsleuth-install-ryzen-smu-dkms`) builds the pinned third-party `ryzen_smu` module **offline** from the vendored source; without it the AMD fields read `N/A (DriverMissing)` and everything else keeps serving. The standalone `ryzen-smu-dkms` AUR extra is **mutually exclusive** with the app packages — full details in the [User Guide](Docs/User_Guide.md).
 
-**Intel live subtimings (optional extra):** `yay -S ramsleuth-intel-dkms` provides RamSleuth's own in-repo `ramsleuth_intel` kernel module — DKMS-built for your running kernel, exposing the raw IMC registers over world-readable sysfs; source and dev-branch installs ship the helper directly (`sudo ramsleuth-install-intel-dkms`), and the one-click setup routes to it automatically on Intel hosts (the v2.4.13 release tarball and the `ramsleuth-bin` binary ship the `ramsleuth_intel` source + the helper). Without it the daemon falls back to the read-only `/dev/mem` MCHBAR map where the kernel permits, and the Intel fields read `N/A (DriverMissing)` where it does not — everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
+**Intel live subtimings (optional extra):** `yay -S ramsleuth-intel-dkms` provides RamSleuth's own in-repo `ramsleuth_intel` kernel module — DKMS-built for your running kernel, exposing the raw IMC registers over world-readable sysfs; source and dev-branch installs ship the helper directly (`sudo ramsleuth-install-intel-dkms`), and the one-click setup routes to it automatically on Intel hosts (the v2.4.16 release tarball and the `ramsleuth-bin` binary ship the `ramsleuth_intel` source + the helper). Without it the daemon falls back to the read-only `/dev/mem` MCHBAR map where the kernel permits, and the Intel fields read `N/A (DriverMissing)` where it does not — everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
 
 **Build from source:** `cargo build --workspace --release` — Rust MSRV 1.75, producing the 6 binaries above; system-library and per-path details in the [User Guide](Docs/User_Guide.md).
 
@@ -69,7 +69,7 @@ The full walkthrough — every zone, key, flag, N/A reason, and day-2 troublesho
 
 ## Documentation
 
-- [Architecture](Docs/Architecture.md) — the deep technical design: the two-layer model, the daemon and wire protocol, the 8-crate workspace map, every telemetry source, the benchmark engine, deployment, and testing/CI.
+- [Architecture](Docs/Architecture.md) — the deep technical design: the two-layer model, the daemon and wire protocol, the 9-crate workspace map, every telemetry source, the benchmark engine, deployment, and testing/CI.
 - [User Guide](Docs/User_Guide.md) — installation, first run, running the GUI / TUI / CLI / standalone tools, reading the data (clocks, subtimings, SPD/XMP/EXPO, N/A reasons), and day-2 troubleshooting.
 - [Packaging & AUR](packaging/README.md) — the two-package AUR model, the unified version-bump flow, the `ryzen-smu-dkms` extra, and the CI/release artifact contracts.
 - [Changelog](CHANGELOG.md) — release history.
