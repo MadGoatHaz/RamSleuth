@@ -292,8 +292,8 @@ const USAGE: &str = concat!(
     "ramsleuth — the RamSleuth live desktop dashboard (egui)\n",
     "\n",
     "Live RAM telemetry (AMD SMU / Intel IMC), SPD module details with\n",
-    "XMP/EXPO profiles, channel mode + ECC status, and the AIDA64-style\n",
-    "memory benchmark. Talks to the privileged ramsleuth-daemon over the\n",
+    "XMP/EXPO profiles, channel mode + ECC status, and the Memory &\n",
+    "Latency Benchmark. Talks to the privileged ramsleuth-daemon over the\n",
     "Unix socket (the daemon needs root / CAP_SYS_RAWIO; without it the\n",
     "privileged fields degrade to N/A).\n",
     "\n",
@@ -549,7 +549,7 @@ fn about_body() -> Vec<(&'static str, String)> {
     vec![
         (
             "What RamSleuth is",
-            "Live RAM telemetry + an AIDA64-style memory benchmark \
+            "Live RAM telemetry + a Memory & Latency Benchmark \
              for AMD and Intel desktops. Watch your memory in real \
              time — clocks, timings, voltages, channel mode, ECC — \
              and measure how fast your memory subsystem really is.".to_owned(),
@@ -570,7 +570,7 @@ fn about_body() -> Vec<(&'static str, String)> {
              \u{2022} SPD module details: part, serial, rank, speed, \
              XMP / EXPO profiles\n\
              \u{2022} Channel mode + ECC status (both platforms)\n\
-             \u{2022} AIDA64-style memory benchmark: read / write / \
+             \u{2022} Memory & Latency Benchmark: read / write / \
              copy / latency\n\
              \u{2022} Benchmark burn-in for stress testing\n\
              \u{2022} Probe report: a consent-gated snapshot for bug \
@@ -5320,7 +5320,7 @@ mod tests {
         );
         for needle in [
             "CAP_SYS_RAWIO",
-            "AIDA64-style memory benchmark",
+            "Memory & Latency Benchmark",
             "XMP / EXPO",
             "ECC",
             "burn-in",

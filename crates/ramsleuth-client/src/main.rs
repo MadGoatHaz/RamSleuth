@@ -12,7 +12,7 @@
 //!   exit-criterion command: full hardware timings against a running
 //!   daemon;
 //! - `bench`  → a streamed benchmark run (a progress line per completed
-//!   cell, then the terminal AIDA64-style 4×4 grid);
+//!   cell, then the terminal 4×4 grid);
 //! - `status` → the one-line-per-section health summary;
 //! - `probe`  → the consent-gated probe report (the TUI `[F]` / GUI
 //!   Probe parity): `GetProbeReport` → the chunk-2 markdown written to
@@ -45,8 +45,8 @@
 //!   dump     Print the dashboard-style telemetry listing (default):
 //!            CPU, the AMD / Intel sections, and the SPD modules with
 //!            XMP/EXPO profiles
-//!   bench    Run a streamed AIDA64-style memory bandwidth / latency
-//!            benchmark (progress lines + the 4x4 grid)
+//!   bench    Run a streamed Memory & Latency Benchmark
+//!            (progress lines + the 4x4 grid)
 //!   status   Print the per-section health summary
 //!   probe    Fetch the probe report from the daemon and write it as
 //!            markdown to ~/.ramsleuth/probe-report.md (--stdout prints
@@ -189,8 +189,8 @@ const USAGE: &str = concat!(
     "  dump     Print the dashboard-style telemetry listing (default):\n",
     "           CPU, the AMD / Intel sections, and the SPD modules with\n",
     "           XMP/EXPO profiles\n",
-    "  bench    Run a streamed AIDA64-style memory bandwidth / latency\n",
-    "           benchmark (progress lines + the 4x4 grid)\n",
+    "  bench    Run a streamed Memory & Latency Benchmark\n",
+    "           (progress lines + the 4x4 grid)\n",
     "  status   Print the per-section health summary\n",
     "  probe    Fetch the probe report from the daemon and write it as\n",
     "           markdown to ~/.ramsleuth/probe-report.md (--stdout\n",

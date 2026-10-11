@@ -11,7 +11,7 @@
 //! - benchmark orchestrator + result aggregation
 //!
 //! A standalone verification CLI (`src/main.rs`, `cargo run -p ramsleuth-bench`)
-//! printing the AIDA64-style grid is added in the final Phase 1 chunk.
+//! printing the 4×4 grid is added in the final Phase 1 chunk.
 //!
 //! The kernels require no third-party dependencies (`core::arch`
 //! intrinsics from the standard library); the worker dispatch (P1-08)
@@ -68,7 +68,7 @@ mod latency;
 pub use latency::build_chase_ring;
 
 // P1-10: benchmark orchestrator — runs all tiers × ops, aggregates the
-// AIDA64-style 4×4 grid, and materializes the 64-byte-strided chase buffer
+// 4×4 grid, and materializes the 64-byte-strided chase buffer
 // for true DRAM latency.
 mod orchestrator;
 pub use orchestrator::{BenchmarkGrid, Metric, OrchestratorError, Tier, run_all};

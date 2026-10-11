@@ -10,7 +10,7 @@
 //! (`BenchResult` / `BenchCancelled` / `Error`). Every event prints as
 //! it arrives (a `Full` run streams 12 progress lines over minutes —
 //! the user watches it live), and the terminal [`BenchmarkGrid`]
-//! renders through the pure [`render_grid`] (the AIDA64-style 4×4
+//! renders through the pure [`render_grid`] (the 4×4
 //! table: tier rows × Read/Write/Copy/Latency columns, GB/s + ns/hop
 //! per the Phase 1 unit convention, an unmeasured cell — `0.0` on the
 //! wire, the grid carries no Na arm — prints `N/A`).
@@ -891,7 +891,7 @@ mod tests {
     /// same top-to-bottom order the standalone `ramsleuth-bench` `main.rs`
     /// `ROWS` uses — so both frontends render the same [`BenchmarkGrid`]
     /// identically. Pre-fix the client used the ascending `Memory, L1, L2,
-    /// L3` order (a divergence from the standalone/AIDA64 convention).
+    /// L3` order (a divergence from the standalone/benchmark convention).
     #[test]
     fn tc_cli6_tier_order_matches_the_standalone_convention() {
         // The client's tier order is the descending convention.
