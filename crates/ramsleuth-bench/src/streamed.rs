@@ -18,7 +18,9 @@
 //!   pointer-chase latency passes (the complete 4×4 grid);
 //! - [`StreamTarget::Tier`] — the tier's three cells plus that tier's
 //!   latency pass;
-//! - [`StreamTarget::Cell`] — exactly one bandwidth cell.
+//! - [`StreamTarget::Cell`] — exactly one bandwidth cell;
+//! - [`StreamTarget::Latency`] — exactly one tier's pointer-chase latency
+//!   pass, no bandwidth cells (BENCH-G1: a latency-only run target).
 //!
 //! Unrequested cells stay `0.0` in the returned [`BenchmarkGrid`]. The
 //! latency pass is the widened median-of-3 kernel from P3-08
@@ -106,6 +108,10 @@ pub enum StreamTarget {
     Tier(Tier),
     /// Exactly one bandwidth cell.
     Cell(Tier, BenchOp),
+    /// Exactly one tier's pointer-chase latency pass (no bandwidth cells).
+    /// Appended at the tail (BENCH-G1, C6 append-only): the existing
+    /// `Full`/`Tier`/`Cell` discriminants are unchanged.
+    Latency(Tier),
 }
 
 /// Configuration for one streamed run.
@@ -528,47 +534,56 @@ fn run_cell_pass(
 ) -> Result<(), StreamError> {
     let mut cell_index = ctx.cell_index;
     for &tier in &TIER_ORDER {
-        // This tier's cells in global order (the list is tier-major).
+        // This tier's bandwidth cells in global order (the list is tier-major).
         let tier_ops: Vec<BenchOp> = setup
             .cells
             .iter()
             .filter_map(|(t, op)| (*t == tier).then_some(*op))
             .collect();
-        if tier_ops.is_empty() {
-            continue; // the target never touches this tier
+        // A tier is touched if it has bandwidth cells, or if the target
+        // covers it for its latency pass (Full / Tier(t) / Latency(t)).
+        // A latency-only target (BENCH-G1) has no bandwidth cells but
+        // still runs its tier's latency pass.
+        let covers = covers_full_tier(&setup.target, tier);
+        if tier_ops.is_empty() && !covers {
+            continue; // the target never touches this tier at all
         }
         let slot = tier as usize;
         let size = normalize_size(tier_size(&setup.plan, tier));
 
         // Bandwidth cells: one shared aligned src/dst window pair per
         // tier (mirroring `run_all_sized`: one allocation, one fill).
-        let mut src = AlignedBuf::new(size);
-        let mut dst = AlignedBuf::new(size);
-        fill_pattern(src.as_mut_slice());
-        for &op in &tier_ops {
-            // Gate: between cells.
-            ensure_not_cancelled(cancel)?;
-            let value =
-                bench_bandwidth(
-                    &setup.effective,
-                    op,
-                    src.as_slice(),
-                    dst.as_mut_slice(),
-                    setup.use_avx512,
-                )
-                .map_err(map_orchestrator_error)?;
-            set_bandwidth_cell(grid, slot, op, value);
-            emit_cell(tier, op, value, cell_index, setup.total_cells);
-            cell_index += 1;
+        // None for a latency-only target.
+        if !tier_ops.is_empty() {
+            let mut src = AlignedBuf::new(size);
+            let mut dst = AlignedBuf::new(size);
+            fill_pattern(src.as_mut_slice());
+            for &op in &tier_ops {
+                // Gate: between cells.
+                ensure_not_cancelled(cancel)?;
+                let value =
+                    bench_bandwidth(
+                        &setup.effective,
+                        op,
+                        tier,
+                        src.as_slice(),
+                        dst.as_mut_slice(),
+                        setup.use_avx512,
+                    )
+                    .map_err(map_orchestrator_error)?;
+                set_bandwidth_cell(grid, slot, op, value);
+                emit_cell(tier, op, value, cell_index, setup.total_cells);
+                cell_index += 1;
+            }
+            // Release both windows before the chase buffer so the per-tier
+            // peak stays at ~1× the tier size.
+            drop(src);
+            drop(dst);
         }
-        // Release both windows before the chase buffer so the per-tier
-        // peak stays at ~1× the tier size.
-        drop(src);
-        drop(dst);
 
-        // Latency: a per-tier measurement (not a cell) that runs only
-        // when the target covers the whole tier.
-        if covers_full_tier(&setup.target, tier) {
+        // Latency: a per-tier measurement (not a cell) that runs when the
+        // target covers the whole tier (Full / Tier(t) / Latency(t)).
+        if covers {
             // Gate: between the last bandwidth cell and the latency pass.
             ensure_not_cancelled(cancel)?;
             let ns = bench_latency(size, tier as u64 + 1);
@@ -600,7 +615,7 @@ fn tier_size(plan: &BufferPlan, tier: Tier) -> usize {
 }
 
 /// The target's cell list, tier-major, op-ordered (`Full` = 12,
-/// `Tier` = 3, `Cell` = 1).
+/// `Tier` = 3, `Cell` = 1, `Latency` = 0).
 fn cells_for_target(target: &StreamTarget) -> Vec<(Tier, BenchOp)> {
     match target {
         StreamTarget::Full => TIER_ORDER
@@ -609,16 +624,20 @@ fn cells_for_target(target: &StreamTarget) -> Vec<(Tier, BenchOp)> {
             .collect(),
         StreamTarget::Tier(tier) => OP_ORDER.iter().map(|&op| (*tier, op)).collect(),
         StreamTarget::Cell(tier, op) => vec![(*tier, *op)],
+        // A latency-only target runs no bandwidth cells (BENCH-G1).
+        StreamTarget::Latency(_) => Vec::new(),
     }
 }
 
-/// `true` when the target runs the whole tier (its three cells plus the
-/// latency pass): `Full` and `Tier(t)`; a single `Cell` never does.
+/// `true` when the target runs the tier's latency pass: `Full` (every
+/// tier), `Tier(t)` / `Latency(t)` (that tier); a single `Cell` never does.
 fn covers_full_tier(target: &StreamTarget, tier: Tier) -> bool {
     match target {
         StreamTarget::Full => true,
         StreamTarget::Tier(t) => *t == tier,
         StreamTarget::Cell(..) => false,
+        // A latency-only target runs exactly its tier's latency pass (BENCH-G1).
+        StreamTarget::Latency(t) => *t == tier,
     }
 }
 
@@ -1059,5 +1078,118 @@ mod tests {
         let back: Vec<BurnInTick> =
             bincode::deserialize(&bytes).expect("BurnInTick must deserialize");
         assert_eq!(back, ticks);
+    }
+
+    /// TC-BENCHG1 (a) (BENCH-G1): a latency-only target runs **no**
+    /// bandwidth cells (`cells_for_target` is empty) and the streamed run
+    /// performs exactly that tier's latency pass — the one new run-mode
+    /// gap the reframed goal surfaced (latency was untargetable alone).
+    #[test]
+    fn tc_benchg1_latency_target_runs_only_its_latency_pass() {
+        // No bandwidth cells for a latency-only target.
+        assert!(
+            cells_for_target(&StreamTarget::Latency(Tier::L3)).is_empty(),
+            "a latency-only target runs no bandwidth cells"
+        );
+        // The streamed run performs exactly the L3 latency pass.
+        let grid =
+            run_streamed(&options(StreamTarget::Latency(Tier::L3)), None)
+                .expect("a latency-only run must succeed");
+        assert!(grid.cell(Tier::L3, Metric::Latency) > 0.0, "the L3 latency pass ran");
+        // No bandwidth cells ran (any tier), and no other tier's latency ran.
+        for &tier in &TIER_ORDER {
+            for &op in &[Metric::Read, Metric::Write, Metric::Copy] {
+                assert_eq!(
+                    grid.cell(tier, op),
+                    0.0,
+                    "no bandwidth cells for a latency-only target ({tier:?}/{op:?})"
+                );
+            }
+        }
+        for &tier in &[Tier::Memory, Tier::L1, Tier::L2] {
+            assert_eq!(
+                grid.cell(tier, Metric::Latency),
+                0.0,
+                "only the targeted tier's latency pass ran ({tier:?})"
+            );
+        }
+    }
+
+    /// TC-BENCHG1 (b) (BENCH-G1): a burn-in with a `Latency` target
+    /// streams *only* latency `BurnInTick`s (no bandwidth ticks) — a soak
+    /// that stress-tests latency specifically, which had no scoping target
+    /// before this arm existed.
+    #[test]
+    fn tc_benchg1_latency_burn_in_streams_only_latency_ticks() {
+        let (tx, rx) = mpsc::channel();
+        let opts = BurnInOptions {
+            target: StreamTarget::Latency(Tier::Memory),
+            duration_minutes: 0, // infinite: stop via cancel
+            threads: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let cancel = opts.cancel.clone();
+        let run = std::thread::spawn(move || run_burn_in(&opts, Some(tx)));
+        let mut ticks = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(15)) {
+                Ok(t) => {
+                    ticks.push(t);
+                    if ticks.len() >= 3 {
+                        break;
+                    }
+                }
+                Err(_) => panic!("no burn-in ticks within the wait window"),
+            }
+        }
+        cancel.store(true, Ordering::Relaxed);
+        let result = run.join().expect("the run thread must finish");
+        assert!(
+            matches!(result, Err(StreamError::Cancelled)),
+            "a cancelled latency burn-in must return Cancelled, got {result:?}"
+        );
+        for t in &ticks {
+            assert_eq!(t.tier, Tier::Memory, "a Memory latency target only ticks Memory");
+            assert!(t.bandwidth.is_none(), "no bandwidth ticks for a latency-only target");
+            assert!(t.latency_ns.is_some(), "every tick is a latency tick");
+            assert!(t.latency_ns.unwrap() > 0.0, "the latency value is positive");
+        }
+    }
+
+    /// TC-BENCHG1 (c) (BENCH-G1, C6 append-only): the `StreamTarget` wire
+    /// encoding is append-only — the existing `Full`/`Tier`/`Cell`
+    /// discriminants are unchanged (0/1/2), and the new `Latency` arm is
+    /// appended at the tail (discriminant 3). Byte-pinning each arm's
+    /// bincode encoding means any reorder or renumber is a test failure
+    /// (a protocol version bump, never a silent change).
+    #[test]
+    fn tc_benchg1_streamtarget_wire_is_append_only() {
+        // Bincode encodes an enum as a u32 discriminant (LE) + fields.
+        let d = |n: u32| n.to_le_bytes();
+        assert_eq!(
+            bincode::serialize(&StreamTarget::Full).expect("Full"),
+            d(0).to_vec(),
+            "Full must keep discriminant 0"
+        );
+        assert_eq!(
+            bincode::serialize(&StreamTarget::Tier(Tier::Memory)).expect("Tier"),
+            [d(1), d(0)].concat(),
+            "Tier must keep discriminant 1 (+ Tier::Memory = 0)"
+        );
+        assert_eq!(
+            bincode::serialize(&StreamTarget::Cell(Tier::Memory, BenchOp::Read)).expect("Cell"),
+            [d(2), d(0), d(0)].concat(),
+            "Cell must keep discriminant 2 (+ Tier::Memory = 0, BenchOp::Read = 0)"
+        );
+        // The new arm is appended at the tail (discriminant 3).
+        assert_eq!(
+            bincode::serialize(&StreamTarget::Latency(Tier::Memory)).expect("Latency"),
+            [d(3), d(0)].concat(),
+            "Latency must be appended at discriminant 3 (+ Tier::Memory = 0)"
+        );
+        // Round-trip: the new arm deserializes back to itself.
+        let bytes = bincode::serialize(&StreamTarget::Latency(Tier::L3)).expect("Latency L3");
+        let back: StreamTarget = bincode::deserialize(&bytes).expect("Latency L3 round-trip");
+        assert_eq!(back, StreamTarget::Latency(Tier::L3));
     }
 }

@@ -1,14 +1,24 @@
-//! COPY bandwidth kernel (AVX2, 256-bit aligned loads + non-temporal stores).
+//! COPY bandwidth kernels (AVX2, 256-bit aligned loads + a store leg).
 //!
-//! **Chunk P1-06 — [COUPLED-TO: P1-01].** A pure copy loop over an
+//! **Chunk P1-06 — [COUPLED-TO: P1-01].** Two copy kernels over an
 //! already-aligned buffer pair: every 32-byte chunk is read from `src`
-//! with one aligned `_mm256_load_si256` (the P1-04 load shape) and
-//! written to `dst` with one `_mm256_stream_si256` (the P1-05
-//! non-temporal store shape — a store that bypasses the cache hierarchy
-//! and goes straight to DRAM, exactly the destination-write policy a
-//! copy-bandwidth benchmark wants), with a single trailing
-//! `_mm_sfence()` (the P1-05 tail) making every non-temporal store
-//! globally visible before the checksum pass reads `dst`.
+//! with one aligned `_mm256_load_si256` (the P1-04 load shape — the
+//! read leg is always cache-aligned, tier-correct), and written to `dst`
+//! with one of two store shapes:
+//!
+//! - [`avx2_copy`] — **non-temporal** stores (`_mm256_stream_si256`) that
+//!   bypass the cache hierarchy and go straight to DRAM, with a single
+//!   trailing `_mm_sfence()` (the P1-05 tail) making every store globally
+//!   visible. This is the **Memory-tier** copy path.
+//! - [`avx2_copy_resident`] — **cache-resident** aligned stores
+//!   (`_mm256_store_si256`) that go through the cache hierarchy (no
+//!   `_mm_sfence`). This is the **L1/L2/L3-tier** copy path.
+//!
+//! **Per-tier fidelity (BENCH-3):** the worker selects the copy's *write
+//! leg* by [`Tier`] (cache-resident for L1/L2/L3, NT for Memory) — the
+//! same tier-aware policy as the write kernel (BENCH-1) — so each cache
+//! tier's "Copy" cell is a true per-tier copy, not a cache-read +
+//! DRAM-write composite.
 //!
 //! **Dispatch (consumes the frozen P1-01 interface):** on an x86_64 host
 //! reporting AVX2 ([`CpuFeatures::detect`]) the SIMD body runs; on
@@ -43,17 +53,21 @@
 //! Tests allocate via `Layout::from_size_align(len, 32)`.
 
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{_mm256_load_si256, _mm256_stream_si256, _mm_sfence, __m256i};
+use core::arch::x86_64::{
+    _mm256_load_si256, _mm256_store_si256, _mm256_stream_si256, _mm_sfence, __m256i,
+};
 
 use crate::features::CpuFeatures;
 use crate::kernel_read::avx2_read;
 
-/// Copy the whole of `src` into `dst` and return the checksum of the
-/// destination after the copy: the P1-04 wrapping word-sum (mod 2^64)
-/// of `dst`'s little-endian 64-bit words, computed with the frozen
-/// [`avx2_read`] kernel (identical semantics on the SIMD and scalar
-/// paths; `0` for an empty/zeroed destination). See the module docs for
-/// dispatch, the checksum definition, and the frozen precondition.
+/// Copy the whole of `src` into `dst` with a **non-temporal** store leg
+/// and return the checksum of the destination after the copy: the P1-04
+/// wrapping word-sum (mod 2^64) of `dst`'s little-endian 64-bit words,
+/// computed with the frozen [`avx2_read`] kernel (identical semantics on
+/// the SIMD and scalar paths; `0` for an empty/zeroed destination). The
+/// NT write leg bypasses the cache → the **Memory-tier** copy path. See
+/// the module docs for dispatch, the checksum definition, and the frozen
+/// precondition.
 ///
 /// # Precondition
 ///
@@ -87,6 +101,59 @@ pub fn avx2_copy(src: &[u8], dst: &mut [u8]) -> u64 {
     // Scalar fallback: byte-identical destination contents; the
     // checksum is the same P1-04 word sum (`avx2_read` itself falls
     // back to its scalar form off-AVX2, so both paths agree).
+    scalar_copy(src, dst);
+    avx2_read(dst)
+}
+
+/// Copy the whole of `src` into `dst` with a **cache-resident** store
+/// leg and return the checksum of the destination after the copy: the
+/// P1-04 wrapping word-sum (mod 2^64) of `dst`'s little-endian 64-bit
+/// words, computed with the frozen [`avx2_read`] kernel (identical
+/// semantics to [`avx2_copy`]; `0` for an empty/zeroed destination). The
+/// aligned stores go through the cache → the **L1/L2/L3-tier** copy path
+/// (BENCH-3). See the module docs for dispatch and the frozen
+/// precondition.
+///
+/// # Precondition
+///
+/// `src` and `dst` must each be 32-byte aligned, both lengths a
+/// multiple of 32 and equal, and the ranges must not alias (asserted in
+/// debug builds; undefined behavior in release builds otherwise). The
+/// kernel does not realign internally.
+pub fn avx2_copy_resident(src: &[u8], dst: &mut [u8]) -> u64 {
+    debug_assert!(src.len() == dst.len(), "avx2_copy_resident: src.len() must equal dst.len()");
+    debug_assert!(
+        (src.as_ptr() as usize) % 32 == 0,
+        "avx2_copy_resident: src must be 32-byte aligned",
+    );
+    debug_assert!(
+        (dst.as_ptr() as usize) % 32 == 0,
+        "avx2_copy_resident: dst must be 32-byte aligned",
+    );
+    debug_assert!(
+        src.len() % 32 == 0,
+        "avx2_copy_resident: src.len() must be a multiple of 32",
+    );
+    debug_assert!(
+        src.as_ptr() as usize + src.len() <= dst.as_ptr() as usize
+            || dst.as_ptr() as usize + dst.len() <= src.as_ptr() as usize,
+        "avx2_copy_resident: src and dst must not alias",
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        if CpuFeatures::detect().avx2 {
+            // SAFETY: the debug_asserts above (and the documented
+            // precondition) guarantee 32-byte alignment on both sides,
+            // equal 32-multiple lengths, and disjoint ranges; `src`
+            // keeps its buffer valid for reads and `dst` for writes.
+            unsafe {
+                avx2_copy_resident_simd(src.as_ptr(), dst.as_mut_ptr(), src.len());
+            }
+            return avx2_read(dst);
+        }
+    }
+    // Scalar fallback: byte-identical destination contents; the
+    // checksum is the same P1-04 word sum.
     scalar_copy(src, dst);
     avx2_read(dst)
 }
@@ -137,6 +204,50 @@ unsafe fn avx2_copy_simd(src: *const u8, dst: *mut u8, len: usize) {
     // before the caller observes `dst` (placed after the last store,
     // mirroring the P1-05 tail).
     _mm_sfence();
+}
+
+/// AVX2 cache-resident body: unrolled 256-bit aligned loads from `src`
+/// interleaved with **aligned** (cache-resident) 256-bit stores into
+/// `dst` (no `_mm_sfence`). **L1/L2/L3-tier** copy path (BENCH-3).
+///
+/// # Safety
+///
+/// `src` must be 32-byte aligned and valid for reads of `len` bytes;
+/// `dst` must be 32-byte aligned and valid for writes of `len` bytes;
+/// `len` a multiple of 32; and the two spans must not alias (enforced
+/// by [`avx2_copy_resident`]'s debug asserts and documented
+/// precondition). Every load/store touches one 32-byte chunk strictly
+/// inside its span.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_copy_resident_simd(src: *const u8, dst: *mut u8, len: usize) {
+    // SAFETY: the caller (`avx2_copy_resident`) guarantees both pointers
+    // are 32-byte aligned, `len % 32 == 0`, `src` is valid for reads of
+    // `len` bytes, `dst` is valid for writes of `len` bytes, and the
+    // spans are disjoint; each intrinsic below therefore touches one
+    // 32-byte chunk strictly inside its valid, alignment-correct span.
+    let s = src as *const __m256i;
+    let d = dst as *mut __m256i;
+    let chunks = len / 32;
+    let mut i = 0;
+    // Unrolled main loop: four aligned loads and four aligned
+    // (cache-resident) stores per iteration, interleaved chunk by chunk.
+    while i + 4 <= chunks {
+        let v0 = _mm256_load_si256(s.add(i));
+        let v1 = _mm256_load_si256(s.add(i + 1));
+        let v2 = _mm256_load_si256(s.add(i + 2));
+        let v3 = _mm256_load_si256(s.add(i + 3));
+        _mm256_store_si256(d.add(i), v0);
+        _mm256_store_si256(d.add(i + 1), v1);
+        _mm256_store_si256(d.add(i + 2), v2);
+        _mm256_store_si256(d.add(i + 3), v3);
+        i += 4;
+    }
+    // Tail: the remaining 0-3 chunks.
+    while i < chunks {
+        _mm256_store_si256(d.add(i), _mm256_load_si256(s.add(i)));
+        i += 1;
+    }
 }
 
 /// Safe scalar fallback copying `src` into `dst` with contents
@@ -264,6 +375,42 @@ mod tests {
         let word = 0xA5A5_A5A5_A5A5_A5A5u64;
         assert_eq!(avx2_copy(src, dst), word.wrapping_mul(4));
         assert_eq!(dst, src, "destination must be byte-identical to the source");
+        dealloc_aligned(src_ptr, LEN);
+        dealloc_aligned(dst_ptr, LEN);
+    }
+
+    /// (d0) The cache-resident copy is byte-identical to the source and
+    /// checksums the same as the NT copy (only the store instruction
+    /// differs: `_mm256_store_si256` vs `_mm256_stream_si256`) — the
+    /// per-tier BENCH-3 L1/L2/L3 path.
+    #[test]
+    fn resident_copy_matches_nt_contents_and_checksum() {
+        const LEN: usize = 4 * 1024;
+        let src_ptr = aligned_zeroed(LEN);
+        // SAFETY: `src_ptr` is valid for `LEN` reads/writes (fresh allocation).
+        let src = unsafe { core::slice::from_raw_parts_mut(src_ptr, LEN) };
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let dst_ptr = aligned_zeroed(LEN);
+        // SAFETY: `dst_ptr` is valid for `LEN` writes (fresh allocation).
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, LEN) };
+        dst.fill(0);
+        let resident_checksum = avx2_copy_resident(src, dst);
+        assert_eq!(dst, src, "resident copy must be byte-identical to the source");
+        assert_eq!(resident_checksum, word_sum(src), "resident copy checksum = P1-04 word sum");
+        // The NT and resident copies agree on contents and checksum.
+        dst.fill(0);
+        let nt_checksum = avx2_copy(src, dst);
+        assert_eq!(resident_checksum, nt_checksum, "resident and NT copy checksums must agree");
+        assert_eq!(dst, src);
+        #[cfg(target_arch = "x86_64")]
+        if CpuFeatures::detect().avx2 {
+            dst.fill(0);
+            // SAFETY: the precondition holds by construction of `src`/`dst`.
+            unsafe { avx2_copy_resident_simd(src.as_ptr(), dst.as_mut_ptr(), LEN) };
+            assert_eq!(dst, src, "resident SIMD body must copy byte-identically");
+        }
         dealloc_aligned(src_ptr, LEN);
         dealloc_aligned(dst_ptr, LEN);
     }

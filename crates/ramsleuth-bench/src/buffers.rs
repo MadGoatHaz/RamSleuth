@@ -13,7 +13,11 @@
 //! | L2 (`l2`)       | host L2 size from sysfs; 1 MiB fallback           |
 //! | L3 (`l3`)       | one per-CCD slice ([`CpuTopology::ccd_l3_bytes`]) |
 //! | DRAM (`dram`)   | `max(256 MiB, 3 × total system L3)`               |
-//! | Ring (`latency_ring`) | fixed 128 MiB; the 64-byte chase stride is applied by the P1-09 kernel |
+//!
+//! The latency chase uses the **per-tier bandwidth size** (the DRAM
+//! chase buffer is `dram`, sized beyond L3) — there is no separate
+//! fixed latency ring (BENCH-4 removed the dead 128 MiB `latency_ring`
+//! field; the 64-byte chase stride is applied by the latency kernel).
 //!
 //! **L3 choice (documented):** the L3 bandwidth buffer is sized at the
 //! *per-CCD* granularity (`ccd_l3_bytes`), not the whole-socket total —
@@ -48,17 +52,16 @@ const L2_DEFAULT: u64 = 1024 * 1024;
 const DRAM_FLOOR: u64 = 256 * 1024 * 1024;
 /// DRAM is `max(DRAM_FLOOR, DRAM_L3_MULTIPLIER × total system L3)`.
 const DRAM_L3_MULTIPLIER: u64 = 3;
-/// Fixed pointer-chase latency ring size: 128 MiB.
-const LATENCY_RING: u64 = 128 * 1024 * 1024;
 /// sysfs root holding the per-CPU `cpuN/` directories.
 const SYSFS_CPU_ROOT: &str = "/sys/devices/system/cpu";
 
-/// Frozen buffer sizes (bytes) for the four bandwidth tiers plus the
-/// latency ring.
+/// Frozen buffer sizes (bytes) for the four bandwidth tiers.
 ///
 /// All fields are rounded up to a 64-byte multiple (and remain page-
 /// aligned). See the module docs for the sizing rules; this struct is
 /// sizing only — allocation happens in the worker/orchestrator chunks.
+/// The latency chase reuses the per-tier bandwidth size (no separate
+/// ring — BENCH-4 removed the dead 128 MiB `latency_ring` field).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferPlan {
     /// L1d-tier bandwidth buffer: host L1d size (32 KiB fallback).
@@ -68,16 +71,14 @@ pub struct BufferPlan {
     /// L3-tier bandwidth buffer: one per-CCD L3 slice.
     pub l3: usize,
     /// DRAM-tier bandwidth buffer: `max(256 MiB, 3 × total system L3)`.
+    /// Also the size of the DRAM latency chase buffer.
     pub dram: usize,
-    /// Pointer-chase latency ring: 128 MiB. The 64-byte chase stride is a
-    /// property of the P1-09 kernel, not of the ring's size.
-    pub latency_ring: usize,
 }
 
 /// Compute the buffer size plan for `topo`.
 ///
 /// Pure sizing, fallible-safe: L1d/L2 come from the host's sysfs when
-/// readable (documented defaults otherwise), and L3/DRAM/ring derive from
+/// readable (documented defaults otherwise), and L3/DRAM derive from
 /// the frozen [`CpuTopology`]. Never allocates buffers and never fails.
 pub fn plan(topo: &CpuTopology) -> BufferPlan {
     BufferPlan {
@@ -85,7 +86,6 @@ pub fn plan(topo: &CpuTopology) -> BufferPlan {
         l2: size_of(read_l2_size().unwrap_or(L2_DEFAULT)),
         l3: size_of(topo.ccd_l3_bytes),
         dram: size_of(dram_bytes(topo.total_l3_bytes)),
-        latency_ring: size_of(LATENCY_RING),
     }
 }
 
@@ -235,18 +235,33 @@ mod tests {
     fn all_sizes_are_64_byte_aligned() {
         for (total, ccd) in [(32 * MIB, 32 * MIB), (128 * MIB, 32 * MIB)] {
             let plan = plan(&synthetic_topo(total, ccd));
-            for size in [plan.l1, plan.l2, plan.l3, plan.dram, plan.latency_ring] {
+            for size in [plan.l1, plan.l2, plan.l3, plan.dram] {
                 assert_eq!(size % 64, 0, "size {size} is not 64-byte aligned");
             }
         }
     }
 
-    /// (d) The latency ring is exactly 128 MiB and 64-byte aligned.
+    /// (d) BENCH-4: the DRAM latency chase buffer is the per-tier
+    /// **bandwidth** size (`plan.dram`), not a separate 128 MiB ring — the
+    /// dead `latency_ring` field is gone (compile-level: it no longer
+    /// exists on [`BufferPlan`]).
     #[test]
-    fn latency_ring_is_128_mib_and_aligned() {
-        let plan = plan(&synthetic_topo(32 * MIB, 32 * MIB));
-        assert_eq!(plan.latency_ring, (128 * MIB) as usize);
-        assert_eq!(plan.latency_ring % 64, 0);
+    fn tc_bench4_dram_chase_is_the_bandwidth_size_not_a_128mib_ring() {
+        use crate::orchestrator::normalize_size;
+        let plan = plan(&synthetic_topo(32 * MIB, 32 * MIB)); // dram = 256 MiB
+        // The DRAM chase buffer is sized from `plan.dram` (the bandwidth
+        // size), rounded to a 64-byte multiple.
+        let dram_chase = normalize_size(plan.dram);
+        assert_eq!(
+            dram_chase, plan.dram,
+            "the DRAM chase buffer must be the bandwidth size (plan.dram)"
+        );
+        // And it is NOT the old dead 128 MiB latency ring.
+        assert_ne!(
+            dram_chase,
+            (128 * MIB) as usize,
+            "the DRAM chase buffer must not be the removed 128 MiB ring"
+        );
     }
 
     /// DRAM invariant (PLAN.md §1.2): always ≥ the 256 MiB floor and
@@ -333,7 +348,7 @@ mod tests {
             plan.l3 as u64 <= topo.ccd_l3_bytes + ALIGN_64,
             "L3 buffer more than one alignment step above the CCD slice"
         );
-        for size in [plan.l1, plan.l2, plan.l3, plan.dram, plan.latency_ring] {
+        for size in [plan.l1, plan.l2, plan.l3, plan.dram] {
             assert_eq!(size % 64, 0, "size {size} is not 64-byte aligned");
         }
     }

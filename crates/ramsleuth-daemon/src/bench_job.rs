@@ -472,13 +472,15 @@ fn release(active: &Mutex<ActiveSlot>, run_id: u64, busy: &AtomicBool) {
 /// requested target as-is; `MemoryOnly` restricts the run to the
 /// memory tier — `Full` / `Tier(·)` → the memory tier (its three cells
 /// plus its latency pass), `Cell(·, op)` → the memory tier's `op`
-/// cell (op preserved, tier clamped).
+/// cell (op preserved, tier clamped), `Latency(·)` → the memory tier's
+/// latency pass (BENCH-G1, tier clamped).
 fn mapped_target(target: StreamTarget, mode: BenchMode) -> StreamTarget {
     match mode {
         BenchMode::Full => target,
         BenchMode::MemoryOnly => match target {
             StreamTarget::Full | StreamTarget::Tier(_) => StreamTarget::Tier(Tier::Memory),
             StreamTarget::Cell(_, op) => StreamTarget::Cell(Tier::Memory, op),
+            StreamTarget::Latency(_) => StreamTarget::Latency(Tier::Memory),
         },
     }
 }
