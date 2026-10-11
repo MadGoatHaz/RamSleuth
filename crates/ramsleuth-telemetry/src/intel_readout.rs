@@ -160,6 +160,15 @@
 //! 256 KiB — routed by [`read_intel`] on the profile's map family));
 //! the skeleton path is not used by the live path.
 //!
+//! **Removal is gated (TEL-4):** the skeleton is known-wrong (the
+//! `IMC_FREQ_RATIO @ 0x5058` mis-location) but is retained **only**
+//! because the downstream GUI / TUI / client fixture code builds its
+//! synthetic [`IntelReadout`]s through [`decode_channel`]. Deleting it is a
+//! cross-workstream step: those fixtures (the frontend / client streams,
+//! not this telemetry-lib stream) must first be re-pointed to build through
+//! the live [`decode`] (or a purpose-built fixture constructor), after which
+//! the skeleton and its `decode_*` helpers can be removed.
+//!
 //! # Fixture tests (the CI stand-in for the hardware acceptance)
 //!
 //! The `tests` module pins the plan §6.1 Skylake acceptance numbers

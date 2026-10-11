@@ -198,7 +198,11 @@ pub fn collect_from(root: &Path) -> SmbiosTopology {
             topology.locators.push(locator);
         }
     }
-    topology.derived_mode = derive_mode(&topology.locators);
+    // Board-keyed channel grammar (TEL-3): the DMI board name selects the
+    // per-firmware `Controller<digit>` profile; absent → the vendor-neutral
+    // rules only.
+    let board = read_board_name(root);
+    topology.derived_mode = derive_mode(board.as_deref(), &topology.locators);
     topology
 }
 
@@ -298,33 +302,20 @@ fn string_at(table: &[u8], ref_idx: u8) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The channel designation (A–D) of a locator string, if one is present.
+/// The channel designation (A–D) of a locator string, if one is present
+/// (the **vendor-neutral** general grammar — TEL-3).
 ///
-/// Two grammars, tried in order:
+/// A standalone A–D letter token (e.g. `A` in `CPU0_DIMM_A`) or an A–D
+/// letter immediately followed by a digit (e.g. `A1`, `B2`). This
+/// distinguishes a channel designation from an A–D letter that is merely
+/// the start of a word (the `D` in `DIMM` is never a channel).
 ///
-/// 1. **`Controller<digit>`** (case-insensitive) — this firmware names
-///    its DIMMs `Controller0-ChannelA-DIMM0` / `Controller1-ChannelA-DIMM0`
-///    — *both* say "ChannelA"; the true channel is the **Controller**
-///    index: `0`→`A`, `1`→`B`, `2`→`C`, `3`→`D` (a digit above `3` is not
-///    a channel designation);
-/// 2. a standalone A–D letter token (e.g. `A` in `CPU0_DIMM_A`) or an A–D
-///    letter immediately followed by a digit (e.g. `A1`, `B2`). This
-///    distinguishes a channel designation from an A–D letter that is
-///    merely the start of a word (the `D` in `DIMM` is never a channel).
+/// The per-firmware `Controller<digit>` grammar is **not** here (TEL-3) —
+/// it is board-keyed (applied via [`channel_of_keyed`] for the boards in
+/// [`CONTROLLER_GRAMMAR_BOARDS`]), so a generic `…Controller0…` locator
+/// degrades to `None` (→ [`DerivedMode::Ambiguous`]) in the general path
+/// instead of short-circuiting to a confident channel.
 fn channel_of(locator: &str) -> Option<char> {
-    // Pass 1: the `Controller<digit>` grammar (0→A … 3→D).
-    for token in locator.split(|c: char| !c.is_alphanumeric()) {
-        if let Some(digit) = token
-            .to_ascii_lowercase()
-            .as_str()
-            .strip_prefix("controller")
-            .and_then(|rest| rest.parse::<u8>().ok())
-            .filter(|&d| d <= 3)
-        {
-            return Some(char::from(b'A' + digit));
-        }
-    }
-    // Pass 2: the standalone A–D letter rules.
     for token in locator.split(|c: char| !c.is_alphanumeric()) {
         let b = token.as_bytes();
         if b.is_empty() {
@@ -344,16 +335,68 @@ fn channel_of(locator: &str) -> Option<char> {
     None
 }
 
+/// The **board-specific** `Controller<digit>` → A/B/C/D grammar (TEL-3).
+///
+/// Some firmware (the 12600KF / Z690M-ITX/ax reference) names its DIMMs
+/// `Controller0-ChannelA-DIMM0` / `Controller1-ChannelA-DIMM0` — *both* say
+/// "ChannelA"; the true channel is the **Controller** index: `0`→`A`,
+/// `1`→`B`, `2`→`C`, `3`→`D` (a digit above `3` is not a channel
+/// designation). This is a per-firmware convention, **not** vendor-neutral,
+/// so it is applied only under a DMI-board-keyed profile
+/// ([`channel_of_keyed`]) — never in the general [`channel_of`].
+fn controller_digit_channel(locator: &str) -> Option<char> {
+    for token in locator.split(|c: char| !c.is_alphanumeric()) {
+        if let Some(digit) = token
+            .to_ascii_lowercase()
+            .as_str()
+            .strip_prefix("controller")
+            .and_then(|rest| rest.parse::<u8>().ok())
+            .filter(|&d| d <= 3)
+        {
+            return Some(char::from(b'A' + digit));
+        }
+    }
+    None
+}
+
+/// The DMI boards whose firmware uses the per-firmware
+/// `Controller<digit>` DIMM-locator grammar (TEL-3). Matched as a
+/// case-insensitive substring of the DMI `board_name`, mirroring
+/// [`crate::board_vrm::profile_for`].
+const CONTROLLER_GRAMMAR_BOARDS: &[&str] = &["z690m-itx/ax"];
+
+/// The board-keyed channel lookup (TEL-3): for a board in
+/// [`CONTROLLER_GRAMMAR_BOARDS`], the per-firmware
+/// [`controller_digit_channel`] grammar is tried first; otherwise (and as
+/// the fallback) the vendor-neutral [`channel_of`] rules apply. A `None`
+/// board (no DMI board name) uses the general rules only — a generic
+/// `…Controller0…` locator degrades to `None` (→ `Ambiguous`).
+fn channel_of_keyed(board: Option<&str>, locator: &str) -> Option<char> {
+    if let Some(board) = board {
+        let lowered = board.to_ascii_lowercase();
+        if CONTROLLER_GRAMMAR_BOARDS.iter().any(|key| lowered.contains(key)) {
+            if let Some(c) = controller_digit_channel(locator) {
+                return Some(c);
+            }
+        }
+    }
+    channel_of(locator)
+}
+
 /// Classify the populated DIMM locators into a [`DerivedMode`]:
 /// any ambiguous locator (no channel designation) → `Ambiguous`; ≥ 2
 /// distinct channels → `Dual`; a single channel → `Single`.
-fn derive_mode(locators: &[String]) -> DerivedMode {
+///
+/// `board` is the DMI board name (TEL-3): it keys the board-specific
+/// `Controller<digit>` grammar via [`channel_of_keyed`]; `None` (no board
+/// name) uses the vendor-neutral [`channel_of`] rules only.
+fn derive_mode(board: Option<&str>, locators: &[String]) -> DerivedMode {
     if locators.is_empty() {
         return DerivedMode::Ambiguous;
     }
     let mut channels = HashSet::new();
     for loc in locators {
-        match channel_of(loc) {
+        match channel_of_keyed(board, loc) {
             Some(c) => {
                 channels.insert(c);
             }
@@ -364,6 +407,23 @@ fn derive_mode(locators: &[String]) -> DerivedMode {
         0 => DerivedMode::Ambiguous,
         1 => DerivedMode::Single,
         _ => DerivedMode::Dual,
+    }
+}
+
+/// Read the DMI board name (the `id/board_name` file, a sibling of the
+/// `entries` directory that `root` points to) for the board-keyed
+/// `Controller<digit>` grammar (TEL-3). The canonical path is
+/// `/sys/firmware/dmi/id/board_name` (with `root` =
+/// `/sys/firmware/dmi/entries`). Any absence / unreadable file → `None`
+/// (the general vendor-neutral rules apply; no panic).
+fn read_board_name(root: &Path) -> Option<String> {
+    let base = root.parent()?;
+    let text = std::fs::read_to_string(base.join("id").join("board_name")).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
     }
 }
 
@@ -405,24 +465,39 @@ mod tests {
         f.write_all(bytes).expect("entry raw write");
     }
 
-    /// A temp directory (pid-scoped; removed on drop).
+    /// A temp DMI tree (pid-scoped; removed on drop). `root` is the
+    /// `entries` directory (holding the `17-*` structures); the DMI
+    /// `id/board_name` lives at `<base>/id/board_name` (a sibling of
+    /// `root`), so `read_board_name(root)` resolves it (TEL-3).
     struct TempDmi {
         root: std::path::PathBuf,
     }
 
     impl TempDmi {
         fn new(test: &str) -> Self {
-            let mut root = std::env::temp_dir();
-            root.push(format!("ramsleuth-dmi-{test}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).expect("dmi dir");
-            Self { root }
+            let base = std::env::temp_dir()
+                .join(format!("ramsleuth-dmi-{test}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(base.join("entries")).expect("dmi entries dir");
+            Self {
+                root: base.join("entries"),
+            }
+        }
+
+        /// Write the DMI `id/board_name` (a sibling of `root`) — the
+        /// board-keyed `Controller<digit>` grammar selector (TEL-3).
+        fn write_board_name(&self, name: &str) {
+            let id = self.root.parent().expect("base dir").join("id");
+            std::fs::create_dir_all(&id).expect("dmi id dir");
+            std::fs::write(id.join("board_name"), name).expect("board_name write");
         }
     }
 
     impl Drop for TempDmi {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            if let Some(base) = self.root.parent() {
+                let _ = std::fs::remove_dir_all(base);
+            }
         }
     }
 
@@ -609,30 +684,30 @@ const REAL_12600KF_17_1: &[u8] = &[
         assert_eq!(t, SmbiosTopology::empty());
     }
 
-    /// (j) The `channel_of` heuristic: a channel designation is recognized
-    /// (the `Controller<digit>` grammar, a single A–D letter,
-    /// letter+digit) but not an A–D letter that starts a word (`DIMM`,
-    /// `RAM`).
+    /// (j) The general `channel_of` heuristic (TEL-3: vendor-neutral rules
+    /// only): a standalone A–D letter or an A–D letter followed by a digit
+    /// is a channel designation; an A–D letter that starts a word (`DIMM`,
+    /// `RAM`) is not. The per-firmware `Controller<digit>` grammar is
+    /// **not** in the general path — a `…Controller0…` locator degrades to
+    /// `None` here (it is applied only under a board key, TC-TEL3).
     #[test]
     fn channel_of_recognizes_designations_only() {
-        // The `Controller<digit>` grammar (0→A … 3→D) — this firmware
-        // names both DIMMs "ChannelA"; the channel is the Controller
-        // index.
-        assert_eq!(channel_of("Controller0-ChannelA-DIMM0"), Some('A'));
-        assert_eq!(channel_of("Controller1-ChannelA-DIMM0"), Some('B'));
-        assert_eq!(channel_of("Controller2-ChannelA-DIMM0"), Some('C'));
-        assert_eq!(channel_of("Controller3-ChannelA-DIMM0"), Some('D'));
+        // Vendor-neutral rules.
         assert_eq!(channel_of("A2"), Some('A'));
         assert_eq!(channel_of("DIMM A1"), Some('A'));
         assert_eq!(channel_of("CPU0_DIMM_B"), Some('B'));
         assert_eq!(channel_of("Channel A Slot 1"), Some('A'));
-        // No channel designation (a digit above 3 is not a channel; an
-        // A–D letter that starts a word is not one either).
-        assert_eq!(channel_of("Controller4-ChannelA-DIMM0"), None);
+        // No channel designation: an A–D letter that starts a word is not
+        // one.
         assert_eq!(channel_of("DIMM 1"), None);
         assert_eq!(channel_of("Slot 1"), None);
         assert_eq!(channel_of("RAM"), None);
         assert_eq!(channel_of(""), None);
+        // TEL-3: the `Controller<digit>` grammar is board-keyed, so the
+        // GENERAL path does not short-circuit a `Controller0` locator to a
+        // confident channel — it degrades to `None` (→ `Ambiguous`).
+        assert_eq!(channel_of("Controller0-ChannelA-DIMM0"), None);
+        assert_eq!(channel_of("Controller1-ChannelA-DIMM0"), None);
     }
 
     /// (k) `string_at` extracts the right null-separated string — real
@@ -651,13 +726,17 @@ const REAL_12600KF_17_1: &[u8] = &[
 
     /// The real 12600KF / Z690M-ITX/ax table (SMBIOS 3.5, 92-byte fixed
     /// part, `17-<n>/raw`): both entries parse to 2 × 16 GiB DDR4 DIMMs
-    /// whose `ControllerN` locators derive `Dual` — the exact topology
-    /// the L3 firmware override consumes.
+    /// whose `ControllerN` locators derive `Dual` **under the board key**
+    /// (TEL-3 — the Z690M-ITX/ax firmware uses the per-firmware
+    /// `Controller<digit>` grammar) — the exact topology the L3 firmware
+    /// override consumes.
     #[test]
     fn real_12600kf_table_reports_dual() {
         let dmi = TempDmi::new("real-12600kf");
         write_entry(&dmi.root, 0, REAL_12600KF_17_0);
         write_entry(&dmi.root, 1, REAL_12600KF_17_1);
+        // The board name selects the `Controller<digit>` grammar (TEL-3).
+        dmi.write_board_name("ASRock Z690M-ITX/ax");
 
         let t = collect_from(&dmi.root);
         assert_eq!(t.populated_count, 2);
@@ -671,5 +750,61 @@ const REAL_12600KF_17_1: &[u8] = &[
             ]
         );
         assert_eq!(t.derived_mode, DerivedMode::Dual);
+    }
+
+    /// (TC-TEL3) The per-firmware `Controller<digit>` grammar is
+    /// board-keyed: a `…Controller0…` locator does **not** short-circuit to
+    /// a confident channel in the general path (no board name → it degrades
+    /// to `None` / `Ambiguous`), but it **does** resolve under the
+    /// DMI-keyed profile (the Z690M-ITX/ax board selects the grammar),
+    /// deriving `Dual` from the matched `Controller0` / `Controller1` pair.
+    #[test]
+    fn tc_tel3_controller_grammar_is_board_keyed() {
+        // General path: no board name → `Controller0` is not a channel
+        // designation (the vendor-neutral rules don't match it).
+        assert_eq!(channel_of("Controller0-ChannelA-DIMM0"), None);
+        assert_eq!(channel_of_keyed(None, "Controller0-ChannelA-DIMM0"), None);
+        // Two `ControllerN` locators with no board name → `Ambiguous`.
+        assert_eq!(
+            derive_mode(
+                None,
+                &[
+                    "Controller0-ChannelA-DIMM0".to_owned(),
+                    "Controller1-ChannelA-DIMM0".to_owned(),
+                ]
+            ),
+            DerivedMode::Ambiguous
+        );
+
+        // Board-keyed path: the Z690M-ITX/ax profile selects the
+        // `Controller<digit>` grammar → the pair resolves to `Dual`.
+        assert_eq!(
+            channel_of_keyed(Some("ASRock Z690M-ITX/ax"), "Controller0-ChannelA-DIMM0"),
+            Some('A')
+        );
+        assert_eq!(
+            channel_of_keyed(Some("ASRock Z690M-ITX/ax"), "Controller1-ChannelA-DIMM0"),
+            Some('B')
+        );
+        assert_eq!(
+            derive_mode(
+                Some("ASRock Z690M-ITX/ax"),
+                &[
+                    "Controller0-ChannelA-DIMM0".to_owned(),
+                    "Controller1-ChannelA-DIMM0".to_owned(),
+                ]
+            ),
+            DerivedMode::Dual
+        );
+
+        // End to end through `collect_from`: the same `ControllerN` table
+        // derives `Ambiguous` without a board name and `Dual` once the DMI
+        // board name is present.
+        let dmi = TempDmi::new("tel3-keyed");
+        write_entry(&dmi.root, 0, REAL_12600KF_17_0);
+        write_entry(&dmi.root, 1, REAL_12600KF_17_1);
+        assert_eq!(collect_from(&dmi.root).derived_mode, DerivedMode::Ambiguous);
+        dmi.write_board_name("ASRock Z690M-ITX/ax");
+        assert_eq!(collect_from(&dmi.root).derived_mode, DerivedMode::Dual);
     }
 }

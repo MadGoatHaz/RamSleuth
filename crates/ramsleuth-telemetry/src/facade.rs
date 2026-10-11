@@ -243,13 +243,20 @@ pub fn reason_from(e: &TelemetryError) -> NaReason {
 /// `absent()` state: both fields `Unknown`); so only `acquire` /
 /// `parse` can fail the branch: the error semantics are unchanged.
 fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
-    if !matches!(cpu.vendor, CpuVendor::Amd(_)) {
-        return Err(TelemetryError::UnsupportedHardware {
-            vendor: "AMD SMU telemetry requires AMD silicon".to_owned(),
-        });
-    }
+    // Generation-first (TEL-2): the CPUID `AmdZen` family is the primary
+    // PM-table decode key — thread it into `amd_pm::parse` (mirrors how the
+    // Intel branch keys on `IntelGen` via `intel_gen::profile_for`). A
+    // non-AMD / unknown-family vendor is rejected before any provider call.
+    let zen = match cpu.vendor {
+        CpuVendor::Amd(zen) => zen,
+        _ => {
+            return Err(TelemetryError::UnsupportedHardware {
+                vendor: "AMD SMU telemetry requires AMD silicon".to_owned(),
+            })
+        }
+    };
     let ctx = amd_smu::acquire()?;
-    let mut snap = amd_pm::parse(&ctx)?;
+    let mut snap = amd_pm::parse(&ctx, zen)?;
     // The no-panic overlay (P6-02, frozen): populates `gdm` + the 27
     // `timings` from the driver `smn` attribute when readable; never
     // fails the branch and never touches the PM-table fields.
