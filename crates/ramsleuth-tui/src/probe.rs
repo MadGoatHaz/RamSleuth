@@ -16,16 +16,14 @@
 //!   `Preview` (the scrollable markdown + a transient notice line —
 //!   the `[w]` write / `[c]` copy outcome — + the key footer).
 //! - [`render_probe_overlay`] — the overlay paint: drawn **last** by
-//!   [`crate::ui::render`], topmost, over the whole frame (the
-//!   graphs-overlay paint-order idiom — the dashboard renders
-//!   underneath first, the overlay wins the paint). While open it is
-//!   **modal**: it first blanks the whole frame to the terminal's
-//!   default surface (erasing the dashboard painted earlier in the
-//!   same fresh frame — a `Block` never erases symbols, §2.1), then
-//!   draws the phase. The consent is a centered 72×8 box whose lines
-//!   are padded to the inner width; the preview is a full-frame titled
-//!   block with the markdown as a scrolled [`Paragraph`], the notice
-//!   line, and the key footer.
+//!   [`crate::ui::render`], topmost (the graphs-overlay paint-order
+//!   idiom — the dashboard renders underneath first, the overlay wins
+//!   the paint). While open it is **modal**: each phase erases only the
+//!   region it occupies by construction via the single `blank_area`
+//!   idiom (FE-4) — the consent its centered box, the preview the whole
+//!   frame (a `Block` never erases symbols, §2.1) — then draws the
+//!   phase. The preview is a full-frame titled block with the markdown
+//!   as a scrolled [`Paragraph`], the notice line, and the key footer.
 //! - [`preview_max_scroll`] — the preview's scroll clamp (the
 //!   markdown's line count minus the visible text height — the same
 //!   layout the render draws): the main loop clamps the
@@ -167,38 +165,19 @@ pub fn render_probe_overlay(frame: &mut Frame, overlay: &ProbeOverlayState, area
     match overlay {
         ProbeOverlayState::None => {}
         ProbeOverlayState::Consent { .. } => {
-            // Modal: erase the dashboard painted earlier in this same
-            // fresh frame before the consent box draws (BUG 5 — the
-            // consent no longer floats over the live dashboard; a
-            // `Block` is style-only and never erases symbols).
-            blank_frame(frame, area);
+            // The consent erases only the region it occupies by
+            // construction (the centered box) via the single `blank_area`
+            // idiom (FE-4) — a `Block` is style-only and never erases
+            // symbols, so the box's own rect is cleared before it draws.
+            crate::graphs::blank_area(frame.buffer_mut(), box_area, SLATE);
             render_consent(frame, box_area)
         }
         ProbeOverlayState::Preview { markdown, notice, scroll } => {
-            // The preview covers the full frame; blanking first keeps
-            // both open phases symmetric (a clean modal surface).
-            blank_frame(frame, area);
+            // The preview's region IS the whole frame; blanking it to the
+            // terminal's default surface keeps both open phases a clean
+            // modal surface (FE-4 — the same single `blank_area` idiom).
+            crate::graphs::blank_area(frame.buffer_mut(), area, Color::Reset);
             render_preview(frame, markdown, notice, *scroll, box_area)
-        }
-    }
-}
-
-/// Blank the whole `area` to the terminal's default surface (symbol
-/// `' '`, no background — a bare frame): a `Block` is style-only
-/// (borders/title/bg via `set_style` — it never erases cell symbols)
-/// and a `Paragraph` writes only its content width, so the dashboard
-/// painted earlier in this same fresh frame must be explicitly erased
-/// before an open (modal) overlay draws (BUG 5 — the fresh-buffer
-/// intra-frame layering rule, §2.1).
-fn blank_frame(frame: &mut Frame, area: Rect) {
-    if area.is_empty() {
-        return;
-    }
-    let buf = frame.buffer_mut();
-    for y in area.y..area.y + area.height {
-        for x in area.x..area.x + area.width {
-            buf[(x, y)].set_symbol(" ");
-            buf[(x, y)].set_style(Style::default());
         }
     }
 }
@@ -255,38 +234,10 @@ fn render_consent(frame: &mut Frame, area: Rect) {
         Span::styled("no", Style::default().fg(LIGHT_GREY)),
     ]));
     lines.push(Line::from(""));
-    // Pad every line to the box's inner width: a `Paragraph` writes
-    // only its content width, so the trailing cells would otherwise
-    // keep whatever the block left behind — the box interior must be
-    // fully ours (BUG 5's defense-in-depth).
-    let lines: Vec<Line> = lines
-        .into_iter()
-        .map(|line| pad_line_to_width(line, inner.width))
-        .collect();
+    // The box interior was already erased by `blank_area` (FE-4 — the
+    // single per-surface idiom), so the `Paragraph`'s trailing cells are
+    // already blank — no line-padding defense-in-depth is needed.
     frame.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Pad a `Line` to exactly `width` cells: when the line's total content
-/// width is under `width`, extend its last span (or append a bare space
-/// span) with spaces so the trailing cells are explicit. Over-long
-/// lines are left untouched — the `Paragraph` truncates them at the
-/// area edge, so padding is safe.
-fn pad_line_to_width(mut line: Line, width: u16) -> Line {
-    let used: usize = line.spans.iter().map(|span| span.content.chars().count()).sum();
-    if (used as u16) >= width {
-        return line;
-    }
-    let pad = " ".repeat(width as usize - used);
-    match line.spans.last_mut() {
-        Some(last) => {
-            // `Cow<str>` has no `push_str`; rebuild the content as an
-            // owned string with the padding appended.
-            let content = format!("{}{}", last.content, pad);
-            last.content = std::borrow::Cow::Owned(content);
-        }
-        None => line.spans.push(Span::raw(pad)),
-    }
-    line
 }
 
 /// The markdown preview: the full-frame titled block — the report
@@ -661,15 +612,19 @@ mod tests {
     }
 
     /// (f′) BUG 5 — the consent is modal: the open overlay blanks the
-    /// whole frame (erasing the dashboard painted earlier in the same
-    /// fresh frame) before drawing the centered 72×8 box. Seed the
-    /// buffer with `'D'` glyphs (dashboard simulation), render the
-    /// consent, and assert (a) every cell **outside** the box is `' '`,
-    /// and (b) no `'D'` survives anywhere in the frame.
+    /// TC-FE4 (part 2 — an overlay clears only its own region, never the
+    /// whole screen): seed the buffer with `'D'` glyphs (a dashboard
+    /// simulation), render the consent overlay, and assert (a) every cell
+    /// **outside** the centered box still shows `'D'` (the dashboard
+    /// survives — the overlay did NOT clear the entire screen) and (b)
+    /// the box's own region is erased (no `'D'` inside). Pre-FE-4 the
+    /// consent blanked the whole frame (the old BUG 5 behavior); now it
+    /// clears only the region it occupies by construction, via the single
+    /// `blank_area` idiom.
     #[test]
-    fn consent_blanks_the_frame_around_the_box() {
-        let width = 100;
-        let height = 30;
+    fn tc_fe4_consent_clears_only_its_box_not_the_frame() {
+        let width = 100u16;
+        let height = 30u16;
         let overlay = ProbeOverlayState::Consent { markdown: fixture_markdown() };
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal must init");
@@ -682,28 +637,24 @@ mod tests {
                     }
                 }
                 render_probe_overlay(f, &overlay, Rect::new(0, 0, width, height));
-                // (b) No 'D' survives anywhere in the frame.
-                for y in 0..height {
-                    for x in 0..width {
-                        assert_ne!(
-                            f.buffer_mut()[(x, y)].symbol(),
-                            "D",
-                            "a dashboard glyph ('D') survived at ({x}, {y})"
-                        );
-                    }
-                }
-                // (a) Every cell outside the centered 72×8 box is blank.
                 let consent_box = overlay_area(Rect::new(0, 0, width, height), &overlay)
                     .expect("the consent box must fit a 100x30 frame");
                 for y in 0..height {
                     for x in 0..width {
                         let in_box = (consent_box.x..consent_box.x + consent_box.width).contains(&x)
                             && (consent_box.y..consent_box.y + consent_box.height).contains(&y);
-                        if !in_box {
+                        let sym = f.buffer_mut()[(x, y)].symbol();
+                        if in_box {
+                            assert_ne!(
+                                sym,
+                                "D",
+                                "the box's own region must be erased (no 'D' inside) at ({x}, {y})"
+                            );
+                        } else {
                             assert_eq!(
-                                f.buffer_mut()[(x, y)].symbol(),
-                                " ",
-                                "a non-blank cell survived outside the consent box at ({x}, {y})"
+                                sym,
+                                "D",
+                                "the dashboard 'D' must survive OUTSIDE the box (no full-frame clear) at ({x}, {y})"
                             );
                         }
                     }

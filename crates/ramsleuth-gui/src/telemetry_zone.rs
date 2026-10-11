@@ -1402,13 +1402,11 @@ mod tests {
     /// within [`ZONE_CONTENT_BUDGET`].
     #[test]
     fn renders_headlessly_without_panic_and_within_budget() {
-        // The zone's column allocation (main.rs: 55% of the panel
-        // width, clamped to `max_left` = avail − MIN_RIGHT_W −
-        // COLUMN_GAP): 952 × 0.55 ≈ 524 pt → 504 pt at the 968 pt
-        // default window (right column = MIN_RIGHT_W 440); the full
-        // 600 pt height = `DEFAULT_WINDOW_SIZE[1]` (main.rs, C13-01 —
-        // mirrored literal: a lib module cannot reference the bin's
-        // constant) — the zone lays out at its natural height (no
+        // The zone's test allocation: a representative 504 pt width
+        // (the zone's grid needs room for its label + value columns) ×
+        // the full 600 pt height = `DEFAULT_WINDOW_SIZE[1]` (main.rs,
+        // C13-01 — mirrored literal: a lib module cannot reference the
+        // bin's constant) — the zone lays out at its natural height (no
         // scroll area).
         const ZONE_W: f32 = 504.0;
         const ZONE_H: f32 = 600.0;

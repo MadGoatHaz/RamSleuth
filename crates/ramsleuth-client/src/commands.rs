@@ -53,8 +53,12 @@ use ramsleuth_telemetry::SystemMemoryTelemetry;
 
 use crate::client::{Client, ClientError};
 
-/// The grid's tier row order (the [`Tier`] discriminants, 0..4).
-const TIER_ORDER: [Tier; 4] = [Tier::Memory, Tier::L1, Tier::L2, Tier::L3];
+/// The grid's tier row order (CLI-6): the descending
+/// `Memory, L3, L2, L1` convention — the same top-to-bottom order the
+/// standalone `ramsleuth-bench` `main.rs` `ROWS` and the GUI/TUI grid use,
+/// so every frontend renders the same [`BenchmarkGrid`] in the same tier
+/// order (a deliberate match, not a divergence).
+const TIER_ORDER: [Tier; 4] = [Tier::Memory, Tier::L3, Tier::L2, Tier::L1];
 
 /// The grid's metric column order (the [`Metric`] discriminants, 0..4:
 /// the three bandwidth columns, then the latency column).
@@ -109,9 +113,9 @@ fn cell_text(grid: &BenchmarkGrid, tier: &Tier, metric: &Metric) -> String {
 /// ```text
 ///         Read         Write        Copy         Latency
 /// Memory  512.00 GB/s  410.00 GB/s  455.00 GB/s  88.00 ns/hop
-/// L1      897.50 GB/s  823.00 GB/s  851.50 GB/s   1.10 ns/hop
-/// L2      402.00 GB/s  311.50 GB/s  349.00 GB/s   3.40 ns/hop
 /// L3      198.50 GB/s  152.00 GB/s  176.50 GB/s  12.70 ns/hop
+/// L2      402.00 GB/s  311.50 GB/s  349.00 GB/s   3.40 ns/hop
+/// L1      897.50 GB/s  823.00 GB/s  851.50 GB/s   1.10 ns/hop
 /// ```
 ///
 /// (a partial target prints `N/A` where its cells never ran)
@@ -886,13 +890,38 @@ mod tests {
         assert!(lines[0].contains("Copy"), "got: {text}");
         assert!(lines[0].contains("Latency"), "got: {text}");
         assert!(lines[1].starts_with("Memory"), "got: {text}");
-        assert!(lines[2].starts_with("L1"), "got: {text}");
+        assert!(lines[2].starts_with("L3"), "got: {text}");
         assert!(lines[3].starts_with("L2"), "got: {text}");
-        assert!(lines[4].starts_with("L3"), "got: {text}");
+        assert!(lines[4].starts_with("L1"), "got: {text}");
         assert!(lines[1].contains("512.00 GB/s"), "got: {text}");
         assert!(lines[1].contains("88.00 ns/hop"), "got: {text}");
-        assert!(lines[4].contains("12.70 ns/hop"), "got: {text}");
+        assert!(lines[2].contains("12.70 ns/hop"), "got: {text}");
         assert!(!text.contains("N/A"), "a full grid has no N/A cells, got: {text}");
+    }
+
+    /// TC-CLI6 (the tier-order confirming test): the client `render_grid`
+    /// tier order is the descending `Memory, L3, L2, L1` convention — the
+    /// same top-to-bottom order the standalone `ramsleuth-bench` `main.rs`
+    /// `ROWS` uses — so both frontends render the same [`BenchmarkGrid`]
+    /// identically. Pre-fix the client used the ascending `Memory, L1, L2,
+    /// L3` order (a divergence from the standalone/AIDA64 convention).
+    #[test]
+    fn tc_cli6_tier_order_matches_the_standalone_convention() {
+        // The client's tier order is the descending convention.
+        assert_eq!(
+            TIER_ORDER,
+            [Tier::Memory, Tier::L3, Tier::L2, Tier::L1],
+            "the client grid tier order is Memory, L3, L2, L1"
+        );
+        // The rendered grid's rows come out in that order (the bench
+        // `main.rs` `ROWS` = [Memory, L3, L2, L1] — the same top-to-bottom
+        // order).
+        let text = render_grid(&full_grid());
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].starts_with("Memory"), "row 1: {text}");
+        assert!(lines[2].starts_with("L3"), "row 2: {text}");
+        assert!(lines[3].starts_with("L2"), "row 3: {text}");
+        assert!(lines[4].starts_with("L1"), "row 4: {text}");
     }
 
     /// (h) `render_grid` on a partial grid (a single-cell run): the one

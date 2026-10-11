@@ -812,7 +812,7 @@ throughout.
 ## 6. Running the CLI (`ramsleuth-client`)
 
 The CLI is the unprivileged command-line client — the same daemon socket,
-three subcommands. If you omit the subcommand, `dump` runs.
+five subcommands. If you omit the subcommand, `dump` runs.
 
 ```text
 Usage: ramsleuth-client [SUBCOMMAND] [OPTIONS]
@@ -821,19 +821,29 @@ Subcommands:
   dump     Print the dashboard-style telemetry listing (default)
   bench    Run a streamed benchmark (progress lines + the 4x4 grid)
   status   Print the per-section health summary
+  probe    Fetch the consent-gated probe report (markdown to
+           ~/.ramsleuth/probe-report.md; --stdout prints it; --json
+           emits the raw ProbeReport)
+  burn     Start a burn-in soak (--duration <minutes>, 0 = infinite)
 
 Options:
   --socket <path>                  Daemon Unix socket
                                    (default: /run/ramsleuth/ramsleuth.sock)
-  --tier <memory|l1|l2|l3|full>    Benchmark tier scope (default: full)
-  --mode <full|memory-only>        Benchmark scope (default: full)
+  --tier <memory|l1|l2|l3|full>    bench: tier scope (default: full)
+  --mode <full|memory-only>        bench: run scope (default: full)
+  --stdout                         probe: print the report to stdout
+  --json                           probe: emit the raw ProbeReport as JSON
+  --duration <minutes>             burn: the soak duration (default: 5;
+                                   0 = infinite)
 
 Exit codes: 0 success, 1 daemon/client error, 2 usage error
 ```
 
 - **`dump`** — the Phase-3 exit-criterion command: one `GetTelemetry` round
-  trip, rendered as a dashboard-style listing with four sections —
-  `=== CPU ===` (vendor + brand), `=== AMD ===` (clocks & ratios, the 27
+  trip, rendered as a dashboard-style listing with five sections —
+  `=== CPU ===` (vendor + brand), `=== Vcore ===` (the single vCore reading:
+  the delivered value, the `[est]` badge for a heuristic reading, and the
+  VID + signed delta when present), `=== AMD ===` (clocks & ratios, the 27
   primary/secondary/tertiary + turnaround subtimings in ticks, the CAD bus
   in ohms, the voltages), `=== Intel ===` (the per-channel IMC decode, plus
   RTL), and `=== SPD ===` (per-slot modules + XMP/EXPO profiles). Every cell
@@ -854,6 +864,17 @@ Exit codes: 0 success, 1 daemon/client error, 2 usage error
   `AMD: N/A (<reason>)`, `Intel: ok` / `Intel: N/A (<reason>)`,
   `SPD: ok (n modules)` / `SPD: N/A (no modules)`, plus the daemon socket
   line. This is the fastest way to see *what* is degraded.
+- **`probe`** — the consent-gated "Submit Probe Report" fetch (the TUI `[F]`
+  / GUI Probe parity path): one `GetProbeReport` round trip, the report
+  written as markdown to `~/.ramsleuth/probe-report.md` (the TUI `[w]` / GUI
+  location) by default, printed to stdout with `--stdout`, or emitted as the
+  raw `ProbeReport` JSON with `--json`.
+- **`burn`** — starts a burn-in soak (`StartBurnIn { Full, --duration }`), a
+  repeated full-grid run. `--duration <minutes>` (default `5`; `0` =
+  infinite) sets the deadline — the daemon stops the run itself at the
+  deadline, or you cancel it from any client (the TUI `[C]` key / the GUI
+  cancel) via the daemon's `CancelBenchmark`. The command prints the
+  confirmation and exits; the run keeps going daemon-side without its owner.
 
 **Exit codes:** `0` success; `1` a daemon/client error (connect, timeout,
 protocol, or I/O — each with its structured diagnostic); `2` a usage error
@@ -923,17 +944,39 @@ ramsleuth-telemetry -h
 
 A thin front end for the telemetry collector: it **reads the hardware
 directly — no daemon, no socket** — and prints the full
-`SystemMemoryTelemetry` snapshot either as a dashboard listing
+`SystemMemoryTelemetry` snapshot either as a human-readable dashboard
+listing
 
 ```
-CPU: Amd(Zen5) — AMD Ryzen 9 7950X 16-Core
-AMD: <full readout, or N/A (<reason>)>
-Intel: <per-channel readout, or N/A (<reason>)>
-SPD[0]: <module: maker, die, part, rank, density, speed, profiles>
+RamSleuth - system memory telemetry
+===================================
+
+=== CPU ===
+  vendor  AMD Zen 5
+  brand   AMD Ryzen 9 7950X 16-Core
+
+=== Vcore ===
+  CPU Core Voltage  1.150 V
+
+=== AMD ===
+  --- Clocks & ratios ---
+  MCLK  2000.00 MHz
+  …            (or a single N/A (<reason>) line when the branch degraded)
+
+=== Intel ===
+  …
+
+=== SPD ===
+  --- Module 0x52 (DDR5) ---
+  maker  …
+  …
 ```
 
-or as a JSON block (`{"cpu":{"vendor","brand"},"amd":…,"intel":…,"spd":[…]}`,
-with `null` for any unavailable section). Two properties make it a good
+or as a JSON block carrying the **same fields** (`{"cpu":{"vendor","brand"},
+"vcore":…,"amd":…,"intel":…,"spd":[…]}`, with `null` for any unavailable
+section). Every cell prints its formatted value or the human-readable
+`N/A (<reason>)` phrase, so a fully degraded host still gets a complete,
+honest dashboard. Two properties make it a good
 first diagnostic on an unfamiliar box:
 
 - **It exits `0` even when everything is N/A** — N/A is a valid, structured

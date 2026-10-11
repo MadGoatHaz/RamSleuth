@@ -148,6 +148,14 @@ const TEXT_MARGIN: f32 = 3.0;
 const ROW_BG: Color32 = Color32::from_rgb(0x16, 0x16, 0x1C);
 /// The window title (the dedicated graphs window, C7-20/21).
 const WINDOW_TITLE: &str = "RAM & SYSTEM GRAPHS";
+
+/// The TUI/GUI graphs parity note (FE-8): the GUI's graphs window is the
+/// full interactive view; the TUI shows a compact 5-series sparkline.
+/// Both read the **same** live `GraphSample` source — this note makes the
+/// intentional capability split user-visible in both surfaces, not a
+/// silent divergence.
+const GRAPH_PARITY_NOTE: &str =
+    "GUI: full graphs window · same live data as the TUI [g] sparklines";
 /// The no-source note (D-4): the bare `N/A` — a source-less
 /// series never fakes a 0 line (0 ≠ N/A) — the label + this
 /// note, no geometry.
@@ -799,6 +807,11 @@ pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState, poll_interv
                 subtitle.push_str(&format!(" · −{pan:.0} s"));
             }
             ui.label(RichText::new(subtitle).color(dim));
+            // The parity note (FE-8): the GUI window vs the TUI sparkline
+            // share the same live `GraphSample` source — the intentional
+            // capability split, made user-visible (not a silent
+            // divergence).
+            ui.label(RichText::new(GRAPH_PARITY_NOTE).color(dim));
             ui.add_space(8.0);
             // The window-resolution row (C7-22 item 7f): four
             // selectable buttons (selecting one resets the pan to
@@ -1684,6 +1697,35 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// TC-FE8 (the TUI/GUI graphs parity note, GUI side): the graphs
+    /// window carries the user-visible parity note (FE-8) — the GUI full
+    /// window vs the TUI compact sparkline share the same live
+    /// `GraphSample` source. Assert the shared "same live data" marker +
+    /// the GUI descriptor render in the window (not a silent divergence).
+    #[test]
+    fn tc_fe8_gui_window_carries_the_parity_note() {
+        let mut iv = 2000u64;
+        let mut full = GraphState::default();
+        full.samples.push(sample(1000.0, 3600.0, 1150.0, 1150.0, 45.0, 26.35));
+        let ctx = egui::Context::default();
+        ctx.begin_frame(egui::RawInput::default());
+        render_graphs_window(&ctx, &full, &mut iv);
+        let out = ctx.end_frame();
+        let texts = painted_texts(&out);
+        assert!(
+            texts.iter().any(|t| t.contains("same live data")),
+            "the GUI window must carry the shared-data parity marker: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("GUI: full graphs window")),
+            "the GUI window must name its full-window capability: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| *t == GRAPH_PARITY_NOTE),
+            "the full note must render: {texts:?}"
+        );
     }
 
     /// (o) The interactive render with a synthetic hover: a hover

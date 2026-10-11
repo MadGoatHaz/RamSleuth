@@ -214,6 +214,32 @@ use ramsleuth_tui::probe::{
     write_probe_report,
 };
 use ramsleuth_tui::{key_to_action, render, Action, AppState, BenchState};
+// ---------------------------------------------------------------------------
+// Poison-tolerant shared-state guard acquisition (FE-3).
+//
+// The shared state lives behind an `RwLock` held by both threads (the
+// updater writes, the render / poll thread reads). A stray panic that drops
+// a guard poisons the lock; a bare `.read().unwrap()` / `.write().unwrap()`
+// on the next acquisition would re-panic, cascading one bad read across
+// both threads and taking the whole UI down. These two helpers are the
+// single acquisition idiom: `unwrap_or_else(|p| p.into_inner())` recovers
+// the inner value from a poisoned guard, so a panic degrades (the last-good
+// state is read) instead of cascading (the no-panic contract, D5).
+// ---------------------------------------------------------------------------
+
+/// Acquire a read guard on the shared state, recovering a poisoned lock
+/// (FE-3): `into_inner` yields the last-good inner value instead of
+/// re-panicking, so one stray panic degrades a single read, never the
+/// whole UI.
+fn state_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Acquire a write guard on the shared state, recovering a poisoned lock
+/// (FE-3): the same idiom as [`state_read`], for the mutation path.
+fn state_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|p| p.into_inner())
+}
 
 /// The poll interval's sane lower bound in milliseconds (the GUI
 /// `update.rs` `MIN_POLL_INTERVAL_MS` rule, re-stated locally): a
@@ -625,7 +651,7 @@ fn run_bench(
         Err(error) => {
             // A brief per-mutation lock scope (C14-03) — never held
             // across the stream drain.
-            let mut s = state.write().unwrap();
+            let mut s = state_write(state);
             s.bench.running = false;
             s.error = Some(error.to_string());
             return Ok(());
@@ -635,7 +661,7 @@ fn run_bench(
     // kill a long run's frame gap mid-stream (the 120 s CLI
     // precedent).
     if let Err(error) = client.set_read_timeout(BENCH_READ_TIMEOUT) {
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.running = false;
         s.error = Some(error.to_string());
         return Ok(());
@@ -647,7 +673,7 @@ fn run_bench(
         // (FE-9) is stamped here by the updater, not the render pass:
         // the status line reads `run_started` (a pure function of
         // `&AppState`), so the render never mutates a global.
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.running = true;
         s.bench.progress.clear();
         s.bench.run_started = Some(Instant::now());
@@ -658,7 +684,7 @@ fn run_bench(
         target: cmd.target,
         mode: cmd.mode,
     }) {
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.running = false;
         s.error = Some(error.to_string());
         return Ok(());
@@ -670,28 +696,28 @@ fn run_bench(
         if cancel.load(Ordering::Relaxed) {
             // The run id is read under a brief scope; the
             // `CancelBenchmark` itself goes out with no lock held.
-            let run_id = state.read().unwrap().bench.run_id;
+            let run_id = state_read(state).bench.run_id;
             if let Some(run_id) = run_id {
                 let _ = client.send(&Request::CancelBenchmark { run_id });
             }
-            state.write().unwrap().bench.running = false;
+            state_write(state).bench.running = false;
             break;
         }
         match client.recv() {
             Ok(Response::BenchStarted { run_id }) => {
                 // The run's id lands (the Cancel key addresses the
                 // run with it, TUI-20) — a brief scope.
-                state.write().unwrap().bench.run_id = Some(run_id);
+                state_write(state).bench.run_id = Some(run_id);
             }
             Ok(Response::BenchProgress(progress)) => {
                 // One streamed progress event (latest last) — a
                 // brief scope.
-                state.write().unwrap().bench.progress.push(progress);
+                state_write(state).bench.progress.push(progress);
             }
             Ok(Response::BenchResult { grid, .. }) => {
                 // The terminal frame: the grid + the clean stop in
                 // one brief scope.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.bench.grid = Some(grid);
                 s.bench.running = false;
                 break;
@@ -699,7 +725,7 @@ fn run_bench(
             Ok(Response::BenchCancelled { .. }) => {
                 // The clean-stop ack (the run ended at its cancel
                 // gate) — a brief scope.
-                state.write().unwrap().bench.running = false;
+                state_write(state).bench.running = false;
                 break;
             }
             Ok(Response::Error(message)) => {
@@ -707,7 +733,7 @@ fn run_bench(
                 // single-flight `Error` for a second start while a
                 // run is in flight (P3-15/D-6): record + end, never
                 // a panic (D5).
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some(message);
                 s.bench.running = false;
                 break;
@@ -716,7 +742,7 @@ fn run_bench(
                 // A telemetry frame in the bench stream violates the
                 // wire contract (`GetTelemetry` is served on its own
                 // connection, P3-16): stop the run and record it.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some("unexpected response during benchmark".to_owned());
                 s.bench.running = false;
                 break;
@@ -726,7 +752,7 @@ fn run_bench(
                 // the wire contract (burn-in ticks stream only on the
                 // owning `StartBurnIn` connection, D-1/D-2): stop
                 // the run and record it (the GUI `run_bench` mirror).
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some("unexpected burn-in frame during benchmark".to_owned());
                 s.bench.running = false;
                 break;
@@ -736,13 +762,13 @@ fn run_bench(
                 // violates the wire contract (probe reports reply
                 // only to `GetProbeReport`, chunk probe-1a): stop
                 // the run and record it.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some("unexpected probe report during benchmark".to_owned());
                 s.bench.running = false;
                 break;
             }
             Err(error) => {
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some(error.to_string());
                 s.bench.running = false;
                 break;
@@ -806,7 +832,7 @@ fn run_burn_in(
         Err(error) => {
             // A brief per-mutation lock scope (C14-03) — never held
             // across the stream drain.
-            let mut s = state.write().unwrap();
+            let mut s = state_write(state);
             s.bench.burn_in.running = false;
             s.error = Some(error.to_string());
             return Ok(());
@@ -816,7 +842,7 @@ fn run_burn_in(
     // would kill a long soak's frame gap mid-stream (the 120 s CLI
     // precedent).
     if let Err(error) = client.set_read_timeout(BENCH_READ_TIMEOUT) {
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.burn_in.running = false;
         s.error = Some(error.to_string());
         return Ok(());
@@ -825,7 +851,7 @@ fn run_burn_in(
         // A fresh run starts from the idle burn-in state: a stale
         // run's tick bookkeeping (iteration / elapsed / `latest`)
         // never mixes into a new one — one brief scope.
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.burn_in = ramsleuth_tui::ui::BurnInState::default();
         s.bench.burn_in.running = true;
         // The new run's id arrives with the `BenchStarted` ack.
@@ -836,7 +862,7 @@ fn run_burn_in(
     // violation (never a normal-bench run): record it and stop —
     // no panic (D5).
     let Some(duration_minutes) = cmd.duration_minutes else {
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.burn_in.running = false;
         s.error =
             Some("burn-in command without a duration_minutes discriminator".to_owned());
@@ -846,7 +872,7 @@ fn run_burn_in(
         target: cmd.target,
         duration_minutes,
     }) {
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.burn_in.running = false;
         s.error = Some(error.to_string());
         return Ok(());
@@ -860,18 +886,18 @@ fn run_burn_in(
         if cancel.load(Ordering::Relaxed) {
             // The run id is read under a brief scope; the
             // `CancelBenchmark` itself goes out with no lock held.
-            let run_id = state.read().unwrap().bench.run_id;
+            let run_id = state_read(state).bench.run_id;
             if let Some(run_id) = run_id {
                 let _ = client.send(&Request::CancelBenchmark { run_id });
             }
-            state.write().unwrap().bench.burn_in.running = false;
+            state_write(state).bench.burn_in.running = false;
             break;
         }
         match client.recv() {
             Ok(Response::BenchStarted { run_id }) => {
                 // The shared run id lands (the `[C]` key addresses
                 // the run with it) — a brief scope.
-                state.write().unwrap().bench.run_id = Some(run_id);
+                state_write(state).bench.run_id = Some(run_id);
             }
             Ok(Response::BurnInProgress(tick)) => {
                 // The tick's bookkeeping lands in the burn-in state
@@ -890,7 +916,7 @@ fn run_burn_in(
                     bandwidth,
                     latency_ns,
                 } = tick;
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.bench.burn_in.elapsed_secs = s.bench.burn_in.elapsed_secs.max(elapsed_secs);
                 let slot = tier as usize;
                 match (bandwidth, latency_ns) {
@@ -934,7 +960,7 @@ fn run_burn_in(
                 // connection, D-1/D-2): record the structured
                 // error and stop the run — the permanent mirror of
                 // `run_bench`'s `BurnInProgress` contract guard.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some("unexpected benchmark frame during burn-in".to_owned());
                 s.bench.burn_in.running = false;
                 break;
@@ -944,7 +970,7 @@ fn run_burn_in(
                 // lands in the shared terminal grid (the zone-2
                 // table + the later F3 export pick it up for free)
                 // + the clean stop in one brief scope.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.bench.grid = Some(grid);
                 s.bench.burn_in.running = false;
                 break;
@@ -952,7 +978,7 @@ fn run_burn_in(
             Ok(Response::BenchCancelled { .. }) => {
                 // The clean-stop ack (the run ended at its cancel
                 // gate) — a brief scope.
-                state.write().unwrap().bench.burn_in.running = false;
+                state_write(state).bench.burn_in.running = false;
                 break;
             }
             Ok(Response::Error(message)) => {
@@ -960,7 +986,7 @@ fn run_burn_in(
                 // single-flight `Error` for a second start while a
                 // run is in flight (P3-15/D-6): record + end, never
                 // a panic (D5).
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some(message);
                 s.bench.burn_in.running = false;
                 break;
@@ -970,7 +996,7 @@ fn run_burn_in(
                 // the wire contract (`GetTelemetry` is served on its
                 // own connection, P3-16): stop the run and record
                 // it.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some("unexpected response during burn-in".to_owned());
                 s.bench.burn_in.running = false;
                 break;
@@ -980,13 +1006,13 @@ fn run_burn_in(
                 // violates the wire contract (probe reports reply
                 // only to `GetProbeReport`, chunk probe-1a): stop
                 // the run and record it.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some("unexpected probe report during burn-in".to_owned());
                 s.bench.burn_in.running = false;
                 break;
             }
             Err(error) => {
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some(error.to_string());
                 s.bench.burn_in.running = false;
                 break;
@@ -1117,7 +1143,7 @@ fn spawn_updater(
             // re-read every tick so a changed interval (clamped) or
             // refresh gate takes effect without a restart.
             let (refresh, interval) = {
-                let app = state.read().unwrap();
+                let app = state_read(&state);
                 (
                     app.settings.refresh,
                     clamp_poll_interval(app.settings.poll_interval_ms),
@@ -1152,7 +1178,7 @@ fn spawn_updater(
                             // Daemon down: the friendly disconnected
                             // state (the no-panic contract, D5); the
                             // next tick re-probes.
-                            let mut snapshot = state.write().unwrap();
+                            let mut snapshot = state_write(&state);
                             snapshot.error = Some(error.to_string());
                             snapshot.daemon_status = "disconnected".to_owned();
                             prev_connected = false;
@@ -1169,7 +1195,7 @@ fn spawn_updater(
                                 // Baseline / reconnect / cadence: send
                                 // `GetTelemetry` on this connection (one
                                 // connection total) and update the state.
-                                poll_with_client(&mut client, &socket, &mut state.write().unwrap());
+                                poll_with_client(&mut client, &socket, &mut state_write(&state));
                                 last_poll = Instant::now();
                             }
                             // Not due (refresh off, steady state): drop
@@ -1233,7 +1259,7 @@ fn snapshot_path() -> PathBuf {
 /// recorded in `state.error`; the TUI never dies on a snapshot.
 fn write_snapshot(state: &Arc<RwLock<AppState>>) {
     let text = {
-        let snapshot = state.read().unwrap();
+        let snapshot = state_read(state);
         match &snapshot.telemetry {
             Some(telemetry) => ramsleuth_client::render(telemetry),
             None => {
@@ -1251,10 +1277,10 @@ fn write_snapshot(state: &Arc<RwLock<AppState>>) {
     let path = snapshot_path();
     match std::fs::write(&path, text) {
         Ok(()) => {
-            state.write().unwrap().daemon_status = format!("snapshot: {}", path.display());
+            state_write(state).daemon_status = format!("snapshot: {}", path.display());
         }
         Err(e) => {
-            state.write().unwrap().error = Some(format!("snapshot failed: {e}"));
+            state_write(state).error = Some(format!("snapshot failed: {e}"));
         }
     }
 }
@@ -1374,10 +1400,10 @@ fn record_export_result(state: &mut AppState, result: Result<Option<PathBuf>, St
 /// [`record_export_result`].
 fn write_export(state: &Arc<RwLock<AppState>>) {
     let result = {
-        let snapshot = state.read().unwrap();
+        let snapshot = state_read(state);
         perform_export(&snapshot, &export_out_dir())
     };
-    record_export_result(&mut state.write().unwrap(), result);
+    record_export_result(&mut state_write(state), result);
 }
 
 // ------------------------------------------------------------------
@@ -1403,19 +1429,19 @@ fn probe_report_fetch(socket: &Path, state: &Arc<RwLock<AppState>>) {
     let mut client = match Client::connect(socket) {
         Ok(client) => client,
         Err(error) => {
-            state.write().unwrap().error = Some(error.to_string());
+            state_write(state).error = Some(error.to_string());
             return;
         }
     };
     match client.request(&Request::GetProbeReport) {
         Ok(Response::ProbeReport(report)) => {
             let markdown = render_probe_report_md(&report);
-            state.write().unwrap().probe = ProbeOverlayState::Consent { markdown };
+            state_write(state).probe = ProbeOverlayState::Consent { markdown };
         }
         Ok(Response::Error(message)) => {
             // The daemon was reachable but rejected the request
             // (a structured wire error, not a transport failure).
-            state.write().unwrap().error = Some(message);
+            state_write(state).error = Some(message);
         }
         Ok(_) => {
             // Any other frame in reply to `GetProbeReport` violates
@@ -1427,7 +1453,7 @@ fn probe_report_fetch(socket: &Path, state: &Arc<RwLock<AppState>>) {
                 .error = Some("unexpected response to GetProbeReport".to_owned());
         }
         Err(error) => {
-            state.write().unwrap().error = Some(error.to_string());
+            state_write(state).error = Some(error.to_string());
         }
     }
 }
@@ -1437,7 +1463,7 @@ fn probe_report_fetch(socket: &Path, state: &Arc<RwLock<AppState>>) {
 /// / copy): a one-time clone (an intentional action, never a
 /// per-keystroke cost).
 fn preview_markdown(state: &Arc<RwLock<AppState>>) -> Option<String> {
-    let app = state.read().unwrap();
+    let app = state_read(state);
     match &app.probe {
         ProbeOverlayState::Preview { markdown, .. } => Some(markdown.clone()),
         _ => None,
@@ -1450,7 +1476,7 @@ fn preview_markdown(state: &Arc<RwLock<AppState>>) -> Option<String> {
 /// no-op (the callers' phase guard makes that unreachable — the
 /// fn stays total, D5).
 fn set_preview_notice(state: &Arc<RwLock<AppState>>, tone: NoticeTone, text: String) {
-    if let ProbeOverlayState::Preview { notice, .. } = &mut state.write().unwrap().probe {
+    if let ProbeOverlayState::Preview { notice, .. } = &mut state_write(state).probe {
         *notice = Some((tone, text));
     }
 }
@@ -1462,7 +1488,7 @@ fn set_preview_notice(state: &Arc<RwLock<AppState>>, tone: NoticeTone, text: Str
 /// scrolls, the end is never overshot.
 fn scroll_probe_preview(state: &Arc<RwLock<AppState>>, area: Rect, delta: i32) {
     let (current, max) = {
-        let app = state.read().unwrap();
+        let app = state_read(state);
         match &app.probe {
             ProbeOverlayState::Preview { markdown, scroll, .. } => {
                 (*scroll, ramsleuth_tui::probe::preview_max_scroll(markdown, area))
@@ -1472,7 +1498,7 @@ fn scroll_probe_preview(state: &Arc<RwLock<AppState>>, area: Rect, delta: i32) {
     };
     let next = (i64::from(current) + i64::from(delta)).clamp(0, i64::from(max)) as u16;
     if next != current {
-        if let ProbeOverlayState::Preview { scroll, .. } = &mut state.write().unwrap().probe {
+        if let ProbeOverlayState::Preview { scroll, .. } = &mut state_write(state).probe {
             *scroll = next;
         }
     }
@@ -1500,7 +1526,7 @@ fn handle_probe_overlay_key(
         // preview (the one-time clone; a `[y]` in the preview is a
         // no-op — the answer keys are consumed).
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            let mut app = state.write().unwrap();
+            let mut app = state_write(state);
             if let ProbeOverlayState::Consent { markdown } =
                 std::mem::replace(&mut app.probe, ProbeOverlayState::None)
             {
@@ -1516,7 +1542,7 @@ fn handle_probe_overlay_key(
         | KeyCode::Char('n')
         | KeyCode::Char('N')
         | KeyCode::Esc => {
-            state.write().unwrap().probe = ProbeOverlayState::None;
+            state_write(state).probe = ProbeOverlayState::None;
         }
         // `[w]` (preview only): write the report to `write_path`
         // (the live loop passes `~/.ramsleuth/probe-report.md`; the
@@ -1778,25 +1804,26 @@ fn apply_requirements_auto_open(state: &RwLock<AppState>, dismissed: bool) {
         return;
     }
     let needs_open = {
-        let app = state.read().unwrap();
+        let app = state_read(state);
         !app.settings.requirements_open && !ramsleuth_tui::requirements::diagnose(&app).is_empty()
     };
     if needs_open {
-        state.write().unwrap().settings.requirements_open = true;
+        state_write(state).settings.requirements_open = true;
     }
 }
 
-/// The `[d]` screen's + the settings strip's visibility the
-/// [`render`] draws (the ghosting guard's predicate, the main loop's
-/// transition check): the controls block (the 17-key map) its
-/// `requirements_open` flag alone (the screen's informational
-/// companion — drawn while the screen is open, regardless of the
-/// strip's presence), the
+/// The `[d]` screen's + the settings strip's visibility [`render`]
+/// draws: the controls block (the 17-key map) its `requirements_open`
+/// flag alone (the screen's informational companion — drawn while the
+/// screen is open, regardless of the strip's presence), the
 /// requirements strip presence-driven — its `requirements_open` flag
 /// AND a non-empty [`ramsleuth_tui::requirements::diagnose`] (the
 /// strip auto-vanishes on the daemon-connect transition — `diagnose`
 /// empties — so the flag alone would miss it) — and the settings strip
-/// its `settings_open` flag alone.
+/// its `settings_open` flag alone. `render` applies this rule inline;
+/// this helper is retained (test-only, FE-4) to pin the presence-driven
+/// auto-vanish invariant.
+#[cfg(test)]
 fn strip_visibility(state: &AppState) -> (bool, bool, bool) {
     (
         state.settings.requirements_open,
@@ -1807,9 +1834,9 @@ fn strip_visibility(state: &AppState) -> (bool, bool, bool) {
 
 /// The terminal event loop (P3-24): initialize the terminal (the
 /// [`TerminalGuard`] restores it on the way out of this function), spawn
-/// the background updater, then tick — guard the screen against strip
-/// ghosting (clear on a visible→hidden transition), draw the dashboard,
-/// poll events for 250 ms, dispatch the frozen `Action` table. Returns
+/// the background updater, then tick — draw the dashboard (each surface
+/// erases its own region, FE-4 — no global screen-clear), poll events
+/// for 250 ms, dispatch the frozen `Action` table. Returns
 /// the process exit code: `0` on a normal quit, `1` when the terminal
 /// could not be initialized.
 fn run(args: TuiArgs) -> ExitCode {
@@ -1843,19 +1870,12 @@ fn run(args: TuiArgs) -> ExitCode {
     // user toggles the strip open again); `false` at startup and
     // after an explicit reopen.
     let mut requirements_dismissed = false;
-    // The ghosting guard (the startup clear's continuation): a strip
-    // (or the graphs panel) leaves the layout tree when it closes, so a
-    // surface drawn one frame and gone the next would leave its stale
-    // pixels (the yellow SETUP box, the controls block, the settings
-    // line, the graphs panel) where the re-laid-out frame does not
-    // overwrite them — the screen is cleared on any visible→hidden
-    // transition. All four surfaces start closed (`false`); the
-    // previous-frame values are advanced after each draw.
-    let mut prev_about_shown = false;
-    let mut prev_requirements_shown = false;
-    let mut prev_settings_shown = false;
-    let mut prev_graphs_shown = false;
-
+    // FE-4: no global screen-clear ghosting guard. Each surface erases
+    // its own region at the top of its paint (the single `blank_area`
+    // idiom in `render`), and the zones expand to absorb a closed strip's
+    // freed rows — so a visible→hidden transition never clears the whole
+    // screen (no flicker). The one-time startup `terminal.clear()` (the
+    // first frame draws onto a blank surface) is the only clear.
     let updater = spawn_updater(
         Arc::clone(&state),
         Arc::clone(&stop),
@@ -1871,48 +1891,19 @@ fn run(args: TuiArgs) -> ExitCode {
         // closed until the user toggles it open again).
         apply_requirements_auto_open(&state, requirements_dismissed);
 
-        // The ghosting guard: the surfaces' visibility the render draws
-        // this tick (the controls block the `[d]` flag alone; the
-        // requirements strip presence-driven — its flag AND a non-empty
-        // `diagnose`; the settings strip its flag alone). A
-        // visible→hidden transition of any of them clears the screen
-        // before the draw — the closing surface's stale pixels would
-        // otherwise linger where the re-laid-out frame does not reach
-        // them.
-        let (about_shown, requirements_shown, settings_shown, graphs_shown) = {
-            let app = state.read().unwrap();
-            // Read the graphs knob alongside the strips (the `[g]` panel
-            // is the fourth ghosting surface — its `visible→hidden`
-            // transition clears the screen too).
-            let (about, requirements, settings) = strip_visibility(&app);
-            (about, requirements, settings, app.settings.graphs_open)
-        };
-        if (prev_about_shown && !about_shown)
-            || (prev_requirements_shown && !requirements_shown)
-            || (prev_settings_shown && !settings_shown)
-            || (prev_graphs_shown && !graphs_shown)
-        {
-            let _ = terminal.clear();
-        }
-
         // One draw per tick (250 ms cadence): the read lock is held only
-        // for the frame render (pure over `&AppState`, P3-23).
+        // for the frame render (pure over `&AppState`, P3-23). Each
+        // surface erases its own region inside `render` (FE-4) — no
+        // global screen-clear on a visible→hidden transition.
         let draw_state = Arc::clone(&state);
         if let Err(message) = terminal.draw(|frame| {
-            let snapshot = draw_state.read().unwrap();
+            let snapshot = state_read(&draw_state);
             render(frame, &snapshot);
         }) {
             // A failed draw (e.g. the terminal was detached) is recorded,
             // not fatal: the loop keeps running, the status zone shows it.
-            state.write().unwrap().error = Some(format!("terminal draw failed: {message}"));
+            state_write(&state).error = Some(format!("terminal draw failed: {message}"));
         }
-
-        // Advance the ghosting guard's previous-frame visibility (the
-        // next tick's transition check compares against this frame).
-        prev_about_shown = about_shown;
-        prev_requirements_shown = requirements_shown;
-        prev_settings_shown = settings_shown;
-        prev_graphs_shown = graphs_shown;
 
         match events::poll_event(POLL_TIMEOUT) {
             Ok(Some(Event::Key(key))) => {
@@ -1921,7 +1912,7 @@ fn run(args: TuiArgs) -> ExitCode {
                 // global key table below is bypassed — a `[q]` in
                 // the preview closes it, it does not quit the TUI;
                 // `[f]` does not re-fetch).
-                if state.read().unwrap().probe.is_open() {
+                if state_read(&state).probe.is_open() {
                     // The overlay's key handler takes the
                     // terminal's area (the scroll clamp's layout —
                     // the render draws the preview into the same
@@ -1953,7 +1944,7 @@ fn run(args: TuiArgs) -> ExitCode {
                     // poll, the `[S]`/`[E]` file writes, the `[Q]`
                     // break) is performed with the lock released.
                     let side = {
-                        let mut s = state.write().unwrap();
+                        let mut s = state_write(&state);
                         dispatch_action(action, &mut s, &mut requirements_dismissed, &bench_tx, &cancel)
                     };
                     match side {
@@ -1966,7 +1957,7 @@ fn run(args: TuiArgs) -> ExitCode {
                         // connect-retry window + the 5 s read
                         // timeout).
                         SideEffect::Refresh => {
-                            let _ = poll_once(&args.socket, &mut state.write().unwrap());
+                            let _ = poll_once(&args.socket, &mut state_write(&state));
                         }
                         // `[S]`: write the timestamped text snapshot
                         // to the CWD + record its path in
@@ -2003,7 +1994,7 @@ fn run(args: TuiArgs) -> ExitCode {
             Err(message) => {
                 // An event-stream failure (e.g. a raw-mode teardown) is
                 // recorded in the state — the loop keeps running.
-                state.write().unwrap().error = Some(format!("event stream: {message}"));
+                state_write(&state).error = Some(format!("event stream: {message}"));
             }
         }
     }
@@ -2070,6 +2061,39 @@ mod tests {
     use ramsleuth_telemetry::{RailConfidence, VoltageTelemetry};
 
     use super::*;
+
+    /// TC-FE3 (the poison-cascade confirming test): poison the shared-state
+    /// lock (a panic while holding a write guard), then a subsequent read and
+    /// write **through the [`state_read`] / [`state_write`] helpers** recover
+    /// the guard via `into_inner` **without** re-panicking — one stray panic
+    /// degrades a single access, it never cascades across both threads and
+    /// takes the whole UI down. Pre-fix the bare `.read().unwrap()` /
+    /// `.write().unwrap()` panicked on the poisoned lock (the cascade).
+    #[test]
+    fn tc_fe3_poisoned_lock_recovers_without_cascade() {
+        use std::panic;
+        let state = Arc::new(RwLock::new(AppState::default()));
+        // Poison the lock: panic while holding a write guard (the value is
+        // set first so the recovery has something meaningful to assert).
+        let poisoned = Arc::clone(&state);
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(move || {
+            let mut guard = poisoned.write().unwrap();
+            guard.error = Some("panic-while-holding".to_owned());
+            panic!("poison the lock");
+        }));
+        assert!(state.is_poisoned(), "the lock must be poisoned after the panic");
+        // A read through the helper recovers the guard (no cascade panic) and
+        // sees the value the panicking writer set.
+        let app = state_read(&state);
+        assert_eq!(app.error.as_deref(), Some("panic-while-holding"), "read recovers the last-good value");
+        drop(app);
+        // A write through the helper also recovers (no cascade panic).
+        let mut app = state_write(&state);
+        app.error = Some("recovered".to_owned());
+        drop(app);
+        // The recovered value is readable and mutated as expected.
+        assert_eq!(state_read(&state).error.as_deref(), Some("recovered"));
+    }
 
     /// A unique temp socket path owned by a guard that removes the file
     /// on drop (best-effort cleanup; the path is pid-qualified so
@@ -4333,40 +4357,40 @@ mod tests {
 
         apply_requirements_auto_open(&state, dismissed);
         assert!(
-            state.read().unwrap().settings.requirements_open,
+            state_read(&state).settings.requirements_open,
             "the auto-open opens the strip while a requirement is present"
         );
 
         // `[d]` (the strip is open): close + dismiss.
         {
-            let mut s = state.write().unwrap();
+            let mut s = state_write(&state);
             assert_eq!(
                 dispatch_action(Action::ToggleRequirements, &mut s, &mut dismissed, &tx, &cancel),
                 SideEffect::None
             );
         }
         assert!(dismissed, "closing dismisses the auto-open (the latch)");
-        assert!(!state.read().unwrap().settings.requirements_open, "the strip is closed");
+        assert!(!state_read(&state).settings.requirements_open, "the strip is closed");
         apply_requirements_auto_open(&state, dismissed);
         assert!(
-            !state.read().unwrap().settings.requirements_open,
+            !state_read(&state).settings.requirements_open,
             "a dismissed strip stays closed while the requirement persists"
         );
 
         // `[d]` again (the strip is closed): reopen + clear the
         // dismissal (the auto-open applies again).
         {
-            let mut s = state.write().unwrap();
+            let mut s = state_write(&state);
             assert_eq!(
                 dispatch_action(Action::ToggleRequirements, &mut s, &mut dismissed, &tx, &cancel),
                 SideEffect::None
             );
         }
         assert!(!dismissed, "reopening clears the dismissal");
-        assert!(state.read().unwrap().settings.requirements_open, "the strip is open again");
+        assert!(state_read(&state).settings.requirements_open, "the strip is open again");
         apply_requirements_auto_open(&state, dismissed);
         assert!(
-            state.read().unwrap().settings.requirements_open,
+            state_read(&state).settings.requirements_open,
             "the auto-open keeps an open strip open"
         );
 
@@ -4378,7 +4402,7 @@ mod tests {
         }));
         apply_requirements_auto_open(&clean, false);
         assert!(
-            !clean.read().unwrap().settings.requirements_open,
+            !state_read(&clean).settings.requirements_open,
             "no requirement: no auto-open"
         );
     }
@@ -4499,7 +4523,7 @@ mod tests {
                 key_to_action(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))?;
             apply_requirements_auto_open(state, *dismissed);
             Some({
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 dispatch_action(action, &mut s, dismissed, tx, cancel)
             })
         }
@@ -4531,7 +4555,7 @@ mod tests {
             "the side effects come out in the scripted order"
         );
 
-        let s = state.read().unwrap();
+        let s = state_read(&state);
         assert!(s.settings.graphs_open, "one `[g]` opens the graphs overlay");
         assert_eq!(s.settings.poll_interval_ms, 5_000, "one `[p]` advances 2 s → 5 s");
         assert!(!s.settings.capacity_gib, "one `[u]` flips GiB → GB");
@@ -4760,7 +4784,7 @@ mod tests {
         let state = Arc::new(RwLock::new(AppState::default()));
         probe_report_fetch(sock.path(), &state);
 
-        let app = state.read().unwrap();
+        let app = state_read(&state);
         match &app.probe {
             ProbeOverlayState::Consent { markdown } => {
                 assert!(markdown.starts_with("# RamSleuth Probe Report"), "{markdown}");
@@ -4780,7 +4804,7 @@ mod tests {
         let sock = TempSocket::new("probe-missing");
         let state = Arc::new(RwLock::new(AppState::default()));
         probe_report_fetch(sock.path(), &state);
-        let app = state.read().unwrap();
+        let app = state_read(&state);
         assert_eq!(app.probe, ProbeOverlayState::None, "no overlay on a failed fetch");
         let error = app.error.clone().expect("a friendly error must be recorded");
         assert!(error.contains("daemon not running"), "{error}");
@@ -4804,7 +4828,7 @@ mod tests {
         });
         let state = Arc::new(RwLock::new(AppState::default()));
         probe_report_fetch(sock.path(), &state);
-        let app = state.read().unwrap();
+        let app = state_read(&state);
         assert_eq!(app.probe, ProbeOverlayState::None, "no overlay on a contract violation");
         assert_eq!(app.error.as_deref(), Some("unexpected response to GetProbeReport"));
         stand_in.join();
@@ -4831,7 +4855,7 @@ mod tests {
             &no_clip,
         );
         assert!(
-            matches!(state.read().unwrap().probe, ProbeOverlayState::Consent { .. }),
+            matches!(state_read(&state).probe, ProbeOverlayState::Consent { .. }),
             "[f] must not close the consent"
         );
         handle_probe_overlay_key(
@@ -4842,7 +4866,7 @@ mod tests {
             &no_clip,
         );
         assert_eq!(
-            state.read().unwrap().probe,
+            state_read(&state).probe,
             ProbeOverlayState::None,
             "[q] must close the consent"
         );
@@ -4854,7 +4878,7 @@ mod tests {
             &no_clip,
         );
         assert_eq!(
-            state.read().unwrap().probe,
+            state_read(&state).probe,
             ProbeOverlayState::None,
             "[n] stays closed after the `[q]`"
         );
@@ -4877,7 +4901,7 @@ mod tests {
             &dir.path,
             &|_: &str| Ok("copied".to_owned()),
         );
-        let app = state.read().unwrap();
+        let app = state_read(&state);
         match &app.probe {
             ProbeOverlayState::Preview { markdown, notice, scroll } => {
                 assert_eq!(markdown, "# the report", "the carried markdown must move over");
@@ -4923,7 +4947,7 @@ mod tests {
             &no_clip,
         );
         assert_eq!(
-            state.read().unwrap().probe,
+            state_read(&state).probe,
             ProbeOverlayState::None,
             "[q] must close the preview"
         );
@@ -4955,7 +4979,7 @@ mod tests {
                 Ok("Copied to clipboard (wl-copy)".to_owned())
             },
         );
-        let app = state.read().unwrap();
+        let app = state_read(&state);
         match &app.probe {
             ProbeOverlayState::Preview { notice: Some((tone, text)), .. } => {
                 assert_eq!(*tone, NoticeTone::Ok);
@@ -4979,7 +5003,7 @@ mod tests {
             &dir.path,
             &|_: &str| Err("no clipboard utility found".to_owned()),
         );
-        let app = state.read().unwrap();
+        let app = state_read(&state);
         match &app.probe {
             ProbeOverlayState::Preview { notice: Some((tone, text)), .. } => {
                 assert_eq!(*tone, NoticeTone::Warn, "no utility is a warning, not a failure");
@@ -5066,7 +5090,7 @@ mod tests {
     /// The current preview scroll offset (the test assertion helper;
     /// panics if the overlay is not in the preview phase).
     fn scroll_of(state: &Arc<RwLock<AppState>>) -> u16 {
-        let app = state.read().unwrap();
+        let app = state_read(state);
         match &app.probe {
             ProbeOverlayState::Preview { scroll, .. } => *scroll,
             other => panic!("the preview must stay open, got {other:?}"),

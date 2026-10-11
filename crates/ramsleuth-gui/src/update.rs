@@ -92,6 +92,32 @@ use ramsleuth_telemetry::{ProbeReport, SystemMemoryTelemetry};
 use crate::graph::GraphState;
 use crate::history::HistoryState;
 use crate::settings::{DEFAULT_POLL_INTERVAL_MS, GuiSettings};
+// ---------------------------------------------------------------------------
+// Poison-tolerant shared-state guard acquisition (FE-3).
+//
+// The shared state lives behind an `RwLock` held by both threads (the
+// updater writes, the render / poll thread reads). A stray panic that drops
+// a guard poisons the lock; a bare `.read().unwrap()` / `.write().unwrap()`
+// on the next acquisition would re-panic, cascading one bad read across
+// both threads and taking the whole UI down. These two helpers are the
+// single acquisition idiom: `unwrap_or_else(|p| p.into_inner())` recovers
+// the inner value from a poisoned guard, so a panic degrades (the last-good
+// state is read) instead of cascading (the no-panic contract, D5).
+// ---------------------------------------------------------------------------
+
+/// Acquire a read guard on the shared state, recovering a poisoned lock
+/// (FE-3): `into_inner` yields the last-good inner value instead of
+/// re-panicking, so one stray panic degrades a single read, never the
+/// whole UI.
+fn state_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Acquire a write guard on the shared state, recovering a poisoned lock
+/// (FE-3): the same idiom as [`state_read`], for the mutation path.
+fn state_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|p| p.into_inner())
+}
 
 /// Background-loop tick: short enough to keep an in-flight bench run's
 /// progress frames responsive, cheap when idle.
@@ -415,7 +441,7 @@ pub fn poll_telemetry(socket: &Path, state: &mut TelemetryData) -> Result<(), St
 /// daemon.
 pub fn request_probe_report(socket: &Path, state: &RwLock<TelemetryData>) -> Result<(), String> {
     // The in-flight marker (the consent dialog's progress indicator).
-    state.write().unwrap().probe_result = ProbeResult::Pending;
+    state_write(state).probe_result = ProbeResult::Pending;
     let mut client = match Client::connect(socket) {
         Ok(client) => client,
         Err(error) => {
@@ -428,20 +454,20 @@ pub fn request_probe_report(socket: &Path, state: &RwLock<TelemetryData>) -> Res
     };
     match client.request(&Request::GetProbeReport) {
         Ok(Response::ProbeReport(report)) => {
-            state.write().unwrap().probe_result = ProbeResult::Ok(report);
+            state_write(state).probe_result = ProbeResult::Ok(report);
         }
         Ok(Response::Error(message)) => {
-            state.write().unwrap().probe_result = ProbeResult::Err(message);
+            state_write(state).probe_result = ProbeResult::Err(message);
         }
         Ok(_) => {
             // Any other frame in reply to `GetProbeReport` violates
             // the wire contract (P3-16: the daemon answers one
             // request with exactly one response).
-            state.write().unwrap().probe_result =
+            state_write(state).probe_result =
                 ProbeResult::Err("unexpected response to GetProbeReport".to_owned());
         }
         Err(error) => {
-            state.write().unwrap().probe_result = ProbeResult::Err(error.to_string());
+            state_write(state).probe_result = ProbeResult::Err(error.to_string());
         }
     }
     Ok(())
@@ -579,7 +605,7 @@ pub fn run_bench(
         Err(error) => {
             // A brief per-mutation lock scope (C14-03) — never held
             // across the stream drain.
-            let mut s = state.write().unwrap();
+            let mut s = state_write(state);
             s.bench.running = false;
             s.error = Some(error.to_string());
             return Ok(());
@@ -589,7 +615,7 @@ pub fn run_bench(
     // kill a long run's frame gap mid-stream (the 120 s CLI
     // precedent).
     if let Err(error) = client.set_read_timeout(BENCH_READ_TIMEOUT) {
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.running = false;
         s.error = Some(error.to_string());
         return Ok(());
@@ -598,7 +624,7 @@ pub fn run_bench(
         // The run starts: `running = true`, the progress list cleared,
         // and a stale `run_id` dropped (a stale run's events never
         // mix into a new one) — one brief scope.
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.running = true;
         s.bench.progress.clear();
         // The new run's id arrives with the `BenchStarted` ack.
@@ -608,7 +634,7 @@ pub fn run_bench(
         target: cmd.target,
         mode: cmd.mode,
     }) {
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.running = false;
         s.error = Some(error.to_string());
         return Ok(());
@@ -620,34 +646,34 @@ pub fn run_bench(
         if cancel.load(Ordering::Relaxed) {
             // The run id is read under a brief scope; the
             // `CancelBenchmark` itself goes out with no lock held.
-            let run_id = state.read().unwrap().bench.run_id;
+            let run_id = state_read(state).bench.run_id;
             if let Some(run_id) = run_id {
                 let _ = client.send(&Request::CancelBenchmark { run_id });
             }
-            state.write().unwrap().bench.running = false;
+            state_write(state).bench.running = false;
             break;
         }
         match client.recv() {
             Ok(Response::BenchStarted { run_id }) => {
-                state.write().unwrap().bench.run_id = Some(run_id);
+                state_write(state).bench.run_id = Some(run_id);
             }
             Ok(Response::BenchProgress(progress)) => {
-                state.write().unwrap().bench.progress.push(progress);
+                state_write(state).bench.progress.push(progress);
             }
             Ok(Response::BenchResult { grid, .. }) => {
                 // The terminal frame: the grid + the clean stop in one
                 // brief scope.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.bench.grid = Some(grid);
                 s.bench.running = false;
                 break;
             }
             Ok(Response::BenchCancelled { .. }) => {
-                state.write().unwrap().bench.running = false;
+                state_write(state).bench.running = false;
                 break;
             }
             Ok(Response::Error(message)) => {
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some(message);
                 s.bench.running = false;
                 break;
@@ -656,7 +682,7 @@ pub fn run_bench(
                 // A telemetry frame in the bench stream violates the
                 // wire contract (`GetTelemetry` is served on its own
                 // connection, P3-16): stop the run and record it.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some("unexpected response during benchmark".to_owned());
                 s.bench.running = false;
                 break;
@@ -668,7 +694,7 @@ pub fn run_bench(
                 // run and record it — the permanent mirror of
                 // `run_burn_in`'s `BenchProgress` contract guard
                 // (C7-16 landed the real burn-in consumption).
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error =
                     Some("unexpected burn-in frame during benchmark".to_owned());
                 s.bench.running = false;
@@ -679,13 +705,13 @@ pub fn run_bench(
                 // violates the wire contract (probe reports reply
                 // only to `GetProbeReport`, chunk probe-1a): stop
                 // the run and record it.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some("unexpected probe report during benchmark".to_owned());
                 s.bench.running = false;
                 break;
             }
             Err(error) => {
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some(error.to_string());
                 s.bench.running = false;
                 break;
@@ -748,7 +774,7 @@ pub fn run_burn_in(
         Err(error) => {
             // A brief per-mutation lock scope (C14-03) — never held
             // across the stream drain.
-            let mut s = state.write().unwrap();
+            let mut s = state_write(state);
             s.bench.burn_in.running = false;
             s.error = Some(error.to_string());
             return Ok(());
@@ -758,7 +784,7 @@ pub fn run_burn_in(
     // kill a long burn-in's frame gap mid-stream (the 120 s CLI
     // precedent).
     if let Err(error) = client.set_read_timeout(BENCH_READ_TIMEOUT) {
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.burn_in.running = false;
         s.error = Some(error.to_string());
         return Ok(());
@@ -767,7 +793,7 @@ pub fn run_burn_in(
         // A fresh run starts from the idle burn-in state: a stale
         // run's tick bookkeeping (iteration / elapsed / `latest`)
         // never mixes into a new one — one brief scope.
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.burn_in = BurnInState::default();
         s.bench.burn_in.running = true;
         // The new run's id arrives with the `BenchStarted` ack.
@@ -777,7 +803,7 @@ pub fn run_burn_in(
     // path; a `None` cmd reaching it is a dispatch contract violation
     // (never a normal-bench run): record it and stop — no panic (D5).
     let Some(duration_minutes) = cmd.duration_minutes else {
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.burn_in.running = false;
         s.error =
             Some("burn-in command without a duration_minutes discriminator".to_owned());
@@ -787,7 +813,7 @@ pub fn run_burn_in(
         target: cmd.target,
         duration_minutes,
     }) {
-        let mut s = state.write().unwrap();
+        let mut s = state_write(state);
         s.bench.burn_in.running = false;
         s.error = Some(error.to_string());
         return Ok(());
@@ -799,16 +825,16 @@ pub fn run_burn_in(
         if cancel.load(Ordering::Relaxed) {
             // The run id is read under a brief scope; the
             // `CancelBenchmark` itself goes out with no lock held.
-            let run_id = state.read().unwrap().bench.run_id;
+            let run_id = state_read(state).bench.run_id;
             if let Some(run_id) = run_id {
                 let _ = client.send(&Request::CancelBenchmark { run_id });
             }
-            state.write().unwrap().bench.burn_in.running = false;
+            state_write(state).bench.burn_in.running = false;
             break;
         }
         match client.recv() {
             Ok(Response::BenchStarted { run_id }) => {
-                state.write().unwrap().bench.run_id = Some(run_id);
+                state_write(state).bench.run_id = Some(run_id);
             }
             Ok(Response::BurnInProgress(tick)) => {
                 // The tick's bookkeeping lands in the burn-in state
@@ -824,7 +850,7 @@ pub fn run_burn_in(
                     bandwidth,
                     latency_ns,
                 } = tick;
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.bench.burn_in.iteration = iteration;
                 s.bench.burn_in.elapsed_secs = elapsed_secs;
                 let slot = tier as usize;
@@ -868,7 +894,7 @@ pub fn run_burn_in(
                 // D-1/D-2): record the structured error and stop the
                 // run — the permanent mirror of `run_bench`'s
                 // `BurnInProgress` contract guard.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some("unexpected benchmark frame during burn-in".to_owned());
                 s.bench.burn_in.running = false;
                 break;
@@ -876,17 +902,17 @@ pub fn run_burn_in(
             Ok(Response::BenchResult { grid, .. }) => {
                 // The terminal grid is the last completed pass: the
                 // 4×4 table + the F2/F3 exports pick it up for free.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.bench.grid = Some(grid);
                 s.bench.burn_in.running = false;
                 break;
             }
             Ok(Response::BenchCancelled { .. }) => {
-                state.write().unwrap().bench.burn_in.running = false;
+                state_write(state).bench.burn_in.running = false;
                 break;
             }
             Ok(Response::Error(message)) => {
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some(message);
                 s.bench.burn_in.running = false;
                 break;
@@ -895,7 +921,7 @@ pub fn run_burn_in(
                 // A telemetry frame in the burn-in stream violates the
                 // wire contract (`GetTelemetry` is served on its own
                 // connection, P3-16): stop the run and record it.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some("unexpected response during burn-in".to_owned());
                 s.bench.burn_in.running = false;
                 break;
@@ -905,13 +931,13 @@ pub fn run_burn_in(
                 // violates the wire contract (probe reports reply
                 // only to `GetProbeReport`, chunk probe-1a): stop
                 // the run and record it.
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some("unexpected probe report during burn-in".to_owned());
                 s.bench.burn_in.running = false;
                 break;
             }
             Err(error) => {
-                let mut s = state.write().unwrap();
+                let mut s = state_write(state);
                 s.error = Some(error.to_string());
                 s.bench.burn_in.running = false;
                 break;
@@ -1009,11 +1035,11 @@ pub fn spawn_poller(
             // it clears the flag and runs the one-shot request here,
             // before the bench dispatch (a probe never blocks a run).
             let (probe_requested, socket) = {
-                let s = state.read().unwrap();
+                let s = state_read(&state);
                 (s.probe_requested, s.settings.socket.clone())
             };
             if probe_requested {
-                state.write().unwrap().probe_requested = false;
+                state_write(&state).probe_requested = false;
                 let _ = request_probe_report(Path::new(&socket), &state);
             }
             match bench_rx.try_recv() {
@@ -1021,7 +1047,7 @@ pub fn spawn_poller(
                     // The live settings socket (C6-30): a panel edit
                     // retargets the next run (the fresh connection
                     // per cycle rides the change — D6).
-                    let socket = state.read().unwrap().settings.socket.clone();
+                    let socket = state_read(&state).settings.socket.clone();
                     // The run-class dispatch (C7-16): the cmd's
                     // `duration_minutes` is the discriminator —
                     // `None` routes to `run_bench` (a normal run),
@@ -1046,7 +1072,7 @@ pub fn spawn_poller(
                     // refresh gate, or the socket takes effect
                     // without a restart.
                     let (interval, refresh_enabled, socket, reconnect_requested) = {
-                        let settings = state.read().unwrap();
+                        let settings = state_read(&state);
                         (
                             clamp_poll_interval(settings.settings.poll_interval_ms),
                             settings.settings.refresh_enabled,
@@ -1069,9 +1095,9 @@ pub fn spawn_poller(
                         // (b) one-shot baseline re-triggers on the
                         // next tick (one extra idempotent poll,
                         // then the normal rhythm).
-                        state.write().unwrap().reconnect_requested = false;
+                        state_write(&state).reconnect_requested = false;
                         last_poll = Instant::now();
-                        let _ = poll_telemetry(Path::new(&socket), &mut state.write().unwrap());
+                        let _ = poll_telemetry(Path::new(&socket), &mut state_write(&state));
                     } else if baseline_for.as_deref() != Some(socket.as_str()) {
                         // The one-shot baseline fetch for this socket
                         // value (D-8): exactly one per distinct
@@ -1082,12 +1108,12 @@ pub fn spawn_poller(
                         // baseline is not re-attempted on its own — so
                         // the (c) cadence starts a full interval after
                         // it.
-                        let _ = poll_telemetry(Path::new(&socket), &mut state.write().unwrap());
+                        let _ = poll_telemetry(Path::new(&socket), &mut state_write(&state));
                         baseline_for = Some(socket);
                         last_poll = Instant::now();
                     } else if refresh_enabled && last_poll.elapsed() >= interval {
                         last_poll = Instant::now();
-                        let _ = poll_telemetry(Path::new(&socket), &mut state.write().unwrap());
+                        let _ = poll_telemetry(Path::new(&socket), &mut state_write(&state));
                     }
                 }
                 Err(TryRecvError::Disconnected) => break,
@@ -1123,6 +1149,37 @@ mod tests {
     use crate::history::HISTORY_CAPACITY;
 
     use super::*;
+
+    /// TC-FE3 (the poison-cascade confirming test, GUI side): poison the
+    /// shared-state lock (a panic while holding a write guard), then a
+    /// subsequent read and write **through the [`state_read`] /
+    /// [`state_write`] helpers** recover the guard via `into_inner`
+    /// **without** re-panicking — one stray panic degrades a single
+    /// access, it never cascades across the poller and render threads.
+    /// Pre-fix the bare `.read().unwrap()` / `.write().unwrap()` panicked
+    /// on the poisoned lock (the cascade).
+    #[test]
+    fn tc_fe3_poisoned_lock_recovers_without_cascade() {
+        use std::panic;
+        let state = Arc::new(RwLock::new(TelemetryData::default()));
+        let poisoned = Arc::clone(&state);
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(move || {
+            let mut guard = poisoned.write().unwrap();
+            guard.error = Some("panic-while-holding".to_owned());
+            panic!("poison the lock");
+        }));
+        assert!(state.is_poisoned(), "the lock must be poisoned after the panic");
+        // A read through the helper recovers the guard (no cascade panic) and
+        // sees the value the panicking writer set.
+        let data = state_read(&state);
+        assert_eq!(data.error.as_deref(), Some("panic-while-holding"), "read recovers the last-good value");
+        drop(data);
+        // A write through the helper also recovers (no cascade panic).
+        let mut data = state_write(&state);
+        data.error = Some("recovered".to_owned());
+        drop(data);
+        assert_eq!(state_read(&state).error.as_deref(), Some("recovered"));
+    }
 
     /// A unique temp socket path owned by a guard that removes the file
     /// on drop (best-effort cleanup; the path is pid-qualified so
@@ -3350,7 +3407,7 @@ mod tests {
         });
         let state = Arc::new(RwLock::new(TelemetryData::default()));
         let _ = request_probe_report(sock.path(), &state);
-        let guard = state.read().unwrap();
+        let guard = state_read(&state);
         match &guard.probe_result {
             ProbeResult::Ok(r) => {
                 assert_eq!(*r, expected, "the landed report must match")
@@ -3367,7 +3424,7 @@ mod tests {
         let sock = TempSocket::new("probe-report-missing");
         let state = Arc::new(RwLock::new(TelemetryData::default()));
         let _ = request_probe_report(sock.path(), &state);
-        let guard = state.read().unwrap();
+        let guard = state_read(&state);
         match &guard.probe_result {
             ProbeResult::Err(msg) => {
                 assert!(!msg.is_empty(), "a friendly error text")

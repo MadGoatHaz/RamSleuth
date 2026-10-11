@@ -352,6 +352,10 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         .split(area);
 
     let width = usize::from(outer[0].width);
+    // FE-4: the header erases its own region before it paints (a
+    // `Paragraph` writes only its content width; the single per-surface
+    // `blank_area` idiom keeps the region clean by construction).
+    crate::graphs::blank_area(frame.buffer_mut(), outer[0], Color::Reset);
     frame.render_widget(
         Paragraph::new(vec![
             header_line1(state, width),
@@ -363,17 +367,21 @@ pub fn render(frame: &mut Frame, state: &AppState) {
 
     // The optional strips, in the same order (a closed / absent strip
     // is simply missing from the layout — the header stays the top
-    // three rows, the zones take the remainder).
+    // three rows, the zones take the remainder). Each strip erases its
+    // own region first (FE-4).
     let mut row = 1;
     if state.settings.settings_open {
+        crate::graphs::blank_area(frame.buffer_mut(), outer[row], Color::Reset);
         frame.render_widget(Paragraph::new(settings_strip_line(state)), outer[row]);
         row += 1;
     }
     if requirements_open {
+        crate::graphs::blank_area(frame.buffer_mut(), outer[row], SLATE);
         crate::requirements::render_requirements_strip(frame, &requirements, outer[row]);
         row += 1;
     }
     if state.settings.requirements_open {
+        crate::graphs::blank_area(frame.buffer_mut(), outer[row], SLATE);
         crate::requirements::render_about_block(frame, outer[row]);
         row += 1;
     }
@@ -392,8 +400,16 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         .spacing(1)
         .split(zone_area);
 
+    // FE-4: each zone erases its own (layout-dependent) region before it
+    // paints. When a strip above closes, the zones expand to absorb the
+    // freed rows — blanking their new region is what erases the closed
+    // strip's stale pixels (the per-surface idiom replaces the old
+    // global screen-clear on a visible→hidden transition).
+    crate::graphs::blank_area(frame.buffer_mut(), zones[0], SLATE);
     render_zone1(frame, state, zones[0]);
+    crate::graphs::blank_area(frame.buffer_mut(), zones[1], SLATE);
     render_zone2(frame, state, zones[1]);
+    crate::graphs::blank_area(frame.buffer_mut(), zones[2], SLATE);
     render_zone3(frame, state, zones[2]);
 
     // The graphs overlay: drawn last over the whole zone area (the
