@@ -14,6 +14,23 @@
 //! **No-panic contract:** every arm is bincode-serializable (plan D3);
 //! failures cross the wire as structured payloads — [`Response::Error`]
 //! and the `Na(reason)` sections inside a snapshot — never as panics.
+//!
+//! **Forward-compatibility contract (C6 / DAEMON-1, enforced):** the wire
+//! is versioned by [`crate::PROTOCOL_VERSION`] (the frame header) and the
+//! payload layouts are **byte-pinned** (the `TC-DAEMON1` tests below).
+//! The payload structs — the telemetry crate's `SystemMemoryTelemetry` /
+//! `ProbeReport` / `ProbeRaw` / `SpdModule` and the bench crate's
+//! `StreamTarget` / `StreamProgress` / `BenchmarkGrid` / `BurnInTick` —
+//! are **bincode-positional**, so their fields serialize in declaration
+//! order with no per-field names. The sanctioned evolution rule is
+//! **append-only-at-the-tail**: a new field is added at the *end* of a
+//! struct (the OQ-10 pattern the enum discriminant pins already follow),
+//! never reordered, removed, or re-typed in place. Any such layout change
+//! is a *schema change*: it changes the pinned bytes (the `TC-DAEMON1`
+//! test fails) and MUST bump [`crate::PROTOCOL_VERSION`] in lockstep, so
+//! a peer on a different generation is rejected by
+//! [`crate::frame::decode_frame`] instead of silently mis-parsing. A
+//! reorder is therefore a version bump — never a silent change.
 
 use ramsleuth_bench::{BenchmarkGrid, BurnInTick, StreamProgress, StreamTarget};
 use ramsleuth_telemetry::{ProbeReport, SystemMemoryTelemetry};
@@ -135,8 +152,8 @@ mod tests {
     use ramsleuth_bench::{BenchOp, Tier};
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
-    use ramsleuth_telemetry::spd_decode::SpdModule;
-    use ramsleuth_telemetry::SystemPlatform;
+    use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
+    use ramsleuth_telemetry::{ProbeRaw, ProbeSystem, SystemPlatform};
 
     /// A representative snapshot: a `Value` CPU branch, structured-`Na`
     /// vendor branches, one SPD module with mixed `Value`/`Na` cells, a
@@ -435,5 +452,233 @@ mod tests {
             7,
             "Response::ProbeReport",
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TC-DAEMON1 (c): payload-layout byte-pinning (the forward-compat
+    // anchor). The payload structs are bincode-positional and
+    // append-only-at-the-tail; pinning each canonical encoding means any
+    // field add / reorder / type change alters the bytes and fails this
+    // test — forcing a deliberate `PROTOCOL_VERSION` bump.
+    // ------------------------------------------------------------------
+
+    /// Encode a byte slice to a lowercase hex string (for pinning).
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Canonical `SystemMemoryTelemetry` (host-independent, fixed values).
+    fn canonical_system_memory_telemetry() -> SystemMemoryTelemetry {
+        SystemMemoryTelemetry {
+            cpu: CpuInfo {
+                vendor: CpuVendor::Amd(AmdZen::Zen3),
+                brand: "Ryzen 9 5950X".to_owned(),
+            },
+            amd: Section::na(NaReason::DriverMissing),
+            intel: Section::na(NaReason::UnsupportedHardware),
+            spd: vec![canonical_spd_module()],
+            platform: SystemPlatform {
+                cpu_clock_mhz: Section::Value(3500.0),
+                motherboard: Section::Value("Test Board".to_owned()),
+                bios: Section::Value("1.0".to_owned()),
+                agesa: Section::na(NaReason::NotApplicable),
+                smu_version: Section::na(NaReason::NotApplicable),
+            },
+            total_capacity: Section::Value(16.0),
+            dimm_sizes: vec![Section::Value(16.0)],
+            vcore: Section::na(NaReason::NotApplicable),
+        }
+    }
+
+    /// Canonical `SpdModule` (one DDR4 DIMM, one XMP profile).
+    fn canonical_spd_module() -> SpdModule {
+        SpdModule {
+            index: 0x52,
+            is_ddr5: false,
+            maker: Section::Value("0xC1".to_owned()),
+            die_maker: Section::Value("SK hynix".to_owned()),
+            die_type: Section::na(NaReason::NotApplicable),
+            devices: Section::Value(8),
+            part: Section::na(NaReason::NotApplicable),
+            serial: Section::na(NaReason::NotApplicable),
+            rank: Section::Value(1),
+            density_mbit: Section::Value(16_384),
+            speed_mts: Section::Value(3_200),
+            profiles: vec![SpdProfile {
+                index: 1,
+                speed_mts: Section::Value(3_200),
+                cas: Section::Value(14),
+                trcd: Section::Value(14),
+                trp: Section::Value(14),
+                tras: Section::Value(28),
+                voltage: Section::Value(1_200),
+            }],
+        }
+    }
+
+    /// Canonical `StreamProgress` (one completed bandwidth cell).
+    fn canonical_stream_progress() -> StreamProgress {
+        StreamProgress {
+            cell_index: 0,
+            total_cells: 12,
+            tier: Tier::Memory,
+            op: BenchOp::Read,
+            value: 512.0,
+            label: "Memory \u{b7} Read (GB/s)".to_owned(),
+        }
+    }
+
+    /// Canonical `BenchmarkGrid` (the 4\u{d7}4 grid, fixed cells).
+    fn canonical_benchmark_grid() -> BenchmarkGrid {
+        BenchmarkGrid {
+            read_gbps: [512.0, 897.5, 402.0, 198.5],
+            write_gbps: [410.0, 823.0, 311.5, 152.0],
+            copy_gbps: [455.0, 851.5, 349.0, 176.5],
+            latency_ns: [88.0, 1.1, 3.4, 12.7],
+        }
+    }
+
+    /// Canonical `BurnInTick` (one completed bandwidth cell).
+    fn canonical_burn_in_tick() -> BurnInTick {
+        BurnInTick {
+            iteration: 1,
+            elapsed_secs: 1.5,
+            tier: Tier::Memory,
+            bandwidth: Some((BenchOp::Read, 512.0)),
+            latency_ns: None,
+        }
+    }
+
+    /// Canonical `ProbeRaw` (a representative Intel subset populated, the
+    /// rest at their `Default` containment).
+    fn canonical_probe_raw() -> ProbeRaw {
+        ProbeRaw {
+            mcbios_req: Some(0x0000_0012),
+            tc_ch0_dbp: Some(0x1111_0F11),
+            tc_ch0_rap: Some(0x2718_0204),
+            mad_inter_channel: Some(0x0000_0003),
+            mchbar_base: Some(0xFED1_0000),
+            mchbar_enabled: true,
+            ..Default::default()
+        }
+    }
+
+    /// Canonical `ProbeReport` (snapshot + raw + system identity).
+    fn canonical_probe_report() -> ProbeReport {
+        ProbeReport {
+            telemetry: canonical_system_memory_telemetry(),
+            raw: Some(canonical_probe_raw()),
+            system: ProbeSystem {
+                cpu_brand: "Ryzen 9 5950X".to_owned(),
+                cpu_vendor: "AMD".to_owned(),
+                cpu_gen: "Zen 3".to_owned(),
+                pci_host_bridge: Some("0x1234".to_owned()),
+                kernel: "6.6.0-1-cachyos".to_owned(),
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                ramsleuth_version: "2.4.15".to_owned(),
+                telemetry_source: "ryzen_smu".to_owned(),
+            },
+        }
+    }
+
+    /// TC-DAEMON1 (c, generation helper): print each canonical payload's
+    /// bincode encoding as hex so the pins below can be (re)generated.
+    /// Run with `cargo test -p ramsleuth-protocol tc_daemon1_generate --
+    /// --nocapture`. **Not a pass/fail assertion** — it only prints.
+    #[test]
+    fn tc_daemon1_generate_payload_pins() {
+        let cases: [(&str, String); 7] = [
+            (
+                "SystemMemoryTelemetry",
+                to_hex(&bincode::serialize(&canonical_system_memory_telemetry()).unwrap()),
+            ),
+            (
+                "SpdModule",
+                to_hex(&bincode::serialize(&canonical_spd_module()).unwrap()),
+            ),
+            (
+                "StreamProgress",
+                to_hex(&bincode::serialize(&canonical_stream_progress()).unwrap()),
+            ),
+            (
+                "BenchmarkGrid",
+                to_hex(&bincode::serialize(&canonical_benchmark_grid()).unwrap()),
+            ),
+            (
+                "BurnInTick",
+                to_hex(&bincode::serialize(&canonical_burn_in_tick()).unwrap()),
+            ),
+            (
+                "ProbeRaw",
+                to_hex(&bincode::serialize(&canonical_probe_raw()).unwrap()),
+            ),
+            (
+                "ProbeReport",
+                to_hex(&bincode::serialize(&canonical_probe_report()).unwrap()),
+            ),
+        ];
+        for (name, hex) in &cases {
+            println!("PIN {name} = \"{hex}\";");
+        }
+    }
+
+    /// TC-DAEMON1 (c): **byte-pin** each payload struct's canonical
+    /// bincode encoding. The payload layouts are bincode-positional and
+    /// append-only-at-the-tail; any field add / reorder / type change
+    /// alters these bytes and fails this test — forcing a deliberate
+    /// `PROTOCOL_VERSION` bump (the forward-compat guarantee, C6).
+    ///
+    /// To regenerate the pins after a sanctioned schema change: bump
+    /// `PROTOCOL_VERSION`, run `cargo test -p ramsleuth-protocol
+    /// tc_daemon1_generate -- --nocapture`, and paste the printed hex into
+    /// the literals below.
+    #[test]
+    fn tc_daemon1_payload_layout_byte_pins() {
+        let pins: [(&str, &str, &str); 7] = [
+            (
+                "SystemMemoryTelemetry",
+                &to_hex(&bincode::serialize(&canonical_system_memory_telemetry()).unwrap()),
+                "00000000020000000d0000000000000052797a656e2039203539353058010000000100000001000000000000000100000000000000520000000000040000000000000030784331000000000800000000000000534b2068796e69780100000004000000000000000801000000040000000100000004000000000000000100000000004000000000800c01000000000000000100000000800c000000000e000000000e000000000e000000001c00000000b00400000000000000000058ab40000000000a000000000000005465737420426f617264000000000300000000000000312e300100000004000000010000000400000000000000000000000000304001000000000000000000000000000000000030400100000004000000",
+            ),
+            (
+                "SpdModule",
+                &to_hex(&bincode::serialize(&canonical_spd_module()).unwrap()),
+                "520000000000040000000000000030784331000000000800000000000000534b2068796e69780100000004000000000000000801000000040000000100000004000000000000000100000000004000000000800c01000000000000000100000000800c000000000e000000000e000000000e000000001c00000000b004",
+            ),
+            (
+                "StreamProgress",
+                &to_hex(&bincode::serialize(&canonical_stream_progress()).unwrap()),
+                "000000000c0000000000000000000000000000000000804015000000000000004d656d6f727920c2b72052656164202847422f7329",
+            ),
+            (
+                "BenchmarkGrid",
+                &to_hex(&bincode::serialize(&canonical_benchmark_grid()).unwrap()),
+                "000000000000804000000000000c8c4000000000002079400000000000d068400000000000a079400000000000b88940000000000078734000000000000063400000000000707c4000000000009c8a400000000000d07540000000000010664000000000000056409a9999999999f13f3333333333330b406666666666662940",
+            ),
+            (
+                "BurnInTick",
+                &to_hex(&bincode::serialize(&canonical_burn_in_tick()).unwrap()),
+                "01000000000000000000f83f000000000100000000000000000000804000",
+            ),
+            (
+                "ProbeRaw",
+                &to_hex(&bincode::serialize(&canonical_probe_raw()).unwrap()),
+                "011200000001110f11110104021827000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000103000000000000000000010000d1fe0000000001000000000000000000000000000000",
+            ),
+            (
+                "ProbeReport",
+                &to_hex(&bincode::serialize(&canonical_probe_report()).unwrap()),
+                "00000000020000000d0000000000000052797a656e2039203539353058010000000100000001000000000000000100000000000000520000000000040000000000000030784331000000000800000000000000534b2068796e69780100000004000000000000000801000000040000000100000004000000000000000100000000004000000000800c01000000000000000100000000800c000000000e000000000e000000000e000000001c00000000b00400000000000000000058ab40000000000a000000000000005465737420426f617264000000000300000000000000312e30010000000400000001000000040000000000000000000000000030400100000000000000000000000000000000003040010000000400000001011200000001110f11110104021827000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000103000000000000000000010000d1fe00000000010000000000000000000000000000000d0000000000000052797a656e20392035393530580300000000000000414d4405000000000000005a656e20330106000000000000003078313233340f00000000000000362e362e302d312d63616368796f7305000000000000006c696e757806000000000000007838365f36340600000000000000322e342e3135090000000000000072797a656e5f736d75",
+            ),
+        ];
+        for (name, actual, pinned) in pins {
+            assert_eq!(
+                actual,
+                pinned,
+                "{name} payload layout changed — this is a schema change: bump \
+                 PROTOCOL_VERSION (C6 / DAEMON-1) and regenerate the pin"
+            );
+        }
     }
 }
