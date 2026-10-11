@@ -1,7 +1,7 @@
 # RamSleuth — Architecture
 
 **Document:** `Docs/Architecture.md` (part of the RamSleuth v2 repository-facing documentation)
-**Applies to:** workspace v2.4.13 (branch `v2-development`)
+**Applies to:** workspace v2.4.16 (branch `v2-development`)
 **Audience:** expert readers — kernel-aware systems programmers, packagers, and maintainers who need the full design rationale behind RamSleuth.
 
 Companion documents: [`README.md`](../README.md) (entry point), [`Docs/User_Guide.md`](User_Guide.md) (operational guide), [`packaging/README.md`](../packaging/README.md) (packaging and operator guide).
@@ -41,7 +41,9 @@ desktop systems. It has two product layers:
   XMP 3.0-EXPO profiles).
 - **Layer 2 — the benchmark engine (the Memory & Latency Benchmark).** A 4×4 grid of memory
   bandwidth (Read / Write / Copy) and pointer-chase latency across the Memory /
-  L1 / L2 / L3 tiers, measured with AVX2 / AVX-512F SIMD kernels, one pinned
+  L1 / L2 / L3 tiers — with **tier-aware write/copy kernels** (each cell
+  reflects the tier it is labelled) and a **fixed 1,000,000-hop latency chase** —
+  measured with AVX2 / AVX-512F SIMD kernels, one pinned
   worker per physical core, plus a multi-pass "burn-in" soak mode.
 
 Both layers are exposed through **two frontends** — a ratatui/crossterm TUI and
@@ -170,26 +172,31 @@ Layer 2 answers *"how fast is this memory subsystem?"*. The
 - **Bandwidth kernels** — hand-written **AVX2** (256-bit, 32-byte blocks) and
   **AVX-512F** (512-bit, 64-byte blocks) read / write / copy routines; the
   512-bit kernels carry their own AVX2 fallback, and the engine picks the family
-  at runtime from `is_x86_feature_detected!`.
+  at runtime from `is_x86_feature_detected!`. The **write and copy kernels are
+  tier-aware** (selected by `Tier`, not just the SIMD family): L1/L2/L3 use
+  cache-resident (non-temporal) stores, Memory uses non-temporal (DRAM) stores,
+  and the read leg stays cache-aligned — so each cell reflects the tier it is
+  labelled (per-tier fidelity).
 - **Pinned workers** — the host CPU topology is read from sysfs; exactly one
   worker thread per *physical* core (SMT siblings filtered) pins itself via
   `sched_setaffinity`, and all workers start a pass in lockstep across a
   barrier, so the DRAM bus is driven the way a real multi-threaded workload
   drives it.
-- **Pointer-chase latency** — a 128 MiB buffer is materialized as a single
-  pseudo-random *ring*: slot `i` stores the index of the next hop one cache
-  line (64 B) away, defeating hardware prefetchers so every hop is a true
+- **Pointer-chase latency** — the tier's bandwidth buffer is materialized as
+  a single pseudo-random *ring*: slot `i` stores the index of the next hop one
+  cache line (64 B) away, defeating hardware prefetchers so every hop is a true
   dependent load. The chase is timed with serialized `__rdtscp` self-calibrated
-  against `Instant`, and the grid cell is the median of three runs over at
-  least one million hops.
+  against `Instant`, over a **fixed 1,000,000 hops** (independent of the ring
+  length — no full traversal), and the grid cell is the median of three runs.
 - **Burn-in mode** — a multi-pass duration run (5-minute soak by default in the
   frontends, or any duration including infinite) that repeatedly executes whole
   passes, streaming one tick per completed cell and per completed per-tier
   latency pass. It is a distinct run class from the single-pass benchmark: the
   two are mutually exclusive daemon-side.
 
-The engine is also a standalone binary (`ramsleuth-bench --avx512 --json`) so a
-power user can run the grid directly, without the daemon, on any machine.
+The engine is also a standalone binary (`ramsleuth-bench --avx512 --json`, or
+just the latency pass with `--latency`) so a power user can run the grid
+directly, without the daemon, on any machine.
 
 ---
 
@@ -263,12 +270,12 @@ reason renders identically in the CLI, TUI, and GUI.
 
 ## 4. The workspace map
 
-The repository is a Cargo **workspace of 8 members** — 7 product crates plus one
-development tool — all inheriting a single version:
+The repository is a Cargo **workspace of 9 members** — **8 product crates** plus
+one development tool — all inheriting a single version:
 
 | Workspace fact | Value |
 |----------------|-------|
-| Version | **2.4.13** (`[workspace.package].version`) |
+| Version | **2.4.16** (`[workspace.package].version`) |
 | Edition | 2021 |
 | MSRV | **1.75** (`rust-version`) |
 | Resolver | 2 |
@@ -278,33 +285,42 @@ development tool — all inheriting a single version:
 
 The six installed binaries are `ramsleuth-daemon`, `ramsleuth-client`,
 `ramsleuth-tui`, `ramsleuth` (the GUI), `ramsleuth-bench`, and
-`ramsleuth-telemetry`; `ramsleuth-protocol` is library-only and is never
-installed, and `ramsleuth-gen-icon` is a dev tool that is never installed.
+`ramsleuth-telemetry`; `ramsleuth-protocol` and `ramsleuth-display` are
+library-only and are never installed, and `ramsleuth-gen-icon` is a dev tool
+that is never installed.
 
 ### 4.1 Dependency direction
 
 ```text
-ramsleuth-telemetry  ramsleuth-bench
-        \                  /
-         v                v
-      ramsleuth-protocol
-         ^                ^
-         |                |
- ramsleuth-client --------+
-         ^
-    /    |    \
-   v     v     v
- TUI    GUI   CLI (the crate's own bin)
-         ^
-         |
-     ramsleuth-daemon  (tokio, spawn_blocking the bench/telemetry calls)
+ramsleuth-telemetry   ramsleuth-bench
+        \                     /
+         v                   v
+      ramsleuth-display          (shared presentation layer: formatters + N/A maps + CPU-temp scan)
+         ^  ^  ^
+         |  |  |
+         |  +--+--------------------+
+         |            ramsleuth-protocol   (wire vocabulary + versioned frame codec)
+         |                ^        ^
+         |                |        |
+  ramsleuth-client -------+        |
+         ^          (client lib + CLI bin)
+   /    |    \
+  v     v     v
+TUI    GUI   CLI (the client's own bin)
+              ^
+              |
+       ramsleuth-daemon   (tokio; spawn_blocking the bench/telemetry calls)
 ```
 
-Payload types cross the wire **verbatim** from their owning crates
+`ramsleuth-display` is the **shared presentation layer** — formatters, the
+N/A-reason text maps, and the CPU-temp scan — **not** a wire crate: it shapes
+the values for the frontends but never crosses the socket. The payload types
+cross the wire **verbatim** from their owning crates
 ([`SystemMemoryTelemetry`](#10-the-telemetry-core),
 `StreamTarget` / `StreamProgress` / `BenchmarkGrid` / `BurnInTick`) — the
-protocol crate owns only the four wire enums and the socket-path constant, so
-there is no duplicated type surface to drift.
+protocol crate owns only the four wire enums, the versioned frame codec
+(`PROTOCOL_VERSION` in the 8-byte header, §7.1), and the socket-path constant,
+so there is no duplicated type surface to drift.
 
 ### 4.2 `ramsleuth-telemetry`
 
@@ -321,7 +337,7 @@ section is N/A, exit 2 on a bad flag).
 | `cpuid.rs` | `CpuInfo::detect()` — vendor (`AuthenticAMD` / `GenuineIntel` / unknown), microarchitecture (`AmdZen` Zen1–Zen5 by CPUID family; `IntelGen` Skylake–Arrow Lake), brand string. Pure `__cpuid` intrinsic; the dispatch key of the whole crate. |
 | `error.rs` | The contract types: `TelemetryError` (rich cause: vendor, driver, privilege hint, PM-table version, `io::Error`, parse detail), `NaReason` (the six display reasons, §3.3), `Section<T>` (`Value`/`Na`). |
 | `amd_smu.rs` | The single privileged gateway to the `ryzen_smu` driver: sysfs-first PM-blob acquisition, version sourcing, the char-device fallback, and safe `nix` wrappers (no `unsafe`). |
-| `amd_pm.rs` | Version-guarded parse of the raw PM blob into clocks (MCLK/UCLK/FCLK) and voltages (VDDCR_VDD/VDDCR_SOC). |
+| `amd_pm.rs` | **Generation-first** parse of the raw PM blob (dispatch on the CPUID `AmdZen` family; the `TableVersionId` is a **per-generation plausibility filter, not a closed allowlist**) into clocks (MCLK/UCLK/FCLK) and voltages (VDDCR_VDD/VDDCR_SOC). |
 | `amd_smn.rs` | The `smn` accessor protocol plus the verified SMN register tables — the 13-register timing block (the 27 subtimings, GDM, command rate) and the 14-register channel set (per-UMC CS base/mask + `UmcCapHi` → channel mode + ECC). |
 | `amd_readout.rs` | The four vendor-neutral display types (`ClockReadout`, `TimingSet`, `CadBus`, `VoltageSet`) and the AMD mapping onto them, with sanity gating. |
 | `intel_gen.rs` | The per-generation decode-profile dispatcher (IG-01/IG-03): `profile_for(IntelGen)` → the static `GenProfile` (window size — 64 KiB for Tier 1 / Rocket Lake, 256 KiB for the Alder family; channel count 2/2/2/4; `GearCap` None / Gear2 / Gear4; `GenMap` family), plus the Tier-3 `ALDER_CHANNELS` subchannel descriptors and the widened DDR5 `ALDER_FIELDS` bit ranges. Pure data, no I/O — the foundation every generational decode dispatches on. |
@@ -335,6 +351,22 @@ section is N/A, exit 2 on a bad flag).
 | `board_vrm.rs` | DMI-keyed `nct6798` board profiles (the VDDIO_MEM overlay and cross-check rails). |
 | `facade.rs` | `collect()` — the aggregation + per-branch containment (§10.1). |
 | `main.rs` | The standalone `ramsleuth-telemetry` CLI. |
+
+### 4.2b `ramsleuth-display` (the shared presentation layer — new this cycle, C3)
+
+**Role:** the single shared presentation layer — **single-source display**. Pure
+value formatters, the `NaReason` → text maps, and the CPU-temperature scan that
+every real frontend (TUI, GUI, CLI) renders through, so the same value + the
+same `NaReason` can never diverge. It depends **only** on the two leaf crates
+(`ramsleuth-telemetry` + `ramsleuth-bench`) — **no `ratatui`/`egui`/`tokio`** —
+and it **does not recompute a value the daemon provides** (the formatters take
+the wire payload and shape it for display; the daemon is authoritative for
+streamed values, the frontends consume, they do not recompute).
+**Library-only, never installed.**
+
+| `src/` file | Responsibility |
+|-------------|----------------|
+| `lib.rs` | Crate root: the shared formatters (capacity, clock, channel-mode, DIMM summary, slot note, ECC, sync-mode, AGESA fragment), the `na_cell_text` / `na_section_text` N/A maps, `read_cpu_temp_c` (the shared CPU-temp scan), `cpu_gen_text`, and `bench_cell_text` — the one implementation every frontend renders through (no-panic: every formatter degrades a non-finite/`Na` input to an honest placeholder). |
 
 ### 4.3 `ramsleuth-bench`
 
@@ -350,11 +382,11 @@ library (the daemon runs it on a blocking thread) and a standalone binary
 | `kernel_read.rs` / `kernel_write.rs` / `kernel_copy.rs` | The AVX2 256-bit bandwidth kernels (32-byte blocks). |
 | `kernel_512.rs` | The AVX-512F 512-bit kernels (64-byte blocks), each carrying its own AVX2 fallback. |
 | `topology.rs` | CPU topology from sysfs: SMT-filtered physical cores, logical CPUs, per-CCD and total L3. |
-| `buffers.rs` | Buffer sizing for every tier (L1/L2/L3/DRAM) plus the fixed 128 MiB latency ring; allocation is the caller's job. |
-| `worker.rs` | Pinned multi-threaded pass: per-core `sched_setaffinity`, barrier lockstep, block-aligned partitioning, checksum aggregation. |
-| `latency.rs` | The pointer-chase ring builder + the `__rdtscp` self-calibrated measurement kernel. |
+| `buffers.rs` | Buffer sizing for every tier (L1/L2/L3/DRAM) — **DRAM = `max(256 MiB, 3 × total system L3)`** so the Memory row is true DRAM; the latency chase **reuses the per-tier bandwidth size** (no separate 128 MiB ring); allocation is the caller's job. |
+| `worker.rs` | Pinned multi-threaded pass: per-core `sched_setaffinity`, barrier lockstep, block-aligned partitioning, checksum aggregation; **the write/copy kernels are tier-aware** (cache-resident for L1/L2/L3, non-temporal for Memory — per-tier fidelity). |
+| `latency.rs` | The pointer-chase ring builder + the **single** `__rdtscp` self-calibrated measurement kernel (**a fixed 1,000,000-hop chase**, materialized 64-byte-strided). |
 | `orchestrator.rs` | `run_all` — runs every tier × op, best-of-3 bandwidth / median latency, and fills the 4×4 `BenchmarkGrid`. |
-| `streamed.rs` | The wire-ready contract: `run_streamed` (targeted cells, progress events, clean cancel) and `run_burn_in` (multi-pass duration runs, `BurnInTick` events). |
+| `streamed.rs` | The wire-ready contract: `run_streamed` (a `StreamTarget` of `Full` / `Tier(t)` / `Cell(t, op)` / **`Latency(t)`**, progress events, clean cancel) and `run_burn_in` (multi-pass duration runs, `BurnInTick` events). |
 | `main.rs` | The standalone CLI harness. |
 
 ### 4.4 `ramsleuth-protocol`
@@ -365,8 +397,8 @@ library (the daemon runs it on a blocking thread) and a standalone binary
 | `src/` file | Responsibility |
 |-------------|----------------|
 | `lib.rs` | Crate root: re-exports the frame codec and message types. |
-| `messages.rs` | `Message` (`Request` \| `Response`), the `Request`/`Response`/`BenchMode` enums, and the frozen `DEFAULT_SOCKET_PATH` constant. Payloads are the telemetry/bench types verbatim. |
-| `frame.rs` | The length-prefixed bincode 1.3 codec: `encode_frame` / `decode_frame`, the incremental-reader contract, the 16 MiB `MAX_FRAME_SIZE` guard, and `FrameError`. |
+| `messages.rs` | `Message` (`Request` \| `Response`), the `Request`/`Response`/`BenchMode` enums, and the frozen `DEFAULT_SOCKET_PATH` constant. Payloads are the telemetry/bench types verbatim. The payload layouts are **byte-pinned and append-only-at-the-tail**; the wire is **versioned** (`PROTOCOL_VERSION`) and a layout change is a version bump. |
+| `frame.rs` | The **versioned, length-prefixed** bincode 1.3 codec — an **8-byte header `[4-byte LE length][4-byte LE PROTOCOL_VERSION]`** + payload: `encode_frame` / `decode_frame`, the incremental-reader contract, the 16 MiB `MAX_FRAME_SIZE` guard, and `FrameError` (**incl. `VersionMismatch`**). |
 
 ### 4.5 `ramsleuth-daemon`
 
@@ -389,15 +421,17 @@ in the workspace. Both a library and the `ramsleuth-daemon` binary.
 ### 4.6 `ramsleuth-client`
 
 **Role:** the shared unprivileged IPC client — the transport every frontend
-consumes. Both a library and the CLI binary (`dump` / `bench` / `status`).
+consumes. Both a library and the CLI binary (`dump` / `bench` / `status` /
+**`probe` / `burn`**). Like the TUI and GUI, it renders all values and N/A
+text **through the shared `ramsleuth-display` layer**.
 
 | `src/` file | Responsibility |
 |-------------|----------------|
 | `client.rs` | The synchronous `std::os::unix::net::UnixStream` transport: connect with retries + backoff, timeouts, incremental frame read/write, one-round-trip `request()`, and the structured `ClientError` (incl. `DaemonDown`). |
 | `dump.rs` | The `dump` command: the pure dashboard-style `render` (every cell as value or `N/A (<reason>)`) + the one-RPC `GetTelemetry` variant. |
-| `commands.rs` | The `bench` (streamed run + terminal 4×4 grid through the pure `render_grid`) and `status` (per-section health summary) commands. |
-| `main.rs` | The CLI: subcommand dispatch, `--socket` / `--tier` / `--mode`, per-command read timeouts, exit codes 0/1/2. |
-| `lib.rs` | Crate root: re-exports `Client`, `ClientError`, and the three commands. |
+| `commands.rs` | The `bench` (streamed run + terminal 4×4 grid through the pure `render_grid`), the `status` (per-section health summary), **`probe` (the consent-gated report: `--stdout` / `--json`)**, and **`burn` (the soak: `--duration`)** commands. |
+| `main.rs` | The CLI: subcommand dispatch, `--socket` / `--tier` / `--mode` / **`--stdout` / `--json` / `--duration`**, per-command read timeouts, exit codes 0/1/2. |
+| `lib.rs` | Crate root: re-exports `Client`, `ClientError`, and the **five** commands. |
 
 ### 4.7 `ramsleuth-tui`
 
@@ -410,7 +444,7 @@ Both a library (the pure pieces: key mapping, render, rings, graphs) and the
 | `events.rs` | The frozen 17-key contract: pure `key_to_action` mapping + the single crossterm `poll_event` site. |
 | `ui.rs` | The three-zone dashboard renderer, `AppState` (wire types verbatim), the semantic palette, the parity strips. |
 | `ring.rs` | The TUI-local bounded FIFO ring (default 300 samples = 10 min at the 2 s poll) — a `std`-only mirror of the GUI core, no egui dependency. |
-| `graphs.rs` | The five-series graphs state (1800-deep ring = 60 min), the Na-guarded record hook, the window filter, the block-bar sparkline panel, and the CPU-temp source scan. |
+| `graphs.rs` | The five-series graphs state (1800-deep ring = 60 min), the Na-guarded record hook, the window filter, and the block-bar sparkline panel; the CPU-temp scan is **consumed from `ramsleuth-display`** (the shared single-source scan). |
 | `requirements.rs` | The TUI `diagnose` — the setup-requirements list behind the `[d]` strip. |
 | `main.rs` | The binary: terminal `Drop` guard, the background poller thread, the action dispatcher, bench/burn-in workers, snapshot/export, CLI. |
 | `lib.rs` | Crate root. |
@@ -419,7 +453,9 @@ Both a library (the pure pieces: key mapping, render, rings, graphs) and the
 
 **Role:** the desktop frontend (egui / eframe 0.27 + `egui_extras` + `png`)
 — binary name `ramsleuth`. Both a library (style, update/poller, zones, graph,
-history, settings, first-run) and the app shell.
+history, settings, first-run) and the app shell. Like the TUI and CLI, it
+renders all values and N/A text **through the shared `ramsleuth-display`
+layer**.
 
 | `src/` file | Responsibility |
 |-------------|----------------|
@@ -714,32 +750,50 @@ direction.
 | `Protocol(String)` | The stream violated the wire contract: an oversized frame, a bincode rejection, or a request frame where a response was due. |
 | `Io(io::Error)` | Mid-session i/o failure; a connection closed before a complete frame arrives carries `ErrorKind::UnexpectedEof`. |
 
-The CLI binary dispatches three subcommands over this transport:
+The CLI binary dispatches five subcommands over this transport:
 
 ```text
 Usage: ramsleuth-client [SUBCOMMAND] [OPTIONS]
+
+Subcommands:
   dump     Print the dashboard-style telemetry listing (default)
   bench    Run a streamed benchmark (progress lines + the 4x4 grid)
   status   Print the per-section health summary
+  probe    Fetch the consent-gated probe report (markdown to
+           ~/.ramsleuth/probe-report.md; --stdout prints it; --json
+           emits the raw ProbeReport)
+  burn     Start a burn-in soak (--duration <minutes>, 0 = infinite)
 
-  --socket <path>                  Daemon Unix socket (default: /run/ramsleuth/ramsleuth.sock)
-  --tier <memory|l1|l2|l3|full>    Benchmark tier scope (default: full)
-  --mode <full|memory-only>        Benchmark scope (default: full)
+Options:
+  --socket <path>                  Daemon Unix socket
+                                   (default: /run/ramsleuth/ramsleuth.sock)
+  --tier <memory|l1|l2|l3|full>    bench: tier scope (default: full)
+  --mode <full|memory-only>        bench: run scope (default: full)
+  --stdout                         probe: print the report to stdout
+  --json                           probe: emit the raw ProbeReport as JSON
+  --duration <minutes>             burn: the soak duration (default: 5;
+                                   0 = infinite)
+
+Exit codes: 0 success, 1 daemon/client error, 2 usage error
 ```
 
 `dump` is the one-RPC `GetTelemetry` → pure `render` → stdout (a 10 s read
 timeout); `bench` is the streamed run — a `BenchStarted` ack, one progress
 line per completed cell, then the terminal 4×4 grid through the
 pure `render_grid` (an unmeasured cell — `0.0` on the wire — prints `N/A`);
-`status` is the one-RPC per-section summary. Exit codes: **0** success, **1**
-daemon/client error (each with its structured diagnostic), **2** usage error.
+`status` is the one-RPC per-section summary; `probe` is the one
+`GetProbeReport` round trip → markdown to `~/.ramsleuth/probe-report.md`
+(`--stdout` prints it, `--json` emits the raw `ProbeReport`); and `burn` is
+`StartBurnIn` with `--duration` (`0` = infinite). Exit codes: **0** success,
+**1** daemon/client error (each with its structured diagnostic), **2** usage
+error.
 
 ---
 
 ## 7. The wire protocol
 
-The protocol is **binary, length-prefixed, and synchronous-format**: one
-`Message` per frame, per direction. It is owned by `ramsleuth-protocol`
+The protocol is **binary, versioned, length-prefixed, and synchronous-format**:
+one `Message` per frame, per direction. It is owned by `ramsleuth-protocol`
 (`frame.rs` for the codec, `messages.rs` for the vocabulary) and spoken by
 exactly two kinds of endpoint — the tokio daemon and the std clients — which
 never reimplement the layout.
@@ -747,14 +801,21 @@ never reimplement the layout.
 ### 7.1 Frame format
 
 ```text
-+----------------+----------------------------------------------+
-| 4-byte LE u32  |   bincode 1.3 serialization of the Message   |
-| payload length |                                              |
-+----------------+----------------------------------------------+
++----------------+----------------------+----------------------------------+
+| 4-byte LE u32  | 4-byte LE u32        |  bincode 1.3 serialization of    |
+| payload length | PROTOCOL_VERSION     |  the Message payload             |
++----------------+----------------------+----------------------------------+
 ```
 
-- the length prefix counts **payload bytes only** (never itself); a frame is
-  at most `4 + MAX_FRAME_SIZE` on the wire;
+- the length prefix counts **the version word + the payload**
+  (`length == 4 + payload.len()`; never itself); a frame is at most
+  `8 + MAX_FRAME_SIZE` on the wire;
+- **`PROTOCOL_VERSION` = 1** (`u32`) is the payload's schema generation,
+  carried in every frame header; `decode_frame` **rejects** a mismatched
+  version with `FrameError::VersionMismatch` (never a silent mis-parse) — the
+  forward-compat anchor. The payload structs are bincode-positional,
+  **append-only-at-the-tail, and byte-pinned**; any layout change is a schema
+  change that **must bump `PROTOCOL_VERSION`**;
 - **`MAX_FRAME_SIZE` = 16 MiB** — any frame whose *declared* length exceeds the
   guard is rejected as `FrameError::Oversized` **before the payload is
   awaited**, so a hostile or corrupted length prefix can never make a peer
@@ -765,7 +826,9 @@ never reimplement the layout.
   stream); `Frame.consumed` is the exact number of bytes one frame used, so
   back-to-back frames in one buffer decode in order;
 - **no panics**: a bincode rejection surfaces as `FrameError::Decode(msg)`, a
-  truncated buffer as `Incomplete`, an oversized declaration as `Oversized`.
+  truncated buffer as `Incomplete`, an oversized declaration as `Oversized`,
+  and a **cross-generation frame as `VersionMismatch`** (the connection is
+  dropped, never mis-parsed).
 
 ### 7.2 Message types
 
@@ -778,7 +841,7 @@ protocol violation and closes the connection.
 | Arm | Payload | Semantics |
 |-----|---------|-----------|
 | `GetTelemetry` | — | Fetch the current snapshot (served from the daemon's TTL cache; stays servable *while* a benchmark runs). |
-| `StartBenchmark` | `target: StreamTarget`, `mode: BenchMode` | Start a single-pass run. `StreamTarget` = `Full` / `Tier(t)` / `Cell(t, op)`; `BenchMode` = `Full` / `MemoryOnly`. Single-flight — a second start while one is active gets `Response::Error`. |
+| `StartBenchmark` | `target: StreamTarget`, `mode: BenchMode` | Start a single-pass run. `StreamTarget` = `Full` / `Tier(t)` / `Cell(t, op)` / **`Latency(t)`**; `BenchMode` = `Full` / `MemoryOnly`. Single-flight — a second start while one is active gets `Response::Error`. |
 | `StartBurnIn` | `target: StreamTarget`, `duration_minutes: u32` | Start a multi-pass burn-in; **`0` means infinite** (stop only via cancel); `n > 0` stops once a pass has completed and the run elapsed is `n × 60` s. A distinct run class sharing the single-flight slot. |
 | `CancelBenchmark` | `run_id: u64` | Stop the active run `run_id` at its next gate (any connection may send it). |
 | `GetProbeReport` | — | Fetch the consent-gated probe report: the full snapshot + the Intel raw-register dump (when available) + the system identity → `Response::ProbeReport` (the `probe.rs` wire types, §10). Append-only (OQ-10) — discriminant 4. |
@@ -819,8 +882,12 @@ two appended arms land at the next discriminants only (`Request::
 GetProbeReport` at 4, `Response::ProbeReport` at 7), and the `cpuid.rs` IG-10
 pin applies the same rule to the wire-riding `IntelGen` enum (`RocketLake`
 appended at discriminant 11 — the eleven pre-existing variants 0–10
-byte-unchanged). An appended arm therefore never shifts a pre-existing
-encoding, so new and old peers stay wire-compatible.
+byte-unchanged). The **enforcement** is the frame's `PROTOCOL_VERSION`
+(bumped on any payload layout change) *plus* the `TC-DAEMON1` byte-pinning
+tests — an appended field / arm therefore never shifts a pre-existing
+encoding, and a layout change is a version bump, never a silent change, so
+new and old peers stay wire-compatible (a mismatched generation is rejected
+with `VersionMismatch`, §7.1).
 
 ### 7.3 Frozen constants
 
@@ -872,7 +939,7 @@ lives in one pure function (`events::key_to_action`), unit-tested headlessly:
   clocks/ratios (MCLK / UCLK / FCLK, UCLK:MCLK divide mode, GDM, command rate),
   the primary / secondary / tertiary + turnaround timing sets, CAD
   drive/termination, and the voltage rails (VDDCR_VDD first).
-- **Zone 2 — the AIDA-style benchmark engine.** The 4×4 grid (tier rows ×
+- **Zone 2 — the Memory & Latency Benchmark.** The 4×4 grid (tier rows ×
   Read/Write/Copy/Latency columns). While a run is in flight it is *live*: a
   normal bench accumulates the streamed progress events (newest value per cell
   wins; non-finite/non-positive readings never count) and a burn-in shows its
@@ -1170,9 +1237,17 @@ installed amkillam build registers *only* the sysfs kobject (no char node), so
 this path is dead on it and is kept purely as 53XU-fork tolerance. Missing
 driver → `DriverMissing`; permission error → `InsufficientPrivilege`.
 
-**The parse (version-guarded).** Accepted `TableVersionId` sets: **Vermeer
-(Zen 3)** — 10 exact ids — and **Matisse (Zen 2)** — 8 exact ids; any other
-word is `UnknownPmTableVersion`. Minimum blob length is `0x518` (326 × f32).
+**The parse (generation-first, TEL-2).** The decode dispatches on the
+CPUID-detected **`AmdZen` family (Zen 1 → Zen 5)** as the primary key; the
+`TableVersionId` is a **per-generation plausibility filter, not a global
+closed allowlist**. The verified generations (Matisse/Zen 2 = 8 exact ids,
+Vermeer/Zen 3 = 10 exact ids) key on the version's major prefix; the
+**unverified generations (Zen 1 / 4 / 5) accept any non-zero word, so a
+Zen 4 (`0x1A`) / Zen 5 (`0x1C`) desktop reaches a live decode path**
+(previously the whole section read `N/A`). A genuinely-unrecognized firmware
+(a zero `TableVersionId`, or a verified generation whose major prefix
+mismatches its CPUID family) yields `UnknownPmTableVersion`. Minimum blob
+length is `0x518` (326 × f32).
 Field offsets (f32 LE, verified on 5950X silicon via `monitor_cpu`):
 `0x0A0` VDDCR_VDD (Vcore, volts), `0x0B0` VDDCR_SOC (volts), `0x0C0` FCLK
 (MHz), `0x0C8` UCLK (MHz), `0x0CC` MCLK (MHz). Every read goes through a
@@ -1610,17 +1685,21 @@ size rounds up to a 64-byte (cache-line) multiple and stays page-aligned:
 | L1 | host L1d from sysfs (scanned by `level`/`type`, never a bare index); 32 KiB fallback |
 | L2 | host L2 from sysfs; 1 MiB fallback |
 | L3 | **one per-CCD slice** (keeps the pass inside a single CCD's L3) |
-| DRAM (Memory) | `max(256 MiB, 3 × total system L3)` |
-| latency ring | **fixed 128 MiB** |
+| DRAM (Memory) | `max(256 MiB, 3 × total system L3)` — guaranteed beyond L3, so the Memory row is true DRAM |
+
+The latency chase has no buffer of its own: it **reuses the tier's bandwidth
+buffer**, and the hop count is a **fixed 1,000,000** (independent of the
+buffer's size).
 
 ### 11.4 Pointer-chase latency
 
 `latency.rs` builds a **single-cycle ring** — slot `i` stores the index of
 the *next* hop — so traversing from any start visits every slot exactly once.
-The orchestrator **materializes** the ring into the 128 MiB buffer with each
-slot as a little-endian `u64` at physical offset `64·i` — consecutive hops one
-cache line apart in pseudo-random order, defeating hardware
-stream/spatial prefetchers so every hop is a true dependent memory access.
+The orchestrator **materializes** the ring into the **tier's bandwidth buffer**
+(DRAM = beyond L3) with each slot as a little-endian `u64` at physical offset
+`64·i` — consecutive hops one cache line apart in pseudo-random order,
+defeating hardware stream/spatial prefetchers so every hop is a true dependent
+memory access.
 `chase_latency_ns` walks it as a strictly dependent load chain
 (`idx = ring[idx]` — the CPU cannot overlap or prefetch hops):
 
@@ -1630,8 +1709,9 @@ stream/spatial prefetchers so every hop is a true dependent memory access.
   frequency, robust to power/thermal scaling);
 - **non-x86_64:** `Instant` only (reduced precision, documented).
 
-Hop count: at least one full traversal of the cycle *and* at least **one
-million hops** for a stable average.
+Hop count: a **fixed 1,000,000 hops** (`CHASE_HOPS`), **independent of the
+ring length** (a partial traversal of a large ring is statistically robust;
+a full traversal is never required).
 
 ### 11.5 The orchestrator & the 4×4 grid
 
@@ -1639,11 +1719,13 @@ million hops** for a stable average.
 
 - **bandwidth:** **3** wall-timed passes per tier; the cell is
   `total_bytes / best_elapsed` — **best-of-3**, which trims the first run's
-  cold start (page faults, TLB warmup, thread spin-up);
+  cold start (page faults, TLB warmup, thread spin-up). The **write/copy
+  kernels are tier-aware** (L1/L2/L3 cache-resident non-temporal; Memory
+  non-temporal/DRAM), so each cell reflects its tier;
 - **latency:** 3 runs over the materialized full-tier ring (chasing the whole
   tier buffer — not the compact 8-byte-entry ring — puts the Memory-tier
-  working set beyond L3: true DRAM row latency, not an L3 one); the cell is
-  the **median** ns/hop.
+  working set beyond L3: true DRAM row latency, not an L3 one) at a **fixed
+  1,000,000 hops**; the cell is the **median** ns/hop.
 
 The standalone binary prints the grid as a fixed-width table (an unmeasured
 cell prints `N/A`) and, with `--json`, a serde-free JSON object.
@@ -1655,7 +1737,9 @@ cell prints `N/A`) and, with `--json`, a serde-free JSON object.
 
 - a **cell** is one (tier, op) bandwidth pair — the grid's 12 bandwidth cells,
   tier-major; `StreamTarget` selects `Full` (all 12 cells + the four per-tier
-  latency passes), one `Tier` (its 3 cells + its latency pass), or one `Cell`;
+  latency passes), one `Tier` (its 3 cells + its latency pass), one `Cell`,
+  **or one `Latency(t)`** (that tier's pointer-chase pass only — the BENCH-G1
+  latency-only target, runnable by both `run_streamed` and `run_burn_in`);
   unrequested cells stay `0.0` in the returned grid;
 - `run_streamed` detects the topology itself, sizes every tier via `plan`,
   picks the kernel family at runtime, and bounds the pinned worker count via
@@ -1733,12 +1817,12 @@ reference): 6 binaries → `/usr/bin/`; the unit → `/usr/lib/systemd/system/`
 (+ preset); the `ramsleuth` group (idempotent `groupadd -r` in the `.install`
 hooks); the AMD DKMS helper → `/usr/bin/ramsleuth-install-ryzen-smu-dkms`;
 the Intel DKMS helper → `/usr/bin/ramsleuth-install-intel-dkms` (guarded —
-the v2.4.13 source tree and the re-cut `-bin` tarball carry it, skipped with
+the v2.4.16 source tree and the re-cut `-bin` tarball carry it, skipped with
 a note only on a pre-2.3.0 asset); **the in-repo `ramsleuth_intel` source
 tree → `/usr/share/ramsleuth-intel-dkms/src/`** (guarded the same way —
 the exact path the Intel helper resolves, so the one-click Intel DKMS
 install works from a bare AUR install with no manual source step; the
-published `-bin` tarball (the v2.4.13 re-cut) carries the helper + tree, and
+published `-bin` tarball (the v2.4.16 re-cut) carries the helper + tree, and
 the existence guard covers only pre-2.4.2 assets); **the vendored
 `ryzen_smu` source tree → `/usr/share/ryzen-smu-dkms/vendor/`** (guarded
 for pre-vendor tags — the exact path the AMD helper resolves as its
@@ -1826,7 +1910,7 @@ fallback remains available where unblocked. When present:
   network and no upstream pin;
 - **both main packages bundle that source tree** (to
   `/usr/share/ramsleuth-intel-dkms/src/` — guarded like the Intel helper:
-  the published `-bin` tarball (the v2.4.13 re-cut) carries it and installs
+  the published `-bin` tarball (the v2.4.16 re-cut) carries it and installs
   it, and the existence guard covers only pre-2.4.2 assets, which ship
   nothing and skip cleanly), which is the exact path the helper resolves as
   its installed copy: the **one-click Intel DKMS install works from a bare
@@ -1894,19 +1978,23 @@ so the interesting surfaces are pure and testable headlessly:
   the full target range and the infinite/finite durations); the **OQ-10
   byte-pinning tests** pin the append-only rule (the `messages.rs`
   `request_response_bincode_byte_pinning_oq10`: `Request::GetProbeReport`
-  must land at discriminant 4 and `Response::ProbeReport` at the appended
-  discriminant 7, with every pre-existing arm's leading discriminant bytes
-  byte-unchanged; the `cpuid.rs` IG-10 serde pin: `IntelGen::RocketLake` at
-  discriminant 11, the eleven pre-existing variants 0–10 unchanged); the
-  `probe.rs` round-trip suite pins the `ProbeReport` / `ProbeRaw` /
-  `ProbeSystem` wire shapes (incl. the OQ-10 AMD section appended after
-  every Intel field); the frame codec
-  tests cover the exact `[4-byte LE length][payload]` layout, every
-  truncated-buffer cut of a real frame (all `Incomplete`), a hostile
-  length prefix (`Oversized` *before* the payload is awaited), a length
-  exactly at the 16 MiB cap (`Incomplete`, not `Oversized`), a bincode-rejected
-  payload (`Decode`, never a panic), and two back-to-back frames decoding in
-  order with exact `consumed` accounting;
+   must land at discriminant 4 and `Response::ProbeReport` at the appended
+   discriminant 7, with every pre-existing arm's leading discriminant bytes
+   byte-unchanged; the `cpuid.rs` IG-10 serde pin: `IntelGen::RocketLake` at
+   discriminant 11, the eleven pre-existing variants 0–10 unchanged — and
+   the pins are reinforced by the **frame's `PROTOCOL_VERSION`**, under
+   which a payload layout change is a version bump); the
+   `probe.rs` round-trip suite pins the `ProbeReport` / `ProbeRaw` /
+   `ProbeSystem` wire shapes (incl. the OQ-10 AMD section appended after
+   every Intel field); the frame codec
+   tests cover the exact **`[4-byte LE length][4-byte LE PROTOCOL_VERSION][payload]`**
+   layout, **a mismatched version rejected as `VersionMismatch` (never a
+   silent mis-parse)**, the **`TC-DAEMON1` payload-layout byte-pins**, every
+   truncated-buffer cut of a real frame (all `Incomplete`), a hostile
+   length prefix (`Oversized` *before* the payload is awaited), a length
+   exactly at the 16 MiB cap (`Incomplete`, not `Oversized`), a bincode-rejected
+   payload (`Decode`, never a panic), and two back-to-back frames decoding in
+   order with exact `consumed` accounting;
 - **socket setup** — tokio-based tests against real temp-dir sockets: a fresh
   path binds at mode `0660` with a live listener; a stale file is removed and
   rebound; a live listener is reported `AlreadyRunning` without touching it;
