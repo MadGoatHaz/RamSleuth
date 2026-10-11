@@ -487,10 +487,11 @@ mod tests {
     use std::thread;
 
     use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message};
-    use ramsleuth_telemetry::amd_readout::EccStatus;
     use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
-    use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
+    use ramsleuth_telemetry::intel_readout::{
+        ChannelRegs, fixture_channel_regs, fixture_intel_readout,
+    };
     use ramsleuth_telemetry::spd_decode::SpdModule;
     use ramsleuth_telemetry::{ProbeReport, ProbeSystem, SystemMemoryTelemetry, SystemPlatform};
 
@@ -595,36 +596,22 @@ mod tests {
 
     /// A mixed snapshot: an Intel CPU, an `Na` AMD branch (the driver
     /// missing on an Intel host), a populated single-channel Intel
-    /// readout (built through the public `decode_channel`), one SPD
-    /// module.
+    /// readout (built through the **live** decode — the TEL-4 fixture
+    /// constructor), one SPD module.
     fn mixed_snapshot() -> SystemMemoryTelemetry {
-        // MCS_COMMAND_0: tCL / tRCD / tRP / tRAS (ticks).
-        let cmd0: u32 = 16 | (16 << 8) | (16 << 16) | (32 << 24);
-        // MCS_COMMAND_1: 1N command rate + gear 1 + RTL 6 ticks.
-        let cmd1: u32 = 6 << 4;
-        // MCS_COMMAND_2: tCCD_S / tCCD_L (ticks).
-        let cmd2: u32 = 4 | (12 << 8);
-        // MCS_COMMAND_3: tRDRD / tRDWR / tWRWR / tWRRD (ticks).
-        let cmd3: u32 = 10 | (8 << 8) | (12 << 16) | (4 << 24);
         SystemMemoryTelemetry {
             cpu: CpuInfo {
                 vendor: CpuVendor::Intel(IntelGen::AlderLake),
                 brand: "Intel Core i7-12700K".to_owned(),
             },
             amd: Section::na(NaReason::DriverMissing),
-            intel: Section::Value(IntelReadout {
-                channels: vec![decode_channel(
-                    0,
-                    Some(160),
-                    [Some(cmd0), Some(cmd1), Some(cmd2), Some(cmd3)],
-                )],
-                channel_mode: None,
-                ecc_status: EccStatus::Unknown,
-                memory_tech: None,
-                channel_trust: None,
-                channel_annotation: String::new(),
-                dimm_count: 0,
-            }),
+            intel: Section::Value(fixture_intel_readout(
+                IntelGen::RocketLake,
+                Some(0x0000_0120), // ratio 32 @ 100 MHz / 2 → 1600 MHz
+                &fixture_channel_regs(),
+                &ChannelRegs::default(),
+                true, // the single-channel fixture shape
+            )),
             spd: vec![SpdModule {
                 index: 0x50,
                 is_ddr5: false,

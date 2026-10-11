@@ -958,7 +958,10 @@ mod tests {
 
     /// (e) The `(target, mode)` fold: `Full` keeps the requested
     /// target as-is; `MemoryOnly` restricts the run to the memory
-    /// tier (a `Cell` keeps its op, the tier clamped).
+    /// tier (a `Cell` keeps its op, the tier clamped; a `Latency`
+    /// target keeps its tier under `Full` and clamps to the memory
+    /// tier under `MemoryOnly` — BENCH-G1, the daemon honors the
+    /// latency-only arm).
     #[test]
     fn mapped_target_folds_mode_onto_the_memory_tier() {
         // Full scope: the requested target, as-is.
@@ -987,6 +990,17 @@ mod tests {
         assert_eq!(
             mapped_target(StreamTarget::Cell(Tier::L2, BenchOp::Read), BenchMode::MemoryOnly),
             StreamTarget::Cell(Tier::Memory, BenchOp::Read)
+        );
+        // Latency (BENCH-G1): the latency-only arm is honored by the
+        // daemon — kept as-requested under `Full`, clamped to the
+        // memory tier under `MemoryOnly`.
+        assert_eq!(
+            mapped_target(StreamTarget::Latency(Tier::L3), BenchMode::Full),
+            StreamTarget::Latency(Tier::L3)
+        );
+        assert_eq!(
+            mapped_target(StreamTarget::Latency(Tier::L3), BenchMode::MemoryOnly),
+            StreamTarget::Latency(Tier::Memory)
         );
     }
 

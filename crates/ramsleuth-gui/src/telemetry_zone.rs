@@ -774,7 +774,9 @@ mod tests {
     };
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
-    use ramsleuth_telemetry::intel_readout::{decode_channel, IntelReadout};
+    use ramsleuth_telemetry::intel_readout::{
+        ChannelRegs, IntelReadout, fixture_channel_regs, fixture_intel_readout,
+    };
     use ramsleuth_telemetry::SystemMemoryTelemetry;
     use ramsleuth_telemetry::{RailConfidence, SystemPlatform};
 
@@ -847,30 +849,20 @@ mod tests {
         }
     }
 
-    /// A two-channel Intel readout built through the public decode
-    /// core: channel 0 fully populated (DDR4-3200 class), channel 1 the
-    /// all-Na degradation state (every register absent).
+    /// A two-channel Intel readout built through the **live** decode
+    /// core (the TEL-4 fixture constructor): channel 0 fully populated
+    /// (1600 MHz MCLK = the DDR4-3200 class, gear 1× from the
+    /// `MC_BIOS_REQ` word), channel 1 with every per-channel register
+    /// absent (the degradation state — the shared global `MC_BIOS_REQ`
+    /// word still feeds its MCLK / gear / uclk rows, the live model).
     fn fixture_intel() -> IntelReadout {
-        // MCS_COMMAND_0: tCL / tRCD / tRP / tRAS (ticks).
-        let cmd0: u32 = 16 | (16 << 8) | (16 << 16) | (32 << 24);
-        // MCS_COMMAND_1: 1N command rate + gear 1 + RTL 6 ticks.
-        let cmd1: u32 = 6 << 4;
-        // MCS_COMMAND_2: tCCD_S / tCCD_L (ticks).
-        let cmd2: u32 = 4 | (12 << 8);
-        // MCS_COMMAND_3: tRDRD / tRDWR / tWRWR / tWRRD (ticks).
-        let cmd3: u32 = 10 | (8 << 8) | (12 << 16) | (4 << 24);
-        IntelReadout {
-            channels: vec![
-                decode_channel(0, Some(160), [Some(cmd0), Some(cmd1), Some(cmd2), Some(cmd3)]),
-                decode_channel(1, None, [None; 4]),
-            ],
-            channel_mode: None,
-            ecc_status: EccStatus::Unknown,
-            memory_tech: None,
-            channel_trust: None,
-            channel_annotation: String::new(),
-            dimm_count: 0,
-        }
+        fixture_intel_readout(
+            IntelGen::RocketLake,
+            Some(0x0000_0120), // ratio 32 @ 100 MHz / 2 → 1600 MHz; gear bits 00b → 1×
+            &fixture_channel_regs(),
+            &ChannelRegs::default(),
+            false,
+        )
     }
 
     /// A representative snapshot: a `Value` AMD readout, a `Na` Intel
@@ -1193,8 +1185,11 @@ mod tests {
     /// (e) A populated Intel branch renders per channel: one `Intel ch
     /// N` block per channel (the off-vendor AMD block is omitted,
     /// C7-14), the decoded channel 0 with its readings (incl. the
-    /// channel-level RTL appended to `[Clocks & Ratios]`), the
-    /// degraded channel 1 all-N/A; the split `GEAR_DOWN` / `CR` rows
+    /// channel-level RTL row — an honest N/A: the live IMC map has no
+    /// RTL register), and channel 1 with every **per-channel** register
+    /// absent (its timing rows degrade — the shared global
+    /// `MC_BIOS_REQ` word still feeds both channels' MCLK / gear /
+    /// uclk rows, the live model); the split `GEAR_DOWN` / `CR` rows
     /// degrade to bare gray N/A (D-C11 not-applicable cells, D-4/D-5)
     /// and the `gear` row survives on the Intel channels (D-6).
     #[test]
@@ -1218,23 +1213,19 @@ mod tests {
 
         let rows = all_rows(&blocks);
         let mclk = displays(&rows, "MCLK");
-        // channel 0 decodes; channel 1's frequency-ratio read failed
-        // (Na(ParseError) — the terse per-cell reason tag).
-        assert_eq!(
-            mclk,
-            vec![
-                "1600.00 MHz",
-                "N/A (decode failed)",
-            ]
-        );
+        // The MCLK is the **global** `MC_BIOS_REQ` decode (one word
+        // shared across channels) — both channels carry it.
+        assert_eq!(mclk, vec!["1600.00 MHz", "1600.00 MHz"]);
 
         let gear = displays(&rows, "gear");
+        // The gear cell is layered from the same global word on every
+        // channel (the Rocket Lake profile's `MC_BIOS_REQ[17:16]`).
         assert_eq!(gear[0], "1x", "channel 0 decodes gear 1");
-        assert!(gear[1].contains("N/A"), "channel 1 is degraded");
+        assert_eq!(gear[1], "1x", "channel 1 shares the global gear word");
 
         let rtl = displays(&rows, "RTL");
         assert_eq!(rtl.len(), 2, "one RTL row per channel");
-        assert_eq!(rtl[0], "6", "channel 0's decoded RTL (ticks)");
+        assert_eq!(rtl[0], "N/A", "the live IMC map has no RTL register (D-4 bare N/A)");
         assert!(rtl[1].contains("N/A"), "channel 1's degraded RTL");
 
         // The split GEAR_DOWN / CR rows across the two Intel channel

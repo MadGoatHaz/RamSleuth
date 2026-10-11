@@ -2003,7 +2003,8 @@ mod tests {
     };
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, IntelGen};
     use ramsleuth_telemetry::intel_readout::{
-        decode_channel, IntelChannel, IntelReadout, MemoryTech,
+        ChannelRegs, IntelChannel, IntelReadout, MemoryTech, fixture_channel_regs,
+        fixture_intel_readout,
     };
     use ramsleuth_telemetry::SystemPlatform;
 
@@ -2443,10 +2444,6 @@ mod tests {
     /// channel plus the all-Na degradation channel) without panicking.
     #[test]
     fn intel_state_renders_per_channel() {
-        let cmd0: u32 = 16 | (16 << 8) | (16 << 16) | (32 << 24);
-        let cmd1: u32 = 6 << 4;
-        let cmd2: u32 = 4 | (12 << 8);
-        let cmd3: u32 = 10 | (8 << 8) | (12 << 16) | (4 << 24);
         let state = AppState {
             telemetry: Some(SystemMemoryTelemetry {
                 cpu: CpuInfo {
@@ -2454,23 +2451,17 @@ mod tests {
                     brand: "synthetic".to_owned(),
                 },
                 amd: Section::na(NaReason::UnsupportedHardware),
-                intel: Section::Value(IntelReadout {
-                    channels: vec![
-                        decode_channel(0, Some(160), [
-                            Some(cmd0),
-                            Some(cmd1),
-                            Some(cmd2),
-                            Some(cmd3),
-                        ]),
-                        decode_channel(1, None, [None; 4]),
-                    ],
-                    channel_mode: None,
-                    ecc_status: EccStatus::Unknown,
-                    memory_tech: None,
-                    channel_trust: None,
-                    channel_annotation: String::new(),
-                    dimm_count: 0,
-                }),
+                // The synthetic readout builds through the **live** decode
+                // (the TEL-4 fixture constructor): ch0 = 1600 MHz MCLK
+                // (ratio 12 @ 133.3333 MHz) + the full acceptance raws,
+                // ch1 = the all-Na degradation.
+                intel: Section::Value(fixture_intel_readout(
+                    IntelGen::Skylake,
+                    Some(0x0000_000C),
+                    &fixture_channel_regs(),
+                    &ChannelRegs::default(),
+                    false,
+                )),
                 spd: Vec::new(),
                 platform: SystemPlatform {
                     cpu_clock_mhz: Section::Value(2400.0),
@@ -3415,9 +3406,9 @@ mod tests {
     /// (q2) The speed segment's MCLK×2 fallback: no bound module
     /// carries a speed, so the line derives the rate from the
     /// platform — the AMD readout's MCLK (the fixture's 1600 MHz →
-    /// 3200 MT/s) and the max Intel channel MCLK (the legacy
-    /// `decode_channel` 160 ratio → 1600 MHz → 3200 MT/s; the
-    /// Na-MCLK second channel is skipped by the max).
+    /// 3200 MT/s) and the max Intel channel MCLK (the live-decode
+    /// fixture's 1600 MHz → 3200 MT/s; the Na-MCLK second channel is
+    /// skipped by the max).
     #[test]
     fn ram_line_prefix_speed_falls_back_to_mclk_x2() {
         // The AMD branch carries the MCLK.
@@ -3445,34 +3436,20 @@ mod tests {
             "RAM: 32 GiB (2x16 GiB) 3200 MT/s | Dual-Channel (Symmetric) | ECC: Capable (disabled) | Mode: "
         );
         // The Intel branch: the max channel MCLK wins (the Na-MCLK
-        // second channel is skipped).
-        let cmd0: u32 = 16 | (16 << 8) | (16 << 16) | (32 << 24);
-        let cmd1: u32 = 6 << 4;
-        let cmd2: u32 = 4 | (12 << 8);
-        let cmd3: u32 = 10 | (8 << 8) | (12 << 16) | (4 << 24);
+        // second channel is skipped) — the live-decode fixture (TEL-4).
         let intel = SystemMemoryTelemetry {
             cpu: CpuInfo {
                 vendor: CpuVendor::Intel(IntelGen::Skylake),
                 brand: "synthetic".to_owned(),
             },
             amd: Section::na(NaReason::UnsupportedHardware),
-            intel: Section::Value(IntelReadout {
-                channels: vec![
-                    decode_channel(0, Some(160), [
-                        Some(cmd0),
-                        Some(cmd1),
-                        Some(cmd2),
-                        Some(cmd3),
-                    ]),
-                    decode_channel(1, None, [None; 4]),
-                ],
-                channel_mode: None,
-                ecc_status: EccStatus::Unknown,
-                memory_tech: None,
-                channel_trust: None,
-                channel_annotation: String::new(),
-                dimm_count: 0,
-            }),
+            intel: Section::Value(fixture_intel_readout(
+                IntelGen::Skylake,
+                Some(0x0000_000C), // ratio 12 @ 133.3333 MHz → 1600 MHz
+                &fixture_channel_regs(),
+                &ChannelRegs::default(),
+                false,
+            )),
             spd: vec![module(Section::na(NaReason::NotApplicable), None)],
             platform: SystemPlatform {
                 cpu_clock_mhz: Section::Value(3600.0),
@@ -3949,7 +3926,6 @@ mod tests {
     /// `AMD:` line.
     #[test]
     fn amd_na_hidden_on_intel_host() {
-        let cmd0: u32 = 16 | (16 << 8) | (16 << 16) | (32 << 24);
         let state = AppState {
             telemetry: Some(SystemMemoryTelemetry {
                 cpu: CpuInfo {
@@ -3957,20 +3933,19 @@ mod tests {
                     brand: "synthetic".to_owned(),
                 },
                 amd: Section::na(NaReason::UnsupportedHardware),
-                intel: Section::Value(IntelReadout {
-                    channels: vec![decode_channel(0, Some(160), [
-                        Some(cmd0),
-                        None,
-                        None,
-                        None,
-                    ])],
-                    channel_mode: None,
-                    ecc_status: EccStatus::Unknown,
-                    memory_tech: None,
-                    channel_trust: None,
-                    channel_annotation: String::new(),
-                    dimm_count: 0,
-                }),
+                // A single partially-populated channel through the live
+                // decode (TEL-4): only `TC_DBP` present (per-register
+                // containment), 1600 MHz MCLK.
+                intel: Section::Value(fixture_intel_readout(
+                    IntelGen::Skylake,
+                    Some(0x0000_000C),
+                    &ChannelRegs {
+                        tc_dbp: Some(0x1111_0F11),
+                        ..ChannelRegs::default()
+                    },
+                    &ChannelRegs::default(),
+                    true,
+                )),
                 spd: Vec::new(),
                 platform: SystemPlatform {
                     cpu_clock_mhz: Section::Value(2400.0),

@@ -525,7 +525,9 @@ mod tests {
     use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message};
     use ramsleuth_telemetry::amd_readout::{CommandRate, EccStatus, MemoryChannelMode};
     use ramsleuth_telemetry::cpuid::{AmdZen, IntelGen};
-    use ramsleuth_telemetry::intel_readout::{ChannelMode, decode_channel};
+    use ramsleuth_telemetry::intel_readout::{
+        ChannelMode, ChannelRegs, fixture_channel_regs, fixture_intel_readout,
+    };
     use ramsleuth_telemetry::{RailConfidence, SystemPlatform};
 
     use super::*;
@@ -596,31 +598,22 @@ mod tests {
         }
     }
 
-    /// A two-channel Intel readout built through the public decode core:
-    /// channel 0 fully populated (DDR4-3200 class), channel 1 the
-    /// all-Na degradation state (every register absent).
+    /// A two-channel Intel readout built through the **live** decode
+    /// core (the TEL-4 fixture constructor): channel 0 fully populated
+    /// (1600 MHz MCLK = the DDR4-3200 class, gear 1× from the
+    /// `MC_BIOS_REQ` word), channel 1 the all-Na degradation state
+    /// (every register absent); the Dual-Flex channel mode is the
+    /// readout-level override.
     fn fixture_intel() -> IntelReadout {
-        // MCS_COMMAND_0: tCL / tRCD / tRP / tRAS (ticks).
-        let cmd0: u32 = 16 | (16 << 8) | (16 << 16) | (32 << 24);
-        // MCS_COMMAND_1: 1N command rate (bits 1:0 = 0) + gear 1 (bits
-        // 3:2 = 0) + RTL 6 ticks (bits 6:4) = 6 << 4.
-        let cmd1: u32 = 6 << 4;
-        // MCS_COMMAND_2: tCCD_S / tCCD_L (ticks).
-        let cmd2: u32 = 4 | (12 << 8);
-        // MCS_COMMAND_3: tRDRD / tRDWR / tWRWR / tWRRD (ticks).
-        let cmd3: u32 = 10 | (8 << 8) | (12 << 16) | (4 << 24);
-        IntelReadout {
-            channels: vec![
-                decode_channel(0, Some(160), [Some(cmd0), Some(cmd1), Some(cmd2), Some(cmd3)]),
-                decode_channel(1, None, [None, None, None, None]),
-            ],
-            channel_mode: Some(ChannelMode::DualFlex),
-            ecc_status: EccStatus::Unknown,
-            memory_tech: None,
-            channel_trust: None,
-            channel_annotation: String::new(),
-            dimm_count: 0,
-        }
+        let mut ro = fixture_intel_readout(
+            IntelGen::RocketLake,
+            Some(0x0000_0120), // ratio 32 @ 100 MHz / 2 → 1600 MHz; gear bits 00b → 1×
+            &fixture_channel_regs(),
+            &ChannelRegs::default(),
+            false,
+        );
+        ro.channel_mode = Some(ChannelMode::DualFlex);
+        ro
     }
 
     /// One SPD module with mixed `Value` cells and one XMP/EXPO profile.
@@ -823,8 +816,9 @@ mod tests {
     }
 
     /// (e) The Intel branch renders per channel: channel 0 with its
-    /// decoded readings + RTL, channel 1 the all-Na degradation (every
-    /// cell `N/A`, including the derived-uclk parse errors).
+    /// decoded readings (the channel-level RTL row is an honest N/A —
+    /// the live IMC map has no RTL register), channel 1 the all-Na
+    /// degradation (every cell `N/A`, including the MCLK parse error).
     #[test]
     fn intel_render_is_per_channel() {
         let text = render(&intel_populated());
@@ -835,12 +829,13 @@ mod tests {
         assert!(text.contains("channel mode  Dual-Channel (Flex)"));
         assert!(text.contains("--- Channel 0 ---"));
         assert!(text.contains("--- Channel 1 ---"));
-        // channel 0: decoded clocks (ratio 160 → 1600 MHz) + RTL ticks
+        // channel 0: decoded clocks (1600 MHz MCLK) + gear 1×
         assert!(text.contains("1600.00 MHz"));
-        assert!(text.contains("1x")); // gear 1 (cmd1 bits 3:2 = 0)
+        assert!(text.contains("1x")); // gear 1 (MC_BIOS_REQ gear bits 00b)
         assert!(text.contains("N/A (decode failed)"));
-        // channel 0 RTL
-        assert!(text.contains("RTL (ticks)  6"));
+        // channel 0 RTL: the live map has no RTL register (the
+        // `NotApplicable` cell keeps the one bare `N/A`, D-4).
+        assert!(text.contains("RTL (ticks)  N/A"));
     }
 
     /// (f) `dump` over a live in-process daemon stand-in: a `Telemetry`

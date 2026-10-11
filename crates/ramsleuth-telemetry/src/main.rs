@@ -658,7 +658,9 @@ mod tests {
     use super::*;
     use ramsleuth_telemetry::amd_readout::{CommandRate, EccStatus, MemoryChannelMode};
     use ramsleuth_telemetry::cpuid::{AmdZen, IntelGen};
-    use ramsleuth_telemetry::intel_readout::{ChannelMode, decode_channel};
+    use ramsleuth_telemetry::intel_readout::{
+        ChannelMode, ChannelRegs, fixture_channel_regs, fixture_intel_readout,
+    };
     use ramsleuth_telemetry::{RailConfidence, SystemPlatform};
 
     /// A synthetic all-Na snapshot (pure — never calls `collect()`).
@@ -1040,29 +1042,21 @@ mod tests {
         assert_eq!(vendor_text(&CpuVendor::Unknown), "unknown");
     }
 
-    /// (h) The Intel section renders per-channel (built through the public
-    /// `decode_channel`) — no Debug wall, the channel mode line + the
-    /// decoded readings.
+    /// (h) The Intel section renders per-channel (built through the
+    /// **live** decode — the TEL-4 fixture constructor) — no Debug
+    /// wall, the channel mode line + the decoded readings.
     #[test]
     fn intel_section_renders_per_channel() {
-        let cmd0: u32 = 16 | (16 << 8) | (16 << 16) | (32 << 24);
-        let cmd1: u32 = 6 << 4;
-        let cmd2: u32 = 4 | (12 << 8);
-        let cmd3: u32 = 10 | (8 << 8) | (12 << 16) | (4 << 24);
         let mut t = all_na();
-        t.intel = Section::Value(IntelReadout {
-            channels: vec![decode_channel(
-                0,
-                Some(160),
-                [Some(cmd0), Some(cmd1), Some(cmd2), Some(cmd3)],
-            )],
-            channel_mode: Some(ChannelMode::DualFlex),
-            ecc_status: EccStatus::Unknown,
-            memory_tech: None,
-            channel_trust: None,
-            channel_annotation: String::new(),
-            dimm_count: 0,
-        });
+        let mut ro = fixture_intel_readout(
+            IntelGen::Skylake,
+            Some(0x0000_000C), // ratio 12 @ 133.3333 MHz → 1600 MHz
+            &fixture_channel_regs(),
+            &ChannelRegs::default(),
+            true, // the single-channel fixture shape
+        );
+        ro.channel_mode = Some(ChannelMode::DualFlex);
+        t.intel = Section::Value(ro);
         let out = render_dashboard(&t);
         assert!(!out.contains("IntelReadout {"), "no Debug wall: {out}");
         assert!(out.contains("--- Channel 0 ---"), "{out}");

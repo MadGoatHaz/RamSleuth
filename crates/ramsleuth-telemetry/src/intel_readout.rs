@@ -144,30 +144,18 @@
 //! — the MMIO read primitive lives in the `intel_mchbar` module
 //! (bounds-checked; out-of-bounds → `Parse`, never a fault).
 //!
-//! # Legacy compatibility surface
+//! # The live decode is the only decode
 //!
-//! [`decode_channel`], [`channel_offsets`], and the legacy `decode_*`
-//! bit-field helpers at the bottom of this module are the **pre-v2.2.1
-//! skeleton decode, retained verbatim as a frozen compatibility
-//! surface**: the GUI / TUI / client fixture code (which this chunk must
-//! not touch) builds its synthetic [`IntelReadout`] fixtures through
-//! [`decode_channel`], and the wire-safe [`IntelChannel`] /
-//! [`IntelReadout`] shapes it produces stay stable (no protocol change).
 //! The **live** decode path is exclusively [`decode`] over
 //! [`IntelImcRegs`] (fed by the sysfs reader and the `/dev/mem`
 //! readers [`IntelImcRegs::from_bar`] (Tier 1 / Rocket Lake, 64 KiB)
 //! / [`IntelImcRegs::from_bar_wide`] (the Tier-3 Alder family,
-//! 256 KiB — routed by [`read_intel`] on the profile's map family));
-//! the skeleton path is not used by the live path.
-//!
-//! **Removal is gated (TEL-4):** the skeleton is known-wrong (the
-//! `IMC_FREQ_RATIO @ 0x5058` mis-location) but is retained **only**
-//! because the downstream GUI / TUI / client fixture code builds its
-//! synthetic [`IntelReadout`]s through [`decode_channel`]. Deleting it is a
-//! cross-workstream step: those fixtures (the frontend / client streams,
-//! not this telemetry-lib stream) must first be re-pointed to build through
-//! the live [`decode`] (or a purpose-built fixture constructor), after which
-//! the skeleton and its `decode_*` helpers can be removed.
+//! 256 KiB — routed by [`read_intel`] on the profile's map family)).
+//! The pre-v2.2.1 skeleton decode (the known-wrong
+//! `IMC_FREQ_RATIO @ 0x5058` mis-location) is **gone** (TEL-4): the
+//! downstream GUI / TUI / client / standalone-bin fixture code builds
+//! its synthetic [`IntelReadout`]s through the [`fixture_intel_readout`]
+//! helper (a purpose-built constructor over the live [`decode`]).
 //!
 //! # Fixture tests (the CI stand-in for the hardware acceptance)
 //!
@@ -180,7 +168,7 @@
 //! reserved / overflow gates, the gen gate, and bincode round-trips —
 //! all without hardware, root, or I/O.
 
-use crate::amd_readout::{CadBus, ClockReadout, DivMode, EccStatus, GearMode, TimingSet, VoltageSet};
+use crate::amd_readout::{CadBus, ClockReadout, EccStatus, GearMode, TimingSet, VoltageSet};
 use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_gen::{AlderChannelMap, ALDER_CHANNELS, ALDER_FIELDS, GearCap, GenMap, profile_for};
@@ -245,39 +233,12 @@ pub const MAX_IMC_OFFSET: usize = MC_BIOS_REQ_OFFSET + 4;
 /// Highest per-channel offset (channel 1's `TC_WRWR`, 4-byte access).
 pub const MAX_CHANNEL_OFFSET: usize = CHANNEL1_BASE + TC_WRWR_OFFSET + 4;
 
-// ---------------------------------------------------------------------------
-// Legacy (pre-v2.2.1 skeleton) register table — the frozen compatibility
-// surface for the downstream fixture code; see the module docs.
-// ---------------------------------------------------------------------------
-
-/// Legacy skeleton global register — `0x5058` is a free-running
-/// performance counter, not a frequency ratio (the Bug 2 mis-location).
-pub const LEGACY_FREQ_RATIO_OFFSET: usize = 0x5058;
-
-/// Legacy per-channel MCS command-block base; channel `n` sits at
-/// `LEGACY_MCS_CHANNEL_BASE + n * LEGACY_MCS_CHANNEL_STRIDE`.
-pub const LEGACY_MCS_CHANNEL_BASE: usize = 0x5400;
-pub const LEGACY_MCS_CHANNEL_STRIDE: usize = 0x100;
-
-/// Legacy offsets within a channel's MCS command block (in decode order).
-const LEGACY_MCS_COMMAND_0: usize = 0x000; // tCL / tRCD / tRP / tRAS
-const LEGACY_MCS_COMMAND_1: usize = 0x004; // command rate / gear / RTL
-const LEGACY_MCS_COMMAND_2: usize = 0x008; // tCCD_S / tCCD_L
-const LEGACY_MCS_COMMAND_3: usize = 0x00C; // tRDRD / tRDWR / tWRWR / tWRRD
-
-/// Highest legacy per-channel offset (channel 3's last command register).
-pub const LEGACY_MCS_MAX_OFFSET: usize =
-    LEGACY_MCS_CHANNEL_BASE + 3 * LEGACY_MCS_CHANNEL_STRIDE + LEGACY_MCS_COMMAND_3;
-
-// Compile-time proof that every register read in this module (both the
-// hardware-authoritative Tier-1 table and the legacy skeleton table)
-// fits the 64 KiB Tier-1 MCHBAR window (each read is a 4-byte access).
-// A violated bound fails const evaluation (division by zero).
+// Compile-time proof that every register read in this module
+// (the hardware-authoritative Tier-1 table) fits the 64 KiB Tier-1
+// MCHBAR window (each read is a 4-byte access). A violated bound
+// fails const evaluation (division by zero).
 const _ASSERT_IMC_READS_IN_WINDOW: () = {
-    let in_window = MAX_IMC_OFFSET <= MCHBAR_WINDOW
-        && MAX_CHANNEL_OFFSET <= MCHBAR_WINDOW
-        && LEGACY_FREQ_RATIO_OFFSET + 4 <= MCHBAR_WINDOW
-        && LEGACY_MCS_MAX_OFFSET <= MCHBAR_WINDOW;
+    let in_window = MAX_IMC_OFFSET <= MCHBAR_WINDOW && MAX_CHANNEL_OFFSET <= MCHBAR_WINDOW;
     let _proof: usize = 1 / if in_window { 1 } else { 0 };
 };
 
@@ -1081,6 +1042,16 @@ pub fn mcbios_gear(raw: u32, cap: GearCap) -> Option<GearMode> {
     } else {
         // Gear 1 (bits [17:16] = 00b): 1:1 — every cap.
         Some(GearMode::One)
+    }
+}
+
+/// The SA:MEM divisor for a decoded [`GearMode`] (`uclk = mclk /
+/// gear`).
+fn gear_divisor(gear: GearMode) -> f64 {
+    match gear {
+        GearMode::One => 1.0,
+        GearMode::Two => 2.0,
+        GearMode::Four => 4.0,
     }
 }
 
@@ -2375,275 +2346,75 @@ fn decoded_readout(
 }
 
 // ---------------------------------------------------------------------------
-// Legacy compatibility surface — the pre-v2.2.1 skeleton decode (Bug 2).
-//
-// Retained verbatim (old register map: `IMC_FREQ_RATIO @ 0x5058` + the
-// packed `MCS_COMMAND_0..3` dwords @ `0x5400`) because the GUI / TUI /
-// client fixture code builds its synthetic `IntelReadout`s through
-// [`decode_channel`] and this chunk must not modify those crates. The
-// live decode path is exclusively [`decode`] / [`read_regs`] over
-// the producer raws (the sysfs reader and the `/dev/mem` readers
-// [`IntelImcRegs::from_bar`] / [`IntelImcRegs::from_bar_wide`]);
-// nothing live uses this surface.
+// Fixture helpers (TEL-4) — the purpose-built constructor the downstream
+// GUI / TUI / client / standalone-bin fixture tests build their synthetic
+// [`IntelReadout`]s through. The pre-v2.2.1 skeleton decode (the known-
+// wrong `IMC_FREQ_RATIO @ 0x5058` map) is gone: the only decode in this
+// module is the live [`decode`] over [`IntelImcRegs`].
 // ---------------------------------------------------------------------------
 
-/// Step between the legacy `IMC_FREQ_RATIO` codes (ratio × 10 MHz).
-const FREQ_RATIO_STEP_MHZ: f64 = 10.0;
-
-/// The four per-channel legacy MCS command-register offsets for channel
-/// `ch`, in decode order (`COMMAND_0..3`). All values are 4-byte
-/// aligned and within the MCHBAR window (compile-asserted; re-checked
-/// by `MchBar::read_u32`).
-pub fn channel_offsets(ch: u8) -> [usize; 4] {
-    let base = LEGACY_MCS_CHANNEL_BASE + usize::from(ch) * LEGACY_MCS_CHANNEL_STRIDE;
-    [
-        base + LEGACY_MCS_COMMAND_0,
-        base + LEGACY_MCS_COMMAND_1,
-        base + LEGACY_MCS_COMMAND_2,
-        base + LEGACY_MCS_COMMAND_3,
-    ]
-}
-
-/// Extract a register field that is already masked to ≤ 255 as a `u16`
-/// (legacy). The caller's mask makes the conversion lossless, so
-/// `try_from` always succeeds; the `unwrap_or` fallback is an
-/// unreachable no-panic guard.
-fn field_u16(v: u32) -> u16 {
-    u16::try_from(v).unwrap_or(u16::MAX)
-}
-
-/// Legacy tCL — `MCS_COMMAND_0` bits 7:0 (ticks).
-pub fn decode_tcl(reg: u32) -> u16 {
-    field_u16(reg & 0xFF)
-}
-
-/// Legacy tRCD — `MCS_COMMAND_0` bits 15:8 (ticks).
-pub fn decode_trcd(reg: u32) -> u16 {
-    field_u16((reg >> 8) & 0xFF)
-}
-
-/// Legacy tRP — `MCS_COMMAND_0` bits 23:16 (ticks).
-pub fn decode_trp(reg: u32) -> u16 {
-    field_u16((reg >> 16) & 0xFF)
-}
-
-/// Legacy tRAS — `MCS_COMMAND_0` bits 31:24 (ticks).
-pub fn decode_tras(reg: u32) -> u16 {
-    field_u16((reg >> 24) & 0xFF)
-}
-
-/// Legacy command rate — `MCS_COMMAND_1` bits 1:0: `0` = 1N, `1` = 2N;
-/// `2`/`3` are reserved encodings → `None`.
-pub fn decode_cmd_rate(reg: u32) -> Option<DivMode> {
-    match reg & 0b11 {
-        0 => Some(DivMode::OneToOne),
-        1 => Some(DivMode::OneToTwo),
-        _ => None,
+/// The canonical "fully populated" channel raws (the §6.1 acceptance
+/// raws — in-range values that decode cleanly through the live map):
+/// `TC_DBP = 0x1111_0F11` (tCL 17, tCWL 15, tRCD 17, tRP 17),
+/// `TC_RAP = 0x2718_0204` (tRRD_S 4, tRTP 8, tFAW 24, tRAS 39),
+/// `TC_RFP = 0x0000_01A4` (tRFC 420), `TC_RAP2 = 0x0000_0C0A`
+/// (tRRD_L 10, tWR 12), and the four turnaround quartets.
+pub fn fixture_channel_regs() -> ChannelRegs {
+    ChannelRegs {
+        tc_dbp: Some(0x1111_0F11),
+        tc_rap: Some(0x2718_0204),
+        tc_rfp: Some(0x0000_01A4),
+        tc_rap2: Some(0x0000_0C0A),
+        tc_rdrd: Some(0x0048_C286),
+        tc_rdwr: Some(0x0000_0280),
+        tc_wrrd: Some(0x0000_0308),
+        tc_wrwr: Some(0x0040_C204),
     }
 }
 
-/// Legacy gear mode — `MCS_COMMAND_1` bits 3:2: `0` = 1×, `1` = 2×,
-/// `2` = 4×; `3` is reserved → `None`.
-pub fn decode_gear(reg: u32) -> Option<GearMode> {
-    match (reg >> 2) & 0b11 {
-        0 => Some(GearMode::One),
-        1 => Some(GearMode::Two),
-        2 => Some(GearMode::Four),
-        _ => None,
-    }
-}
-
-/// Legacy RTL — `MCS_COMMAND_1` bits 6:4 (ticks).
-pub fn decode_rtl(reg: u32) -> u16 {
-    field_u16((reg >> 4) & 0b111)
-}
-
-/// Legacy tCCD_S (short) — `MCS_COMMAND_2` bits 7:0 (ticks).
-pub fn decode_tccd_s(reg: u32) -> u16 {
-    field_u16(reg & 0xFF)
-}
-
-/// Legacy tCCD_L (long) — `MCS_COMMAND_2` bits 15:8 (ticks).
-pub fn decode_tccd_l(reg: u32) -> u16 {
-    field_u16((reg >> 8) & 0xFF)
-}
-
-/// Legacy tRDRD — `MCS_COMMAND_3` bits 7:0 (ticks).
-pub fn decode_trdrd(reg: u32) -> u16 {
-    field_u16(reg & 0xFF)
-}
-
-/// Legacy tRDWR — `MCS_COMMAND_3` bits 15:8 (ticks).
-pub fn decode_trdwr(reg: u32) -> u16 {
-    field_u16((reg >> 8) & 0xFF)
-}
-
-/// Legacy tWRWR — `MCS_COMMAND_3` bits 23:16 (ticks).
-pub fn decode_twrwr(reg: u32) -> u16 {
-    field_u16((reg >> 16) & 0xFF)
-}
-
-/// Legacy tWRRD — `MCS_COMMAND_3` bits 31:24 (ticks).
-pub fn decode_twrrd(reg: u32) -> u16 {
-    field_u16((reg >> 24) & 0xFF)
-}
-
-/// Legacy DRAM frequency ratio — `IMC_FREQ_RATIO` bits 7:0 (in 10 MHz
-/// units); a code of `0` means unconfigured → `None`.
-pub fn decode_freq_ratio(reg: u32) -> Option<u16> {
-    let ratio = field_u16(reg & 0xFF);
-    (ratio != 0).then_some(ratio)
-}
-
-/// The legacy SA:MEM divisor for a decoded [`GearMode`]
-/// (`uclk = mclk / gear`).
-fn gear_divisor(gear: GearMode) -> f64 {
-    match gear {
-        GearMode::One => 1.0,
-        GearMode::Two => 2.0,
-        GearMode::Four => 4.0,
-    }
-}
-
-/// Decode one legacy tick field from an optionally-failed register read:
-/// a failed read → `Na(ParseError)`; a decoded value outside [1, 2048]
-/// (including `0`) → `Na(ParseError)`; otherwise the tick value.
-fn timing_section(reg: Option<u32>, name: &str, f: fn(u32) -> u16) -> Section<u16> {
-    match reg {
-        None => Section::na(NaReason::ParseError(format!("{name}: register read failed"))),
-        Some(raw) => ticks_section(f(raw), name),
-    }
-}
-
-/// Decode one channel from raw register values (the legacy skeleton
-/// compat core — see the module docs; not used by the live path).
+/// A synthetic [`IntelReadout`] built through the **live** [`decode`]
+/// (TEL-4): `gen` selects the profile (Tier 1 / Rocket Lake on the
+/// 64 KiB map; the Alder family on the Tier-3 subchannel path);
+/// `mcbios_req` is the global DRAM clock word (the MCLK source — e.g.
+/// `0x0000_000C` = ratio 12 @ 133.3333 MHz = **1600 MHz** for a
+/// Skylake–Comet Lake host; `0x0000_0120` = ratio 32 @ 100 MHz / 2 =
+/// **1600 MHz**, gear bits `00b` = 1×, for an 11th-gen-and-later host);
+/// `ch0` / `ch1` are the raw channel register sets ([`ChannelRegs::
+/// default()`] = the all-`Na` degradation channel); `single` truncates
+/// the readout to its first channel (the decode always emits the
+/// profile's channel count — the single-channel fixture shape).
 ///
-/// `mclk_reg` is the global `IMC_FREQ_RATIO` read; `regs` holds the
-/// channel's four MCS command registers in [`channel_offsets`] order.
-/// Each is `None` when the underlying read failed; the fields sourced
-/// from a failed register degrade to `Na(ParseError)` while the rest of
-/// the channel decodes normally. Never panics (D5).
-pub fn decode_channel(index: u8, mclk_reg: Option<u32>, regs: [Option<u32>; 4]) -> IntelChannel {
-    // Decode order: (COMMAND_0, COMMAND_1, COMMAND_2, COMMAND_3).
-    let [cmd0, cmd1, cmd2, cmd3] = regs;
-
-    // --- clocks -----------------------------------------------------------
-    let mclk = match mclk_reg.and_then(decode_freq_ratio) {
-        Some(ratio) => clock_section(f64::from(ratio) * FREQ_RATIO_STEP_MHZ),
-        None => Section::na(NaReason::ParseError(
-            "DRAM frequency ratio absent (register read failed or unconfigured)".to_owned(),
-        )),
+/// The fixture carries no MAD raws and no SMBIOS topology, so the
+/// 4-tier channel resolution lands in the terminal branch; the
+/// constructor normalizes those slots to the canonical empty fixture
+/// state (`channel_mode` / `memory_tech` / `channel_trust` `None`,
+/// empty annotation, `dimm_count` 0, `ecc_status`
+/// [`EccStatus::Unknown`]). The caller may override `channel_mode`
+/// (e.g. [`ChannelMode::DualFlex`]) for the mode-line rendering tests.
+pub fn fixture_intel_readout(
+    gen: IntelGen,
+    mcbios_req: Option<u32>,
+    ch0: &ChannelRegs,
+    ch1: &ChannelRegs,
+    single: bool,
+) -> IntelReadout {
+    let regs = IntelImcRegs {
+        mcbios_req,
+        ch0: ch0.clone(),
+        ch1: ch1.clone(),
+        ..IntelImcRegs::default()
     };
-    let gear = cmd1.and_then(decode_gear);
-    let uclk = match (mclk.value().copied(), gear) {
-        (Some(m), Some(g)) => clock_section(m / gear_divisor(g)),
-        (None, _) => Section::na(NaReason::ParseError(
-            "uclk = mclk / gear: mclk unavailable".to_owned(),
-        )),
-        (_, None) => Section::na(NaReason::ParseError(
-            "uclk = mclk / gear: gear unavailable or reserved encoding".to_owned(),
-        )),
-    };
-    let div_mode = match cmd1.and_then(decode_cmd_rate) {
-        Some(d) => Section::Value(d),
-        None => Section::na(NaReason::ParseError(
-            "command rate absent (register read failed) or reserved encoding".to_owned(),
-        )),
-    };
-    let gear_mode = match gear {
-        Some(g) => Section::Value(g),
-        None => Section::na(NaReason::ParseError(
-            "gear mode absent (register read failed) or reserved encoding".to_owned(),
-        )),
-    };
-    let clocks = ClockReadout {
-        mclk_mhz: mclk,
-        uclk_mhz: uclk,
-        fclk_mhz: Section::na(NaReason::NotApplicable),
-        div_mode,
-        gear_mode,
-        gdm: Section::na(NaReason::NotApplicable),
-        pdm: Section::na(NaReason::NotApplicable),
-        // D-C11: the IMC command rate (1N/2N) is already surfaced as
-        // `div_mode`; a separate slot would redundantly re-expose the
-        // same bits → honest not-applicable.
-        command_rate: Section::na(NaReason::NotApplicable),
-    };
-
-    // --- timings (ticks) ----------------------------------------------------
-    let cl = timing_section(cmd0, "tCL", decode_tcl);
-    let rcdrd = timing_section(cmd0, "tRCD", decode_trcd);
-    let rp = timing_section(cmd0, "tRP", decode_trp);
-    let ras = timing_section(cmd0, "tRAS", decode_tras);
-    let rc = match (ras.value().copied(), rp.value().copied()) {
-        (Some(a), Some(b)) => ticks_section(a.saturating_add(b), "tRC (tRAS + tRP)"),
-        _ => Section::na(NaReason::NotApplicable),
-    };
-    let rrds = timing_section(cmd2, "tCCD_S", decode_tccd_s);
-    let rrld = timing_section(cmd2, "tCCD_L", decode_tccd_l);
-    let rdrd_sd = timing_section(cmd3, "tRDRD", decode_trdrd);
-    let rdwr = timing_section(cmd3, "tRDWR", decode_trdwr);
-    let wrwr_sd = timing_section(cmd3, "tWRWR", decode_twrwr);
-    let wrrd = timing_section(cmd3, "tWRRD", decode_twrrd);
-    let timings = TimingSet {
-        cl,
-        rcwdwr: Section::na(NaReason::NotApplicable),
-        rcdrd,
-        rp,
-        ras,
-        rc,
-        rrds,
-        rrld,
-        faw: Section::na(NaReason::NotApplicable),
-        wtrs: Section::na(NaReason::NotApplicable),
-        wtrl: Section::na(NaReason::NotApplicable),
-        wr: Section::na(NaReason::NotApplicable),
-        rfc1: Section::na(NaReason::NotApplicable),
-        rfc2: Section::na(NaReason::NotApplicable),
-        rfcsb: Section::na(NaReason::NotApplicable),
-        cwl: Section::na(NaReason::NotApplicable),
-        rtp: Section::na(NaReason::NotApplicable),
-        rdwr,
-        wrrd,
-        rdrd_sd,
-        rdrd_dd: Section::na(NaReason::NotApplicable),
-        rdrd_scl: Section::na(NaReason::NotApplicable),
-        rdrd_sc: Section::na(NaReason::NotApplicable),
-        wrwr_sd,
-        wrwr_dd: Section::na(NaReason::NotApplicable),
-        wrwr_scl: Section::na(NaReason::NotApplicable),
-        wrwr_sc: Section::na(NaReason::NotApplicable),
-    };
-
-    let rtl = timing_section(cmd1, "RTL", decode_rtl);
-
-    // --- CAD bus + voltages: not exposed by the Intel MCHBAR window --------
-    let cad_bus = CadBus {
-        proc_odt: Section::na(NaReason::NotApplicable),
-        rtt_nom: Section::na(NaReason::NotApplicable),
-        rtt_wr: Section::na(NaReason::NotApplicable),
-        rtt_park: Section::na(NaReason::NotApplicable),
-        clk_drv: Section::na(NaReason::NotApplicable),
-        addr_cmd_drv: Section::na(NaReason::NotApplicable),
-        cs_odt_drv: Section::na(NaReason::NotApplicable),
-        cke_drv: Section::na(NaReason::NotApplicable),
-    };
-    let voltages = VoltageSet {
-        vddcr_soc_mv: Section::na(NaReason::NotApplicable),
-        vddio_mem_mv: Section::na(NaReason::NotApplicable),
-        vdd_misc_mv: Section::na(NaReason::NotApplicable),
-        vpp_mv: Section::na(NaReason::NotApplicable),
-        vcore_mv: Section::na(NaReason::NotApplicable),
-    };
-
-    IntelChannel {
-        index,
-        clocks,
-        timings,
-        cad_bus,
-        voltages,
-        rtl,
+    let mut out = decode(&regs, gen, None, None, None, &SmbiosTopology::default());
+    out.channel_mode = None;
+    out.memory_tech = None;
+    out.channel_trust = None;
+    out.channel_annotation = String::new();
+    out.dimm_count = 0;
+    out.ecc_status = EccStatus::Unknown;
+    if single {
+        out.channels.truncate(1);
     }
+    out
 }
 
 #[cfg(test)]
@@ -2653,9 +2424,9 @@ mod tests {
     //! ratio 18 @ 133.3333 MHz = 2400 MHz MCLK / 4800 MT/s) pin the
     //! decoded numbers exactly, plus degradation / containment / gate /
     //! wire-safety coverage, all without hardware, root, or I/O. The
-    //! legacy-compat surface keeps its original fixture tests (they
-    //! exercise the frozen compatibility core the downstream GUI / TUI /
-    //! client fixtures rely on).
+    //! downstream fixture constructor ([`fixture_intel_readout`]) is
+    //! pinned by TC-TEL4 (the legacy skeleton is gone; the fixtures
+    //! build through the live [`decode`]).
 
     use super::*;
     use crate::cpuid::AmdZen;
@@ -5300,127 +5071,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
-    // Legacy compatibility surface — the original fixture tests
-    // (they exercise the frozen skeleton core the downstream GUI / TUI /
-    // client fixtures build their `IntelReadout`s through).
-    // -----------------------------------------------------------------
-
-    /// Synthesize the legacy `MCS_COMMAND_0` from its four 8-bit fields.
-    fn cmd0(cl: u32, rcdd: u32, rp: u32, ras: u32) -> u32 {
-        (cl & 0xFF) | ((rcdd & 0xFF) << 8) | ((rp & 0xFF) << 16) | ((ras & 0xFF) << 24)
-    }
-
-    /// Synthesize the legacy `MCS_COMMAND_1` from its command-rate /
-    /// gear / RTL fields.
-    fn cmd1(rate: u32, gear: u32, rtl: u32) -> u32 {
-        (rate & 0b11) | ((gear & 0b11) << 2) | ((rtl & 0b111) << 4)
-    }
-
-    /// Synthesize the legacy `MCS_COMMAND_2` from tCCD_S / tCCD_L.
-    fn cmd2(ccd_s: u32, ccd_l: u32) -> u32 {
-        (ccd_s & 0xFF) | ((ccd_l & 0xFF) << 8)
-    }
-
-    /// Synthesize the legacy `MCS_COMMAND_3` from its four 8-bit
-    /// turnaround fields.
-    fn cmd3(rdrd: u32, rdwr: u32, wrwr: u32, wrrd: u32) -> u32 {
-        (rdrd & 0xFF) | ((rdwr & 0xFF) << 8) | ((wrwr & 0xFF) << 16) | ((wrrd & 0xFF) << 24)
-    }
-
-    /// A fully-populated synthetic legacy channel (DDR4-3200 class
-    /// values).
-    fn full_regs() -> [Option<u32>; 4] {
-        [
-            Some(cmd0(16, 16, 16, 32)),
-            Some(cmd1(0, 0, 6)), // 1N, gear 1, RTL 6
-            Some(cmd2(4, 12)),
-            Some(cmd3(10, 8, 12, 4)),
-        ]
-    }
-
-    /// (a) tCL/tRCD/tRP/tRAS decode from their `MCS_COMMAND_0` bit
-    /// fields, including the 8-bit maximums.
-    #[test]
-    fn decode_command0_fields() {
-        let reg = cmd0(16, 16, 16, 32);
-        assert_eq!(decode_tcl(reg), 16);
-        assert_eq!(decode_trcd(reg), 16);
-        assert_eq!(decode_trp(reg), 16);
-        assert_eq!(decode_tras(reg), 32);
-
-        let reg = cmd0(255, 255, 255, 255);
-        assert_eq!(decode_tcl(reg), 255);
-        assert_eq!(decode_trcd(reg), 255);
-        assert_eq!(decode_trp(reg), 255);
-        assert_eq!(decode_tras(reg), 255);
-    }
-
-    /// (a) Command rate / gear / RTL decode from their `MCS_COMMAND_1`
-    /// bit fields.
-    #[test]
-    fn decode_command1_fields() {
-        // 1N, gear 1, RTL 6.
-        let reg = cmd1(0, 0, 6);
-        assert_eq!(decode_cmd_rate(reg), Some(DivMode::OneToOne));
-        assert_eq!(decode_gear(reg), Some(GearMode::One));
-        assert_eq!(decode_rtl(reg), 6);
-
-        // 2N, gear 2, RTL 1 (max 3-bit value below).
-        let reg = cmd1(1, 1, 1);
-        assert_eq!(decode_cmd_rate(reg), Some(DivMode::OneToTwo));
-        assert_eq!(decode_gear(reg), Some(GearMode::Two));
-        assert_eq!(decode_rtl(reg), 1);
-
-        // RTL 3-bit maximum.
-        assert_eq!(decode_rtl(cmd1(0, 0, 7)), 7);
-    }
-
-    /// (b) Reserved encodings decode to `None` (never a bogus mode).
-    #[test]
-    fn decode_reserved_encodings_are_none() {
-        assert_eq!(decode_cmd_rate(cmd1(2, 0, 0)), None);
-        assert_eq!(decode_cmd_rate(cmd1(3, 0, 0)), None);
-        assert_eq!(decode_gear(cmd1(0, 3, 0)), None);
-        assert_eq!(decode_freq_ratio(0), None); // unconfigured ratio
-    }
-
-    /// (a) tCCD_S / tCCD_L decode from their `MCS_COMMAND_2` bit fields.
-    #[test]
-    fn decode_command2_fields() {
-        let reg = cmd2(4, 12);
-        assert_eq!(decode_tccd_s(reg), 4);
-        assert_eq!(decode_tccd_l(reg), 12);
-    }
-
-    /// (a) tRDRD/tRDWR/tWRWR/tWRRD decode from their `MCS_COMMAND_3`
-    /// bit fields.
-    #[test]
-    fn decode_command3_fields() {
-        let reg = cmd3(10, 8, 12, 4);
-        assert_eq!(decode_trdrd(reg), 10);
-        assert_eq!(decode_trdwr(reg), 8);
-        assert_eq!(decode_twrwr(reg), 12);
-        assert_eq!(decode_twrrd(reg), 4);
-    }
-
-    /// (a) The frequency ratio decodes to the 10 MHz units (code 0 is
-    /// unconfigured → `None`).
-    #[test]
-    fn decode_freq_ratio_to_mhz() {
-        assert_eq!(decode_freq_ratio(0), None);
-        assert_eq!(decode_freq_ratio(133), Some(133));
-        assert_eq!(decode_freq_ratio(160), Some(160));
-        assert_eq!(decode_freq_ratio(0xFF), Some(255));
-
-        // 160 × 10 MHz = 1600 MHz (DDR4-3200).
-        let ratio = match decode_freq_ratio(160) {
-            Some(r) => r,
-            None => panic!("ratio 160 must decode"),
-        };
-        assert_eq!(f64::from(ratio) * FREQ_RATIO_STEP_MHZ, 1600.0);
-    }
-
     /// (c) The fixed channel-count model per [`IntelGen`].
     #[test]
     fn channel_count_model() {
@@ -5441,30 +5091,6 @@ mod tests {
         }
         for g in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
             assert_eq!(channel_count(g), 4, "{g:?}");
-        }
-    }
-
-    /// The per-channel legacy offset table is 4-aligned, fits the MCHBAR
-    /// window, and the per-channel blocks never overlap.
-    #[test]
-    fn channel_offsets_within_window() {
-        for ch in 0u8..4 {
-            let offs = channel_offsets(ch);
-            for off in offs {
-                assert_eq!(off % 4, 0, "offset {off:#x} must be 4-aligned");
-                assert!(
-                    off + 4 <= MCHBAR_WINDOW,
-                    "offset {off:#x} must fit the MCHBAR window"
-                );
-            }
-        }
-        assert_eq!(channel_offsets(0)[0], 0x5400);
-        assert_eq!(channel_offsets(3)[3], 0x570C);
-
-        let o0 = channel_offsets(0).to_vec();
-        let o1 = channel_offsets(1).to_vec();
-        for a in &o0 {
-            assert!(!o1.contains(a), "channel blocks must not overlap: {a:#x}");
         }
     }
 
@@ -5530,245 +5156,6 @@ mod tests {
         }
     }
 
-    /// (a) + (d) A fully-populated synthetic legacy channel: every
-    /// decoded field is a `Value` with the expected value; CAD bus,
-    /// voltages, fclk/GDM/PDM, and the unexposed timing slots are all
-    /// `Na(NotApplicable)`; tRC is the derived `tRAS + tRP`.
-    #[test]
-    fn decode_channel_full_registers() {
-        let ch = decode_channel(0, Some(160), full_regs());
-        assert_eq!(ch.index, 0);
-
-        // clocks: mclk 1600 MHz, uclk = mclk / gear(1), 1N, gear 1.
-        assert_eq!(ch.clocks.mclk_mhz, Section::Value(1600.0));
-        assert_eq!(ch.clocks.uclk_mhz, Section::Value(1600.0));
-        assert_eq!(ch.clocks.div_mode, Section::Value(DivMode::OneToOne));
-        assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
-        assert_eq!(ch.clocks.fclk_mhz, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch.clocks.gdm, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch.clocks.pdm, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch.clocks.command_rate, Section::na(NaReason::NotApplicable));
-
-        // RTL (channel-level field).
-        assert_eq!(ch.rtl, Section::Value(6));
-
-        // decoded timing slots (ticks).
-        assert_eq!(ch.timings.cl, Section::Value(16));
-        assert_eq!(ch.timings.rcdrd, Section::Value(16));
-        assert_eq!(ch.timings.rp, Section::Value(16));
-        assert_eq!(ch.timings.ras, Section::Value(32));
-        assert_eq!(ch.timings.rc, Section::Value(48)); // 32 + 16 (derived)
-        assert_eq!(ch.timings.rrds, Section::Value(4)); // tCCD_S slot
-        assert_eq!(ch.timings.rrld, Section::Value(12)); // tCCD_L slot
-        assert_eq!(ch.timings.rdwr, Section::Value(8));
-        assert_eq!(ch.timings.wrrd, Section::Value(4));
-        assert_eq!(ch.timings.rdrd_sd, Section::Value(10));
-        assert_eq!(ch.timings.wrwr_sd, Section::Value(12));
-
-        // (d) unexposed timing slots → Na(NotApplicable).
-        for s in [
-            &ch.timings.rcwdwr,
-            &ch.timings.faw,
-            &ch.timings.wtrs,
-            &ch.timings.wtrl,
-            &ch.timings.wr,
-            &ch.timings.rfc1,
-            &ch.timings.rfc2,
-            &ch.timings.rfcsb,
-            &ch.timings.cwl,
-            &ch.timings.rtp,
-            &ch.timings.rdrd_dd,
-            &ch.timings.rdrd_scl,
-            &ch.timings.rdrd_sc,
-            &ch.timings.wrwr_dd,
-            &ch.timings.wrwr_scl,
-            &ch.timings.wrwr_sc,
-        ] {
-            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
-        }
-
-        // (d) CAD bus (5 ohm fields + 3 RTT fields) → Na(NotApplicable).
-        for s in [
-            &ch.cad_bus.proc_odt,
-            &ch.cad_bus.clk_drv,
-            &ch.cad_bus.addr_cmd_drv,
-            &ch.cad_bus.cs_odt_drv,
-            &ch.cad_bus.cke_drv,
-        ] {
-            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
-        }
-        for s in [&ch.cad_bus.rtt_nom, &ch.cad_bus.rtt_wr, &ch.cad_bus.rtt_park] {
-            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
-        }
-
-        // (d) voltages (5 rails, incl. Vcore — C12) → Na(NotApplicable).
-        for s in [
-            &ch.voltages.vddcr_soc_mv,
-            &ch.voltages.vddio_mem_mv,
-            &ch.voltages.vdd_misc_mv,
-            &ch.voltages.vpp_mv,
-            &ch.voltages.vcore_mv,
-        ] {
-            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
-        }
-    }
-
-    /// (a) Gear divides mclk into uclk (gear 4 → 1600 MHz / 4 = 400
-    /// MHz) and 2N maps to [`DivMode::OneToTwo`].
-    #[test]
-    fn decode_channel_gear_divides_uclk() {
-        let regs = [
-            Some(cmd0(16, 16, 16, 32)),
-            Some(cmd1(1, 2, 0)), // 2N, gear 4
-            Some(cmd2(4, 12)),
-            Some(cmd3(10, 8, 12, 4)),
-        ];
-        let ch = decode_channel(1, Some(160), regs);
-        assert_eq!(ch.clocks.mclk_mhz, Section::Value(1600.0));
-        assert_eq!(ch.clocks.uclk_mhz, Section::Value(400.0));
-        assert_eq!(ch.clocks.div_mode, Section::Value(DivMode::OneToTwo));
-        assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Four));
-    }
-
-    /// (b) A failed register read degrades only the fields sourced from
-    /// that register; everything else still decodes to `Value`.
-    #[test]
-    fn decode_channel_read_failure_degrades_only_sourced_fields() {
-        let ch = decode_channel(2, Some(160), [
-            None, // COMMAND_0 read failed
-            Some(cmd1(0, 0, 6)),
-            None, // COMMAND_2 read failed
-            Some(cmd3(10, 8, 12, 4)),
-        ]);
-
-        // sourced from the failed reads → Na(ParseError)
-        for s in [
-            &ch.timings.cl,
-            &ch.timings.rcdrd,
-            &ch.timings.rp,
-            &ch.timings.ras,
-            &ch.timings.rrds,
-            &ch.timings.rrld,
-        ] {
-            assert!(matches!(s, Section::Na(NaReason::ParseError(_))), "{s:?}");
-        }
-        // derived from a failed source → Na(NotApplicable)
-        assert!(matches!(ch.timings.rc, Section::Na(NaReason::NotApplicable)));
-        // decoded registers stay Value
-        assert_eq!(ch.clocks.mclk_mhz, Section::Value(1600.0));
-        assert_eq!(ch.clocks.uclk_mhz, Section::Value(1600.0));
-        assert_eq!(ch.rtl, Section::Value(6));
-        assert_eq!(ch.timings.rdwr, Section::Value(8));
-        assert_eq!(ch.timings.wrrd, Section::Value(4));
-        assert_eq!(ch.timings.rdrd_sd, Section::Value(10));
-        assert_eq!(ch.timings.wrwr_sd, Section::Value(12));
-    }
-
-    /// (e) + plan "guard-disabled fixture": every register absent (and
-    /// the global ratio absent) degrades the whole legacy channel to
-    /// `Na` sections — no panic, no garbage values.
-    #[test]
-    fn decode_channel_all_absent_degrades_without_panic() {
-        let ch = decode_channel(3, None, [None; 4]);
-
-        fn is_na<T: std::fmt::Debug>(s: &Section<T>) {
-            assert!(s.is_na(), "{s:?}");
-        }
-        is_na(&ch.clocks.mclk_mhz);
-        is_na(&ch.clocks.uclk_mhz);
-        is_na(&ch.clocks.fclk_mhz);
-        is_na(&ch.clocks.div_mode);
-        is_na(&ch.clocks.gear_mode);
-        is_na(&ch.clocks.gdm);
-        is_na(&ch.clocks.pdm);
-        is_na(&ch.clocks.command_rate);
-        let timing_secs: [&Section<u16>; 27] = [
-            &ch.timings.cl,
-            &ch.timings.rcwdwr,
-            &ch.timings.rcdrd,
-            &ch.timings.rp,
-            &ch.timings.ras,
-            &ch.timings.rc,
-            &ch.timings.rrds,
-            &ch.timings.rrld,
-            &ch.timings.faw,
-            &ch.timings.wtrs,
-            &ch.timings.wtrl,
-            &ch.timings.wr,
-            &ch.timings.rfc1,
-            &ch.timings.rfc2,
-            &ch.timings.rfcsb,
-            &ch.timings.cwl,
-            &ch.timings.rtp,
-            &ch.timings.rdwr,
-            &ch.timings.wrrd,
-            &ch.timings.rdrd_sd,
-            &ch.timings.rdrd_dd,
-            &ch.timings.rdrd_scl,
-            &ch.timings.rdrd_sc,
-            &ch.timings.wrwr_sd,
-            &ch.timings.wrwr_dd,
-            &ch.timings.wrwr_scl,
-            &ch.timings.wrwr_sc,
-        ];
-        for s in &timing_secs {
-            assert!(s.is_na(), "{s:?}");
-        }
-        assert!(ch.rtl.is_na());
-        for s in [
-            &ch.cad_bus.proc_odt,
-            &ch.cad_bus.clk_drv,
-            &ch.cad_bus.addr_cmd_drv,
-            &ch.cad_bus.cs_odt_drv,
-            &ch.cad_bus.cke_drv,
-        ] {
-            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
-        }
-        for s in [
-            &ch.voltages.vddcr_soc_mv,
-            &ch.voltages.vddio_mem_mv,
-            &ch.voltages.vdd_misc_mv,
-            &ch.voltages.vpp_mv,
-            &ch.voltages.vcore_mv,
-        ] {
-            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
-        }
-    }
-
-    /// (b) A decoded tick of `0` (tCL, and RTL) is not a valid trained
-    /// value → `Na(ParseError)`; the same register's other fields still
-    /// decode.
-    #[test]
-    fn zero_tick_fields_degrade_to_na() {
-        let ch = decode_channel(0, Some(160), [
-            Some(cmd0(0, 16, 16, 32)), // tCL = 0
-            Some(cmd1(0, 0, 0)), // RTL = 0
-            Some(cmd2(4, 12)),
-            Some(cmd3(10, 8, 12, 4)),
-        ]);
-        assert!(matches!(ch.timings.cl, Section::Na(NaReason::ParseError(_))));
-        assert!(matches!(ch.rtl, Section::Na(NaReason::ParseError(_))));
-        assert_eq!(ch.timings.rcdrd, Section::Value(16));
-    }
-
-    /// (b) A reserved gear encoding degrades `gear_mode` and (because
-    /// it is the divisor) `uclk` to `Na(ParseError)`, while the
-    /// remaining decoded fields stay `Value`.
-    #[test]
-    fn reserved_gear_degrades_gear_and_uclk() {
-        let ch = decode_channel(0, Some(160), [
-            Some(cmd0(16, 16, 16, 32)),
-            Some(cmd1(0, 3, 6)), // gear = 0b11 (reserved)
-            Some(cmd2(4, 12)),
-            Some(cmd3(10, 8, 12, 4)),
-        ]);
-        assert!(matches!(ch.clocks.gear_mode, Section::Na(NaReason::ParseError(_))));
-        assert!(matches!(ch.clocks.uclk_mhz, Section::Na(NaReason::ParseError(_))));
-        assert_eq!(ch.clocks.mclk_mhz, Section::Value(1600.0));
-        assert_eq!(ch.clocks.div_mode, Section::Value(DivMode::OneToOne));
-        assert_eq!(ch.rtl, Section::Value(6));
-    }
-
     /// The clock sanity gate bounds the displayed value range.
     #[test]
     fn clock_section_sanity_gate() {
@@ -5781,54 +5168,62 @@ mod tests {
     }
 
     /// The frozen readout types are `Clone` + `Debug` + `PartialEq`,
-    /// the legacy decode is deterministic, and an `IntelReadout` holds
-    /// the channel set.
+    /// the live-decode fixture is deterministic, and an `IntelReadout`
+    /// holds the channel set.
     #[test]
     fn readout_and_channel_traits() {
         fn bound<T: Clone + std::fmt::Debug + PartialEq>() {}
         bound::<IntelChannel>();
         bound::<IntelReadout>();
 
-        let a = decode_channel(0, Some(160), full_regs());
+        let ro = fixture_intel_readout(
+            IntelGen::Skylake,
+            Some(0x0000_000C),
+            &fixture_channel_regs(),
+            &ChannelRegs::default(),
+            false,
+        );
+        let a = ro.channels[0].clone();
         let b = a.clone();
         assert_eq!(a, b);
         assert!(!format!("{a:?}").is_empty());
         // deterministic: decoding the same registers twice is equal
-        assert_eq!(a, decode_channel(0, Some(160), full_regs()));
+        assert_eq!(
+            a,
+            fixture_intel_readout(
+                IntelGen::Skylake,
+                Some(0x0000_000C),
+                &fixture_channel_regs(),
+                &ChannelRegs::default(),
+                false,
+            )
+            .channels[0]
+        );
 
-        let ro = IntelReadout {
-            channels: vec![a, b],
-            channel_mode: None,
-            ecc_status: EccStatus::Unknown,
-            memory_tech: None,
-            channel_trust: None,
-            channel_annotation: String::new(),
-            dimm_count: 0,
-        };
         assert_eq!(ro.channels.len(), 2);
         assert_eq!(ro.channels[0].index, 0);
-        assert_eq!(ro.channels[1].index, 0);
+        assert_eq!(ro.channels[1].index, 1);
     }
 
     /// (f) P3-04: a multi-channel `IntelReadout` — a fully populated
-    /// legacy channel plus an all-`Na` degradation channel — round-
-    /// trips through bincode, proving the Intel readout (every field
-    /// type of `IntelChannel`) is wire-safe.
+    /// live-decoded channel plus an all-`Na` degradation channel —
+    /// round-trips through bincode, proving the Intel readout (every
+    /// field type of `IntelChannel`) is wire-safe.
     #[test]
     fn intel_readout_bincode_round_trip() {
-        let ro = IntelReadout {
-            channels: vec![
-                decode_channel(0, Some(160), full_regs()),
-                decode_channel(1, None, [None; 4]), // all-Na channel
-            ],
-            channel_mode: Some(ChannelMode::DualFlex),
-            ecc_status: EccStatus::CapableButDisabled,
-            // The Chunk 2 fields: a DDR4 Flex dual, verified-hardware trust.
-            memory_tech: Some(MemoryTech::Ddr4),
-            channel_trust: Some(ChannelTrust::VerifiedHardware),
-            channel_annotation: String::new(),
-            dimm_count: 2,
-        };
+        let mut ro = fixture_intel_readout(
+            IntelGen::Skylake,
+            Some(0x0000_000C),
+            &fixture_channel_regs(),
+            &ChannelRegs::default(),
+            false,
+        );
+        ro.channel_mode = Some(ChannelMode::DualFlex);
+        ro.ecc_status = EccStatus::CapableButDisabled;
+        // The Chunk 2 fields: a DDR4 Flex dual, verified-hardware trust.
+        ro.memory_tech = Some(MemoryTech::Ddr4);
+        ro.channel_trust = Some(ChannelTrust::VerifiedHardware);
+        ro.dimm_count = 2;
 
         let bytes = bincode::serialize(&ro)
             .expect("IntelReadout must serialize (no-panic contract)");
@@ -5843,23 +5238,93 @@ mod tests {
 
         // the fully degraded readout (every channel all-Na) is wire-safe
         // too
-        let all_na = IntelReadout {
-            channels: vec![
-                decode_channel(0, None, [None; 4]),
-                decode_channel(1, None, [None; 4]),
-            ],
-            channel_mode: None,
-            ecc_status: EccStatus::Unknown,
-            memory_tech: None,
-            channel_trust: None,
-            channel_annotation: String::new(),
-            dimm_count: 0,
-        };
+        let all_na = fixture_intel_readout(
+            IntelGen::Skylake,
+            None,
+            &ChannelRegs::default(),
+            &ChannelRegs::default(),
+            false,
+        );
         let bytes = bincode::serialize(&all_na)
             .expect("IntelReadout must serialize (no-panic contract)");
         let back: IntelReadout =
             bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
         assert_eq!(all_na, back);
+    }
+
+    /// TC-TEL4 (TEL-4): the known-wrong pre-v2.2.1 IMC skeleton is
+    /// gone — the legacy per-channel decode entry point, the legacy
+    /// frequency-ratio decoder, the legacy `decode_*` bit-field
+    /// helpers, and the legacy register table no longer exist in this
+    /// module's source; and the downstream fixture constructor
+    /// ([`fixture_intel_readout`]) builds its readout through the
+    /// **live** [`decode`] — the fixture's channel 0 decodes the
+    /// 1600 MHz MCLK from the `MC_BIOS_REQ` word (not the skeleton's
+    /// ratio register), channel 1 is the all-Na degradation, and the
+    /// readout carries the canonical empty resolution state.
+    #[test]
+    fn tc_tel4_legacy_skeleton_is_gone_and_fixtures_use_the_live_decode() {
+        // (1) The legacy surface is gone from the module source. The
+        // identifiers are assembled from pairs at runtime so this test's
+        // own source never contains the literal (a self-reference would
+        // trip its own scan).
+        let src = include_str!("intel_readout.rs");
+        let gone: Vec<String> = [
+            ("decode", "channel"),
+            ("decode", "freq_ratio"),
+            ("decode", "tcl"),
+            ("decode", "trcd"),
+            ("decode", "trp"),
+            ("decode", "tras"),
+            ("decode", "cmd_rate"),
+            ("decode", "gear"),
+            ("decode", "rtl"),
+            ("decode", "tccd_s"),
+            ("decode", "tccd_l"),
+            ("decode", "trdrd"),
+            ("decode", "trdwr"),
+            ("decode", "twrwr"),
+            ("decode", "twrrd"),
+            ("channel", "offsets"),
+            ("LEGACY", "_MCS"),
+            ("LEGACY", "_FREQ_RATIO"),
+            ("FREQ_RATIO_STEP", "_MHZ"),
+        ]
+        .iter()
+        .map(|(a, b)| format!("{a}{b}"))
+        .collect();
+        for gone in &gone {
+            assert!(
+                !src.contains(gone.as_str()),
+                "the legacy skeleton identifier `{gone}` must be gone (TEL-4)"
+            );
+        }
+
+        // (2) The fixture constructor builds through the live decode.
+        let ro = fixture_intel_readout(
+            IntelGen::Skylake,
+            Some(0x0000_000C), // ratio 12 @ 133.3333 MHz → 1600 MHz
+            &fixture_channel_regs(),
+            &ChannelRegs::default(),
+            false,
+        );
+        assert_eq!(ro.channels.len(), 2);
+        // Channel 0: the live MCLK decode over the §6.1 acceptance raws.
+        assert_eq!(ro.channels[0].clocks.mclk_mhz, Section::Value(1600.0));
+        assert_eq!(ro.channels[0].timings.cl, Section::Value(17));
+        // Channel 1: the per-channel-register degradation — its timing
+        // cells are all Na (every `TC_*` register absent); the MCLK is
+        // the global `MC_BIOS_REQ` decode, shared by both channels (the
+        // live model).
+        assert_eq!(ro.channels[1].clocks.mclk_mhz, Section::Value(1600.0));
+        assert!(ro.channels[1].timings.cl.is_na());
+        assert!(ro.channels[1].timings.ras.is_na());
+        // The canonical empty resolution state (no MAD raws, no SMBIOS).
+        assert_eq!(ro.channel_mode, None);
+        assert_eq!(ro.channel_trust, None);
+        assert!(ro.channel_annotation.is_empty());
+        assert_eq!(ro.dimm_count, 0);
+        assert_eq!(ro.ecc_status, EccStatus::Unknown);
     }
 
     /// decode_ecc_status maps the raw CAPID0_A bit 17 (ECC_DIS) to the

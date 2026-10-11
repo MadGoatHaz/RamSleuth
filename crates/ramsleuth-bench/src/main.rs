@@ -7,10 +7,16 @@
 //! lives here — all measurement stays in the library.
 //!
 //! ```text
-//! cargo run -p ramsleuth-bench [--avx512] [--json] [--help] [--version]
+//! cargo run -p ramsleuth-bench [--avx512] [--json] [--latency] [--help] [--version]
 //! ```
+//!
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
-use ramsleuth_bench::{detect, run_all, BenchmarkGrid, CpuFeatures};
+use ramsleuth_bench::{
+    detect, run_all, run_streamed, BenchmarkGrid, CpuFeatures, Metric, StreamOptions,
+    StreamTarget, Tier,
+};
 
 /// Parsed CLI options (std-only parsing — no arg-parsing dependency).
 #[derive(Debug)]
@@ -19,6 +25,9 @@ pub(crate) struct Opts {
     pub(crate) avx512: bool,
     /// Also print the grid as a JSON object.
     pub(crate) json: bool,
+    /// Run the latency pass only (the DRAM pointer-chase latency — no
+    /// bandwidth cells; the BENCH-G1 user-facing trigger).
+    pub(crate) latency_only: bool,
 }
 
 /// Usage text printed for `--help`/`--version` and parse errors.
@@ -34,6 +43,8 @@ const USAGE: &str = concat!(
     "  --avx512     Force the AVX-512 kernel path (falls back to AVX2 when\n",
     "               AVX-512F is absent)\n",
     "  --json       Also print the grid as a JSON object\n",
+    "  --latency    Run the latency pass only (the DRAM pointer-chase\n",
+    "               latency — no bandwidth cells)\n",
     "  -h, --help   Print this help and exit\n",
     "  -V, --version Print the version and exit\n",
 );
@@ -85,11 +96,16 @@ where
 /// short-circuits them before running); unknown flags are rejected
 /// with an error naming the offending flag.
 pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
-    let mut opts = Opts { avx512: false, json: false };
+    let mut opts = Opts {
+        avx512: false,
+        json: false,
+        latency_only: false,
+    };
     for arg in args {
         match arg.as_str() {
             "--avx512" => opts.avx512 = true,
             "--json" => opts.json = true,
+            "--latency" => opts.latency_only = true,
             // recognized; the entrypoint short-circuits them (help →
             // usage, version → the version line)
             "--help" | "-h" | "--version" | "-V" => {}
@@ -97,6 +113,17 @@ pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
         }
     }
     Ok(opts)
+}
+
+/// The run target for `--latency` (BENCH-G1, the user-facing trigger):
+/// the DRAM (Memory tier) pointer-chase latency pass **only** — no
+/// bandwidth cells. The bench crate's `run_streamed` executes exactly
+/// that tier's latency pass for this target (TC-BENCHG1(a)); the daemon
+/// path honors the same arm (`bench_job`'s `mapped_target` keeps it
+/// under `BenchMode::Full` and folds it to `Latency(Memory)` under
+/// `MemoryOnly`).
+pub(crate) fn latency_only_target() -> StreamTarget {
+    StreamTarget::Latency(Tier::Memory)
 }
 
 /// Format one f64 as a JSON number: shortest round-trip decimal, or
@@ -197,6 +224,34 @@ fn main() {
         println!("note: --avx512 requested but AVX-512F is absent; the AVX-512 kernels fall back to AVX2.");
     }
 
+    if opts.latency_only {
+        // The latency-only run (BENCH-G1): `run_streamed` over the
+        // `Latency(Memory)` target — exactly the DRAM pointer-chase
+        // pass, no bandwidth cells (the grid's bandwidth slots stay 0.0).
+        let grid = match run_streamed(
+            &StreamOptions {
+                target: latency_only_target(),
+                threads: 0, // auto: one worker per detected physical core
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            None,
+        ) {
+            Ok(grid) => grid,
+            Err(error) => {
+                eprintln!("ramsleuth-bench: {error}");
+                std::process::exit(1);
+            }
+        };
+        println!(
+            "DRAM latency: {:.1} ns",
+            grid.cell(Tier::Memory, Metric::Latency)
+        );
+        if opts.json {
+            println!("{}", to_json(&grid));
+        }
+        return;
+    }
+
     let grid = match run_all(opts.avx512) {
         Ok(grid) => grid,
         Err(error) => {
@@ -285,6 +340,29 @@ mod tests {
         assert_eq!(
             version_line(),
             format!("ramSleuth ramsleuth-bench v{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// TC-BENCH-G1 (CLI trigger, BENCH-G1): `--latency` is the
+    /// user-facing latency-only run — it parses, and the target it
+    /// selects is `StreamTarget::Latency(Tier::Memory)` (no bandwidth
+    /// cells — the bench crate's TC-BENCHG1(a) pins that `run_streamed`
+    /// then performs exactly the DRAM latency pass; the daemon path
+    /// honors the same arm: `bench_job`'s `mapped_target` keeps it
+    /// under `BenchMode::Full` and folds it to `Latency(Memory)` under
+    /// `MemoryOnly`). The usage text documents the flag.
+    #[test]
+    fn tc_bench_g1_latency_flag_is_the_latency_only_trigger() {
+        let opts = parse_opts(&["--latency".into()]).expect("--latency parses");
+        assert!(opts.latency_only, "--latency sets the latency-only flag");
+        assert_eq!(
+            latency_only_target(),
+            StreamTarget::Latency(Tier::Memory),
+            "the CLI trigger selects the DRAM latency-only target"
+        );
+        assert!(
+            USAGE.contains("--latency"),
+            "the usage text documents --latency: {USAGE}"
         );
     }
 

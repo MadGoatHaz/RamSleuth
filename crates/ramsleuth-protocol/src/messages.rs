@@ -464,7 +464,12 @@ mod tests {
 
     /// Encode a byte slice to a lowercase hex string (for pinning).
     fn to_hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        use std::fmt::Write;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
     }
 
     /// Canonical `SystemMemoryTelemetry` (host-independent, fixed values).
