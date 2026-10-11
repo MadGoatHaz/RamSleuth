@@ -99,11 +99,11 @@ arch=(x86_64)
 url="https://github.com/MadGoatHaz/RamSleuth"
 license=(MIT GPL-2.0-only)
 source=("https://github.com/MadGoatHaz/RamSleuth/releases/download/v$pkgver/ramsleuth-$pkgver-x86_64.tar.zst")
-# v2.4.15: PLACEHOLDER pin — the published v2.4.14 asset's sha256 is
-# carried until the v2.4.15 release asset exists (AUR requires a real
+# v2.4.16: PLACEHOLDER pin — the published v2.4.14 asset's sha256 is
+# carried until the v2.4.16 release asset exists (AUR requires a real
 # sha256, no SKIP); finalize from the published release .sha256 sidecar at
 # the post-release re-cut (the v2.4.14 pin is replaced then — that asset
-# predates the 2.4.15 changes).
+# predates the 2.4.16 changes).
 #
 sha256sums=('b96d5f7307884a2c3cda10b1b401736bfae07d6ee7dcc00067056097dded5567')
 install=ramsleuth-bin.install
