@@ -256,6 +256,14 @@ const SLATE: Color = Color::Rgb(0x1E, 0x1E, 0x24);
 /// Dim grey: the labels, the min/max, the sample-count line.
 const DIM: Color = Color::Rgb(0x8A, 0x8A, 0x96);
 
+/// The TUI/GUI graphs parity note (FE-8): the TUI shows a compact
+/// 5-series sparkline; the GUI's graphs window is the full interactive
+/// view. Both read the **same** live [`GraphSample`] source — this note
+/// makes the intentional capability split user-visible in both surfaces,
+/// not a silent divergence.
+const GRAPH_PARITY_NOTE: &str =
+    "TUI: compact 5-series sparklines · same live data as the GUI graphs window";
+
 /// The window filter (the `[w]` action's pure core): the samples
 /// with `t ≥ newest_t − window_min·60`, oldest → newest.
 ///
@@ -288,13 +296,20 @@ type Series = (&'static str, fn(&GraphSample) -> f64);
 /// label (all five series labels are ≤ 12 chars).
 const LABEL_CELL: usize = 14;
 
-/// Blank every cell of `area` (symbol `' '` + the panel's bg style):
-/// a `Block` is style-only (borders/title/bg via `set_style` — it never
-/// erases cell symbols) and a `Paragraph` writes only as many cells as
-/// its content, so the zone glyphs painted earlier in the same fresh
-/// frame must be explicitly erased before the panel paints (intra-frame
-/// layering — the fresh-buffer rule; §2.1 of the 2.4.14 plan).
-fn blank_area(buf: &mut ratatui::buffer::Buffer, area: Rect, bg: Color) {
+/// The single per-surface erase idiom (FE-4): blank every cell of `area`
+/// (symbol `' '` + the surface's `bg`). A `Block` is style-only (borders /
+/// title / bg via `set_style` — it never erases cell symbols) and a
+/// `Paragraph` writes only as many cells as its content, so a surface
+/// painted last + topmost (an overlay, or a zone that just expanded to
+/// absorb a closed strip's region) must explicitly erase **only the region
+/// it occupies by construction** before it paints. Each surface clears its
+/// own rect — a visible→hidden transition never clears the whole screen
+/// (the old global `terminal.clear()` ghosting guard is gone). Intra-frame
+/// layering — the fresh-buffer rule.
+pub(crate) fn blank_area(buf: &mut ratatui::buffer::Buffer, area: Rect, bg: Color) {
+    if area.is_empty() {
+        return;
+    }
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             buf[(x, y)].set_symbol(" ");
@@ -366,6 +381,7 @@ pub fn render_graphs_panel(
     ];
     let mut constraints = vec![Constraint::Length(1); series.len()];
     constraints.push(Constraint::Length(1)); // the sample-count line
+    constraints.push(Constraint::Length(1)); // the TUI/GUI parity note (FE-8)
     constraints.push(Constraint::Fill(1)); // slack (clipped, never scrolled)
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -382,6 +398,16 @@ pub fn render_graphs_panel(
             Style::default().fg(DIM),
         ))),
         rows[series.len()],
+    );
+    // The parity note (FE-8): the TUI sparkline vs the GUI window share
+    // the same live `GraphSample` source — the intentional capability
+    // split, made user-visible (not a silent divergence).
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            GRAPH_PARITY_NOTE,
+            Style::default().fg(DIM),
+        ))),
+        rows[series.len() + 1],
     );
 }
 
@@ -507,11 +533,57 @@ fn quantize(value: f64, min: f64, max: f64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::buffer::Buffer;
     use ramsleuth_telemetry::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
     use ramsleuth_telemetry::amd_readout::{map_amd, AmdReadout};
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::{RailConfidence, SystemPlatform, VoltageTelemetry};
+
+    /// TC-FE4 (part 1 — the single per-surface idiom clears exactly its
+    /// rect): `blank_area` erases every cell of the given [`Rect`] (to
+    /// `' '`) and leaves every cell outside it untouched. The cleared
+    /// rect == the surface's rect, so a surface clearing its own region
+    /// never clears the whole screen (the old global `terminal.clear()`
+    /// ghosting guard is gone).
+    #[test]
+    fn tc_fe4_blank_area_clears_exactly_its_rect() {
+        let width = 12u16;
+        let height = 6u16;
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        // Seed every cell with a sentinel.
+        for y in 0..height {
+            for x in 0..width {
+                buf[(x, y)].set_symbol("#");
+            }
+        }
+        let rect = Rect::new(3, 1, 4, 2); // x 3..7, y 1..3
+        blank_area(&mut buf, rect, Color::Reset);
+        // Every cell in the rect is blanked.
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                assert_eq!(
+                    buf[(x, y)].symbol(),
+                    " ",
+                    "an in-rect cell must be blanked at ({x},{y})"
+                );
+            }
+        }
+        // Every cell outside the rect retains the sentinel.
+        for y in 0..height {
+            for x in 0..width {
+                let in_rect = (rect.x..rect.x + rect.width).contains(&x)
+                    && (rect.y..rect.y + rect.height).contains(&y);
+                if !in_rect {
+                    assert_eq!(
+                        buf[(x, y)].symbol(),
+                        "#",
+                        "an out-of-rect cell must be untouched at ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
 
     /// An AMD readout with VDDCR_SOC = `soc_mv` + Vcore =
     /// `vcore_mv` (the `u16` voltage mapping: in-band → `Value`,
@@ -817,6 +889,29 @@ mod tests {
             .map(|line| line.trim_end().to_owned())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// TC-FE8 (the TUI/GUI graphs parity note, TUI side): the `[g]`
+    /// panel carries the user-visible parity note (FE-8) — the TUI
+    /// compact sparkline vs the GUI full window share the same live
+    /// `GraphSample` source. Assert the shared "same live data" marker +
+    /// the TUI descriptor render in the panel body (not a silent
+    /// divergence).
+    #[test]
+    fn tc_fe8_tui_panel_carries_the_parity_note() {
+        let mut state = GraphState::default();
+        state.samples.push(sample(1000.0, 3500.0));
+        state.samples.push(sample(1001.0, 3600.0));
+        let text = draw_panel(&state, 5, 80, 24);
+        assert!(
+            text.contains("same live data"),
+            "the TUI panel must carry the shared-data parity marker: {text}"
+        );
+        assert!(
+            text.contains("TUI: compact 5-series sparklines"),
+            "the TUI panel must name its compact-sparkline capability: {text}"
+        );
+        assert!(text.contains(GRAPH_PARITY_NOTE), "the full note must render: {text}");
     }
 
     /// (l) The window filter keeps only the samples with

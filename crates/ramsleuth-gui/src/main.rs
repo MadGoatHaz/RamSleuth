@@ -154,6 +154,32 @@ use ramsleuth_telemetry::intel_readout::{ChannelMode, ChannelTrust};
 use ramsleuth_telemetry::probe::render_probe_report_md;
 use ramsleuth_telemetry::spd_decode::SpdModule;
 use ramsleuth_telemetry::{ProbeReport, SystemMemoryTelemetry};
+// ---------------------------------------------------------------------------
+// Poison-tolerant shared-state guard acquisition (FE-3).
+//
+// The shared state lives behind an `RwLock` held by both threads (the
+// updater writes, the render / poll thread reads). A stray panic that drops
+// a guard poisons the lock; a bare `.read().unwrap()` / `.write().unwrap()`
+// on the next acquisition would re-panic, cascading one bad read across
+// both threads and taking the whole UI down. These two helpers are the
+// single acquisition idiom: `unwrap_or_else(|p| p.into_inner())` recovers
+// the inner value from a poisoned guard, so a panic degrades (the last-good
+// state is read) instead of cascading (the no-panic contract, D5).
+// ---------------------------------------------------------------------------
+
+/// Acquire a read guard on the shared state, recovering a poisoned lock
+/// (FE-3): `into_inner` yields the last-good inner value instead of
+/// re-panicking, so one stray panic degrades a single read, never the
+/// whole UI.
+fn state_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Acquire a write guard on the shared state, recovering a poisoned lock
+/// (FE-3): the same idiom as [`state_read`], for the mutation path.
+fn state_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|p| p.into_inner())
+}
 
 /// How long a transient header notice (an F2 / F3 export result) stays
 /// visible before it fades.
@@ -167,17 +193,15 @@ const POLLER_JOIN_DEADLINE: Duration = Duration::from_secs(10);
 /// The join-poll granularity while waiting for the poller.
 const JOIN_POLL: Duration = Duration::from_millis(50);
 /// The main dashboard's default inner size (D-13.4 — tight,
-/// content-derived 968×600: 8 (OUTER_MARGIN, left) + 504 (left
-/// column = min(952·0.55, 952−440−8) over inner = 968 − 16) +
-/// 8 (COLUMN_GAP) + 440 (MIN_RIGHT_W) + 8 (OUTER_MARGIN, right);
-/// H = 70 (header) + 8 (row bottom gap) + 522 (row_h, >= 11 pt
-/// headroom over both columns' natural content).
+/// content-derived 968×600: 8 (OUTER_MARGIN, left) + the two equal zone
+/// columns (`ui.columns(2)`, FE-5) + 8 (COLUMN_GAP) + 8 (OUTER_MARGIN,
+/// right); H = 70 (header) + 8 (row bottom gap) + 522 (row height, >=
+/// 11 pt headroom over both columns' natural content).
 const DEFAULT_WINDOW_SIZE: [f32; 2] = [968.0, 600.0];
-/// The main dashboard's minimum inner size (D-13.4 — both
-/// columns at their minima: 8 (OUTER_MARGIN) + 420 (MIN_LEFT_W) +
-/// 8 (COLUMN_GAP) + 440 (MIN_RIGHT_W) + 8 (OUTER_MARGIN) = 892,
-/// exact sum; H = 600 = default — below that the status zone's
-/// bottom rows clip (it has no scroll of its own)).
+/// The main dashboard's minimum inner size (D-13.4 — both columns at
+/// their practical minimum, 8 (OUTER_MARGIN) × 2 + 8 (COLUMN_GAP) + the
+/// zones' minimum widths = 892; H = 600 = default — below that the
+/// status zone's bottom rows clip (it has no scroll of its own)).
 const MIN_WINDOW_SIZE: [f32; 2] = [892.0, 600.0];
 /// The Graphs window's initial inner size (C7-21, D-3 — the deferred
 /// child viewport; the plan's default, a bit narrower + shorter
@@ -189,12 +213,8 @@ const GRAPHS_WINDOW_MIN_SIZE: [f32; 2] = [640.0, 420.0];
 /// The repaint cadence: ~60 FPS (16 ms — eframe's vsync drives the
 /// actual present; this only asks for the next frame).
 const REPAINT: Duration = Duration::from_millis(16);
-/// The min width of the left (telemetry) column — the zone's grid
-/// needs room for its label + value columns.
-const MIN_LEFT_W: f32 = 420.0;
-/// The min width of the right (bench / status) column.
-const MIN_RIGHT_W: f32 = 440.0;
-/// The gap between the two columns.
+/// The gap between the two zone columns (FE-5: the `ui.columns(2)`
+/// `item_spacing.x`).
 const COLUMN_GAP: f32 = 8.0;
 /// The central panel's symmetric side margin (D-15.1): the row's
 /// left + right outer margin — equal to the pre-existing left
@@ -878,7 +898,7 @@ impl eframe::App for RamSleuthApp {
         // (the render thread does no I/O, D6 — the settings strip is
         // its one permitted write).
         let header_action = {
-            let data = self.state.read().unwrap();
+            let data = state_read(&self.state);
             Self::render_header(
                 ctx,
                 &data,
@@ -899,7 +919,7 @@ impl eframe::App for RamSleuthApp {
         // with all-`N/A` telemetry (and it can be re-opened any time;
         // the strip's "Got it" + the toggle write the same flag, D-C7).
         let requirements_present = {
-            let data = self.state.read().unwrap();
+            let data = state_read(&self.state);
             requirements_strip_visible(self.requirements_open, &data)
         };
         if requirements_present {
@@ -915,7 +935,7 @@ impl eframe::App for RamSleuthApp {
             self.render_settings_area(ctx);
         }
         let button_action = {
-            let data = self.state.read().unwrap();
+            let data = state_read(&self.state);
             self.render_zones(ctx, &data)
         };
         // One dispatch path for both sources: the button (the
@@ -1406,127 +1426,75 @@ impl RamSleuthApp {
         let bench_tx = &self.bench_tx;
         let cancel = &self.cancel;
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(SLATE))
+            // FE-5: the panel's inner margin carries the symmetric
+            // outer margin (the hand-rolled `add_space(OUTER_MARGIN)`
+            // bookkeeping is gone) — the `ui.columns` primitive below
+            // splits the margin-reduced width into the two zone
+            // columns. A pathological window collapses the content to
+            // zero (never a negative allocation, never a panic).
+            .frame(egui::Frame::default().fill(SLATE).inner_margin(OUTER_MARGIN))
             .show(ctx, |ui| {
-                // The columns take the central panel's full height
-                // (C7-19 removed the bottom history strip's fixed
-                // budget — no window-level scroll, the single
-                // non-scrolling dashboard). A pathological window
-                // collapses the row to zero (never a negative
-                // allocation, never a panic).
-                let row_h = (ui.available_size().y - COLUMN_GAP).max(0.0);
-                // The style's item_spacing, captured before the row
-                // zeroes its main axis below (the row manages its
-                // horizontal spacing explicitly, D-15.1); each
-                // column's content restores it — the zones' grids
-                // read item_spacing.x for their inner gaps.
+                // The style's item_spacing, captured before the column
+                // gap is set below; each column's content restores it —
+                // the zones' grids read `item_spacing.x` for their inner
+                // gaps (D-15.1).
                 let item_spacing = ui.spacing().item_spacing;
-                ui.horizontal(|ui| {
-                    // The row is spaced entirely by its explicit
-                    // `add_space` calls (the two OUTER_MARGINs + the
-                    // COLUMN_GAP). Zero the layout's automatic
-                    // main-axis item_spacing so it does not double-
-                    // count against the split budget (D-15.1) — the
-                    // cross-axis (y) spacing is kept and inherited by
-                    // each column's vertical content.
-                    ui.style_mut().spacing.item_spacing =
-                        egui::vec2(0.0, item_spacing.y);
-                    ui.add_space(OUTER_MARGIN);
-                    let avail = ui.available_size();
-                    // The split is computed against `inner` (avail.x
-                    // minus the trailing OUTER_MARGIN the row ends
-                    // with after the right column): left_w +
-                    // COLUMN_GAP + right_w + OUTER_MARGIN == avail.x
-                    // exactly, the right column always keeps
-                    // MIN_RIGHT_W, and the right allocation ends
-                    // OUTER_MARGIN (8 pt) inside the panel edge —
-                    // the frame stroke's 0.5 pt outer half clears
-                    // the clip rect (D-15.1). A pathological avail.x
-                    // below both minima degenerates left-first
-                    // (never a negative allocation, never a panic).
-                    let inner = (avail.x - OUTER_MARGIN).max(0.0);
-                    let max_left = (inner - MIN_RIGHT_W - COLUMN_GAP).max(0.0);
-                    let min_left = MIN_LEFT_W.min(max_left);
-                    let left_w = (inner * 0.55).clamp(min_left, max_left);
-                    let right_w = (inner - left_w - COLUMN_GAP).max(0.0);
+                // FE-5: the two zone columns via egui's layout primitive
+                // (`ui.columns`) — the hand-rolled 55% width arithmetic
+                // is gone. The gap between the columns is `COLUMN_GAP`
+                // (the style's `item_spacing.x`, restored inside each
+                // column so the zones keep their inner gaps).
+                ui.style_mut().spacing.item_spacing =
+                    egui::vec2(COLUMN_GAP, item_spacing.y);
+                // `ui.columns` hands the closure a `&mut [Ui]` — one
+                // column per element (egui 0.27), so `columns[0]` is the
+                // left (telemetry) zone and `columns[1]` the right
+                // (bench + status) zone. Each column restores the style's
+                // `item_spacing` (the zones read `item_spacing.x` for
+                // their inner gaps).
+                ui.columns(2, |columns: &mut [egui::Ui]| {
                     // Left: zone 1 (the live timing matrix, its own
                     // bounded scroll area).
-                    ui.allocate_ui_with_layout(
-                        egui::Vec2::new(left_w, row_h),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            ui.style_mut().spacing.item_spacing =
-                                item_spacing;
-                            render_telemetry_zone(ui, data)
-                        },
-                    );
-                    ui.add_space(COLUMN_GAP);
-                    // Right: zone 2 over zone 3 as two stacked
-                    // slices (C9-05, D-4b): the bench slice at its
-                    // natural height, the preserved 8 pt gap, then
-                    // the status slice at the remaining column
-                    // height — two `allocate_ui_with_layout` children
-                    // of the column's single allocation (the border /
-                    // balance against zone 1 is unchanged). The
-                    // `ScrollArea` stays as the overflow fallback:
-                    // in a small window the bench's natural height
-                    // alone exceeds the column, the status slice
-                    // takes its zero budget, and the content scrolls
-                    // below — never a clipped / overflowing paint.
-                    ui.allocate_ui_with_layout(
-                        egui::Vec2::new(right_w, row_h),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            ui.style_mut().spacing.item_spacing =
-                                item_spacing;
-                            let _ = egui::ScrollArea::vertical().show(ui, |ui| {
-                                // The slice width is the scroll
-                                // content's available width:
-                                // `right_w` with no scrollbar,
-                                // `right_w` minus the gutter while
-                                // the fallback scrolls (today's
-                                // exact width behavior — no
-                                // regression).
-                                let slice_w = ui.available_size().x.max(0.0);
-                                // Slice 1: the bench at its natural
-                                // height — the zero-budget
-                                // allocation: top-down content
-                                // self-sizes past the zero rect (egui
-                                // never clips a child to it) and
-                                // advances the layout by the drawn
-                                // `min_rect`, whose height is the
-                                // natural size.
-                                let bench = ui.allocate_ui_with_layout(
-                                    egui::Vec2::new(slice_w, 0.0),
-                                    egui::Layout::top_down(egui::Align::LEFT),
-                                    |ui| render_bench_zone(ui, data, bench_tx, cancel),
-                                );
-                                let bench_h = bench.response.rect.height().max(0.0);
-                                ui.add_space(8.0);
-                                // Slice 2: the status at the
-                                // remaining column height
-                                // (`row_h - bench_h - 8`, minus the
-                                // item gap egui leaves after the
-                                // bench allocation — reserving it
-                                // keeps the filled status slice
-                                // (C9-07) exactly at the column's
-                                // bottom: no permanent scrollbar at
-                                // 968×600, C7-19). Zero when the
-                                // bench alone overflows (the scroll
-                                // fallback above).
-                                let gap = ui.spacing().item_spacing.y;
-                                let status_h = (row_h - bench_h - 8.0 - gap).max(0.0);
-                                let _ = ui.allocate_ui_with_layout(
-                                    egui::Vec2::new(slice_w, status_h),
-                                    egui::Layout::top_down(egui::Align::LEFT),
-                                    |ui| {
-                                        action = render_status_zone(ui, data);
-                                    },
-                                );
+                    {
+                        let ui = &mut columns[0];
+                        ui.style_mut().spacing.item_spacing = item_spacing;
+                        render_telemetry_zone(ui, data);
+                    }
+                    // Right: zone 2 over zone 3 (C9-05, D-4b). The
+                    // `ScrollArea` is the genuine overflow fallback
+                    // (a small window scrolls, it never clips): inside it
+                    // the bench sizes **naturally** (FE-5 — no zero-height
+                    // `allocate_ui_with_layout` read-back footgun) and the
+                    // status fills the **constrained remainder** via a
+                    // bounded `Frame` (not an arithmetic `row_h − bench_h
+                    // − 8` slice).
+                    {
+                        let ui = &mut columns[1];
+                        ui.style_mut().spacing.item_spacing = item_spacing;
+                        let _ = egui::ScrollArea::vertical().show(ui, |ui| {
+                            // The bench at its natural height — it
+                            // renders directly in the top-down column and
+                            // advances the layout by its drawn `min_rect`
+                            // (a non-zero, content-sized allocation).
+                            render_bench_zone(ui, data, bench_tx, cancel);
+                            ui.add_space(8.0);
+                            // The status fills the constrained remainder:
+                            // a `Frame` bounded to the column's available
+                            // size after the bench (egui's
+                            // `available_size` — the layout primitive, not
+                            // a manual subtraction). Zero budget when the
+                            // bench alone overflows (the scroll fallback
+                            // above).
+                            let remaining = ui.available_size();
+                            let _ = egui::Frame::default().show(ui, |ui| {
+                                ui.set_max_size(egui::vec2(
+                                    remaining.x.max(0.0),
+                                    remaining.y.max(0.0),
+                                ));
+                                action = render_status_zone(ui, data);
                             });
-                        },
-                    );
-                    ui.add_space(OUTER_MARGIN);
+                        });
+                    }
                 });
             });
         action
@@ -1551,7 +1519,7 @@ impl RamSleuthApp {
                 ui.label(egui::RichText::new("Settings").strong().color(CYAN));
                 ui.add_space(2.0);
                 // The one permitted render-thread write (D6): no I/O.
-                let mut guard = self.state.write().unwrap();
+                let mut guard = state_write(&self.state);
                 render_settings_panel(ui, &mut guard.settings);
             });
     }
@@ -1574,7 +1542,7 @@ impl RamSleuthApp {
     fn render_requirements_area(&mut self, ctx: &egui::Context) {
         // One brief read snapshot (no I/O, D6) drives the strip.
         let requirements = {
-            let data = self.state.read().unwrap();
+            let data = state_read(&self.state);
             diagnose(&data)
         };
         egui::TopBottomPanel::top("ramsleuth_requirements")
@@ -1588,7 +1556,7 @@ impl RamSleuthApp {
                 // guard drops at the end of the closure, never held
                 // across I/O): the wizard's click flips `running`,
                 // the worker's terminal state is painted here.
-                let mut setup = self.setup.write().unwrap();
+                let mut setup = state_write(&self.setup);
                 render_requirements_strip_with_setup(
                     ui,
                     &requirements,
@@ -1612,7 +1580,7 @@ impl RamSleuthApp {
     /// manual `sudo` pointer (no-panic, plan D5 / risk 1).
     fn maybe_spawn_setup_worker(&mut self) {
         // The common case: no edge — one brief read, no spawn.
-        if !self.setup.read().unwrap().running {
+        if !state_read(&self.setup).running {
             return;
         }
         // Consume the edge + gather the inputs (a brief write, the
@@ -1622,9 +1590,9 @@ impl RamSleuthApp {
         // action carries the driver on AMD/Intel silicon from the
         // very first launch — no second stage.
         let (with_dkms, user) = {
-            let mut setup = self.setup.write().unwrap();
+            let mut setup = state_write(&self.setup);
             setup.running = false;
-            let data = self.state.read().unwrap();
+            let data = state_read(&self.state);
             (setup_with_dkms(&data), current_user())
         };
         match user {
@@ -1637,7 +1605,7 @@ impl RamSleuthApp {
             None => {
                 // The mandatory `--user` value is unresolvable here:
                 // degrade to the manual floor (plan risk 1).
-                let mut setup = self.setup.write().unwrap();
+                let mut setup = state_write(&self.setup);
                 setup.done = false;
                 setup.failure = Some(with_setup_log_pointer(
                     "cannot resolve the current user for the setup helper — run \
@@ -1655,7 +1623,7 @@ impl RamSleuthApp {
     fn handle_action(&mut self, ctx: &egui::Context, action: GuiAction) {
         match action {
             GuiAction::SnapshotPng | GuiAction::ExportJson => {
-                let data = self.state.read().unwrap();
+                let data = state_read(&self.state);
                 let text = match perform_export(action, &data, &self.out_dir) {
                     Ok(Some(path)) => format!("wrote {}", path.display()),
                     Ok(None) => "nothing to export yet (no data)".to_owned(),
@@ -1688,7 +1656,7 @@ impl RamSleuthApp {
     fn apply_graphs_lifecycle(&mut self) {
         let now_open = self.graphs_open.load(Ordering::Relaxed);
         if now_open != self.last_graphs_open {
-            let mut guard = self.state.write().unwrap();
+            let mut guard = state_write(&self.state);
             if let Some(refresh) = apply_refresh_transition(
                 &mut self.saved_refresh,
                 &mut self.last_graphs_open,
@@ -1710,19 +1678,19 @@ impl RamSleuthApp {
         if !matches!(self.probe_state, ProbeState::Consent) {
             return;
         }
-        let result = self.state.read().unwrap().probe_result.clone();
+        let result = state_read(&self.state).probe_result.clone();
         match result {
             ProbeResult::Ok(report) => {
                 let md = render_probe_report_md(&report);
                 self.probe_title = Some(probe_issue_title(&report));
                 self.probe_state = ProbeState::Preview(md);
-                self.state.write().unwrap().probe_result = ProbeResult::None;
+                state_write(&self.state).probe_result = ProbeResult::None;
             }
             ProbeResult::Err(message) => {
                 self.probe_state = ProbeState::Idle;
                 self.probe_title = None;
                 self.notice = Some((format!("! {message}"), Instant::now()));
-                self.state.write().unwrap().probe_result = ProbeResult::None;
+                state_write(&self.state).probe_result = ProbeResult::None;
             }
             ProbeResult::Pending | ProbeResult::None => {
                 // In flight / the poller has not processed the edge
@@ -1795,7 +1763,7 @@ impl RamSleuthApp {
                             // The in-flight indicator (the poller is
                             // fetching): a spinner + the disabled
                             // buttons.
-                            let in_flight = self.state.read().unwrap().probe_result
+                            let in_flight = state_read(&self.state).probe_result
                                 == ProbeResult::Pending;
                             ui.horizontal(|ui| {
                                 if in_flight {
@@ -1821,7 +1789,7 @@ impl RamSleuthApp {
                                     // clears the flag + does the
                                     // daemon I/O, landing
                                     // `probe_result`.
-                                    self.state.write().unwrap().probe_requested = true;
+                                    state_write(&self.state).probe_requested = true;
                                 }
                                 // Secondary (the `Got it` precedent):
                                 // plain — return to `Idle`.
@@ -2232,12 +2200,12 @@ fn spawn_setup_worker(
         // now-serving daemon without a manual restart; the strip
         // unmounts on its own the moment it connects.
         if outcome.done {
-            state.write().unwrap().reconnect_requested = true;
+            state_write(&state).reconnect_requested = true;
         }
         // The one brief write-lock hand-off (the sanctioned D6
         // idiom — held only for the assignment, never across the
         // spawn).
-        *setup.write().unwrap() = outcome;
+        *state_write(&setup) = outcome;
     });
 }
 
@@ -2341,7 +2309,7 @@ fn run_graphs_child_frame(
         // copied out (a `u64`) and written back: a shared borrow of
         // `data.graph` and a mutable borrow of the knob through the
         // guard's deref cannot coexist in one expression.
-        let mut data = state.write().unwrap();
+        let mut data = state_write(state);
         let mut poll_interval_ms = data.settings.poll_interval_ms;
         render_graphs_window(ctx, &data.graph, &mut poll_interval_ms);
         data.settings.poll_interval_ms = poll_interval_ms;
@@ -4173,7 +4141,7 @@ mod tests {
                 probe_title: None,
                 about_open: false,
             };
-            let gate = |app: &RamSleuthApp| app.state.read().unwrap().settings.refresh_enabled;
+            let gate = |app: &RamSleuthApp| state_read(&app.state).settings.refresh_enabled;
 
             // The opening edge (the header button's click stores
             // `true`, g1): the detector force-enables the gate.
@@ -4360,6 +4328,107 @@ mod tests {
                 );
             }
         }
+        fs::remove_dir_all(&out_dir).expect("cleanup");
+    }
+
+    /// TC-FE5 (the GUI layout confirming test): the bench zone receives a
+    /// **natural, non-zero** allocation (its frame rect's height > 0 and
+    /// equals its content — NOT the old zero-height
+    /// `allocate_ui_with_layout(Vec2(w, 0.0))` read-back footgun), and the
+    /// status zone fills the **constrained remainder** below it; a resize
+    /// to a small window takes the `ScrollArea` overflow fallback **without**
+    /// re-entering a zero-height measure path (no panic). Pre-FE-5 the bench
+    /// was measured through a zero rect and the status through an
+    /// arithmetic `row_h − bench_h − 8` remainder slice.
+    #[test]
+    fn tc_fe5_bench_natural_status_fills_remainder() {
+        let out_dir = temp_out_dir("fe5-zones");
+        let (bench_tx, _bench_rx) = std::sync::mpsc::channel::<BenchCmd>();
+        let app = RamSleuthApp {
+            state: Arc::new(RwLock::new(TelemetryData::default())),
+            bench_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            settings_open: false,
+            requirements_open: false,
+            setup: Arc::new(RwLock::new(SetupOutcome::default())),
+            icon: None,
+            graphs_open: Arc::new(AtomicBool::new(false)),
+            saved_refresh: None,
+            last_graphs_open: false,
+            out_dir: out_dir.clone(),
+            poller: None,
+            notice: None,
+            probe_state: ProbeState::default(),
+            probe_title: None,
+            about_open: false,
+        };
+        let data = TelemetryData::default();
+
+        // Extract the CYAN-stroked zone frame rects (the bench + status
+        // share the right column's left edge).
+        let frame_rects = |w: f32, h: f32| -> Vec<egui::Rect> {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(w, h));
+            let ctx = egui::Context::default();
+            ctx.begin_frame(egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            });
+            let action = app.render_zones(&ctx, &data);
+            let out = ctx.end_frame();
+            assert_eq!(action, GuiAction::None, "a no-click frame reports no action");
+            out.shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.stroke.color == CYAN && rect.rect.width() >= 100.0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // (1) Default window: the bench is a natural, non-zero height and
+        // sits above the status, which fills the constrained remainder
+        // (down to the column's bottom).
+        let frames = frame_rects(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1]);
+        assert!(frames.len() >= 2, "the bench + status frames must render ({frames:?})");
+        let right_x = frames.iter().fold(0.0_f32, |mx, r| mx.max(r.min.x));
+        let mut right: Vec<egui::Rect> = frames
+            .into_iter()
+            .filter(|r| (r.min.x - right_x).abs() < 2.0)
+            .collect();
+        right.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
+        let (bench, status) = (right[0], right[1]);
+        // The bench's allocation is natural + non-zero (not a zero-rect
+        // read-back): a bench grid is a substantial, content-sized height.
+        assert!(
+            bench.height() > 40.0,
+            "the bench zone must get a natural, non-zero height (got {})",
+            bench.height()
+        );
+        // The status fills the constrained remainder: below the bench,
+        // reaching the column's bottom (no gap left unfilled at the
+        // default size).
+        assert!(bench.max.y < status.min.y, "the bench must sit above the status");
+        assert!(
+            status.max.y > DEFAULT_WINDOW_SIZE[1] - 60.0,
+            "the status must fill down toward the column bottom (bottom {} of {})",
+            status.max.y,
+            DEFAULT_WINDOW_SIZE[1]
+        );
+
+        // (2) A small window: the bench's natural height overflows the
+        // column, the `ScrollArea` fallback takes over — no panic, and the
+        // bench is STILL a non-zero (natural) allocation (the zero-height
+        // measure path is gone).
+        let small = frame_rects(900.0, 220.0);
+        assert!(
+            !small.is_empty(),
+            "the small window must still render the zone frames (no panic)"
+        );
         fs::remove_dir_all(&out_dir).expect("cleanup");
     }
 
@@ -4686,7 +4755,7 @@ mod tests {
         }
         assert!(app.probe_title.is_some(), "the title must be set");
         assert_eq!(
-            app.state.read().unwrap().probe_result,
+            state_read(&app.state).probe_result,
             ProbeResult::None,
             "the result slot must be consumed"
         );
@@ -4738,7 +4807,7 @@ mod tests {
             "the failure must flash a notice"
         );
         assert_eq!(
-            app.state.read().unwrap().probe_result,
+            state_read(&app.state).probe_result,
             ProbeResult::None,
             "the result slot must be consumed"
         );
@@ -4885,7 +4954,7 @@ mod tests {
             "the Cancel button must paint: {texts:?}"
         );
         assert!(
-            !app.state.read().unwrap().probe_requested,
+            !state_read(&app.state).probe_requested,
             "no click must not set the edge"
         );
 
@@ -4916,7 +4985,7 @@ mod tests {
         frame(vec![click(true)], &mut app);
         frame(vec![click(false)], &mut app);
         assert!(
-            app.state.read().unwrap().probe_requested,
+            state_read(&app.state).probe_requested,
             "a press + release on Allow must set the request edge"
         );
         assert_eq!(
@@ -4977,7 +5046,7 @@ mod tests {
             "a press + release on Cancel must return to Idle"
         );
         assert!(
-            !app.state.read().unwrap().probe_requested,
+            !state_read(&app.state).probe_requested,
             "Cancel must not set the request edge"
         );
 
