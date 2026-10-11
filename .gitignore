@@ -8,11 +8,9 @@
 *.swp
 .DS_Store
 
-# Development documentation (cycle plans, research notes, handovers, AUR ops reference) — local dev-doc storage, NOT repo-facing
-Work/
-plans/
-# Active lease board (work/DEV_LOG.md) + scratch (work/scratch/) — local-only; never commit, do NOT `git add -A`
+# Development workspace (local-only, NOT repo-facing) — lease board (work/DEV_LOG.md), master log (work/MASTER_LOG.md), plans (work/plans/), research notes (work/research/), handovers, AUR ops reference, scope tracking, scratch. Never commit, do NOT `git add -A`
 work/
+plans/
 
 # Agent state (carries a full origin/master checkout) — never committable
 .kilo/
