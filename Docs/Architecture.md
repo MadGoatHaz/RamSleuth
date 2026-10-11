@@ -39,7 +39,7 @@ desktop systems. It has two product layers:
   bridge's MCHBAR window; and — on both — the fully unprivileged decode of every
   DIMM's SPD EEPROM (JEP106 makers, rank, density, base speed, and XMP 2.0 /
   XMP 3.0-EXPO profiles).
-- **Layer 2 — the benchmark engine.** An AIDA64-style 4×4 grid of memory
+- **Layer 2 — the benchmark engine (the Memory & Latency Benchmark).** A 4×4 grid of memory
   bandwidth (Read / Write / Copy) and pointer-chase latency across the Memory /
   L1 / L2 / L3 tiers, measured with AVX2 / AVX-512F SIMD kernels, one pinned
   worker per physical core, plus a multi-pass "burn-in" soak mode.
@@ -157,7 +157,7 @@ supported boards.
 ### 2.2 Layer 2 — the benchmark engine
 
 Layer 2 answers *"how fast is this memory subsystem?"*. The
-[`ramsleuth-bench`](#43-ramsleuth-bench) crate implements an AIDA64-style
+[`ramsleuth-bench`](#43-ramsleuth-bench) crate implements a
 **4×4 grid**:
 
 | Tier   | Read | Write | Copy | Latency |
@@ -729,7 +729,7 @@ Usage: ramsleuth-client [SUBCOMMAND] [OPTIONS]
 
 `dump` is the one-RPC `GetTelemetry` → pure `render` → stdout (a 10 s read
 timeout); `bench` is the streamed run — a `BenchStarted` ack, one progress
-line per completed cell, then the terminal AIDA64-style 4×4 grid through the
+line per completed cell, then the terminal 4×4 grid through the
 pure `render_grid` (an unmeasured cell — `0.0` on the wire — prints `N/A`);
 `status` is the one-RPC per-section summary. Exit codes: **0** success, **1**
 daemon/client error (each with its structured diagnostic), **2** usage error.

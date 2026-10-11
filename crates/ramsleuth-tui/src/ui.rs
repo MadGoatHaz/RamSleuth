@@ -1251,7 +1251,7 @@ fn bench_cell_text(
 /// The 4×4 grid: tier rows × Read/Write/Copy/Latency columns, in its
 /// current run state (the GUI `render_grid_table` mirror, the bare
 /// terminal-width form: the Read/Write/Copy columns are GB/s — named in
-/// the zone title — and the last column is ns/hop, the AIDA64
+/// the zone title — and the last column is ns/hop, the benchmark
 /// convention). **Not in flight** — the terminal result grid of the
 /// last completed run (or the all-`N/A` zero grid when none has landed
 /// yet — the layout never shifts when the result lands); **a run in
@@ -1897,7 +1897,7 @@ fn no_spd_item() -> ListItem<'static> {
 // structurally not-applicable cell. One implementation, shared with the
 // GUI (C3).
 
-/// The display name of a grid tier row (`Mem` — the AIDA64 grid
+/// The display name of a grid tier row (`Mem` — the benchmark grid
 /// convention, which also fits the column budget).
 fn tier_name(tier: Tier) -> &'static str {
     match tier {

@@ -2,7 +2,7 @@
 
 **Version:** 2.4.13 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
 
-RamSleuth v2 is a live RAM telemetry suite and an AIDA64-style memory benchmark for
+RamSleuth v2 is a live RAM telemetry suite and a Memory & Latency Benchmark for
 AMD and Intel desktops. It watches your memory system in real time — clocks, the
 27 live DRAM subtimings, voltages, temperatures, bandwidth — and it measures your
 memory subsystem with a proper four-by-four benchmark grid (DRAM, L1, L2, L3 ×
@@ -74,8 +74,8 @@ memory controller's own state and shows it in a dense dashboard:
   part number, serial, rank, density, base speed, and the factory XMP/EXPO
   profiles stored on each module.
 
-**"How fast is it, really?"** RamSleuth ships a full benchmark engine in the
-same spirit as AIDA64's memory benchmark:
+**"How fast is it, really?"** RamSleuth ships a full, native memory & latency benchmark
+engine:
 
 - A **4×4 grid** — tier rows (Memory/DRAM, L1, L2, L3) × metric columns
   (Read, Write, Copy, Latency), with bandwidth in GB/s and latency in
@@ -576,7 +576,7 @@ that is the platform) as a `key: value` row — the clocks and ratios
 the voltage rails. Missing cells render `N/A` in muted grey — never a crash,
 never a blank mystery (see [Section 9](#9-na--what-the-structured-reasons-mean)).
 
-**Zone 2 — `2 · BENCHMARK ENGINE`** (right, top). The AIDA64-style **4×4
+**Zone 2 — `2 · BENCHMARK ENGINE`** (right, top). The **4×4
 grid**: tier rows **Memory / L1 / L2 / L3** × metric columns **Read / Write /
 Copy / Latency**, bandwidth cells in GB/s (cyan) and latency cells in ns
 (amber). The grid is **live during a run** — each streamed progress event
@@ -916,7 +916,7 @@ cores, logical CPUs, SMT, total L3), prints a summary line —
 ramsleuth-bench: 16 physical cores (32 logical, SMT on), total L3 64 MiB, AVX2 yes, AVX-512 no
 ```
 
-— runs the full orchestrator (`run_all`), and prints the AIDA64-style grid
+— runs the full orchestrator (`run_all`), and prints the 4×4 grid
 as a fixed-width table:
 
 ```

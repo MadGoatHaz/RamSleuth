@@ -202,7 +202,7 @@ pub fn export_json(
 const CARD_W: usize = 640;
 const CARD_H: usize = 420;
 const MARGIN: usize = 16;
-/// One grid cell (the AIDA64 layout is 4 tiers × 4 metrics).
+/// One grid cell (the benchmark layout is 4 tiers × 4 metrics).
 const CELL_W: usize = 140;
 const CELL_H: usize = 64;
 /// Gutter between cells; the outer margin is shared with the header.
@@ -234,7 +234,7 @@ const DIM_CELL: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x3A, 0x44);
 /// `RamSleuth v2.1.0 <YYYY-MM-DD HH:MM:SS>`, the CPU line (brand +
 /// platform clock), the RAM line (total capacity + channel mode from
 /// the bound-DIMM count), a dim separator, then the 4×4 block of
-/// cells — one per [`Tier`] row × [`Metric`] column, the AIDA64
+/// cells — one per [`Tier`] row × [`Metric`] column, the benchmark
 /// layout — each colored by its value magnitude along the CYAN →
 /// AMBER → CRIMSON ramp (an unmeasured 0.0 cell, the wire's `N/A`,
 /// renders dim). Absent telemetry or cells degrade to the honest `N/A`

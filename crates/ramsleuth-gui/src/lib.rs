@@ -24,7 +24,7 @@
 //!   subtimings matrix — [`timing_cells`] (the pure, deterministic cell
 //!   builder over the AMD / Intel readout) + [`render_telemetry_zone`]
 //!   (the titled, bounded-height `egui::Grid` renderer).
-//! - `bench_zone` — P3-28 — zone 2: the AIDA64-style 4×4 benchmark
+//! - `bench_zone` — P3-28 — zone 2: the 4×4 benchmark
 //!   grid + run controls + live progress — [`grid_cells`] (the pure
 //!   16-cell builder over the terminal result grid) +
 //!   [`render_bench_zone`] (the titled-frame `egui_extras::TableBuilder`
@@ -114,7 +114,7 @@ pub use update::{
 // exercise without an egui context.
 pub use telemetry_zone::{render_telemetry_zone, timing_cells};
 
-// P3-28: zone 2 (the AIDA64-style benchmark grid + run controls +
+// P3-28: zone 2 (the 4×4 benchmark grid + run controls +
 // live progress), re-exported at the root (workspace re-export style)
 // — the app shell (P3-30) calls `render_bench_zone` with a read-only
 // `&TelemetryData` snapshot + the poller's `BenchCmd` sender + the

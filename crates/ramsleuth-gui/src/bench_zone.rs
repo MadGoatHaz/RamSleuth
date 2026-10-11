@@ -1,4 +1,4 @@
-//! Zone 2 renderer: the AIDA64-style 4×4 benchmark grid, the run
+//! Zone 2 renderer: the 4×4 benchmark grid, the run
 //! controls (including the burn-in — a duration knob + `Run Burn-In`,
 //! C7-18 — and a live per-iteration row), and a flat status line
 //! (C7-17 — the P3-28 progress pill retired).

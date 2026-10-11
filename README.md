@@ -1,12 +1,12 @@
 # RamSleuth v2.4.15
 
-Live memory-controller telemetry and an AIDA64-style benchmark engine for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
+Live memory-controller telemetry and a native memory & latency benchmark engine for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
 
 ![RamSleuth — GUI and TUI](img/RamSleuth.png)
 
 ## What it is
 
-RamSleuth is an 8-crate Rust workspace (7 product crates + the `tools/gen-icon` dev tool) with two layers: **live telemetry** of the memory controller's operating state, and an **AIDA64-style benchmark engine** for bandwidth and latency.
+RamSleuth is an 8-crate Rust workspace (7 product crates + the `tools/gen-icon` dev tool) with two layers: **live telemetry** of the memory controller's operating state, and a **native memory & latency benchmark engine** for bandwidth and latency.
 
 Every privileged read flows through a single root daemon that holds only `CAP_SYS_RAWIO` — all clients (the CLI, the TUI, the GUI) run fully unprivileged — and the no-panic contract means a missing driver, privilege, or piece of hardware never crashes anything: the affected fields render as a structured `N/A (<reason>)` and the process exits 0.
 
@@ -15,7 +15,7 @@ Every privileged read flows through a single root daemon that holds only `CAP_SY
 - **Live AMD memory-controller state** — SMU PM-table clocks (MCLK/UCLK/FCLK), 27 DRAM subtimings, GDM, and command rate via the `ryzen_smu` kernel driver, plus channel-mode (SMN CS population) and ECC (SMN `UmcCapHi`) decoded from the memory-controller registers.
 - **Live Intel memory-controller state** — trained DRAM subtimings + the DRAM core clock, decoded from the IMC registers across the full Tier 1–3 desktop line (Skylake → Arrow Lake): the `ramsleuth_intel` kernel module's 25 sysfs attributes first, the host-bridge MCHBAR mapped read-only through `/dev/mem` as the fallback where the kernel permits. **Modern Intel is detected correctly** — the generation is resolved from the CPUID model *and* brand string, so a 12th-gen+ part (e.g. the i5-12600KF) resolves to Alder Lake and decodes fully (no more false `unsupported`), and the IMC base + window are keyed on that generation (`0xd800` / 256 KiB for 12th-gen+, `0x5000` / 64 KiB before). **Channel mode is hardware-derived and cross-checked** — capacity-derived from the DIMM slot registers and reconciled against the unprivileged SMBIOS Type 17 population (a 4-tier trust procedure), so a populated dual-channel kit reads `Dual-Channel (Symmetric)` (DDR4) or `Dual-Channel (4x 32-bit Subchannels)` (DDR5), never a false `Single-Channel`; ECC decodes from the host-bridge `CAPID0_A` (`Not Capable` / `Capable (disabled)` / `Enabled` / `N/A`). **CPU vCore is board-delivered** from the Super-I/O `in0` (the direct VRM sense) with an honest confidence badge — verified on a curated seed board, `[est]` on a consumer-vendor board, `N/A` on enterprise / out-of-bounds / no-Super-I/O (never a fabricated value).
 - **Unprivileged SPD** — every DIMM's EEPROM decoded without root, re-baselined to the JEDEC SPD standard — JESD79-4 (DDR4, 512 B) / JESD79-5 (DDR5, 1024 B): module maker + DRAM die maker (JEP106), rank + bus width, part, serial, JEDEC base speed, XMP 2.0 (DDR4) / XMP 3.0-EXPO (DDR5) profiles; the root daemon additionally attempts to bind any EEPROM the kernel's `ee1004` driver missed (SPD auto-bind, on by default — `--no-spd-autobind` to disable, non-fatal, never unbinds).
-- **AIDA64-style 4×4 benchmark** — native AVX2/AVX-512F kernels, one worker pinned per physical core, pointer-chase latency, and an optional burn-in soak.
+- **Memory & Latency Benchmark (4×4 grid)** — native AVX2/AVX-512F kernels, one worker pinned per physical core, pointer-chase latency, and an optional burn-in soak.
 - **Dual frontend, full CLI** — the same live three-zone dashboard in a 17-key ratatui terminal UI and an egui desktop app, with 5-series graphs and PNG/JSON export.
 - **One-line RAM summary** — the header reads `RAM: <size> (<dimm>) <speed> MT/s | <channel mode> | ECC: <status> | Mode: <clocking>` — channel mode on both platforms (Intel MAD + DIMM population, AMD SMN CS population), ECC from the host-bridge / SMN registers.
 - **Submit Probe Report** — consent-gated (the GUI header `Probe` button, the TUI `[F]`): a markdown report with the system identity (CPU brand/generation, PCI host-bridge ID, kernel/OS/arch, version, telemetry source), the decoded readout, the N/A reasons, and the raw register dump (Intel + AMD) — one-click **Open GitHub Issue** (GUI) or a `~/.ramsleuth/probe-report.md` write (TUI `[w]`), with an explicit no-PII disclosure.

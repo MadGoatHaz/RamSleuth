@@ -2,7 +2,7 @@
 //!
 //! **Chunk P1-11 — [COUPLED-TO: P1-10].** Thin harness around the frozen
 //! orchestrator: detects host features and topology, runs [`run_all`],
-//! and prints the AIDA64-style 4×4 grid as a fixed-width text table
+//! and prints the 4×4 grid as a fixed-width text table
 //! plus (with `--json`) a serde-free JSON object. No benchmark logic
 //! lives here — all measurement stays in the library.
 //!
@@ -32,8 +32,8 @@ pub(crate) struct Opts {
 
 /// Usage text printed for `--help`/`--version` and parse errors.
 const USAGE: &str = concat!(
-    "ramsleuth-bench — the standalone AIDA64-style memory bandwidth &\n",
-    "latency grid (Memory/L3/L2/L1 × read/write/copy/latency)\n",
+    "ramsleuth-bench — the standalone Memory & Latency Benchmark\n",
+    "(Memory/L3/L2/L1 × read/write/copy/latency)\n",
     "\n",
     "Runs the benchmark directly — no daemon needed.\n",
     "\n",
@@ -158,7 +158,7 @@ pub(crate) fn to_json(grid: &BenchmarkGrid) -> String {
 /// `Memory (DRAM)`, `L3`, `L2`, `L1` (slots are the `Tier` discriminants).
 const ROWS: [(&str, usize); 4] = [("Memory (DRAM)", 0), ("L3", 3), ("L2", 2), ("L1", 1)];
 
-/// The grid as a fixed-width AIDA64-style text table: bandwidth cells
+/// The grid as a fixed-width text table: bandwidth cells
 /// with 2 decimals (GB/s), latency cells with 1 decimal (ns).
 pub(crate) fn render_grid(grid: &BenchmarkGrid) -> String {
     const COL: usize = 12;

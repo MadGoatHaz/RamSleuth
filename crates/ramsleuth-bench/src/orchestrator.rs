@@ -1,5 +1,5 @@
 //! Benchmark orchestrator & aggregation — runs all tiers × ops and fills
-//! the AIDA64-style 4×4 grid.
+//! the 4×4 grid.
 //!
 //! **Chunk P1-10 — [COUPLED-TO: P1-08, P1-09].** Consumes the frozen
 //! topology (P1-02), buffer sizing (P1-03), pinned worker dispatch
@@ -87,7 +87,7 @@ pub enum Metric {
     Latency,
 }
 
-/// AIDA64-style 4×4 benchmark grid: four tiers × four metrics.
+/// The 4×4 benchmark grid: four tiers × four metrics.
 ///
 /// Every array is indexed by [`Tier`] (discriminant order
 /// `Memory, L1, L2, L3`); [`BenchmarkGrid::cell`] is the lookup.
