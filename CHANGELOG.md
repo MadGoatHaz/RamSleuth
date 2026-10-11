@@ -6,6 +6,24 @@ All notable per-release changes to RamSleuth. Newest first.
 
 ## [Unreleased]
 
+## [2.4.16] - 2026-10-11
+
+### Added
+- **Single-source display: new shared `ramsleuth-display` crate** — the daemon is now the authoritative source for streamed values (burn-in elapsed is stamped from the daemon's own clock and forwarded in real time, with per-cell ticks re-stamped monotonically), and the TUI, GUI, and CLI all render through one shared implementation of the formatters, the N/A reason maps, and the CPU-temp scan instead of each frontend recomputing its own — removing a class of display divergence between frontends
+- **Versioned wire protocol (`PROTOCOL_VERSION`)** — the 8-byte frame header now carries a protocol version alongside the length, with byte-pinned, length-prefixed payloads; a cross-generation frame is rejected with `VersionMismatch` (never a silent mis-parse), so the wire is forward-compatible across daemon/client versions
+- **Latency-only benchmark run target** — a new `StreamTarget::Latency(Tier)` arm (append-only, byte-pinned) runs the DRAM pointer-chase pass only, with no bandwidth cells, exposed as a `--latency` flag on the standalone bench CLI
+
+### Changed
+- **Memory & Latency Benchmark per-tier fidelity (renamed from the retired "AIDA64-style" term)** — tier-aware write/copy kernels (the L1/L2/L3 cells are now cache-resident and no longer report DRAM; Memory uses non-temporal stores), a fixed 1M-hop latency chase (eliminating the ~30-min full-DRAM traversal, so a 5-minute burn-in can finish a pass), dead code + a duplicate latency kernel removed, and a release-path bounds check (a corrupted ring degrades to a non-counted 0.0 instead of UB)
+- **AMD generality** — the AMD PM-table decode is now family/generation-keyed (Zen 4/5 and newer reach a live decode path instead of the whole section reading N/A, via a per-generation table-version plausibility filter), the AMD SMN layer is now unsafe-free, and the channel locator grammar is generalized (a board-keyed `Controller<digit>` profile + vendor-neutral rules)
+- **Frontend/CLI hardening** — N/A reasons are user-facing (a human-readable phrase, not the Debug form) across the CLI, the standalone tools, and the dashboard; TUI/GUI layout rework (a per-surface erase idiom, a column-based GUI layout, a rendered parity note on the TUI/GUI graph surfaces); CLI dashboard/JSON consistency (the JSON carries the same fields the dashboard shows, including vCore); tier order aligned so every frontend renders the benchmark grid identically
+- **Terminology** — "AIDA64-style" is purged repo-wide in favor of the canonical "Memory & Latency Benchmark"
+
+### Fixed
+- **RwLock poison recovery (TUI + GUI)** — a stray panic that poisons a shared-state lock now recovers the last-good value through poison-tolerant guard helpers, instead of re-panicking and cascading across both threads
+- **Daemon telemetry-cache concurrency** — the cache is now a read/write-split `RwLock` (a fresh snapshot is a cheap shared read; a re-collect is an exclusive write), so concurrent TUI + GUI + CLI frontends no longer queue behind the full re-collect
+- **Daemon burn-in duration re-clamp** — a client-supplied burn-in duration is re-clamped on the privileged daemon side to the sanctioned 0..=1440 range (`u32::MAX` can no longer become a ~138-year deadline)
+
 ## [2.4.15] - 2026-10-09
 
 ### Fixed
