@@ -93,11 +93,15 @@ pub enum IntelGen {
     /// 11th-gen brand hint stays the conservative Comet Lake bucket.
     RocketLake,
     /// 4th gen Xeon Scalable (Sapphire Rapids, 2023) — server /
-    /// workstation (models `0x8F`).
+    /// workstation (models `0x8F`), 8-channel DDR5.
     ///
     /// Appended after [`Self::RocketLake`] (OQ-10 append-only, index 12).
-    /// The coarse pre-fix table mis-bucketed `0x8F` to Coffee Lake; it
-    /// has no [`crate::intel_gen::profile_for`] entry (honest `N/A`).
+    /// The coarse pre-fix table mis-bucketed `0x8F` to Coffee Lake.
+    /// **Server uncore** (H-9): the [`crate::intel_gen::profile_for`]
+    /// entry is the 8-channel `Server` profile — telemetry sources from
+    /// SMBIOS Type 17 + the SPD EEPROM, never the MCHBAR MMIO window
+    /// (the decode routes through
+    /// [`crate::intel_readout::is_server_gen`] → `decode_server`).
     SapphireRapids,
     /// Jasper Lake (Atom Tremont client, 2021, models `0x9C`).
     ///
