@@ -2170,6 +2170,29 @@ pub fn decode(
         // OQ-11: confirm on hardware before shipping (working
         // assumption).
         Some(p) if matches!(p.map, GenMap::Alder) => {
+            // ============================================================================
+            // C-3: KNOWN REGISTER ALIASING ON 12th-gen+ (PENDING HARDWARE VERIFICATION)
+            // ============================================================================
+            // On Alder Lake and later, the MAD block base (0xD800) overlaps the MCL1
+            // TC register block (also at 0xD800). The same physical words are exposed
+            // as both:
+            //   - mad_inter_channel / mad_intra_ch0 / mad_intra_ch1 / mad_dimm_ch0/1
+            //   - mcl1_tc_pre / mcl1_tc_act / mcl1_tc_act2 / mcl1_tc_wtr / ...
+            //
+            // The current code consumes BOTH interpretations in a single decode call.
+            // This is KNOWN to be incorrect — one of the two mappings is wrong.
+            //
+            // Until hardware verification determines the true ownership of the 0xD800
+            // page, the code uses the following heuristic:
+            //   - If SMBIOS confirms DDR4: prefer MAD interpretation for geometry,
+            //     ignore MCL1 timing words from the same page
+            //   - If SMBIOS confirms DDR5: prefer MCL1 interpretation for timing,
+            //     ignore MAD geometry words from the same page
+            //   - If SMBIOS is unavailable: use MAD for geometry (safer default)
+            //
+            // TODO(C-3): Replace heuristic with verified register map once hardware
+            // confirmation is available (requires Alder Lake DDR4 + DDR5 test systems).
+            // ============================================================================
             // OQ-5 (IG-28): the tile-routing probe — on Meteor /
             // Arrow Lake, a fully degenerate primary window (every
             // register None / 0x0 / 0xFFFF_FFFF) is the runtime
@@ -2211,6 +2234,39 @@ pub fn decode(
             {
                 return decode_alder_ddr4(regs, gen, &res);
             }
+
+            // C-3: apply the aliasing policy so one interpretation of the
+            // shared `0xD800` page does not corrupt the other.
+            let policy = c3_alias_policy(res.tech);
+
+            // The effective channel resolution: the Mcl1 (DDR5) policy does
+            // not trust the MAD geometry words → recompute from SMBIOS
+            // alone; the MadAnnotated (unknown) policy carries the aliasing
+            // annotation; the Mad (DDR4) policy keeps `res`.
+            let mut effective_res = res.clone();
+            match policy {
+                C3AliasPolicy::Mcl1 => {
+                    effective_res = resolve_channel(None, None, smbios);
+                }
+                C3AliasPolicy::MadAnnotated => {
+                    if !effective_res.annotation.is_empty() {
+                        effective_res.annotation.push(' ');
+                    }
+                    effective_res.annotation.push_str(
+                        "[0xD800 page: MAD/MCL1 aliasing — geometry from MAD, timing unavailable]",
+                    );
+                }
+                C3AliasPolicy::Mad => {}
+            }
+
+            // The effective register set: the Mad (DDR4) policy does not
+            // trust the MCL1 timing words (the same `0xD800` page) → null
+            // them (the non-aliased mirror @ `0x4800` is still used via
+            // [`mirror_or_mcl`]).
+            let mut effective_regs = regs.clone();
+            if matches!(policy, C3AliasPolicy::Mad) {
+                effective_regs.mcl1 = MclRegs::default();
+            }
             let subch_indices: &[usize] = if ddr5 {
                 &[0, 1, 2, 3]
             } else {
@@ -2224,7 +2280,7 @@ pub fn decode(
             let mut channels = Vec::with_capacity(subch_indices.len());
             for (pos, &i) in subch_indices.iter().enumerate() {
                 let map = &ALDER_CHANNELS[i];
-                let mcl = tier3_mcl_for(i, map, regs);
+                let mcl = tier3_mcl_for(i, map, &effective_regs);
                 let mut channel = decode_tier3_channel(i as u8, mclk.clone(), &mcl, map);
                 channel.clocks.gear_mode = gear_mode.clone();
                 channel.clocks.uclk_mhz = uclk.clone();
@@ -2238,7 +2294,7 @@ pub fn decode(
                 channel.index = pos as u8;
                 channels.push(channel);
             }
-            decoded_readout(channels, &res, EccStatus::Unknown)
+            decoded_readout(channels, &effective_res, EccStatus::Unknown)
         }
         // Unprofiled generations, and any future profiled family whose
         // decode path has not landed (Sandy / Haswell): behavior
@@ -2252,6 +2308,49 @@ pub fn decode(
             }
             all_na_readout(channels)
         }
+    }
+}
+
+// ============================================================================
+// C-3: MAD/MCL1 aliasing policy on 12th-gen+ (the `0xD800` page)
+// ============================================================================
+
+/// The C-3 MAD/MCL1 aliasing policy for 12th-gen+ (the `0xD800` page is
+/// read as both the MAD block and the MCL1 block). Keyed on the resolved
+/// memory technology ([`ChannelResolution::tech`]):
+///
+/// - [`C3AliasPolicy::Mad`] (DDR4) — the `0xD800` page is the MAD block:
+///   trust the MAD words for channel mode/geometry; the MCL1 timing words
+///   (the same page) are **not** decoded.
+/// - [`C3AliasPolicy::Mcl1`] (DDR5) — the `0xD800` page is the MCL1 block:
+///   trust the MCL1 words for timing; the MAD geometry words (the same
+///   page) do **not** drive the channel mode.
+/// - [`C3AliasPolicy::MadAnnotated`] (unknown tech) — trust the MAD words
+///   for geometry (the current behavior) and carry the aliasing
+///   annotation.
+///
+/// This is a **preparation** (no hardware verification yet): it prevents
+/// one interpretation from corrupting the other on 12th-gen+ while
+/// leaving pre-12th-gen (the `0x5000` IMC base, no aliasing) untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum C3AliasPolicy {
+    /// The `0xD800` page is the MAD block (DDR4): MAD geometry trusted,
+    /// MCL1 timing words not decoded.
+    Mad,
+    /// The `0xD800` page is the MCL1 block (DDR5): MCL1 timing trusted,
+    /// MAD geometry words do not drive the channel mode.
+    Mcl1,
+    /// The tech is unknown: MAD geometry trusted (the current behavior) and
+    /// the aliasing annotation is carried.
+    MadAnnotated,
+}
+
+/// Select the C-3 aliasing policy from the resolved memory technology.
+fn c3_alias_policy(tech: Option<MemoryTech>) -> C3AliasPolicy {
+    match tech {
+        Some(MemoryTech::Ddr4) => C3AliasPolicy::Mad,
+        Some(MemoryTech::Ddr5) => C3AliasPolicy::Mcl1,
+        _ => C3AliasPolicy::MadAnnotated,
     }
 }
 
@@ -3108,6 +3207,23 @@ pub fn resolve_channel(
                         trust: Some(ChannelTrust::Override),
                         annotation: format!(
                             "[Override: MCHBAR decoded Single-Channel, but SMBIOS Type 17 confirms {dimm_count} DIMMs across Channel A/B. Reporting Dual-Channel]"
+                        ),
+                        dimm_count,
+                    }
+                } else if smbios.populated_count >= 2
+                    && smbios.derived_mode == DerivedMode::Ambiguous
+                {
+                    // M-15: soft annotation fallback — the MMIO decoded
+                    // Single and SMBIOS confirms ≥ 2 DIMMs, but the locators
+                    // carry no channel designation, so the channel count is
+                    // unresolvable from firmware. Keep the MMIO Single
+                    // verdict (soft) and carry the annotation.
+                    ChannelResolution {
+                        mode: Some(ChannelMode::Single),
+                        tech,
+                        trust: Some(ChannelTrust::VerifiedHardware),
+                        annotation: format!(
+                            "MMIO reports single-channel with {dimm_count} DIMMs present — channel designations unresolvable from firmware locators"
                         ),
                         dimm_count,
                     }
@@ -6716,6 +6832,97 @@ mod tests {
         assert_eq!(r.mode, None);
         assert_eq!(r.trust, Some(ChannelTrust::None));
         assert!(r.annotation.contains("Error"));
+    }
+
+    /// (M-15) The soft annotation fallback: the MMIO decoded Single and
+    /// SMBIOS confirms ≥ 2 DIMMs, but the locators carry no channel
+    /// designation (`Ambiguous`). The channel count is unresolvable from
+    /// firmware, so the Single verdict is kept (soft) and the M-15
+    /// annotation is carried.
+    #[test]
+    fn resolve_channel_m15_single_with_ambiguous_locators_annotates() {
+        let r = resolve_channel(
+            Some(ChannelMode::Single),
+            None,
+            &smbios_topology(2, DerivedMode::Ambiguous, None),
+        );
+        assert_eq!(r.mode, Some(ChannelMode::Single));
+        assert_eq!(r.trust, Some(ChannelTrust::VerifiedHardware));
+        assert!(
+            r.annotation.contains("unresolvable from firmware locators"),
+            "{:?}",
+            r.annotation
+        );
+        assert!(r.annotation.contains("2 DIMMs"), "{:?}", r.annotation);
+        assert_eq!(r.dimm_count, 2);
+    }
+
+    /// (C-3) When the resolved tech is DDR4, the `0xD800` page is the MAD
+    /// block, so the MCL1 timing words (the same page) are **not** decoded:
+    /// a subchannel whose mirror is a disabled default falls back to the
+    /// (now nulled) MCL1 words and degrades to N/A, not a fabricated MCL1
+    /// timing. The MAD geometry (channel mode / tech) is still trusted.
+    #[test]
+    fn c3_ddr4_mcl1_timing_not_decoded() {
+        // The mirror for subchannel 2 is a disabled default (bus-fault), so
+        // without the C-3 fix it would fall back to the MCL1 words; the MCL1
+        // block (0xD800) carries valid-looking timing words.
+        let regs = IntelImcRegs {
+            ch2: ChannelRegs {
+                tc_dbp: Some(0xFFFF_FFFF),
+                tc_rap: Some(0xFFFF_FFFF),
+                tc_rfp: Some(0xFFFF_FFFF),
+                tc_rap2: Some(0xFFFF_FFFF),
+                tc_rdrd: Some(0xFFFF_FFFF),
+                tc_rdwr: Some(0xFFFF_FFFF),
+                tc_wrrd: Some(0xFFFF_FFFF),
+                tc_wrwr: Some(0xFFFF_FFFF),
+            },
+            mcl1: MclRegs {
+                tc_pre: Some(0x0028_8410),
+                tc_act: Some(0x0010_0020),
+                tc_act2: Some(0x0000_0001),
+                tc_wtr: Some(0x0000_0002),
+                tc_rfp: Some(0x0000_0004),
+                tc_rfp2: Some(0x0000_0008),
+                tc_rdrd: Some(0x0000_0010),
+                tc_wrwr: Some(0x0000_0020),
+            },
+            ..Default::default()
+        };
+        // MAD geometry (0xD800 page): mad_inter with DDR_TYPE bits = 000
+        // (DDR4). OQ-11: no MAD_DIMM_CH2/CH3 -> the 2-channel DDR4 geometry.
+        let mad_inter = 0x100u32; // [2:0] = 000 -> DDR4
+
+        let readout = decode(
+            &regs,
+            IntelGen::AlderLake,
+            Some(mad_inter),
+            None,
+            None,
+            &SmbiosTopology::empty(),
+        );
+
+        // res.tech == Some(Ddr4) -> the C-3 Mad policy nulls the MCL1
+        // timing words; subchannel 2's mirror is a disabled default, so its
+        // timings are N/A (NOT decoded from the aliased MCL1 words).
+        assert_eq!(readout.memory_tech, Some(MemoryTech::Ddr4));
+        let ch2 = readout
+            .channels
+            .iter()
+            .find(|c| c.index == 2)
+            .expect("subchannel 2 present");
+        // tRCD (from TC_PRE) and tCL (from TC_ACT) must both be N/A.
+        assert!(
+            matches!(ch2.timings.rcdrd, Section::Na(_)),
+            "MCL1 tRCD must not be decoded for DDR4: {:?}",
+            ch2.timings.rcdrd
+        );
+        assert!(
+            matches!(ch2.timings.cl, Section::Na(_)),
+            "MCL1 tCL must not be decoded for DDR4: {:?}",
+            ch2.timings.cl
+        );
     }
 
     /// The exact user bug, end to end: a dual-channel 2×16 GiB system
