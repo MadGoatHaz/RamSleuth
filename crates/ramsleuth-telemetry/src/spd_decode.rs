@@ -1157,9 +1157,21 @@ fn decode_xmp3(data: &[u8]) -> Vec<SpdProfile> {
         if block[0] != n as u8 || block[1] == 0 {
             continue;
         }
+        // Sanity gate (C-1): the frequency is a 16-bit LE MHz value at
+        // +2/+3; a DDR5 XMP / EXPO profile must land in 3200-10666 MT/s
+        // (MHz x 2). A blank (0) or implausible rate is a bogus slot ->
+        // skip it (never report a sub-3200 / over-10666 "profile").
+        let freq_mhz = u16::from_le_bytes([block[2], block[3]]);
+        let speed = freq_mhz.saturating_mul(2); // MHz -> MT/s
+        if !(3200..=10666).contains(&speed) {
+            continue;
+        }
         if let Some(p) = xmp_profile(&block, |b| {
             // XMP 3.0 / EXPO field offsets within the 32-byte structure.
-            let speed = u16::from(b[2]) * 2; // frequency byte @2 (MHz) -> MT/s
+            // The frequency is a 16-bit LE MHz value at +2/+3 (C-1); the
+            // rate in MT/s is MHz x 2.
+            let freq_mhz = u16::from_le_bytes([b[2], b[3]]);
+            let speed = freq_mhz.saturating_mul(2); // MHz -> MT/s
             SpdProfile {
                 index: n as u8,
                 speed_mts: non_zero_u16(speed, "XMP 3.0 frequency"),
@@ -1436,11 +1448,13 @@ mod tests {
         // (C7-02) - this fixture is the part/profile coexistence proof.
         data[0x300] = XMP3_REVISION; // rev 0x30 + "XMP" signature @ +2
         data[0x302..0x305].copy_from_slice(&XMP3_SIGNATURE);
-        // Profile 0 @ 0x310: index 0, validity mask 1, 256 MT/s,
+        // Profile 0 @ 0x310: index 0, validity mask 1, 4800 MT/s
+        // (2400 MHz = 0x0960 LE),
         // CL/tRCD/tRP/tRAS = 20/20/20/40, 1250 mV.
         data[0x310] = 0x00;
         data[0x311] = 0x01;
-        data[0x312] = 0x80; // 128 MHz -> 256 MT/s
+        data[0x312] = 0x60; // 2400 MHz LE low byte -> 4800 MT/s
+        data[0x313] = 0x09; // 2400 MHz LE high byte
         data[0x314] = 20;
         data[0x315] = 20;
         data[0x316] = 20;
@@ -1528,12 +1542,91 @@ mod tests {
         assert_eq!(m.profiles.len(), 1, "profile 0 valid, the rest blank");
         let p = &m.profiles[0];
         assert_eq!(p.index, 0);
-        assert_eq!(p.speed_mts, Section::Value(256));
+        assert_eq!(p.speed_mts, Section::Value(4800));
         assert_eq!(p.cas, Section::Value(20));
         assert_eq!(p.trcd, Section::Value(20));
         assert_eq!(p.trp, Section::Value(20));
         assert_eq!(p.tras, Section::Value(40));
         assert_eq!(p.voltage, Section::Value(1250));
+    }
+
+    /// C-1 regression: a realistic DDR5-6000 XMP 3.0 / EXPO profile
+    /// (3000 MHz stored as a 16-bit LE value at +2/+3) decodes to
+    /// 6000 MT/s. The frequency spans two bytes, not one.
+    #[test]
+    fn synthetic_ddr5_6000_profile_decodes_to_6000() {
+        let mut data = vec![0u8; 1024];
+        // DDR5 classification: byte 0x02 = 0x0C + 1024 B image.
+        data[0x02] = 0x0C;
+        // XMP 3.0 / EXPO region at 0x300.
+        data[0x300] = XMP3_REVISION;
+        data[0x302..0x305].copy_from_slice(&XMP3_SIGNATURE);
+        // Profile 0 @ 0x310: index 0, validity mask 1, 6000 MT/s
+        // (3000 MHz = 0x0BB8 LE -> bytes [0xB8, 0x0B]),
+        // CL/tRCD/tRP/tRAS = 30/36/36/90, 1400 mV.
+        data[0x310] = 0x00;
+        data[0x311] = 0x01;
+        data[0x312] = 0xB8; // 3000 MHz LE low byte -> 6000 MT/s
+        data[0x313] = 0x0B; // 3000 MHz LE high byte
+        data[0x314] = 30;
+        data[0x315] = 36;
+        data[0x316] = 36;
+        data[0x317] = 90;
+        data[0x323] = 0x78; // 1400 mV LE (block 19/20)
+        data[0x324] = 0x05;
+        let m = decode(&SpdImage {
+            index: 0x54,
+            data,
+        });
+        assert!(m.is_ddr5);
+        assert_eq!(m.profiles.len(), 1, "profile 0 valid (6000 MT/s)");
+        let p = &m.profiles[0];
+        assert_eq!(p.index, 0);
+        assert_eq!(p.speed_mts, Section::Value(6000), "3000 MHz x 2 = 6000 MT/s");
+        assert_eq!(p.cas, Section::Value(30));
+        assert_eq!(p.trcd, Section::Value(36));
+        assert_eq!(p.trp, Section::Value(36));
+        assert_eq!(p.tras, Section::Value(90));
+        assert_eq!(p.voltage, Section::Value(1400));
+    }
+
+    /// C-1 regression: a blank / implausible XMP 3.0 frequency is a bogus
+    /// slot and is dropped outright (the profile list stays empty) - both
+    /// when +2/+3 are zero (no profile) and when the resulting rate falls
+    /// outside the DDR5 3200-10666 MT/s band (e.g. the old 8-bit bug's
+    /// 128 MHz -> 256 MT/s). The gate fires before the timings are read, so
+    /// a slot with valid CL/timings but a bogus speed is still dropped.
+    #[test]
+    fn xmp3_blank_or_implausible_frequency_is_dropped() {
+        // Both frequency bytes zero (no profile) -> speed 0 -> dropped.
+        let mut data = vec![0u8; 1024];
+        data[0x02] = 0x0C;
+        data[0x300] = XMP3_REVISION;
+        data[0x302..0x305].copy_from_slice(&XMP3_SIGNATURE);
+        data[0x310] = 0x00;
+        data[0x311] = 0x01; // validity mask non-zero, but frequency blank
+        data[0x312] = 0x00;
+        data[0x313] = 0x00;
+        data[0x314] = 30; // timings present, but the bogus speed wins
+        let m = decode(&SpdImage { index: 0x55, data });
+        assert!(m.profiles.is_empty(), "blank frequency -> no profile");
+
+        // An implausible rate (128 MHz -> 256 MT/s, the old 8-bit bug)
+        // is below the 3200 floor -> dropped.
+        let mut data = vec![0u8; 1024];
+        data[0x02] = 0x0C;
+        data[0x300] = XMP3_REVISION;
+        data[0x302..0x305].copy_from_slice(&XMP3_SIGNATURE);
+        data[0x310] = 0x00;
+        data[0x311] = 0x01;
+        data[0x312] = 0x80; // 128 MHz (low byte) / 0x00 high -> 256 MT/s
+        data[0x313] = 0x00;
+        data[0x314] = 30;
+        let m = decode(&SpdImage { index: 0x56, data });
+        assert!(
+            m.profiles.is_empty(),
+            "256 MT/s is below the 3200 floor -> bogus slot dropped"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2336,11 +2429,13 @@ mod tests {
         // XMP 3.0 / EXPO region at 0x300 (JESD79-5 home).
         data[0x300] = XMP3_REVISION; // rev 0x30 + "XMP" signature @ +2
         data[0x302..0x305].copy_from_slice(&XMP3_SIGNATURE);
-        // Profile 0 @ 0x310: index 0, validity mask 1, 256 MT/s,
+        // Profile 0 @ 0x310: index 0, validity mask 1, 4800 MT/s
+        // (2400 MHz = 0x0960 LE),
         // CL/tRCD/tRP/tRAS = 20/20/20/40, 1250 mV.
         data[0x310] = 0x00;
         data[0x311] = 0x01;
-        data[0x312] = 0x80; // 128 MHz -> 256 MT/s
+        data[0x312] = 0x60; // 2400 MHz LE low byte -> 4800 MT/s
+        data[0x313] = 0x09; // 2400 MHz LE high byte
         data[0x314] = 20;
         data[0x315] = 20;
         data[0x316] = 20;
@@ -2358,7 +2453,7 @@ mod tests {
         );
         assert!(!m.profiles.is_empty(), "the XMP3 profile at 0x300 must decode");
         let p = &m.profiles[0];
-        assert_eq!(p.speed_mts, Section::Value(256));
+        assert_eq!(p.speed_mts, Section::Value(4800));
         assert_eq!(p.voltage, Section::Value(1250));
     }
 
