@@ -26,9 +26,12 @@
 //!    - an image whose length is neither 512 nor 1024 → skipped with a
 //!      warning (not a layout this chunk serves).
 //!
-//! The caller (the P2-10 facade) renders an empty result as `SPD: N/A`;
-//! the P2-09 decoder consumes the raw images (JEP106 makers, ranks,
-//! part/serial, XMP/EXPO profiles).
+//! The caller (the P2-10 facade) renders the result as `SPD: N/A` when
+//! empty and carries the [`SpdAcquireStatus`] (H-8) into the readout's
+//! annotation so the user knows *why* the list is empty (driver not
+//! loaded / not listable / no devices bound / all images invalid), not
+//! just *that* it is. The P2-09 decoder consumes the raw images (JEP106
+//! makers, ranks, part/serial, XMP/EXPO profiles).
 //!
 //! # Safety
 //!
@@ -37,9 +40,10 @@
 //! # Platform
 //!
 //! The sysfs walk is `#[cfg(target_os = "linux")]`. On non-Linux targets
-//! [`acquire()`] returns `Ok(vec![])` (this module still compiles; the
-//! pure helpers [`parse_device_name`] / [`validate_image`] are
-//! platform-independent).
+//! [`acquire()`] returns
+//! `Ok((vec![], SpdAcquireStatus::DriverMissing))` (this module still
+//! compiles; the pure helpers [`parse_device_name`] / [`validate_image`]
+//! are platform-independent).
 
 use crate::error::TelemetryResult;
 
@@ -77,21 +81,56 @@ pub struct SpdImage {
     pub data: Vec<u8>,
 }
 
+/// The acquisition status of the SPD source (H-8): *why* the module list
+/// is empty (or not). The facade threads this into the readout's
+/// annotation (as a string, e.g. `"SPD: driver not loaded"`) so the user
+/// knows why SPD is absent — not just that it is — without a new wire
+/// field (the existing `channel_annotation` String carries it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpdAcquireStatus {
+    /// Successfully read N modules.
+    Ok,
+    /// The `ee1004` driver directory was not found (module not loaded).
+    DriverMissing,
+    /// The driver directory exists but is not listable (permission).
+    Unlistable,
+    /// The directory is listable but no `ee1004` devices are bound.
+    NoDevices,
+    /// Devices were found but every image failed to decode (bad length).
+    AllImagesInvalid,
+}
+
+impl std::fmt::Display for SpdAcquireStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            SpdAcquireStatus::Ok => "ok",
+            SpdAcquireStatus::DriverMissing => "driver not loaded",
+            SpdAcquireStatus::Unlistable => "driver directory not listable",
+            SpdAcquireStatus::NoDevices => "no devices bound",
+            SpdAcquireStatus::AllImagesInvalid => "all images invalid",
+        };
+        write!(f, "{s}")
+    }
+}
+
 /// Acquire the raw SPD image of every bound `ee1004` device.
 ///
 /// The unprivileged entry point of the SPD telemetry branch: pure sysfs
-/// reads (see the module docs for the enumeration strategy). Returns:
+/// reads (see the module docs for the enumeration strategy). Returns a
+/// `(images, status)` pair:
 ///
-/// - `Ok(vec![])` when the driver is absent, no device is bound, or the
-///   platform is non-Linux (a one-line warning goes to stderr in the
-///   first two cases) — the caller renders this as "no SPD data", never
-///   an error;
-/// - `Ok([SpdImage; N])` with one image per successfully read device.
+/// - the images: `vec![]` when the driver is absent, no device is bound,
+///   or the platform is non-Linux (a one-line warning goes to stderr in
+///   the first two cases) — the caller renders this as "no SPD data",
+///   never an error — else one [`SpdImage`] per successfully read device;
+/// - the [`SpdAcquireStatus`] (H-8): *why* the list is empty (driver not
+///   loaded / not listable / no devices bound / all images invalid) or
+///   `Ok` when at least one module decoded.
 ///
 /// Per-device read failures are skipped with a warning and **not**
 /// returned as `Err`: one bad DIMM must not drop the others (plan D5),
 /// and this module can never fail the process.
-pub fn acquire() -> TelemetryResult<Vec<SpdImage>> {
+pub fn acquire() -> TelemetryResult<(Vec<SpdImage>, SpdAcquireStatus)> {
     #[cfg(target_os = "linux")]
     {
         acquire_linux()
@@ -99,7 +138,7 @@ pub fn acquire() -> TelemetryResult<Vec<SpdImage>> {
     #[cfg(not(target_os = "linux"))]
     {
         eprintln!("warning: SPD EEPROM acquisition is Linux-only; no SPD data");
-        finalize_images(&[])
+        Ok((Vec::new(), SpdAcquireStatus::DriverMissing))
     }
 }
 
@@ -190,18 +229,19 @@ fn read_eeprom(name: &str) -> std::io::Result<Vec<u8>> {
 }
 
 /// The Linux acquisition path: enumerate → read → finalize (see the
-/// module docs for the strategy and failure policy).
+/// module docs for the strategy and failure policy). Returns the
+/// `(images, status)` pair (H-8).
 #[cfg(target_os = "linux")]
-fn acquire_linux() -> TelemetryResult<Vec<SpdImage>> {
+fn acquire_linux() -> TelemetryResult<(Vec<SpdImage>, SpdAcquireStatus)> {
     let entries = match enumerate_driver_dir() {
         DriverDir::Entries(entries) => entries,
         DriverDir::NotLoaded => {
             eprintln!("warning: SPD EEPROM driver 'ee1004' is not loaded; no SPD data");
-            return Ok(Vec::new());
+            return Ok((Vec::new(), SpdAcquireStatus::DriverMissing));
         }
         DriverDir::Unlistable(e) => {
             eprintln!("warning: cannot enumerate {EE1004_DRIVER_DIR}: {e}; no SPD data");
-            return Ok(Vec::new());
+            return Ok((Vec::new(), SpdAcquireStatus::Unlistable));
         }
     };
     // One bad device must not drop the others (D5): an unreadable
@@ -221,7 +261,7 @@ fn acquire_linux() -> TelemetryResult<Vec<SpdImage>> {
         eprintln!(
             "warning: no bound SPD EEPROM (ee1004) devices under {EE1004_DRIVER_DIR}; no SPD data"
         );
-        return Ok(Vec::new());
+        return Ok((Vec::new(), SpdAcquireStatus::NoDevices));
     }
     let skipped = devices.iter().filter(|(_, data)| !validate_image(data)).count();
     if skipped > 0 {
@@ -229,7 +269,15 @@ fn acquire_linux() -> TelemetryResult<Vec<SpdImage>> {
             "warning: {skipped} SPD image(s) skipped (length neither {SPD_DDR4_LEN} nor {SPD_DDR5_LEN} bytes)"
         );
     }
-    finalize_images(&devices)
+    let images = finalize_images(&devices)?;
+    // H-8: devices were found but none decoded to a valid image length →
+    // the whole acquisition is `AllImagesInvalid` (not `Ok`).
+    let status = if images.is_empty() {
+        SpdAcquireStatus::AllImagesInvalid
+    } else {
+        SpdAcquireStatus::Ok
+    };
+    Ok((images, status))
 }
 
 #[cfg(test)]
@@ -354,9 +402,13 @@ mod tests {
             res.is_ok(),
             "acquire() must be Ok on this unprivileged DDR4 host, got: {res:?}"
         );
-        // `unwrap_or_default` is a no-panic fallback: the assertion above
-        // already proved the result is `Ok`.
-        let images = res.unwrap_or_default();
+        // The assertion above proved the result is `Ok`; the `match`
+        // destructure is a no-panic fallback (no `unwrap` on hardware
+        // data — the no-panic contract).
+        let (images, _status) = match res {
+            Ok(v) => v,
+            Err(_) => return, // unreachable
+        };
         assert!(
             (1..=2).contains(&images.len()),
             "this host has two bound SPD EEPROMs, got {} image(s)",
@@ -371,5 +423,25 @@ mod tests {
             );
             assert!(validate_image(&img.data));
         }
+    }
+
+    /// H-8: the [`SpdAcquireStatus`] `Display` renders each variant as the
+    /// human annotation the facade threads into the readout.
+    #[test]
+    fn spd_acquire_status_display() {
+        assert_eq!(SpdAcquireStatus::Ok.to_string(), "ok");
+        assert_eq!(
+            SpdAcquireStatus::DriverMissing.to_string(),
+            "driver not loaded"
+        );
+        assert_eq!(
+            SpdAcquireStatus::Unlistable.to_string(),
+            "driver directory not listable"
+        );
+        assert_eq!(SpdAcquireStatus::NoDevices.to_string(), "no devices bound");
+        assert_eq!(
+            SpdAcquireStatus::AllImagesInvalid.to_string(),
+            "all images invalid"
+        );
     }
 }

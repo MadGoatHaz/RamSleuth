@@ -1815,7 +1815,7 @@ mod tests {
     #[test]
     fn live_acquire_decode_never_panics() {
         let images = match crate::spd_eeprom::acquire() {
-            Ok(imgs) => imgs,
+            Ok((imgs, _status)) => imgs,
             Err(e) => {
                 eprintln!("note: live acquire() -> Err({e}); skipping live decode");
                 return;

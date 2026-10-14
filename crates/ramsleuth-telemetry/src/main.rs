@@ -702,7 +702,7 @@ fn main() {
             // The SMBIOS Type 17 topology (unprivileged dmi read) feeds the
             // Intel section's capacity line and the server-uncore speed
             // fallback (the SPD EEPROM is not OS-visible on those platforms).
-            let smbios = intel_smbios::collect();
+            let (smbios, _smbios_status) = intel_smbios::collect();
             if opts.json {
                 println!("{}", to_json(&t, &smbios));
             } else {
