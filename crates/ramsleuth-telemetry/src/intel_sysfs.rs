@@ -29,6 +29,16 @@
 //! every Tier-3 field simply reads `None` — the same graceful
 //! containment as the 5 MAD attributes, never an error.
 //!
+//! The Phase 1d Alder Lake **DDR4** TC attributes — the two per-MC
+//! `alk_d4_mc0_tc_*` / `alk_d4_mc1_tc_*` blocks (10 words each, the
+//! 64-bit `TC_PRE` split into `tc_pre_lo` / `tc_pre_hi`) — populate the
+//! [`IntelImcRegs::alk_d4_tc0`] / [`IntelImcRegs::alk_d4_tc1`] fields the
+//! DDR4 decode in [`crate::intel_readout`] consumes. These ride in the
+//! kernel module's gen-gated `alk_d4_group` (created only on 12th-gen+
+//! hosts); on a pre-12th-gen host the files are absent and both TC
+//! blocks read all-`None` — the same graceful containment as the Tier-3
+//! fields, never an error.
+//!
 //! # Design split (mirrors the AMD branch)
 //!
 //! **The module exposes raw values; the decode lives in Rust** (plan §2):
@@ -98,7 +108,7 @@ use std::path::Path;
 
 use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{TelemetryError, TelemetryResult};
-use crate::intel_readout::{ChannelRegs, IntelImcRegs, MclRegs};
+use crate::intel_readout::{AlderDdr4TcRegs, ChannelRegs, IntelImcRegs, MclRegs};
 
 /// The `ramsleuth_intel` sysfs kobject directory (frozen contract, plan
 /// §3.1 — the INTEL-05 module creates it only on a fully successful
@@ -333,6 +343,41 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
         tc_wrwr: read_u32_attr(root, "mcl1_tc_wrwr")?,
     };
 
+    // The two Alder Lake DDR4 TC blocks (Phase 1d): the per-controller
+    // `0xE000` (MC0) / `0x1E000` (MC1) TC blocks exposed by the kernel
+    // module's gen-gated `alk_d4_group` (created only on 12th-gen+
+    // hosts). The 64-bit `TC_PRE` is split into a low word
+    // (`tc_pre_lo` @ +0x00) and a high word (`tc_pre_hi` @ +0x04); the
+    // remaining eight registers are single 32-bit words. Absent on a
+    // pre-12th-gen host (the module exposes no `alk_d4_mc*` attributes)
+    // -> all-`None` (graceful degradation, never an error), with the same
+    // per-attribute containment as the core 19. The DDR4 decode in
+    // `intel_readout` consumes these (keyed on `res.tech == Ddr4`).
+    let alk_d4_tc0 = AlderDdr4TcRegs {
+        tc_pre_lo: read_u32_attr(root, "alk_d4_mc0_tc_pre_lo")?,
+        tc_pre_hi: read_u32_attr(root, "alk_d4_mc0_tc_pre_hi")?,
+        tc_act: read_u32_attr(root, "alk_d4_mc0_tc_act")?,
+        tc_rdrd: read_u32_attr(root, "alk_d4_mc0_tc_rdrd")?,
+        tc_rdwr: read_u32_attr(root, "alk_d4_mc0_tc_rdwr")?,
+        tc_wrrd: read_u32_attr(root, "alk_d4_mc0_tc_wrrd")?,
+        tc_wrwr: read_u32_attr(root, "alk_d4_mc0_tc_wrwr")?,
+        tc_odt: read_u32_attr(root, "alk_d4_mc0_tc_odt")?,
+        tc_rfp: read_u32_attr(root, "alk_d4_mc0_tc_rfp")?,
+        tc_rftp: read_u32_attr(root, "alk_d4_mc0_tc_rftp")?,
+    };
+    let alk_d4_tc1 = AlderDdr4TcRegs {
+        tc_pre_lo: read_u32_attr(root, "alk_d4_mc1_tc_pre_lo")?,
+        tc_pre_hi: read_u32_attr(root, "alk_d4_mc1_tc_pre_hi")?,
+        tc_act: read_u32_attr(root, "alk_d4_mc1_tc_act")?,
+        tc_rdrd: read_u32_attr(root, "alk_d4_mc1_tc_rdrd")?,
+        tc_rdwr: read_u32_attr(root, "alk_d4_mc1_tc_rdwr")?,
+        tc_wrrd: read_u32_attr(root, "alk_d4_mc1_tc_wrrd")?,
+        tc_wrwr: read_u32_attr(root, "alk_d4_mc1_tc_wrwr")?,
+        tc_odt: read_u32_attr(root, "alk_d4_mc1_tc_odt")?,
+        tc_rfp: read_u32_attr(root, "alk_d4_mc1_tc_rfp")?,
+        tc_rftp: read_u32_attr(root, "alk_d4_mc1_tc_rftp")?,
+    };
+
     // The 5 global MAD channel/geometry attributes (24-attr module
     // builds only): absent on a pre-24-attr build -> `None` (graceful),
     // with the same per-attribute containment as the core 19.
@@ -364,12 +409,14 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
             mcl1,
             mad_dimm_ch2,
             mad_dimm_ch3,
-            // Phase 1d: the Alder Lake DDR4 TC blocks (`0xE000`/`0x1E000`)
-            // are populated from the kernel module's new sysfs attributes;
-            // until then they default to all-`None` (the DDR4 decode
-            // degrades its timings to `Na(ParseError)` on the sysfs path,
-            // while the `/dev/mem` `from_bar_wide` path reads them directly).
-            ..IntelImcRegs::default()
+            // Phase 1d: the two Alder Lake DDR4 TC blocks
+            // (`0xE000`/`0x1E000`), populated from the kernel module's
+            // gen-gated `alk_d4_mc{0,1}_tc_*` attributes; all-`None` on a
+            // pre-12th-gen host (graceful). The DDR4 decode in
+            // `intel_readout` consumes these; the `/dev/mem`
+            // `from_bar_wide` path reads the same blocks directly.
+            alk_d4_tc0,
+            alk_d4_tc1,
         },
         mchbar,
         mad_inter_channel,
@@ -623,6 +670,34 @@ mod tests {
         k.write("mad_dimm_ch3", "0x00000014\n");
     }
 
+    /// The Phase 1d Alder Lake DDR4 TC attributes as frozen sysfs
+    /// payloads (`0x%08x\n`) — the two per-MC `alk_d4_mc{0,1}_tc_*`
+    /// blocks (10 words each, the 64-bit `TC_PRE` split into
+    /// `tc_pre_lo` / `tc_pre_hi`); arbitrary raw fixture values (no
+    /// decode in this module — the decode lives in `intel_readout`).
+    fn write_alk_d4_attrs(k: &TempKobject) {
+        k.write("alk_d4_mc0_tc_pre_lo", "0x000000ab\n");
+        k.write("alk_d4_mc0_tc_pre_hi", "0x000000cd\n");
+        k.write("alk_d4_mc0_tc_act", "0x00000111\n");
+        k.write("alk_d4_mc0_tc_rdrd", "0x00000222\n");
+        k.write("alk_d4_mc0_tc_rdwr", "0x00000333\n");
+        k.write("alk_d4_mc0_tc_wrrd", "0x00000444\n");
+        k.write("alk_d4_mc0_tc_wrwr", "0x00000555\n");
+        k.write("alk_d4_mc0_tc_odt", "0x00000666\n");
+        k.write("alk_d4_mc0_tc_rfp", "0x00000777\n");
+        k.write("alk_d4_mc0_tc_rftp", "0x00000888\n");
+        k.write("alk_d4_mc1_tc_pre_lo", "0x000000ba\n");
+        k.write("alk_d4_mc1_tc_pre_hi", "0x000000dc\n");
+        k.write("alk_d4_mc1_tc_act", "0x00000121\n");
+        k.write("alk_d4_mc1_tc_rdrd", "0x00000232\n");
+        k.write("alk_d4_mc1_tc_rdwr", "0x00000343\n");
+        k.write("alk_d4_mc1_tc_wrrd", "0x00000454\n");
+        k.write("alk_d4_mc1_tc_wrwr", "0x00000565\n");
+        k.write("alk_d4_mc1_tc_odt", "0x00000676\n");
+        k.write("alk_d4_mc1_tc_rfp", "0x00000787\n");
+        k.write("alk_d4_mc1_tc_rftp", "0x00000898\n");
+    }
+
     // -----------------------------------------------------------------
     // (a) A fully-populated kobject.
     // -----------------------------------------------------------------
@@ -810,6 +885,99 @@ mod tests {
         );
         assert_eq!(out.mad_dimm_ch2, None);
         assert_eq!(out.mad_dimm_ch3, None);
+    }
+
+    // -----------------------------------------------------------------
+    // (a4) The Phase 1d Alder Lake DDR4 TC attributes.
+    // -----------------------------------------------------------------
+
+    /// A 12th-gen+ kobject (the core 19 + the `alk_d4_mc{0,1}_tc_*`
+    /// blocks) populates the two Alder Lake DDR4 TC blocks
+    /// (`IntelImcRegs.alk_d4_tc0` / `alk_d4_tc1`), while the absent
+    /// Tier-3 DDR5 fields (`ch2` / `ch3` / `mcl0` / `mcl1` /
+    /// `mad_dimm_ch2/3`) degrade to all-`None` (graceful containment).
+    #[test]
+    fn alk_d4_attrs_populate_on_12th_gen_kobject() {
+        let k = TempKobject::new("alk-d4-present");
+        write_acceptance_kobject(&k);
+        write_alk_d4_attrs(&k);
+        let out = read_from(&k.root).expect("containment -> Ok");
+        let mut expected = acceptance_regs();
+        expected.alk_d4_tc0 = AlderDdr4TcRegs {
+            tc_pre_lo: Some(0x0000_00AB),
+            tc_pre_hi: Some(0x0000_00CD),
+            tc_act: Some(0x0000_0111),
+            tc_rdrd: Some(0x0000_0222),
+            tc_rdwr: Some(0x0000_0333),
+            tc_wrrd: Some(0x0000_0444),
+            tc_wrwr: Some(0x0000_0555),
+            tc_odt: Some(0x0000_0666),
+            tc_rfp: Some(0x0000_0777),
+            tc_rftp: Some(0x0000_0888),
+        };
+        expected.alk_d4_tc1 = AlderDdr4TcRegs {
+            tc_pre_lo: Some(0x0000_00BA),
+            tc_pre_hi: Some(0x0000_00DC),
+            tc_act: Some(0x0000_0121),
+            tc_rdrd: Some(0x0000_0232),
+            tc_rdwr: Some(0x0000_0343),
+            tc_wrrd: Some(0x0000_0454),
+            tc_wrwr: Some(0x0000_0565),
+            tc_odt: Some(0x0000_0676),
+            tc_rfp: Some(0x0000_0787),
+            tc_rftp: Some(0x0000_0898),
+        };
+        assert_eq!(out.regs, expected);
+        assert_eq!(
+            out.mchbar,
+            MchBarInfo {
+                base: Some(0xFED1_0000),
+                enabled: Some(true)
+            }
+        );
+    }
+
+    /// A pre-12th-gen kobject (the core 19 only, no `alk_d4_mc*` files)
+    /// degrades gracefully: both Alder Lake DDR4 TC blocks read all-`None`
+    /// (graceful containment — no error, no `DriverMissing`); the core 19
+    /// and the MCHBAR diagnostics are intact.
+    #[test]
+    fn alk_d4_attrs_absent_on_19_attr_kobject_degrade_to_none() {
+        let k = TempKobject::new("alk-d4-absent");
+        write_acceptance_kobject(&k); // the 19 core attributes only
+        let out = read_from(&k.root).expect("containment -> Ok");
+        assert_eq!(out.regs, acceptance_regs());
+        assert_eq!(
+            out.mchbar,
+            MchBarInfo {
+                base: Some(0xFED1_0000),
+                enabled: Some(true)
+            }
+        );
+        // `acceptance_regs()` leaves both TC blocks at default (all
+        // `None`) — the pre-12th-gen containment arm.
+        assert_eq!(out.regs.alk_d4_tc0, AlderDdr4TcRegs::default());
+        assert_eq!(out.regs.alk_d4_tc1, AlderDdr4TcRegs::default());
+    }
+
+    /// One malformed Alder Lake DDR4 TC attribute → `None` for that
+    /// register only; the sibling registers in the same block and the
+    /// other MC assemble (per-register containment).
+    #[test]
+    fn alk_d4_malformed_attr_degrades_to_none_only() {
+        let k = TempKobject::new("alk-d4-malformed");
+        write_acceptance_kobject(&k);
+        write_alk_d4_attrs(&k);
+        k.write("alk_d4_mc0_tc_rfp", "not-a-register\n");
+        let out = read_from(&k.root).expect("containment -> Ok");
+        // The malformed register degrades to `None` for that slot only.
+        assert_eq!(out.regs.alk_d4_tc0.tc_rfp, None);
+        // The sibling registers in the same block are intact.
+        assert_eq!(out.regs.alk_d4_tc0.tc_pre_lo, Some(0x0000_00AB));
+        assert_eq!(out.regs.alk_d4_tc0.tc_rftp, Some(0x0000_0888));
+        // The other MC block is unaffected.
+        assert_eq!(out.regs.alk_d4_tc1.tc_pre_lo, Some(0x0000_00BA));
+        assert_eq!(out.regs.alk_d4_tc1.tc_rftp, Some(0x0000_0898));
     }
 
     // -----------------------------------------------------------------
