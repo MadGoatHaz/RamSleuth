@@ -22,6 +22,21 @@
  * family. On a 12th-gen box the pre-Chunk-2 module read 0x5000 (unmapped
  * -> 0x0 / 0xFFFF_FFFF) and misreported the channel mode.
  *
+ * Phase 1d (Alder Lake DDR4): on the DDR4 12th-gen+ family the per-MC
+ * TC timing registers live at MCHBAR + 0xE000 (MC0) / + 0x1E000 (MC1;
+ * +0x10000 inter-controller stride) — NOT the 0x4000/0x4400 Tier-1
+ * mirror window (which returns 0xFFFFFFFF on DDR4) — per the Intel
+ * 12th-Gen Datasheet Vol. 2, §3.2.66-3.2.87. They are exposed as a
+ * second, nameless sysfs attribute group created only when the CPU is
+ * the 12th-gen+ family (the same generation that selects the 256 KiB
+ * Tier-3 window): the 10-word TC block per MC (the 64-bit TC_PRE split
+ * into lo @ +0x00 / hi @ +0x04; plus TC_ACT/TC_RDRD/TC_RDWR/TC_WRRD/
+ * TC_WRWR/TC_ODT/TC_RFP/TC_RFTP) and the 8-word native MCL block per
+ * MC at 0xD000/0xD800 (the Tier-3 uncore fallback the userspace
+ * reader already reads as mcl0_tc_* / mcl1_tc_*). The 0x4000/0x4400
+ * Tier-1 mirror blocks stay for Tier-1 compatibility; the
+ * pre-12th-gen surface is the core 25 attributes unchanged.
+ *
  * This module performs no decoding: each register attribute is the raw
  * 32-bit value, little-endian, one line, "0x%08x".  The RamSleuth
  * userspace reader decodes the bitfields per CPU generation, so one
@@ -60,8 +75,11 @@
 #define MCHBAR_ADDR_MASK	0x0000007FFFFFF000ULL	/* bits 12..38 */
 
 /* Default window (Tier 1 / Tier 2): the 64 KiB covering every
- * register we expose (the highest exposed offset is MC_BIOS_REQ at
- * 0x5E00). */
+ * register we expose on a pre-12th-gen box (the highest exposed
+ * offset is MC_BIOS_REQ at 0x5E00). The Phase 1d Alder Lake DDR4
+ * attributes (0xE000+/0x1E000+ TC, 0xD000/0xD800 MCL) are created
+ * only on the 12th-gen+ family, which gets the Tier-3 256 KiB window
+ * (the highest exposed offset there is MC1's TC_RFTP at 0x1E43C). */
 #define IMC_MAP_SIZE_DEFAULT	0x10000
 
 /* Tier 3 (12th-gen+): the wider 256 KiB window, selected by the CPU
@@ -90,6 +108,92 @@
 #define REG_TC_RDWR_CH1	0x4424
 #define REG_TC_WRRD_CH1	0x4428
 #define REG_TC_WRWR_CH1	0x442C
+
+/*
+ * Phase 1d (Alder Lake DDR4): the per-MC TC timing registers of the
+ * DDR4 12th-gen+ family (Intel 12th-Gen Datasheet Vol. 2,
+ * §3.2.66-3.2.87). On DDR4 the TC block is NOT the 0x4000/0x4400
+ * Tier-1 mirror window (which returns 0xFFFFFFFF on DDR4) but the
+ * native MC0 @ 0xE000 / MC1 @ 0x1E000 (= 0xE000 + the 0x10000
+ * inter-controller stride) bases. TC_PRE is a 64-bit register read as
+ * two 32-bit words (x86 MMIO is 32-bit granular): lo @ +0x00
+ * (tRP / tRDPRE / tPPD), hi @ +0x04 (tWRPRE / tRAS / tRCD).
+ */
+#define ALK_D4_MC0_BASE		0xE000
+#define ALK_D4_MC1_BASE		0x1E000
+
+#define ALK_D4_TC_PRE		0x00
+#define ALK_D4_TC_PRE_HI	0x04
+#define ALK_D4_TC_ACT		0x08
+#define ALK_D4_TC_RDRD		0x0C
+#define ALK_D4_TC_RDWR		0x10
+#define ALK_D4_TC_WRRD		0x14
+#define ALK_D4_TC_WRWR		0x18
+#define ALK_D4_TC_ODT		0x70
+#define ALK_D4_TC_RFP		0x438
+#define ALK_D4_TC_RFTP		0x43C
+
+#define REG_ALK_D4_MC0_TC_PRE_LO	(ALK_D4_MC0_BASE + ALK_D4_TC_PRE)
+#define REG_ALK_D4_MC0_TC_PRE_HI	(ALK_D4_MC0_BASE + ALK_D4_TC_PRE_HI)
+#define REG_ALK_D4_MC0_TC_ACT		(ALK_D4_MC0_BASE + ALK_D4_TC_ACT)
+#define REG_ALK_D4_MC0_TC_RDRD		(ALK_D4_MC0_BASE + ALK_D4_TC_RDRD)
+#define REG_ALK_D4_MC0_TC_RDWR		(ALK_D4_MC0_BASE + ALK_D4_TC_RDWR)
+#define REG_ALK_D4_MC0_TC_WRRD		(ALK_D4_MC0_BASE + ALK_D4_TC_WRRD)
+#define REG_ALK_D4_MC0_TC_WRWR		(ALK_D4_MC0_BASE + ALK_D4_TC_WRWR)
+#define REG_ALK_D4_MC0_TC_ODT		(ALK_D4_MC0_BASE + ALK_D4_TC_ODT)
+#define REG_ALK_D4_MC0_TC_RFP		(ALK_D4_MC0_BASE + ALK_D4_TC_RFP)
+#define REG_ALK_D4_MC0_TC_RFTP		(ALK_D4_MC0_BASE + ALK_D4_TC_RFTP)
+
+#define REG_ALK_D4_MC1_TC_PRE_LO	(ALK_D4_MC1_BASE + ALK_D4_TC_PRE)
+#define REG_ALK_D4_MC1_TC_PRE_HI	(ALK_D4_MC1_BASE + ALK_D4_TC_PRE_HI)
+#define REG_ALK_D4_MC1_TC_ACT		(ALK_D4_MC1_BASE + ALK_D4_TC_ACT)
+#define REG_ALK_D4_MC1_TC_RDRD		(ALK_D4_MC1_BASE + ALK_D4_TC_RDRD)
+#define REG_ALK_D4_MC1_TC_RDWR		(ALK_D4_MC1_BASE + ALK_D4_TC_RDWR)
+#define REG_ALK_D4_MC1_TC_WRRD		(ALK_D4_MC1_BASE + ALK_D4_TC_WRRD)
+#define REG_ALK_D4_MC1_TC_WRWR		(ALK_D4_MC1_BASE + ALK_D4_TC_WRWR)
+#define REG_ALK_D4_MC1_TC_ODT		(ALK_D4_MC1_BASE + ALK_D4_TC_ODT)
+#define REG_ALK_D4_MC1_TC_RFP		(ALK_D4_MC1_BASE + ALK_D4_TC_RFP)
+#define REG_ALK_D4_MC1_TC_RFTP		(ALK_D4_MC1_BASE + ALK_D4_TC_RFTP)
+
+/*
+ * Phase 1d: the native MCL (uncore memory-controller) blocks — the
+ * Tier-3 uncore fallback, MC0 @ 0xD000 / MC1 @ 0xD800, with the 8-word
+ * Alder layout (TC_PRE/TC_ACT/TC_ACT2/TC_WTR/TC_RFP/TC_RFP2/TC_RDRD/
+ * TC_WRWR). The userspace reader decodes these as its mcl0/mcl1
+ * register set (the mcl0_tc_* / mcl1_tc_* contract names). On the
+ * 12th-gen+ family the MCL1 block shares its 0xD800 page with the
+ * gen-keyed MAD block (the overlapping words are the same raw
+ * registers; the userspace decode disambiguates by generation).
+ */
+#define MCL0_BASE		0xD000
+#define MCL1_BASE		0xD800
+
+#define MCL_TC_PRE		0x00
+#define MCL_TC_ACT		0x04
+#define MCL_TC_ACT2		0x08
+#define MCL_TC_WTR		0x10
+#define MCL_TC_RFP		0x14
+#define MCL_TC_RFP2		0x18
+#define MCL_TC_RDRD		0x20
+#define MCL_TC_WRWR		0x28
+
+#define REG_MCL0_TC_PRE		(MCL0_BASE + MCL_TC_PRE)
+#define REG_MCL0_TC_ACT		(MCL0_BASE + MCL_TC_ACT)
+#define REG_MCL0_TC_ACT2	(MCL0_BASE + MCL_TC_ACT2)
+#define REG_MCL0_TC_WTR		(MCL0_BASE + MCL_TC_WTR)
+#define REG_MCL0_TC_RFP		(MCL0_BASE + MCL_TC_RFP)
+#define REG_MCL0_TC_RFP2	(MCL0_BASE + MCL_TC_RFP2)
+#define REG_MCL0_TC_RDRD	(MCL0_BASE + MCL_TC_RDRD)
+#define REG_MCL0_TC_WRWR	(MCL0_BASE + MCL_TC_WRWR)
+
+#define REG_MCL1_TC_PRE		(MCL1_BASE + MCL_TC_PRE)
+#define REG_MCL1_TC_ACT		(MCL1_BASE + MCL_TC_ACT)
+#define REG_MCL1_TC_ACT2	(MCL1_BASE + MCL_TC_ACT2)
+#define REG_MCL1_TC_WTR		(MCL1_BASE + MCL_TC_WTR)
+#define REG_MCL1_TC_RFP		(MCL1_BASE + MCL_TC_RFP)
+#define REG_MCL1_TC_RFP2	(MCL1_BASE + MCL_TC_RFP2)
+#define REG_MCL1_TC_RDRD	(MCL1_BASE + MCL_TC_RDRD)
+#define REG_MCL1_TC_WRWR	(MCL1_BASE + MCL_TC_WRWR)
 
 /* Global (not per-channel) IMC channel-mode / DIMM-geometry registers
  * (raw only; the userspace reader decodes them). Their MCHBAR-relative
@@ -156,6 +260,50 @@ RAW_ATTR(mad_intra_ch0, mad_offs.intra0)
 RAW_ATTR(mad_intra_ch1, mad_offs.intra1)
 RAW_ATTR(mad_dimm_ch0, mad_offs.dimm0)
 RAW_ATTR(mad_dimm_ch1, mad_offs.dimm1)
+
+/*
+ * Phase 1d (Alder Lake DDR4): the per-MC TC blocks (the 64-bit TC_PRE
+ * split into lo/hi; the datasheet §3.2.66-3.2.87 offsets) and the
+ * native MCL blocks (the userspace mcl0/mcl1 contract names). Raw
+ * words only, like the core set; created only on the 12th-gen+ family
+ * (see alk_d4_group below).
+ */
+RAW_ATTR(alk_d4_mc0_tc_pre_lo, REG_ALK_D4_MC0_TC_PRE_LO)
+RAW_ATTR(alk_d4_mc0_tc_pre_hi, REG_ALK_D4_MC0_TC_PRE_HI)
+RAW_ATTR(alk_d4_mc0_tc_act, REG_ALK_D4_MC0_TC_ACT)
+RAW_ATTR(alk_d4_mc0_tc_rdrd, REG_ALK_D4_MC0_TC_RDRD)
+RAW_ATTR(alk_d4_mc0_tc_rdwr, REG_ALK_D4_MC0_TC_RDWR)
+RAW_ATTR(alk_d4_mc0_tc_wrrd, REG_ALK_D4_MC0_TC_WRRD)
+RAW_ATTR(alk_d4_mc0_tc_wrwr, REG_ALK_D4_MC0_TC_WRWR)
+RAW_ATTR(alk_d4_mc0_tc_odt, REG_ALK_D4_MC0_TC_ODT)
+RAW_ATTR(alk_d4_mc0_tc_rfp, REG_ALK_D4_MC0_TC_RFP)
+RAW_ATTR(alk_d4_mc0_tc_rftp, REG_ALK_D4_MC0_TC_RFTP)
+RAW_ATTR(alk_d4_mc1_tc_pre_lo, REG_ALK_D4_MC1_TC_PRE_LO)
+RAW_ATTR(alk_d4_mc1_tc_pre_hi, REG_ALK_D4_MC1_TC_PRE_HI)
+RAW_ATTR(alk_d4_mc1_tc_act, REG_ALK_D4_MC1_TC_ACT)
+RAW_ATTR(alk_d4_mc1_tc_rdrd, REG_ALK_D4_MC1_TC_RDRD)
+RAW_ATTR(alk_d4_mc1_tc_rdwr, REG_ALK_D4_MC1_TC_RDWR)
+RAW_ATTR(alk_d4_mc1_tc_wrrd, REG_ALK_D4_MC1_TC_WRRD)
+RAW_ATTR(alk_d4_mc1_tc_wrwr, REG_ALK_D4_MC1_TC_WRWR)
+RAW_ATTR(alk_d4_mc1_tc_odt, REG_ALK_D4_MC1_TC_ODT)
+RAW_ATTR(alk_d4_mc1_tc_rfp, REG_ALK_D4_MC1_TC_RFP)
+RAW_ATTR(alk_d4_mc1_tc_rftp, REG_ALK_D4_MC1_TC_RFTP)
+RAW_ATTR(mcl0_tc_pre, REG_MCL0_TC_PRE)
+RAW_ATTR(mcl0_tc_act, REG_MCL0_TC_ACT)
+RAW_ATTR(mcl0_tc_act2, REG_MCL0_TC_ACT2)
+RAW_ATTR(mcl0_tc_wtr, REG_MCL0_TC_WTR)
+RAW_ATTR(mcl0_tc_rfp, REG_MCL0_TC_RFP)
+RAW_ATTR(mcl0_tc_rfp2, REG_MCL0_TC_RFP2)
+RAW_ATTR(mcl0_tc_rdrd, REG_MCL0_TC_RDRD)
+RAW_ATTR(mcl0_tc_wrwr, REG_MCL0_TC_WRWR)
+RAW_ATTR(mcl1_tc_pre, REG_MCL1_TC_PRE)
+RAW_ATTR(mcl1_tc_act, REG_MCL1_TC_ACT)
+RAW_ATTR(mcl1_tc_act2, REG_MCL1_TC_ACT2)
+RAW_ATTR(mcl1_tc_wtr, REG_MCL1_TC_WTR)
+RAW_ATTR(mcl1_tc_rfp, REG_MCL1_TC_RFP)
+RAW_ATTR(mcl1_tc_rfp2, REG_MCL1_TC_RFP2)
+RAW_ATTR(mcl1_tc_rdrd, REG_MCL1_TC_RDRD)
+RAW_ATTR(mcl1_tc_wrwr, REG_MCL1_TC_WRWR)
 
 /*
  * MCHBAR physical base, 16 hex digits, no prefix
@@ -233,6 +381,59 @@ static struct attribute_group ramsleuth_group = {
 };
 
 /*
+ * Phase 1d: the Alder Lake DDR4 attribute group — the two 0xE000/
+ * 0x1E000 TC blocks (10 words each) + the two 0xD000/0xD800 native
+ * MCL blocks (8 words each). A nameless group: its attributes land in
+ * the kobject root (the same /sys/kernel/ramsleuth_intel/ directory as
+ * the core 25). Created only on the 12th-gen+ family (the same
+ * generation that selects the 256 KiB Tier-3 window); the
+ * pre-12th-gen surface stays the core 25. Removal is implicit: the
+ * kobject_put in _exit deletes the whole directory tree.
+ */
+static struct attribute *alk_d4_attrs[] = {
+	&dev_attr_alk_d4_mc0_tc_pre_lo.attr,
+	&dev_attr_alk_d4_mc0_tc_pre_hi.attr,
+	&dev_attr_alk_d4_mc0_tc_act.attr,
+	&dev_attr_alk_d4_mc0_tc_rdrd.attr,
+	&dev_attr_alk_d4_mc0_tc_rdwr.attr,
+	&dev_attr_alk_d4_mc0_tc_wrrd.attr,
+	&dev_attr_alk_d4_mc0_tc_wrwr.attr,
+	&dev_attr_alk_d4_mc0_tc_odt.attr,
+	&dev_attr_alk_d4_mc0_tc_rfp.attr,
+	&dev_attr_alk_d4_mc0_tc_rftp.attr,
+	&dev_attr_alk_d4_mc1_tc_pre_lo.attr,
+	&dev_attr_alk_d4_mc1_tc_pre_hi.attr,
+	&dev_attr_alk_d4_mc1_tc_act.attr,
+	&dev_attr_alk_d4_mc1_tc_rdrd.attr,
+	&dev_attr_alk_d4_mc1_tc_rdwr.attr,
+	&dev_attr_alk_d4_mc1_tc_wrrd.attr,
+	&dev_attr_alk_d4_mc1_tc_wrwr.attr,
+	&dev_attr_alk_d4_mc1_tc_odt.attr,
+	&dev_attr_alk_d4_mc1_tc_rfp.attr,
+	&dev_attr_alk_d4_mc1_tc_rftp.attr,
+	&dev_attr_mcl0_tc_pre.attr,
+	&dev_attr_mcl0_tc_act.attr,
+	&dev_attr_mcl0_tc_act2.attr,
+	&dev_attr_mcl0_tc_wtr.attr,
+	&dev_attr_mcl0_tc_rfp.attr,
+	&dev_attr_mcl0_tc_rfp2.attr,
+	&dev_attr_mcl0_tc_rdrd.attr,
+	&dev_attr_mcl0_tc_wrwr.attr,
+	&dev_attr_mcl1_tc_pre.attr,
+	&dev_attr_mcl1_tc_act.attr,
+	&dev_attr_mcl1_tc_act2.attr,
+	&dev_attr_mcl1_tc_wtr.attr,
+	&dev_attr_mcl1_tc_rfp.attr,
+	&dev_attr_mcl1_tc_rfp2.attr,
+	&dev_attr_mcl1_tc_rdrd.attr,
+	&dev_attr_mcl1_tc_wrwr.attr,
+	NULL,
+};
+static struct attribute_group alk_d4_group = {
+	.attrs = alk_d4_attrs,
+};
+
+/*
  * Chunk 2: the 12th-gen+ (Alder Lake and later) CPU model set — the set
  * whose IMC MAD registers moved to the 0xd800 base. This mirrors the
  * userspace `is_12th_gen_plus` in intel_readout.rs (Chunk 1's gen set):
@@ -269,6 +470,7 @@ static int __init ramsleuth_intel_init(void)
 	u32 model;
 	u16 vendor;
 	size_t map_size;
+	size_t attr_count;
 	int ret;
 
 	pdev = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(0, 0));
@@ -379,11 +581,37 @@ static int __init ramsleuth_intel_init(void)
 		return ret;
 	}
 
+	/*
+	 * Phase 1d: the Alder Lake DDR4 surface (the 0xE000/0x1E000 TC
+	 * blocks + the 0xD000/0xD800 MCL blocks) is exposed only on the
+	 * 12th-gen+ family — the same generation that selects the 256
+	 * KiB Tier-3 window (map_size above); on a pre-12th-gen box the
+	 * surface stays the core 25 (the 0x4000/0x4400 Tier-1 mirror,
+	 * kept for Tier-1 compatibility). The nameless group lands its
+	 * attributes in the kobject root.
+	 */
+	attr_count = ARRAY_SIZE(ramsleuth_attrs) - 1;
+	if (is_12th_gen_plus(model)) {
+		ret = sysfs_create_group(ramsleuth_kobj, &alk_d4_group);
+		if (ret) {
+			kobject_put(ramsleuth_kobj);
+			ramsleuth_kobj = NULL;
+			iounmap(mchbar_mmio);
+			mchbar_mmio = NULL;
+			pr_err(DRIVER_NAME
+			       ": failed to create the Alder Lake DDR4 sysfs attributes (%d)\n",
+			       ret);
+			pci_dev_put(host_bridge);
+			host_bridge = NULL;
+			return ret;
+		}
+		attr_count += ARRAY_SIZE(alk_d4_attrs) - 1;
+	}
+
 	pr_info(DRIVER_NAME
 		": MCHBAR base 0x%llx, IMC base 0x%x (model 0x%02x), %zu attributes under /sys/kernel/%s/\n",
 		(unsigned long long)mchbar_base,
-		imc_base, model,
-		ARRAY_SIZE(ramsleuth_attrs) - 1, DRIVER_NAME);
+		imc_base, model, attr_count, DRIVER_NAME);
 	return 0;
 }
 

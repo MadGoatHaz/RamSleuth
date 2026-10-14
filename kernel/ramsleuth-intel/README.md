@@ -22,9 +22,12 @@ selection includes `<asm/cpuid/api.h>` — see "Building + installing").
 
 The raw register attributes each emit the 32-bit register exactly as read
 — one line, `0x%08x`, little-endian — plus the two MCHBAR diagnostic
-attributes and `capid0a` (25 total, listed below). Nothing is ever written
-to the register space (read-only `ioread32`), so the module is safe to load
-on any Intel client host.
+attributes and `capid0a` (25 core attributes, listed below; on the
+12th-gen+ family a second, gen-gated group adds 36 more — the Alder Lake
+DDR4 `0xE000`/`0x1E000` TC blocks and the `0xD000`/`0xD800` native MCL
+blocks — see "The Alder Lake DDR4 attributes" below). Nothing is ever
+written to the register space (read-only `ioread32`), so the module is safe
+to load on any Intel client host.
 
 ## When it loads (probe sequence)
 
@@ -56,7 +59,9 @@ succeed**; every failure path unmaps/drops refs and leaves no kobject:
 6. **Require `MCHBAR_EN`** (bit 0 of the raw value) set and a nonzero base
    (`raw & 0x7FFFFFF000`, bits 38:16, 64 KiB-aligned); a zero base means
    unpopulated/virtualized → `-ENODEV`.
-7. **`ioremap(base, map_size)`**, then create the `ramsleuth_intel` kobject.
+7. **`ioremap(base, map_size)`**, then create the `ramsleuth_intel` kobject
+   (and, on the 12th-gen+ family, the Alder Lake DDR4 attribute group —
+   see below).
 
 ## MCHBAR decode
 
@@ -147,6 +152,73 @@ five `mad_*` attributes are global (not per-channel) IMC registers. The
 single `capid0a` attribute is read from PCI config space rather than the
 MCHBAR window — the input to the userspace ECC decode.
 
+## The Alder Lake DDR4 attributes (12th-gen+ only)
+
+On the 12th-gen+ family (the same generation that selects the 256 KiB
+window, step 5) the module creates a second, gen-gated attribute group in
+the same kobject directory: 36 more read-only `0444` attributes — the
+per-MC TC timing registers of the **DDR4** Alder/Raptor layout (Intel
+12th-Gen Datasheet Vol. 2, §3.2.66-3.2.87) and the native MCL blocks.
+On a pre-12th-gen box the group is not created; the surface is the core
+25 (the `0x4000`/`0x4400` Tier-1 mirror blocks stay for Tier-1
+compatibility). All are raw words only — no decoding (the userspace
+reader owns the bitfields).
+
+- **The TC blocks** — `alk_d4_mc0_tc_*` @ MCHBAR+`0xE000` and
+  `alk_d4_mc1_tc_*` @ MCHBAR+`0x1E000` (`0xE000` + the `0x10000`
+  inter-controller stride). **`TC_PRE` is a 64-bit register**, exposed as
+  two 32-bit words — `tc_pre_lo` @ `+0x00` (tRP / tRDPRE / tPPD) and
+  `tc_pre_hi` @ `+0x04` (tWRPRE / tRAS / tRCD) — since x86 MMIO is
+  32-bit granular. These are **not** the `0x4000`/`0x4400` mirror window
+  (which returns `0xFFFFFFFF` on DDR4).
+- **The native MCL blocks** — `mcl0_tc_*` @ MCHBAR+`0xD000` and
+  `mcl1_tc_*` @ MCHBAR+`0xD800` (the Tier-3 uncore fallback). The
+  `mcl0_tc_*` / `mcl1_tc_*` names are the frozen contract the userspace
+  reader already reads (8 words each: `pre` / `act` / `act2` / `wtr` /
+  `rfp` / `rfp2` / `rdrd` / `wrwr`); on the 12th-gen+ family the MCL1
+  block shares its `0xD800` page with the gen-keyed MAD block, so the
+  overlapping words are the same raw registers (the userspace decode
+  disambiguates by generation).
+
+| Attribute | Source | Line format |
+|---|---|---|
+| `alk_d4_mc0_tc_pre_lo` | MCHBAR + `0xE000` + `0x00` | `0x%08x` |
+| `alk_d4_mc0_tc_pre_hi` | MCHBAR + `0xE000` + `0x04` | `0x%08x` |
+| `alk_d4_mc0_tc_act` | MCHBAR + `0xE000` + `0x08` | `0x%08x` |
+| `alk_d4_mc0_tc_rdrd` | MCHBAR + `0xE000` + `0x0C` | `0x%08x` |
+| `alk_d4_mc0_tc_rdwr` | MCHBAR + `0xE000` + `0x10` | `0x%08x` |
+| `alk_d4_mc0_tc_wrrd` | MCHBAR + `0xE000` + `0x14` | `0x%08x` |
+| `alk_d4_mc0_tc_wrwr` | MCHBAR + `0xE000` + `0x18` | `0x%08x` |
+| `alk_d4_mc0_tc_odt` | MCHBAR + `0xE000` + `0x70` | `0x%08x` |
+| `alk_d4_mc0_tc_rfp` | MCHBAR + `0xE000` + `0x438` | `0x%08x` |
+| `alk_d4_mc0_tc_rftp` | MCHBAR + `0xE000` + `0x43C` | `0x%08x` |
+| `alk_d4_mc1_tc_pre_lo` | MCHBAR + `0x1E000` + `0x00` | `0x%08x` |
+| `alk_d4_mc1_tc_pre_hi` | MCHBAR + `0x1E000` + `0x04` | `0x%08x` |
+| `alk_d4_mc1_tc_act` | MCHBAR + `0x1E000` + `0x08` | `0x%08x` |
+| `alk_d4_mc1_tc_rdrd` | MCHBAR + `0x1E000` + `0x0C` | `0x%08x` |
+| `alk_d4_mc1_tc_rdwr` | MCHBAR + `0x1E000` + `0x10` | `0x%08x` |
+| `alk_d4_mc1_tc_wrrd` | MCHBAR + `0x1E000` + `0x14` | `0x%08x` |
+| `alk_d4_mc1_tc_wrwr` | MCHBAR + `0x1E000` + `0x18` | `0x%08x` |
+| `alk_d4_mc1_tc_odt` | MCHBAR + `0x1E000` + `0x70` | `0x%08x` |
+| `alk_d4_mc1_tc_rfp` | MCHBAR + `0x1E000` + `0x438` | `0x%08x` |
+| `alk_d4_mc1_tc_rftp` | MCHBAR + `0x1E000` + `0x43C` | `0x%08x` |
+| `mcl0_tc_pre` | MCHBAR + `0xD000` + `0x00` | `0x%08x` |
+| `mcl0_tc_act` | MCHBAR + `0xD000` + `0x04` | `0x%08x` |
+| `mcl0_tc_act2` | MCHBAR + `0xD000` + `0x08` | `0x%08x` |
+| `mcl0_tc_wtr` | MCHBAR + `0xD000` + `0x10` | `0x%08x` |
+| `mcl0_tc_rfp` | MCHBAR + `0xD000` + `0x14` | `0x%08x` |
+| `mcl0_tc_rfp2` | MCHBAR + `0xD000` + `0x18` | `0x%08x` |
+| `mcl0_tc_rdrd` | MCHBAR + `0xD000` + `0x20` | `0x%08x` |
+| `mcl0_tc_wrwr` | MCHBAR + `0xD000` + `0x28` | `0x%08x` |
+| `mcl1_tc_pre` | MCHBAR + `0xD800` + `0x00` | `0x%08x` |
+| `mcl1_tc_act` | MCHBAR + `0xD800` + `0x04` | `0x%08x` |
+| `mcl1_tc_act2` | MCHBAR + `0xD800` + `0x08` | `0x%08x` |
+| `mcl1_tc_wtr` | MCHBAR + `0xD800` + `0x10` | `0x%08x` |
+| `mcl1_tc_rfp` | MCHBAR + `0xD800` + `0x14` | `0x%08x` |
+| `mcl1_tc_rfp2` | MCHBAR + `0xD800` + `0x18` | `0x%08x` |
+| `mcl1_tc_rdrd` | MCHBAR + `0xD800` + `0x20` | `0x%08x` |
+| `mcl1_tc_wrwr` | MCHBAR + `0xD800` + `0x28` | `0x%08x` |
+
 ## Tier 1 / 2 / 3 (and the honest gap)
 
 The module is generation-agnostic; tier logic lives in userspace
@@ -157,15 +229,18 @@ The module is generation-agnostic; tier logic lives in userspace
 - **Tier 3** = Alder / Raptor / Meteor / Arrow (256 KiB, DDR5 4-subchannel,
   MCL fallback, Gear4)
 
-**Honest gap:** the module exposes only the Tier-1-shaped surface (the two
-`0x4000/0x4400` channel blocks). It does **NOT** expose the Tier-3 ch2/ch3
-mirror blocks (`0x4800/0x4C00`), the native MCL blocks (`0xD000/0xD800`), or
-`mad_dimm_ch2/3` (`0x5060/0x5064`); userspace defines those extra attributes
-and degrades them to `None` when absent. So on a Tier-3 host a loaded module
-yields **LESS** decode coverage than no module (the DDR5 4-subchannel +
-MCL-fallback path exists only via the `/dev/mem` 256 KiB path). The module
-*does* map the full 256 KiB window on a 12th-gen+ host (gen-keyed, step 5)
-— it simply exposes the Tier-1-shaped attribute set over it.
+**Honest gap:** on a pre-12th-gen host the module exposes the Tier-1-shaped
+surface (the two `0x4000/0x4400` channel blocks) over the 64 KiB window. On
+a 12th-gen+ host it *also* exposes the native MCL blocks
+(`0xD000/0xD800` — `mcl0_tc_*` / `mcl1_tc_*`) and the Alder Lake DDR4 TC
+blocks (`0xE000`/`0x1E000` — `alk_d4_mc0/1_tc_*`; see "The Alder Lake DDR4
+attributes"), so a DDR4 Tier-3 host (e.g. an i5-12600KF) gets full timing
+decode from the module. It does **NOT** expose the Tier-3 ch2/ch3 mirror
+blocks (`0x4800/0x4C00`) or `mad_dimm_ch2/3` (`0x5060/0x5064`); userspace
+defines those extra attributes and degrades them to `None` when absent — so
+a DDR5 4-subchannel host's mirror-window decode still exists only via the
+`/dev/mem` 256 KiB path. The module maps the full 256 KiB window on a
+12th-gen+ host (gen-keyed, step 5).
 
 ## Building + installing (DKMS)
 
