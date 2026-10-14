@@ -97,6 +97,21 @@ const DEV_FMEM: &str = "/dev/fmem";
 /// Privilege hint carried by [`TelemetryError::InsufficientPrivilege`].
 const PRIV_HINT_DEVMEM: &str = "map /dev/mem read-only requires CAP_SYS_RAWIO or root";
 
+/// Known hypervisor / virtualization DMI system-vendor strings (M-20).
+/// Matched as a case-insensitive substring of the DMI `sys_vendor`
+/// (`/sys/class/dmi/id/sys_vendor`). A zero MCHBAR base on a host whose
+/// vendor matches one of these is a virtualized guest (the MCHBAR is not
+/// exposed to the guest), not a genuinely unsupported platform.
+const HYPERVISOR_VENDORS: &[&str] = &[
+    "innotek gmbh", // VirtualBox
+    "qemu",         // QEMU/KVM
+    "microsoft",    // Hyper-V
+    "vmware",       // VMware
+    "google",       // GCE
+    "amazon ec2",   // AWS
+    "alibaba",      // Alibaba Cloud
+];
+
 /// Size of the MCHBAR MMIO window mapped read-only for Tier 1/2
 /// (64 KiB).
 ///
@@ -379,6 +394,29 @@ fn check_read_bounds(offset: usize, len: usize) -> Result<(), TelemetryError> {
     Ok(())
 }
 
+/// The MCHBAR `base == 0` error detail (M-20): a known hypervisor vendor
+/// (the DMI `sys_vendor`) yields the specific "virtualized host" message
+/// (the MCHBAR is not exposed to the guest); anything else keeps the
+/// generic "unsupported platform" message. Pure (no I/O) so it is
+/// unit-testable.
+fn mchbar_zero_detail(sys_vendor: Option<&str>) -> String {
+    match sys_vendor.and_then(|vendor| {
+        let lowered = vendor.to_ascii_lowercase();
+        HYPERVISOR_VENDORS
+            .iter()
+            .find(|key| lowered.contains(*key))
+            .map(|_| vendor)
+    }) {
+        Some(vendor) => format!(
+            "Intel host bridge with unpopulated MCHBAR (virtualized host ({}): MCHBAR not exposed to guest)",
+            vendor
+        ),
+        None => {
+            "Intel host bridge with unpopulated MCHBAR (BAR5=0, unsupported platform)".to_owned()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Linux acquisition (config space -> /dev/mem map). Non-Linux targets
 // compile `acquire()` to the platform error above and exclude this whole
@@ -391,8 +429,10 @@ fn acquire_linux(vendor: CpuVendor) -> TelemetryResult<MchBar> {
     let raw = decode_bar5(&config)?;
     let base = mchbar_base(raw);
     if base == 0 {
+        // M-20: a zero base on a known hypervisor guest is "virtualized"
+        // (the MCHBAR is not exposed to the guest), not merely "unsupported".
         return Err(TelemetryError::UnsupportedHardware {
-            vendor: "Intel host bridge with unpopulated MCHBAR (BAR5=0, virtualized or unsupported)".to_owned(),
+            vendor: mchbar_zero_detail(read_dmi_sys_vendor().as_deref()),
         });
     }
     // The window size is profile-driven (IG-25): 256 KiB for the
@@ -408,6 +448,20 @@ fn acquire_linux(vendor: CpuVendor) -> TelemetryResult<MchBar> {
         region,
         len: length,
     })
+}
+
+/// The DMI system vendor for the running host (the `sys_vendor` file,
+/// M-20), or `None` when absent / unreadable (a guest may not export it;
+/// no panic).
+#[cfg(target_os = "linux")]
+fn read_dmi_sys_vendor() -> Option<String> {
+    let text = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor").ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
 
 /// Read the host-bridge PCI config-space image from sysfs.
@@ -660,6 +714,39 @@ mod tests {
         assert_eq!(mchbar_base(0x0000_0000_0000_F000), 0x0000_0000_0000_F000);
         assert_eq!(mchbar_base(0x2), 0x0);
         assert_eq!(mchbar_base(0x0), 0x0);
+    }
+
+    /// (M-20) The `base == 0` error detail: a known hypervisor vendor
+    /// (the DMI `sys_vendor`) yields the specific "virtualized host" message
+    /// naming the vendor; a non-hypervisor vendor or no vendor keeps the
+    /// generic "unsupported platform" message. Matching is case-insensitive.
+    #[test]
+    fn mchbar_zero_detail_detects_hypervisors() {
+        // Known hypervisor vendors -> the specific virtualized-host message,
+        // naming the vendor verbatim.
+        for vendor in [
+            "QEMU",
+            "innotek gmbh",
+            "Microsoft Corporation",
+            "VMware, Inc.",
+            "Google",
+            "Amazon EC2",
+            "Alibaba Cloud",
+        ] {
+            let detail = mchbar_zero_detail(Some(vendor));
+            assert!(
+                detail.contains("virtualized host"),
+                "{vendor:?} should be detected as virtualized: {detail}"
+            );
+            assert!(detail.contains(vendor), "the vendor should be named: {detail}");
+        }
+        // A non-hypervisor vendor -> the generic unsupported-platform message.
+        let detail = mchbar_zero_detail(Some("Intel"));
+        assert!(detail.contains("unsupported platform"), "{detail}");
+        assert!(!detail.contains("virtualized host"), "{detail}");
+        // No vendor (absent / unreadable `sys_vendor`) -> the generic message.
+        let detail = mchbar_zero_detail(None);
+        assert!(detail.contains("unsupported platform"), "{detail}");
     }
 
     /// (d) The pure Intel vendor gate: non-Intel vendors (AMD / unknown)
