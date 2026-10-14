@@ -16,6 +16,14 @@
 //! mirror and uncore-MCL bases, and the widened DDR5 timing bitfield
 //! constants ([`ALDER_FIELDS`]).
 //!
+//! Phase 1 (Intel MC fix) adds the **Alder/Raptor Lake DDR4** register
+//! map: the two per-controller channel descriptors ([`ALDER_DDR4_CHANNELS`])
+//! whose TC register blocks live at `MCHBAR + 0xE000` / `0x1E000` (NOT the
+//! legacy `0x4000` mirror window Tier 1 uses), and the DDR4 timing
+//! bitfield constants ([`ALDER_DDR4_FIELDS`]). DDR4 Alder Lake is 2 memory
+//! controllers × 1 channel each (no subchannels), distinct from both the
+//! Tier-1 (Skylake) and the DDR5 ([`ALDER_FIELDS`]) layouts.
+//!
 //! The `mchbar_mask` values here are **diagnostic-only** for the
 //! dispatcher (OQ-8): they document the alignment contract each profile
 //! decodes against and do NOT alter the merged kernel module's ioremap
@@ -316,6 +324,181 @@ pub const ALDER_FIELDS: AlderFields = AlderFields {
     twrwr_sg: (5, 0),
     twrwr_dg: (11, 6),
 };
+
+// ---------------------------------------------------------------------
+// Phase 1 (Intel MC fix): the Alder/Raptor Lake DDR4 register map
+// ---------------------------------------------------------------------
+
+/// The Alder/Raptor Lake **DDR4** timing bitfields (Phase 1a).
+///
+/// Transcribed from the Intel 12th Gen Core Datasheet Vol 2
+/// (doc 710723-003), §3.2.66–3.2.87. DDR4 Alder Lake is 2 memory
+/// controllers × 1 channel each (no subchannels). The TC register block
+/// is at `MCHBAR + 0xE000` (MC0) / `MCHBAR + 0x1E000` (MC1) — **not** the
+/// legacy `0x4000` mirror window the Tier-1 map reads (which returns
+/// `0xFFFFFFFF` on DDR4 Alder Lake).
+///
+/// `TC_PRE` is a **64-bit** register: its `[58:51]`-class fields (tRCD /
+/// tRAS / tWRPRE) exceed a single 32-bit word, so the decode reads it as
+/// two 32-bit words — a low word (`[31:0]`, `+0x00`) and a high word
+/// (`[63:32]`, `+0x04`). The table records the full 64-bit `[hi:lo]`
+/// positions; a field is in the high word when `lo >= 32` (word-relative
+/// position `[hi-32 : lo-32]`), else in the low word at `[hi:lo]`.
+/// Every other `TC_*` register here is a plain 32-bit word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlderDdr4Fields {
+    // `TC_PRE` @ +0xE000 (64-bit; high word @ +0x04, low word @ +0x00).
+    /// tRCD — ACT→CAS same bank, [58:51] (high word [26:19]).
+    pub trcd: BitRange,
+    /// tRAS — ACT→PRE same bank, [50:42] (high word [18:10]).
+    pub tras: BitRange,
+    /// tWRPRE — WR→PRE same bank, [41:32] (high word [9:0]).
+    pub twrpre: BitRange,
+    /// tPPD — PRE→PRE same rank, [23:20] (low word).
+    pub tppd: BitRange,
+    /// tRDPRE — RD→PRE same bank, [19:13] (low word).
+    pub trdpre: BitRange,
+    /// tRP — PRE→ACT same bank, [7:0] (low word).
+    pub trp: BitRange,
+    // `TC_ACT` @ +0xE008 (32-bit).
+    /// tRRD_DG — ACT→ACT diff bank group, [21:15].
+    pub trrd_dg: BitRange,
+    /// tRRD_SG — ACT→ACT same bank group (tRRD_L for DDR4), [14:9].
+    pub trrd_sg: BitRange,
+    /// tFAW — four-activate window, [8:0].
+    pub tfaw: BitRange,
+    // `TC_RDRD` @ +0xE00C (32-bit).
+    /// tRDRD_DD — RD→RD other DIMM, [31:24].
+    pub rdrd_dd: BitRange,
+    /// tRDRD_DR — RD→RD other rank, [23:16].
+    pub rdrd_dr: BitRange,
+    /// tRDRD_DG — RD→RD diff bank group, [14:8].
+    pub rdrd_dg: BitRange,
+    /// tRDRD_SG — RD→RD same bank group, [6:0].
+    pub rdrd_sg: BitRange,
+    // `TC_RDWR` @ +0xE010 (32-bit).
+    /// tRDWR_DD — RD→WR other DIMM, [31:24].
+    pub rdwr_dd: BitRange,
+    /// tRDWR_DR — RD→WR other rank, [23:16].
+    pub rdwr_dr: BitRange,
+    /// tRDWR_DG — RD→WR diff bank group, [15:8].
+    pub rdwr_dg: BitRange,
+    /// tRDWR_SG — RD→WR same bank group, [7:0].
+    pub rdwr_sg: BitRange,
+    // `TC_WRRD` @ +0xE014 (32-bit).
+    /// tWRRD_DD — WR→RD other DIMM, [31:25].
+    pub wrrd_dd: BitRange,
+    /// tWRRD_DR — WR→RD other rank, [24:18].
+    pub wrrd_dr: BitRange,
+    /// tWRRD_DG — WR→RD diff bank group, [17:9].
+    pub wrrd_dg: BitRange,
+    /// tWRRD_SG — WR→RD same bank group, [8:0].
+    pub wrrd_sg: BitRange,
+    // `TC_WRWR` @ +0xE018 (32-bit).
+    /// tWRWR_DD — WR→WR other DIMM, [31:24].
+    pub wrwr_dd: BitRange,
+    /// tWRWR_DR — WR→WR other rank, [22:16].
+    pub wrwr_dr: BitRange,
+    /// tWRWR_DG — WR→WR diff bank group, [14:8].
+    pub wrwr_dg: BitRange,
+    /// tWRWR_SG — WR→WR same bank group, [6:0].
+    pub wrwr_sg: BitRange,
+    // `TC_ODT` @ +0xE070 (32-bit).
+    /// tCWL — WR command→data, [31:24].
+    pub tcwl: BitRange,
+    /// tCL — RD command→data, [22:16].
+    pub tcl: BitRange,
+    // `TC_RFP` @ +0xE438 (32-bit).
+    /// tREFI×9 (1024-DCLK units), [31:24].
+    pub trefi9: BitRange,
+    /// OREF_RI — rank-idle period (DCLK), [7:0].
+    pub oref_ri: BitRange,
+    // `TC_RFTP` @ +0xE43C (32-bit).
+    /// tRFC — refresh time, [30:18].
+    pub trfc: BitRange,
+    /// tREFI — average refresh interval (tCK), [17:0].
+    pub trefi: BitRange,
+}
+
+/// The Alder/Raptor Lake **DDR4** timing field table (Phase 1a), per the
+/// Intel 12th Gen Core Datasheet Vol 2 §3.2.66–3.2.87.
+pub const ALDER_DDR4_FIELDS: AlderDdr4Fields = AlderDdr4Fields {
+    // TC_PRE @ +0xE000 (64-bit).
+    trcd: (58, 51),
+    tras: (50, 42),
+    twrpre: (41, 32),
+    tppd: (23, 20),
+    trdpre: (19, 13),
+    trp: (7, 0),
+    // TC_ACT @ +0xE008 (32-bit).
+    trrd_dg: (21, 15),
+    trrd_sg: (14, 9),
+    tfaw: (8, 0),
+    // TC_RDRD @ +0xE00C (32-bit).
+    rdrd_dd: (31, 24),
+    rdrd_dr: (23, 16),
+    rdrd_dg: (14, 8),
+    rdrd_sg: (6, 0),
+    // TC_RDWR @ +0xE010 (32-bit).
+    rdwr_dd: (31, 24),
+    rdwr_dr: (23, 16),
+    rdwr_dg: (15, 8),
+    rdwr_sg: (7, 0),
+    // TC_WRRD @ +0xE014 (32-bit).
+    wrrd_dd: (31, 25),
+    wrrd_dr: (24, 18),
+    wrrd_dg: (17, 9),
+    wrrd_sg: (8, 0),
+    // TC_WRWR @ +0xE018 (32-bit).
+    wrwr_dd: (31, 24),
+    wrwr_dr: (22, 16),
+    wrwr_dg: (14, 8),
+    wrwr_sg: (6, 0),
+    // TC_ODT @ +0xE070 (32-bit).
+    tcwl: (31, 24),
+    tcl: (22, 16),
+    // TC_RFP @ +0xE438 (32-bit).
+    trefi9: (31, 24),
+    oref_ri: (7, 0),
+    // TC_RFTP @ +0xE43C (32-bit).
+    trfc: (30, 18),
+    trefi: (17, 0),
+};
+
+/// An Alder/Raptor Lake **DDR4** channel descriptor (Phase 1b): one 64-bit
+/// channel per memory controller (2 MCs total, no subchannels).
+///
+/// The TC register block is at `tc_base` from MCHBAR; the MCL register
+/// block at `mcl_base`. MC1 is MC0's block offset by the inter-controller
+/// stride `0x10000` (the DDR4 TC block: `0xE000 + 0x10000 = 0x1E000`; the
+/// MCL block: `0xD000 + 0x800 = 0xD800`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlderDdr4ChannelMap {
+    /// The TC register block base offset from MCHBAR (MC0 @ `0xE000`,
+    /// MC1 @ `0x1E000`).
+    pub tc_base: u32,
+    /// The MCL register block base offset from MCHBAR (MC0 @ `0xD000`,
+    /// MC1 @ `0xD800`).
+    pub mcl_base: u32,
+}
+
+/// MC0 DDR4 channel: TC block @ `0xE000`, MCL block @ `0xD000`.
+pub const ALDER_DDR4_MC0: AlderDdr4ChannelMap = AlderDdr4ChannelMap {
+    tc_base: 0xE000,
+    mcl_base: 0xD000,
+};
+
+/// MC1 DDR4 channel: TC block @ `0x1E000` (`0xE000 + 0x10000`), MCL block
+/// @ `0xD800`.
+pub const ALDER_DDR4_MC1: AlderDdr4ChannelMap = AlderDdr4ChannelMap {
+    tc_base: 0x1E000,
+    mcl_base: 0xD800,
+};
+
+/// The two Alder/Raptor Lake **DDR4** channel descriptors in controller
+/// order (MC0, MC1) — 2 channels, no subchannels (Phase 1b).
+pub static ALDER_DDR4_CHANNELS: &[AlderDdr4ChannelMap] = &[ALDER_DDR4_MC0, ALDER_DDR4_MC1];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +680,113 @@ mod tests {
         assert_eq!(ranges.len(), 22);
         for (hi, lo) in ranges {
             assert!(lo <= hi && hi <= 31, "malformed range ({hi}, {lo})");
+        }
+    }
+
+    /// The two Alder Lake DDR4 channel descriptors pin the per-controller
+    /// TC block bases (`0xE000` MC0, `0x1E000` MC1 = `0xE000 + 0x10000`)
+    /// and the MCL block bases (`0xD000` / `0xD800`) — 2 channels, no
+    /// subchannels (Phase 1b).
+    #[test]
+    fn alder_ddr4_channels_pin_mc_bases() {
+        assert_eq!(ALDER_DDR4_CHANNELS.len(), 2, "DDR4 Alder Lake = 2 MCs");
+        let expected: [(u32, u32); 2] = [
+            (0xE000, 0xD000), // MC0
+            (0x1E000, 0xD800), // MC1 (0xE000 + 0x10000)
+        ];
+        for (i, ch) in ALDER_DDR4_CHANNELS.iter().enumerate() {
+            assert_eq!(ch.tc_base, expected[i].0, "MC{i} tc_base");
+            assert_eq!(ch.mcl_base, expected[i].1, "MC{i} mcl_base");
+        }
+        // The inter-MC stride is 0x10000 for the TC block.
+        assert_eq!(
+            ALDER_DDR4_CHANNELS[1].tc_base - ALDER_DDR4_CHANNELS[0].tc_base,
+            0x10000,
+        );
+    }
+
+    /// The Alder Lake DDR4 timing fields pin the exact `(hi, lo)` ranges
+    /// of the Intel 12th Gen Datasheet Vol 2 §3.2.66–3.2.87 table,
+    /// grouped by their TC register (Phase 1a). `TC_PRE` is the 64-bit
+    /// register (high-word fields reach bit 58); every other register is
+    /// 32-bit.
+    #[test]
+    fn alder_ddr4_fields_match_datasheet() {
+        let f = ALDER_DDR4_FIELDS;
+        // TC_PRE @ +0xE000 (64-bit).
+        assert_eq!(f.trcd, (58, 51));
+        assert_eq!(f.tras, (50, 42));
+        assert_eq!(f.twrpre, (41, 32));
+        assert_eq!(f.tppd, (23, 20));
+        assert_eq!(f.trdpre, (19, 13));
+        assert_eq!(f.trp, (7, 0));
+        // TC_ACT @ +0xE008 (32-bit).
+        assert_eq!(f.trrd_dg, (21, 15));
+        assert_eq!(f.trrd_sg, (14, 9));
+        assert_eq!(f.tfaw, (8, 0));
+        // TC_RDRD @ +0xE00C (32-bit).
+        assert_eq!(f.rdrd_dd, (31, 24));
+        assert_eq!(f.rdrd_dr, (23, 16));
+        assert_eq!(f.rdrd_dg, (14, 8));
+        assert_eq!(f.rdrd_sg, (6, 0));
+        // TC_RDWR @ +0xE010 (32-bit).
+        assert_eq!(f.rdwr_dd, (31, 24));
+        assert_eq!(f.rdwr_dr, (23, 16));
+        assert_eq!(f.rdwr_dg, (15, 8));
+        assert_eq!(f.rdwr_sg, (7, 0));
+        // TC_WRRD @ +0xE014 (32-bit).
+        assert_eq!(f.wrrd_dd, (31, 25));
+        assert_eq!(f.wrrd_dr, (24, 18));
+        assert_eq!(f.wrrd_dg, (17, 9));
+        assert_eq!(f.wrrd_sg, (8, 0));
+        // TC_WRWR @ +0xE018 (32-bit).
+        assert_eq!(f.wrwr_dd, (31, 24));
+        assert_eq!(f.wrwr_dr, (22, 16));
+        assert_eq!(f.wrwr_dg, (14, 8));
+        assert_eq!(f.wrwr_sg, (6, 0));
+        // TC_ODT @ +0xE070 (32-bit).
+        assert_eq!(f.tcwl, (31, 24));
+        assert_eq!(f.tcl, (22, 16));
+        // TC_RFP @ +0xE438 (32-bit).
+        assert_eq!(f.trefi9, (31, 24));
+        assert_eq!(f.oref_ri, (7, 0));
+        // TC_RFTP @ +0xE43C (32-bit).
+        assert_eq!(f.trfc, (30, 18));
+        assert_eq!(f.trefi, (17, 0));
+
+        // Every range is well-formed: lo <= hi. The 64-bit TC_PRE fields
+        // may reach bit 63; the 32-bit register fields stay <= 31.
+        let all = [
+            f.trcd, f.tras, f.twrpre, f.tppd, f.trdpre, f.trp, f.trrd_dg,
+            f.trrd_sg, f.tfaw, f.rdrd_dd, f.rdrd_dr, f.rdrd_dg, f.rdrd_sg,
+            f.rdwr_dd, f.rdwr_dr, f.rdwr_dg, f.rdwr_sg, f.wrrd_dd,
+            f.wrrd_dr, f.wrrd_dg, f.wrrd_sg, f.wrwr_dd, f.wrwr_dr,
+            f.wrwr_dg, f.wrwr_sg, f.tcwl, f.tcl, f.trefi9, f.oref_ri,
+            f.trfc, f.trefi,
+        ];
+        assert_eq!(all.len(), 31);
+        for (hi, lo) in all {
+            assert!(lo <= hi, "malformed range ({hi}, {lo})");
+            assert!(hi <= 63, "range exceeds 64-bit space ({hi}, {lo})");
+        }
+        // The 32-bit registers never exceed bit 31.
+        let thirty_two_bit = [
+            f.tppd, f.trdpre, f.trp, f.trrd_dg, f.trrd_sg, f.tfaw, f.rdrd_dd,
+            f.rdrd_dr, f.rdrd_dg, f.rdrd_sg, f.rdwr_dd, f.rdwr_dr, f.rdwr_dg,
+            f.rdwr_sg, f.wrrd_dd, f.wrrd_dr, f.wrrd_dg, f.wrrd_sg, f.wrwr_dd,
+            f.wrwr_dr, f.wrwr_dg, f.wrwr_sg, f.tcwl, f.tcl, f.trefi9,
+            f.oref_ri, f.trfc, f.trefi,
+        ];
+        for (hi, lo) in thirty_two_bit {
+            assert!(hi <= 31, "32-bit field exceeds word ({hi}, {lo})");
+        }
+        // The high-word TC_PRE fields sit in [32, 63]; the low-word in
+        // [0, 31].
+        for (hi, lo) in [f.trcd, f.tras, f.twrpre] {
+            assert!(lo >= 32 && hi <= 63, "high-word field ({hi}, {lo})");
+        }
+        for (hi, lo) in [f.tppd, f.trdpre, f.trp] {
+            assert!(hi <= 31, "low-word field ({hi}, {lo})");
         }
     }
 }

@@ -364,6 +364,12 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
             mcl1,
             mad_dimm_ch2,
             mad_dimm_ch3,
+            // Phase 1d: the Alder Lake DDR4 TC blocks (`0xE000`/`0x1E000`)
+            // are populated from the kernel module's new sysfs attributes;
+            // until then they default to all-`None` (the DDR4 decode
+            // degrades its timings to `Na(ParseError)` on the sysfs path,
+            // while the `/dev/mem` `from_bar_wide` path reads them directly).
+            ..IntelImcRegs::default()
         },
         mchbar,
         mad_inter_channel,
