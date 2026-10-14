@@ -261,15 +261,28 @@ impl Drop for MchBar {
 ///   MCHBAR (MCHBAR_EN=0) that nonetheless carries address bits.
 /// - [`TelemetryError::Io`] — any other raw I/O failure.
 pub fn acquire() -> TelemetryResult<MchBar> {
+    // L-9: the no-arg convenience wrapper (standalone use) detects the CPU
+    // internally; the facade uses [`acquire_for`] to thread its single
+    // per-snapshot detect result through (no redundant re-detect).
+    acquire_for(CpuInfo::detect().vendor)
+}
+
+/// Acquire the read-only MCHBAR mapping for an already-detected vendor
+/// (L-9): the facade threads its single per-snapshot `CpuInfo::detect()`
+/// result through, so the `/dev/mem` path does not re-detect the CPU.
+///
+/// # Errors
+///
+/// As [`acquire`] (the vendor gate runs on the supplied `vendor`).
+pub fn acquire_for(vendor: CpuVendor) -> TelemetryResult<MchBar> {
     // 1. Vendor gate: pure, so non-Intel hardware is rejected before any
     //    file or device access (plan §D4 hard gate).
-    let info = CpuInfo::detect();
-    intel_vendor_gate(info.vendor)?;
+    intel_vendor_gate(vendor)?;
 
     // 2. Platform gate: the devmem map is Linux-only.
     #[cfg(target_os = "linux")]
     {
-        acquire_linux(info.vendor)
+        acquire_linux(vendor)
     }
     #[cfg(not(target_os = "linux"))]
     {

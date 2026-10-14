@@ -11,6 +11,8 @@
 //! adds the Tier-3 `Alder` family entries (Alder/Raptor Lake at the
 //! DDR4-default 2-channel count, Meteor/Arrow Lake at the DDR5
 //! 2-channel count — C-4: both are dual-channel, not 4-channel). The
+//! The client Haswell / Broadwell `IntelGen` variants (L-8) resolve to
+//! the shared Tier-1 profile (the same 64 KiB register map). The
 //! server-uncore `GenMap::Server` line (Haswell-E / Broadwell-E /
 //! Skylake-X / Cascade Lake / Sapphire Rapids — H-9) carries the
 //! no-MMIO profiles (4 / 6 / 8 channels). IG-20 adds the
@@ -105,9 +107,10 @@ pub enum GenMap {
 /// through [`profile_for`] and never mutated at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenProfile {
-    /// The MCHBAR register window size in bytes the profile's register
-    /// table is compile-checked against (Tier 1/Rocket: 64 KiB; the
-    /// Alder family: 256 KiB).
+    /// Minimum mapped window size covering this profile's register table
+    /// (Tier 1/Rocket: 64 KiB; the Alder family: 256 KiB). NOT a claim
+    /// about the actual hardware BAR size (which may be larger). The
+    /// runtime mapper in `intel_mchbar.rs` uses its own mask.
     pub window_size: usize,
     /// The MCHBAR base-address alignment mask (diagnostic-only, OQ-8).
     pub mchbar_mask: u64,
@@ -227,12 +230,17 @@ const SERVER_8CH: GenProfile = GenProfile {
 /// its family gains a profile entry in a later chunk.
 pub fn profile_for(gen: IntelGen) -> Option<&'static GenProfile> {
     match gen {
+        // The client Haswell / Broadwell (L-8) share the identical 64 KiB
+        // Tier-1 register map — the same profile as the rest of the
+        // pre-8th / 6th-gen line.
         IntelGen::Skylake
         | IntelGen::KabyLake
         | IntelGen::CoffeeLake
         | IntelGen::CometLake
         | IntelGen::IceLake
-        | IntelGen::TigerLake => Some(&TIER1),
+        | IntelGen::TigerLake
+        | IntelGen::Haswell
+        | IntelGen::Broadwell => Some(&TIER1),
         IntelGen::RocketLake => Some(&ROCKET),
         IntelGen::AlderLake | IntelGen::RaptorLake => Some(&ALDER_2CH),
         IntelGen::MeteorLake | IntelGen::ArrowLake => Some(&ALDER_DDR5),
@@ -601,10 +609,10 @@ pub static ALDER_DDR4_CHANNELS: &[AlderDdr4ChannelMap] = &[ALDER_DDR4_MC0, ALDER
 mod tests {
     use super::*;
 
-    /// The six Tier-1 generations (the original four plus Ice Lake /
-    /// Tiger Lake — H-1) all resolve to the shared Tier-1 profile with
-    /// the exact IG-01 values (64 KiB window, diagnostic mask,
-    /// 2 channels, no gear, Tier-1 map).
+    /// The Tier-1 generations (the original four plus Ice Lake /
+    /// Tiger Lake — H-1, and the client Haswell / Broadwell — L-8) all
+    /// resolve to the shared Tier-1 profile with the exact IG-01 values
+    /// (64 KiB window, diagnostic mask, 2 channels, no gear, Tier-1 map).
     #[test]
     fn tier1_generations_resolve_to_shared_profile() {
         for gen in [
@@ -614,6 +622,8 @@ mod tests {
             IntelGen::CometLake,
             IntelGen::IceLake,
             IntelGen::TigerLake,
+            IntelGen::Haswell,
+            IntelGen::Broadwell,
         ] {
             let p = profile_for(gen)
                 .unwrap_or_else(|| panic!("{gen:?} must resolve to the Tier-1 profile"));

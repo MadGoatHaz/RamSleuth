@@ -1,7 +1,7 @@
 //! Intel IMC raw reader — the `ramsleuth_intel` sysfs kobject (INTEL-03).
 //!
 //! This module is the **primary raw acquisition** path of the Intel
-//! branch (plan §3.5): it reads the core 19 raw IMC register attributes
+//! branch (plan §3.5): it reads the raw IMC register attributes
 //! published by the `ramsleuth_intel` kernel module (INTEL-05) under
 //! `/sys/kernel/ramsleuth_intel/` and assembles them into the raw
 //! register set [`IntelImcRegs`] that the pure decode core
@@ -10,34 +10,31 @@
 //! map, so both producers feed one decode (plan §3.5: module-first,
 //! devmem-fallback, single decode core).
 //!
-//! 24-attr module builds additionally expose 5 **global** MAD
-//! channel/geometry attributes: `mad_inter_channel` and
-//! `mad_dimm_ch0/1` are decode inputs (the facade passes them alongside
-//! the register set to [`crate::intel_readout::decode`] — the
-//! channel-mode population cross-check), while `mad_intra_ch0/1` ride as
-//! raw `Option<u32>` siblings on [`SysfsRegs`] (no decode consumes
-//! them). On a pre-24-attr build (19 attrs) those files are absent and
-//! the 5 fields simply read `None` — graceful degradation, not an
-//! error; the core 19 keep their existing semantics.
+//! **The v2.4.16 attribute surface (L-18).** On a 12th-gen+ (Alder /
+//! Raptor Lake DDR4) module build the kobject exposes **79** attributes:
+//! the **25 core** (the `mchbar_base` / `mchbar_enabled` diagnostics,
+//! `mcbios_req`, the two Tier-1 `ch0_tc_*` / `ch1_tc_*` mirror blocks
+//! (8 words each), the five `mad_*` channel/geometry raws, and
+//! `capid0a`), the **36 `alk_d4`** (the two per-MC `alk_d4_mc{0,1}_tc_*`
+//! DDR4 TC blocks (10 words each, the 64-bit `TC_PRE` split lo/hi) + the
+//! two native `mcl{0,1}_tc_*` blocks (8 words each)), and the **18
+//! Tier-3 `ch2`/`ch3`/`mad_dimm`** (the two `ch2_tc_*` / `ch3_tc_*`
+//! mirror blocks (8 words each) + the `mad_dimm_ch2` / `mad_dimm_ch3`
+//! raws). Each [`read_u32_attr`] degrades independently to `None`
+//! (per-register containment): on a smaller / older module build any
+//! absent attribute simply reads `None`, never an error — the core 25
+//! always exist; the other 54 ride the gen-gated groups.
 //!
-//! The Tier-3 (Alder/Raptor) extension attributes — the `ch2_tc_*` /
-//! `ch3_tc_*` mirror blocks (8 each), the `mcl0_tc_*` / `mcl1_tc_*`
-//! native-MCL blocks (8 each), and the Alder/DDR5 `mad_dimm_ch2` /
-//! `mad_dimm_ch3` raws — populate the IG-22 [`IntelImcRegs`] extension
-//! fields; `mad_dimm_ch2/3` also ride as raw [`SysfsRegs`] siblings. On
-//! a 64 KiB module build (24 attrs or fewer) those files are absent and
-//! every Tier-3 field simply reads `None` — the same graceful
-//! containment as the 5 MAD attributes, never an error.
+//! **Read cost (L-17).** Each telemetry cycle issues **79 sequential
+//! open/read/close operations** on sysfs files. At the standard 1 Hz
+//! telemetry rate this is <1 ms total. No caching is performed (data
+//! must always be fresh). For high-rate applications, a combined-blob
+//! kernel attribute or parallel I/O would reduce the overhead.
 //!
-//! The Phase 1d Alder Lake **DDR4** TC attributes — the two per-MC
-//! `alk_d4_mc0_tc_*` / `alk_d4_mc1_tc_*` blocks (10 words each, the
-//! 64-bit `TC_PRE` split into `tc_pre_lo` / `tc_pre_hi`) — populate the
-//! [`IntelImcRegs::alk_d4_tc0`] / [`IntelImcRegs::alk_d4_tc1`] fields the
-//! DDR4 decode in [`crate::intel_readout`] consumes. These ride in the
-//! kernel module's gen-gated `alk_d4_group` (created only on 12th-gen+
-//! hosts); on a pre-12th-gen host the files are absent and both TC
-//! blocks read all-`None` — the same graceful containment as the Tier-3
-//! fields, never an error.
+//! The `mad_inter_channel` / `mad_dimm_ch0/1` raws are decode inputs
+//! (the channel-mode population cross-check) carried on [`IntelImcRegs`]
+//! itself; `mad_intra_ch0/1` ride as raw [`SysfsRegs`] siblings (no
+//! decode consumes them).
 //!
 //! # Design split (mirrors the AMD branch)
 //!
@@ -61,10 +58,10 @@
 //!    [`TelemetryError::Parse`] (broken install). Unreadable →
 //!    [`TelemetryError::InsufficientPrivilege`]; any other I/O →
 //!    [`TelemetryError::Io`].
-//! 3. **Per-attribute containment:** each attribute (the core 19, the 5
-//!    global MAD attributes on 24-attr builds, and the Tier-3
-//!    `ch2_tc_*` / `ch3_tc_*` / `mcl0_tc_*` / `mcl1_tc_*` /
-//!    `mad_dimm_ch2/3` attributes on extended builds) is read
+//! 3. **Per-attribute containment:** each attribute (the 25 core, the
+//!    36 `alk_d4` DDR4 TC / MCL attributes, and the 18 Tier-3
+//!    `ch2_tc_*` / `ch3_tc_*` / `mad_dimm_ch2/3` attributes — 79 total on
+//!    a 12th-gen+ build) is read
 //!    independently. An **absent** attribute and a **malformed** payload
 //!    both degrade to `None` for that register only — the rest of the set
 //!    assembles normally, nothing panics, and one bad register never
@@ -141,37 +138,40 @@ pub struct MchBarInfo {
     pub enabled: Option<bool>,
 }
 
-/// Raw acquisition result from the `ramsleuth_intel` kobject: the 51-slot
-/// raw IMC register set for the decode core, the MCHBAR diagnostics as a
-/// sibling, the 5 global MAD channel/geometry registers (24-attr module
-/// builds: `mad_inter_channel` + `mad_dimm_ch0/1` as decode inputs
-/// passed alongside, `mad_intra_ch0/1` as raw siblings), and — the
-/// Tier-3 extension (IG-23) — the 2 Alder/DDR5 `mad_dimm_ch2` /
-/// `mad_dimm_ch3` raws as sibling copies of their decode-input fields.
+/// Raw acquisition result from the `ramsleuth_intel` kobject: the
+/// [`IntelImcRegs`] raw register set (74 `Option<u32>` slots — the decode
+/// inputs incl. the 5 MAD channel/geometry raws) for the decode core, the
+/// MCHBAR diagnostics as a sibling, `mad_intra_ch0/1` as raw siblings
+/// (no decode consumes them), and — the Tier-3 extension (IG-23) — the
+/// 2 Alder/DDR5 `mad_dimm_ch2` / `mad_dimm_ch3` raws as sibling copies of
+/// their decode-input fields.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SysfsRegs {
-    /// The raw register set (51 `Option<u32>` slots; `None` per register
+    /// The raw register set (74 `Option<u32>` slots; `None` per register
     /// on a contained absent/malformed read — incl. every Tier-3 field
     /// on a 64 KiB module build).
     pub regs: IntelImcRegs,
     /// MCHBAR diagnostics (`mchbar_base` / `mchbar_enabled`).
     pub mchbar: MchBarInfo,
     /// Channel mode / interleave config (raw `mad_inter_channel`).
-    /// `None` on a pre-24-attr module build (absent) or a malformed read.
+    /// `None` when the attribute is absent (a module build that does not
+    /// expose it) or a malformed read.
     pub mad_inter_channel: Option<u32>,
-    /// Channel 0 rank/geometry (raw `mad_intra_ch0`). `None` on a
-    /// pre-24-attr module build (absent) or a malformed read.
+    /// Channel 0 rank/geometry (raw `mad_intra_ch0`). `None` when the
+    /// attribute is absent or a malformed read.
     pub mad_intra_ch0: Option<u32>,
-    /// Channel 1 rank/geometry (raw `mad_intra_ch1`). `None` on a
-    /// pre-24-attr module build (absent) or a malformed read.
+    /// Channel 1 rank/geometry (raw `mad_intra_ch1`). `None` when the
+    /// attribute is absent or a malformed read.
     pub mad_intra_ch1: Option<u32>,
-    /// Channel 0 DIMM capacity (raw `mad_dimm_ch0`) — a decode input
-    /// for the channel-mode population cross-check. `None` on a
-    /// pre-24-attr module build (absent) or a malformed read.
+    /// Channel 0 DIMM capacity (raw `mad_dimm_ch0`) — a decode input for
+    /// the channel-mode population cross-check (carried on the register
+    /// set, L-10). `None` when the attribute is absent or a malformed
+    /// read.
     pub mad_dimm_ch0: Option<u32>,
-    /// Channel 1 DIMM capacity (raw `mad_dimm_ch1`) — a decode input
-    /// for the channel-mode population cross-check. `None` on a
-    /// pre-24-attr module build (absent) or a malformed read.
+    /// Channel 1 DIMM capacity (raw `mad_dimm_ch1`) — a decode input for
+    /// the channel-mode population cross-check (carried on the register
+    /// set, L-10). `None` when the attribute is absent or a malformed
+    /// read.
     pub mad_dimm_ch1: Option<u32>,
     /// Channel 2 DIMM capacity (raw `mad_dimm_ch2` — the Alder/DDR5
     /// subchannel-2 geometry). The same raw is also a decode input on
@@ -200,8 +200,9 @@ pub struct SysfsRegs {
 /// 2. the kobject gate ([`kobject_gate`]) — absent →
 ///    [`TelemetryError::DriverMissing`];
 /// 3. the per-attribute reads with per-register containment
-///    ([`read_from`]) — the core 19, the 5 global MAD attributes
-///    (graceful `None` on a pre-24-attr build), and the Tier-3
+    ///    ([`read_from`]) — the 25 core, the 36 `alk_d4` attributes
+    ///    (graceful `None` on a build that does not expose them), and the
+    ///    18 Tier-3
 ///    `ch2/ch3` / `mcl0/mcl1` / `mad_dimm_ch2/3` attributes
 ///    (graceful `None` on a 64 KiB module build).
 ///
@@ -222,7 +223,7 @@ pub fn acquire() -> TelemetryResult<SysfsRegs> {
     let info = CpuInfo::detect();
     vendor_gate(&info)?;
 
-    // 2. The kobject + the 19 attributes (per-register containment).
+    // 2. The kobject + the attribute set (per-register containment).
     read_from(Path::new(KOBJECT_DIR))
 }
 
@@ -256,13 +257,13 @@ fn vendor_string(info: &CpuInfo) -> String {
 }
 
 /// Read the raw attributes from a `ramsleuth_intel`-shaped kobject
-/// directory and assemble the [`SysfsRegs`] result: the core 19 (MCHBAR
-/// diagnostics + the 51-slot register set), the 5 global MAD attributes
-/// (absent on a pre-24-attr module build → `None`), and the Tier-3
-/// extension attributes — the `ch2_tc_*` / `ch3_tc_*` mirror blocks, the
-/// `mcl0_tc_*` / `mcl1_tc_*` native-MCL blocks, and the `mad_dimm_ch2` /
-/// `mad_dimm_ch3` raws — which are absent on a 64 KiB module build and
-/// then read `None` (graceful degradation, not an error; IG-23).
+/// directory and assemble the [`SysfsRegs`] result: the 25 core (MCHBAR
+/// diagnostics + the 74-slot register set), the 36 `alk_d4` DDR4 TC / MCL
+/// attributes, and the 18 Tier-3 extension attributes — the `ch2_tc_*` /
+/// `ch3_tc_*` mirror blocks, the `mcl0_tc_*` / `mcl1_tc_*` native-MCL
+/// blocks, and the `mad_dimm_ch2` / `mad_dimm_ch3` raws — which are
+/// absent on a smaller module build and then read `None` (graceful
+/// degradation, not an error; IG-23).
 ///
 /// The root is injectable (the public [`acquire`] passes
 /// [`KOBJECT_DIR`]); the fixture tests pass a temp directory.
@@ -302,7 +303,7 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
     // The Tier-3 channel-mirror blocks (the `0x4800` / `0x4C00` mirrors
     // of ch0/ch1; IG-22/IG-23): absent on a 64 KiB module build ->
     // all-`None` (graceful), with the same per-attribute containment as
-    // the core 19.
+    // the core 25.
     let ch2 = ChannelRegs {
         tc_dbp: read_u32_attr(root, "ch2_tc_dbp")?,
         tc_rap: read_u32_attr(root, "ch2_tc_rap")?,
@@ -355,7 +356,7 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
     // remaining eight registers are single 32-bit words. Absent on a
     // pre-12th-gen host (the module exposes no `alk_d4_mc*` attributes)
     // -> all-`None` (graceful degradation, never an error), with the same
-    // per-attribute containment as the core 19. The DDR4 decode in
+    // per-attribute containment as the core 25. The DDR4 decode in
     // `intel_readout` consumes these (keyed on `res.tech == Ddr4`).
     let alk_d4_tc0 = AlderDdr4TcRegs {
         tc_pre_lo: read_u32_attr(root, "alk_d4_mc0_tc_pre_lo")?,
@@ -382,9 +383,11 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
         tc_rftp: read_u32_attr(root, "alk_d4_mc1_tc_rftp")?,
     };
 
-    // The 5 global MAD channel/geometry attributes (24-attr module
-    // builds only): absent on a pre-24-attr build -> `None` (graceful),
-    // with the same per-attribute containment as the core 19.
+    // The 5 global MAD channel/geometry attributes: `mad_inter_channel` /
+    // `mad_dimm_ch0/1` are decode inputs (carried on the register set,
+    // L-10); `mad_intra_ch0/1` are raw siblings (no decode consumes them).
+    // Absent on a build that does not expose them -> `None` (graceful),
+    // with the same per-attribute containment as the core 25.
     let mad_inter_channel = read_u32_attr(root, "mad_inter_channel")?;
     let mad_intra_ch0 = read_u32_attr(root, "mad_intra_ch0")?;
     let mad_intra_ch1 = read_u32_attr(root, "mad_intra_ch1")?;
@@ -394,7 +397,7 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
     // The 2 Alder/DDR5 MAD_DIMM_CH2/CH3 raws (IG-22/IG-23): decode
     // inputs (in the register set) + raw siblings; absent on a 64 KiB
     // module build -> `None` (graceful), with the same per-attribute
-    // containment as the core 19.
+    // containment as the core 25.
     let mad_dimm_ch2 = read_u32_attr(root, "mad_dimm_ch2")?;
     let mad_dimm_ch3 = read_u32_attr(root, "mad_dimm_ch3")?;
     // CAPID0_A (host-bridge config offset 0xE4): the Intel ECC decode
@@ -411,6 +414,11 @@ fn read_from(root: &Path) -> TelemetryResult<SysfsRegs> {
             ch3,
             mcl0,
             mcl1,
+            // L-10: the MAD channel/geometry decode inputs ride on the
+            // register set (all MAD data comes from `regs` in `decode`).
+            mad_inter_channel,
+            mad_dimm_ch0,
+            mad_dimm_ch1,
             mad_dimm_ch2,
             mad_dimm_ch3,
             // Phase 1d: the two Alder Lake DDR4 TC blocks
@@ -479,8 +487,8 @@ fn classify_io(e: &std::io::Error) -> TelemetryError {
 /// Read one raw attribute by name from the kobject directory.
 ///
 /// - absent → `Ok(None)` (per-register containment — a module build that
-///   exposes a subset degrades only the missing registers, e.g. a
-///   pre-24-attr build lacking the 5 MAD attributes);
+///   exposes a subset degrades only the missing registers, e.g. a build
+///   that lacks the MAD attributes);
 /// - present but not valid UTF-8 → `Ok(None)` (malformed payload);
 /// - unreadable → [`TelemetryError::InsufficientPrivilege`];
 /// - any other I/O → [`TelemetryError::Io`].
@@ -766,7 +774,12 @@ mod tests {
         write_acceptance_kobject(&k);
         write_mad_attrs(&k);
         let out = read_from(&k.root).expect("kobject present -> Ok");
-        assert_eq!(out.regs, acceptance_regs());
+        // L-10: the MAD decode inputs now ride on `out.regs` too.
+        let mut expected = acceptance_regs();
+        expected.mad_inter_channel = Some(0x0000_0000);
+        expected.mad_dimm_ch0 = Some(0x0000_0020);
+        expected.mad_dimm_ch1 = Some(0x0000_0020);
+        assert_eq!(out.regs, expected);
         assert_eq!(
             out.mchbar,
             MchBarInfo {
@@ -813,7 +826,12 @@ mod tests {
         write_mad_attrs(&k);
         k.write("mad_intra_ch1", "not-a-register\n");
         let out = read_from(&k.root).expect("containment -> Ok");
-        assert_eq!(out.regs, acceptance_regs());
+        // L-10: the MAD decode inputs now ride on `out.regs` too.
+        let mut expected = acceptance_regs();
+        expected.mad_inter_channel = Some(0x0000_0000);
+        expected.mad_dimm_ch0 = Some(0x0000_0020);
+        expected.mad_dimm_ch1 = Some(0x0000_0020);
+        assert_eq!(out.regs, expected);
         assert_eq!(out.mad_inter_channel, Some(0x0000_0000));
         assert_eq!(out.mad_intra_ch0, Some(0x0000_0005));
         assert_eq!(out.mad_intra_ch1, None);

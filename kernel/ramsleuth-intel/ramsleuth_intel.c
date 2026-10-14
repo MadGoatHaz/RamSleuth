@@ -58,6 +58,14 @@
  * ioremap OK).  Any failure leaves no kobject behind and returns a
  * clean -E* code.  On non-Intel platforms (e.g. an AMD host) the load
  * fails with -ENODEV by design: no kobject is ever created.
+ *
+ * Generation scope (L-14): this module loads on ANY Intel host bridge
+ * at 00:00.0.  The userspace generation gate (intel_gen.rs
+ * profile_for) is the enforcement point — unsupported generations are
+ * rejected before any register data is consumed.  The module itself is
+ * permissive by design (it only ever publishes raw register words); it
+ * does not and cannot decode per-generation bitfields, so it does not
+ * gate on the CPU generation the way the decode layer does.
  */
 
 #include <asm/cpuid/api.h>
@@ -321,6 +329,13 @@ RAW_ATTR(mad_dimm_ch3, mad_offs.dimm3)
  * native MCL blocks (the userspace mcl0/mcl1 contract names). Raw
  * words only, like the core set; created only on the 12th-gen+ family
  * (see alk_d4_group below).
+ *
+ * 64-bit TC_PRE split (L-15): TC_PRE is a 64-bit register exposed as two
+ * 32-bit attributes (lo/hi).  A torn read is possible only during an
+ * in-progress MRC retrain (BIOS firmware activity); in normal operation
+ * TC_PRE is static after boot.  No reassembly is performed in userspace —
+ * each 32-bit word is decoded independently with word-relative field
+ * positions.
  */
 RAW_ATTR(alk_d4_mc0_tc_pre_lo, REG_ALK_D4_MC0_TC_PRE_LO)
 RAW_ATTR(alk_d4_mc0_tc_pre_hi, REG_ALK_D4_MC0_TC_PRE_HI)
@@ -388,6 +403,11 @@ static struct kobj_attribute dev_attr_mchbar_enabled = __ATTR_RO(mchbar_enabled)
  * truncated in /sys/.../config).  On a read failure (no retained handle
  * or a config read error) print the 0xffffffff sentinel so the attribute
  * never fails a read; module load is unaffected.
+ *
+ * Per-read cost (L-16): each show issues a live PCIe config transaction
+ * (~1-2 us).  At the standard 1 Hz telemetry rate this is negligible.
+ * For high-rate consumers (>100 Hz), consider caching the value with a
+ * TTL instead of re-reading the config space on every access.
  */
 static ssize_t capid0a_show(struct kobject *kobj,
 			    struct kobj_attribute *attr, char *buf)
@@ -542,6 +562,25 @@ static bool is_12th_gen_plus(u32 model)
 	}
 }
 
+/*
+ * The DDR4 12th-gen+ subset (Alder/Raptor Lake) that exposes the
+ * 0xE000/0x1E000 per-MC DDR4 TC blocks.  Meteor / Arrow / Lunar Lake are
+ * 12th-gen+ (the 0xD800 MAD base + the 256 KiB window) but DDR5-only —
+ * they have no DDR4 TC surface, so the alk_d4 group is created ONLY for
+ * this subset (L-12: it was previously created for every is_12th_gen_plus
+ * model, exposing misleading DDR4 attrs on DDR5-only parts).
+ */
+static bool is_alder_raptor_ddr4(u32 model)
+{
+	switch (model) {
+	case 0x97: case 0x9A: case 0xBE:	/* Alder Lake (DDR4) */
+	case 0xB7: case 0xBA: case 0xBF:	/* Raptor Lake (DDR4) */
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int __init ramsleuth_intel_init(void)
 {
 	struct pci_dev *pdev;
@@ -677,6 +716,13 @@ static int __init ramsleuth_intel_init(void)
 		return -ENOMEM;
 	}
 
+	/*
+	 * Probe window (L-13): the kobject is created before its attribute
+	 * groups.  A userspace reader in this window sees the directory but
+	 * no files — all reads return None.  This is a transient condition
+	 * (<<1ms) that produces an honest all-N/A cycle.  The /dev/mem
+	 * fallback does NOT trigger (it requires dir-absent at gate time).
+	 */
 	ret = sysfs_create_group(ramsleuth_kobj, &ramsleuth_group);
 	if (ret) {
 		kobject_put(ramsleuth_kobj);
@@ -691,18 +737,17 @@ static int __init ramsleuth_intel_init(void)
 	}
 
 	/*
-	 * Phase 1d + M-1: the Alder Lake DDR4 surface (the 0xE000/0x1E000
-	 * TC blocks + the 0xD000/0xD800 MCL blocks) and the DDR5
-	 * 4-subchannel surface (the ch2/ch3 TC mirror blocks at
-	 * 0x4800/0x4C00 + the mad_dimm_ch2/3 raws) are exposed only on the
-	 * 12th-gen+ family — the same generation that selects the 256
-	 * KiB Tier-3 window (map_size above); on a pre-12th-gen box the
-	 * surface stays the core 25 (the 0x4000/0x4400 Tier-1 mirror,
-	 * kept for Tier-1 compatibility). The nameless group lands its
-	 * attributes in the kobject root.
+	 * Phase 1d: the Alder Lake DDR4 surface (the 0xE000/0x1E000 TC
+	 * blocks + the 0xD000/0xD800 MCL blocks) is exposed only on the
+	 * DDR4 12th-gen+ family (Alder/Raptor Lake — is_alder_raptor_ddr4;
+	 * L-12: Meteor/Arrow/Lunar are 12th-gen+ but DDR5-only and have no
+	 * DDR4 TC surface).  On a pre-12th-gen box or a DDR5-only 12th-gen+
+	 * box the surface stays the core 25 (the 0x4000/0x4400 Tier-1
+	 * mirror, kept for Tier-1 compatibility). The nameless group lands
+	 * its attributes in the kobject root.
 	 */
 	attr_count = ARRAY_SIZE(ramsleuth_attrs) - 1;
-	if (is_12th_gen_plus(model)) {
+	if (is_alder_raptor_ddr4(model)) {
 		ret = sysfs_create_group(ramsleuth_kobj, &alk_d4_group);
 		if (ret) {
 			kobject_put(ramsleuth_kobj);
@@ -728,12 +773,25 @@ static int __init ramsleuth_intel_init(void)
 
 static void __exit ramsleuth_intel_exit(void)
 {
-	if (ramsleuth_kobj)
+	/*
+	 * Clear each global BEFORE tearing it down (L-11): a userspace
+	 * reader racing the exit path (the RAW_ATTR show guard:
+	 * `if (!mchbar_mmio) return -EIO`) then sees NULL and bails — never
+	 * an ioread on a region being iounmap'd (use-after-free).
+	 */
+	if (ramsleuth_kobj) {
 		kobject_put(ramsleuth_kobj);
-	if (mchbar_mmio)
-		iounmap(mchbar_mmio);
-	if (host_bridge)
+		ramsleuth_kobj = NULL;
+	}
+	if (mchbar_mmio) {
+		void __iomem *mmio = mchbar_mmio;
+		mchbar_mmio = NULL;
+		iounmap(mmio);
+	}
+	if (host_bridge) {
 		pci_dev_put(host_bridge);
+		host_bridge = NULL;
+	}
 }
 
 module_init(ramsleuth_intel_init);
