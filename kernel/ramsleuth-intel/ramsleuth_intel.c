@@ -37,6 +37,17 @@
  * Tier-1 mirror blocks stay for Tier-1 compatibility; the
  * pre-12th-gen surface is the core 25 attributes unchanged.
  *
+ * M-1 (DDR5 4-subchannel surface): the 12th-gen+ DDR5 family splits each
+ * legacy memory channel into two subchannels, so the per-channel TC timing
+ * mirrors extend to ch2 (0x4800) and ch3 (0x4C00) — the 0x400-stride
+ * mirrors of ch0 (0x4000) / ch1 (0x4400) — and the global MAD block gains
+ * the mad_dimm_ch2/3 raws (the gen-keyed MAD base + 0x14/+ 0x18, the
+ * 4-byte stride of mad_dimm_ch0/1). The userspace reader (intel_sysfs)
+ * reads all 18 of these; the pre-M-1 module created none, so they read
+ * 0xFFFFFFFF / were absent. They ride in the same gen-gated nameless group
+ * as the Phase 1d DDR4 surface (12th-gen+ only); the pre-12th-gen surface
+ * stays the core 25 attributes unchanged.
+ *
  * This module performs no decoding: each register attribute is the raw
  * 32-bit value, little-endian, one line, "0x%08x".  The RamSleuth
  * userspace reader decodes the bitfields per CPU generation, so one
@@ -108,6 +119,29 @@
 #define REG_TC_RDWR_CH1	0x4424
 #define REG_TC_WRRD_CH1	0x4428
 #define REG_TC_WRWR_CH1	0x442C
+
+/*
+ * M-1: the DDR5 4-subchannel mirror blocks (12th-gen+ only). ch2 is the
+ * 0x4800 mirror and ch3 the 0x4C00 mirror of ch0 (0x4000) / ch1 (0x4400) —
+ * the same 8-word TC layout on the 0x400 channel stride.
+ */
+#define REG_TC_DBP_CH2	0x4800
+#define REG_TC_RAP_CH2	0x4804
+#define REG_TC_RFP_CH2	0x4808
+#define REG_TC_RAP2_CH2	0x480C
+#define REG_TC_RDRD_CH2	0x4820
+#define REG_TC_RDWR_CH2	0x4824
+#define REG_TC_WRRD_CH2	0x4828
+#define REG_TC_WRWR_CH2	0x482C
+
+#define REG_TC_DBP_CH3	0x4C00
+#define REG_TC_RAP_CH3	0x4C04
+#define REG_TC_RFP_CH3	0x4C08
+#define REG_TC_RAP2_CH3	0x4C0C
+#define REG_TC_RDRD_CH3	0x4C20
+#define REG_TC_RDWR_CH3	0x4C24
+#define REG_TC_WRRD_CH3	0x4C28
+#define REG_TC_WRWR_CH3	0x4C2C
 
 /*
  * Phase 1d (Alder Lake DDR4): the per-MC TC timing registers of the
@@ -220,6 +254,8 @@ static struct {
 	u32 intra1;	/* MAD_INTRA_CH1     = imc_base + 0x08 */
 	u32 dimm0;	/* MAD_DIMM_CH0      = imc_base + 0x0C */
 	u32 dimm1;	/* MAD_DIMM_CH1      = imc_base + 0x10 */
+	u32 dimm2;	/* MAD_DIMM_CH2      = imc_base + 0x14 */
+	u32 dimm3;	/* MAD_DIMM_CH3      = imc_base + 0x18 */
 } mad_offs;
 
 /*
@@ -255,11 +291,29 @@ RAW_ATTR(ch1_tc_rdrd, REG_TC_RDRD_CH1)
 RAW_ATTR(ch1_tc_rdwr, REG_TC_RDWR_CH1)
 RAW_ATTR(ch1_tc_wrrd, REG_TC_WRRD_CH1)
 RAW_ATTR(ch1_tc_wrwr, REG_TC_WRWR_CH1)
+RAW_ATTR(ch2_tc_dbp, REG_TC_DBP_CH2)
+RAW_ATTR(ch2_tc_rap, REG_TC_RAP_CH2)
+RAW_ATTR(ch2_tc_rfp, REG_TC_RFP_CH2)
+RAW_ATTR(ch2_tc_rap2, REG_TC_RAP2_CH2)
+RAW_ATTR(ch2_tc_rdrd, REG_TC_RDRD_CH2)
+RAW_ATTR(ch2_tc_rdwr, REG_TC_RDWR_CH2)
+RAW_ATTR(ch2_tc_wrrd, REG_TC_WRRD_CH2)
+RAW_ATTR(ch2_tc_wrwr, REG_TC_WRWR_CH2)
+RAW_ATTR(ch3_tc_dbp, REG_TC_DBP_CH3)
+RAW_ATTR(ch3_tc_rap, REG_TC_RAP_CH3)
+RAW_ATTR(ch3_tc_rfp, REG_TC_RFP_CH3)
+RAW_ATTR(ch3_tc_rap2, REG_TC_RAP2_CH3)
+RAW_ATTR(ch3_tc_rdrd, REG_TC_RDRD_CH3)
+RAW_ATTR(ch3_tc_rdwr, REG_TC_RDWR_CH3)
+RAW_ATTR(ch3_tc_wrrd, REG_TC_WRRD_CH3)
+RAW_ATTR(ch3_tc_wrwr, REG_TC_WRWR_CH3)
 RAW_ATTR(mad_inter_channel, mad_offs.inter)
 RAW_ATTR(mad_intra_ch0, mad_offs.intra0)
 RAW_ATTR(mad_intra_ch1, mad_offs.intra1)
 RAW_ATTR(mad_dimm_ch0, mad_offs.dimm0)
 RAW_ATTR(mad_dimm_ch1, mad_offs.dimm1)
+RAW_ATTR(mad_dimm_ch2, mad_offs.dimm2)
+RAW_ATTR(mad_dimm_ch3, mad_offs.dimm3)
 
 /*
  * Phase 1d (Alder Lake DDR4): the per-MC TC blocks (the 64-bit TC_PRE
@@ -383,12 +437,14 @@ static struct attribute_group ramsleuth_group = {
 /*
  * Phase 1d: the Alder Lake DDR4 attribute group — the two 0xE000/
  * 0x1E000 TC blocks (10 words each) + the two 0xD000/0xD800 native
- * MCL blocks (8 words each). A nameless group: its attributes land in
- * the kobject root (the same /sys/kernel/ramsleuth_intel/ directory as
- * the core 25). Created only on the 12th-gen+ family (the same
- * generation that selects the 256 KiB Tier-3 window); the
- * pre-12th-gen surface stays the core 25. Removal is implicit: the
- * kobject_put in _exit deletes the whole directory tree.
+ * MCL blocks (8 words each) + the M-1 DDR5 4-subchannel surface: the
+ * ch2/ch3 TC mirror blocks (8 words each, 0x4800/0x4C00) and the
+ * mad_dimm_ch2/3 raws (the gen-keyed MAD block + 0x14/+ 0x18). A nameless
+ * group: its attributes land in the kobject root (the same
+ * /sys/kernel/ramsleuth_intel/ directory as the core 25). Created only on
+ * the 12th-gen+ family (the same generation that selects the 256 KiB
+ * Tier-3 window); the pre-12th-gen surface stays the core 25. Removal is
+ * implicit: the kobject_put in _exit deletes the whole directory tree.
  */
 static struct attribute *alk_d4_attrs[] = {
 	&dev_attr_alk_d4_mc0_tc_pre_lo.attr,
@@ -427,6 +483,30 @@ static struct attribute *alk_d4_attrs[] = {
 	&dev_attr_mcl1_tc_rfp2.attr,
 	&dev_attr_mcl1_tc_rdrd.attr,
 	&dev_attr_mcl1_tc_wrwr.attr,
+	/*
+	 * M-1: the DDR5 4-subchannel mirror blocks (ch2 @ 0x4800 / ch3 @
+	 * 0x4C00, 8 words each) + the mad_dimm_ch2/3 raws (the gen-keyed
+	 * MAD block + 0x14/+ 0x18) — the surface the userspace reader
+	 * reads but the pre-M-1 module never created.
+	 */
+	&dev_attr_ch2_tc_dbp.attr,
+	&dev_attr_ch2_tc_rap.attr,
+	&dev_attr_ch2_tc_rfp.attr,
+	&dev_attr_ch2_tc_rap2.attr,
+	&dev_attr_ch2_tc_rdrd.attr,
+	&dev_attr_ch2_tc_rdwr.attr,
+	&dev_attr_ch2_tc_wrrd.attr,
+	&dev_attr_ch2_tc_wrwr.attr,
+	&dev_attr_ch3_tc_dbp.attr,
+	&dev_attr_ch3_tc_rap.attr,
+	&dev_attr_ch3_tc_rfp.attr,
+	&dev_attr_ch3_tc_rap2.attr,
+	&dev_attr_ch3_tc_rdrd.attr,
+	&dev_attr_ch3_tc_rdwr.attr,
+	&dev_attr_ch3_tc_wrrd.attr,
+	&dev_attr_ch3_tc_wrwr.attr,
+	&dev_attr_mad_dimm_ch2.attr,
+	&dev_attr_mad_dimm_ch3.attr,
 	NULL,
 };
 static struct attribute_group alk_d4_group = {
@@ -480,8 +560,20 @@ static int __init ramsleuth_intel_init(void)
 	}
 
 	vendor = pdev->vendor;
-	pci_read_config_dword(pdev, MCHBAR_LO_OFF, &lo);
-	pci_read_config_dword(pdev, MCHBAR_HI_OFF, &hi);
+	ret = pci_read_config_dword(pdev, MCHBAR_LO_OFF, &lo);
+	if (ret) {
+		pr_err(DRIVER_NAME
+		       ": failed to read MCHBAR_LO (PCIe error %d)\n", ret);
+		pci_dev_put(pdev);
+		return ret;
+	}
+	ret = pci_read_config_dword(pdev, MCHBAR_HI_OFF, &hi);
+	if (ret) {
+		pr_err(DRIVER_NAME
+		       ": failed to read MCHBAR_HI (PCIe error %d)\n", ret);
+		pci_dev_put(pdev);
+		return ret;
+	}
 
 	/*
 	 * Retain a module-lifetime reference to the host bridge so the
@@ -523,6 +615,8 @@ static int __init ramsleuth_intel_init(void)
 	mad_offs.intra1 = imc_base + 0x08;
 	mad_offs.dimm0 = imc_base + 0x0C;
 	mad_offs.dimm1 = imc_base + 0x10;
+	mad_offs.dimm2 = imc_base + 0x14;
+	mad_offs.dimm3 = imc_base + 0x18;
 
 	/*
 	 * Window size: 256 KiB for the 12th-gen+ family (the wider
@@ -544,6 +638,21 @@ static int __init ramsleuth_intel_init(void)
 	mchbar_base = raw & MCHBAR_ADDR_MASK;
 	if (!mchbar_base) {
 		pr_err(DRIVER_NAME ": MCHBAR base is zero\n");
+		pci_dev_put(host_bridge);
+		host_bridge = NULL;
+		return -ENODEV;
+	}
+
+	/*
+	 * Defensive alignment check: a real MCHBAR base is 64 KiB aligned
+	 * (bits 0..15 clear). The mask above clears only the low 12 bits, so
+	 * a mis-decoded base that is merely 4 KiB aligned (bits 12..15 set)
+	 * would otherwise slip through — reject it.
+	 */
+	if (mchbar_base & 0xFFFF) {
+		pr_err(DRIVER_NAME
+		       ": MCHBAR base 0x%llx not 64KiB-aligned\n",
+		       (unsigned long long)mchbar_base);
 		pci_dev_put(host_bridge);
 		host_bridge = NULL;
 		return -ENODEV;
@@ -582,8 +691,10 @@ static int __init ramsleuth_intel_init(void)
 	}
 
 	/*
-	 * Phase 1d: the Alder Lake DDR4 surface (the 0xE000/0x1E000 TC
-	 * blocks + the 0xD000/0xD800 MCL blocks) is exposed only on the
+	 * Phase 1d + M-1: the Alder Lake DDR4 surface (the 0xE000/0x1E000
+	 * TC blocks + the 0xD000/0xD800 MCL blocks) and the DDR5
+	 * 4-subchannel surface (the ch2/ch3 TC mirror blocks at
+	 * 0x4800/0x4C00 + the mad_dimm_ch2/3 raws) are exposed only on the
 	 * 12th-gen+ family — the same generation that selects the 256
 	 * KiB Tier-3 window (map_size above); on a pre-12th-gen box the
 	 * surface stays the core 25 (the 0x4000/0x4400 Tier-1 mirror,

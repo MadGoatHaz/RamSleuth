@@ -100,9 +100,13 @@
 //! injectable root of [`read_from`]) — the plan §6.1 Skylake DDR4-2400
 //! acceptance values, the absent / not-a-directory kobject arms, the
 //! per-attribute malformed / absent containment arms (incl. the 5 global
-//! MAD attributes on 24-attr vs 19-attr builds and the Tier-3 attributes
-//! on the 29-attr vs 19-attr builds), the parse strictness table, and
-//! the error-classification arms. No hardware, no root.
+//! MAD attributes on a 24-attr vs 19-attr synthetic build and the Tier-3
+//! attributes on a 29-attr vs 19-attr synthetic build — the real 12th-gen+
+//! module build exposes the full 79-attr surface: the core 25 + the
+//! gen-gated `alk_d4` group's 36 DDR4 TC/MCL words + the 18 M-1
+//! 4-subchannel words (ch2/ch3 mirrors + mad_dimm_ch2/3)), the parse
+//! strictness table, and the error-classification arms. No hardware, no
+//! root.
 
 use std::path::Path;
 
@@ -556,7 +560,9 @@ mod tests {
     //! `ramsleuth_intel` directory in a temp root (no hardware, no
     //! root), pinning the plan §6.1 Skylake DDR4-2400 acceptance values,
     //! the 24-attr vs 19-attr MAD arms, the Tier-3 29-attr vs 19-attr
-    //! arms (IG-23), and every containment / classification arm.
+    //! arms (IG-23; the synthetic fixtures — the real 12th-gen+ module
+    //! build exposes the full 79-attr surface), and every containment /
+    //! classification arm.
 
     use super::*;
     use std::path::PathBuf;
@@ -836,12 +842,14 @@ mod tests {
     // (a3) The Tier-3 extension attributes (IG-23).
     // -----------------------------------------------------------------
 
-    /// A 29-attr kobject (the core 19 + the 8 `ch2_tc_*` mirror attrs +
-    /// `mad_dimm_ch2/3`) populates the Tier-3 extension: the `ch2`
+    /// A synthetic 29-attr kobject (the core 19 + the 8 `ch2_tc_*` mirror
+    /// attrs + `mad_dimm_ch2/3`) populates the Tier-3 extension: the `ch2`
     /// register block and the `mad_dimm_ch2/3` raws (decode inputs +
     /// [`SysfsRegs`] siblings), while the absent `ch3` / `mcl0` / `mcl1`
     /// blocks degrade to all-`None` (graceful containment — no error, no
-    /// `DriverMissing`).
+    /// `DriverMissing`). The real 12th-gen+ module build is larger (the
+    /// full 79-attr surface incl. `ch3` / `mcl0` / `mcl1`); this fixture
+    /// exercises the ch2-only arm of that containment.
     #[test]
     fn tier3_attrs_populate_on_29_attr_kobject() {
         let k = TempKobject::new("tier3-29");
