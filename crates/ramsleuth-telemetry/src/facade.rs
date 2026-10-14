@@ -52,10 +52,11 @@ use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_mchbar;
 use crate::intel_readout::{self, IntelReadout};
+use crate::intel_smbios::SmbiosSourceStatus;
 use crate::intel_sysfs;
 use crate::platform::{self, SystemPlatform};
 use crate::spd_decode::{self, SpdModule};
-use crate::spd_eeprom;
+use crate::spd_eeprom::{self, SpdAcquireStatus};
 
 /// The full system memory telemetry snapshot — the Phase 2 exit-criteria
 /// struct (v2 §2.2.1), extended in Cycle 6 with the platform branch
@@ -176,11 +177,17 @@ pub fn collect() -> SystemMemoryTelemetry {
     let cpu = CpuInfo::detect();
     // 2. AMD branch (gated on vendor before any provider I/O).
     let amd = amd_branch(&cpu);
-    // 3. Intel branch (gated on vendor before any provider I/O).
+    // 3. Intel branch (gated on vendor before any provider I/O); the
+    //    SMBIOS source status is already threaded into its annotation
+    //    (M-17) inside the branch.
     let intel = intel_branch(&cpu);
     // 4. SPD branch (vendor-independent; per-device containment lives
-    //    inside the provider).
-    let spd = spd_branch();
+    //    inside the provider). Returns the `(modules, status)` pair (H-8).
+    let (spd, spd_status) = spd_branch();
+    // 4b. H-8: thread the SPD acquire status into the Intel readout's
+    //     annotation (a `Value` readout only) so the user knows *why* the
+    //     SPD list is empty — not just *that* it is.
+    let intel = annotate_intel_with_spd(intel, spd_status);
     // 5. Platform branch (vendor-independent, C6-01; never fails the
     //    process — every field degrades independently).
     let platform = platform_branch();
@@ -311,8 +318,11 @@ fn intel_branch(cpu: &CpuInfo) -> TelemetryResult<IntelReadout> {
     // firmware cross-check) — collected once and supplied to the decode on
     // BOTH the sysfs and the `/dev/mem` fallback arms (the fallback path
     // benefits from the same cross-check, plan hard-constraint #5).
-    // No-panic: a missing `dmi` dir yields the empty topology.
-    let smbios = crate::intel_smbios::collect();
+    // M-17: the source status (why the topology is empty) is threaded into
+    // the readout's annotation so the user knows the L1 result was NOT
+    // firmware-verified. No-panic: a missing `dmi` dir yields the empty
+    // topology + `DirAbsent`.
+    let (smbios, smbios_status) = crate::intel_smbios::collect();
 
     // 4. Primary: the `ramsleuth_intel` sysfs kobject (plan §3.5).
     match intel_sysfs::acquire() {
@@ -329,6 +339,9 @@ fn intel_branch(cpu: &CpuInfo) -> TelemetryResult<IntelReadout> {
             // ECC capability from the capid0a attribute (the sysfs-only
             // decode input; the /dev/mem fallback has none -> Unknown).
             ro.ecc_status = intel_readout::decode_ecc_status(sysfs.capid0a);
+            // M-17: thread the SMBIOS source status into the annotation.
+            ro.channel_annotation =
+                annotate_smbios_status(&ro.channel_annotation, smbios_status);
             Ok(ro)
         }
         // The frozen fallthrough rule: the `/dev/mem` fallback is taken
@@ -336,23 +349,35 @@ fn intel_branch(cpu: &CpuInfo) -> TelemetryResult<IntelReadout> {
         // Any other sysfs outcome is reported as-is.
         Err(TelemetryError::DriverMissing { .. }) => {
             let bar = intel_mchbar::acquire()?;
-            intel_readout::read_intel(&bar, &smbios)
+            let mut ro = intel_readout::read_intel(&bar, &smbios)?;
+            // M-17: thread the SMBIOS source status into the annotation.
+            ro.channel_annotation =
+                annotate_smbios_status(&ro.channel_annotation, smbios_status);
+            Ok(ro)
         }
         Err(err) => Err(err),
     }
 }
 
 /// SPD branch: `spd_eeprom::acquire()` → `spd_decode::decode()` per
-/// image.
+/// image. Returns the `(modules, status)` pair (H-8): the status says
+/// *why* the module list is empty (driver not loaded / not listable /
+/// no devices bound / all images invalid) so the facade can thread it
+/// into the readout's annotation.
 ///
 /// Vendor-independent and unprivileged (pure sysfs reads). Any
 /// acquisition error degrades to an empty module list — one bad source
 /// never drops the others, and the branch never fails the process (the
 /// provider already skips per-device failures).
-fn spd_branch() -> Vec<SpdModule> {
+fn spd_branch() -> (Vec<SpdModule>, SpdAcquireStatus) {
     match spd_eeprom::acquire() {
-        Ok(images) => images.iter().map(spd_decode::decode).collect(),
-        Err(_) => Vec::new(),
+        Ok((images, status)) => {
+            let modules = images.iter().map(spd_decode::decode).collect();
+            (modules, status)
+        }
+        // Defensive: `acquire()` degrades every real failure to an `Ok`
+        // (it never returns `Err`), so this arm is a no-panic backstop.
+        Err(_) => (Vec::new(), SpdAcquireStatus::Unlistable),
     }
 }
 
@@ -532,6 +557,48 @@ fn section_from<T>(result: TelemetryResult<T>) -> Section<T> {
     match result {
         Ok(value) => Section::Value(value),
         Err(err) => Section::Na(reason_from(&err)),
+    }
+}
+
+/// M-17: append the SMBIOS source-status note to the readout's channel
+/// annotation when the firmware cross-check was unavailable, so the user
+/// knows the L1 result was NOT verified. `Ok` leaves the annotation
+/// untouched (the clean case). Pure (no I/O), never a panic.
+fn annotate_smbios_status(annotation: &str, status: SmbiosSourceStatus) -> String {
+    if status == SmbiosSourceStatus::Ok {
+        return annotation.to_owned();
+    }
+    let note = format!("[firmware cross-check unavailable: {status}]");
+    if annotation.is_empty() {
+        note
+    } else {
+        format!("{annotation} {note}")
+    }
+}
+
+/// H-8: thread the SPD acquire status into the Intel readout's channel
+/// annotation, so the user knows *why* the SPD module list is empty
+/// (driver not loaded / not listable / no devices bound / all images
+/// invalid) — not just *that* it is. `Ok` (and a degraded `Na` Intel
+/// branch, which has no annotation to carry it) leaves the readout
+/// untouched. Pure (no I/O), never a panic.
+fn annotate_intel_with_spd(
+    intel: TelemetryResult<IntelReadout>,
+    status: SpdAcquireStatus,
+) -> TelemetryResult<IntelReadout> {
+    match intel {
+        Ok(mut ro) => {
+            if status != SpdAcquireStatus::Ok {
+                let note = format!("SPD: {status}");
+                ro.channel_annotation = if ro.channel_annotation.is_empty() {
+                    note
+                } else {
+                    format!("{} {note}", ro.channel_annotation)
+                };
+            }
+            Ok(ro)
+        }
+        Err(err) => Err(err),
     }
 }
 

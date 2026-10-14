@@ -31,8 +31,13 @@
 //!    `mmap(PROT_READ, MAP_PRIVATE)` the profile-sized MCHBAR window at
 //!    the decoded base (64 KiB Tier 1/2, 256 KiB Tier 3 —
 //!    [`window_size_for`], IG-25), owned by the RAII [`MchBar`] guard.
-//!    - EACCES/EPERM, or a STRICT_DEVMEM range rejection surfaced by the
-//!      kernel as EIO/ENODATA, → [`TelemetryError::InsufficientPrivilege`].
+//!    - EACCES/EPERM (a true missing-capability denial) →
+//!      [`TelemetryError::InsufficientPrivilege`] with the CAP_SYS_RAWIO /
+//!      root hint; a STRICT_DEVMEM range rejection (the kernel surfacing
+//!      EIO / ENODATA for a non-RAM PCI MMIO `mmap`) → the same variant but
+//!      with a distinct hint pointing at the `ramsleuth_intel` kernel module
+//!      (H-7: that block is a kernel-config issue, not a permission one, so
+//!      "run as root" would mislead).
 //!    - Neither node present → [`TelemetryError::DriverMissing`].
 //!
 //! # Safety
@@ -94,8 +99,20 @@ const DEV_MEM: &str = "/dev/mem";
 /// Fallback devmem node (plan §D4; some kernels expose MMIO via `/dev/fmem`).
 const DEV_FMEM: &str = "/dev/fmem";
 
-/// Privilege hint carried by [`TelemetryError::InsufficientPrivilege`].
+/// Privilege hint carried by [`TelemetryError::InsufficientPrivilege`] for a
+/// true missing-capability denial (EACCES/EPERM at `open`/`mmap` time).
 const PRIV_HINT_DEVMEM: &str = "map /dev/mem read-only requires CAP_SYS_RAWIO or root";
+
+/// STRICT_DEVMEM hint (H-7): carried by
+/// [`TelemetryError::InsufficientPrivilege`] when the kernel's
+/// `CONFIG_STRICT_DEVMEM=y` rejects a non-RAM (PCI MMIO) `mmap` of
+/// `/dev/mem`, surfaced as EIO (or ENODATA in some configs). This is a
+/// **kernel-config block, not a missing capability** — so the hint points
+/// at the primary `ramsleuth_intel` kernel-module path (which maps the IMC
+/// registers directly, bypassing `/dev/mem`) rather than "run as root",
+/// which would not clear the block.
+const PRIV_HINT_STRICT_DEVMEM: &str =
+    "STRICT_DEVMEM kernel config blocks /dev/mem MMIO access; load the ramsleuth_intel kernel module (primary path) instead";
 
 /// Size of the MCHBAR MMIO window mapped read-only for Tier 1/2
 /// (64 KiB).
@@ -221,8 +238,10 @@ impl Drop for MchBar {
 ///   to 0 and the readout degrades to a clean `N/A (unsupported hardware)`.
 /// - [`TelemetryError::DriverMissing`] — the host-bridge PCI config device
 ///   or both `/dev/mem` and `/dev/fmem` are absent.
-/// - [`TelemetryError::InsufficientPrivilege`] — devmem open/map permission
-///   denial (EACCES/EPERM) or a STRICT_DEVMEM range rejection.
+/// - [`TelemetryError::InsufficientPrivilege`] — a true devmem open/map
+///   permission denial (EACCES/EPERM, the CAP_SYS_RAWIO / root hint) or a
+///   STRICT_DEVMEM range rejection (EIO / ENODATA, the kernel-config hint
+///   pointing at the `ramsleuth_intel` module — H-7 distinguishes the two).
 /// - [`TelemetryError::Parse`] — config space too short, or a disabled
 ///   MCHBAR (MCHBAR_EN=0) that nonetheless carries address bits.
 /// - [`TelemetryError::Io`] — any other raw I/O failure.
@@ -332,6 +351,31 @@ pub fn mchbar_base(bar5: u64) -> u64 {
     bar5 & MCHBAR_BASE_MASK
 }
 
+/// M-13: decode a valid (non-zero) MCHBAR base from a PCI config-space
+/// image, or `None` when the image is too short / the MCHBAR is disabled
+/// (base 0) / inconsistent. Pure (no I/O): the pinned-BDF read and the
+/// bounded device scan both reduce to this, so a candidate with no valid
+/// MCHBAR is simply skipped.
+pub fn mchbar_base_from_config(config: &[u8]) -> Option<u64> {
+    let raw = decode_bar5(config).ok()?;
+    let base = mchbar_base(raw);
+    (base != 0).then_some(base)
+}
+
+/// M-13: `true` when a PCI config-space image is an Intel (vendor `0x8086`)
+/// host-to-PCI bridge (class code `0x0600`: the class byte `0x06` "Bridge
+/// device" + the subclass byte `0x00`). The vendor occupies config
+/// `0x00-0x01` and the class / subclass `0x08-0x09` (the first two bytes
+/// of the 3-byte class code). Pure (no I/O), never panics on a short image.
+pub fn is_intel_host_bridge(config: &[u8]) -> bool {
+    if config.len() < 0x0A {
+        return false;
+    }
+    let vendor = u16::from_le_bytes([config[0x00], config[0x01]]);
+    let class = ((config[0x08] as u16) << 8) | (config[0x09] as u16);
+    vendor == 0x8086 && class == 0x0600
+}
+
 /// The mapped MCHBAR window size for a detected vendor (IG-25): the
 /// profiled generation's `window_size` from
 /// [`intel_gen::profile_for`] (Tier 1 and Rocket Lake: 64 KiB; the
@@ -387,14 +431,62 @@ fn check_read_bounds(offset: usize, len: usize) -> Result<(), TelemetryError> {
 
 #[cfg(target_os = "linux")]
 fn acquire_linux(vendor: CpuVendor) -> TelemetryResult<MchBar> {
-    let config = read_host_bridge_config()?;
-    let raw = decode_bar5(&config)?;
+    // M-13: the pinned host bridge (`0000:00:00.0`) is the FIRST candidate
+    // (zero behavior change on working systems). A valid base maps the
+    // window directly; any no-valid-base state (absent / unreadable /
+    // short / disabled / base 0) remembers the pinned outcome as the
+    // terminal error and falls through to the bounded device scan.
+    match read_pinned_and_decode() {
+        PinnedResult::Mapped(base) => map_mchbar(vendor, base),
+        PinnedResult::NoValid(err) => {
+            if let Some(bar) = scan_and_map(vendor) {
+                return Ok(bar);
+            }
+            Err(err)
+        }
+    }
+}
+
+/// The pinned host-bridge read + decode outcome (M-13): a valid MCHBAR
+/// base, or the original `acquire_linux` error when no valid base decodes.
+#[cfg(target_os = "linux")]
+enum PinnedResult {
+    /// A non-zero MCHBAR base decoded from the pinned bridge.
+    Mapped(u64),
+    /// No valid MCHBAR from the pinned bridge; `err` is the original
+    /// `acquire_linux` outcome for that state (preserved verbatim).
+    NoValid(TelemetryError),
+}
+
+/// M-13: read + decode the pinned host bridge, preserving the original
+/// `acquire_linux` error semantics for each no-valid-base state
+/// (`DriverMissing` / `Io` on a config read failure, `Parse` on a short /
+/// inconsistent config, `UnsupportedHardware` on a disabled base-0 MCHBAR).
+#[cfg(target_os = "linux")]
+fn read_pinned_and_decode() -> PinnedResult {
+    let config = match read_host_bridge_config() {
+        Ok(c) => c,
+        Err(e) => return PinnedResult::NoValid(e),
+    };
+    let raw = match decode_bar5(&config) {
+        Ok(r) => r,
+        Err(e) => return PinnedResult::NoValid(e),
+    };
     let base = mchbar_base(raw);
     if base == 0 {
-        return Err(TelemetryError::UnsupportedHardware {
+        PinnedResult::NoValid(TelemetryError::UnsupportedHardware {
             vendor: "Intel host bridge with unpopulated MCHBAR (BAR5=0, virtualized or unsupported)".to_owned(),
-        });
+        })
+    } else {
+        PinnedResult::Mapped(base)
     }
+}
+
+/// M-13: map the profile-sized window at `base` (the shared tail of the
+/// original `acquire_linux`): profile-driven window size, devmem open,
+/// read-only `mmap`.
+#[cfg(target_os = "linux")]
+fn map_mchbar(vendor: CpuVendor, base: u64) -> TelemetryResult<MchBar> {
     // The window size is profile-driven (IG-25): 256 KiB for the
     // Tier-3 Alder family, 64 KiB otherwise.
     let length = window_size_for(vendor);
@@ -408,6 +500,63 @@ fn acquire_linux(vendor: CpuVendor) -> TelemetryResult<MchBar> {
         region,
         len: length,
     })
+}
+
+/// M-13: the bounded scan fallback — try each discovered Intel
+/// host-bridge BDF for a valid MCHBAR base and map the first one found.
+/// Logs which BDF was used (for diagnostics). Returns `None` when no
+/// candidate yields a mappable base (the caller then reports the pinned
+/// outcome). Never panics: a candidate with no valid MCHBAR is skipped.
+#[cfg(target_os = "linux")]
+fn scan_and_map(vendor: CpuVendor) -> Option<MchBar> {
+    for bdf in scan_host_bridge_bdfs() {
+        let Some(base) = try_mchbar_base(&bdf) else {
+            continue; // this candidate has no valid MCHBAR; try the next
+        };
+        eprintln!("info: MCHBAR discovered at host bridge {bdf} (base {base:#x})");
+        return map_mchbar(vendor, base).ok();
+    }
+    None
+}
+
+/// M-13: read a candidate BDF's config space and decode a valid (non-zero)
+/// MCHBAR base, or `None` when the config is absent / unreadable / too
+/// short / decodes to 0.
+#[cfg(target_os = "linux")]
+fn try_mchbar_base(bdf: &str) -> Option<u64> {
+    let path = format!("/sys/bus/pci/devices/{bdf}/config");
+    let config = std::fs::read(path).ok()?;
+    mchbar_base_from_config(&config)
+}
+
+/// M-13: the additional Intel host-to-PCI bridge BDFs to try after the
+/// pinned `0000:00:00.0` — a bounded scan of `/sys/bus/pci/devices/*`
+/// (vendor `0x8086`, class `0x0600`). Capped at 3 discovered (4 candidates
+/// total including the pinned) so a broken system cannot loop forever. The
+/// scan is best-effort: an unreadable device directory or config yields no
+/// candidates, never a panic.
+#[cfg(target_os = "linux")]
+fn scan_host_bridge_bdfs() -> Vec<String> {
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/bus/pci/devices") {
+        for entry in entries.flatten() {
+            if found.len() >= 3 {
+                break;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == HOST_BRIDGE_BDF {
+                continue; // the pinned candidate is tried separately
+            }
+            let config = match std::fs::read(entry.path().join("config")) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if is_intel_host_bridge(&config) {
+                found.push(name);
+            }
+        }
+    }
+    found
 }
 
 /// Read the host-bridge PCI config-space image from sysfs.
@@ -493,10 +642,18 @@ fn mmap_devmem(fd: RawFd, base: u64, length: usize) -> TelemetryResult<NonNull<u
     }
 }
 
-/// Classify a devmem `open`/`mmap` failure: permission denials (EACCES/EPERM)
-/// and STRICT_DEVMEM range rejections (EIO/ENODATA) →
-/// [`TelemetryError::InsufficientPrivilege`]; absent node →
-/// [`TelemetryError::DriverMissing`]; anything else → [`TelemetryError::Io`].
+/// Classify a devmem `open`/`mmap` failure (H-7: the two denial modes are
+/// told apart, not both labelled a privilege problem):
+/// - a true missing-capability denial (EACCES/EPERM,
+///   [`std::io::ErrorKind::PermissionDenied`]) →
+///   [`TelemetryError::InsufficientPrivilege`] with the CAP_SYS_RAWIO /
+///   root hint ([`PRIV_HINT_DEVMEM`]);
+/// - a STRICT_DEVMEM range rejection (the kernel surfacing EIO / ENODATA
+///   for a non-RAM PCI MMIO `mmap`) → the same variant but with the
+///   kernel-config hint ([`PRIV_HINT_STRICT_DEVMEM`]) pointing at the
+///   `ramsleuth_intel` module — "run as root" would not clear it;
+/// - an absent node → [`TelemetryError::DriverMissing`];
+/// - anything else → [`TelemetryError::Io`].
 ///
 /// The STRICT_DEVMEM arm matches on the raw OS code rather than
 /// [`std::io::ErrorKind`]: the kernel rejects a non-RAM (PCI MMIO) `mmap`
@@ -505,15 +662,21 @@ fn mmap_devmem(fd: RawFd, base: u64, length: usize) -> TelemetryResult<NonNull<u
 #[cfg(target_os = "linux")]
 fn classify_devmem(e: &std::io::Error) -> TelemetryError {
     match e.kind() {
+        // A true missing-capability denial (EACCES/EPERM): the caller lacks
+        // CAP_SYS_RAWIO / root (H-7: the real privilege case).
         std::io::ErrorKind::PermissionDenied => TelemetryError::InsufficientPrivilege {
             hint: PRIV_HINT_DEVMEM,
         },
         std::io::ErrorKind::NotFound => TelemetryError::DriverMissing { driver: DEV_MEM },
         _ => match e.raw_os_error() {
             // STRICT_DEVMEM range rejection (drivers/char/mem.c): EIO, or
-            // ENODATA in some kernel configs.
+            // ENODATA in some kernel configs. H-7: a kernel-config block,
+            // not a missing capability — the hint points at the
+            // ramsleuth_intel kernel module, not "run as root".
             Some(code) if code == nix::libc::EIO || code == nix::libc::ENODATA => {
-                TelemetryError::InsufficientPrivilege { hint: PRIV_HINT_DEVMEM }
+                TelemetryError::InsufficientPrivilege {
+                    hint: PRIV_HINT_STRICT_DEVMEM,
+                }
             }
             _ => TelemetryError::Io(reconstruct_io(e)),
         },
@@ -662,6 +825,50 @@ mod tests {
         assert_eq!(mchbar_base(0x0), 0x0);
     }
 
+    /// (M-13) `is_intel_host_bridge` recognizes an Intel (`0x8086`)
+    /// host-to-PCI bridge (class `0x0600`) and rejects a non-Intel vendor,
+    /// a wrong subclass (PCI-to-PCI `0x0604`), a wrong class (VGA
+    /// `0x0300`), and a short image — never panics.
+    #[test]
+    fn is_intel_host_bridge_matches_vendor_and_class() {
+        let mut cfg = [0u8; 0x10];
+        cfg[0x00..0x02].copy_from_slice(&0x8086u16.to_le_bytes()); // Intel
+        cfg[0x08] = 0x06; // Bridge device
+        cfg[0x09] = 0x00; // Host to PCI bridge
+        assert!(is_intel_host_bridge(&cfg));
+
+        let mut amd = cfg;
+        amd[0x00..0x02].copy_from_slice(&0x1022u16.to_le_bytes()); // AMD
+        assert!(!is_intel_host_bridge(&amd));
+
+        let mut pcipci = cfg;
+        pcipci[0x09] = 0x04; // PCI-to-PCI bridge subclass
+        assert!(!is_intel_host_bridge(&pcipci));
+
+        let mut vga = cfg;
+        vga[0x08] = 0x03; // Display controller class
+        assert!(!is_intel_host_bridge(&vga));
+
+        assert!(!is_intel_host_bridge(&[0u8; 4])); // short image
+    }
+
+    /// (M-13) `mchbar_base_from_config` decodes a non-zero base from a
+    /// valid config and yields `None` for the unpopulated (base 0) and
+    /// short-config cases — the scan's per-candidate accept/reject test.
+    #[test]
+    fn mchbar_base_from_config_valid_and_invalid() {
+        let cfg = config_with_bar5(0xFED1_0001, 0x0000_0000); // valid Skylake
+        assert_eq!(
+            mchbar_base_from_config(&cfg),
+            Some(0x0000_0000_FED1_0000)
+        );
+
+        let cfg = config_with_bar5(0x0000_0000, 0x0000_0000); // unpopulated
+        assert_eq!(mchbar_base_from_config(&cfg), None);
+
+        assert_eq!(mchbar_base_from_config(&[0u8; 8]), None); // too short
+    }
+
     /// (d) The pure Intel vendor gate: non-Intel vendors (AMD / unknown)
     /// yield `UnsupportedHardware`; Intel passes. No I/O involved.
     #[test]
@@ -733,23 +940,48 @@ mod tests {
         ));
     }
 
-    /// STRICT_DEVMEM (review fix F1): on a root host with
-    /// `CONFIG_STRICT_DEVMEM`, `mmap` of a non-RAM (PCI MMIO) range through
-    /// `/dev/mem` fails with EIO (ENODATA in some kernel configs). Rust
-    /// surfaces those as `ErrorKind::Other` with the raw OS code — so the
-    /// classification must match the raw code and still yield
-    /// [`TelemetryError::InsufficientPrivilege`] with the devmem hint per the
-    /// frozen contract (never `Io`).
+    /// H-7: a STRICT_DEVMEM range rejection (the kernel surfacing EIO /
+    /// ENODATA for a non-RAM PCI MMIO `mmap` through `/dev/mem`) must yield
+    /// [`TelemetryError::InsufficientPrivilege`] with the **kernel-config**
+    /// hint ([`PRIV_HINT_STRICT_DEVMEM`]) — not the CAP_SYS_RAWIO / root
+    /// hint (running as root would not clear the block; the `ramsleuth_intel`
+    /// module is the primary path). Rust surfaces these as
+    /// `ErrorKind::Other`, so the classification matches the raw code and
+    /// never yields `Io`.
     #[cfg(target_os = "linux")]
     #[test]
-    fn strict_devmem_rejections_classify_as_insufficient_privilege() {
+    fn strict_devmem_rejections_carry_the_kernel_config_hint() {
         for code in [nix::libc::EIO, nix::libc::ENODATA] {
             assert_eq!(
                 classify_devmem(&std::io::Error::from_raw_os_error(code)),
                 TelemetryError::InsufficientPrivilege {
+                    hint: PRIV_HINT_STRICT_DEVMEM
+                },
+                "raw OS code {code} (STRICT_DEVMEM rejection) must carry the kernel-config hint, not the privilege hint"
+            );
+        }
+    }
+
+    /// H-7: a true missing-capability denial (EACCES/EPERM) keeps the
+    /// CAP_SYS_RAWIO / root hint ([`PRIV_HINT_DEVMEM`]) — distinct from the
+    /// STRICT_DEVMEM kernel-config hint. Both are `PermissionDenied` kind,
+    /// so the kind-based arm (not the raw-code arm) handles them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn permission_denial_keeps_the_privilege_hint() {
+        for code in [nix::libc::EACCES, nix::libc::EPERM] {
+            let e = std::io::Error::from_raw_os_error(code);
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "EACCES/EPERM must surface as PermissionDenied"
+            );
+            assert_eq!(
+                classify_devmem(&e),
+                TelemetryError::InsufficientPrivilege {
                     hint: PRIV_HINT_DEVMEM
                 },
-                "raw OS code {code} (STRICT_DEVMEM rejection) must classify as InsufficientPrivilege, not Io"
+                "raw OS code {code} (a real privilege denial) must keep the privilege hint"
             );
         }
     }

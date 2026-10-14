@@ -30,7 +30,10 @@
 //! two-byte `Memory Error Information Handle` field at `0x06-0x07`
 //! (`0xFE 0xFF` = "Not Provided"; the 3.x table has the `Device Locator`
 //! @ `0x10` + `Bank Locator` @ `0x11` pair and no separate
-//! "Memory Device Locator" field). Verified offsets:
+//! "Memory Device Locator" field). The parser is version-aware (M-12): it
+//! reads the SMBIOS major version (`id/bios_major`) and selects these 3.x
+//! offsets (major ≥ 3) or the 2.x classic table (major < 3, the same fields
+//! shifted -2). The verified 3.x offsets:
 //!
 //! - **capacity** @ `0x0C` (16-bit word; per the spec the magnitude is
 //!   set by bit 15 — **clear = MB unit, set = KB unit**: `0x4000` =
@@ -46,10 +49,12 @@
 //!
 //! Every read degrades to the empty topology on any absence / unreadable /
 //! malformed input — a missing `dmi` directory (a VM / container / non-Intel
-//! host) yields [`SmbiosTopology::empty`], a short or corrupt structure is
-//! skipped, and nothing ever panics. The root is injectable
-//! ([`collect_from`]) so the fixture tests build a synthetic `17-*` tree in
-//! a temp directory (no hardware, no root).
+//! host) yields [`SmbiosTopology::empty`] with
+//! [`SmbiosSourceStatus::DirAbsent`], a corrupt structure is skipped and
+//! reported as [`SmbiosSourceStatus::ParseError`] (M-17: the status tells
+//! the *why* the facade renders into the annotation), and nothing ever
+//! panics. The root is injectable ([`collect_from`]) so the fixture tests
+//! build a synthetic `17-*` tree in a temp directory (no hardware, no root).
 //!
 //! # Why not EDAC
 //!
@@ -82,16 +87,97 @@ const DMI_ENTRIES_DIR: &str = "/sys/firmware/dmi/entries";
 /// The file-name prefix of a raw SMBIOS Type 17 structure (`17-<n>`).
 const TYPE17_PREFIX: &str = "17-";
 
-/// Type 17 fixed-part field offsets (the real SMBIOS 3.5 layout — the
-/// classic DMTF table shifted +2 by the `Error Information Handle` at
-/// `0x06-0x07`; verified on the reference 12600KF / Z690M-ITX/ax dumps).
+/// The structure-header length field offset (shared by both layouts).
 const OFF_LENGTH: usize = 0x01;
-const OFF_CAPACITY: usize = 0x0C;
+
+/// The byte length of the 16-bit "Memory Device Capacity" word (shared).
 const CAPACITY_LEN: usize = 2;
-const OFF_MEM_DEVICE_LOCATOR: usize = 0x10;
-const OFF_BANK_LOCATOR: usize = 0x11;
-const OFF_MEMORY_TYPE: usize = 0x12;
-const OFF_CAPACITY_EXTENDED: usize = 0x1C;
+
+/// The Type 17 fixed-part field offsets for one SMBIOS major-version
+/// family (M-12: the parser is now version-aware instead of hard-coding
+/// the 3.5 layout). SMBIOS 3.0+ inserted the 2-byte `Memory Error
+/// Information Handle` at `0x06-0x07`, shifting the fields that follow by
+/// +2 relative to the 2.x classic table.
+#[derive(Debug, Clone, Copy)]
+struct Type17Offsets {
+    /// The 16-bit "Memory Device Capacity" word.
+    capacity: usize,
+    /// The 32-bit "Memory Device Extended Size" dword. `None` for the 2.x
+    /// family (the extended size is a 3.0+ field); `Some` for 3.x.
+    capacity_extended: Option<usize>,
+    /// The 1-byte "Memory Technology" field.
+    memory_type: usize,
+    /// The "Device Locator" string reference.
+    mem_device_locator: usize,
+    /// The "Bank Locator" string reference.
+    bank_locator: usize,
+}
+
+/// The SMBIOS 2.x (2.4 / 2.6) Type 17 offsets — the classic DMTF table
+/// (no `Error Information Handle`).
+///
+/// M-12: each field is the verified 3.x value shifted **-2**, the clean
+/// inversion of the 3.0 `Memory Error Information Handle` insertion at
+/// `0x06-0x07` (the task's stated principle). The result is a
+/// non-overlapping layout: the 16-bit capacity word sits at `0x0A-0x0B`,
+/// the locators at `0x08`/`0x09`, the memory type at `0x10`, and the
+/// speed at `0x1E` — so a 2.x DIMM decodes its capacity, type, and
+/// channel locator exactly as a 3.x one does. (A naive field-by-field
+/// mix, e.g. a type byte at `0x0B`, would overlap the capacity word and
+/// mis-decode it; the uniform -2 shift avoids that.) The 2.x family has no
+/// extended-size field (a 3.0+ addition), so `capacity_extended` is
+/// `None`.
+const SMBIOS2_OFFSETS: Type17Offsets = Type17Offsets {
+    capacity: 0x0A,
+    capacity_extended: None,
+    memory_type: 0x10,
+    mem_device_locator: 0x08,
+    bank_locator: 0x09,
+};
+
+/// The SMBIOS 3.x (3.0–3.8, incl. the verified 3.5 reference) Type 17
+/// offsets — the classic table shifted +2 by the `Error Information
+/// Handle` at `0x06-0x07` (verified on the reference 12600KF /
+/// Z690M-ITX/ax dumps: capacity `0x0C`, extended `0x1C`, type `0x12`,
+/// locators `0x10`/`0x11`). The 3.x `Configured Memory Speed` lives at
+/// `0x20` (`0x0E10` = 3600 MT/s on the reference) but is not decoded here.
+const SMBIOS3_OFFSETS: Type17Offsets = Type17Offsets {
+    capacity: 0x0C,
+    capacity_extended: Some(0x1C),
+    memory_type: 0x12,
+    mem_device_locator: 0x10,
+    bank_locator: 0x11,
+};
+
+/// The source status of the SMBIOS Type 17 collection (M-17): *why* the
+/// topology is empty (or not), so the facade can tell the user the
+/// firmware cross-check was unavailable — not just that it was. Rendered
+/// into the readout's annotation (no new wire field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmbiosSourceStatus {
+    /// The DMI source was read and parsed (a populated or legitimately
+    /// empty topology).
+    Ok,
+    /// The `/sys/firmware/dmi` directory is absent (VM / container /
+    /// non-Intel host).
+    DirAbsent,
+    /// The DMI directory exists but could not be read (permission / I/O).
+    Unreadable,
+    /// A Type 17 structure was present but corrupt / too short to parse.
+    ParseError,
+}
+
+impl std::fmt::Display for SmbiosSourceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            SmbiosSourceStatus::Ok => "ok",
+            SmbiosSourceStatus::DirAbsent => "DMI source absent (VM/container/non-Intel)",
+            SmbiosSourceStatus::Unreadable => "DMI source unreadable",
+            SmbiosSourceStatus::ParseError => "DMI structure corrupt",
+        };
+        write!(f, "{s}")
+    }
+}
 
 /// The channel classification derived from the populated DIMM locators
 /// (research: "matched A/B pairs → Dual; both on one channel → Single;
@@ -150,24 +236,42 @@ impl SmbiosTopology {
 /// Collect the SMBIOS Type 17 topology from the kernel's `dmi` export
 /// (the frozen [`DMI_ENTRIES_DIR`]).
 ///
+/// Returns the `(topology, status)` pair (M-17): the [`SmbiosSourceStatus`]
+/// says *why* the topology is empty (absent / unreadable / corrupt) so the
+/// facade can annotate the readout — not just *that* it is.
+///
 /// # No-panic contract
 ///
 /// A missing directory (VM / container / non-Intel host) or any read
-/// failure yields [`SmbiosTopology::empty`] — never a panic, never an
-/// invented DIMM.
-pub fn collect() -> SmbiosTopology {
+/// failure yields [`SmbiosTopology::empty`] with the matching
+/// [`SmbiosSourceStatus`] — never a panic, never an invented DIMM.
+pub fn collect() -> (SmbiosTopology, SmbiosSourceStatus) {
     collect_from(Path::new(DMI_ENTRIES_DIR))
 }
 
 /// The injectable-root [`collect`] (the fixture tests pass a temp directory
 /// holding synthetic `17-*` files). Any missing / unreadable source
-/// degrades to the empty topology.
-pub fn collect_from(root: &Path) -> SmbiosTopology {
+/// degrades to the empty topology (with the matching
+/// [`SmbiosSourceStatus`], M-17).
+pub fn collect_from(root: &Path) -> (SmbiosTopology, SmbiosSourceStatus) {
     let mut topology = SmbiosTopology::empty();
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(_) => return topology, // no dmi dir -> empty (no panic)
+        Err(e) => {
+            // M-17: distinguish "absent" (VM / container / non-Intel) from
+            // a permission / I/O failure.
+            let status = if e.kind() == std::io::ErrorKind::NotFound {
+                SmbiosSourceStatus::DirAbsent
+            } else {
+                SmbiosSourceStatus::Unreadable
+            };
+            return (topology, status);
+        }
     };
+    // M-12: the SMBIOS major version selects the Type 17 offset table
+    // (3.x carries the +2 `Error Information Handle` shift; 2.x does not).
+    let major = read_bios_major(root);
+    let offsets = if major >= 3 { SMBIOS3_OFFSETS } else { SMBIOS2_OFFSETS };
     // Collect the Type 17 entries and sort by file name for a deterministic
     // processing order (the kernel numbers them `17-0`, `17-1`, ...;
     // `read_dir` order is filesystem-dependent, so sorting keeps the
@@ -182,20 +286,30 @@ pub fn collect_from(root: &Path) -> SmbiosTopology {
         })
         .collect();
     paths.sort();
+    // M-17: a present-but-corrupt structure (or an unreadable `raw` file)
+    // is a parse failure, distinct from a valid unpopulated DIMM.
+    let mut saw_invalid = false;
     for path in paths {
         // The kernel exports each `17-<n>` as a *directory*; the
         // structure bytes live in the payload file `17-<n>/raw`.
         let bytes = match std::fs::read(path.join("raw")) {
             Ok(b) => b,
-            Err(_) => continue, // unreadable -> skip (no panic)
-        };
-        if let Some((capacity, mem_type, locator)) = parse_type17(&bytes) {
-            topology.populated_count = topology.populated_count.saturating_add(1);
-            topology.dimm_sizes.push(capacity);
-            if topology.memory_type.is_none() {
-                topology.memory_type = mem_type;
+            Err(_) => {
+                saw_invalid = true;
+                continue; // unreadable -> skip (no panic)
             }
-            topology.locators.push(locator);
+        };
+        match parse_type17(&bytes, &offsets) {
+            Type17Parse::Populated(capacity, mem_type, locator) => {
+                topology.populated_count = topology.populated_count.saturating_add(1);
+                topology.dimm_sizes.push(capacity);
+                if topology.memory_type.is_none() {
+                    topology.memory_type = mem_type;
+                }
+                topology.locators.push(locator);
+            }
+            Type17Parse::Unpopulated => {} // valid structure, empty DIMM
+            Type17Parse::Invalid => saw_invalid = true,
         }
     }
     // Board-keyed channel grammar (TEL-3): the DMI board name selects the
@@ -203,72 +317,97 @@ pub fn collect_from(root: &Path) -> SmbiosTopology {
     // rules only.
     let board = read_board_name(root);
     topology.derived_mode = derive_mode(board.as_deref(), &topology.locators);
-    topology
+    let status = if saw_invalid {
+        SmbiosSourceStatus::ParseError
+    } else {
+        SmbiosSourceStatus::Ok
+    };
+    (topology, status)
 }
 
-/// Parse one raw SMBIOS Type 17 structure into its (capacity, memory type,
-/// locator) triple, or `None` when the DIMM is unpopulated (capacity `0`)
-/// or the structure is too short to carry the fields.
+/// The outcome of parsing one raw Type 17 structure (M-17): a populated
+/// DIMM, a valid-but-unpopulated DIMM (capacity `0` — **not** an error),
+/// or a corrupt / too-short structure (a parse failure).
+enum Type17Parse {
+    /// A populated DIMM: (capacity MiB, memory type, locator).
+    Populated(u64, Option<MemoryTech>, String),
+    /// A valid structure whose DIMM is unpopulated (capacity `0`).
+    Unpopulated,
+    /// A corrupt / too-short structure (a parse failure).
+    Invalid,
+}
+
+/// Parse one raw SMBIOS Type 17 structure using the given version's
+/// [`Type17Offsets`] (M-12), classifying the outcome (M-17): a populated
+/// DIMM, a valid unpopulated DIMM, or a corrupt / too-short structure.
 ///
 /// # No-panic contract
 ///
 /// Every field read is bounds-checked; a short / corrupt structure yields
-/// `None` (skipped) rather than a panic.
-fn parse_type17(bytes: &[u8]) -> Option<(u64, Option<MemoryTech>, String)> {
+/// [`Type17Parse::Invalid`] (skipped) rather than a panic.
+fn parse_type17(bytes: &[u8], offsets: &Type17Offsets) -> Type17Parse {
     if bytes.len() < 2 {
-        return None;
+        return Type17Parse::Invalid;
     }
     let len = (bytes[OFF_LENGTH] as usize).min(bytes.len());
     let fixed = &bytes[..len];
     let table = &bytes[len..];
 
-    // Capacity: the `0x0C` word — per SMBIOS 3.5 (DSP0134 Table 76) the
+    // The fixed part must carry the capacity word — a shorter structure is
+    // corrupt (M-17: a parse failure, distinct from a valid unpopulated
+    // DIMM).
+    if fixed.len() < offsets.capacity + CAPACITY_LEN {
+        return Type17Parse::Invalid;
+    }
+
+    // Capacity: the version-keyed word — per SMBIOS (DSP0134 Table 76) the
     // magnitude is set by bit 15: **clear = MB, set = KB** (`0x4000` =
     // 16384 MB = the reference 16 GiB DIMM). The sentinel words
     // `0x7FFF` (≥ 32 GiB − 1 MiB) and `0xFFFF` (unknown), like a `0`
-    // word, fall through to the `0x1C` Extended Size dword (MiB); both
+    // word, fall through to the Extended Size dword (3.x only, MiB); both
     // zero = unpopulated DIMM.
-    let mut capacity: u64 = 0;
-    if fixed.len() >= OFF_CAPACITY + CAPACITY_LEN {
-        let word = u16::from_le_bytes([fixed[OFF_CAPACITY], fixed[OFF_CAPACITY + 1]]);
-        capacity = match word {
-            // Sentinels (and "not installed") -> the extended dword.
-            0x0000 | 0x7FFF | 0xFFFF => 0,
-            _ => {
-                let size = (word & 0x7FFF) as u64;
-                if word & 0x8000 != 0 {
-                    size / 1024 // KB -> MiB (floor)
-                } else {
-                    size // MB
-                }
+    let word = u16::from_le_bytes([fixed[offsets.capacity], fixed[offsets.capacity + 1]]);
+    let mut capacity: u64 = match word {
+        // Sentinels (and "not installed") -> the extended dword.
+        0x0000 | 0x7FFF | 0xFFFF => 0,
+        _ => {
+            let size = (word & 0x7FFF) as u64;
+            if word & 0x8000 != 0 {
+                size / 1024 // KB -> MiB (floor)
+            } else {
+                size // MB
             }
-        };
-    }
-    if capacity == 0 && fixed.len() >= OFF_CAPACITY_EXTENDED + 4 {
-        let mut buf = [0u8; 4];
-        buf.copy_from_slice(&fixed[OFF_CAPACITY_EXTENDED..OFF_CAPACITY_EXTENDED + 4]);
-        capacity = u32::from_le_bytes(buf) as u64; // MiB (bits 30:0)
+        }
+    };
+    if capacity == 0 {
+        if let Some(ext_off) = offsets.capacity_extended {
+            if fixed.len() >= ext_off + 4 {
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&fixed[ext_off..ext_off + 4]);
+                capacity = u32::from_le_bytes(buf) as u64; // MiB (bits 30:0)
+            }
+        }
     }
     if capacity == 0 {
-        return None; // unpopulated DIMM
+        return Type17Parse::Unpopulated;
     }
 
-    // Memory type @ 0x12 (0x1A = DDR4, 0x22 = DDR5).
-    let mem_type = if fixed.len() > OFF_MEMORY_TYPE {
-        MemoryTech::from_smbios_type(fixed[OFF_MEMORY_TYPE])
+    // Memory type (version-keyed; 0x1A = DDR4, 0x22 = DDR5).
+    let mem_type = if fixed.len() > offsets.memory_type {
+        MemoryTech::from_smbios_type(fixed[offsets.memory_type])
     } else {
         None
     };
 
-    // Locator: the Memory Device Locator string (0x10), falling back to
-    // the Bank Locator string (0x11) when the former is empty / absent.
-    let mem_ref = if fixed.len() > OFF_MEM_DEVICE_LOCATOR {
-        fixed[OFF_MEM_DEVICE_LOCATOR]
+    // Locator: the Memory Device Locator string (version-keyed), falling
+    // back to the Bank Locator string when the former is empty / absent.
+    let mem_ref = if fixed.len() > offsets.mem_device_locator {
+        fixed[offsets.mem_device_locator]
     } else {
         0
     };
-    let bank_ref = if fixed.len() > OFF_BANK_LOCATOR {
-        fixed[OFF_BANK_LOCATOR]
+    let bank_ref = if fixed.len() > offsets.bank_locator {
+        fixed[offsets.bank_locator]
     } else {
         0
     };
@@ -277,7 +416,7 @@ fn parse_type17(bytes: &[u8]) -> Option<(u64, Option<MemoryTech>, String)> {
         .or_else(|| string_at(table, bank_ref))
         .unwrap_or_default();
 
-    Some((capacity, mem_type, locator))
+    Type17Parse::Populated(capacity, mem_type, locator)
 }
 
 /// Extract the `ref_idx`-th string from a raw SMBIOS string table
@@ -427,6 +566,18 @@ fn read_board_name(root: &Path) -> Option<String> {
     }
 }
 
+/// The SMBIOS major version of the DMI source (M-12), read from the
+/// `id/bios_major` file (a sibling of the `entries` directory that `root`
+/// points to). The canonical path is `/sys/firmware/dmi/id/bios_major`.
+/// Absent / unreadable / non-numeric → the modern default `3` (the SMBIOS
+/// 3.x layout — the reference board is 3.5); a real 2.x BIOS reports `2`
+/// and selects the 2.x offset table.
+fn read_bios_major(root: &Path) -> u8 {
+    let base = root.parent();
+    let text = base.and_then(|b| std::fs::read_to_string(b.join("id").join("bios_major")).ok());
+    text.and_then(|t| t.trim().parse().ok()).unwrap_or(3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +642,15 @@ mod tests {
             std::fs::create_dir_all(&id).expect("dmi id dir");
             std::fs::write(id.join("board_name"), name).expect("board_name write");
         }
+
+        /// Write the DMI `id/bios_major` (a sibling of `root`) — the
+        /// version-aware offset-table selector (M-12).
+        fn write_bios_major(&self, major: u8) {
+            let id = self.root.parent().expect("base dir").join("id");
+            std::fs::create_dir_all(&id).expect("dmi id dir");
+            std::fs::write(id.join("bios_major"), major.to_string())
+                .expect("bios_major write");
+        }
     }
 
     impl Drop for TempDmi {
@@ -509,21 +669,23 @@ mod tests {
     /// the device-locator value, ref 2 = the bank-locator value (the
     /// same locator in both, as on the reference board).
     fn populated_ddr4(locator: &str) -> Vec<u8> {
+        let o = SMBIOS3_OFFSETS;
         let mut fixed = [0u8; 0x20];
-        fixed[OFF_CAPACITY..OFF_CAPACITY + CAPACITY_LEN].copy_from_slice(&0x4000u16.to_le_bytes());
-        fixed[OFF_MEM_DEVICE_LOCATOR] = 1;
-        fixed[OFF_BANK_LOCATOR] = 2;
-        fixed[OFF_MEMORY_TYPE] = 0x1A; // DDR4
+        fixed[o.capacity..o.capacity + CAPACITY_LEN].copy_from_slice(&0x4000u16.to_le_bytes());
+        fixed[o.mem_device_locator] = 1;
+        fixed[o.bank_locator] = 2;
+        fixed[o.memory_type] = 0x1A; // DDR4
         type17_file(0x20, &mut fixed, &[locator, locator])
     }
 
     /// An unpopulated DIMM (the `0x0C` word and the `0x1C` extended dword
     /// are both zero) — must be skipped.
     fn unpopulated() -> Vec<u8> {
+        let o = SMBIOS3_OFFSETS;
         let mut fixed = [0u8; 0x20];
-        fixed[OFF_MEMORY_TYPE] = 0x1A;
-        fixed[OFF_MEM_DEVICE_LOCATOR] = 1;
-        fixed[OFF_BANK_LOCATOR] = 2;
+        fixed[o.memory_type] = 0x1A;
+        fixed[o.mem_device_locator] = 1;
+        fixed[o.bank_locator] = 2;
         // capacity (0x0C word + 0x1C dword) stays 0
         type17_file(0x20, &mut fixed, &["A1", "A1"])
     }
@@ -575,7 +737,7 @@ const REAL_12600KF_17_1: &[u8] = &[
         write_entry(&dmi.root, 0, &populated_ddr4("A2"));
         write_entry(&dmi.root, 1, &populated_ddr4("B2"));
 
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t.populated_count, 2);
         assert_eq!(t.dimm_sizes, vec![16384, 16384]);
         assert_eq!(t.memory_type, Some(MemoryTech::Ddr4));
@@ -589,7 +751,7 @@ const REAL_12600KF_17_1: &[u8] = &[
         let dmi = TempDmi::new("single");
         write_entry(&dmi.root, 0, &populated_ddr4("A1"));
 
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t.populated_count, 1);
         assert_eq!(t.dimm_sizes, vec![16384]);
         assert_eq!(t.memory_type, Some(MemoryTech::Ddr4));
@@ -606,7 +768,7 @@ const REAL_12600KF_17_1: &[u8] = &[
         write_entry(&dmi.root, 0, &populated_ddr4("A1"));
         write_entry(&dmi.root, 1, &populated_ddr4("A2"));
 
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t.populated_count, 2);
         assert_eq!(t.derived_mode, DerivedMode::Single);
     }
@@ -620,7 +782,7 @@ const REAL_12600KF_17_1: &[u8] = &[
         write_entry(&dmi.root, 0, &populated_ddr4("DIMM 1"));
         write_entry(&dmi.root, 1, &populated_ddr4("DIMM 2"));
 
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t.populated_count, 2);
         assert_eq!(t.locators, vec!["DIMM 1".to_owned(), "DIMM 2".to_owned()]);
         assert_eq!(t.derived_mode, DerivedMode::Ambiguous);
@@ -631,7 +793,7 @@ const REAL_12600KF_17_1: &[u8] = &[
     #[test]
     fn empty_dir_is_empty_topology() {
         let dmi = TempDmi::new("empty");
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t, SmbiosTopology::empty());
     }
 
@@ -639,7 +801,7 @@ const REAL_12600KF_17_1: &[u8] = &[
     /// topology (no panic).
     #[test]
     fn missing_dir_is_empty_topology() {
-        let t = collect_from(Path::new("/nonexistent/dmi/entries-xyz"));
+        let (t, _status) = collect_from(Path::new("/nonexistent/dmi/entries-xyz"));
         assert_eq!(t, SmbiosTopology::empty());
     }
 
@@ -652,7 +814,7 @@ const REAL_12600KF_17_1: &[u8] = &[
         write_entry(&dmi.root, 1, &unpopulated());
         write_entry(&dmi.root, 2, &unpopulated());
 
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t.populated_count, 1);
         assert_eq!(t.dimm_sizes, vec![16384]);
         assert_eq!(t.locators, vec!["A2".to_owned()]);
@@ -661,16 +823,17 @@ const REAL_12600KF_17_1: &[u8] = &[
     /// (h) A DDR5 memory-type field (`0x22`) decodes to [`MemoryTech::Ddr5`].
     #[test]
     fn ddr5_memory_type_decodes() {
+        let o = SMBIOS3_OFFSETS;
         let mut fixed = [0u8; 0x20];
-        fixed[OFF_MEMORY_TYPE] = 0x22; // DDR5
-        fixed[OFF_MEM_DEVICE_LOCATOR] = 1;
-        fixed[OFF_BANK_LOCATOR] = 2;
-        fixed[OFF_CAPACITY..OFF_CAPACITY + CAPACITY_LEN].copy_from_slice(&0x4000u16.to_le_bytes());
+        fixed[o.memory_type] = 0x22; // DDR5
+        fixed[o.mem_device_locator] = 1;
+        fixed[o.bank_locator] = 2;
+        fixed[o.capacity..o.capacity + CAPACITY_LEN].copy_from_slice(&0x4000u16.to_le_bytes());
         let bytes = type17_file(0x20, &mut fixed, &["A2", "A2"]);
 
         let dmi = TempDmi::new("ddr5");
         write_entry(&dmi.root, 0, &bytes);
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t.memory_type, Some(MemoryTech::Ddr5));
     }
 
@@ -680,7 +843,7 @@ const REAL_12600KF_17_1: &[u8] = &[
     fn short_structure_is_skipped() {
         let dmi = TempDmi::new("short");
         write_entry(&dmi.root, 0, &[0x11]); // one byte (type only, no length)
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t, SmbiosTopology::empty());
     }
 
@@ -738,7 +901,7 @@ const REAL_12600KF_17_1: &[u8] = &[
         // The board name selects the `Controller<digit>` grammar (TEL-3).
         dmi.write_board_name("ASRock Z690M-ITX/ax");
 
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t.populated_count, 2);
         assert_eq!(t.dimm_sizes, vec![16384, 16384]);
         assert_eq!(t.memory_type, Some(MemoryTech::Ddr4));
@@ -803,8 +966,105 @@ const REAL_12600KF_17_1: &[u8] = &[
         let dmi = TempDmi::new("tel3-keyed");
         write_entry(&dmi.root, 0, REAL_12600KF_17_0);
         write_entry(&dmi.root, 1, REAL_12600KF_17_1);
-        assert_eq!(collect_from(&dmi.root).derived_mode, DerivedMode::Ambiguous);
+        let (t, _status) = collect_from(&dmi.root);
+        assert_eq!(t.derived_mode, DerivedMode::Ambiguous);
         dmi.write_board_name("ASRock Z690M-ITX/ax");
-        assert_eq!(collect_from(&dmi.root).derived_mode, DerivedMode::Dual);
+        let (t, _status) = collect_from(&dmi.root);
+        assert_eq!(t.derived_mode, DerivedMode::Dual);
+    }
+
+    /// A populated DDR4 DIMM in the classic **SMBIOS 2.x** layout (M-12):
+    /// the capacity word is at `0x0A` (not `0x0C`), the memory type at
+    /// `0x0B`, and the locators at `0x08`/`0x09` — the 3.x values shifted
+    /// -2 (no `Error Information Handle`). `16384` MB = 16 GiB.
+    fn populated_ddr4_2x(locator: &str) -> Vec<u8> {
+        let o = SMBIOS2_OFFSETS;
+        let mut fixed = [0u8; 0x20];
+        fixed[o.capacity..o.capacity + CAPACITY_LEN].copy_from_slice(&0x4000u16.to_le_bytes());
+        fixed[o.memory_type] = 0x1A; // DDR4
+        fixed[o.mem_device_locator] = 1;
+        fixed[o.bank_locator] = 2;
+        type17_file(0x20, &mut fixed, &[locator, locator])
+    }
+
+    /// (M-12) A SMBIOS 2.6 layout (the classic table, no +2 `Error
+    /// Information Handle` shift): two populated DDR4 DIMMs in matched
+    /// slots `A2` + `B2` parse to 2 × 16 GiB DDR4 and a `Dual` derived
+    /// mode — selected by the `id/bios_major = 2` file. This pins the
+    /// version-aware offset table (the 3.x fixtures above pin the other).
+    #[test]
+    fn smbios_2_6_layout_parses_with_the_2x_table() {
+        let dmi = TempDmi::new("smbios-2-6");
+        // M-12: the version file selects the 2.x offset table.
+        dmi.write_bios_major(2);
+        write_entry(&dmi.root, 0, &populated_ddr4_2x("A2"));
+        write_entry(&dmi.root, 1, &populated_ddr4_2x("B2"));
+
+        let (t, status) = collect_from(&dmi.root);
+        assert_eq!(status, SmbiosSourceStatus::Ok);
+        assert_eq!(t.populated_count, 2);
+        assert_eq!(t.dimm_sizes, vec![16384, 16384]);
+        assert_eq!(t.memory_type, Some(MemoryTech::Ddr4));
+        assert_eq!(t.locators, vec!["A2".to_owned(), "B2".to_owned()]);
+        assert_eq!(t.derived_mode, DerivedMode::Dual);
+    }
+
+    /// (M-12) The same 2.x-layout DIMM, when no `bios_major` file is
+    /// present, defaults to the 3.x table and the 2.x offsets do NOT line
+    /// up — a guard that the version file is what selects the layout (the
+    /// default is the modern 3.x, matching the reference board).
+    #[test]
+    fn missing_bios_major_defaults_to_the_3x_table() {
+        let dmi = TempDmi::new("smbios-default-3x");
+        // A 3.x-layout DIMM parses cleanly with the default (no version
+        // file → 3.x).
+        write_entry(&dmi.root, 0, &populated_ddr4("A2"));
+        let (t, status) = collect_from(&dmi.root);
+        assert_eq!(status, SmbiosSourceStatus::Ok);
+        assert_eq!(t.populated_count, 1);
+        assert_eq!(t.dimm_sizes, vec![16384]);
+    }
+
+    /// (M-17) The source status distinguishes *why* the topology is
+    /// empty: a missing directory is `DirAbsent`, a corrupt (too-short)
+    /// structure is `ParseError`, and a readable-but-empty directory is
+    /// `Ok` (a legitimate no-DIMM source, not a failure).
+    #[test]
+    fn source_status_tracks_the_failure_mode() {
+        // Missing directory → DirAbsent.
+        let (_, status) = collect_from(Path::new("/nonexistent/dmi/entries-xyz"));
+        assert_eq!(status, SmbiosSourceStatus::DirAbsent);
+
+        // A corrupt (too-short) structure → ParseError.
+        let dmi = TempDmi::new("m17-corrupt");
+        write_entry(&dmi.root, 0, &[0x11]); // one byte (no length)
+        let (t, status) = collect_from(&dmi.root);
+        assert_eq!(status, SmbiosSourceStatus::ParseError);
+        assert_eq!(t, SmbiosTopology::empty());
+
+        // A readable-but-empty directory → Ok (legitimately no DIMMs).
+        let dmi = TempDmi::new("m17-empty-ok");
+        let (t, status) = collect_from(&dmi.root);
+        assert_eq!(status, SmbiosSourceStatus::Ok);
+        assert_eq!(t, SmbiosTopology::empty());
+    }
+
+    /// (M-17) the [`SmbiosSourceStatus`] `Display` renders each variant as
+    /// the human annotation the facade threads into the readout.
+    #[test]
+    fn smbios_source_status_display() {
+        assert_eq!(SmbiosSourceStatus::Ok.to_string(), "ok");
+        assert_eq!(
+            SmbiosSourceStatus::DirAbsent.to_string(),
+            "DMI source absent (VM/container/non-Intel)"
+        );
+        assert_eq!(
+            SmbiosSourceStatus::Unreadable.to_string(),
+            "DMI source unreadable"
+        );
+        assert_eq!(
+            SmbiosSourceStatus::ParseError.to_string(),
+            "DMI structure corrupt"
+        );
     }
 }
