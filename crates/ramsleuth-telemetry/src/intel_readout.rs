@@ -177,6 +177,7 @@ use crate::intel_gen::{
 };
 use crate::intel_mchbar::MchBar;
 use crate::intel_smbios::{DerivedMode, SmbiosTopology};
+use crate::spd_decode::SpdModule;
 
 // ---------------------------------------------------------------------------
 // Hardware-authoritative Tier-1 register table (MCHBAR-relative offsets).
@@ -2260,6 +2261,262 @@ pub fn read_regs(regs: &IntelImcRegs) -> IntelReadout {
 }
 
 // ---------------------------------------------------------------------------
+// Server-uncore decode (Haswell-E / Broadwell-E / Skylake-X / Cascade Lake):
+// no OS-accessible MC timing registers — the telemetry sources SMBIOS Type 17
+// + the SPD EEPROM, never the MCHBAR MMIO window.
+// ---------------------------------------------------------------------------
+
+/// The true reason a structurally-absent MC-live register field carries on
+/// server uncore (an honest N/A — never a placeholder zero, never a
+/// fabricated value).
+pub const SERVER_NA_REASON: &str = "server uncore: no OS-accessible MC timing registers";
+
+/// `true` for a generation on the `Server` register-map family (the
+/// server-uncore platforms — Haswell-E / Broadwell-E / Skylake-X / Cascade
+/// Lake). These have no OS-accessible MC timing registers, so the decode
+/// sources SMBIOS + SPD (see [`decode_server`]) and never reads the MCHBAR
+/// MMIO window.
+pub fn is_server_gen(gen: IntelGen) -> bool {
+    matches!(profile_for(gen).map(|p| p.map), Some(GenMap::Server))
+}
+
+/// The server-uncore decode: one [`IntelChannel`] per the generation's
+/// channel count, every cell sourced from real hardware — the SMBIOS Type 17
+/// topology (capacity / technology / population) and the SPD EEPROM (rated
+/// timings / speed) — with the MC-live register fields an honest N/A.
+///
+/// # Mapping (all real data, no fabrication)
+///
+/// - `clocks.mclk_mhz` ← the SPD module's rated data rate / 2 (the analog
+///   DRAM clock — a DDR4-2400 module → 1200 MHz); `Na(NotApplicable)` when no
+///   module carries a speed. Every other clock / gear / command-rate cell is
+///   `Na(NotApplicable)` (no OS-accessible source).
+/// - `timings` — the four SPD-rated core timings (`cl` / `rcdrd` / `rcwdwr` /
+///   `rp` / `ras` + the synthesized `rc = ras + rp`) are `Value`s from the
+///   module's factory profile; every other MC-live timing is `Na` with
+///   [`SERVER_NA_REASON`]. A module with no usable profile degrades all its
+///   timing cells to the same honest reason.
+/// - `cad_bus` / `voltages` / `rtl` → `Na(NotApplicable)` (the IMC window does
+///   not expose them — as on the client Tier-1 decode).
+/// - `channel_mode` / `memory_tech` / `channel_trust` / `dimm_count` ← the
+///   SMBIOS Type 17 topology resolved with **no** MMIO input (the 4-tier
+///   [`resolve_channel`] firmware-verified L2 / L4 states).
+/// - `channel_annotation` ← the honest source note (timings SPD-rated,
+///   topology firmware-verified, the populated/total channel count).
+/// - `ecc_status` ← [`EccStatus::Unknown`] (no OS-accessible ECC source on
+///   server uncore; never fabricated).
+///
+/// # No-panic contract (D5)
+///
+/// Pure: no I/O, no `unsafe`. An empty SPD list degrades the timing / clock
+/// cells to N/A while the SMBIOS topology still carries the readout; a
+/// missing / ambiguous SMBIOS topology degrades the channel mode to the
+/// honest terminal state. Never a panic, never an invented value.
+pub fn decode_server(
+    smbios: &SmbiosTopology,
+    spd: &[SpdModule],
+    gen: IntelGen,
+) -> IntelReadout {
+    let count = channel_count(gen);
+
+    // The representative SPD module: the first one carrying usable rated
+    // data (a speed or a profile timing); `None` when no module is present.
+    let rep = spd.iter().find(|m| {
+        m.speed_mts.value().is_some()
+            || m.profiles
+                .iter()
+                .any(|p| p.cas.value().is_some() || p.trcd.value().is_some())
+    });
+
+    // The analog DRAM clock from the representative module's rated data rate
+    // (DDR: MT/s = MCLK × 2).
+    let mclk = rep
+        .and_then(|m| m.speed_mts.value().copied())
+        .map(|mts| Section::Value(f64::from(mts) / 2.0))
+        .unwrap_or(Section::na(NaReason::NotApplicable));
+    let clocks = server_clocks(&mclk);
+
+    let mut channels = Vec::with_capacity(usize::from(count));
+    for i in 0..count {
+        // Per-channel: the module bound to this channel when present, else
+        // the representative (a matched kit runs every channel at the same
+        // rated timing). No module at all → the all-Na timing set.
+        let module = spd.get(i as usize).or(rep);
+        let timings = match module {
+            Some(m) => server_timings(m),
+            None => all_na_timings(),
+        };
+        channels.push(IntelChannel {
+            index: i,
+            clocks: clocks.clone(),
+            timings,
+            cad_bus: all_na_cad_bus(),
+            voltages: all_na_voltages(),
+            rtl: Section::na(NaReason::NotApplicable),
+        });
+    }
+
+    // The SMBIOS Type 17 topology, resolved with NO MMIO input (the 4-tier
+    // procedure's firmware-verified L2 / L4 states).
+    let res = resolve_channel(None, smbios.memory_type, smbios);
+
+    let annotation = format!(
+        "Server uncore: no OS-accessible MC timing registers — timings are \
+         SPD-rated (module EEPROM), topology is SMBIOS Type 17 ({} of {} \
+         channels populated)",
+        res.dimm_count, count
+    );
+
+    IntelReadout {
+        channels,
+        channel_mode: res.mode,
+        ecc_status: EccStatus::Unknown,
+        memory_tech: res.tech,
+        channel_trust: res.trust,
+        channel_annotation: annotation,
+        dimm_count: res.dimm_count,
+    }
+}
+
+/// The server-uncore clock cells: `mclk` from the SPD rated data rate; every
+/// other clock / gear / command-rate cell `Na(NotApplicable)` (no
+/// OS-accessible source).
+fn server_clocks(mclk: &Section<f64>) -> ClockReadout {
+    ClockReadout {
+        mclk_mhz: mclk.clone(),
+        uclk_mhz: Section::na(NaReason::NotApplicable),
+        fclk_mhz: Section::na(NaReason::NotApplicable),
+        div_mode: Section::na(NaReason::NotApplicable),
+        gear_mode: Section::na(NaReason::NotApplicable),
+        gdm: Section::na(NaReason::NotApplicable),
+        pdm: Section::na(NaReason::NotApplicable),
+        command_rate: Section::na(NaReason::NotApplicable),
+    }
+}
+
+/// An MC-live timing cell's honest server-uncore N/A ([`SERVER_NA_REASON`]).
+fn server_na_u16() -> Section<u16> {
+    Section::na(NaReason::ParseError(SERVER_NA_REASON.to_owned()))
+}
+
+/// The SPD-rated core timings for one module: the four JEDEC core timings
+/// (`cl` / `rcdrd` / `rcwdwr` / `rp` / `ras` + the synthesized `rc`) from the
+/// module's factory profile (profile 1); every other MC-live timing is
+/// [`server_na_u16`]. A module with no usable profile degrades all its
+/// timing cells to the same honest reason.
+fn server_timings(module: &SpdModule) -> TimingSet {
+    let rating = |v: Option<u8>| match v {
+        Some(t) if t > 0 => Section::Value(u16::from(t)),
+        _ => server_na_u16(),
+    };
+    let (cl, trcd, trp, tras) = match module.profiles.first() {
+        Some(p) => (
+            p.cas.value().copied(),
+            p.trcd.value().copied(),
+            p.trp.value().copied(),
+            p.tras.value().copied(),
+        ),
+        None => (None, None, None, None),
+    };
+    // tRC = tRAS + tRP (the JEDEC identity — Intel exposes no tRC register),
+    // when both decode.
+    let rc = match (tras, trp) {
+        (Some(a), Some(r)) if a > 0 && r > 0 => Section::Value(u16::from(a) + u16::from(r)),
+        _ => server_na_u16(),
+    };
+    TimingSet {
+        cl: rating(cl),
+        rcwdwr: rating(trcd),
+        rcdrd: rating(trcd),
+        rp: rating(trp),
+        ras: rating(tras),
+        rc,
+        rrds: server_na_u16(),
+        rrld: server_na_u16(),
+        faw: server_na_u16(),
+        wtrs: server_na_u16(),
+        wtrl: server_na_u16(),
+        wr: server_na_u16(),
+        rfc1: server_na_u16(),
+        rfc2: server_na_u16(),
+        rfcsb: server_na_u16(),
+        cwl: server_na_u16(),
+        rtp: server_na_u16(),
+        rdwr: server_na_u16(),
+        wrrd: server_na_u16(),
+        rdrd_sd: server_na_u16(),
+        rdrd_dd: server_na_u16(),
+        rdrd_scl: server_na_u16(),
+        rdrd_sc: server_na_u16(),
+        wrwr_sd: server_na_u16(),
+        wrwr_dd: server_na_u16(),
+        wrwr_scl: server_na_u16(),
+        wrwr_sc: server_na_u16(),
+    }
+}
+
+/// The all-Na timing set (no SPD module present): every cell the honest
+/// server-uncore reason.
+fn all_na_timings() -> TimingSet {
+    TimingSet {
+        cl: server_na_u16(),
+        rcwdwr: server_na_u16(),
+        rcdrd: server_na_u16(),
+        rp: server_na_u16(),
+        ras: server_na_u16(),
+        rc: server_na_u16(),
+        rrds: server_na_u16(),
+        rrld: server_na_u16(),
+        faw: server_na_u16(),
+        wtrs: server_na_u16(),
+        wtrl: server_na_u16(),
+        wr: server_na_u16(),
+        rfc1: server_na_u16(),
+        rfc2: server_na_u16(),
+        rfcsb: server_na_u16(),
+        cwl: server_na_u16(),
+        rtp: server_na_u16(),
+        rdwr: server_na_u16(),
+        wrrd: server_na_u16(),
+        rdrd_sd: server_na_u16(),
+        rdrd_dd: server_na_u16(),
+        rdrd_scl: server_na_u16(),
+        rdrd_sc: server_na_u16(),
+        wrwr_sd: server_na_u16(),
+        wrwr_dd: server_na_u16(),
+        wrwr_scl: server_na_u16(),
+        wrwr_sc: server_na_u16(),
+    }
+}
+
+/// The CAD-bus cells, all `Na(NotApplicable)` (the IMC window does not expose
+/// drive strengths — as on the client decode).
+fn all_na_cad_bus() -> CadBus {
+    CadBus {
+        proc_odt: Section::na(NaReason::NotApplicable),
+        rtt_nom: Section::na(NaReason::NotApplicable),
+        rtt_wr: Section::na(NaReason::NotApplicable),
+        rtt_park: Section::na(NaReason::NotApplicable),
+        clk_drv: Section::na(NaReason::NotApplicable),
+        addr_cmd_drv: Section::na(NaReason::NotApplicable),
+        cs_odt_drv: Section::na(NaReason::NotApplicable),
+        cke_drv: Section::na(NaReason::NotApplicable),
+    }
+}
+
+/// The voltage cells, all `Na(NotApplicable)` (the IMC window does not expose
+/// memory rails — as on the client decode).
+fn all_na_voltages() -> VoltageSet {
+    VoltageSet {
+        vddcr_soc_mv: Section::na(NaReason::NotApplicable),
+        vddio_mem_mv: Section::na(NaReason::NotApplicable),
+        vdd_misc_mv: Section::na(NaReason::NotApplicable),
+        vpp_mv: Section::na(NaReason::NotApplicable),
+        vcore_mv: Section::na(NaReason::NotApplicable),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Frozen display types (shape unchanged — wire-safe, bincode round-trips
 // stay valid; only which cells carry `Value` vs `Na` changes).
 // ---------------------------------------------------------------------------
@@ -2848,6 +3105,7 @@ mod tests {
     use super::*;
     use crate::cpuid::AmdZen;
     use crate::intel_gen::ALDER_CHANNELS;
+    use crate::spd_decode::SpdProfile;
 
     // -----------------------------------------------------------------
     // The §6.1 acceptance fixture (Skylake i5-6600T, ratio 18 @
@@ -6226,5 +6484,170 @@ mod tests {
         );
         assert_eq!(ro.channel_mode, None);
         assert_eq!(ro.channel_trust, Some(ChannelTrust::None));
+    }
+
+    // -----------------------------------------------------------------
+    // Server-uncore decode (Haswell-E / Broadwell-E / Skylake-X /
+    // Cascade Lake): SMBIOS + SPD sourcing, honest N/A for MC-live.
+    // -----------------------------------------------------------------
+
+    /// A populated SMBIOS Type 17 topology (2 × 8 GiB DDR4 across two
+    /// channels — the x99 reference shape).
+    fn server_smbios() -> SmbiosTopology {
+        SmbiosTopology {
+            populated_count: 2,
+            dimm_sizes: vec![8192, 8192],
+            memory_type: Some(MemoryTech::Ddr4),
+            locators: vec!["A1".to_owned(), "B1".to_owned()],
+            derived_mode: DerivedMode::Dual,
+        }
+    }
+
+    /// A DDR4 SPD module with a factory profile carrying the given rated
+    /// timings.
+    fn server_spd_module(
+        index: u8,
+        speed_mts: u16,
+        cl: u8,
+        trcd: u8,
+        trp: u8,
+        tras: u8,
+    ) -> SpdModule {
+        SpdModule {
+            index,
+            is_ddr5: false,
+            maker: Section::Value("Samsung".to_owned()),
+            die_maker: Section::Value("Samsung".to_owned()),
+            die_type: Section::na(NaReason::NotApplicable),
+            devices: Section::Value(16),
+            part: Section::Value("M393B2K40DB0-ITD".to_owned()),
+            serial: Section::Value("0ABC1234".to_owned()),
+            rank: Section::Value(1),
+            density_mbit: Section::Value(16384),
+            speed_mts: Section::Value(speed_mts),
+            profiles: vec![SpdProfile {
+                index: 1,
+                speed_mts: Section::Value(speed_mts),
+                cas: Section::Value(cl),
+                trcd: Section::Value(trcd),
+                trp: Section::Value(trp),
+                tras: Section::Value(tras),
+                voltage: Section::Value(1200),
+            }],
+        }
+    }
+
+    /// `is_server_gen` classifies the four server-uncore generations and
+    /// rejects every client / unprofiled generation.
+    #[test]
+    fn is_server_gen_classifies_server_platforms() {
+        for gen in [
+            IntelGen::HaswellE,
+            IntelGen::BroadwellE,
+            IntelGen::SkylakeX,
+            IntelGen::CascadeLake,
+        ] {
+            assert!(is_server_gen(gen), "{gen:?} is a server gen");
+        }
+        for gen in [
+            IntelGen::Skylake,
+            IntelGen::KabyLake,
+            IntelGen::CoffeeLake,
+            IntelGen::CometLake,
+            IntelGen::RocketLake,
+            IntelGen::AlderLake,
+            IntelGen::RaptorLake,
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
+            IntelGen::Unrecognized,
+        ] {
+            assert!(!is_server_gen(gen), "{gen:?} is not a server gen");
+        }
+    }
+
+    /// The Broadwell-E (x99 reference) server decode: 4 channels, MCLK from
+    /// the SPD rated speed (2400 MT/s → 1200 MHz), the four SPD-rated core
+    /// timings (+ the synthesized tRC) as `Value`s, every other MC-live
+    /// timing the honest server-uncore N/A, the SMBIOS topology carried
+    /// (dual-channel, DDR4, 2 DIMMs), and the honest source annotation.
+    #[test]
+    fn decode_server_broadwell_e_sources_smbios_and_spd() {
+        let smbios = server_smbios();
+        let spd = vec![
+            server_spd_module(0x50, 2400, 16, 16, 16, 32),
+            server_spd_module(0x51, 2400, 16, 16, 16, 32),
+        ];
+        let ro = decode_server(&smbios, &spd, IntelGen::BroadwellE);
+
+        // Quad-channel Broadwell-E.
+        assert_eq!(ro.channels.len(), 4, "Broadwell-E is quad-channel");
+        // MCLK = SPD rated speed / 2 (2400 MT/s → 1200 MHz).
+        assert_eq!(ro.channels[0].clocks.mclk_mhz, Section::Value(1200.0));
+        // The four SPD-rated core timings + the synthesized tRC.
+        let t = &ro.channels[0].timings;
+        assert_eq!(t.cl, Section::Value(16));
+        assert_eq!(t.rcdrd, Section::Value(16));
+        assert_eq!(t.rcwdwr, Section::Value(16));
+        assert_eq!(t.rp, Section::Value(16));
+        assert_eq!(t.ras, Section::Value(32));
+        assert_eq!(t.rc, Section::Value(48), "tRC = tRAS + tRP");
+        // Every other MC-live timing: the honest server-uncore N/A.
+        let na = NaReason::ParseError(SERVER_NA_REASON.to_owned());
+        assert_eq!(t.rrds, Section::Na(na.clone()));
+        assert_eq!(t.faw, Section::Na(na.clone()));
+        assert_eq!(t.rfc1, Section::Na(na.clone()));
+        assert_eq!(t.rdrd_dd, Section::Na(na));
+        // CAD bus / voltages / RTL: structurally N/A.
+        assert!(ro.channels[0].cad_bus.proc_odt.is_na());
+        assert!(ro.channels[0].voltages.vddio_mem_mv.is_na());
+        assert!(ro.channels[0].rtl.is_na());
+        // The SMBIOS topology is carried (dual-channel, DDR4, 2 DIMMs).
+        assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));
+        assert_eq!(ro.memory_tech, Some(MemoryTech::Ddr4));
+        assert_eq!(ro.dimm_count, 2);
+        assert_eq!(ro.ecc_status, EccStatus::Unknown);
+        // The honest source annotation names the server-uncore limitation,
+        // the SPD-rated provenance, and the populated/total channel count.
+        assert!(ro.channel_annotation.contains("Server uncore"));
+        assert!(ro.channel_annotation.contains("SPD-rated"));
+        assert!(ro.channel_annotation.contains("2 of 4"));
+    }
+
+    /// An empty SPD list degrades the clock + timing cells to N/A while the
+    /// SMBIOS topology still carries the readout (no panic, no invention).
+    #[test]
+    fn decode_server_empty_spd_degrades_timings_keeps_smbios() {
+        let smbios = server_smbios();
+        let ro = decode_server(&smbios, &[], IntelGen::BroadwellE);
+        assert_eq!(ro.channels.len(), 4);
+        assert!(ro.channels[0].clocks.mclk_mhz.is_na());
+        assert!(ro.channels[0].timings.cl.is_na());
+        // The SMBIOS topology still resolves.
+        assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));
+        assert_eq!(ro.dimm_count, 2);
+        assert_eq!(ro.memory_tech, Some(MemoryTech::Ddr4));
+    }
+
+    /// Cascade Lake is the hex-channel server profile (6 channels).
+    #[test]
+    fn decode_server_cascade_lake_is_hex_channel() {
+        let ro = decode_server(&SmbiosTopology::empty(), &[], IntelGen::CascadeLake);
+        assert_eq!(ro.channels.len(), 6, "Cascade Lake is hex-channel");
+    }
+
+    /// A module with a speed but no usable profile: the MCLK still decodes
+    /// from the rated speed, but the SPD-rated core timings degrade to the
+    /// honest server-uncore N/A (never a fabricated zero).
+    #[test]
+    fn decode_server_module_without_profile_degrades_to_na() {
+        let smbios = server_smbios();
+        let mut m = server_spd_module(0x50, 2400, 0, 0, 0, 0);
+        m.profiles.clear();
+        let ro = decode_server(&smbios, std::slice::from_ref(&m), IntelGen::HaswellE);
+        assert_eq!(ro.channels[0].clocks.mclk_mhz, Section::Value(1200.0));
+        assert!(ro.channels[0].timings.cl.is_na());
+        assert!(ro.channels[0].timings.ras.is_na());
+        // Haswell-E is quad-channel like Broadwell-E.
+        assert_eq!(ro.channels.len(), 4);
     }
 }

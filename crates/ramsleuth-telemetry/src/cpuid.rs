@@ -121,6 +121,39 @@ pub enum IntelGen {
     /// prefix + `Ultra` token; no [`crate::intel_gen::profile_for`]
     /// entry (honest `N/A`).
     CoreSeries1Mobile,
+    /// Broadwell-E (Xeon E5-2600 v4 / E3-1500 v5 server, 2016) —
+    /// quad-channel DDR4 (models `0x47` / `0x57` / `0x6D` / `0x77` /
+    /// `0x7D`, plus the client-colliding `0x56` resolved by the brand
+    /// string).
+    ///
+    /// Appended after [`Self::CoreSeries1Mobile`] (OQ-10 append-only,
+    /// index 16). **Server uncore**: the memory-controller timing
+    /// registers are not PCI-BAR-mapped and are unreachable via
+    /// `/dev/mem` (the 16 MiB MCH-window sweep found only a sparse
+    /// page-0 cluster), so the [`crate::intel_gen::profile_for`] entry
+    /// is the `Server` profile — telemetry sources from SMBIOS Type 17
+    /// + the SPD EEPROM, never the MCHBAR MMIO window.
+    BroadwellE,
+    /// Haswell-E (Xeon E5-2600 v3 / E3-1500 v4 server, 2014) —
+    /// quad-channel DDR4 (models `0x3F` / `0x4F`, both client-colliding
+    /// and resolved by the brand string's `v3` token).
+    ///
+    /// Appended (OQ-10 append-only, index 17). Server uncore like
+    /// [`Self::BroadwellE`] — the `Server` profile.
+    HaswellE,
+    /// Skylake-X (Core i7-7800X / i9-7900X + the Xeon-E v4 overlap, 2017)
+    /// — quad-channel DDR4 (model `0x55` non-colliding; `0x56` / `0x5E` /
+    /// `0x8E` client-colliding, resolved by the brand string).
+    ///
+    /// Appended (OQ-10 append-only, index 18). Server uncore like
+    /// [`Self::BroadwellE`] — the `Server` profile.
+    SkylakeX,
+    /// Cascade Lake (Xeon Scalable 1st gen, 2019) — up to 6-channel DDR4
+    /// (models `0x62` / `0x6C` / `0x86`, all non-colliding).
+    ///
+    /// Appended (OQ-10 append-only, index 19). Server uncore like
+    /// [`Self::BroadwellE`] — the `Server` profile (the 6-channel count).
+    CascadeLake,
 }
 
 /// The stable, human-readable name of an Intel generation (DAEMON-2):
@@ -148,6 +181,10 @@ impl std::fmt::Display for IntelGen {
             Self::JasperLake => "Jasper Lake",
             Self::LunarLake => "Lunar Lake",
             Self::CoreSeries1Mobile => "Core Series 1 Mobile",
+            Self::BroadwellE => "Broadwell-E",
+            Self::HaswellE => "Haswell-E",
+            Self::SkylakeX => "Skylake-X",
+            Self::CascadeLake => "Cascade Lake",
         };
         f.write_str(name)
     }
@@ -405,6 +442,17 @@ fn intel_gen_from_model(model: u32) -> Option<IntelGen> {
         0x9C => Some(IntelGen::JasperLake),
         // ES / prototype silicon (were Ice Lake / Coffee Lake / Alder Lake).
         0x9B | 0x9F | 0xC0 => Some(IntelGen::Unrecognized),
+        // --- Server platforms (server uncore: no OS-accessible MC timing
+        // registers — the `Server` profile sources SMBIOS + SPD) ---
+        // Broadwell-E (Xeon E5-2600 v4): the non-colliding models. The
+        // client-colliding `0x56` (Skylake core) is resolved by the brand
+        // string in [`intel_gen_from_brand`].
+        0x47 | 0x57 | 0x6D | 0x77 | 0x7D => Some(IntelGen::BroadwellE),
+        // Skylake-X (Core i7-7800X / i9-7900X): the non-colliding model.
+        // The client-colliding `0x56` / `0x5E` / `0x8E` are brand-resolved.
+        0x55 => Some(IntelGen::SkylakeX),
+        // Cascade Lake (Xeon Scalable 1st gen): all non-colliding.
+        0x62 | 0x6C | 0x86 => Some(IntelGen::CascadeLake),
         _ => None,
     }
 }
@@ -646,6 +694,63 @@ pub fn brand_gen_hint(brand: &str) -> Option<u8> {
     brand_parse(brand).and_then(|t| (1..=14).contains(&t.gen).then_some(t.gen))
 }
 
+/// The server-platform generation a CPUID brand string indicates, if
+/// any (the client/server model-number collisions).
+///
+/// A single 8-bit CPUID model field spans both client and server silicon
+/// (OQ-10), so the marketing brand string is the tie-breaker for the
+/// colliding models:
+///
+/// - **Xeon E** `E5-<digits>` / `E3-<digits>` part number + a
+///   `v<digit>` generation suffix: `v3` → [`IntelGen::HaswellE`], `v4`
+///   → [`IntelGen::BroadwellE`] (e.g. `Intel(R) Xeon(R) CPU E5-2680 v4
+///   @ 2.40GHz`).
+/// - **Skylake-X Core** `i7-78<NN>X` / `i9-79<NN>X` (e.g. `Intel(R)
+///   Core(TM) i7-7800X CPU @ 3.50GHz`) → [`IntelGen::SkylakeX`].
+///
+/// Returns `None` for every non-server brand (the caller keeps the model
+/// table's conservative client assignment). Never panics.
+fn server_gen_from_brand(brand: &str) -> Option<IntelGen> {
+    let toks: Vec<String> = brand
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+
+    // Xeon E line: an `e5-<digits>` / `e3-<digits>` part number plus a
+    // `v<digit>` generation suffix.
+    let has_xeon_e = toks.iter().any(|t| {
+        (t.starts_with("e5-") || t.starts_with("e3-"))
+            && t.split('-')
+                .nth(1)
+                .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+    });
+    if has_xeon_e {
+        for t in &toks {
+            if let Some(d) = t.strip_prefix('v').and_then(|r| r.parse::<u8>().ok()) {
+                return match d {
+                    3 => Some(IntelGen::HaswellE),
+                    4 => Some(IntelGen::BroadwellE),
+                    _ => None,
+                };
+            }
+        }
+        return None;
+    }
+
+    // Skylake-X Core: `i7-78<NN>x` / `i9-79<NN>x` (8 chars, `x` suffix).
+    for t in &toks {
+        if t.len() == 8
+            && (t.starts_with("i7-78") || t.starts_with("i9-79"))
+            && t.as_bytes()[5].is_ascii_digit()
+            && t.as_bytes()[6].is_ascii_digit()
+            && t.ends_with('x')
+        {
+            return Some(IntelGen::SkylakeX);
+        }
+    }
+    None
+}
+
 /// Resolve an Intel generation from the CPUID model number, with the
 /// brand string as the general distinguishing signal.
 ///
@@ -676,12 +781,21 @@ pub fn intel_gen_from_brand(brand: &str, model: u32) -> Option<IntelGen> {
     let tok = brand_parse(brand);
     match model {
         // --- Colliding models: the brand string resolves the tie ---
-        0x8E => match tok.as_ref().map(|t| t.gen) {
-            Some(7) => Some(IntelGen::KabyLake),
-            Some(8) => Some(IntelGen::CoffeeLake),
-            Some(10) => Some(IntelGen::CometLake),
-            _ => from_model, // 7th/8th-mobile default: Kaby Lake
-        },
+        // `0x8E` also spans Skylake-X (the `i7-78xx` / `i9-79xx` Core line)
+        // on top of the 7th/8th/10th-gen mobile client: the server brand
+        // wins first, then the client marketing generation.
+        0x8E => {
+            if let Some(server) = server_gen_from_brand(brand) {
+                Some(server)
+            } else {
+                match tok.as_ref().map(|t| t.gen) {
+                    Some(7) => Some(IntelGen::KabyLake),
+                    Some(8) => Some(IntelGen::CoffeeLake),
+                    Some(10) => Some(IntelGen::CometLake),
+                    _ => from_model, // 7th/8th-mobile default: Kaby Lake
+                }
+            }
+        }
         0x9E => match tok.as_ref().map(|t| t.gen) {
             Some(7) => Some(IntelGen::KabyLake),
             _ => from_model, // 8th/9th / Xeon E default: Coffee Lake
@@ -711,6 +825,15 @@ pub fn intel_gen_from_brand(brand: &str, model: u32) -> Option<IntelGen> {
                 from_model // 13th default: Raptor Lake
             }
         }
+        // --- Server platforms: the client-colliding models resolve by
+        // brand (server wins; absent server brand keeps the client
+        // model-table bucket) ---
+        // Haswell-E (Xeon E v3) collides with the client Haswell /
+        // Broadwell `0x3F` / `0x4F` Tier-1 bucket.
+        0x3F | 0x4F => server_gen_from_brand(brand).or(from_model),
+        // Broadwell-E (Xeon E v4) / Skylake-X collide with the client
+        // Skylake / Kaby Lake `0x56` / `0x5E` Tier-1 bucket.
+        0x56 | 0x5E => server_gen_from_brand(brand).or(from_model),
         // --- Non-colliding models: the model table is authoritative ---
         _ => from_model,
     }
@@ -1224,5 +1347,167 @@ mod tests {
                 let _ = intel_gen_from_brand(brand, m);
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Server platforms (Broadwell-E / Haswell-E / Skylake-X / Cascade
+    // Lake): the model + brand dispatch and the OQ-10 append-only wire
+    // encoding.
+    // ------------------------------------------------------------------
+
+    /// The non-colliding server models map directly from the model table
+    /// (authoritative at the model level): Broadwell-E
+    /// `0x47`/`0x57`/`0x6D`/`0x77`/`0x7D`, Skylake-X `0x55`, Cascade Lake
+    /// `0x62`/`0x6C`/`0x86`.
+    #[test]
+    fn server_gen_from_model_non_colliding() {
+        for m in [0x47u32, 0x57, 0x6D, 0x77, 0x7D] {
+            assert_eq!(
+                intel_gen_from_model(m),
+                Some(IntelGen::BroadwellE),
+                "model {m:#04x} -> Broadwell-E"
+            );
+        }
+        assert_eq!(intel_gen_from_model(0x55), Some(IntelGen::SkylakeX));
+        for m in [0x62u32, 0x6C, 0x86] {
+            assert_eq!(
+                intel_gen_from_model(m),
+                Some(IntelGen::CascadeLake),
+                "model {m:#04x} -> Cascade Lake"
+            );
+        }
+    }
+
+    /// The client-colliding server models keep the client bucket at the
+    /// *model* level (the brand string is the OQ-10 tie-breaker, never a
+    /// silent re-bucket): `0x3F`/`0x4F`/`0x56`/`0x5E` stay the Tier-1
+    /// Skylake line, `0x8E` stays the Kaby Lake line.
+    #[test]
+    fn server_gen_colliding_models_keep_client_bucket_at_model_level() {
+        assert_eq!(intel_gen_from_model(0x3F), Some(IntelGen::Skylake));
+        assert_eq!(intel_gen_from_model(0x4F), Some(IntelGen::Skylake));
+        assert_eq!(intel_gen_from_model(0x52), Some(IntelGen::Skylake));
+        assert_eq!(intel_gen_from_model(0x56), Some(IntelGen::Skylake));
+        assert_eq!(intel_gen_from_model(0x5E), Some(IntelGen::Skylake));
+        assert_eq!(intel_gen_from_model(0x8E), Some(IntelGen::KabyLake));
+    }
+
+    /// `server_gen_from_brand`: the Xeon E `v3`/`v4` line → Haswell-E /
+    /// Broadwell-E, the Skylake-X Core `i7-78xx`/`i9-79xx` line →
+    /// Skylake-X, and every non-server brand → `None` (the client
+    /// fallback applies).
+    #[test]
+    fn server_gen_from_brand_classifies_server_lines() {
+        // Xeon E v3 → Haswell-E; v4 → Broadwell-E (the `E5-` part form).
+        assert_eq!(
+            server_gen_from_brand("Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.40GHz"),
+            Some(IntelGen::HaswellE)
+        );
+        assert_eq!(
+            server_gen_from_brand("Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz"),
+            Some(IntelGen::BroadwellE)
+        );
+        // Skylake-X Core i7-7800X / i9-7900X → Skylake-X.
+        assert_eq!(
+            server_gen_from_brand("Intel(R) Core(TM) i7-7800X CPU @ 3.50GHz"),
+            Some(IntelGen::SkylakeX)
+        );
+        assert_eq!(
+            server_gen_from_brand("Intel(R) Core(TM) i9-7900X CPU @ 4.30GHz"),
+            Some(IntelGen::SkylakeX)
+        );
+        // Non-server brands → None (an unrecognized vN, a Xeon W, a client
+        // Core, and the empty string all keep the client fallback).
+        assert_eq!(server_gen_from_brand("Intel(R) Xeon(R) E3-1505M v6 @ 2.80GHz"), None);
+        assert_eq!(server_gen_from_brand("Intel(R) Xeon(R) W-2123 CPU @ 3.30GHz"), None);
+        assert_eq!(server_gen_from_brand("Intel(R) Core(TM) i5-6600K CPU @ 3.50GHz"), None);
+        assert_eq!(server_gen_from_brand("Intel(R) Core(TM) i7-7700 CPU @ 4.20GHz"), None);
+        assert_eq!(server_gen_from_brand(""), None);
+    }
+
+    /// End to end: the client-colliding server models resolve to the
+    /// server generation via the brand string, and keep the client bucket
+    /// for a client brand (OQ-10). The x99 test system (Xeon E5-2680 v4 =
+    /// model `0x47`, non-colliding) resolves to Broadwell-E directly.
+    #[test]
+    fn server_gen_from_brand_end_to_end_collisions() {
+        // Haswell-E (`0x3F`/`0x4F`) with a Xeon E v3 brand.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.40GHz", 0x3F),
+            Some(IntelGen::HaswellE)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Xeon(R) CPU E5-2690 v3 @ 3.60GHz", 0x4F),
+            Some(IntelGen::HaswellE)
+        );
+        // The same models with a CLIENT brand keep the Tier-1 Skylake bucket.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i7-4790K CPU @ 4.00GHz", 0x3F),
+            Some(IntelGen::Skylake)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i5-4690 CPU @ 3.50GHz", 0x4F),
+            Some(IntelGen::Skylake)
+        );
+        // Broadwell-E (`0x56`) with a Xeon E v4 brand.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz", 0x56),
+            Some(IntelGen::BroadwellE)
+        );
+        // Skylake-X (`0x56`/`0x5E`/`0x8E`) with a Core i7/i9-7xxx brand.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i7-7800X CPU @ 3.50GHz", 0x56),
+            Some(IntelGen::SkylakeX)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i9-7900X CPU @ 4.30GHz", 0x5E),
+            Some(IntelGen::SkylakeX)
+        );
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Core(TM) i7-7820X CPU @ 3.50GHz", 0x8E),
+            Some(IntelGen::SkylakeX)
+        );
+        // The x99 test system: Xeon E5-2680 v4 = model `0x47` (non-colliding)
+        // → Broadwell-E straight from the model table (brand consistent).
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz", 0x47),
+            Some(IntelGen::BroadwellE)
+        );
+        // Cascade Lake (Xeon Scalable, non-colliding models) → model table.
+        assert_eq!(
+            intel_gen_from_brand("Intel(R) Xeon(R) Platinum 8180 CPU @ 2.80GHz", 0x62),
+            Some(IntelGen::CascadeLake)
+        );
+    }
+
+    /// OQ-10 append-only: the four server variants occupy the next
+    /// discriminants (16-19) — the pre-existing 0-15 byte-pins are
+    /// untouched (a separate frozen test guards those).
+    #[test]
+    fn server_gen_wire_encoding_oq10() {
+        let appended: [(IntelGen, u32); 4] = [
+            (IntelGen::BroadwellE, 16),
+            (IntelGen::HaswellE, 17),
+            (IntelGen::SkylakeX, 18),
+            (IntelGen::CascadeLake, 19),
+        ];
+        for (gen, expected) in appended {
+            let bytes = bincode::serialize(&gen).expect("IntelGen must serialize (OQ-10 pin)");
+            assert_eq!(
+                bytes,
+                expected.to_le_bytes().to_vec(),
+                "{gen:?} appended wire encoding (OQ-10)"
+            );
+        }
+    }
+
+    /// The server variants' stable `Display` names (DAEMON-2): the
+    /// `cpu_gen` wire string the TUI / GUI / CLI render.
+    #[test]
+    fn server_gen_display_names() {
+        assert_eq!(IntelGen::BroadwellE.to_string(), "Broadwell-E");
+        assert_eq!(IntelGen::HaswellE.to_string(), "Haswell-E");
+        assert_eq!(IntelGen::SkylakeX.to_string(), "Skylake-X");
+        assert_eq!(IntelGen::CascadeLake.to_string(), "Cascade Lake");
     }
 }

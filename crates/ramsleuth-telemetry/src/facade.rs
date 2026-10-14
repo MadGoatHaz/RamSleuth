@@ -142,19 +142,24 @@ pub struct SystemMemoryTelemetry {
 /// # Behavior
 ///
 /// 1. `CpuInfo::detect()` — the single CPUID dispatch key.
-/// 2. AMD branch (AMD silicon only): `amd_smu::acquire()` →
+/// 2. SPD branch (all vendors, unprivileged): `spd_eeprom::acquire()` →
+///    `spd_decode::decode()` per image — collected before the Intel branch
+///    because the server-uncore decode sources the SPD modules (real
+///    EEPROM data).
+/// 3. AMD branch (AMD silicon only): `amd_smu::acquire()` →
 ///    `amd_pm::parse()` → `amd_smn::apply_smn` (no-panic overlay) →
 ///    `amd_smn::read_all_channel_registers` + `decode_channel_registers`
 ///    (OQ-10: the 14-register channel mode + ECC decode) →
 ///    `amd_readout::map_amd_with()`.
-/// 3. Intel branch (Intel silicon only, v1 profiled generations —
-///    Tier 1 + Rocket Lake):
-///    `intel_sysfs::acquire()` → `intel_readout::decode` (primary);
-///    on `DriverMissing` (kobject absent) only:
+/// 4. Intel branch (Intel silicon only, profiled generations): the
+///    **server-uncore** platforms (Haswell-E / Broadwell-E / Skylake-X /
+///    Cascade Lake) → `intel_readout::decode_server` (SMBIOS topology +
+///    SPD-rated timings; the MC-live cells an honest N/A — never the MMIO
+///    path); the **client** platforms (Tier 1 + Rocket Lake + the Tier-3
+///    Alder family) → `intel_sysfs::acquire()` → `intel_readout::decode`
+///    (primary); on `DriverMissing` (kobject absent) only:
 ///    `intel_mchbar::acquire()` → `intel_readout::read_intel` (the
 ///    `/dev/mem` fallback, plan §3.5).
-/// 4. SPD branch (all vendors, unprivileged): `spd_eeprom::acquire()` →
-///    `spd_decode::decode()` per image.
 /// 5. Platform branch (all vendors, C6-01): `platform::collect_platform()`
 ///    — every field degrades independently and it never fails the
 ///    process.
@@ -174,13 +179,16 @@ pub struct SystemMemoryTelemetry {
 pub fn collect() -> SystemMemoryTelemetry {
     // 1. Detect the CPU once; every vendor branch dispatches on it.
     let cpu = CpuInfo::detect();
-    // 2. AMD branch (gated on vendor before any provider I/O).
-    let amd = amd_branch(&cpu);
-    // 3. Intel branch (gated on vendor before any provider I/O).
-    let intel = intel_branch(&cpu);
-    // 4. SPD branch (vendor-independent; per-device containment lives
-    //    inside the provider).
+    // 2. SPD branch (vendor-independent; per-device containment lives
+    //    inside the provider). Collected before the Intel branch because
+    //    the server-uncore decode sources the SPD modules (real EEPROM
+    //    data) alongside the SMBIOS topology.
     let spd = spd_branch();
+    // 3. AMD branch (gated on vendor before any provider I/O).
+    let amd = amd_branch(&cpu);
+    // 4. Intel branch (gated on vendor before any provider I/O; the server
+    //    platforms source SMBIOS + SPD and never touch the MMIO path).
+    let intel = intel_branch(&cpu, &spd);
     // 5. Platform branch (vendor-independent, C6-01; never fails the
     //    process — every field degrades independently).
     let platform = platform_branch();
@@ -278,6 +286,14 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
 /// `intel_mchbar::acquire()` → `intel_readout::read_intel` (the `/dev/mem`
 /// MCHBAR fallback).
 ///
+/// **Server-uncore platforms** (Haswell-E / Broadwell-E / Skylake-X /
+/// Cascade Lake) take a third path: their memory-controller timing
+/// registers are not OS-accessible (no PCI BAR, unreachable via
+/// `/dev/mem`), so — after the vendor / generation gates and the SMBIOS
+/// collection — the branch returns `intel_readout::decode_server` (SMBIOS
+/// topology + SPD-rated timings, the MC-live cells an honest N/A) and
+/// **never** touches the sysfs / `/dev/mem` MMIO path.
+///
 /// Gated on the already-detected vendor: non-Intel silicon returns
 /// `Err(UnsupportedHardware)` before any provider call (zero I/O in
 /// this branch — the provider's own vendor gate is a second line of
@@ -294,7 +310,7 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
 /// sources would mask a real fault. Both sources feed the same pure
 /// decode core (`decode` over `IntelImcRegs`), and a branch failure
 /// degrades only the Intel `Section` (via [`reason_from`]).
-fn intel_branch(cpu: &CpuInfo) -> TelemetryResult<IntelReadout> {
+fn intel_branch(cpu: &CpuInfo, spd: &[SpdModule]) -> TelemetryResult<IntelReadout> {
     // 1. Pure vendor gate (zero I/O): non-Intel silicon is rejected
     //    before any provider call (the branch's first line of defense).
     intel_sysfs::vendor_gate(cpu)?;
@@ -302,17 +318,27 @@ fn intel_branch(cpu: &CpuInfo) -> TelemetryResult<IntelReadout> {
     //    is `Ok` for Intel silicon — re-verified, zero I/O).
     let gen = intel_readout::intel_gen_gate(cpu)?;
     // 3. The profile-based generation gate (IG-16): Tier 1 + Rocket
-    //    Lake (Tier 2) pass; any other Intel generation degrades the
-    //    whole branch before any raw source is touched (never garbage
-    //    from a mismatched register map).
+    //    Lake (Tier 2) + the Tier-3 Alder family + the server-uncore
+    //    platforms pass; any other Intel generation degrades the whole
+    //    branch before any raw source is touched (never garbage from a
+    //    mismatched register map).
     intel_readout::gen_gate(gen)?;
 
-    // Chunk 2: the SMBIOS Type 17 topology (the 4-tier trust procedure's
-    // firmware cross-check) — collected once and supplied to the decode on
-    // BOTH the sysfs and the `/dev/mem` fallback arms (the fallback path
-    // benefits from the same cross-check, plan hard-constraint #5).
-    // No-panic: a missing `dmi` dir yields the empty topology.
+    // The SMBIOS Type 17 topology (the 4-tier trust procedure's firmware
+    // cross-check) — collected once and supplied to the decode on BOTH the
+    // sysfs / `/dev/mem` client arms and the server-uncore arm. No-panic:
+    // a missing `dmi` dir yields the empty topology.
     let smbios = crate::intel_smbios::collect();
+
+    // Server platforms (Haswell-E / Broadwell-E / Skylake-X / Cascade
+    // Lake): the memory-controller timing registers live in CPU-internal
+    // uncore space that is not PCI-BAR-mapped and is unreachable via
+    // `/dev/mem` — so the readout sources SMBIOS (topology / capacity /
+    // technology) + the SPD EEPROM (rated timings / speed) and NEVER
+    // attempts the sysfs / `/dev/mem` MMIO path.
+    if intel_readout::is_server_gen(gen) {
+        return Ok(intel_readout::decode_server(&smbios, spd, gen));
+    }
 
     // 4. Primary: the `ramsleuth_intel` sysfs kobject (plan §3.5).
     match intel_sysfs::acquire() {
@@ -785,6 +811,29 @@ mod tests {
         assert_eq!(t.platform, platform);
         assert_eq!(t.dimm_sizes, dimm_sizes);
         assert_eq!(t.total_capacity, total_capacity);
+    }
+
+    /// The Intel branch routes a server-uncore generation (Broadwell-E —
+    /// the x99 reference) to [`intel_readout::decode_server`]: the result
+    /// is a `Value` carrying the server signature (quad-channel, the
+    /// "Server uncore … SPD-rated" annotation) and **never** touches the
+    /// sysfs / `/dev/mem` MMIO path. On a non-Intel test host the absent
+    /// kobject would otherwise drive the branch to an `Err`, so a `Value`
+    /// result here proves the server routing fired.
+    #[test]
+    fn intel_branch_routes_server_gen_to_decode_server() {
+        let cpu = CpuInfo {
+            vendor: CpuVendor::Intel(IntelGen::BroadwellE),
+            brand: "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz".to_owned(),
+        };
+        let ro = intel_branch(&cpu, &[]).expect("a server gen must decode (no Err)");
+        assert_eq!(ro.channels.len(), 4, "Broadwell-E is quad-channel");
+        assert!(
+            ro.channel_annotation.contains("Server uncore"),
+            "the server annotation must name the uncore limitation: {:?}",
+            ro.channel_annotation
+        );
+        assert!(ro.channel_annotation.contains("SPD-rated"));
     }
 
     /// `section_from` is the single containment rule for both vendor

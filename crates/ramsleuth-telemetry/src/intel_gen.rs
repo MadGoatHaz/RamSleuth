@@ -63,6 +63,10 @@ pub enum GenMap {
     Sandy,
     /// Haswell/Broadwell (64 KiB window) — later chunk (variants pending).
     Haswell,
+    /// Server uncore (Haswell-E / Broadwell-E / Skylake-X / Cascade Lake):
+    /// no OS-accessible MC timing registers — the decode sources SMBIOS
+    /// Type 17 + the SPD EEPROM and never reads the MCHBAR MMIO window.
+    Server,
 }
 
 /// A static per-generation MCHBAR decode profile.
@@ -130,6 +134,35 @@ const ALDER_4CH: GenProfile = GenProfile {
     map: GenMap::Alder,
 };
 
+/// The server-uncore profile (Haswell-E / Broadwell-E / Skylake-X):
+/// quad-channel DDR4. `mchbar_mask` is `0` — there is **no** valid
+/// OS-accessible MCHBAR: the memory-controller timing registers live in
+/// CPU-internal uncore space that is not PCI-BAR-mapped and is unreachable
+/// via `/dev/mem` (the 16 MiB MCH-window sweep on the x99 reference found
+/// only a sparse page-0 cluster). The decode for this profile never reads
+/// the MMIO window: all memory telemetry sources from SMBIOS Type 17
+/// (topology / capacity / technology) + the SPD EEPROM (rated timings /
+/// speed). `window_size` is a page multiple kept only for the `mmap`
+/// contract (the width is irrelevant — no MMIO read happens).
+const SERVER_4CH: GenProfile = GenProfile {
+    window_size: 0x10000,
+    mchbar_mask: 0,
+    channel_count: 4,
+    gear: GearCap::None,
+    map: GenMap::Server,
+};
+
+/// The server-uncore profile (Cascade Lake, Xeon Scalable 1st gen):
+/// hex-channel DDR4 (the 6-channel count). Same no-MMIO contract as
+/// [`SERVER_4CH`].
+const SERVER_6CH: GenProfile = GenProfile {
+    window_size: 0x10000,
+    mchbar_mask: 0,
+    channel_count: 6,
+    gear: GearCap::None,
+    map: GenMap::Server,
+};
+
 /// Resolve the static decode profile for a generation.
 ///
 /// Returns the shared Tier-1 profile for the four Tier-1 generations,
@@ -148,6 +181,10 @@ pub fn profile_for(gen: IntelGen) -> Option<&'static GenProfile> {
         IntelGen::RocketLake => Some(&ROCKET),
         IntelGen::AlderLake | IntelGen::RaptorLake => Some(&ALDER_2CH),
         IntelGen::MeteorLake | IntelGen::ArrowLake => Some(&ALDER_4CH),
+        // Server uncore: no OS-accessible MC timing registers — the decode
+        // sources SMBIOS + SPD, never the MCHBAR MMIO window.
+        IntelGen::HaswellE | IntelGen::BroadwellE | IntelGen::SkylakeX => Some(&SERVER_4CH),
+        IntelGen::CascadeLake => Some(&SERVER_6CH),
         _ => None,
     }
 }
@@ -559,6 +596,29 @@ mod tests {
         assert_eq!(profile_for(IntelGen::JasperLake), None);
         assert_eq!(profile_for(IntelGen::LunarLake), None);
         assert_eq!(profile_for(IntelGen::CoreSeries1Mobile), None);
+    }
+
+    /// The server-uncore generations resolve to the `Server` profile:
+    /// Haswell-E / Broadwell-E / Skylake-X at the quad-channel count and
+    /// Cascade Lake at the hex-channel count — all with `mchbar_mask = 0`
+    /// (no OS-accessible MCHBAR), no gear register, and the `Server` map.
+    #[test]
+    fn server_generations_resolve_to_server_profile() {
+        for gen in [IntelGen::HaswellE, IntelGen::BroadwellE, IntelGen::SkylakeX] {
+            let p = profile_for(gen)
+                .unwrap_or_else(|| panic!("{gen:?} must resolve to the Server profile"));
+            assert_eq!(p, &SERVER_4CH, "{gen:?}");
+            assert_eq!(p.map, GenMap::Server, "{gen:?}");
+            assert_eq!(p.mchbar_mask, 0, "{gen:?} (no OS-accessible MCHBAR)");
+            assert_eq!(p.channel_count, 4, "{gen:?} (quad-channel)");
+            assert_eq!(p.gear, GearCap::None, "{gen:?} (DDR4, no gear register)");
+        }
+        let p = profile_for(IntelGen::CascadeLake)
+            .unwrap_or_else(|| panic!("CascadeLake must resolve to the Server profile"));
+        assert_eq!(p, &SERVER_6CH, "Cascade Lake");
+        assert_eq!(p.map, GenMap::Server, "Cascade Lake");
+        assert_eq!(p.channel_count, 6, "Cascade Lake is hex-channel");
+        assert_eq!(p.mchbar_mask, 0, "Cascade Lake (no OS-accessible MCHBAR)");
     }
 
     /// Alder Lake and Raptor Lake resolve to the shared 2-channel
