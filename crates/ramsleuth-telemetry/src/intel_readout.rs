@@ -168,6 +168,8 @@
 //! reserved / overflow gates, the gen gate, and bincode round-trips —
 //! all without hardware, root, or I/O.
 
+use std::collections::HashMap;
+
 use crate::amd_readout::{CadBus, ClockReadout, EccStatus, GearMode, TimingSet, VoltageSet};
 use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
@@ -267,10 +269,22 @@ pub const MCL_TC_RFP2_OFFSET: usize = 0x18;
 pub const MCL_TC_RDRD_OFFSET: usize = 0x20;
 pub const MCL_TC_WRWR_OFFSET: usize = 0x28;
 
-/// `MAD_DIMM_CH2` / `MAD_DIMM_CH3` (Alder/DDR5 subchannel 2/3 geometry;
-/// Research lines 212-213).
-pub const MAD_DIMM_CH2_OFFSET: usize = 0x5060;
-pub const MAD_DIMM_CH3_OFFSET: usize = 0x5064;
+/// `MAD_DIMM_CH2` / `MAD_DIMM_CH3` intra-IMC-base offsets. The full
+/// address is [`imc_base_for`] + this: `0x5000` pre-12th-gen (→ the
+/// legacy `0x5060` / `0x5064`) or `0xD800` 12th-gen+ (→ `0xD860` /
+/// `0xD864`). The `+0x60` / `+0x64` intra-base position is preserved from
+/// the legacy map — it is **not** the `+0x0C` / `+0x10`
+/// `MAD_INTER_CHANNEL` / `MAD_DIMM_CH0/1` stride [`read_intel`] reads, and
+/// reusing that stride would collide with the native MCL1 block (also at
+/// `0xD800`, whose `TC_RFP` / `TC_RFP2` sit at `+0x14` / `+0x18`).
+pub const MAD_DIMM_CH2_INTRA: usize = 0x60;
+pub const MAD_DIMM_CH3_INTRA: usize = 0x64;
+
+/// The pre-12th-gen (`imc_base` = `0x5000`) `MAD_DIMM_CH2` /
+/// `MAD_DIMM_CH3` absolute offsets — the legacy `0x5060` / `0x5064`, kept
+/// for the window compile-assert and the reader test fixtures.
+pub const MAD_DIMM_CH2_OFFSET: usize = 0x5000 + MAD_DIMM_CH2_INTRA;
+pub const MAD_DIMM_CH3_OFFSET: usize = 0x5000 + MAD_DIMM_CH3_INTRA;
 
 /// Highest Tier-3 MCL offset (MC1's `TC_WRWR`, 4-byte access).
 pub const MAX_MCL_OFFSET: usize = MCL1_BASE + MCL_TC_WRWR_OFFSET + 4;
@@ -539,7 +553,13 @@ impl IntelImcRegs {
     /// one bad read never poisons the rest and never panics. The thin
     /// `MchBar` shell of the pure reader core [`from_wide_reader`].
     pub fn from_bar_wide(bar: &MchBar) -> Self {
-        Self::from_wide_reader(|off| bar.read_u32(off).ok())
+        // H-12: routed only for the Alder family (all 12th-gen+), so the
+        // IMC base is always `imc_base_for`'s 12th-gen+ value (`0xD800`)
+        // — the `MAD_DIMM_CH2/CH3` raws key off it.
+        Self::from_wide_reader(
+            imc_base_for(IntelGen::AlderLake),
+            |off| bar.read_u32(off).ok(),
+        )
     }
 
     /// The [`from_bar_wide`] read set over an abstract register reader:
@@ -552,10 +572,11 @@ impl IntelImcRegs {
     /// four `ALDER_CHANNELS` mirror blocks, the two native MCL blocks
     /// (`0xD000`/`0xD800` — the uncore fallbacks the 9-register
     /// `from_bar` never reads), the two `MAD_DIMM_CH2` /
-    /// `MAD_DIMM_CH3` raws, and the two Alder Lake DDR4 TC blocks
-    /// (`0xE000`/`0x1E000`, Phase 1) — the unit-testable half of the
-    /// reader contract.
-    pub(crate) fn from_wide_reader<R>(mut read: R) -> Self
+    /// `MAD_DIMM_CH3` raws (gen-keyed: the `imc_base` argument + the
+    /// `0x60` / `0x64` intra-base offset), and the two Alder Lake DDR4
+    /// TC blocks (`0xE000`/`0x1E000`, Phase 1) — the unit-testable half
+    /// of the reader contract.
+    pub(crate) fn from_wide_reader<R>(imc_base: usize, mut read: R) -> Self
     where
         R: FnMut(usize) -> Option<u32>,
     {
@@ -582,6 +603,12 @@ impl IntelImcRegs {
         let mut alk_d4_tc1 = AlderDdr4TcRegs::default();
         read_alder_ddr4_tc_regs(&mut read, ALK_D4_TC0_BASE, &mut alk_d4_tc0);
         read_alder_ddr4_tc_regs(&mut read, ALK_D4_TC1_BASE, &mut alk_d4_tc1);
+        // H-12: the `MAD_DIMM_CH2` / `CH3` raws sit at the gen-keyed IMC
+        // base (`0xD800` 12th-gen+, `0x5000` pre-12th-gen) + the `0x60` /
+        // `0x64` intra-base offset — the legacy `0x5060` / `0x5064`
+        // preserved relative to the base (NOT the `+0x0C` / `+0x10`
+        // `MAD_INTER_CHANNEL` / `MAD_DIMM_CH0/1` stride [`read_intel`]
+        // reads, which would collide with the native MCL1 block).
         Self {
             mcbios_req: read(MC_BIOS_REQ_OFFSET),
             ch0,
@@ -590,8 +617,8 @@ impl IntelImcRegs {
             ch3,
             mcl0,
             mcl1,
-            mad_dimm_ch2: read(MAD_DIMM_CH2_OFFSET),
-            mad_dimm_ch3: read(MAD_DIMM_CH3_OFFSET),
+            mad_dimm_ch2: read(imc_base + MAD_DIMM_CH2_INTRA),
+            mad_dimm_ch3: read(imc_base + MAD_DIMM_CH3_INTRA),
             alk_d4_tc0,
             alk_d4_tc1,
         }
@@ -829,14 +856,13 @@ pub fn channel_count(gen: IntelGen) -> u8 {
     if let Some(p) = profile_for(gen) {
         return p.channel_count;
     }
-    match gen {
-        IntelGen::IceLake | IntelGen::TigerLake | IntelGen::AlderLake | IntelGen::RaptorLake => 2,
-        IntelGen::MeteorLake | IntelGen::ArrowLake => 4,
-        // The profiled generations (Tier 1 + Rocket Lake + the Alder
-        // family) return above; any future profiled family never
-        // reaches this legacy fallback.
-        _ => 2,
-    }
+    // No decode profile: the common 2-channel desktop fallback. Every
+    // profiled generation (Tier 1 + Rocket Lake + the Alder family + the
+    // server gens) returns above via `profile_for`, so the specific-gen
+    // arms that used to live here are dead (C-4 made Arrow / Meteor
+    // Lake 2-channel; the profile is now the single source of truth for
+    // the count).
+    2
 }
 
 // ---------------------------------------------------------------------------
@@ -2112,12 +2138,20 @@ pub fn decode(
             // (GearCap::Gear4 — the Alder profile; Breakdown §3D).
             let (gear_mode, uclk) = gear_uclk_cells(p.gear, &mclk, regs.mcbios_req);
             let mut channels = Vec::with_capacity(subch_indices.len());
-            for &i in subch_indices {
+            for (pos, &i) in subch_indices.iter().enumerate() {
                 let map = &ALDER_CHANNELS[i];
                 let mcl = tier3_mcl_for(i, map, regs);
                 let mut channel = decode_tier3_channel(i as u8, mclk.clone(), &mcl, map);
                 channel.clocks.gear_mode = gear_mode.clone();
                 channel.clocks.uclk_mhz = uclk.clone();
+                // M-7: the display index is the channel's position in the
+                // output vector, not the subchannel identity. The DDR4
+                // 2-channel default uses subchannels `[0, 2]` (MC0-subch0 +
+                // MC1-subch2); keeping `i` would render "ch 0 / ch 2" and
+                // imply a gapped 4-channel platform. The DDR5 4-subchannel
+                // set is already positional (`[0, 1, 2, 3]`), so this is a
+                // no-op there.
+                channel.index = pos as u8;
                 channels.push(channel);
             }
             decoded_readout(channels, &res, EccStatus::Unknown)
@@ -2286,6 +2320,77 @@ pub fn is_server_gen(gen: IntelGen) -> bool {
     matches!(profile_for(gen).map(|p| p.map), Some(GenMap::Server))
 }
 
+/// The channel-group key parsed from an SMBIOS Type 17 locator string
+/// (M-9): the designator that tells one memory channel apart from the next
+/// on a multi-DIMM-per-channel server. Recognizes the common forms — an
+/// explicit `Ch<N>` / `Channel <N>`, and a leading slot letter
+/// (`DIMM_A1` -> `A`, `B2` -> `B`) — and yields `None` when the locator
+/// carries no channel signal (the binding then keeps the legacy ordinal
+/// order rather than re-ordering on a guess).
+fn locator_channel_key(locator: &str) -> Option<String> {
+    let s = locator.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    // Explicit numeric channel designator ("ch0", "channel 1", "ch 2").
+    for prefix in ["channel ", "ch ", "ch"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).take(2).collect();
+            if !digits.is_empty() {
+                return Some(format!("ch{digits}"));
+            }
+        }
+    }
+    // A leading slot letter: drop the common non-channel word prefixes
+    // ("dimm", "memory", "module", "slot", "cpu", "channel", "ch") and take
+    // the first alphabetic designator of what remains (e.g. "DIMM_A1" ->
+    // "a1" -> "A").
+    for tok in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if matches!(tok, "dimm" | "memory" | "module" | "slot" | "cpu" | "channel" | "ch") {
+            continue;
+        }
+        if let Some(c) = tok.chars().next() {
+            if c.is_ascii_alphabetic() {
+                return Some(c.to_ascii_uppercase().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Bind the SPD modules to the decode's output channels by their SMBIOS
+/// channel group (M-9) instead of ordinal position. On a
+/// multi-DIMM-per-channel server the ordinal bind (`channel i <- SPD i`)
+/// mis-assigns: with 2 DIMMs per channel, channel 1 would take the second
+/// DIMM of channel 0. We group the SPD modules by the channel key parsed
+/// from each SMBIOS locator and, for output channel `i`, return the first
+/// module of that channel's group.
+///
+/// All-or-nothing: the grouping only activates when the SPD list aligns
+/// 1:1 with the SMBIOS locators AND every locator yields a channel key;
+/// otherwise `None` (the caller keeps the legacy ordinal bind — never a
+/// partial re-order on an ambiguous signal).
+fn spd_by_channel<'a>(
+    smbios: &'a SmbiosTopology,
+    spd: &'a [SpdModule],
+) -> Option<Vec<Option<&'a SpdModule>>> {
+    if spd.is_empty() || spd.len() != smbios.locators.len() {
+        return None;
+    }
+    let mut groups: Vec<Vec<&SpdModule>> = Vec::new();
+    let mut key_index: HashMap<String, usize> = HashMap::new();
+    for (idx, loc) in smbios.locators.iter().enumerate() {
+        let key = locator_channel_key(loc)?;
+        let g = *key_index.entry(key).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[g].push(&spd[idx]);
+    }
+    Some(groups.iter().map(|g| g.first().copied()).collect())
+}
+
 /// The server-uncore decode: one [`IntelChannel`] per the generation's
 /// channel count, every cell sourced from real hardware — the SMBIOS Type 17
 /// topology (capacity / technology / population) and the SPD EEPROM (rated
@@ -2346,16 +2451,30 @@ pub fn decode_server(
     let mclk = rep
         .and_then(|m| m.speed_mts.value().copied())
         .or(smbios.speed_mts)
-        .map(|mts| Section::Value(f64::from(mts) / 2.0))
+        // M-10: gate the derived DRAM clock through the shared sanity
+        // gate — a corrupt SMBIOS speed (e.g. a 0xFFFF 16-bit readback)
+        // divides to an out-of-range MHz and is N/A'd with a proper
+        // reason instead of displayed as real data.
+        .map(|mts| clock_section(f64::from(mts) / 2.0))
         .unwrap_or(Section::na(NaReason::NotApplicable));
     let clocks = server_clocks(&mclk);
 
+    // M-9: bind each output channel to the FIRST SPD module of that
+    // channel's SMBIOS locator group (see [`spd_by_channel`]) instead of
+    // the ordinal position — on a multi-DIMM-per-channel server the
+    // ordinal bind would hand channel 1 the second DIMM of channel 0.
+    let by_channel = spd_by_channel(smbios, spd);
+
     let mut channels = Vec::with_capacity(usize::from(count));
     for i in 0..count {
-        // Per-channel: the module bound to this channel when present, else
-        // the representative (a matched kit runs every channel at the same
-        // rated timing). No module at all → the all-Na timing set.
-        let module = spd.get(i as usize).or(rep);
+        // Per-channel: the module bound to this channel (by its SMBIOS
+        // channel group, else the representative when the grouping is
+        // unavailable). A matched kit runs every channel at the same
+        // rated timing. No module at all → the all-Na timing set.
+        let module = match &by_channel {
+            Some(groups) => groups.get(i as usize).copied().flatten().or(rep),
+            None => spd.get(i as usize).or(rep),
+        };
         let timings = match module {
             Some(m) => server_timings(m),
             None => server_na_timings(),
@@ -2374,11 +2493,19 @@ pub fn decode_server(
     // procedure's firmware-verified L2 / L4 states).
     let res = resolve_channel(None, smbios.memory_type, smbios);
 
+    // M-16: report the populated CHANNEL count (distinct channels with
+    // >=1 DIMM) separately from the raw DIMM count — the old text printed
+    // the DIMM count in the channel slot ("8 of 4 channels populated"),
+    // which is self-contradictory on a multi-DIMM-per-channel server.
+    let populated_channels = match &by_channel {
+        Some(groups) => groups.iter().filter(|m| m.is_some()).count() as u8,
+        None => res.dimm_count.min(count),
+    };
     let annotation = format!(
         "Server uncore: no OS-accessible timing source (no MC BAR, no SPD \
          EEPROM) — timings are SPD-rated (module EEPROM) where visible, \
-         topology is SMBIOS Type 17 ({} of {} channels populated)",
-        res.dimm_count, count
+         topology is SMBIOS Type 17 ({} of {} channels populated, {} DIMMs)",
+        populated_channels, count, res.dimm_count
     );
 
     IntelReadout {
@@ -4333,8 +4460,12 @@ mod tests {
                 seed_word(&mut buf, base + off, 0xB000_0000 | (i as u32) << 12 | (j as u32) << 8);
             }
         }
-        seed_word(&mut buf, MAD_DIMM_CH2_OFFSET, 1);
-        seed_word(&mut buf, MAD_DIMM_CH3_OFFSET, 2);
+        // H-12: the `MAD_DIMM_CH2/CH3` raws are gen-keyed — this is the
+        // Alder (12th-gen) map, so they sit at `imc_base` (`0xD800`) + the
+        // `0x60` / `0x64` intra-base offset (`0xD860` / `0xD864`).
+        let gen = IntelGen::AlderLake;
+        seed_word(&mut buf, imc_base_for(gen) + MAD_DIMM_CH2_INTRA, 1);
+        seed_word(&mut buf, imc_base_for(gen) + MAD_DIMM_CH3_INTRA, 2);
         // Phase 1: the two Alder Lake DDR4 TC blocks (10 reads each — the
         // 64-bit TC_PRE split into a low + a high word).
         let alk_d4_offsets = [
@@ -4356,7 +4487,7 @@ mod tests {
         }
 
         let touched = std::cell::RefCell::new(Vec::new());
-        let regs = IntelImcRegs::from_wide_reader(buffered_reader(buf, &touched));
+        let regs = IntelImcRegs::from_wide_reader(imc_base_for(gen), buffered_reader(buf, &touched));
 
         // Every seeded word lands in its field — the full 51-slot set,
         // including the MCL blocks and the MAD raws the 9-register
@@ -4453,7 +4584,11 @@ mod tests {
                 "the DDR4 TC block @ {base:#x} is fully read (Phase 1)"
             );
         }
-        assert!(set.contains(&MAD_DIMM_CH2_OFFSET) && set.contains(&MAD_DIMM_CH3_OFFSET));
+        assert!(
+            set.contains(&(imc_base_for(gen) + MAD_DIMM_CH2_INTRA))
+                && set.contains(&(imc_base_for(gen) + MAD_DIMM_CH3_INTRA)),
+            "the gen-keyed MAD_DIMM_CH2/CH3 raws are read"
+        );
     }
 
     /// The 64 KiB `/dev/mem` read set is unchanged by the IG-26
@@ -4558,8 +4693,12 @@ mod tests {
         // word; the MCL blocks (0xD000 / 0xD800) are out of bounds.
         seed_word(&mut buf, 0x4800 + TC_DBP_OFFSET, 0x284D_2828);
 
+        // H-12: a pre-12th-gen (IMC base `0x5000`) — the seeded
+        // `MAD_DIMM_CH2/CH3` raws (at `0x5060` / `0x5064`) sit in-window,
+        // while the MCL blocks (`0xD000` / `0xD800`) are past the 48 KiB map.
+        let gen = IntelGen::Skylake;
         let touched = std::cell::RefCell::new(Vec::new());
-        let regs = IntelImcRegs::from_wide_reader(buffered_reader(buf, &touched));
+        let regs = IntelImcRegs::from_wide_reader(imc_base_for(gen), buffered_reader(buf, &touched));
 
         // The in-window reads land.
         assert_eq!(regs.mcbios_req, Some(0x0001_0012));
@@ -4712,10 +4851,13 @@ mod tests {
                     &SmbiosTopology::empty(),
                 );
                 assert_eq!(ro.channels.len(), 2, "{gen:?} ({label}): DDR4 default");
+                // M-7: the display indices are sequential (0, 1), not the
+                // subchannel identities (0, 2) — the latter would render
+                // "ch 0 / ch 2" and imply a gapped 4-channel platform.
                 assert_eq!(
                     ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
-                    vec![0, 2],
-                    "{gen:?} ({label}): MC0 subch0 + MC1 subch2"
+                    vec![0, 1],
+                    "{gen:?} ({label}): sequential display indices"
                 );
                 // No `MAD_DIMM_CH0/1` population raws + no SMBIOS ->
                 // terminal channel mode.
@@ -4862,8 +5004,8 @@ mod tests {
         let ro = decode(&regs, IntelGen::AlderLake, None, None, None, &SmbiosTopology::empty());
         assert_eq!(
             ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
-            vec![0, 2],
-            "DDR4 default geometry (no MAD raws)"
+            vec![0, 1],
+            "DDR4 default geometry (no MAD raws) — M-7: sequential display indices"
         );
         let ch0 = &ro.channels[0];
         assert_eq!(
@@ -4993,12 +5135,15 @@ mod tests {
     /// fixture, and a lone valid `MC_BIOS_REQ` among zeros).
     #[test]
     fn ig28_primary_window_degenerate_probe() {
+        // The probe is generation-agnostic (the closures answer every
+        // offset the same), so any gen keys the reader; use Alder Lake.
+        let gen = IntelGen::AlderLake;
         assert!(IntelImcRegs::default().primary_window_degenerate(), "all-None");
-        let all_zero = IntelImcRegs::from_wide_reader(|_off: usize| Some(0u32));
+        let all_zero = IntelImcRegs::from_wide_reader(imc_base_for(gen), |_off: usize| Some(0u32));
         assert!(all_zero.primary_window_degenerate(), "all-zero");
-        let all_fault = IntelImcRegs::from_wide_reader(|_off: usize| Some(0xFFFF_FFFFu32));
+        let all_fault = IntelImcRegs::from_wide_reader(imc_base_for(gen), |_off: usize| Some(0xFFFF_FFFFu32));
         assert!(all_fault.primary_window_degenerate(), "all-bus-fault");
-        let mixed = IntelImcRegs::from_wide_reader(|off: usize| {
+        let mixed = IntelImcRegs::from_wide_reader(imc_base_for(gen), |off: usize| {
             if off & 1 == 0 {
                 Some(0u32)
             } else {
@@ -5010,7 +5155,7 @@ mod tests {
             !tier3_ddr5_condition_regs().primary_window_degenerate(),
             "populated Tier-3 fixture"
         );
-        let one_valid = IntelImcRegs::from_wide_reader(|off: usize| {
+        let one_valid = IntelImcRegs::from_wide_reader(imc_base_for(gen), |off: usize| {
             if off == MC_BIOS_REQ_OFFSET {
                 Some(0x0001_0012)
             } else {
@@ -5022,10 +5167,10 @@ mod tests {
 
     /// All-degenerate primary-window raws (0x0 / 0xFFFF_FFFF / None)
     /// on Meteor / Arrow Lake → the all-`Na(UnsupportedHardware)`
-    /// readout at the generation's channel count (4) — never a decode
-    /// of the empty window — and the branch-level
-    /// [`tile_routing_suspected`] detail names the SoC-tile routing
-    /// (OQ-5, Research line 328).
+    /// readout at the generation's channel count (2 — C-4 made both
+    /// dual-channel DDR5) — never a decode of the empty window — and the
+    /// branch-level [`tile_routing_suspected`] detail names the SoC-tile
+    /// routing (OQ-5, Research line 328).
     #[test]
     fn ig28_all_degenerate_window_degrades_all_na_with_tile_detail() {
         type Fill = fn(usize) -> Option<u32>;
@@ -5036,10 +5181,10 @@ mod tests {
         ];
         for gen in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
             for (label, fill) in fills {
-                let regs = IntelImcRegs::from_wide_reader(fill);
+                let regs = IntelImcRegs::from_wide_reader(imc_base_for(gen), fill);
                 assert!(regs.primary_window_degenerate(), "{gen:?} ({label})");
                 let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
-                assert_eq!(ro.channels.len(), 4, "{gen:?} ({label})");
+                assert_eq!(ro.channels.len(), 2, "{gen:?} ({label})");
                 for ch in &ro.channels {
                     assert_eq!(
                         ch.clocks.mclk_mhz,
@@ -5093,7 +5238,7 @@ mod tests {
     #[test]
     fn ig28_one_valid_register_keeps_the_normal_decode_path() {
         for gen in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
-            let regs = IntelImcRegs::from_wide_reader(|off: usize| {
+            let regs = IntelImcRegs::from_wide_reader(imc_base_for(gen), |off: usize| {
                 if off == MC_BIOS_REQ_OFFSET {
                     Some(0x0001_0024)
                 } else {
@@ -5274,11 +5419,10 @@ mod tests {
     #[test]
     fn decode_non_tier1_gen_degrades_all_na() {
         let regs = acceptance_regs();
-        for (gen, count) in [
-            (IntelGen::IceLake, 2u8),
-            (IntelGen::TigerLake, 2),
-            (IntelGen::Unrecognized, 2),
-        ] {
+        // H-1: Ice / Tiger Lake are now Tier-1 (live decode), so they no
+        // longer degrade to all-Na — only the unprofiled `Unrecognized`
+        // generation takes the all-`Na(UnsupportedHardware)` arm.
+        for (gen, count) in [(IntelGen::Unrecognized, 2u8)] {
             let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
             assert_eq!(ro.channels.len(), usize::from(count), "{gen:?}");
             for (i, ch) in ro.channels.iter().enumerate() {
@@ -5374,26 +5518,28 @@ mod tests {
     /// dispatch) through the live facade.
     #[test]
     fn gen_gate_dispatches_by_generation() {
+        // H-1 (Ice / Tiger → Tier 1) + H-9 (Sapphire Rapids → Server)
+        // promoted these into the profiled set; the rest stay unprofiled.
         for gen in [
             IntelGen::Skylake,
             IntelGen::KabyLake,
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
+            IntelGen::IceLake,
+            IntelGen::TigerLake,
             IntelGen::RocketLake,
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
+            IntelGen::SapphireRapids,
         ] {
             assert_eq!(gen_gate(gen), Ok(()), "{gen:?}");
         }
         // Every unprofiled generation: the detail names it and the
         // full profiled set (Tier 1 + 2 + 3).
         for gen in [
-            IntelGen::IceLake,
-            IntelGen::TigerLake,
             IntelGen::JasperLake,
-            IntelGen::SapphireRapids,
             IntelGen::LunarLake,
             IntelGen::CoreSeries1Mobile,
             IntelGen::Unrecognized,
@@ -5414,11 +5560,16 @@ mod tests {
     /// profiled; every other generation is not.
     #[test]
     fn gen_supported_matches_profile_for() {
+        // H-1: Ice / Tiger Lake are now profiled (Tier 1), so they join
+        // the supported set; only the unprofiled generations remain
+        // unsupported.
         for gen in [
             IntelGen::Skylake,
             IntelGen::KabyLake,
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
+            IntelGen::IceLake,
+            IntelGen::TigerLake,
             IntelGen::RocketLake,
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
@@ -5427,13 +5578,7 @@ mod tests {
         ] {
             assert!(gen_supported(gen), "{gen:?}");
         }
-        for gen in [
-            IntelGen::IceLake,
-            IntelGen::TigerLake,
-            IntelGen::Unrecognized,
-        ] {
-            assert!(!gen_supported(gen), "{gen:?}");
-        }
+        assert!(!gen_supported(IntelGen::Unrecognized));
     }
 
     /// Rocket Lake through [`decode`]: the shared 64 KiB map decodes
@@ -5814,6 +5959,8 @@ mod tests {
     /// (c) The fixed channel-count model per [`IntelGen`].
     #[test]
     fn channel_count_model() {
+        // C-4: Meteor / Arrow Lake are dual-channel DDR5, so every
+        // desktop generation in this set is 2-channel.
         let two = [
             IntelGen::Skylake,
             IntelGen::KabyLake,
@@ -5823,14 +5970,13 @@ mod tests {
             IntelGen::TigerLake,
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
             IntelGen::RocketLake,
             IntelGen::Unrecognized,
         ];
         for g in two {
             assert_eq!(channel_count(g), 2, "{g:?}");
-        }
-        for g in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
-            assert_eq!(channel_count(g), 4, "{g:?}");
         }
     }
 
@@ -6705,5 +6851,79 @@ mod tests {
         assert!(ro.channels[0].timings.ras.is_na());
         // Haswell-E is quad-channel like Broadwell-E.
         assert_eq!(ro.channels.len(), 4);
+    }
+
+    /// M-7: the Tier-3 2-channel default decodes subchannels `[0, 2]`
+    /// (MC0-subch0 + MC1-subch2), but the display index is the channel's
+    /// position in the output vector (`0`, `1`) — never the subchannel
+    /// identity, which would render "Intel ch 0 / ch 2" and imply a gapped
+    /// 4-channel platform.
+    #[test]
+    fn tier3_two_channel_default_indexes_are_sequential() {
+        // A valid MC_BIOS_REQ keeps the primary window non-degenerate (the
+        // Meteor / Arrow tile-routing probe does not fire); the MAD raws stay
+        // absent so the OQ-11 DDR5 condition is not met (the 2-channel
+        // default, subchannels [0, 2]).
+        let regs = IntelImcRegs {
+            mcbios_req: Some(0x0001_0012),
+            ..IntelImcRegs::default()
+        };
+        let ro = decode(
+            &regs,
+            IntelGen::MeteorLake,
+            None,
+            None,
+            None,
+            &SmbiosTopology::empty(),
+        );
+        assert_eq!(ro.channels.len(), 2, "the 2-channel default");
+        assert_eq!(ro.channels[0].index, 0, "first channel is display index 0");
+        assert_eq!(
+            ro.channels[1].index, 1,
+            "second channel is display index 1 (not subchannel 2)"
+        );
+    }
+
+    /// M-10: a corrupt SMBIOS Configured Memory Speed (a `0xFFFF` 16-bit
+    /// readback → 65535 MT/s → 32767.5 MHz) is outside the plausible clock
+    /// range, so the derived MCLK is N/A'd with a proper reason instead of
+    /// being displayed as real data.
+    #[test]
+    fn decode_server_out_of_range_smbios_speed_is_na() {
+        let mut smbios = SmbiosTopology::empty();
+        smbios.speed_mts = Some(0xFFFF);
+        let ro = decode_server(&smbios, &[], IntelGen::BroadwellE);
+        assert!(
+            matches!(
+                ro.channels[0].clocks.mclk_mhz,
+                Section::Na(NaReason::ParseError(_))
+            ),
+            "out-of-range SMBIOS speed degrades the MCLK to Na(ParseError): {:?}",
+            ro.channels[0].clocks.mclk_mhz
+        );
+    }
+
+    /// M-16: the server-uncore annotation reports the populated CHANNEL
+    /// count and the raw DIMM count separately — never the old
+    /// self-contradictory "8 of 4 channels populated" (the DIMM count in
+    /// the channel slot).
+    #[test]
+    fn decode_server_annotation_reports_channels_and_dimms() {
+        let smbios = server_smbios(); // 2 DIMMs
+        let spd = vec![
+            server_spd_module(0x50, 2400, 16, 16, 16, 32),
+            server_spd_module(0x51, 2400, 16, 16, 16, 32),
+        ];
+        let ro = decode_server(&smbios, &spd, IntelGen::BroadwellE);
+        assert!(
+            ro.channel_annotation.contains("2 of 4"),
+            "the populated channel count is in the annotation: {}",
+            ro.channel_annotation
+        );
+        assert!(
+            ro.channel_annotation.contains("2 DIMMs"),
+            "the raw DIMM count is reported separately: {}",
+            ro.channel_annotation
+        );
     }
 }
