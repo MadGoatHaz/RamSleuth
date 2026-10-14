@@ -1013,7 +1013,7 @@ mod tests {
                 "[r] Refresh — force poll",
                 " ".repeat(4),
                 "[g] Graphs — 5-series panel",
-                " ".repeat(1)
+                " "
             )
         );
         // The `[c]`/`[q]` pair: the BENCH column's final row | the
