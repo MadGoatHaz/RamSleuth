@@ -6,15 +6,20 @@
 //! unsafe, no CPUID — the module is unit-tested in isolation and is the
 //! foundation every later generational-expansion chunk dispatches on.
 //!
-//! IG-01 lands the Tier-1 (Skylake–Comet Lake) and Rocket Lake profiles;
-//! IG-03 adds the Tier-3 `Alder` family entries (Alder/Raptor Lake at the
-//! DDR4-default 2-channel count, Meteor/Arrow Lake at 4 channels). The
+//! IG-01 lands the Tier-1 (Skylake–Comet Lake) and Rocket Lake profiles
+//! (Ice Lake / Tiger Lake join the shared Tier-1 profile — H-1); IG-03
+//! adds the Tier-3 `Alder` family entries (Alder/Raptor Lake at the
+//! DDR4-default 2-channel count, Meteor/Arrow Lake at the DDR5
+//! 2-channel count — C-4: both are dual-channel, not 4-channel). The
 //! `Sandy` and `Haswell` `GenMap` families exist now and gain their
 //! profile entries in later chunks once their `IntelGen` variants land;
-//! IG-20 adds the Alder/Raptor Lake (Tier 3) register table: the four
-//! DDR5 subchannel descriptors ([`ALDER_CHANNELS`]) with their legacy
-//! mirror and uncore-MCL bases, and the widened DDR5 timing bitfield
-//! constants ([`ALDER_FIELDS`]).
+//! the server-uncore `GenMap::Server` line (Haswell-E / Broadwell-E /
+//! Skylake-X / Cascade Lake / Sapphire Rapids — H-9) carries the
+//! no-MMIO profiles (4 / 6 / 8 channels). IG-20 adds the
+//! Alder/Raptor Lake (Tier 3) register table: the four DDR5 subchannel
+//! descriptors ([`ALDER_CHANNELS`]) with their legacy mirror and
+//! uncore-MCL bases, and the widened DDR5 timing bitfield constants
+//! ([`ALDER_FIELDS`]).
 //!
 //! Phase 1 (Intel MC fix) adds the **Alder/Raptor Lake DDR4** register
 //! map: the two per-controller channel descriptors ([`ALDER_DDR4_CHANNELS`])
@@ -63,9 +68,10 @@ pub enum GenMap {
     Sandy,
     /// Haswell/Broadwell (64 KiB window) — later chunk (variants pending).
     Haswell,
-    /// Server uncore (Haswell-E / Broadwell-E / Skylake-X / Cascade Lake):
-    /// no OS-accessible MC timing registers — the decode sources SMBIOS
-    /// Type 17 + the SPD EEPROM and never reads the MCHBAR MMIO window.
+    /// Server uncore (Haswell-E / Broadwell-E / Skylake-X / Cascade
+    /// Lake / Sapphire Rapids): no OS-accessible MC timing registers —
+    /// the decode sources SMBIOS Type 17 + the SPD EEPROM and never
+    /// reads the MCHBAR MMIO window.
     Server,
 }
 
@@ -89,9 +95,10 @@ pub struct GenProfile {
     pub map: GenMap,
 }
 
-/// The shared Tier-1 profile: Skylake, Kaby Lake, Coffee Lake, Comet Lake
-/// (Breakdown §2: 64 KiB window, diagnostic-only mask, 2 channels, no
-/// gear register).
+/// The shared Tier-1 profile: Skylake, Kaby Lake, Coffee Lake, Comet
+/// Lake, Ice Lake, Tiger Lake (H-1: the 10th/11th-gen derivatives reuse
+/// the same 64 KiB register map — Breakdown §2: diagnostic-only mask,
+/// 2 channels, no gear register).
 const TIER1: GenProfile = GenProfile {
     window_size: 0x10000,
     mchbar_mask: 0x0000007FFFFFFE0000,
@@ -123,13 +130,19 @@ const ALDER_2CH: GenProfile = GenProfile {
 };
 
 /// The Meteor/Arrow Lake profile: the 256 KiB window with the 4×-gear
-/// register set and the native 4-channel DDR5 count (Breakdown §2;
-/// Research lines 20–21; the tile-routing caveat OQ-5 is handled in
-/// IG-28).
-const ALDER_4CH: GenProfile = GenProfile {
+/// register set and the **dual-channel** DDR5 count (C-4: both Arrow
+/// Lake-S and Meteor Lake are dual-channel DDR5 — TechPowerUp: 102.4
+/// GB/s = 2×64-bit×6400 for Arrow Lake, 89.6 GB/s = 2×64-bit×5600 for
+/// Meteor Lake; Breakdown §2; Research lines 20–21; the tile-routing
+/// caveat OQ-5 is handled in IG-28).
+///
+/// Meteor Lake has a mixed memory topology (2× DDR5 off-package +
+/// LPDDR5X on-package); this profile models the off-package DDR5
+/// portion only — the LPDDR5X on-package channels are not modeled.
+const ALDER_DDR5: GenProfile = GenProfile {
     window_size: 0x40000,
     mchbar_mask: 0x0000007FFFFFC0000,
-    channel_count: 4,
+    channel_count: 2,
     gear: GearCap::Gear4,
     map: GenMap::Alder,
 };
@@ -163,28 +176,47 @@ const SERVER_6CH: GenProfile = GenProfile {
     map: GenMap::Server,
 };
 
+/// The server-uncore profile (Sapphire Rapids, Xeon Scalable 4th gen):
+/// 8-channel DDR5 (H-9). Same no-MMIO contract as [`SERVER_4CH`] (no
+/// OS-accessible MCHBAR — the decode sources SMBIOS + SPD, never the
+/// MCHBAR MMIO window).
+const SERVER_8CH: GenProfile = GenProfile {
+    window_size: 0x40000,
+    mchbar_mask: 0,
+    channel_count: 8,
+    gear: GearCap::None,
+    map: GenMap::Server,
+};
+
 /// Resolve the static decode profile for a generation.
 ///
-/// Returns the shared Tier-1 profile for the four Tier-1 generations,
-/// the Rocket Lake profile for [`IntelGen::RocketLake`], the 2-channel
-/// Alder profile for [`IntelGen::AlderLake`] / [`IntelGen::RaptorLake`]
-/// and the 4-channel profile for [`IntelGen::MeteorLake`] /
-/// [`IntelGen::ArrowLake`] (IG-03); every other generation (Ice Lake,
-/// Tiger Lake, and [`IntelGen::Unrecognized`]) resolves to `None` until
+/// Returns the shared Tier-1 profile for the Tier-1 generations
+/// (Skylake / Kaby Lake / Coffee Lake / Comet Lake, plus Ice Lake /
+/// Tiger Lake — H-1: the same 64 KiB register map, 2 channels, no
+/// gear), the Rocket Lake profile for [`IntelGen::RocketLake`], the
+/// 2-channel Alder profile for [`IntelGen::AlderLake`] /
+/// [`IntelGen::RaptorLake`] and the 2-channel DDR5 profile for
+/// [`IntelGen::MeteorLake`] / [`IntelGen::ArrowLake`] (IG-03, C-4);
+/// the server-uncore profiles (4 / 6 / 8 channels) for the Xeon / HEDT
+/// line; every other generation (Jasper Lake, Lunar Lake, Core Series
+/// 1 Mobile, and [`IntelGen::Unrecognized`]) resolves to `None` until
 /// its family gains a profile entry in a later chunk.
 pub fn profile_for(gen: IntelGen) -> Option<&'static GenProfile> {
     match gen {
         IntelGen::Skylake
         | IntelGen::KabyLake
         | IntelGen::CoffeeLake
-        | IntelGen::CometLake => Some(&TIER1),
+        | IntelGen::CometLake
+        | IntelGen::IceLake
+        | IntelGen::TigerLake => Some(&TIER1),
         IntelGen::RocketLake => Some(&ROCKET),
         IntelGen::AlderLake | IntelGen::RaptorLake => Some(&ALDER_2CH),
-        IntelGen::MeteorLake | IntelGen::ArrowLake => Some(&ALDER_4CH),
+        IntelGen::MeteorLake | IntelGen::ArrowLake => Some(&ALDER_DDR5),
         // Server uncore: no OS-accessible MC timing registers — the decode
         // sources SMBIOS + SPD, never the MCHBAR MMIO window.
         IntelGen::HaswellE | IntelGen::BroadwellE | IntelGen::SkylakeX => Some(&SERVER_4CH),
         IntelGen::CascadeLake => Some(&SERVER_6CH),
+        IntelGen::SapphireRapids => Some(&SERVER_8CH),
         _ => None,
     }
 }
@@ -540,9 +572,10 @@ pub static ALDER_DDR4_CHANNELS: &[AlderDdr4ChannelMap] = &[ALDER_DDR4_MC0, ALDER
 mod tests {
     use super::*;
 
-    /// The four Tier-1 generations all resolve to the shared Tier-1
-    /// profile with the exact IG-01 values (64 KiB window, diagnostic
-    /// mask, 2 channels, no gear, Tier-1 map).
+    /// The six Tier-1 generations (the original four plus Ice Lake /
+    /// Tiger Lake — H-1) all resolve to the shared Tier-1 profile with
+    /// the exact IG-01 values (64 KiB window, diagnostic mask,
+    /// 2 channels, no gear, Tier-1 map).
     #[test]
     fn tier1_generations_resolve_to_shared_profile() {
         for gen in [
@@ -550,6 +583,8 @@ mod tests {
             IntelGen::KabyLake,
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
+            IntelGen::IceLake,
+            IntelGen::TigerLake,
         ] {
             let p = profile_for(gen)
                 .unwrap_or_else(|| panic!("{gen:?} must resolve to the Tier-1 profile"));
@@ -577,31 +612,31 @@ mod tests {
         assert_eq!(p.map, GenMap::Rocket);
     }
 
-    /// Non-profiled generations resolve to `None` in IG-03: Ice Lake
-    /// and Tiger Lake (no family entry yet) and `Unrecognized`.
+    /// Non-profiled generations resolve to `None`: `Unrecognized`
+    /// (Ice Lake / Tiger Lake now carry the shared Tier-1 profile,
+    /// H-1; the remaining appended variants have their own test below).
     #[test]
     fn non_profiled_generations_resolve_to_none() {
-        assert_eq!(profile_for(IntelGen::IceLake), None);
-        assert_eq!(profile_for(IntelGen::TigerLake), None);
         assert_eq!(profile_for(IntelGen::Unrecognized), None);
     }
 
-    /// The chunk-1 appended variants (Sapphire Rapids, Jasper Lake,
-    /// Lunar Lake, Core Series 1 Mobile) carry no decode profile →
-    /// honest `N/A` (research "desktop impact nil" for the mobile / Atom
-    /// / server collapse).
+    /// The chunk-1 appended variants (Jasper Lake, Lunar Lake, Core
+    /// Series 1 Mobile) carry no decode profile → honest `N/A`
+    /// (research "desktop impact nil" for the mobile / Atom collapse).
+    /// Sapphire Rapids carries the 8-channel server-uncore profile
+    /// (H-9) and is covered by the server test below.
     #[test]
     fn non_profiled_appended_variants_resolve_to_none() {
-        assert_eq!(profile_for(IntelGen::SapphireRapids), None);
         assert_eq!(profile_for(IntelGen::JasperLake), None);
         assert_eq!(profile_for(IntelGen::LunarLake), None);
         assert_eq!(profile_for(IntelGen::CoreSeries1Mobile), None);
     }
 
     /// The server-uncore generations resolve to the `Server` profile:
-    /// Haswell-E / Broadwell-E / Skylake-X at the quad-channel count and
-    /// Cascade Lake at the hex-channel count — all with `mchbar_mask = 0`
-    /// (no OS-accessible MCHBAR), no gear register, and the `Server` map.
+    /// Haswell-E / Broadwell-E / Skylake-X at the quad-channel count,
+    /// Cascade Lake at the hex-channel count, and Sapphire Rapids at the
+    /// 8-channel count (H-9) — all with `mchbar_mask = 0` (no
+    /// OS-accessible MCHBAR), no gear register, and the `Server` map.
     #[test]
     fn server_generations_resolve_to_server_profile() {
         for gen in [IntelGen::HaswellE, IntelGen::BroadwellE, IntelGen::SkylakeX] {
@@ -619,6 +654,13 @@ mod tests {
         assert_eq!(p.map, GenMap::Server, "Cascade Lake");
         assert_eq!(p.channel_count, 6, "Cascade Lake is hex-channel");
         assert_eq!(p.mchbar_mask, 0, "Cascade Lake (no OS-accessible MCHBAR)");
+        let p = profile_for(IntelGen::SapphireRapids)
+            .unwrap_or_else(|| panic!("SapphireRapids must resolve to the Server profile (H-9)"));
+        assert_eq!(p, &SERVER_8CH, "Sapphire Rapids");
+        assert_eq!(p.map, GenMap::Server, "Sapphire Rapids");
+        assert_eq!(p.channel_count, 8, "Sapphire Rapids is 8-channel DDR5 (H-9)");
+        assert_eq!(p.mchbar_mask, 0, "Sapphire Rapids (no OS-accessible MCHBAR)");
+        assert_eq!(p.gear, GearCap::None, "Sapphire Rapids (no gear register)");
     }
 
     /// Alder Lake and Raptor Lake resolve to the shared 2-channel
@@ -639,22 +681,22 @@ mod tests {
         }
     }
 
-    /// Meteor Lake and Arrow Lake resolve to the 4-channel Tier-3
-    /// profile (IG-03): the same 256 KiB window, mask, 4×-gear
-    /// register set, and Alder map as the dual-channel profile, with
-    /// the native 4-channel DDR5 count (Breakdown §2; Research lines
-    /// 20–21).
+    /// Meteor Lake and Arrow Lake resolve to the 2-channel DDR5 Tier-3
+    /// profile (IG-03, C-4: both are **dual-channel** DDR5, not
+    /// 4-channel): the same 256 KiB window, mask, 4×-gear register
+    /// set, and Alder map as the DDR4 profile, with the dual-channel
+    /// DDR5 count (Breakdown §2; Research lines 20–21).
     #[test]
-    fn tier3_quadruple_channel_generations_resolve_to_alder_profile() {
+    fn tier3_ddr5_dual_channel_generations_resolve_to_alder_profile() {
         for gen in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
             let p = profile_for(gen)
-                .unwrap_or_else(|| panic!("{gen:?} must resolve to the 4-channel Alder profile"));
-            assert_eq!(p, &ALDER_4CH, "{gen:?}");
+                .unwrap_or_else(|| panic!("{gen:?} must resolve to the 2-channel DDR5 Alder profile"));
+            assert_eq!(p, &ALDER_DDR5, "{gen:?}");
             assert_eq!(p.window_size, 0x40000, "{gen:?}");
             assert_eq!(p.mchbar_mask, 0x0000007FFFFFC0000, "{gen:?}");
-            assert_eq!(p.channel_count, 4, "{gen:?}");
+            assert_eq!(p.channel_count, 2, "{gen:?}");
             assert_eq!(p.gear, GearCap::Gear4, "{gen:?}");
-                        assert_eq!(p.map, GenMap::Alder, "{gen:?}");
+            assert_eq!(p.map, GenMap::Alder, "{gen:?}");
         }
     }
 
