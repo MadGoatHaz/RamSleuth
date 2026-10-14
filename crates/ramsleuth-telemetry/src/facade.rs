@@ -343,15 +343,9 @@ fn intel_branch(cpu: &CpuInfo, spd: &[SpdModule]) -> TelemetryResult<IntelReadou
     // 4. Primary: the `ramsleuth_intel` sysfs kobject (plan §3.5).
     match intel_sysfs::acquire() {
         // The raw set feeds the same pure decode core as the fallback.
+        // L-10: all MAD data rides on `sysfs.regs` (the 3-arg decode).
         Ok(sysfs) => {
-            let mut ro = intel_readout::decode(
-                &sysfs.regs,
-                gen,
-                sysfs.mad_inter_channel,
-                sysfs.mad_dimm_ch0,
-                sysfs.mad_dimm_ch1,
-                &smbios,
-            );
+            let mut ro = intel_readout::decode(&sysfs.regs, gen, &smbios);
             // ECC capability from the capid0a attribute (the sysfs-only
             // decode input; the /dev/mem fallback has none -> Unknown).
             ro.ecc_status = intel_readout::decode_ecc_status(sysfs.capid0a);
@@ -359,10 +353,11 @@ fn intel_branch(cpu: &CpuInfo, spd: &[SpdModule]) -> TelemetryResult<IntelReadou
         }
         // The frozen fallthrough rule: the `/dev/mem` fallback is taken
         // ONLY on `DriverMissing` (kobject absent — module not loaded).
-        // Any other sysfs outcome is reported as-is.
+        // Any other sysfs outcome is reported as-is. L-9: thread the
+        // already-detected vendor / generation through (no re-detect).
         Err(TelemetryError::DriverMissing { .. }) => {
-            let bar = intel_mchbar::acquire()?;
-            intel_readout::read_intel(&bar, &smbios)
+            let bar = intel_mchbar::acquire_for(cpu.vendor)?;
+            intel_readout::read_intel_with(&bar, &smbios, gen)
         }
         Err(err) => Err(err),
     }

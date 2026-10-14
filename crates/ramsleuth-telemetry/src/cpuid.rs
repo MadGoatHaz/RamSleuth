@@ -158,6 +158,26 @@ pub enum IntelGen {
     /// Appended (OQ-10 append-only, index 19). Server uncore like
     /// [`Self::BroadwellE`] — the `Server` profile (the 6-channel count).
     CascadeLake,
+    /// Haswell (4th gen, 2013) — client DDR3 (models `0x3F` / `0x4F`).
+    ///
+    /// Appended (OQ-10 append-only, index 20). **L-8:** the client
+    /// Haswell / Broadwell models were previously folded into
+    /// [`Self::Skylake`] (a display mislabel). The `64 KiB` Tier-1
+    /// register map is shared, so [`crate::intel_gen::profile_for`]
+    /// resolves these to the `TIER1` profile. The server-colliding
+    /// `0x3F` / `0x4F` still resolve to [`Self::HaswellE`] via the brand
+    /// string (`server_gen_from_brand`); a non-server brand keeps the
+    /// client bucket.
+    Haswell,
+    /// Broadwell (5th gen, 2015) — client DDR3/DDR4 (models `0x56` /
+    /// `0x5E`).
+    ///
+    /// Appended (OQ-10 append-only, index 21). **L-8:** see
+    /// [`Self::Haswell`] — the client Broadwell models were previously
+    /// folded into [`Self::Skylake`]. `profile_for` resolves these to
+    /// `TIER1`; the server-colliding `0x56` / `0x5E` (Skylake-X) resolve
+    /// via the brand string to [`Self::SkylakeX`].
+    Broadwell,
 }
 
 /// The stable, human-readable name of an Intel generation (DAEMON-2):
@@ -189,6 +209,8 @@ impl std::fmt::Display for IntelGen {
             Self::HaswellE => "Haswell-E",
             Self::SkylakeX => "Skylake-X",
             Self::CascadeLake => "Cascade Lake",
+            Self::Haswell => "Haswell",
+            Self::Broadwell => "Broadwell",
         };
         f.write_str(name)
     }
@@ -411,9 +433,15 @@ fn amd_zen_from_family(family: u32, ext_family: u32) -> Option<AmdZen> {
 /// does **not** depend on it.
 fn intel_gen_from_model(model: u32) -> Option<IntelGen> {
     match model {
-        // Pre-8th / 6th-gen Tier-1 line (Skylake core; `0x52` Kaby Lake
-        // folds to Skylake — the 64 KiB IMC base is unchanged).
-        0x3F | 0x4F | 0x52 | 0x56 | 0x5E => Some(IntelGen::Skylake),
+        // 4th-gen Haswell client (L-8: previously folded into Skylake).
+        // The 64 KiB Tier-1 IMC base is shared, so these decode on the
+        // same register map.
+        0x3F | 0x4F => Some(IntelGen::Haswell),
+        // 5th-gen Broadwell client (L-8: previously folded into Skylake).
+        0x56 | 0x5E => Some(IntelGen::Broadwell),
+        // 6th-gen Skylake (`0x52` Kaby Lake folds to Skylake — the 64 KiB
+        // IMC base is unchanged).
+        0x52 => Some(IntelGen::Skylake),
         // 7th/8th mobile (Kaby Lake line) — brand refines (0x8E).
         0x8E => Some(IntelGen::KabyLake),
         // 8th/9th desktop (Coffee Lake line) + Cannon Lake 8th — brand
@@ -832,11 +860,11 @@ pub fn intel_gen_from_brand(brand: &str, model: u32) -> Option<IntelGen> {
         // --- Server platforms: the client-colliding models resolve by
         // brand (server wins; absent server brand keeps the client
         // model-table bucket) ---
-        // Haswell-E (Xeon E v3) collides with the client Haswell /
-        // Broadwell `0x3F` / `0x4F` Tier-1 bucket.
+        // Haswell-E (Xeon E v3) collides with the client Haswell
+        // `0x3F` / `0x4F` bucket (L-8).
         0x3F | 0x4F => server_gen_from_brand(brand).or(from_model),
         // Broadwell-E (Xeon E v4) / Skylake-X collide with the client
-        // Skylake / Kaby Lake `0x56` / `0x5E` Tier-1 bucket.
+        // Broadwell `0x56` / `0x5E` bucket (L-8).
         0x56 | 0x5E => server_gen_from_brand(brand).or(from_model),
         // --- Non-colliding models: the model table is authoritative ---
         _ => from_model,
@@ -997,12 +1025,14 @@ mod tests {
     #[test]
     fn intel_gen_from_model_full_table() {
         let table: &[(u32, IntelGen)] = &[
-            // Pre-8th / 6th-gen Tier-1 line.
-            (0x3F, IntelGen::Skylake),
-            (0x4F, IntelGen::Skylake),
+            // 4th-gen Haswell client (L-8: split out of Skylake).
+            (0x3F, IntelGen::Haswell),
+            (0x4F, IntelGen::Haswell),
+            // 6th-gen Skylake.
             (0x52, IntelGen::Skylake),
-            (0x56, IntelGen::Skylake),
-            (0x5E, IntelGen::Skylake),
+            // 5th-gen Broadwell client (L-8: split out of Skylake).
+            (0x56, IntelGen::Broadwell),
+            (0x5E, IntelGen::Broadwell),
             // 7th/8th mobile.
             (0x8E, IntelGen::KabyLake),
             // 8th/9th desktop + Cannon Lake 8th.
@@ -1384,15 +1414,17 @@ mod tests {
 
     /// The client-colliding server models keep the client bucket at the
     /// *model* level (the brand string is the OQ-10 tie-breaker, never a
-    /// silent re-bucket): `0x3F`/`0x4F`/`0x56`/`0x5E` stay the Tier-1
-    /// Skylake line, `0x8E` stays the Kaby Lake line.
+    /// silent re-bucket): `0x3F`/`0x4F` are the Tier-1 Haswell line,
+    /// `0x56`/`0x5E` the Tier-1 Broadwell line (L-8: split out of the old
+    /// Skylake bucket), `0x52` stays Skylake, and `0x8E` stays the Kaby
+    /// Lake line.
     #[test]
     fn server_gen_colliding_models_keep_client_bucket_at_model_level() {
-        assert_eq!(intel_gen_from_model(0x3F), Some(IntelGen::Skylake));
-        assert_eq!(intel_gen_from_model(0x4F), Some(IntelGen::Skylake));
+        assert_eq!(intel_gen_from_model(0x3F), Some(IntelGen::Haswell));
+        assert_eq!(intel_gen_from_model(0x4F), Some(IntelGen::Haswell));
         assert_eq!(intel_gen_from_model(0x52), Some(IntelGen::Skylake));
-        assert_eq!(intel_gen_from_model(0x56), Some(IntelGen::Skylake));
-        assert_eq!(intel_gen_from_model(0x5E), Some(IntelGen::Skylake));
+        assert_eq!(intel_gen_from_model(0x56), Some(IntelGen::Broadwell));
+        assert_eq!(intel_gen_from_model(0x5E), Some(IntelGen::Broadwell));
         assert_eq!(intel_gen_from_model(0x8E), Some(IntelGen::KabyLake));
     }
 
@@ -1444,14 +1476,15 @@ mod tests {
             intel_gen_from_brand("Intel(R) Xeon(R) CPU E5-2690 v3 @ 3.60GHz", 0x4F),
             Some(IntelGen::HaswellE)
         );
-        // The same models with a CLIENT brand keep the Tier-1 Skylake bucket.
+        // The same models with a CLIENT brand keep the client Haswell
+        // bucket (L-8: split out of the old Tier-1 Skylake bucket).
         assert_eq!(
             intel_gen_from_brand("Intel(R) Core(TM) i7-4790K CPU @ 4.00GHz", 0x3F),
-            Some(IntelGen::Skylake)
+            Some(IntelGen::Haswell)
         );
         assert_eq!(
             intel_gen_from_brand("Intel(R) Core(TM) i5-4690 CPU @ 3.50GHz", 0x4F),
-            Some(IntelGen::Skylake)
+            Some(IntelGen::Haswell)
         );
         // Broadwell-E (`0x56`) with a Xeon E v4 brand.
         assert_eq!(

@@ -421,11 +421,12 @@ pub struct AlderDdr4TcRegs {
 }
 
 /// The full raw IMC register set the decode consumes: one global
-/// register, the two Tier-1 channels, and the Tier-3 (Alder/Raptor)
-/// extension — the `0x4800` / `0x4C00` mirror blocks (`ch2` / `ch3`),
-/// the two native MCL blocks (`mcl0` @ `0xD000` / `mcl1` @ `0xD800`,
-/// OQ-4), and the two Alder/DDR5 `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws
-/// (51 `Option<u32>` slots; `mchbar_base` / `mchbar_enabled` are
+/// register, the four Tier-1/Tier-3 channel blocks (`ch0`–`ch3`), the
+/// two native MCL blocks (`mcl0` @ `0xD000` / `mcl1` @ `0xD800`, OQ-4),
+/// the five `MAD_*` channel/geometry raws (`mad_inter_channel` /
+/// `mad_dimm_ch0`–`ch3` — all decode inputs, L-10), and the two Alder
+/// Lake DDR4 TC blocks (`alk_d4_tc0` / `alk_d4_tc1`) — 74
+/// `Option<u32>` slots in total (`mchbar_base` / `mchbar_enabled` are
 /// diagnostics carried by the producer, not decode inputs).
 ///
 /// Every Tier-3 field defaults to `None` (containment, IG-22): no
@@ -456,6 +457,15 @@ pub struct IntelImcRegs {
     /// MC1 MCL block raws (`0xD800` — Tier-3 native-uncore fallback,
     /// OQ-4).
     pub mcl1: MclRegs,
+    /// `MAD_INTER_CHANNEL` (the global channel-mode / DDR-type word —
+    /// decode input, L-10: the base is gen-keyed, so the `/dev/mem`
+    /// producer sets it; the sysfs producer reads the `mad_inter_channel`
+    /// attribute).
+    pub mad_inter_channel: Option<u32>,
+    /// `MAD_DIMM_CH0` (channel 0 DIMM capacity — decode input, L-10).
+    pub mad_dimm_ch0: Option<u32>,
+    /// `MAD_DIMM_CH1` (channel 1 DIMM capacity — decode input, L-10).
+    pub mad_dimm_ch1: Option<u32>,
     /// `MAD_DIMM_CH2` @ `0x5060` (Alder/DDR5 subchannel 2 geometry,
     /// raw).
     pub mad_dimm_ch2: Option<u32>,
@@ -523,7 +533,7 @@ impl IntelImcRegs {
     /// `0x4000` / `0x4400` / `0x4800` / `0x4C00`), the two native MCL
     /// blocks (`mcl0` @ `0xD000` / `mcl1` @ `0xD800`, OQ-4), and the
     /// two Alder/DDR5 `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws — the full
-    /// 51-slot [`IntelImcRegs`] set (the wide `/dev/mem` half of plan
+    /// 74-slot [`IntelImcRegs`] set (the wide `/dev/mem` half of plan
     /// §3.5; IG-25).
     ///
     /// The map is profile-sized ([`intel_mchbar::window_size_for`]:
@@ -590,6 +600,12 @@ impl IntelImcRegs {
             ch3,
             mcl0,
             mcl1,
+            // L-10: the gen-keyed MAD base (0x5000 / 0xD800) is set by
+            // `read_intel_with` after this pure reader (which reads fixed
+            // offsets only) — `None` here.
+            mad_inter_channel: None,
+            mad_dimm_ch0: None,
+            mad_dimm_ch1: None,
             mad_dimm_ch2: read(MAD_DIMM_CH2_OFFSET),
             mad_dimm_ch3: read(MAD_DIMM_CH3_OFFSET),
             alk_d4_tc0,
@@ -1238,14 +1254,18 @@ fn mcbios_refclk_100(raw: u32) -> bool {
 /// The `MC_BIOS_REQ` gear-ratio field (bits [17:16] — Rocket+ only)
 /// decoded to a [`GearMode`], verbatim per Breakdown §3D:
 ///
-/// - bit 16 = 0b → [`GearMode::One`] (1:1, the synchronous default —
-///   valid on every gear cap);
+/// - bits `[17:16] = 00b` → [`GearMode::One`] (1:1, the synchronous
+///   default) **for every cap, including `GearCap::None`** (L-3): `00b`
+///   means "no gear divider set" = the 1× mode, the normal valid state on
+///   a Tier-1 platform that has no gear register. This is distinct from a
+///   *set* gear bit on a `GearCap::None` platform (below), which is
+///   over-cap → `None`;
 /// - bit 16 = 1b → [`GearMode::Two`] (the `Gear2` and `Gear4` caps);
 /// - bit 17 = 1b (with bit 16 = 0b) → [`GearMode::Four`], allowed ONLY
 ///   when `cap == GearCap::Gear4` (Alder Lake and later); on a `Gear2`
 ///   cap (Rocket Lake) a set bit 17 is over-cap → `None` (documented);
-/// - any other reserved / over-cap encoding (notably gear bits set on a
-///   `GearCap::None` Tier-1 platform, which has no gear register) →
+/// - any other reserved / over-cap encoding (notably a gear bit *set* on
+///   a `GearCap::None` Tier-1 platform, which has no gear register) →
 ///   `None`.
 ///
 /// A `11b` field follows the bit-16 rule (gear 2) — the pinned
@@ -2018,14 +2038,20 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 pub fn decode(
     regs: &IntelImcRegs,
     gen: IntelGen,
-    mad_inter_channel: Option<u32>,
-    mad_dimm_ch0: Option<u32>,
-    mad_dimm_ch1: Option<u32>,
     smbios: &SmbiosTopology,
 ) -> IntelReadout {
+    // L-7: server platforms use decode_server (SMBIOS + SPD), never the
+    // MMIO decode. If called directly (bypassing the facade's
+    // is_server_gen routing), return a structured all-Na readout — never a
+    // decode of the (nonexistent) server MCHBAR window.
+    if is_server_gen(gen) {
+        return server_all_na(gen, smbios.populated_count);
+    }
     // The 4-tier resolution (computed once; shared by the decoded arms).
-    let mmio_mode = mmio_channel_mode(mad_dimm_ch0, mad_dimm_ch1);
-    let mmio_tech = mad_inter_channel.map(MemoryTech::from_mad_bits);
+    // L-10: all MAD data comes from `regs` (the decode inputs
+    // `mad_inter_channel` / `mad_dimm_ch0/1` ride on the register set).
+    let mmio_mode = mmio_channel_mode(regs.mad_dimm_ch0, regs.mad_dimm_ch1);
+    let mmio_tech = regs.mad_inter_channel.map(MemoryTech::from_mad_bits);
     let res = resolve_channel(mmio_mode, mmio_tech, smbios);
 
     match profile_for(gen) {
@@ -2034,17 +2060,29 @@ pub fn decode(
         // the gear cells.
         Some(p) if matches!(p.map, GenMap::Tier1 | GenMap::Rocket) => {
             let mclk = decode_mclk(regs.mcbios_req, gen);
+            // L-5: the gear cells are loop-invariant (the same MC_BIOS_REQ
+            // word for every channel) — decode once, layer on every channel
+            // (the Tier-3 pattern).
+            let gear_cells = (p.gear != GearCap::None)
+                .then(|| gear_uclk_cells(p.gear, &mclk, regs.mcbios_req));
             let mut channels = Vec::with_capacity(usize::from(p.channel_count));
             for i in 0..p.channel_count {
+                // L-4: explicit per-index handling — the Tier-1 register set
+                // has exactly two channels; a higher index (unreachable for
+                // the 2-channel profile) degrades to an all-Na channel
+                // instead of mapping to ch1.
                 let per = match i {
                     0 => &regs.ch0,
-                    _ => &regs.ch1,
+                    1 => &regs.ch1,
+                    _ => {
+                        channels.push(unsupported_channel(i));
+                        continue;
+                    }
                 };
                 let mut channel = decode_tier1_channel(i, mclk.clone(), per);
-                if p.gear != GearCap::None {
-                    let (gear_mode, uclk) = gear_uclk_cells(p.gear, &mclk, regs.mcbios_req);
-                    channel.clocks.gear_mode = gear_mode;
-                    channel.clocks.uclk_mhz = uclk;
+                if let Some((gear_mode, uclk)) = &gear_cells {
+                    channel.clocks.gear_mode = gear_mode.clone();
+                    channel.clocks.uclk_mhz = uclk.clone();
                 }
                 channels.push(channel);
             }
@@ -2075,7 +2113,13 @@ pub fn decode(
                 for ch in 0..count {
                     channels.push(unsupported_channel(ch));
                 }
-                return all_na_readout(channels);
+                // L-2: thread the resolved SMBIOS population + the
+                // tile-routing annotation into the all-Na readout.
+                return all_na_readout(
+                    channels,
+                    res.dimm_count,
+                    "SoC-tile IMC routing suspected (MCHBAR + 0x180000 secondary range, OQ-5) — primary window degenerate",
+                );
             }
             // OQ-11: the DDR5 subchannel-geometry condition (both
             // `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws present and non-zero).
@@ -2132,7 +2176,8 @@ pub fn decode(
             for ch in 0..count {
                 channels.push(unsupported_channel(ch));
             }
-            all_na_readout(channels)
+            // L-2: thread the resolved SMBIOS population + annotation.
+            all_na_readout(channels, res.dimm_count, &res.annotation)
         }
     }
 }
@@ -2185,7 +2230,7 @@ fn gear_uclk_cells(
 /// 2. The read follows the generation's register-map family (the map
 ///    is already profile-sized by [`intel_mchbar::window_size_for`]
 ///    for the same profile): the Tier-3 Alder family reads the full
-///    51-slot offset set through [`IntelImcRegs::from_bar_wide`]
+///    74-slot offset set through [`IntelImcRegs::from_bar_wide`]
 ///    (the 256 KiB profile map — the ch2/ch3 mirror blocks, the two
 ///    native MCL blocks @ `0xD000`/`0xD800`, and the
 ///    `MAD_DIMM_CH2/CH3` raws OQ-11's DDR5 condition needs, none of
@@ -2207,28 +2252,48 @@ fn gear_uclk_cells(
 /// benefits from the same 4-tier cross-check as the sysfs path, plan
 /// hard-constraint #5).
 pub fn read_intel(bar: &MchBar, smbios: &SmbiosTopology) -> TelemetryResult<IntelReadout> {
-    let info = CpuInfo::detect();
-    let gen = intel_gen_gate(&info)?;
+    // L-9: the no-arg convenience wrapper (standalone use) detects the CPU
+    // internally; the facade uses [`read_intel_with`] to thread its single
+    // per-snapshot detect result through (no redundant re-detect).
+    let gen = intel_gen_gate(&CpuInfo::detect())?;
+    read_intel_with(bar, smbios, gen)
+}
+
+/// Read and decode every IMC channel from a live, read-only [`MchBar`]
+/// map for an already-detected generation (L-9): the facade threads its
+/// single per-snapshot detect result through, so the `/dev/mem` path does
+/// not re-detect the CPU (the pre-L-9 path called `CpuInfo::detect()` a
+/// third time per snapshot).
+pub fn read_intel_with(
+    bar: &MchBar,
+    smbios: &SmbiosTopology,
+    gen: IntelGen,
+) -> TelemetryResult<IntelReadout> {
+    // L-7: server platforms use decode_server (SMBIOS + SPD), never the
+    // MMIO read — guard here (before any bar read) so a direct call
+    // (bypassing the facade's is_server_gen routing) returns a structured
+    // all-Na readout instead of reading the (nonexistent) server window.
+    if is_server_gen(gen) {
+        return Ok(server_all_na(gen, smbios.populated_count));
+    }
     // The /dev/mem read set follows the generation's register-map
     // family (IG-26 fix): the Alder family takes the 256 KiB wide set
     // (its map is the 256 KiB profile window); Tier 1 / Rocket Lake
     // (and any future 64 KiB family) keep the 9-register Tier-1 set.
-    let regs = match profile_for(gen).map(|p| p.map) {
+    let mut regs = match profile_for(gen).map(|p| p.map) {
         Some(GenMap::Alder) => IntelImcRegs::from_bar_wide(bar),
         _ => IntelImcRegs::from_bar(bar),
     };
-    // Chunk 2: read the MAD channel/geometry registers at the
-    // gen-appropriate IMC base (0xd800 for 12th-gen+, 0x5000 otherwise —
-    // [`imc_base_for`], the same base the kernel module selects). This is
-    // the hard-constraint fix: the pre-Chunk-2 fallback passed `None` for
-    // all three MAD inputs, so the channel mode was always `None`.
-    // Per-register containment: an out-of-bounds / failed read degrades to
-    // `None` (never a panic).
+    // Chunk 2 / L-10: the gen-keyed MAD channel/geometry registers
+    // (0xd800 for 12th-gen+, 0x5000 otherwise — [`imc_base_for`], the same
+    // base the kernel module selects) ride on the register set (all MAD
+    // data comes from `regs` in [`decode`]). Per-register containment: an
+    // out-of-bounds / failed read degrades to `None` (never a panic).
     let base = imc_base_for(gen);
-    let mad_inter = bar.read_u32(base).ok();
-    let mad_dimm0 = bar.read_u32(base + 0x0C).ok();
-    let mad_dimm1 = bar.read_u32(base + 0x10).ok();
-    Ok(decode(&regs, gen, mad_inter, mad_dimm0, mad_dimm1, smbios))
+    regs.mad_inter_channel = bar.read_u32(base).ok();
+    regs.mad_dimm_ch0 = bar.read_u32(base + 0x0C).ok();
+    regs.mad_dimm_ch1 = bar.read_u32(base + 0x10).ok();
+    Ok(decode(&regs, gen, smbios))
 }
 
 /// Decode a raw register set produced by *any* source (the sysfs path
@@ -2249,13 +2314,13 @@ pub fn read_regs(regs: &IntelImcRegs) -> IntelReadout {
         // The `read_regs` entry point carries no SMBIOS input (it is a
         // pure raw-set decode), so it resolves against the empty topology
         // (the 4-tier degrades to the terminal / MMIO-only states).
-        Ok(gen) => decode(regs, gen, None, None, None, &SmbiosTopology::empty()),
+        Ok(gen) => decode(regs, gen, &SmbiosTopology::empty()),
         Err(_) => {
             let mut channels = Vec::with_capacity(2);
             for ch in 0..2u8 {
                 channels.push(unsupported_channel(ch));
             }
-            all_na_readout(channels)
+            all_na_readout(channels, 0, "")
         }
     }
 }
@@ -3007,17 +3072,44 @@ impl IntelReadout {
 
 /// An all-Na (terminal / unsupported) readout: the degraded shape for a
 /// generation the decode does not cover, or a fully degenerate primary
-/// window. Carries no channel claim (mode / tech / trust all `None`).
-fn all_na_readout(channels: Vec<IntelChannel>) -> IntelReadout {
+/// window. Carries no channel-mode claim (mode / tech / trust all `None`)
+/// but preserves the resolved SMBIOS population count and a human
+/// annotation (L-2: the all-Na degradation no longer discards the
+/// resolved `dimm_count`).
+fn all_na_readout(
+    channels: Vec<IntelChannel>,
+    dimm_count: u8,
+    annotation: &str,
+) -> IntelReadout {
     IntelReadout {
         channels,
         channel_mode: None,
         ecc_status: EccStatus::Unknown,
         memory_tech: None,
         channel_trust: None,
-        channel_annotation: String::new(),
-        dimm_count: 0,
+        channel_annotation: annotation.to_owned(),
+        dimm_count,
     }
+}
+
+/// L-7: the structured all-Na readout a server platform gets when the
+/// MMIO [`decode`] / [`read_intel`] path is hit directly (bypassing the
+/// facade's `is_server_gen` routing to [`decode_server`]). Server uncore
+/// has no OS-accessible MC timing registers, so the honest degradation is
+/// the all-`Na(UnsupportedHardware)` shape at the generation's channel
+/// count, with a note pointing at the correct path and the resolved SMBIOS
+/// population preserved (L-2).
+fn server_all_na(gen: IntelGen, dimm_count: u8) -> IntelReadout {
+    let count = channel_count(gen);
+    let mut channels = Vec::with_capacity(usize::from(count));
+    for ch in 0..count {
+        channels.push(unsupported_channel(ch));
+    }
+    all_na_readout(
+        channels,
+        dimm_count,
+        "server platform: use decode_server (SMBIOS+SPD), not MMIO decode",
+    )
 }
 
 /// A decoded readout: the resolved channels + the 4-tier channel
@@ -3098,7 +3190,7 @@ pub fn fixture_intel_readout(
         ch1: ch1.clone(),
         ..IntelImcRegs::default()
     };
-    let mut out = decode(&regs, gen, None, None, None, &SmbiosTopology::default());
+    let mut out = decode(&regs, gen, &SmbiosTopology::default());
     out.channel_mode = None;
     out.memory_tech = None;
     out.channel_trust = None;
@@ -3195,14 +3287,9 @@ mod tests {
     /// not-applicable, the CAD bus / voltages not exposed.
     #[test]
     fn acceptance_skylake_readout_pins_the_section_numbers() {
-        let ro = decode(
-            &acceptance_regs(),
-            IntelGen::Skylake,
-            Some(0),
-            None,
-            None,
-            &SmbiosTopology::empty(),
-        );
+        let mut regs = acceptance_regs();
+        regs.mad_inter_channel = Some(0);
+        let ro = decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Tier 1: two channels");
         // No `MAD_DIMM_CH0/1` population raws + no SMBIOS -> the 4-tier
         // terminal state (the acceptance fixture pins the *timings*, not the
@@ -3411,16 +3498,10 @@ mod tests {
     fn decode_alder_family_representative_word_end_to_end() {
         let regs = IntelImcRegs {
             mcbios_req: Some(0x79E0_0124),
+            mad_inter_channel: Some(0),
             ..IntelImcRegs::default()
         };
-        let ro = decode(
-            &regs,
-            IntelGen::AlderLake,
-            Some(0),
-            None,
-            None,
-            &SmbiosTopology::empty(),
-        );
+        let ro = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Alder Lake DDR4: two subchannels");
         for ch in &ro.channels {
             assert_eq!(ch.clocks.mclk_mhz, Section::Value(1800.0));
@@ -4297,7 +4378,7 @@ mod tests {
     /// 9-register `from_bar` never touches), the two native MCL
     /// blocks (`0xD000`/`0xD800`), the global `MC_BIOS_REQ`, and the
     /// `MAD_DIMM_CH2/CH3` raws — landing every seeded word in its
-    /// 51-slot field, with exactly 51 distinct 4-byte reads, all
+    /// 74-slot field, with exactly 71 distinct 4-byte reads, all
     /// in-window.
     #[test]
     fn from_bar_wide_reads_the_full_alder_offset_set() {
@@ -4358,7 +4439,8 @@ mod tests {
         let touched = std::cell::RefCell::new(Vec::new());
         let regs = IntelImcRegs::from_wide_reader(buffered_reader(buf, &touched));
 
-        // Every seeded word lands in its field — the full 51-slot set,
+        // Every seeded word lands in its field — the full 74-slot set
+        // (71 read offsets; the 3 gen-keyed MAD raws stay `None` here),
         // including the MCL blocks and the MAD raws the 9-register
         // `from_bar` never reads.
         let expect_ch = |i: u32| {
@@ -4412,6 +4494,9 @@ mod tests {
                 ch3: expect_ch(3),
                 mcl0: expect_mcl(0),
                 mcl1: expect_mcl(1),
+                mad_inter_channel: None,
+                mad_dimm_ch0: None,
+                mad_dimm_ch1: None,
                 mad_dimm_ch2: Some(1),
                 mad_dimm_ch3: Some(2),
                 alk_d4_tc0: expect_alk_d4(0),
@@ -4640,14 +4725,9 @@ mod tests {
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
         ] {
-            let ro = decode(
-                &tier3_ddr5_condition_regs(),
-                gen,
-                Some(0),
-                None,
-                None,
-                &SmbiosTopology::empty(),
-            );
+            let mut regs = tier3_ddr5_condition_regs();
+            regs.mad_inter_channel = Some(0);
+            let ro = decode(&regs, gen, &SmbiosTopology::empty());
             assert_eq!(ro.channels.len(), 4, "{gen:?}: DDR5 condition met -> 4 subchannels");
             assert_eq!(
                 ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
@@ -4703,14 +4783,8 @@ mod tests {
                 let mut regs = tier3_ddr5_condition_regs();
                 regs.mad_dimm_ch2 = mad2;
                 regs.mad_dimm_ch3 = mad3;
-                let ro = decode(
-                    &regs,
-                    gen,
-                    Some(1),
-                    None,
-                    None,
-                    &SmbiosTopology::empty(),
-                );
+                regs.mad_inter_channel = Some(1);
+                let ro = decode(&regs, gen, &SmbiosTopology::empty());
                 assert_eq!(ro.channels.len(), 2, "{gen:?} ({label}): DDR4 default");
                 assert_eq!(
                     ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
@@ -4751,7 +4825,7 @@ mod tests {
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
         ] {
-            let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
+            let ro = decode(&regs, gen, &SmbiosTopology::empty());
             for ch in &ro.channels {
                 assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
                 assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Four), "{gen:?}");
@@ -4771,7 +4845,9 @@ mod tests {
     /// which cells carry `Value` vs `Na` differs).
     #[test]
     fn decode_tier3_four_channel_readout_bincode_round_trip() {
-        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, Some(0), None, None, &SmbiosTopology::empty());
+        let mut regs = tier3_ddr5_condition_regs();
+        regs.mad_inter_channel = Some(0);
+        let ro = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 4, "the 4-subchannel DDR5 shape");
         let bytes = bincode::serialize(&ro)
             .expect("IntelReadout must serialize (no-panic contract)");
@@ -4811,7 +4887,7 @@ mod tests {
             Some(0x0001_0024),
             "Example C register settings: 133.3333 MHz base, ratio 36, Gear 2"
         );
-        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, None, None, None, &SmbiosTopology::empty());
+        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 4, "DDR5 condition met -> 4 subchannels");
         for ch in &ro.channels {
             // Step 1 (memory clock): 18 x 133.3333 MHz = 2400 MHz.
@@ -4859,7 +4935,7 @@ mod tests {
             },
             ..IntelImcRegs::default()
         };
-        let ro = decode(&regs, IntelGen::AlderLake, None, None, None, &SmbiosTopology::empty());
+        let ro = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
         assert_eq!(
             ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
             vec![0, 2],
@@ -4931,7 +5007,7 @@ mod tests {
             mad_dimm_ch3: Some(1),
             ..IntelImcRegs::default()
         };
-        let ro = decode(&regs, IntelGen::AlderLake, None, None, None, &SmbiosTopology::empty());
+        let ro = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 4, "DDR5 condition met -> 4 subchannels");
         assert_eq!(
             ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
@@ -5038,8 +5114,8 @@ mod tests {
             for (label, fill) in fills {
                 let regs = IntelImcRegs::from_wide_reader(fill);
                 assert!(regs.primary_window_degenerate(), "{gen:?} ({label})");
-                let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
-                assert_eq!(ro.channels.len(), 4, "{gen:?} ({label})");
+                let ro = decode(&regs, gen, &SmbiosTopology::empty());
+                assert_eq!(ro.channels.len(), 2, "{gen:?} ({label}) (C-4: dual-channel)");
                 for ch in &ro.channels {
                     assert_eq!(
                         ch.clocks.mclk_mhz,
@@ -5101,7 +5177,7 @@ mod tests {
                 }
             });
             assert!(!regs.primary_window_degenerate(), "{gen:?}");
-            let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
+            let ro = decode(&regs, gen, &SmbiosTopology::empty());
             assert_eq!(ro.channels.len(), 2, "{gen:?}: DDR4 default (MAD raws zero)");
             for ch in &ro.channels {
                 assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
@@ -5121,7 +5197,7 @@ mod tests {
     /// whole channel to honest `Na` — no panic, no garbage values.
     #[test]
     fn decode_all_absent_degrades_without_panic() {
-        let ro = decode(&IntelImcRegs::default(), IntelGen::Skylake, None, None, None, &SmbiosTopology::empty());
+        let ro = decode(&IntelImcRegs::default(), IntelGen::Skylake, &SmbiosTopology::empty());
         for ch in &ro.channels {
             assert!(ch.clocks.mclk_mhz.is_na(), "{:?}", ch.clocks.mclk_mhz);
             for s in [&ch.clocks.uclk_mhz, &ch.clocks.fclk_mhz] {
@@ -5199,7 +5275,7 @@ mod tests {
     fn decode_per_register_containment() {
         let mut regs = acceptance_regs();
         regs.ch0.tc_rap = None;
-        let ro = decode(&regs, IntelGen::Skylake, None, None, None, &SmbiosTopology::empty());
+        let ro = decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty());
         let ch0 = &ro.channels[0];
 
         for s in [&ch0.timings.ras, &ch0.timings.rrds, &ch0.timings.rtp, &ch0.timings.faw] {
@@ -5236,7 +5312,7 @@ mod tests {
         regs.ch0.tc_dbp = Some(0);
         regs.ch0.tc_rfp = Some(0);
         regs.ch1.tc_rap = Some(0);
-        let ro = decode(&regs, IntelGen::Skylake, None, None, None, &SmbiosTopology::empty());
+        let ro = decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty());
 
         let ch0 = &ro.channels[0];
         for s in [
@@ -5275,11 +5351,12 @@ mod tests {
     fn decode_non_tier1_gen_degrades_all_na() {
         let regs = acceptance_regs();
         for (gen, count) in [
-            (IntelGen::IceLake, 2u8),
-            (IntelGen::TigerLake, 2),
+            (IntelGen::JasperLake, 2u8),
+            (IntelGen::LunarLake, 2),
+            (IntelGen::CoreSeries1Mobile, 2),
             (IntelGen::Unrecognized, 2),
         ] {
-            let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
+            let ro = decode(&regs, gen, &SmbiosTopology::empty());
             assert_eq!(ro.channels.len(), usize::from(count), "{gen:?}");
             for (i, ch) in ro.channels.iter().enumerate() {
                 assert_eq!(ch.index, i as u8, "{gen:?}");
@@ -5379,21 +5456,27 @@ mod tests {
             IntelGen::KabyLake,
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
+            IntelGen::IceLake,
+            IntelGen::TigerLake,
+            IntelGen::Haswell,
+            IntelGen::Broadwell,
             IntelGen::RocketLake,
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
+            IntelGen::HaswellE,
+            IntelGen::BroadwellE,
+            IntelGen::SkylakeX,
+            IntelGen::CascadeLake,
+            IntelGen::SapphireRapids,
         ] {
             assert_eq!(gen_gate(gen), Ok(()), "{gen:?}");
         }
         // Every unprofiled generation: the detail names it and the
         // full profiled set (Tier 1 + 2 + 3).
         for gen in [
-            IntelGen::IceLake,
-            IntelGen::TigerLake,
             IntelGen::JasperLake,
-            IntelGen::SapphireRapids,
             IntelGen::LunarLake,
             IntelGen::CoreSeries1Mobile,
             IntelGen::Unrecognized,
@@ -5419,17 +5502,27 @@ mod tests {
             IntelGen::KabyLake,
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
+            IntelGen::IceLake,
+            IntelGen::TigerLake,
+            IntelGen::Haswell,
+            IntelGen::Broadwell,
             IntelGen::RocketLake,
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
+            IntelGen::HaswellE,
+            IntelGen::BroadwellE,
+            IntelGen::SkylakeX,
+            IntelGen::CascadeLake,
+            IntelGen::SapphireRapids,
         ] {
             assert!(gen_supported(gen), "{gen:?}");
         }
         for gen in [
-            IntelGen::IceLake,
-            IntelGen::TigerLake,
+            IntelGen::JasperLake,
+            IntelGen::LunarLake,
+            IntelGen::CoreSeries1Mobile,
             IntelGen::Unrecognized,
         ] {
             assert!(!gen_supported(gen), "{gen:?}");
@@ -5447,10 +5540,10 @@ mod tests {
     /// 11th-gen-and-later half-step — ratio 18 = 2400 MT/s data rate).
     #[test]
     fn decode_rocket_lake_is_tier1_map_plus_gear() {
-        let tier1 = decode(&acceptance_regs(), IntelGen::Skylake, None, None, None, &SmbiosTopology::empty());
+        let tier1 = decode(&acceptance_regs(), IntelGen::Skylake, &SmbiosTopology::empty());
         let mut regs = acceptance_regs();
         regs.mcbios_req = Some(0x0001_0012); // ratio 18 + bit 16 (gear 2)
-        let rocket = decode(&regs, IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
+        let rocket = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(rocket.channels.len(), 2, "Rocket Lake: two channels");
         for (t, r) in tier1.channels.iter().zip(&rocket.channels) {
             // The ratio cells are generation-keyed (see above); every
@@ -5482,13 +5575,13 @@ mod tests {
     /// MC_BIOS_REQ decode).
     #[test]
     fn decode_rocket_lake_gear_containment() {
-        let sync = decode(&acceptance_regs(), IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty()); // 0x12 → 00b
+        let sync = decode(&acceptance_regs(), IntelGen::RocketLake, &SmbiosTopology::empty()); // 0x12 → 00b
         for ch in &sync.channels {
             assert_eq!(ch.clocks.mclk_mhz, Section::Value(1200.0), "ratio 18 half-step");
             assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
             assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "uclk = mclk (gear 1)");
         }
-        let absent = decode(&IntelImcRegs::default(), IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
+        let absent = decode(&IntelImcRegs::default(), IntelGen::RocketLake, &SmbiosTopology::empty());
         for ch in &absent.channels {
             assert!(matches!(
                 ch.clocks.mclk_mhz,
@@ -5543,7 +5636,7 @@ mod tests {
     fn tier2_example_a_gear1_100_mhz_base_end_to_end() {
         let mut regs = acceptance_regs();
         regs.mcbios_req = Some(0x0000_0120);
-        let ro = decode(&regs, IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
+        let ro = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
             // §4 Example A numbers, pinned exactly.
@@ -5584,7 +5677,7 @@ mod tests {
     fn tier2_example_d_gear2_100_mhz_base_end_to_end() {
         let mut regs = acceptance_regs();
         regs.mcbios_req = Some(0x0001_013C);
-        let ro = decode(&regs, IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
+        let ro = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
             // §4 Example D numbers, pinned exactly.
@@ -5625,7 +5718,7 @@ mod tests {
         assert_eq!(turnaround_quartet(0x0000_0308), [8, 12, 0, 0], "TC_WRRD");
         assert_eq!(turnaround_quartet(0x0040_C204), [4, 8, 12, 16], "TC_WRWR");
 
-        let ro = decode(&regs, IntelGen::RocketLake, None, None, None, &SmbiosTopology::empty());
+        let ro = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
             // TC_RDRD: the full sg / dg / dr / dd quartet.
@@ -5653,7 +5746,7 @@ mod tests {
         }
         // Shared-map proof: identical raws decode identically under
         // Tier 1 (only the gear cells differ — pinned above).
-        let tier1 = decode(&regs, IntelGen::Skylake, None, None, None, &SmbiosTopology::empty());
+        let tier1 = decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty());
         for (r, t) in ro.channels.iter().zip(&tier1.channels) {
             assert_eq!(r.timings, t.timings, "all shared-map timings identical");
         }
@@ -5799,9 +5892,13 @@ mod tests {
     #[test]
     fn decode_readout_bincode_round_trip() {
         for ro in [
-            decode(&acceptance_regs(), IntelGen::Skylake, Some(1), None, None, &SmbiosTopology::empty()),
-            decode(&IntelImcRegs::default(), IntelGen::Skylake, None, None, None, &SmbiosTopology::empty()),
-            decode(&acceptance_regs(), IntelGen::AlderLake, None, None, None, &SmbiosTopology::empty()),
+            {
+                let mut regs = acceptance_regs();
+                regs.mad_inter_channel = Some(1);
+                decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty())
+            },
+            decode(&IntelImcRegs::default(), IntelGen::Skylake, &SmbiosTopology::empty()),
+            decode(&acceptance_regs(), IntelGen::AlderLake, &SmbiosTopology::empty()),
         ] {
             let bytes = bincode::serialize(&ro)
                 .expect("IntelReadout must serialize (no-panic contract)");
@@ -5821,16 +5918,17 @@ mod tests {
             IntelGen::CometLake,
             IntelGen::IceLake,
             IntelGen::TigerLake,
+            IntelGen::Haswell,
+            IntelGen::Broadwell,
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
             IntelGen::RocketLake,
             IntelGen::Unrecognized,
         ];
         for g in two {
-            assert_eq!(channel_count(g), 2, "{g:?}");
-        }
-        for g in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
-            assert_eq!(channel_count(g), 4, "{g:?}");
+            assert_eq!(channel_count(g), 2, "{g:?} (C-4: Meteor/Arrow dual-channel)");
         }
     }
 
@@ -6016,6 +6114,7 @@ mod tests {
         };
         let regs = IntelImcRegs {
             mcbios_req: Some(0x0000_0120), // ratio 32 @ 100 MHz / 2 = 1600 MHz
+            mad_inter_channel: Some(0), // [2:0] == 0 -> DDR4 (the dispatch key)
             alk_d4_tc0: d4_tc.clone(),
             alk_d4_tc1: d4_tc,
             ..IntelImcRegs::default()
@@ -6025,7 +6124,7 @@ mod tests {
             ..SmbiosTopology::empty()
         };
         // MAD_INTER_CHANNEL[2:0] == 0 -> DDR4 (the dispatch key).
-        let ro = decode(&regs, IntelGen::AlderLake, Some(0), None, None, &smbios);
+        let ro = decode(&regs, IntelGen::AlderLake, &smbios);
 
         // 2 channels (2 MCs × 1 channel) — not the 4-subchannel DDR5
         // geometry.
@@ -6077,10 +6176,10 @@ mod tests {
     /// steal it.
     #[test]
     fn tc_alk_ddr5_still_routes_to_the_subchannel_path() {
-        let regs = tier3_ddr5_condition_regs();
+        let mut regs = tier3_ddr5_condition_regs();
         // MAD_INTER_CHANNEL[2:0] == 4 -> DDR5.
-        let ro =
-            decode(&regs, IntelGen::AlderLake, Some(4), None, None, &SmbiosTopology::empty());
+        regs.mad_inter_channel = Some(4);
+        let ro = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 4, "DDR5 Alder Lake = 4 subchannels");
     }
 
@@ -6442,14 +6541,11 @@ mod tests {
     fn decode_l3_override_single_mmio_dual_smbios() {
         let smbios = smbios_topology(2, DerivedMode::Dual, Some(MemoryTech::Ddr4));
         // 16 GiB on ch0 (index 32) + 0 on ch1 -> MMIO Single.
-        let ro = decode(
-            &acceptance_regs(),
-            IntelGen::AlderLake,
-            Some(0x0), // DDR_TYPE = DDR4
-            Some(0x20),
-            Some(0x0),
-            &smbios,
-        );
+        let mut regs = acceptance_regs();
+        regs.mad_inter_channel = Some(0x0); // DDR_TYPE = DDR4
+        regs.mad_dimm_ch0 = Some(0x20);
+        regs.mad_dimm_ch1 = Some(0x0);
+        let ro = decode(&regs, IntelGen::AlderLake, &smbios);
         assert_eq!(
             ro.channel_mode,
             Some(ChannelMode::DualSymmetric),
@@ -6474,38 +6570,27 @@ mod tests {
     #[test]
     fn decode_tier1_channel_mode_4_tier() {
         // 2×16 GiB (index 32 each) -> DualSymmetric, L1.
-        let ro = decode(
-            &acceptance_regs(),
-            IntelGen::Skylake,
-            Some(0x0),
-            Some(0x20),
-            Some(0x20),
-            &SmbiosTopology::empty(),
-        );
+        let mut regs = acceptance_regs();
+        regs.mad_inter_channel = Some(0x0);
+        regs.mad_dimm_ch0 = Some(0x20);
+        regs.mad_dimm_ch1 = Some(0x20);
+        let ro = decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty());
         assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));
         assert_eq!(ro.channel_trust, Some(ChannelTrust::VerifiedHardware));
 
         // 16 GiB on ch0 alone -> Single, L1 verified-single.
-        let ro = decode(
-            &acceptance_regs(),
-            IntelGen::Skylake,
-            Some(0x0),
-            Some(0x20),
-            Some(0x0),
-            &SmbiosTopology::empty(),
-        );
+        let mut regs = acceptance_regs();
+        regs.mad_inter_channel = Some(0x0);
+        regs.mad_dimm_ch0 = Some(0x20);
+        regs.mad_dimm_ch1 = Some(0x0);
+        let ro = decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty());
         assert_eq!(ro.channel_mode, Some(ChannelMode::Single));
         assert_eq!(ro.channel_trust, Some(ChannelTrust::VerifiedHardware));
 
         // Absent MMIO raws + no SMBIOS -> terminal None.
-        let ro = decode(
-            &acceptance_regs(),
-            IntelGen::Skylake,
-            Some(0x0),
-            None,
-            None,
-            &SmbiosTopology::empty(),
-        );
+        let mut regs = acceptance_regs();
+        regs.mad_inter_channel = Some(0x0);
+        let ro = decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty());
         assert_eq!(ro.channel_mode, None);
         assert_eq!(ro.channel_trust, Some(ChannelTrust::None));
     }
