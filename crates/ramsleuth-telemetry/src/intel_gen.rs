@@ -8,13 +8,17 @@
 //!
 //! IG-01 lands the Tier-1 (Skylake–Comet Lake) and Rocket Lake profiles;
 //! IG-03 adds the Tier-3 `Alder` family entries (Alder/Raptor Lake at the
-//! DDR4-default 2-channel count, Meteor/Arrow Lake at 4 channels). The
-//! `Sandy` and `Haswell` `GenMap` families exist now and gain their
-//! profile entries in later chunks once their `IntelGen` variants land;
+//! DDR4-default 2-channel count, Meteor/Arrow Lake at 4 channels).
 //! IG-20 adds the Alder/Raptor Lake (Tier 3) register table: the four
 //! DDR5 subchannel descriptors ([`ALDER_CHANNELS`]) with their legacy
 //! mirror and uncore-MCL bases, and the widened DDR5 timing bitfield
 //! constants ([`ALDER_FIELDS`]).
+//!
+//! The canonical hardware constants (MCHBAR window sizes, uncore-MCL
+//! bases, Alder Lake DDR4 TC bases) are declared in this module as the
+//! single source of truth (M-2) so the consumers (intel_readout.rs /
+//! intel_mchbar.rs) import them rather than re-declaring independent
+//! copies.
 //!
 //! The `mchbar_mask` values here are **diagnostic-only** for the
 //! dispatcher (OQ-8): they document the alignment contract each profile
@@ -25,6 +29,29 @@
 //! Breakdown §2 (`plans/PLAN-INTEL-GENERIC.md`).
 
 use crate::cpuid::IntelGen;
+
+// ---------------------------------------------------------------------
+// Canonical hardware constants (single source of truth — M-2)
+// ---------------------------------------------------------------------
+//
+// The shared MCHBAR window sizes, uncore-MCL bases, and Alder Lake DDR4
+// TC bases. Declared here (intel_gen.rs) so the consumers (intel_readout.rs
+// / intel_mchbar.rs) import them instead of re-declaring independent
+// copies. All are `pub` (an additive change); the consumer-side `use`
+// statements are a follow-up task.
+
+/// MCHBAR window size for Tier-1 (64 KiB).
+pub const WINDOW_TIER1: u32 = 0x10000;
+/// MCHBAR window size for Tier-3/Alder (256 KiB).
+pub const WINDOW_ALDER: u32 = 0x40000;
+/// MCL0 base offset (Tier 3 subchannel 0 / MC0).
+pub const MCL0_BASE: u32 = 0xD000;
+/// MCL1 base offset (Tier 3 subchannel 2 / MC1).
+pub const MCL1_BASE: u32 = 0xD800;
+/// ALK DDR4 MC0 TC base.
+pub const ALK_D4_TC0_BASE: u32 = 0xE000;
+/// ALK DDR4 MC1 TC base.
+pub const ALK_D4_TC1_BASE: u32 = 0x1E000;
 
 /// Memory-gear capability of a generation's MCHBAR decode set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,9 +67,10 @@ pub enum GearCap {
 /// The register-map family a generation's MCHBAR offsets belong to.
 ///
 /// The families the generational expansion knows about. IG-01 populates
-/// `Tier1` and `Rocket`; IG-03 populates `Alder`; the `Sandy` and
-/// `Haswell` entries land in later chunks once their `IntelGen` variants
-/// exist.
+/// `Tier1` and `Rocket`; IG-03 populates `Alder`. Pre-Skylake families
+/// (Sandy Bridge, Haswell/Broadwell) are out of scope — the project
+/// supports Skylake (6th) through Arrow Lake plus server platforms — so
+/// they carry no `GenMap` entry (M-3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenMap {
     /// Skylake–Comet Lake (64 KiB window, no gear register).
@@ -51,10 +79,6 @@ pub enum GenMap {
     Rocket,
     /// Alder/Raptor/Meteor/Arrow Lake (256 KiB window, 4× gear) — IG-03.
     Alder,
-    /// Sandy/Ivy Bridge (32 KiB window) — later chunk (variants pending).
-    Sandy,
-    /// Haswell/Broadwell (64 KiB window) — later chunk (variants pending).
-    Haswell,
 }
 
 /// A static per-generation MCHBAR decode profile.
@@ -81,8 +105,8 @@ pub struct GenProfile {
 /// (Breakdown §2: 64 KiB window, diagnostic-only mask, 2 channels, no
 /// gear register).
 const TIER1: GenProfile = GenProfile {
-    window_size: 0x10000,
-    mchbar_mask: 0x0000007FFFFFFE0000,
+    window_size: WINDOW_TIER1 as usize,
+    mchbar_mask: 0x0000_007F_FFFF_0000,
     channel_count: 2,
     gear: GearCap::None,
     map: GenMap::Tier1,
@@ -91,8 +115,8 @@ const TIER1: GenProfile = GenProfile {
 /// The Rocket Lake profile: the Tier-1 64 KiB window with the 2×-gear
 /// register set (Breakdown §2; Research lines 15–17).
 const ROCKET: GenProfile = GenProfile {
-    window_size: 0x10000,
-    mchbar_mask: 0x0000007FFFFFFE0000,
+    window_size: WINDOW_TIER1 as usize,
+    mchbar_mask: 0x0000_007F_FFFF_0000,
     channel_count: 2,
     gear: GearCap::Gear2,
     map: GenMap::Rocket,
@@ -103,8 +127,8 @@ const ROCKET: GenProfile = GenProfile {
 /// documents the DDR4 default — OQ-11's DDR5 detection (IG-26) flips the
 /// decode-time count to 4; the profile field itself is untouched.
 const ALDER_2CH: GenProfile = GenProfile {
-    window_size: 0x40000,
-    mchbar_mask: 0x0000007FFFFFC0000,
+    window_size: WINDOW_ALDER as usize,
+    mchbar_mask: 0x0000_007F_FFFC_0000,
     channel_count: 2,
     gear: GearCap::Gear4,
     map: GenMap::Alder,
@@ -115,8 +139,8 @@ const ALDER_2CH: GenProfile = GenProfile {
 /// Research lines 20–21; the tile-routing caveat OQ-5 is handled in
 /// IG-28).
 const ALDER_4CH: GenProfile = GenProfile {
-    window_size: 0x40000,
-    mchbar_mask: 0x0000007FFFFFC0000,
+    window_size: WINDOW_ALDER as usize,
+    mchbar_mask: 0x0000_007F_FFFC_0000,
     channel_count: 4,
     gear: GearCap::Gear4,
     map: GenMap::Alder,
@@ -140,6 +164,11 @@ pub fn profile_for(gen: IntelGen) -> Option<&'static GenProfile> {
         IntelGen::RocketLake => Some(&ROCKET),
         IntelGen::AlderLake | IntelGen::RaptorLake => Some(&ALDER_2CH),
         IntelGen::MeteorLake | IntelGen::ArrowLake => Some(&ALDER_4CH),
+        // Lunar Lake (Core Ultra 200V) is on-package LPDDR5X only (no off-package DIMMs).
+        // It cannot reuse any existing profile (no DDR5 DIMM channel map applies).
+        // Deliberately out of scope for current Intel telemetry support.
+        // If added in the future, requires a dedicated on-package-memory profile.
+        IntelGen::LunarLake => None,
         _ => None,
     }
 }
@@ -178,7 +207,7 @@ pub struct AlderChannelMap {
 /// 329).
 pub const ALDER_MC0_SUBCH0: AlderChannelMap = AlderChannelMap {
     mirror_base: 0x4000,
-    mcl_base: Some(0xD000),
+    mcl_base: Some(MCL0_BASE),
     is_subch: true,
 };
 
@@ -194,7 +223,7 @@ pub const ALDER_MC0_SUBCH1: AlderChannelMap = AlderChannelMap {
 /// 329).
 pub const ALDER_MC1_SUBCH2: AlderChannelMap = AlderChannelMap {
     mirror_base: 0x4800,
-    mcl_base: Some(0xD800),
+    mcl_base: Some(MCL1_BASE),
     is_subch: true,
 };
 
@@ -335,7 +364,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{gen:?} must resolve to the Tier-1 profile"));
             assert_eq!(p, &TIER1, "{gen:?}");
             assert_eq!(p.window_size, 0x10000, "{gen:?}");
-            assert_eq!(p.mchbar_mask, 0x0000007FFFFFFE0000, "{gen:?}");
+            assert_eq!(p.mchbar_mask, 0x0000_007F_FFFF_0000, "{gen:?}");
             assert_eq!(p.channel_count, 2, "{gen:?}");
             assert_eq!(p.gear, GearCap::None, "{gen:?}");
             assert_eq!(p.map, GenMap::Tier1, "{gen:?}");
@@ -351,7 +380,7 @@ mod tests {
             .unwrap_or_else(|| panic!("RocketLake must resolve to the Rocket profile"));
         assert_eq!(p, &ROCKET);
         assert_eq!(p.window_size, 0x10000);
-        assert_eq!(p.mchbar_mask, 0x0000007FFFFFFE0000);
+        assert_eq!(p.mchbar_mask, 0x0000_007F_FFFF_0000);
         assert_eq!(p.channel_count, 2);
         assert_eq!(p.gear, GearCap::Gear2);
         assert_eq!(p.map, GenMap::Rocket);
@@ -389,7 +418,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{gen:?} must resolve to the 2-channel Alder profile"));
             assert_eq!(p, &ALDER_2CH, "{gen:?}");
             assert_eq!(p.window_size, 0x40000, "{gen:?}");
-            assert_eq!(p.mchbar_mask, 0x0000007FFFFFC0000, "{gen:?}");
+            assert_eq!(p.mchbar_mask, 0x0000_007F_FFFC_0000, "{gen:?}");
             assert_eq!(p.channel_count, 2, "{gen:?}");
             assert_eq!(p.gear, GearCap::Gear4, "{gen:?}");
             assert_eq!(p.map, GenMap::Alder, "{gen:?}");
@@ -408,7 +437,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{gen:?} must resolve to the 4-channel Alder profile"));
             assert_eq!(p, &ALDER_4CH, "{gen:?}");
             assert_eq!(p.window_size, 0x40000, "{gen:?}");
-            assert_eq!(p.mchbar_mask, 0x0000007FFFFFC0000, "{gen:?}");
+            assert_eq!(p.mchbar_mask, 0x0000_007F_FFFC_0000, "{gen:?}");
             assert_eq!(p.channel_count, 4, "{gen:?}");
             assert_eq!(p.gear, GearCap::Gear4, "{gen:?}");
                         assert_eq!(p.map, GenMap::Alder, "{gen:?}");
@@ -498,5 +527,19 @@ mod tests {
         for (hi, lo) in ranges {
             assert!(lo <= hi && hi <= 31, "malformed range ({hi}, {lo})");
         }
+    }
+
+    /// The canonical hardware constants (M-2 single source of truth) match
+    /// the values the consumers (intel_readout.rs / intel_mchbar.rs) expect.
+    /// If a value here is ever changed, this test — and the consumer `use`
+    /// imports it guards — keep the two in sync.
+    #[test]
+    fn constants_match_consumer_expectations() {
+        assert_eq!(WINDOW_TIER1, 0x10000);
+        assert_eq!(WINDOW_ALDER, 0x40000);
+        assert_eq!(MCL0_BASE, 0xD000);
+        assert_eq!(MCL1_BASE, 0xD800);
+        assert_eq!(ALK_D4_TC0_BASE, 0xE000);
+        assert_eq!(ALK_D4_TC1_BASE, 0x1E000);
     }
 }
