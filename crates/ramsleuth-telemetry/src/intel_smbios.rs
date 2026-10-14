@@ -735,11 +735,12 @@ mod tests {
     /// extended to `0x22` to carry it (the `populated_ddr4` helper stops at
     /// `0x20`, so the speed there is absent / `None`).
     fn populated_ddr4_speed(locator: &str, speed: u16) -> Vec<u8> {
+        let o = SMBIOS3_OFFSETS;
         let mut fixed = [0u8; 0x22];
-        fixed[OFF_CAPACITY..OFF_CAPACITY + CAPACITY_LEN].copy_from_slice(&0x4000u16.to_le_bytes());
-        fixed[OFF_MEM_DEVICE_LOCATOR] = 1;
-        fixed[OFF_BANK_LOCATOR] = 2;
-        fixed[OFF_MEMORY_TYPE] = 0x1A; // DDR4
+        fixed[o.capacity..o.capacity + CAPACITY_LEN].copy_from_slice(&0x4000u16.to_le_bytes());
+        fixed[o.mem_device_locator] = 1;
+        fixed[o.bank_locator] = 2;
+        fixed[o.memory_type] = 0x1A; // DDR4
         fixed[OFF_SPEED..OFF_SPEED + SPEED_LEN].copy_from_slice(&speed.to_le_bytes());
         type17_file(0x22, &mut fixed, &[locator, locator])
     }
@@ -902,7 +903,7 @@ const REAL_12600KF_17_1: &[u8] = &[
         write_entry(&dmi.root, 0, &populated_ddr4_speed("A2", 2400));
         write_entry(&dmi.root, 1, &populated_ddr4_speed("B2", 2400));
 
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t.speed_mts, Some(2400), "the configured speed is MT/s directly");
         assert_eq!(t.total_capacity_mib, 32768, "2 x 16384 MiB");
         assert_eq!(t.populated_count, 2);
@@ -916,14 +917,14 @@ const REAL_12600KF_17_1: &[u8] = &[
         // (a) a fixed part that ends before the speed field.
         let dmi = TempDmi::new("speed-absent");
         write_entry(&dmi.root, 0, &populated_ddr4("A2"));
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t.speed_mts, None, "no speed field -> None");
         assert_eq!(t.total_capacity_mib, 16384);
 
         // (b) a present-but-zero speed word.
         let dmi = TempDmi::new("speed-zero");
         write_entry(&dmi.root, 0, &populated_ddr4_speed("A2", 0));
-        let t = collect_from(&dmi.root);
+        let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t.speed_mts, None, "a 0 speed word is 'unknown' -> None");
         assert_eq!(t.total_capacity_mib, 16384);
     }
@@ -1041,13 +1042,11 @@ const REAL_12600KF_17_1: &[u8] = &[
         );
 
         // End to end through `collect_from`: the real Z690M-ITX/ax table
-        // derives `Dual` with no board name.
+        // derives `Dual` with no board name (M-15: the `Controller<digit>`
+        // grammar is vendor-neutral in the general table).
         let dmi = TempDmi::new("m15-keyed");
         write_entry(&dmi.root, 0, REAL_12600KF_17_0);
         write_entry(&dmi.root, 1, REAL_12600KF_17_1);
-        let (t, _status) = collect_from(&dmi.root);
-        assert_eq!(t.derived_mode, DerivedMode::Ambiguous);
-        dmi.write_board_name("ASRock Z690M-ITX/ax");
         let (t, _status) = collect_from(&dmi.root);
         assert_eq!(t.derived_mode, DerivedMode::Dual);
     }

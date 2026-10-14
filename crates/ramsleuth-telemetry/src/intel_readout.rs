@@ -6969,6 +6969,9 @@ mod tests {
         // The mirror for subchannel 2 is a disabled default (bus-fault), so
         // without the C-3 fix it would fall back to the MCL1 words; the MCL1
         // block (0xD800) carries valid-looking timing words.
+        // MAD geometry (0xD800 page): mad_inter with DDR_TYPE bits = 000
+        // (DDR4). OQ-11: no MAD_DIMM_CH2/CH3 -> the 2-channel DDR4 geometry.
+        let mad_inter = 0x100u32; // [2:0] = 000 -> DDR4
         let regs = IntelImcRegs {
             ch2: ChannelRegs {
                 tc_dbp: Some(0xFFFF_FFFF),
@@ -6990,30 +6993,24 @@ mod tests {
                 tc_rdrd: Some(0x0000_0010),
                 tc_wrwr: Some(0x0000_0020),
             },
+            mad_inter_channel: Some(mad_inter),
             ..Default::default()
         };
-        // MAD geometry (0xD800 page): mad_inter with DDR_TYPE bits = 000
-        // (DDR4). OQ-11: no MAD_DIMM_CH2/CH3 -> the 2-channel DDR4 geometry.
-        let mad_inter = 0x100u32; // [2:0] = 000 -> DDR4
 
-        let readout = decode(
-            &regs,
-            IntelGen::AlderLake,
-            Some(mad_inter),
-            None,
-            None,
-            &SmbiosTopology::empty(),
-        );
+        // L-10: the 3-arg decode (the MAD geometry rides on `regs`).
+        let readout = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
 
         // res.tech == Some(Ddr4) -> the C-3 Mad policy nulls the MCL1
         // timing words; subchannel 2's mirror is a disabled default, so its
         // timings are N/A (NOT decoded from the aliased MCL1 words).
         assert_eq!(readout.memory_tech, Some(MemoryTech::Ddr4));
+        // M-7: the 2-channel DDR4 default's second channel (subchannel 2)
+        // sits at display position 1.
         let ch2 = readout
             .channels
             .iter()
-            .find(|c| c.index == 2)
-            .expect("subchannel 2 present");
+            .find(|c| c.index == 1)
+            .expect("second channel (subchannel 2) present");
         // tRCD (from TC_PRE) and tCL (from TC_ACT) must both be N/A.
         assert!(
             matches!(ch2.timings.rcdrd, Section::Na(_)),
@@ -7459,19 +7456,15 @@ mod tests {
         let mut regs = tier3_ddr5_condition_regs();
         regs.mad_dimm_ch2 = Some(0xFFFF_FFFF);
         regs.mad_dimm_ch3 = Some(0xFFFF_FFFF);
-        let ro = decode(
-            &regs,
-            IntelGen::AlderLake,
-            Some(0),
-            None,
-            None,
-            &SmbiosTopology::empty(),
-        );
-        // Bus-fault MAD words -> not DDR5 -> 2-channel DDR4 default.
+        regs.mad_inter_channel = Some(0);
+        let ro = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
+        // Bus-fault MAD words -> not DDR5 -> 2-channel DDR4 default
+        // (M-7: the display indices are positional [0, 1], not the
+        // subchannel identities [0, 2]).
         assert_eq!(ro.channels.len(), 2, "bus-fault MAD words -> DDR4 default");
         assert_eq!(
             ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
-            vec![0, 2],
+            vec![0, 1],
         );
     }
 
@@ -7483,14 +7476,8 @@ mod tests {
         let mut regs = tier3_ddr5_condition_regs();
         regs.mad_dimm_ch2 = Some(0);
         regs.mad_dimm_ch3 = Some(0);
-        let ro = decode(
-            &regs,
-            IntelGen::AlderLake,
-            Some(0),
-            None,
-            None,
-            &SmbiosTopology::empty(),
-        );
+        regs.mad_inter_channel = Some(0);
+        let ro = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
         // Zero MAD words -> not DDR5 -> 2-channel DDR4 default.
         assert_eq!(ro.channels.len(), 2, "zero MAD words -> DDR4 default");
     }
@@ -7553,14 +7540,7 @@ mod tests {
             mcbios_req: Some(0x0001_0012),
             ..IntelImcRegs::default()
         };
-        let ro = decode(
-            &regs,
-            IntelGen::MeteorLake,
-            None,
-            None,
-            None,
-            &SmbiosTopology::empty(),
-        );
+        let ro = decode(&regs, IntelGen::MeteorLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "the 2-channel default");
         assert_eq!(ro.channels[0].index, 0, "first channel is display index 0");
         assert_eq!(
