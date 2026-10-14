@@ -61,7 +61,7 @@
 //!   `ratio × refclk / 2` (the ratio is the effective DDR data-rate
 //!   multiplier in half-cycle steps — e.g. the 12600KF DDR4-3600 word
 //!   0x79E00124: 36 × 100 MHz / 2 = **1800 MHz**); for DDR, MT/s =
-//!   MCLK × 2. Sanity-gated to [1, 4096] MHz; a ratio of 0 =
+//!   MCLK × 2. Sanity-gated to [1, 5333] MHz; a ratio of 0 =
 //!   unconfigured → `Na(ParseError)`.
 //! - `uclk_mhz` ← `MC_BIOS_REQ`: `mclk / gear` (gears 1/2/4, Breakdown
 //!   §3D) on the Rocket Lake profile; `Na(NotApplicable)` on Tier 1
@@ -125,14 +125,15 @@
 //! `MCHBAR + 0x180000` SoC-tile range) degrades the whole readout to
 //! `Na(UnsupportedHardware)` (branch-level detail:
 //! [`tile_routing_suspected`]) — never a decode of the empty window.
-//! Every remaining (unprofiled) generation — Ice Lake / Tiger Lake /
-//! Jasper Lake / Sapphire Rapids / Lunar Lake / Core Series 1 Mobile /
-//! `Unrecognized` — degrades the whole readout to
-//! `Na(UnsupportedHardware)` — never garbage data from a mismatched
-//! register map. [`gen_gate`] (the facade's branch-level gate: Tier 1,
-//! Rocket Lake, and the Tier-3 Alder family) carries the rich detail
-//! for the unprofiled generations; [`tier1_gate`] remains the
-//! Tier-1-only compatibility alias.
+//! Every remaining (unprofiled) generation — Jasper Lake / Lunar Lake /
+//! Core Series 1 Mobile / `Unrecognized` — degrades the whole readout
+//! to `Na(UnsupportedHardware)` — never garbage data from a mismatched
+//! register map. (Ice Lake / Tiger Lake now share the Tier-1 profile;
+//! Sapphire Rapids has its own Server profile.) [`gen_gate`] (the
+//! facade's branch-level gate: Tier 1, Rocket Lake, the Tier-3 Alder
+//! family, and the Server profile) carries the rich detail for the
+//! unprofiled generations; [`tier1_gate`] remains the Tier-1-only
+//! compatibility alias.
 //!
 //! # No-panic contract (D5)
 //!
@@ -294,9 +295,33 @@ const _ASSERT_TIER3_READS_IN_WIDE_WINDOW: () = {
 const TIMING_MIN_TICKS: u16 = 1;
 const TIMING_MAX_TICKS: u16 = 2048;
 
-/// Plausible memory/fabric clock range in MHz.
+/// tRFC1 on DDR5 can reach 4095 (12-bit field max) for high-density dies.
+const TRFC1_MAX_TICKS: u16 = 4095;
+
+/// Maximum plausible memory clock in MHz.
+/// DDR5-8800 → 4400 MHz; DDR5-10666 → 5333 MHz.
+/// Set to 5333 to cover all current and near-future DDR5 speeds.
 const CLOCK_MIN_MHZ: f64 = 1.0;
-const CLOCK_MAX_MHZ: f64 = 4096.0;
+const CLOCK_MAX_MHZ: f64 = 5333.0;
+
+// ---------------------------------------------------------------------------
+// Degenerate-word screening helpers (C-2, H-2, H-14, M-11).
+// ---------------------------------------------------------------------------
+
+/// A word is "present" only if it's non-zero AND not a bus-fault
+/// (`0xFFFF_FFFF`). This prevents degenerate reads from being
+/// misinterpreted as valid evidence (e.g. OQ-11's DDR5 condition).
+fn is_present_word(v: Option<u32>) -> bool {
+    matches!(v, Some(w) if w != 0 && w != 0xFFFF_FFFF)
+}
+
+/// A word is "degenerate" if it is `0` (untrained) or `0xFFFF_FFFF`
+/// (bus-fault readback) — the two degenerate encodings Research line 329
+/// uses for the mirror window. `None` (a failed read) is *not* degenerate
+/// in this sense; it is a separate containment case.
+fn is_degenerate_word(w: u32) -> bool {
+    w == 0 || w == 0xFFFF_FFFF
+}
 
 // ---------------------------------------------------------------------------
 // Raw register types (the module exposes raw values; THIS file decodes).
@@ -662,17 +687,16 @@ pub fn tier1_gate(gen: IntelGen) -> TelemetryResult<()> {
 
 /// The profile-based generation gate (the facade's branch-level gate
 /// as of IG-16): `Ok(())` for every generation [`gen_supported`]
-/// admits — Tier 1 (Skylake / Kaby Lake / Coffee Lake / Comet Lake),
-/// Rocket Lake (Tier 2), and the Tier-3 Alder family (Alder / Raptor /
-/// Meteor / Arrow Lake; profiled as of IG-03, decoding on the Tier-3
-/// subchannel path as of IG-26) — else
+/// admits — Tier 1 (Skylake / Kaby Lake / Coffee Lake / Comet Lake /
+/// Ice Lake / Tiger Lake), Rocket Lake (Tier 2), the Tier-3 Alder
+/// family (Alder / Raptor / Meteor / Arrow Lake), and the Server
+/// profile (Sapphire Rapids) — else
 /// [`TelemetryError::UnsupportedHardware`] whose `vendor` detail names
 /// the detected generation and the profiled set it is absent from (the
-/// unprofiled generations — Ice Lake / Tiger Lake / Jasper Lake /
-/// Sapphire Rapids / Lunar Lake / Core Series 1 Mobile /
-/// `Unrecognized`) — the facade surfaces this as the branch-level
-/// `Na(UnsupportedHardware)` (plan §3.4: never garbage data from a
-/// mismatched register map).
+/// unprofiled generations — Jasper Lake / Lunar Lake / Core Series 1
+/// Mobile / `Unrecognized`) — the facade surfaces this as the
+/// branch-level `Na(UnsupportedHardware)` (plan §3.4: never garbage
+/// data from a mismatched register map).
 ///
 /// This is the gate that lets Rocket Lake reach [`decode`]'s profile
 /// dispatch for the first time (IG-14/IG-15 make `detect()` emit it;
@@ -684,7 +708,7 @@ pub fn gen_gate(gen: IntelGen) -> TelemetryResult<()> {
     }
     Err(TelemetryError::UnsupportedHardware {
         vendor: format!(
-            "Intel {gen:?} has no decode profile; v1 decodes Tier 1 (Skylake/Kaby Lake/Coffee Lake/Comet Lake), Tier 2 (Rocket Lake), and Tier 3 (Alder/Raptor/Meteor/Arrow Lake) only"
+            "Intel {gen:?} has no decode profile; v1 decodes Tier 1 (Skylake/Kaby Lake/Coffee Lake/Comet Lake/Ice Lake/Tiger Lake), Tier 2 (Rocket Lake), Tier 3 (Alder/Raptor/Meteor/Arrow Lake), and Server (Sapphire Rapids) only"
         ),
     })
 }
@@ -955,7 +979,7 @@ pub fn turnaround_quartet(reg: u32) -> [u16; 4] {
 ///
 /// The bit-8 reference-clock select is unchanged across generations
 /// (1 = 100 MHz, 0 = 133.3333 MHz — the PLL base inputs); the result
-/// is sanity-gated to [1, 4096] MHz.
+/// is sanity-gated to [1, 5333] MHz.
 ///
 /// Containment: an absent register → `Na(ParseError)`; a ratio of 0 =
 /// unconfigured → `Na(ParseError)`; the GEAR_RATIO bits (17:16,
@@ -1057,7 +1081,7 @@ fn gear_divisor(gear: GearMode) -> f64 {
 
 /// The internal controller clock (f_UCLK) for the decoded gear, per
 /// Breakdown §3D (f_UCLK = MCLK, MCLK/2, MCLK/4 for gears 1, 2, 4):
-/// `uclk = mclk / gear_divisor(gear)`, sanity-gated to the [1, 4096]
+/// `uclk = mclk / gear_divisor(gear)`, sanity-gated to the [1, 5333]
 /// MHz clock band via [`clock_section`].
 ///
 /// Containment mirrors the legacy uclk rule: an `Na` gear cell (a
@@ -1075,22 +1099,50 @@ pub fn decode_uclk(mclk: f64, gear: &Section<GearMode>) -> Section<f64> {
 
 /// Decode one displayed tick field from an optionally-failed register
 /// read (the per-register containment rule): a failed read →
-/// `Na(ParseError)`; a decoded value of `0` (untrained) or outside
-/// [1, 2048] → `Na(ParseError)`; otherwise the tick value.
+/// `Na(ParseError)`; a degenerate word (`0` = untrained,
+/// `0xFFFF_FFFF` = bus-fault) → `Na(ParseError)`; a decoded value
+/// outside [1, max_ticks] → `Na(ParseError)`; otherwise the tick value.
 fn timing_cell(reg: Option<u32>, name: &str, extract: fn(u32) -> u16) -> Section<u16> {
+    timing_cell_max(reg, name, extract, TIMING_MAX_TICKS)
+}
+
+/// [`timing_cell`] with an explicit per-field tick maximum (H-4):
+/// used for the widened DDR5 tRFC1 (12-bit, max 4095) and the DDR4
+/// tRFC (13-bit, max 8191) fields that exceed the shared
+/// [`TIMING_MAX_TICKS`] of 2048.
+fn timing_cell_max(
+    reg: Option<u32>,
+    name: &str,
+    extract: fn(u32) -> u16,
+    max_ticks: u16,
+) -> Section<u16> {
     match reg {
         None => Section::na(NaReason::ParseError(format!("{name}: register read failed"))),
-        Some(raw) => ticks_section(extract(raw), name),
+        // H-14: Screen degenerate words (bus-fault / untrained) before
+        // any bit extraction.
+        Some(w) if is_degenerate_word(w) => {
+            let detail = if w == 0 { "untrained (0)" } else { "bus-fault (0xFFFFFFFF)" };
+            Section::na(NaReason::ParseError(format!("{name}: {detail}")))
+        }
+        Some(raw) => ticks_section_max(extract(raw), name, max_ticks),
     }
 }
 
-/// Sanity-gate a decoded tick count to a [`Section<u16>`].
+/// Sanity-gate a decoded tick count to a [`Section<u16>`] using the
+/// shared [`TIMING_MAX_TICKS`] bound.
 fn ticks_section(ticks: u16, name: &str) -> Section<u16> {
-    if (TIMING_MIN_TICKS..=TIMING_MAX_TICKS).contains(&ticks) {
+    ticks_section_max(ticks, name, TIMING_MAX_TICKS)
+}
+
+/// Sanity-gate a decoded tick count to a [`Section<u16>`] using an
+/// explicit `max_ticks` bound (H-4: per-field overrides for the
+/// widened DDR5 / DDR4 tRFC fields).
+fn ticks_section_max(ticks: u16, name: &str, max_ticks: u16) -> Section<u16> {
+    if (TIMING_MIN_TICKS..=max_ticks).contains(&ticks) {
         Section::Value(ticks)
     } else {
         Section::na(NaReason::ParseError(format!(
-            "{name} {ticks} ticks outside plausible range [{TIMING_MIN_TICKS}, {TIMING_MAX_TICKS}]"
+            "{name} {ticks} ticks outside plausible range [{TIMING_MIN_TICKS}, {max_ticks}]"
         )))
     }
 }
@@ -1116,6 +1168,20 @@ fn clock_section(mhz: f64) -> Section<f64> {
 /// register failed / a field is untrained), or a structural
 /// `Na(NotApplicable)`.
 fn decode_tier1_channel(index: u8, mclk: Section<f64>, regs: &ChannelRegs) -> IntelChannel {
+    // H-2: Normalize degenerate words to None so the turnaround-quartet
+    // path (which has no per-word degenerate screen) never fabricates
+    // values from a bus-fault readback.
+    let regs = ChannelRegs {
+        tc_dbp: regs.tc_dbp.filter(|&w| !is_degenerate_word(w)),
+        tc_rap: regs.tc_rap.filter(|&w| !is_degenerate_word(w)),
+        tc_rfp: regs.tc_rfp.filter(|&w| !is_degenerate_word(w)),
+        tc_rap2: regs.tc_rap2.filter(|&w| !is_degenerate_word(w)),
+        tc_rdrd: regs.tc_rdrd.filter(|&w| !is_degenerate_word(w)),
+        tc_rdwr: regs.tc_rdwr.filter(|&w| !is_degenerate_word(w)),
+        tc_wrrd: regs.tc_wrrd.filter(|&w| !is_degenerate_word(w)),
+        tc_wrwr: regs.tc_wrwr.filter(|&w| !is_degenerate_word(w)),
+    };
+
     // --- timings (integer DRAM clock cycles) ---------------------------
     // TC_DBP: the unified symmetric tRCD feeds both the rcdrd and the
     // rcwdwr slot (Intel exposes one tRCD, parity matrix: "Symmetrical
@@ -1262,7 +1328,7 @@ fn decode_tier1_channel(index: u8, mclk: Section<f64>, regs: &ChannelRegs) -> In
 /// `map` parameter carries the subchannel's provenance (mirror / MCL
 /// bases) for the IG-25 fallback selection ([`tier3_mcl_for`]).
 ///
-/// The same [1, 2048] tick / [1, 4096] MHz sanity gates as Tier 1 apply
+/// The same [1, 2048] tick / [1, 5333] MHz sanity gates as Tier 1 apply
 /// to every decoded cell, and the `rc = ras + rp` synthesis is preserved
 /// (Breakdown §6 — Intel exposes no tRC register). The gear cells
 /// (`gear_mode` / `uclk_mhz`) stay `Na(NotApplicable)` here, exactly as
@@ -1275,6 +1341,19 @@ pub fn decode_tier3_channel(
     regs: &MclRegs,
     map: &AlderChannelMap,
 ) -> IntelChannel {
+    // H-2: Normalize degenerate words to None so the turnaround-quartet
+    // path never fabricates values from a bus-fault readback.
+    let regs = MclRegs {
+        tc_pre: regs.tc_pre.filter(|&w| !is_degenerate_word(w)),
+        tc_act: regs.tc_act.filter(|&w| !is_degenerate_word(w)),
+        tc_act2: regs.tc_act2.filter(|&w| !is_degenerate_word(w)),
+        tc_wtr: regs.tc_wtr.filter(|&w| !is_degenerate_word(w)),
+        tc_rfp: regs.tc_rfp.filter(|&w| !is_degenerate_word(w)),
+        tc_rfp2: regs.tc_rfp2.filter(|&w| !is_degenerate_word(w)),
+        tc_rdrd: regs.tc_rdrd.filter(|&w| !is_degenerate_word(w)),
+        tc_wrwr: regs.tc_wrwr.filter(|&w| !is_degenerate_word(w)),
+    };
+
     // --- timings (integer DRAM clock cycles) ---------------------------
     // TC_PRE: tRCD (the unified symmetric tRCD feeds both the rcdrd and
     // the rcwdwr slot, as in Tier 1) / tRP / tRAS / tCWL.
@@ -1304,7 +1383,9 @@ pub fn decode_tier3_channel(
     let rtp = timing_cell(regs.tc_wtr, "tRTP", tc_wtr_trtp);
 
     // TC_RFP: tRFC1 (12-bit; tREFI is decoded — no display slot).
-    let rfc1 = timing_cell(regs.tc_rfp, "tRFC1", tc_rfp_trfc1);
+    // H-4: the 12-bit tRFC1 field can reach 4095 for high-density dies,
+    // exceeding the shared TIMING_MAX_TICKS of 2048.
+    let rfc1 = timing_cell_max(regs.tc_rfp, "tRFC1", tc_rfp_trfc1, TRFC1_MAX_TICKS);
 
     // TC_RFP2: tRFCsb — the DDR5-specific same-bank refresh feeds the
     // `rfcsb` display slot (Tier 1 keeps it not-applicable).
@@ -1423,10 +1504,17 @@ pub fn decode_tier3_channel(
 /// a disabled mirror with an absent MCL read → `None` (honest
 /// degradation, never a bogus zero).
 pub fn mirror_or_mcl(mirror: Option<u32>, mcl: Option<u32>) -> Option<u32> {
-    if matches!(mirror, Some(0x0) | Some(0xFFFF_FFFF)) {
-        mcl
-    } else {
-        mirror
+    match mirror {
+        // A failed read is not a disabled mirror → no fallback.
+        None => None,
+        // H-3: A degenerate mirror word (0x0 / 0xFFFF_FFFF) falls back
+        // to the MCL register, which is *also* screened for degenerates
+        // (a bus-faulted MCL word is not a valid fallback source).
+        Some(w) if is_degenerate_word(w) => {
+            mcl.filter(|&w| !is_degenerate_word(w))
+        }
+        // A populated, non-degenerate mirror wins.
+        Some(v) => Some(v),
     }
 }
 
@@ -1562,7 +1650,7 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 /// - **Tier 1 + Rocket Lake**: both channels decode from the verified
 ///   64 KiB register map (identical offsets — Tier 1 and Rocket share
 ///   it): the shared `MC_BIOS_REQ` core clock plus the per-channel
-///   `TC_*` blocks (per-register containment; the frozen [1, 4096] MHz
+///   `TC_*` blocks (per-register containment; the frozen [1, 5333] MHz
 ///   sanity gate). Rocket Lake additionally
 ///   decodes `gear_mode` + `uclk_mhz` from `MC_BIOS_REQ[17:16]`
 ///   (Breakdown §3D, Gear2 cap). Breakdown §3B's Rocket Lake
@@ -1579,7 +1667,7 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 ///   descriptor; its effective [`MclRegs`] is the Research-line-329
 ///   mirror → MCL fallback ([`tier3_mcl_for`]); the widened DDR5
 ///   fields decode through [`decode_tier3_channel`] (per-register
-///   containment; the same [1, 4096] MHz gates); the MCLK is the
+///   containment; the same [1, 5333] MHz gates); the MCLK is the
 ///   11th-gen-and-later half-step decode (`ratio × refclk / 2` — the
 ///   Alder Lake MC_BIOS_REQ decode); the
 ///   gear cells layer on from `MC_BIOS_REQ[17:16]` on the profile's
@@ -1598,13 +1686,12 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 ///   from the secondary range; the branch-level detail is
 ///   [`tile_routing_suspected`].
 /// - **every remaining generation** — the unprofiled generations
-///   (Ice Lake / Tiger Lake / Jasper Lake / Sapphire Rapids / Lunar
-///   Lake / Core Series 1 Mobile / `Unrecognized`): the whole readout
-///   degrades to `Na(UnsupportedHardware)` channels — the registers
-///   are *not* decoded (never garbage from a mismatched map;
-///   [`gen_gate`] — the facade's branch gate — carries the rich detail
-///   for the branch-level error; [`tier1_gate`] remains the Tier-1-only
-///   alias).
+///   (Jasper Lake / Lunar Lake / Core Series 1 Mobile /
+///   `Unrecognized`): the whole readout degrades to
+///   `Na(UnsupportedHardware)` channels — the registers are *not*
+///   decoded (never garbage from a mismatched map; [`gen_gate`] — the
+///   facade's branch gate — carries the rich detail for the branch-level
+///   error; [`tier1_gate`] remains the Tier-1-only alias).
 ///
 /// The channel-mode fields are resolved by the **4-tier trust procedure**
 /// ([`resolve_channel`], Chunk 2): the capacity-derived MMIO mode
@@ -1681,8 +1768,11 @@ pub fn decode(
                 }
                 return all_na_readout(channels);
             }
-            let ddr5 = regs.mad_dimm_ch2.is_some_and(|v| v != 0)
-                && regs.mad_dimm_ch3.is_some_and(|v| v != 0);
+            // C-2: A word is "present" only if it's non-zero AND not a
+            // bus-fault (0xFFFF_FFFF). This prevents degenerate reads
+            // from being misinterpreted as DDR5 evidence.
+            let ddr5 = is_present_word(regs.mad_dimm_ch2)
+                && is_present_word(regs.mad_dimm_ch3);
             let subch_indices: &[usize] = if ddr5 {
                 &[0, 1, 2, 3]
             } else {
@@ -2027,6 +2117,11 @@ pub enum ChannelTrust {
 /// 7-bit fields, so a 16 GiB DIMM is index `32` (`32 × 0.5`), not `16`.
 fn mad_dimm_capacity_gib(mad_dimm_ch: Option<u32>) -> Option<f64> {
     let r = mad_dimm_ch?;
+    // M-11: Screen bus-fault and zero words — a degenerate MAD_DIMM
+    // word is not a valid capacity reading.
+    if is_degenerate_word(r) {
+        return None;
+    }
     let dimm_l = (r & 0x7F) as f64; // [6:0]
     let dimm_s = ((r >> 16) & 0x7F) as f64; // [22:16]
     Some((dimm_l + dimm_s) * 0.5)
@@ -2043,6 +2138,11 @@ fn mad_dimm_capacity_gib(mad_dimm_ch: Option<u32>) -> Option<f64> {
 pub fn decode_ecc_status(capid0a: Option<u32>) -> EccStatus {
     match capid0a {
         None => EccStatus::Unknown,
+        // H-10: The kernel emits 0xFFFF_FFFF when the config read
+        // fails. This is NOT a valid capability assertion.
+        Some(0xFFFF_FFFF) => EccStatus::Unknown,
+        // A zero word is equally suspicious (untrained / cleared).
+        Some(0) => EccStatus::Unknown,
         Some(v) if v & 0x0002_0000 != 0 => EccStatus::NotCapable,
         Some(_) => EccStatus::CapableButDisabled,
     }
@@ -2168,7 +2268,10 @@ pub fn resolve_channel(
     smbios: &SmbiosTopology,
 ) -> ChannelResolution {
     let dimm_count = smbios.populated_count;
-    let tech = mmio_tech.or(smbios.memory_type);
+    // M-6: MemoryTech::Unknown from a bus-faulted MAD word should not
+    // shadow a valid SMBIOS type. Normalize to None before the .or().
+    let mmio_tech_filtered = mmio_tech.filter(|t| !matches!(t, MemoryTech::Unknown));
+    let tech = mmio_tech_filtered.or(smbios.memory_type);
 
     // L1 / L3: the MMIO decode is readable (a valid mode).
     if let Some(mode) = mmio {
@@ -2595,7 +2698,7 @@ mod tests {
 
     // -----------------------------------------------------------------
     // Clock decode: reference clock, unconfigured, reserved bits, the
-    // [1, 4096] MHz sanity gate.
+    // [1, 5333] MHz sanity gate.
     // -----------------------------------------------------------------
 
     /// REF_CLK = 1 (100 MHz), Tier 1 (the legacy physical multiplier —
@@ -2639,38 +2742,55 @@ mod tests {
         );
     }
 
-    /// The [1, 4096] MHz sanity gate bounds the displayed mclk: ratio 31
-    /// at the 133.3333 MHz ref (≈ 4133 MHz) / ratio 41 at the 100 MHz
-    /// ref (4100 MHz) / ratio 255 (≈ 34000 MHz at the 133 ref; 25500
-    /// MHz at the 100 ref) degrade to `Na(ParseError)`; ratio 30 at the
-    /// 133 ref (≈ 4000 MHz) and ratio 40 at the 100 ref (4000 MHz)
-    /// stay in-band.
+    /// The [1, 5333] MHz sanity gate bounds the displayed mclk: ratio
+    /// 40 at the 133.3333 MHz ref (≈ 5333.33 MHz) / ratio 255 (≈ 34000
+    /// MHz at the 133 ref; 25500 MHz at the 100 ref) degrade to
+    /// `Na(ParseError)`; ratio 39 at the 133 ref (≈ 5200 MHz), ratio
+    /// 30 (≈ 4000 MHz), and ratio 40 at the 100 ref (4000 MHz) stay
+    /// in-band. H-6 raised the ceiling from 4096 to 5333 MHz to cover
+    /// DDR5-10666.
     #[test]
     fn decode_mclk_sanity_gate() {
-        // Tier 1 (the legacy full product sets the [1, 4096] bounds).
+        // Tier 1 (the legacy full product sets the [1, 5333] bounds).
+        // ratio 31 @ 133.3333 MHz ≈ 4133 MHz → in-band (H-6).
         assert!(matches!(
             decode_mclk(Some(31), IntelGen::Skylake),
-            Section::Na(NaReason::ParseError(_))
+            Section::Value(_)
         ));
+        // ratio 41 @ 100 MHz = 4100 MHz → in-band (H-6).
         assert!(matches!(
             decode_mclk(Some(0x0129), IntelGen::Skylake),
-            Section::Na(NaReason::ParseError(_))
+            Section::Value(_)
         ));
+        // ratio 255 @ 133.3333 MHz ≈ 34000 MHz → out-of-band.
         assert!(matches!(
             decode_mclk(Some(0x00FF), IntelGen::Skylake),
             Section::Na(NaReason::ParseError(_))
         ));
+        // ratio 255 @ 100 MHz = 25500 MHz → out-of-band.
         assert!(matches!(
             decode_mclk(Some(0x01FF), IntelGen::Skylake),
             Section::Na(NaReason::ParseError(_))
         ));
+        // ratio 30 @ 133.3333 MHz = 4000 MHz → in-band.
         assert!(matches!(
             decode_mclk(Some(30), IntelGen::Skylake),
             Section::Value(_)
         ));
+        // ratio 40 @ 100 MHz = 4000 MHz → in-band.
         assert!(matches!(
             decode_mclk(Some(0x0128), IntelGen::Skylake),
             Section::Value(_)
+        ));
+        // ratio 39 @ 133.3333 MHz ≈ 5200 MHz → in-band.
+        assert!(matches!(
+            decode_mclk(Some(39), IntelGen::Skylake),
+            Section::Value(_)
+        ));
+        // ratio 40 @ 133.3333 MHz ≈ 5333.33 MHz → just over the 5333 limit.
+        assert!(matches!(
+            decode_mclk(Some(40), IntelGen::Skylake),
+            Section::Na(NaReason::ParseError(_))
         ));
     }
 
@@ -2979,7 +3099,7 @@ mod tests {
 
     /// `decode_uclk` containment + the gear-divisor semantics: an `Na`
     /// gear cell degrades uclk to `Na(ParseError)` (never a bogus
-    /// clock); gears 1/2/4 divide mclk by 1/2/4; the [1, 4096] MHz
+    /// clock); gears 1/2/4 divide mclk by 1/2/4; the [1, 5333] MHz
     /// sanity gate bounds the displayed value.
     #[test]
     fn decode_uclk_divides_and_degrades() {
@@ -2998,7 +3118,7 @@ mod tests {
         let na = Section::na(NaReason::ParseError("reserved gear encoding".to_owned()));
         let uclk = decode_uclk(2400.0, &na);
         assert!(matches!(uclk, Section::Na(NaReason::ParseError(_))));
-        // 1.0 / 4 = 0.25 MHz is outside the [1, 4096] band.
+        // 1.0 / 4 = 0.25 MHz is outside the [1, 5333] band.
         let uclk = decode_uclk(1.0, &Section::Value(GearMode::Four));
         assert!(matches!(uclk, Section::Na(NaReason::ParseError(_))));
     }
@@ -4301,7 +4421,8 @@ mod tests {
                 let regs = IntelImcRegs::from_wide_reader(fill);
                 assert!(regs.primary_window_degenerate(), "{gen:?} ({label})");
                 let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
-                assert_eq!(ro.channels.len(), 4, "{gen:?} ({label})");
+                // C-4: Meteor / Arrow Lake are dual-channel DDR5 (2 channels).
+                assert_eq!(ro.channels.len(), 2, "{gen:?} ({label})");
                 for ch in &ro.channels {
                     assert_eq!(
                         ch.clocks.mclk_mhz,
@@ -4536,10 +4657,12 @@ mod tests {
     #[test]
     fn decode_non_tier1_gen_degrades_all_na() {
         let regs = acceptance_regs();
+        // H-1: Ice Lake / Tiger Lake now resolve to the shared TIER1
+        // profile (live decode path) — they no longer degrade to
+        // all-Na. Only Unrecognized (and any future unprofiled gen)
+        // takes the all-Na fallback.
         for (gen, count) in [
-            (IntelGen::IceLake, 2u8),
-            (IntelGen::TigerLake, 2),
-            (IntelGen::Unrecognized, 2),
+            (IntelGen::Unrecognized, 2u8),
         ] {
             let ro = decode(&regs, gen, None, None, None, &SmbiosTopology::empty());
             assert_eq!(ro.channels.len(), usize::from(count), "{gen:?}");
@@ -4641,21 +4764,23 @@ mod tests {
             IntelGen::KabyLake,
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
+            // H-1: Ice Lake / Tiger Lake now resolve to the shared TIER1.
+            IntelGen::IceLake,
+            IntelGen::TigerLake,
             IntelGen::RocketLake,
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
+            // H-9: Sapphire Rapids now resolves to SERVER_8CH.
+            IntelGen::SapphireRapids,
         ] {
             assert_eq!(gen_gate(gen), Ok(()), "{gen:?}");
         }
         // Every unprofiled generation: the detail names it and the
-        // full profiled set (Tier 1 + 2 + 3).
+        // full profiled set (Tier 1 + 2 + 3 + Server).
         for gen in [
-            IntelGen::IceLake,
-            IntelGen::TigerLake,
             IntelGen::JasperLake,
-            IntelGen::SapphireRapids,
             IntelGen::LunarLake,
             IntelGen::CoreSeries1Mobile,
             IntelGen::Unrecognized,
@@ -4664,6 +4789,7 @@ mod tests {
             assert!(msg.contains(&format!("{gen:?}")), "{msg}");
             assert!(msg.contains("has no decode profile"), "{msg}");
             assert!(msg.contains("Tier 3 (Alder/Raptor/Meteor/Arrow Lake)"), "{msg}");
+            assert!(msg.contains("Server (Sapphire Rapids)"), "{msg}");
         }
     }
 
@@ -4681,17 +4807,23 @@ mod tests {
             IntelGen::KabyLake,
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
+            // H-1: Ice Lake / Tiger Lake now resolve to the shared TIER1.
+            IntelGen::IceLake,
+            IntelGen::TigerLake,
             IntelGen::RocketLake,
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
+            // H-9: Sapphire Rapids now resolves to SERVER_8CH.
+            IntelGen::SapphireRapids,
         ] {
             assert!(gen_supported(gen), "{gen:?}");
         }
         for gen in [
-            IntelGen::IceLake,
-            IntelGen::TigerLake,
+            IntelGen::JasperLake,
+            IntelGen::LunarLake,
+            IntelGen::CoreSeries1Mobile,
             IntelGen::Unrecognized,
         ] {
             assert!(!gen_supported(gen), "{gen:?}");
@@ -5079,18 +5211,20 @@ mod tests {
             IntelGen::KabyLake,
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
+            // H-1: Ice Lake / Tiger Lake now resolve to the shared TIER1
+            // profile (2 channels).
             IntelGen::IceLake,
             IntelGen::TigerLake,
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
+            // C-4: Meteor / Arrow Lake are dual-channel DDR5 (2 channels).
+            IntelGen::MeteorLake,
+            IntelGen::ArrowLake,
             IntelGen::RocketLake,
             IntelGen::Unrecognized,
         ];
         for g in two {
             assert_eq!(channel_count(g), 2, "{g:?}");
-        }
-        for g in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
-            assert_eq!(channel_count(g), 4, "{g:?}");
         }
     }
 
@@ -5162,7 +5296,8 @@ mod tests {
         assert_eq!(clock_section(1600.0), Section::Value(1600.0));
         assert_eq!(clock_section(1.0), Section::Value(1.0));
         assert_eq!(clock_section(4096.0), Section::Value(4096.0));
-        for mhz in [0.0, 0.5, 4096.1, 65535.0] {
+        assert_eq!(clock_section(5333.0), Section::Value(5333.0), "H-6: DDR5-10666 upper bound");
+        for mhz in [0.0, 0.5, 5333.1, 65535.0] {
             assert!(matches!(clock_section(mhz), Section::Na(NaReason::ParseError(_))), "{mhz}");
         }
     }
@@ -5337,7 +5472,10 @@ mod tests {
         assert_eq!(decode_ecc_status(Some(0x6201_2671)), EccStatus::CapableButDisabled);
         // Bit 17 set (ECC_DIS) -> NotCapable.
         assert_eq!(decode_ecc_status(Some(0x0002_0000)), EccStatus::NotCapable);
-        assert_eq!(decode_ecc_status(Some(0xFFFF_FFFF)), EccStatus::NotCapable);
+        // H-10: bus-fault word is not a valid capability assertion.
+        assert_eq!(decode_ecc_status(Some(0xFFFF_FFFF)), EccStatus::Unknown);
+        // H-10: zero word is equally suspicious.
+        assert_eq!(decode_ecc_status(Some(0)), EccStatus::Unknown);
         // Absent raw -> Unknown.
         assert_eq!(decode_ecc_status(None), EccStatus::Unknown);
     }
@@ -5420,7 +5558,10 @@ mod tests {
     #[test]
     fn mad_dimm_capacity_gib_0_5gib_layout() {
         assert_eq!(mad_dimm_capacity_gib(None), None);
-        assert_eq!(mad_dimm_capacity_gib(Some(0x0)), Some(0.0));
+        // M-11: zero word is degenerate (screened out).
+        assert_eq!(mad_dimm_capacity_gib(Some(0x0)), None);
+        // M-11: bus-fault word is degenerate (screened out).
+        assert_eq!(mad_dimm_capacity_gib(Some(0xFFFF_FFFF)), None);
         // 16 GiB in slot 0 (index 32: 32 * 0.5 = 16 GiB).
         assert_eq!(mad_dimm_capacity_gib(Some(0x20)), Some(16.0));
         // 8 GiB slot 0 (index 16) + 16 GiB slot 1 (index 32 << 16).
@@ -5470,15 +5611,16 @@ mod tests {
             mmio_channel_mode(Some(0x10), Some(0x20)),
             Some(ChannelMode::DualFlex)
         );
-        // 16 GiB on ch0 alone -> Single.
-        assert_eq!(
-            mmio_channel_mode(Some(0x20), Some(0x0)),
-            Some(ChannelMode::Single)
-        );
+        // M-11: 16 GiB on ch0 + zero word on ch1 -> the zero is screened
+        // as degenerate, so the MMIO is blocked (None) — the SMBIOS tier
+        // handles the single-channel case.
+        assert_eq!(mmio_channel_mode(Some(0x20), Some(0x0)), None);
         // Both absent -> blocked (None).
         assert_eq!(mmio_channel_mode(None, None), None);
         // Both zero (no population) -> blocked (None).
         assert_eq!(mmio_channel_mode(Some(0x0), Some(0x0)), None);
+        // M-11: bus-fault word on one channel -> blocked (None).
+        assert_eq!(mmio_channel_mode(Some(0xFFFF_FFFF), Some(0x20)), None);
     }
 
     /// The IMC base selection is keyed on the CPU generation (NOT the
@@ -5599,15 +5741,19 @@ mod tests {
         assert!(r.annotation.contains("Error"));
     }
 
-    /// The exact user bug, end to end: a dual-channel 2×16 GiB system whose
-    /// (old / mis-located) MMIO decodes Single (16 GiB on ch0, 0 on ch1),
-    /// while SMBIOS Type 17 confirms two populated DIMMs across channels
-    /// A/B. The L3 safety override must report Dual — not Single — with the
-    /// Override trust tier and the single-source display label.
+    /// The exact user bug, end to end: a dual-channel 2×16 GiB system
+    /// whose MMIO is blocked (M-11: the zero word on ch1 is screened as
+    /// degenerate), while SMBIOS Type 17 confirms two populated DIMMs
+    /// across channels A/B. The L2 firmware-verified tier reports Dual
+    /// with the single-source display label.
+    ///
+    /// (The L3 override path — MMIO decodes Single + SMBIOS confirms
+    /// Dual — is pinned by `resolve_channel_l3_override_on_real_topology`
+    /// which calls `resolve_channel` directly.)
     #[test]
     fn decode_l3_override_single_mmio_dual_smbios() {
         let smbios = smbios_topology(2, DerivedMode::Dual, Some(MemoryTech::Ddr4));
-        // 16 GiB on ch0 (index 32) + 0 on ch1 -> MMIO Single.
+        // 16 GiB on ch0 (index 32) + 0 on ch1 (M-11: screened) -> MMIO blocked.
         let ro = decode(
             &acceptance_regs(),
             IntelGen::AlderLake,
@@ -5619,16 +5765,15 @@ mod tests {
         assert_eq!(
             ro.channel_mode,
             Some(ChannelMode::DualSymmetric),
-            "L3 override: MMIO single + SMBIOS dual -> Dual"
+            "MMIO blocked + SMBIOS dual -> Dual (L2 firmware-verified)"
         );
-        assert_eq!(ro.channel_trust, Some(ChannelTrust::Override));
+        assert_eq!(ro.channel_trust, Some(ChannelTrust::VerifiedFirmware));
         assert_eq!(ro.memory_tech, Some(MemoryTech::Ddr4));
         assert_eq!(ro.dimm_count, 2);
-        assert!(ro.channel_annotation.contains("Override"));
         // The single source of truth both frontends render:
         assert_eq!(
             ro.channel_display_label(),
-            Some("Dual-Channel (Symmetric) [unverified]".to_owned())
+            Some("Dual-Channel (Symmetric)".to_owned())
         );
     }
 
@@ -5651,7 +5796,9 @@ mod tests {
         assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));
         assert_eq!(ro.channel_trust, Some(ChannelTrust::VerifiedHardware));
 
-        // 16 GiB on ch0 alone -> Single, L1 verified-single.
+        // M-11: 16 GiB on ch0 + zero word on ch1 -> the zero is screened
+        // as degenerate, so the MMIO is blocked; with no SMBIOS the
+        // resolution is the terminal state.
         let ro = decode(
             &acceptance_regs(),
             IntelGen::Skylake,
@@ -5660,8 +5807,8 @@ mod tests {
             Some(0x0),
             &SmbiosTopology::empty(),
         );
-        assert_eq!(ro.channel_mode, Some(ChannelMode::Single));
-        assert_eq!(ro.channel_trust, Some(ChannelTrust::VerifiedHardware));
+        assert_eq!(ro.channel_mode, None);
+        assert_eq!(ro.channel_trust, Some(ChannelTrust::None));
 
         // Absent MMIO raws + no SMBIOS -> terminal None.
         let ro = decode(
@@ -5674,5 +5821,249 @@ mod tests {
         );
         assert_eq!(ro.channel_mode, None);
         assert_eq!(ro.channel_trust, Some(ChannelTrust::None));
+    }
+
+    // -----------------------------------------------------------------
+    // Degenerate-word screening (C-2, H-2, H-3, H-14, M-6, M-11).
+    // -----------------------------------------------------------------
+
+    /// The degenerate-word screening helpers: `is_present_word` is true
+    /// only for non-zero, non-bus-fault words; `is_degenerate_word` is
+    /// true for `0` and `0xFFFF_FFFF`.
+    #[test]
+    fn degenerate_word_helpers() {
+        // is_present_word
+        assert!(!is_present_word(None), "None is not present");
+        assert!(!is_present_word(Some(0)), "zero is not present");
+        assert!(!is_present_word(Some(0xFFFF_FFFF)), "bus-fault is not present");
+        assert!(is_present_word(Some(1)), "non-zero non-fault is present");
+        assert!(is_present_word(Some(0x1234_5678)), "arbitrary valid word is present");
+
+        // is_degenerate_word
+        assert!(is_degenerate_word(0), "zero is degenerate");
+        assert!(is_degenerate_word(0xFFFF_FFFF), "bus-fault is degenerate");
+        assert!(!is_degenerate_word(1), "non-zero non-fault is not degenerate");
+        assert!(!is_degenerate_word(0x1234_5678), "arbitrary valid word is not degenerate");
+    }
+
+    /// H-2 + H-14: a Tier-1 channel whose every register is the
+    /// bus-fault word `0xFFFF_FFFF` produces all-`Na` timing cells —
+    /// never fabricated values from the all-ones bit pattern.
+    #[test]
+    fn tier1_all_bus_fault_produces_all_na() {
+        let fault = 0xFFFF_FFFF;
+        let regs = ChannelRegs {
+            tc_dbp: Some(fault),
+            tc_rap: Some(fault),
+            tc_rfp: Some(fault),
+            tc_rap2: Some(fault),
+            tc_rdrd: Some(fault),
+            tc_rdwr: Some(fault),
+            tc_wrrd: Some(fault),
+            tc_wrwr: Some(fault),
+        };
+        let ch = decode_tier1_channel(0, Section::Value(2400.0), &regs);
+        // Every timing cell must be Na (no fabricated values).
+        let cells: [&Section<u16>; 27] = [
+            &ch.timings.cl,
+            &ch.timings.rcwdwr,
+            &ch.timings.rcdrd,
+            &ch.timings.rp,
+            &ch.timings.ras,
+            &ch.timings.rc,
+            &ch.timings.rrds,
+            &ch.timings.rrld,
+            &ch.timings.faw,
+            &ch.timings.wtrs,
+            &ch.timings.wtrl,
+            &ch.timings.wr,
+            &ch.timings.rfc1,
+            &ch.timings.rfc2,
+            &ch.timings.rfcsb,
+            &ch.timings.cwl,
+            &ch.timings.rtp,
+            &ch.timings.rdwr,
+            &ch.timings.wrrd,
+            &ch.timings.rdrd_sd,
+            &ch.timings.rdrd_dd,
+            &ch.timings.rdrd_scl,
+            &ch.timings.rdrd_sc,
+            &ch.timings.wrwr_sd,
+            &ch.timings.wrwr_dd,
+            &ch.timings.wrwr_scl,
+            &ch.timings.wrwr_sc,
+        ];
+        for s in &cells {
+            assert!(s.is_na(), "bus-fault channel: {s:?} must be Na");
+        }
+        // The clocks stay valid (the mclk is shared, not per-channel).
+        assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0));
+    }
+
+    /// H-2 + H-14: a Tier-1 channel whose every register is zero
+    /// (untrained) produces all-`Na` timing cells.
+    #[test]
+    fn tier1_all_zero_produces_all_na() {
+        let regs = ChannelRegs {
+            tc_dbp: Some(0),
+            tc_rap: Some(0),
+            tc_rfp: Some(0),
+            tc_rap2: Some(0),
+            tc_rdrd: Some(0),
+            tc_rdwr: Some(0),
+            tc_wrrd: Some(0),
+            tc_wrwr: Some(0),
+        };
+        let ch = decode_tier1_channel(0, Section::Value(2400.0), &regs);
+        for s in [
+            &ch.timings.cl,
+            &ch.timings.cwl,
+            &ch.timings.rcdrd,
+            &ch.timings.rp,
+            &ch.timings.ras,
+            &ch.timings.rrds,
+            &ch.timings.rrld,
+            &ch.timings.faw,
+            &ch.timings.wr,
+            &ch.timings.rfc1,
+            &ch.timings.rdrd_scl,
+            &ch.timings.wrwr_scl,
+        ] {
+            assert!(s.is_na(), "zero channel: {s:?} must be Na");
+        }
+    }
+
+    /// H-3: `mirror_or_mcl` screens the MCL fallback for degenerates
+    /// too — a bus-faulted MCL word is not a valid fallback source.
+    #[test]
+    fn mirror_or_mcl_screens_mcl_for_degenerates() {
+        // Degenerate mirror + degenerate MCL -> None (no bogus value).
+        assert_eq!(
+            mirror_or_mcl(Some(0xFFFF_FFFF), Some(0xFFFF_FFFF)),
+            None,
+            "bus-fault mirror + bus-fault MCL -> None"
+        );
+        assert_eq!(
+            mirror_or_mcl(Some(0), Some(0)),
+            None,
+            "zero mirror + zero MCL -> None"
+        );
+        // Degenerate mirror + valid MCL -> MCL wins.
+        assert_eq!(
+            mirror_or_mcl(Some(0xFFFF_FFFF), Some(0x0028_8410)),
+            Some(0x0028_8410),
+        );
+        // Valid mirror + degenerate MCL -> mirror wins (MCL not used).
+        assert_eq!(
+            mirror_or_mcl(Some(0x0028_8410), Some(0xFFFF_FFFF)),
+            Some(0x0028_8410),
+        );
+    }
+
+    /// M-6: a `MemoryTech::Unknown` from a bus-faulted MAD word does not
+    /// shadow a valid SMBIOS type — `resolve_channel` normalizes it to
+    /// `None` before the `.or()`.
+    #[test]
+    fn resolve_channel_normalizes_unknown_tech() {
+        let smbios = smbios_topology(2, DerivedMode::Dual, Some(MemoryTech::Ddr4));
+        // MMIO tech is Unknown (bus-faulted), SMBIOS has Ddr4.
+        let r = resolve_channel(
+            Some(ChannelMode::DualSymmetric),
+            Some(MemoryTech::Unknown),
+            &smbios,
+        );
+        assert_eq!(r.tech, Some(MemoryTech::Ddr4), "SMBIOS Ddr4 wins over MMIO Unknown");
+
+        // MMIO tech is valid (Ddr5), SMBIOS has Ddr4 -> MMIO wins.
+        let r = resolve_channel(
+            Some(ChannelMode::DualSymmetric),
+            Some(MemoryTech::Ddr5),
+            &smbios,
+        );
+        assert_eq!(r.tech, Some(MemoryTech::Ddr5), "valid MMIO Ddr5 wins");
+    }
+
+    /// C-2: OQ-11's DDR5 condition with bus-fault words — a
+    /// `0xFFFF_FFFF` MAD_DIMM word is not DDR5 evidence (it is a
+    /// bus-fault), so the decode stays on the 2-channel DDR4 default.
+    #[test]
+    fn c2_bus_fault_mad_words_are_not_ddr5_evidence() {
+        let mut regs = tier3_ddr5_condition_regs();
+        regs.mad_dimm_ch2 = Some(0xFFFF_FFFF);
+        regs.mad_dimm_ch3 = Some(0xFFFF_FFFF);
+        let ro = decode(
+            &regs,
+            IntelGen::AlderLake,
+            Some(0),
+            None,
+            None,
+            &SmbiosTopology::empty(),
+        );
+        // Bus-fault MAD words -> not DDR5 -> 2-channel DDR4 default.
+        assert_eq!(ro.channels.len(), 2, "bus-fault MAD words -> DDR4 default");
+        assert_eq!(
+            ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
+            vec![0, 2],
+        );
+    }
+
+    /// C-2: OQ-11's DDR5 condition with zero MAD words — a `0` MAD_DIMM
+    /// word is not DDR5 evidence, so the decode stays on the 2-channel
+    /// DDR4 default.
+    #[test]
+    fn c2_zero_mad_words_are_not_ddr5_evidence() {
+        let mut regs = tier3_ddr5_condition_regs();
+        regs.mad_dimm_ch2 = Some(0);
+        regs.mad_dimm_ch3 = Some(0);
+        let ro = decode(
+            &regs,
+            IntelGen::AlderLake,
+            Some(0),
+            None,
+            None,
+            &SmbiosTopology::empty(),
+        );
+        // Zero MAD words -> not DDR5 -> 2-channel DDR4 default.
+        assert_eq!(ro.channels.len(), 2, "zero MAD words -> DDR4 default");
+    }
+
+    /// H-4: the widened DDR5 tRFC1 field (12-bit, max 4095) decodes
+    /// values above the shared TIMING_MAX_TICKS of 2048 without
+    /// degrading to Na.
+    #[test]
+    fn h4_trfc1_12bit_exceeds_shared_max() {
+        // tRFC1 = 3000 (above 2048, within the 12-bit 4095 max).
+        let mcl = MclRegs {
+            tc_rfp: Some(0x0000_0BB8), // tRFC1 [11:0] = 3000
+            ..MclRegs::default()
+        };
+        let ch = decode_tier3_channel(
+            0,
+            Section::Value(2400.0),
+            &mcl,
+            &ALDER_CHANNELS[0],
+        );
+        assert_eq!(
+            ch.timings.rfc1,
+            Section::Value(3000),
+            "tRFC1 3000 is in-band for the 12-bit field (H-4)"
+        );
+
+        // tRFC1 = 4095 (the 12-bit max) is in-band.
+        let mcl = MclRegs {
+            tc_rfp: Some(0x0000_0FFF), // tRFC1 [11:0] = 4095
+            ..MclRegs::default()
+        };
+        let ch = decode_tier3_channel(
+            0,
+            Section::Value(2400.0),
+            &mcl,
+            &ALDER_CHANNELS[0],
+        );
+        assert_eq!(
+            ch.timings.rfc1,
+            Section::Value(4095),
+            "tRFC1 4095 is the 12-bit max (H-4)"
+        );
     }
 }
