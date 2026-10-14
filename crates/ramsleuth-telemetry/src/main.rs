@@ -25,6 +25,7 @@ use ramsleuth_telemetry::amd_readout::{
 use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor};
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::intel_readout::{IntelChannel, IntelReadout};
+use ramsleuth_telemetry::intel_smbios::{self, SmbiosTopology};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
 use ramsleuth_telemetry::{collect, SystemMemoryTelemetry, VoltageTelemetry};
 
@@ -122,14 +123,21 @@ pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
 // ---------------------------------------------------------------------------
 
 /// The human-readable text of an absent cell (CLI-3): the [`NaReason`]
-/// `Display` phrase (the DAEMON-2 stable name) in the compact `N/A
-/// (<reason>)` form — `N/A (driver missing)`, `N/A (unsupported CPU)`,
-/// …; a structurally not-applicable cell ([`NaReason::NotApplicable`])
-/// keeps the one bare `N/A`. Rendered locally (this bin cannot depend on
-/// `ramsleuth-display` — a cycle), from the telemetry `Display` impl.
+/// phrase in the compact `N/A (<reason>)` form — `N/A (driver missing)`,
+/// `N/A (unsupported CPU)`, …; a structurally not-applicable cell
+/// ([`NaReason::NotApplicable`]) keeps the one bare `N/A`. Rendered locally
+/// (this bin cannot depend on `ramsleuth-display` — a cycle).
+///
+/// Unlike the three real frontends (which keep the terse `decode failed`
+/// tag for a [`NaReason::ParseError`] per the D-4 dense-grid rule), this
+/// **diagnostic** bin renders a `ParseError`'s detail verbatim when it is
+/// non-empty — the *true* reason (e.g. the server-uncore platform note),
+/// never a mislabel of a structural absence as a decode failure — falling
+/// back to `decode failed` for an empty detail.
 fn na_cell(reason: &NaReason) -> String {
     match reason {
         NaReason::NotApplicable => "N/A".to_owned(),
+        NaReason::ParseError(detail) if !detail.is_empty() => format!("N/A ({detail})"),
         r => format!("N/A ({r})"),
     }
 }
@@ -146,6 +154,15 @@ fn cell<T: std::fmt::Display>(section: &Section<T>) -> String {
 fn mhz(section: &Section<f64>) -> String {
     match section {
         Section::Value(value) => format!("{value:.2} MHz"),
+        Section::Na(reason) => na_cell(reason),
+    }
+}
+
+/// A derived data-rate cell: MCLK × 2 (the DDR double-pumping rule) in
+/// MT/s, or the N/A reason text when the MCLK is absent.
+fn mts_from_mclk(mclk: &Section<f64>) -> String {
+    match mclk {
+        Section::Value(value) => format!("{:.0} MT/s", value * 2.0),
         Section::Na(reason) => na_cell(reason),
     }
 }
@@ -261,10 +278,12 @@ fn rows(out: &mut String, indent: &str, pairs: &[(&str, String)]) {
 // Per-display-set row builders (shared by the AMD and Intel sections).
 // ---------------------------------------------------------------------------
 
-/// The seven clocks & ratios rows of a [`ClockReadout`].
-fn clocks_rows(clocks: &ClockReadout) -> [(&str, String); 7] {
+/// The eight clocks & ratios rows of a [`ClockReadout`] (MCLK, the derived
+/// MT/s data rate, UCLK, FCLK, and the mode / gear / power flags).
+fn clocks_rows(clocks: &ClockReadout) -> [(&str, String); 8] {
     [
         ("MCLK", mhz(&clocks.mclk_mhz)),
+        ("MT/s", mts_from_mclk(&clocks.mclk_mhz)),
         ("UCLK", mhz(&clocks.uclk_mhz)),
         ("FCLK", mhz(&clocks.fclk_mhz)),
         ("UCLK:MCLK", div_mode(&clocks.div_mode)),
@@ -423,10 +442,29 @@ fn amd_section_text(section: &Section<AmdReadout>) -> String {
     out
 }
 
-/// The `=== Intel ===` section: a readout-level `channel mode` line, then
-/// one `--- Channel n ---` block per decoded IMC channel, or one
+/// The per-DIMM capacity line: a uniform kit renders `<size> GiB × <count>`,
+/// a mixed kit joins the per-DIMM sizes with ` + `.
+fn dimm_line(sizes: &[u64]) -> String {
+    if sizes.is_empty() {
+        return "N/A".to_owned();
+    }
+    let first = sizes[0];
+    if sizes.iter().all(|&s| s == first) {
+        format!("{:.1} GiB × {}", first as f64 / 1024.0, sizes.len())
+    } else {
+        sizes
+            .iter()
+            .map(|&s| format!("{:.1} GiB", s as f64 / 1024.0))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+}
+
+/// The `=== Intel ===` section: a readout-level `channel mode` line plus the
+/// SMBIOS Type 17 capacity (total + per-DIMM — the firmware ground truth),
+/// then one `--- Channel n ---` block per decoded IMC channel, or one
 /// `N/A (<reason>)` line when the branch degraded.
-fn intel_section_text(section: &Section<IntelReadout>) -> String {
+fn intel_section_text(section: &Section<IntelReadout>, smbios: &SmbiosTopology) -> String {
     let mut out = String::new();
     header(&mut out, "Intel");
     match section {
@@ -439,7 +477,27 @@ fn intel_section_text(section: &Section<IntelReadout>) -> String {
                 .channel_mode
                 .map(|m| m.label().to_owned())
                 .unwrap_or_else(|| "N/A".to_owned());
-            rows(&mut out, "  ", &[("channel mode", mode)]);
+            // The SMBIOS Type 17 capacity (total + per-DIMM), shown
+            // alongside the resolved channel mode.
+            let total_text = if smbios.populated_count > 0 {
+                format!("{:.1} GiB", smbios.total_capacity_mib as f64 / 1024.0)
+            } else {
+                "N/A".to_owned()
+            };
+            let per_dimm_text = if smbios.populated_count > 0 {
+                dimm_line(&smbios.dimm_sizes)
+            } else {
+                "N/A".to_owned()
+            };
+            rows(
+                &mut out,
+                "  ",
+                &[
+                    ("channel mode", mode),
+                    ("total capacity", total_text),
+                    ("per-DIMM", per_dimm_text),
+                ],
+            );
             if readout.channels.is_empty() {
                 out.push_str("  (no channels decoded)\n\n");
                 return out;
@@ -551,7 +609,7 @@ const TITLE: &str = "RamSleuth - system memory telemetry";
 /// snapshot always yields the same `String`; a fully degraded snapshot
 /// renders the complete dashboard without panicking (the no-panic
 /// contract, D5).
-pub(crate) fn render_dashboard(t: &SystemMemoryTelemetry) -> String {
+pub(crate) fn render_dashboard(t: &SystemMemoryTelemetry, smbios: &SmbiosTopology) -> String {
     let mut out = String::new();
     out.push_str(TITLE);
     out.push('\n');
@@ -561,7 +619,7 @@ pub(crate) fn render_dashboard(t: &SystemMemoryTelemetry) -> String {
     out.push_str(&cpu_section_text(&t.cpu));
     out.push_str(&vcore_section_text(&t.vcore));
     out.push_str(&amd_section_text(&t.amd));
-    out.push_str(&intel_section_text(&t.intel));
+    out.push_str(&intel_section_text(&t.intel, smbios));
     out.push_str(&spd_section_text(&t.spd));
     out
 }
@@ -592,14 +650,14 @@ fn json_escape(s: &str) -> String {
 /// never diverge. A degraded vendor section is `null`; the `vcore` field is
 /// the same human-readable string the dashboard's `=== Vcore ===` section
 /// prints (`vcore_display`).
-pub(crate) fn to_json(t: &SystemMemoryTelemetry) -> String {
+pub(crate) fn to_json(t: &SystemMemoryTelemetry, smbios: &SmbiosTopology) -> String {
     let amd = match &t.amd {
         Section::Na(_) => "null".to_owned(),
         _ => format!("\"{}\"", json_escape(&amd_section_text(&t.amd))),
     };
     let intel = match &t.intel {
         Section::Na(_) => "null".to_owned(),
-        _ => format!("\"{}\"", json_escape(&intel_section_text(&t.intel))),
+        _ => format!("\"{}\"", json_escape(&intel_section_text(&t.intel, smbios))),
     };
     let spd = t
         .spd
@@ -641,10 +699,14 @@ fn main() {
         }
         Ok(opts) => {
             let t = collect();
+            // The SMBIOS Type 17 topology (unprivileged dmi read) feeds the
+            // Intel section's capacity line and the server-uncore speed
+            // fallback (the SPD EEPROM is not OS-visible on those platforms).
+            let smbios = intel_smbios::collect();
             if opts.json {
-                println!("{}", to_json(&t));
+                println!("{}", to_json(&t, &smbios));
             } else {
-                print!("{}", render_dashboard(&t));
+                print!("{}", render_dashboard(&t, &smbios));
             }
             // N/A is a valid, structured outcome: exit 0 in every
             // reachable render state (no-panic contract, plan D5).
@@ -659,8 +721,9 @@ mod tests {
     use ramsleuth_telemetry::amd_readout::{CommandRate, EccStatus, MemoryChannelMode};
     use ramsleuth_telemetry::cpuid::{AmdZen, IntelGen};
     use ramsleuth_telemetry::intel_readout::{
-        ChannelMode, ChannelRegs, fixture_channel_regs, fixture_intel_readout,
+        ChannelMode, ChannelRegs, MemoryTech, fixture_channel_regs, fixture_intel_readout,
     };
+    use ramsleuth_telemetry::intel_smbios::DerivedMode;
     use ramsleuth_telemetry::{RailConfidence, SystemPlatform};
 
     /// A synthetic all-Na snapshot (pure — never calls `collect()`).
@@ -825,11 +888,19 @@ mod tests {
         assert_eq!(na_cell(&NaReason::UnsupportedHardware), "N/A (unsupported CPU)");
         assert_eq!(na_cell(&NaReason::InsufficientPrivilege), "N/A (insufficient privilege)");
         assert_eq!(na_cell(&NaReason::UnknownPmTableVersion), "N/A (new PM table)");
-        assert_eq!(na_cell(&NaReason::ParseError("x".to_owned())), "N/A (decode failed)");
+        // A non-empty `ParseError` detail renders the true reason verbatim;
+        // an empty one falls back to the generic "decode failed" phrase.
+        assert_eq!(na_cell(&NaReason::ParseError(String::new())), "N/A (decode failed)");
+        assert_eq!(
+            na_cell(&NaReason::ParseError(
+                "server uncore: no OS-accessible timing source".to_owned()
+            )),
+            "N/A (server uncore: no OS-accessible timing source)"
+        );
         // NotApplicable keeps the one bare N/A.
         assert_eq!(na_cell(&NaReason::NotApplicable), "N/A");
         // The Dashboard carries the phrase, never the Debug variant name.
-        let out = render_dashboard(&all_na());
+        let out = render_dashboard(&all_na(), &SmbiosTopology::empty());
         assert!(out.contains("N/A (driver missing)"), "{out}");
         assert!(out.contains("N/A (unsupported CPU)"), "{out}");
         assert!(!out.contains("DriverMissing"), "no Debug form: {out}");
@@ -846,7 +917,7 @@ mod tests {
     #[test]
     fn tc_cli4_dashboard_human_readable_and_json_carries_vcore() {
         let t = representative();
-        let dash = render_dashboard(&t);
+        let dash = render_dashboard(&t, &SmbiosTopology::empty());
         // No Debug walls anywhere in the dashboard.
         assert!(!dash.contains("SpdModule {"), "no SpdModule Debug wall: {dash}");
         assert!(!dash.contains("ClockReadout {"), "no ClockReadout Debug wall: {dash}");
@@ -864,7 +935,7 @@ mod tests {
         assert!(dash.contains("CPU Core Voltage  1.150 V"), "vCore line: {dash}");
         // The JSON carries the same fields, including a vcore field that
         // matches the dashboard's vCore display (dashboard/JSON consistency).
-        let json = to_json(&t);
+        let json = to_json(&t, &SmbiosTopology::empty());
         for key in ["\"cpu\"", "\"vendor\"", "\"brand\"", "\"vcore\"", "\"amd\"", "\"intel\"", "\"spd\""] {
             assert!(json.contains(key), "missing {key} in: {json}");
         }
@@ -880,7 +951,7 @@ mod tests {
     /// Debug wall.
     #[test]
     fn dashboard_all_na_renders_structured() {
-        let out = render_dashboard(&all_na());
+        let out = render_dashboard(&all_na(), &SmbiosTopology::empty());
         assert!(out.contains("=== CPU ==="));
         assert!(out.contains("=== Vcore ==="));
         assert!(out.contains("=== AMD ==="));
@@ -896,7 +967,7 @@ mod tests {
     /// block per module, no no-modules note.
     #[test]
     fn dashboard_renders_spd_modules() {
-        let out = render_dashboard(&representative());
+        let out = render_dashboard(&representative(), &SmbiosTopology::empty());
         assert!(out.contains("Module 0x52 (DDR4)"));
         assert!(out.contains("Module 0x53 (DDR5)"));
         assert!(!out.contains("no modules"));
@@ -909,7 +980,8 @@ mod tests {
     #[test]
     fn dashboard_vcore_renders_per_confidence() {
         // Absent → N/A.
-        assert!(render_dashboard(&all_na()).contains("CPU Core Voltage  N/A"));
+        assert!(render_dashboard(&all_na(), &SmbiosTopology::empty())
+            .contains("CPU Core Voltage  N/A"));
 
         // Heuristic (no VID) → the value + the `[est]` badge.
         let mut t = all_na();
@@ -920,7 +992,8 @@ mod tests {
             delta_volts: None,
             confidence: RailConfidence::HeuristicDefault,
         });
-        assert!(render_dashboard(&t).contains("CPU Core Voltage  1.216 V [est]"));
+        assert!(render_dashboard(&t, &SmbiosTopology::empty())
+            .contains("CPU Core Voltage  1.216 V [est]"));
 
         // Verified + a synthetic VID → the signed negative delta
         // (1.216 − 1.280 = −64 mV).
@@ -932,7 +1005,7 @@ mod tests {
             delta_volts: Some(1.216 - 1.280),
             confidence: RailConfidence::VerifiedProfile,
         });
-        let out = render_dashboard(&t);
+        let out = render_dashboard(&t, &SmbiosTopology::empty());
         assert!(out.contains("CPU Core Voltage  1.216 V (VID: 1.280 V, Δ -64 mV)"), "{out}");
         assert!(!out.contains("[est]"), "a verified vCore has no badge: {out}");
     }
@@ -943,7 +1016,7 @@ mod tests {
     #[test]
     fn to_json_is_structurally_valid() {
         let t = representative();
-        let out = to_json(&t);
+        let out = to_json(&t, &SmbiosTopology::empty());
         assert!(out.starts_with('{'));
         assert!(out.ends_with('}'));
         for key in ["\"cpu\"", "\"vendor\"", "\"brand\"", "\"vcore\"", "\"amd\"", "\"intel\"", "\"spd\""] {
@@ -1057,10 +1130,40 @@ mod tests {
         );
         ro.channel_mode = Some(ChannelMode::DualFlex);
         t.intel = Section::Value(ro);
-        let out = render_dashboard(&t);
+        let out = render_dashboard(&t, &SmbiosTopology::empty());
         assert!(!out.contains("IntelReadout {"), "no Debug wall: {out}");
         assert!(out.contains("--- Channel 0 ---"), "{out}");
         assert!(out.contains("1600.00 MHz"), "{out}");
         assert!(out.contains("channel mode"), "{out}");
+    }
+
+    /// (i) The Intel section renders the SMBIOS Type 17 capacity (total +
+    /// per-DIMM): a 3 × 8 GiB kit → "24.0 GiB" total and "8.0 GiB × 3"
+    /// per-DIMM (the x99 Broadwell-E reference shape).
+    #[test]
+    fn intel_section_renders_smbios_capacity() {
+        let mut t = all_na();
+        let mut ro = fixture_intel_readout(
+            IntelGen::Skylake,
+            Some(0x0000_000C),
+            &fixture_channel_regs(),
+            &ChannelRegs::default(),
+            true,
+        );
+        ro.channel_mode = Some(ChannelMode::DualSymmetric);
+        t.intel = Section::Value(ro);
+        let smbios = SmbiosTopology {
+            populated_count: 3,
+            dimm_sizes: vec![8192, 8192, 8192],
+            total_capacity_mib: 24576,
+            memory_type: Some(MemoryTech::Ddr4),
+            speed_mts: Some(2400),
+            locators: vec!["B1".to_owned(), "D1".to_owned(), "H1".to_owned()],
+            derived_mode: DerivedMode::Dual,
+        };
+        let out = render_dashboard(&t, &smbios);
+        assert!(out.contains("total capacity"), "{out}");
+        assert!(out.contains("24.0 GiB"), "total 24 GiB: {out}");
+        assert!(out.contains("8.0 GiB × 3"), "per-DIMM 8 GiB × 3: {out}");
     }
 }

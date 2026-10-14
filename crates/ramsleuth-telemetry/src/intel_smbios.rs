@@ -39,6 +39,9 @@
 //! - **extended capacity** @ `0x1C` (32-bit dword, MiB in bits 30:0 —
 //!   the SMBIOS 3.0+ extended size; zero on the reference board);
 //! - **memory type** @ `0x12` (`0x1A` = DDR4, `0x22` = DDR5);
+//! - **speed** @ `0x20` (16-bit word, MT/s **directly** — the "Configured
+//!   Memory Speed"; `0` = unknown. Verified `0x0960` = 2400 on the x99
+//!   Broadwell-E and `0x0E10` = 3600 on the 12600KF);
 //! - **locators**: the "Device Locator" string ref @ `0x10`, with the
 //!   "Bank Locator" string ref @ `0x11` as the fallback.
 //!
@@ -92,6 +95,8 @@ const OFF_MEM_DEVICE_LOCATOR: usize = 0x10;
 const OFF_BANK_LOCATOR: usize = 0x11;
 const OFF_MEMORY_TYPE: usize = 0x12;
 const OFF_CAPACITY_EXTENDED: usize = 0x1C;
+const OFF_SPEED: usize = 0x20;
+const SPEED_LEN: usize = 2;
 
 /// The channel classification derived from the populated DIMM locators
 /// (research: "matched A/B pairs → Dual; both on one channel → Single;
@@ -126,10 +131,16 @@ pub struct SmbiosTopology {
     pub populated_count: u8,
     /// Per-populated-DIMM capacity in MiB (parallel to [`locators`]).
     pub dimm_sizes: Vec<u64>,
+    /// Total installed capacity in MiB (the sum of [`dimm_sizes`]).
+    pub total_capacity_mib: u32,
     /// The active memory technology of the first populated DIMM
     /// (`0x1A` → DDR4, `0x22` → DDR5); `None` when no populated DIMM
     /// carries a recognized type.
     pub memory_type: Option<MemoryTech>,
+    /// The configured memory speed in MT/s (the "Configured Memory Speed"
+    /// of the first populated DIMM, MT/s directly); `None` when no
+    /// populated DIMM reports a nonzero speed.
+    pub speed_mts: Option<u16>,
     /// The locator strings of the populated DIMMs (board-slot designations
     /// such as `A2` / `B2` / `DIMM 1`).
     pub locators: Vec<String>,
@@ -189,15 +200,20 @@ pub fn collect_from(root: &Path) -> SmbiosTopology {
             Ok(b) => b,
             Err(_) => continue, // unreadable -> skip (no panic)
         };
-        if let Some((capacity, mem_type, locator)) = parse_type17(&bytes) {
+        if let Some((capacity, mem_type, locator, speed)) = parse_type17(&bytes) {
             topology.populated_count = topology.populated_count.saturating_add(1);
             topology.dimm_sizes.push(capacity);
             if topology.memory_type.is_none() {
                 topology.memory_type = mem_type;
             }
+            if topology.speed_mts.is_none() {
+                topology.speed_mts = speed;
+            }
             topology.locators.push(locator);
         }
     }
+    // Total capacity = the sum of the per-DIMM sizes (MiB).
+    topology.total_capacity_mib = topology.dimm_sizes.iter().sum::<u64>() as u32;
     // Board-keyed channel grammar (TEL-3): the DMI board name selects the
     // per-firmware `Controller<digit>` profile; absent → the vendor-neutral
     // rules only.
@@ -214,7 +230,7 @@ pub fn collect_from(root: &Path) -> SmbiosTopology {
 ///
 /// Every field read is bounds-checked; a short / corrupt structure yields
 /// `None` (skipped) rather than a panic.
-fn parse_type17(bytes: &[u8]) -> Option<(u64, Option<MemoryTech>, String)> {
+fn parse_type17(bytes: &[u8]) -> Option<(u64, Option<MemoryTech>, String, Option<u16>)> {
     if bytes.len() < 2 {
         return None;
     }
@@ -277,7 +293,20 @@ fn parse_type17(bytes: &[u8]) -> Option<(u64, Option<MemoryTech>, String)> {
         .or_else(|| string_at(table, bank_ref))
         .unwrap_or_default();
 
-    Some((capacity, mem_type, locator))
+    // Configured Memory Speed @ `0x20` (16-bit LE, MT/s directly; `0` =
+    // unknown per the SMBIOS spec).
+    let speed = if fixed.len() >= OFF_SPEED + SPEED_LEN {
+        let word = u16::from_le_bytes([fixed[OFF_SPEED], fixed[OFF_SPEED + 1]]);
+        if word == 0 {
+            None
+        } else {
+            Some(word)
+        }
+    } else {
+        None
+    };
+
+    Some((capacity, mem_type, locator, speed))
 }
 
 /// Extract the `ref_idx`-th string from a raw SMBIOS string table
@@ -528,6 +557,20 @@ mod tests {
         type17_file(0x20, &mut fixed, &["A1", "A1"])
     }
 
+    /// A populated DDR4 DIMM with the Configured Memory Speed field
+    /// (@ `0x20`, 16-bit LE, MT/s directly) populated — the fixed part is
+    /// extended to `0x22` to carry it (the `populated_ddr4` helper stops at
+    /// `0x20`, so the speed there is absent / `None`).
+    fn populated_ddr4_speed(locator: &str, speed: u16) -> Vec<u8> {
+        let mut fixed = [0u8; 0x22];
+        fixed[OFF_CAPACITY..OFF_CAPACITY + CAPACITY_LEN].copy_from_slice(&0x4000u16.to_le_bytes());
+        fixed[OFF_MEM_DEVICE_LOCATOR] = 1;
+        fixed[OFF_BANK_LOCATOR] = 2;
+        fixed[OFF_MEMORY_TYPE] = 0x1A; // DDR4
+        fixed[OFF_SPEED..OFF_SPEED + SPEED_LEN].copy_from_slice(&speed.to_le_bytes());
+        type17_file(0x22, &mut fixed, &[locator, locator])
+    }
+
     /// The verbatim 12600KF / Z690M-ITX/ax SMBIOS Type 17 table
     /// (`17-0/raw`, handle `0x000C`; 183 bytes = the 92-byte SMBIOS 3.5
     /// fixed part + the string region). Captured byte-for-byte from the
@@ -674,6 +717,42 @@ const REAL_12600KF_17_1: &[u8] = &[
         assert_eq!(t.memory_type, Some(MemoryTech::Ddr5));
     }
 
+    /// The Configured Memory Speed field (@ `0x20`, 16-bit LE) is parsed as
+    /// **MT/s directly** (the x99 Broadwell-E `0x0960` = 2400; a matched kit
+    /// reports the same speed on every DIMM, so the first populated one
+    /// wins). The total capacity is the sum of the per-DIMM sizes.
+    #[test]
+    fn speed_field_is_parsed_as_mts_directly() {
+        let dmi = TempDmi::new("speed");
+        write_entry(&dmi.root, 0, &populated_ddr4_speed("A2", 2400));
+        write_entry(&dmi.root, 1, &populated_ddr4_speed("B2", 2400));
+
+        let t = collect_from(&dmi.root);
+        assert_eq!(t.speed_mts, Some(2400), "the configured speed is MT/s directly");
+        assert_eq!(t.total_capacity_mib, 32768, "2 x 16384 MiB");
+        assert_eq!(t.populated_count, 2);
+    }
+
+    /// A `0` speed word (SMBIOS "unknown") and a fixed part that stops
+    /// before `0x20` both yield `speed_mts = None` — never an invented
+    /// speed. The total capacity still sums the populated DIMMs.
+    #[test]
+    fn absent_speed_is_none() {
+        // (a) a fixed part that ends before the speed field.
+        let dmi = TempDmi::new("speed-absent");
+        write_entry(&dmi.root, 0, &populated_ddr4("A2"));
+        let t = collect_from(&dmi.root);
+        assert_eq!(t.speed_mts, None, "no speed field -> None");
+        assert_eq!(t.total_capacity_mib, 16384);
+
+        // (b) a present-but-zero speed word.
+        let dmi = TempDmi::new("speed-zero");
+        write_entry(&dmi.root, 0, &populated_ddr4_speed("A2", 0));
+        let t = collect_from(&dmi.root);
+        assert_eq!(t.speed_mts, None, "a 0 speed word is 'unknown' -> None");
+        assert_eq!(t.total_capacity_mib, 16384);
+    }
+
     /// (i) A corrupt / too-short structure is skipped (no panic) — a
     /// one-byte file yields the empty topology.
     #[test]
@@ -750,6 +829,11 @@ const REAL_12600KF_17_1: &[u8] = &[
             ]
         );
         assert_eq!(t.derived_mode, DerivedMode::Dual);
+        // The real table's Configured Memory Speed @ `0x20` is `0x0E10`
+        // = 3600 MT/s (the 12600KF reference kit); the total capacity is
+        // the sum of the two 16 GiB DIMMs.
+        assert_eq!(t.speed_mts, Some(3600));
+        assert_eq!(t.total_capacity_mib, 32768);
     }
 
     /// (TC-TEL3) The per-firmware `Controller<digit>` grammar is
