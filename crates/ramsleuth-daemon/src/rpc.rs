@@ -812,7 +812,11 @@ fn acquire_amd_raw() -> RawAcquisition {
         RawAcquisition::Amd(ProbeAmdSource {
             smn_regs,
             pm_version: pm.as_ref().map(|ctx| ctx.version),
-            pm_blob: pm.map(|ctx| ctx.pm).unwrap_or_default(),
+            // `ctx.pm` is `Option` (a loaded driver with no `pm_table`
+            // attribute — e.g. Castle Peak / 3990X — yields `None`):
+            // flatten to an empty blob, which is the honest "no PM data"
+            // representation for the raw probe dump.
+            pm_blob: pm.and_then(|ctx| ctx.pm).unwrap_or_default(),
         })
     } else {
         RawAcquisition::Unavailable

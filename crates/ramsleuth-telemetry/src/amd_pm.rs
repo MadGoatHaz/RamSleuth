@@ -372,7 +372,17 @@ fn to_u16(v: f32) -> u16 {
 /// Parses the raw PM-table blob in `ctx` into a structured
 /// [`AmdPmSnapshot`] (frozen public API, P2-04).
 ///
-/// Generation-first flow (P5-15, TEL-2):
+/// **PM-table-unavailable short-circuit:** when `ctx.pm` is `None` (the
+/// driver is loaded but the `pm_table` attribute is not exposed — e.g.
+/// Castle Peak / Threadripper 2990X), the function returns an all-zero
+/// [`AmdPmSnapshot`] (every field degrades to an honest N/A / Disabled
+/// under the P2-05 gates) **before** the version gate runs — with no table
+/// the version is a `0` sentinel that [`PmLayout::from_zen`] would reject,
+/// so the gate must not run in this case. The SMN overlay (timings / GDM /
+/// channel registers) still populates its own slots downstream, so the
+/// resulting readout is not all-N/A.
+///
+/// Generation-first flow (P5-15, TEL-2) for a present blob:
 ///
 /// 1. [`PmLayout::from_zen`] dispatches on the CPUID [`AmdZen`] family
 ///    (the primary key, mirroring
@@ -395,8 +405,14 @@ fn to_u16(v: f32) -> u16 {
 /// Pure: no I/O, no `unsafe`, no panic on any input (non-finite floats
 /// and negative values degrade to `0`).
 pub fn parse(ctx: &SmuContext, zen: AmdZen) -> TelemetryResult<AmdPmSnapshot> {
+    // PM-table-unavailable short-circuit (see the function docs): an all-zero
+    // snapshot returned before the version gate, so a `0` version sentinel
+    // is never rejected here.
+    let Some(pm) = &ctx.pm else {
+        return Ok(all_zero_snapshot(ctx.version));
+    };
+
     let layout = PmLayout::from_zen(zen, ctx.version)?;
-    let pm = &ctx.pm;
 
     // Minimum-length gate: the blob is a headerless f32 array — there is
     // no version word inside it to cross-check (P5-15).
@@ -486,6 +502,72 @@ pub fn parse(ctx: &SmuContext, zen: AmdZen) -> TelemetryResult<AmdPmSnapshot> {
             vcore_mv: to_u16(vddcr_vdd_v * 1000.0),
         },
     })
+}
+
+/// An all-zero [`AmdPmSnapshot`]: every field degrades to an honest
+/// `N/A` / `Disabled` under the P2-05 sanity gates. Used by [`parse`] when
+/// the driver is loaded but the PM table is unavailable
+/// (`SmuContext::pm == None`, e.g. Castle Peak / Threadripper 2990X) — the
+/// PM-derived fields are N/A while the SMN overlay (timings / GDM / channel
+/// registers) still populates its own slots downstream, so the readout is
+/// not all-N/A.
+fn all_zero_snapshot(version: u32) -> AmdPmSnapshot {
+    AmdPmSnapshot {
+        version,
+        mclk_mhz: 0,
+        uclk_mhz: 0,
+        fclk_mhz: 0,
+        div_mode: 0,
+        gdm: 0,
+        pdm: 0,
+        command_rate: 0,
+        timings: AmdPmTimings {
+            cl: 0,
+            rcwdwr: 0,
+            rcdrd: 0,
+            rp: 0,
+            ras: 0,
+            rc: 0,
+            rrds: 0,
+            rrld: 0,
+            faw: 0,
+            wtrs: 0,
+            wtrl: 0,
+            wr: 0,
+            rfc1: 0,
+            rfc2: 0,
+            rfcsb: 0,
+            cwl: 0,
+            rtp: 0,
+            rdwr: 0,
+            wrrd: 0,
+            rdrd_sd: 0,
+            rdrd_dd: 0,
+            rdrd_scl: 0,
+            rdrd_sc: 0,
+            wrwr_sd: 0,
+            wrwr_dd: 0,
+            wrwr_scl: 0,
+            wrwr_sc: 0,
+        },
+        cad_bus: AmdPmCadBus {
+            proc_odt: 0,
+            rtt_nom: 0,
+            rtt_wr: 0,
+            rtt_park: 0,
+            clk_drv: 0,
+            addr_cmd_drv: 0,
+            cs_odt_drv: 0,
+            cke_drv: 0,
+        },
+        voltages: AmdPmVoltages {
+            vddcr_soc_mv: 0,
+            vddio_mem_mv: 0,
+            vdd_misc_mv: 0,
+            vpp_mv: 0,
+            vcore_mv: 0,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -645,7 +727,7 @@ mod tests {
         for (zen, version) in [(AmdZen::Zen4, 0x40_00_01), (AmdZen::Zen5, 0x42_00_01)] {
             let ctx = SmuContext {
                 version,
-                pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.35),
+                pm: Some(synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.35)),
             };
             let snap = parse(&ctx, zen).expect("Zen 4/5 must reach a live decode (TEL-2)");
             assert_eq!(snap.version, version);
@@ -712,7 +794,7 @@ mod tests {
     fn parse_known_vermeer_blob() {
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.35),
+            pm: Some(synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.35)),
         };
         assert_eq!(
             parse(&ctx, AmdZen::Zen3),
@@ -726,7 +808,7 @@ mod tests {
     fn parse_div_mode_derived_1to2() {
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: synthetic_blob(1792.8, 800.4, 1600.6, 0.95, 1.2),
+            pm: Some(synthetic_blob(1792.8, 800.4, 1600.6, 0.95, 1.2)),
         };
         // fclk 1792.8 → 1793, uclk 800.4 → 800, mclk 1600.6 → 1601,
         // 0.95 V → 950 mV, 1.2 V → 1200 mV (Vcore), div mode 1:2.
@@ -741,7 +823,7 @@ mod tests {
     fn parse_known_matisse_blob() {
         let ctx = SmuContext {
             version: V_MATISSE,
-            pm: synthetic_blob(1200.0, 1200.0, 1200.0, 0.9, 1.1),
+            pm: Some(synthetic_blob(1200.0, 1200.0, 1200.0, 0.9, 1.1)),
         };
         assert_eq!(
             parse(&ctx, AmdZen::Zen2),
@@ -756,7 +838,7 @@ mod tests {
     fn parse_zeroes_command_rate_like_gdm_and_pdm() {
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.05),
+            pm: Some(synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.05)),
         };
         let snap = parse(&ctx, AmdZen::Zen3).expect("synthetic blob must parse");
         assert_eq!(snap.command_rate, 0);
@@ -770,7 +852,7 @@ mod tests {
     fn non_finite_fields_degrade_to_zero() {
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: synthetic_blob(f32::NAN, f32::INFINITY, f32::INFINITY, f32::NAN, f32::NAN),
+            pm: Some(synthetic_blob(f32::NAN, f32::INFINITY, f32::INFINITY, f32::NAN, f32::NAN)),
         };
         // uclk == mclk (both +inf) -> derived 1:1; everything else 0.
         assert_eq!(parse(&ctx, AmdZen::Zen3), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 0, 0, 0)));
@@ -781,7 +863,7 @@ mod tests {
     fn negative_fields_degrade_to_zero() {
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: synthetic_blob(-1.0, -2.0, -4.0, -0.5, -1.5),
+            pm: Some(synthetic_blob(-1.0, -2.0, -4.0, -0.5, -1.5)),
         };
         // -2.0 != -4.0 -> derived 1:2.
         assert_eq!(parse(&ctx, AmdZen::Zen3), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 1, 0, 0)));
@@ -796,7 +878,7 @@ mod tests {
         for len in 0..MIN_LEN {
             let ctx = SmuContext {
                 version: V_VERMEER,
-                pm: full[..len].to_vec(),
+                pm: Some(full[..len].to_vec()),
             };
             let res = parse(&ctx, AmdZen::Zen3);
             assert!(
@@ -814,12 +896,45 @@ mod tests {
         blob.extend_from_slice(&[0u8; 16]);
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: blob,
+            pm: Some(blob),
         };
         assert_eq!(
             parse(&ctx, AmdZen::Zen3),
             Ok(known_snapshot(V_VERMEER, 1600, 1600, 1600, 0, 1000, 1200))
         );
+    }
+
+    /// (TC-3990X) A `SmuContext` with `pm: None` (the driver is loaded but
+    /// the `pm_table` attribute is not exposed — e.g. Castle Peak /
+    /// Threadripper 2990X) parses to an all-zero snapshot (every field an
+    /// honest N/A under the P2-05 gates) WITHOUT hitting the version gate —
+    /// a `0` version sentinel is carried, not rejected. This is the fix for
+    /// the 3990X "driver missing" misclassification: the AMD branch stays
+    /// alive (the SMN overlay still populates its slots downstream) instead
+    /// of the whole section degrading to `DriverMissing`.
+    #[test]
+    fn parse_pm_none_yields_all_zero_snapshot() {
+        // A `0` version sentinel (no version attribute published) must NOT
+        // be rejected — the short-circuit returns before the version gate.
+        let ctx = SmuContext { version: 0, pm: None };
+        assert_eq!(parse(&ctx, AmdZen::Zen2), Ok(all_zero_snapshot(0)));
+
+        // A non-zero version (a readable `pm_table_version` attribute) is
+        // carried into the all-zero snapshot.
+        let ctx = SmuContext { version: 0x38_08_05, pm: None };
+        assert_eq!(parse(&ctx, AmdZen::Zen3), Ok(all_zero_snapshot(0x38_08_05)));
+
+        // Every field is zero (the honest-Na basis under the P2-05 gates).
+        let snap = all_zero_snapshot(0);
+        assert_eq!(snap.mclk_mhz, 0);
+        assert_eq!(snap.uclk_mhz, 0);
+        assert_eq!(snap.fclk_mhz, 0);
+        assert_eq!(snap.div_mode, 0);
+        assert_eq!(snap.gdm, 0);
+        assert_eq!(snap.pdm, 0);
+        assert_eq!(snap.command_rate, 0);
+        assert_eq!(snap.voltages.vcore_mv, 0);
+        assert_eq!(snap.voltages.vddcr_soc_mv, 0);
     }
 
     /// (d) Vcore (PM 0x0A0): f32 volts × 1000 → mV, the same conversion
@@ -831,7 +946,7 @@ mod tests {
         for (vcore_v, expected_mv) in cases {
             let ctx = SmuContext {
                 version: V_VERMEER,
-                pm: synthetic_blob(1600.0, 1600.0, 1600.0, 1.0, vcore_v),
+                pm: Some(synthetic_blob(1600.0, 1600.0, 1600.0, 1.0, vcore_v)),
             };
             let snap = parse(&ctx, AmdZen::Zen3).expect("synthetic blob must parse");
             assert_eq!(snap.voltages.vcore_mv, expected_mv);
@@ -839,7 +954,7 @@ mod tests {
         // 0.0 V → 0 mV → out of band → Na downstream.
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: synthetic_blob(1600.0, 1600.0, 1600.0, 1.0, 0.0),
+            pm: Some(synthetic_blob(1600.0, 1600.0, 1600.0, 1.0, 0.0)),
         };
         assert_eq!(
             parse(&ctx, AmdZen::Zen3).expect("synthetic blob must parse").voltages.vcore_mv,

@@ -838,8 +838,11 @@ pub fn run_burn_in(
             }
             Ok(Response::BurnInProgress(tick)) => {
                 // The tick's bookkeeping lands in the burn-in state
-                // under one brief write scope: the newest iteration /
-                // elapsed, and its cell / latency written into
+                // under one brief write scope. The daemon is the single
+                // source of the clock (FE-1): the newest tick's
+                // `elapsed_secs` wins (monotonic — a re-stamped /
+                // elapsed-update tick never moves it backwards), and its
+                // cell / latency (when it carries one) is written into
                 // `latest` (the newest value per cell wins — the
                 // `live_grid` rule; a non-finite / non-positive
                 // reading never renders as data).
@@ -851,11 +854,12 @@ pub fn run_burn_in(
                     latency_ns,
                 } = tick;
                 let mut s = state_write(state);
-                s.bench.burn_in.iteration = iteration;
-                s.bench.burn_in.elapsed_secs = elapsed_secs;
+                s.bench.burn_in.elapsed_secs = s.bench.burn_in.elapsed_secs.max(elapsed_secs);
                 let slot = tier as usize;
                 match (bandwidth, latency_ns) {
                     (Some((op, value)), _) => {
+                        // A data tick: the newest iteration + its cell.
+                        s.bench.burn_in.iteration = iteration;
                         if value.is_finite() && value > 0.0 {
                             match op {
                                 BenchOp::Read => {
@@ -871,19 +875,18 @@ pub fn run_burn_in(
                         }
                     }
                     (None, Some(ns)) => {
+                        // A latency data tick: the newest iteration +
+                        // its latency.
+                        s.bench.burn_in.iteration = iteration;
                         if ns.is_finite() && ns > 0.0 {
                             s.bench.burn_in.latest.latency_ns[slot] = ns;
                         }
                     }
                     (None, None) => {
-                        // A tick with neither a cell nor a latency is
-                        // off-contract (exactly one of the two is
-                        // `Some`, the `BurnInTick` contract): stop
-                        // the run and record it.
-                        s.error =
-                            Some("burn-in tick carried neither a cell nor a latency".to_owned());
-                        s.bench.burn_in.running = false;
-                        break;
+                        // An elapsed-update tick (FE-1): the daemon's
+                        // ~1 s clock — it carries no cell / latency, so
+                        // only `elapsed_secs` (set above) is updated and
+                        // the run continues (the smooth live display).
                     }
                 }
             }

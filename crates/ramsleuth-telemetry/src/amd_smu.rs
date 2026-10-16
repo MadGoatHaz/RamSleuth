@@ -123,16 +123,25 @@ const MAX_PM_TABLE_SIZE: usize = 256 * 1024;
 ///   (P5-15). The `pm_table` blob itself is a headerless f32 array and
 ///   carries no version word; on module builds without that attribute
 ///   (or via the char device fallback) it degrades to the legacy first
-///   four bytes of `pm` ([`extract_version`]).
+///   four bytes of `pm` ([`extract_version`]). A `0` sentinel when `pm` is
+///   `None` and no version attribute is published.
 /// - `pm`: the full raw PM-table blob, preserved verbatim for P2-04's
-///   version-guarded parse.
+///   version-guarded parse — or `None` when the driver is loaded (the
+///   kobject directory exists) but the `pm_table` attribute is not exposed
+///   on this platform (e.g. Castle Peak / Threadripper 2990X, where the
+///   RSMU/PM-table is not supported). A `None` PM table degrades the
+///   PM-derived fields to an honest N/A while the SMN path (timings / GDM
+///   / channel registers) still works — it is NOT "driver missing".
 #[derive(Debug, Clone)]
 pub struct SmuContext {
     /// PM-table `TableVersionId` (sibling `pm_table_version` attribute, or
-    /// the legacy first word of `pm` as fallback).
+    /// the legacy first word of `pm` as fallback). A `0` sentinel when
+    /// `pm` is `None` and no version attribute is published.
     pub version: u32,
-    /// Raw PM-table blob from the `ryzen_smu` driver (headerless f32 array).
-    pub pm: Vec<u8>,
+    /// Raw PM-table blob from the `ryzen_smu` driver (headerless f32
+    /// array), or `None` when the driver is loaded but the `pm_table`
+    /// attribute is not exposed on this platform (see the struct docs).
+    pub pm: Option<Vec<u8>>,
 }
 
 /// Acquire the raw SMU PM-table blob and its version.
@@ -361,10 +370,29 @@ fn acquire_linux() -> TelemetryResult<SmuContext> {
                 break;
             }
             Err(e) => match classify_io_error(&e) {
-                // Absent at this candidate -> try the next one; if it was
-                // the last, fall through to the char device (the module
-                // may expose only one of the two interfaces).
-                TelemetryError::DriverMissing { .. } => continue,
+                // The `pm_table` attribute is absent at this candidate. Two
+                // distinct cases:
+                //  (a) the kobject directory itself is absent -> the driver
+                //      is truly not loaded here; try the next candidate (and,
+                //      if this was the last, fall through to the char device —
+                //      the module may expose only one of the two interfaces).
+                //  (b) the directory exists but the `pm_table` attribute is
+                //      not exposed -> the driver IS loaded but the PM table is
+                //      unsupported on this platform (e.g. Castle Peak /
+                //      Threadripper 2990X). This is NOT "driver missing":
+                //      return a context with `pm: None` so the SMN path still
+                //      works and the PM fields degrade to an honest N/A.
+                TelemetryError::DriverMissing { .. } => {
+                    let dir = kobj_dir_for(path);
+                    if dir.exists() {
+                        found = Some(Ok(SmuContext {
+                            version: read_pm_version_attr(&dir),
+                            pm: None,
+                        }));
+                        break;
+                    }
+                    continue;
+                }
                 // Present but unreadable (-> InsufficientPrivilege) or some
                 // other raw failure (-> Io): report as classified.
                 other => return Err(other),
@@ -374,6 +402,36 @@ fn acquire_linux() -> TelemetryResult<SmuContext> {
     match found {
         Some(result) => result,
         None => chardev_acquire(),
+    }
+}
+
+/// The kobject directory that owns a `pm_table` attribute path (its
+/// parent). Used to tell "the driver is loaded" (the directory exists)
+/// from "the driver is missing" (the directory is absent) when the
+/// `pm_table` attribute itself is not exposed on the platform.
+#[cfg(target_os = "linux")]
+fn kobj_dir_for(pm_table_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(pm_table_path)
+        .parent()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// Read the sibling `pm_table_version` attribute out of a kobject
+/// directory, returning the parsed `TableVersionId` word, or `0` (the
+/// "no version published" sentinel) when the attribute is absent or
+/// unreadable.
+///
+/// Used on the PM-table-unavailable path (the driver is loaded but the
+/// `pm_table` attribute is not exposed): the version is carried for
+/// display only — [`crate::amd_pm::parse`] short-circuits to an all-zero
+/// snapshot before the version gate when `pm` is `None`, so a `0` here is
+/// harmless.
+#[cfg(target_os = "linux")]
+fn read_pm_version_attr(dir: &std::path::Path) -> u32 {
+    match std::fs::read(dir.join("pm_table_version")) {
+        Ok(bytes) => parse_version_word(&bytes).unwrap_or(0),
+        Err(_) => 0,
     }
 }
 
@@ -443,7 +501,7 @@ fn context_from_blob(blob: Vec<u8>) -> TelemetryResult<SmuContext> {
         let expected = parse_table_size(&size_attr)?;
         check_size_matches(expected, blob.len())?;
     }
-    Ok(SmuContext { version, pm: blob })
+    Ok(SmuContext { version, pm: Some(blob) })
 }
 
 /// Read the first existing sibling sysfs attribute in `candidates`.
@@ -746,5 +804,43 @@ mod tests {
 
         // An empty blob degrades everything to `None`.
         assert_eq!(read_pm_key_values(&[]), [None, None, None, None, None]);
+    }
+
+    /// (a) `kobj_dir_for` derives the kobject directory (the parent) from a
+    /// `pm_table` attribute path — the canonical `ryzen_smu_drv` and the
+    /// legacy `ryzen_smu` both resolve to their owning directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kobj_dir_for_derives_the_parent_directory() {
+        assert_eq!(
+            kobj_dir_for("/sys/kernel/ryzen_smu_drv/pm_table"),
+            std::path::PathBuf::from("/sys/kernel/ryzen_smu_drv")
+        );
+        assert_eq!(
+            kobj_dir_for("/sys/kernel/ryzen_smu/pm_table"),
+            std::path::PathBuf::from("/sys/kernel/ryzen_smu")
+        );
+    }
+
+    /// (a) `read_pm_version_attr` parses the sibling `pm_table_version`
+    /// attribute out of a kobject directory, and degrades to the `0`
+    /// sentinel when the attribute is absent (the PM-table-unavailable
+    /// path). Uses a process-unique temp directory with cleanup.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_pm_version_attr_parses_sibling_or_zero_sentinel() {
+        let dir = std::env::temp_dir()
+            .join(format!("ramsleuth_amd_smu_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test: create temp dir");
+        // Absent attribute -> the `0` sentinel.
+        assert_eq!(read_pm_version_attr(&dir), 0);
+        // Present attribute (4-byte LE `TableVersionId` 0x0038_0805) -> parsed.
+        let mut ver = [0u8; 4];
+        ver.copy_from_slice(&0x0038_0805u32.to_le_bytes());
+        std::fs::write(dir.join("pm_table_version"), ver).expect("test: write version");
+        assert_eq!(read_pm_version_attr(&dir), 0x0038_0805);
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
