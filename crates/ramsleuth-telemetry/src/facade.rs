@@ -7,7 +7,9 @@
 //! platform branch (C6-01) each degrade independently to a structured
 //! `Section::Na(reason)` (or an empty SPD list), so a failure in one
 //! branch can never affect the others (plan D5). The per-DIMM
-//! capacities (`dimm_sizes`) derive from the SPD modules, and the total
+//! capacities (`dimm_sizes`) derive from the SPD modules, falling back
+//! to the SMBIOS Type 17 per-device capacities when the SPD is
+//! incomplete (fewer bound modules than populated DIMMs), and the total
 //! capacity prefers the `/proc/meminfo` `MemTotal` (the OS ground
 //! truth) over the SPD sum, which survives as the non-meminfo
 //! fallback (D-C3/D-C9, D-3). The board-VRM read (C12-03) runs after
@@ -39,9 +41,11 @@
 //! `Section::Na(UnsupportedHardware)` with zero I/O in that branch. The
 //! SPD and platform branches run on every vendor (unprivileged sysfs /
 //! DMI + `/proc` reads); the per-DIMM capacities derive from the SPD
-//! modules (`density_mbit × devices / 8192`, D-C3) and the total
-//! capacity prefers the meminfo `MemTotal` (the OS ground truth) over
-//! the SPD sum, which survives as the non-meminfo fallback (D-C9, D-3).
+//! modules (`density_mbit × devices / 8192`, D-C3) — falling back to the
+//! SMBIOS Type 17 per-device capacities when the SPD is incomplete — and
+//! the total capacity prefers the meminfo `MemTotal` (the OS ground
+//! truth) over the SPD sum, which survives as the non-meminfo fallback
+//! (D-C9, D-3).
 
 use crate::amd_pm;
 use crate::amd_readout::{self, AmdReadout};
@@ -52,7 +56,7 @@ use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_mchbar;
 use crate::intel_readout::{self, IntelReadout};
-use crate::intel_smbios::SmbiosSourceStatus;
+use crate::intel_smbios::{SmbiosSourceStatus, SmbiosTopology};
 use crate::intel_sysfs;
 use crate::platform::{self, SystemPlatform};
 use crate::spd_decode::{self, SpdModule};
@@ -79,11 +83,11 @@ use crate::spd_eeprom::{self, SpdAcquireStatus};
 ///   `/proc/meminfo` `MemTotal` (the OS ground truth) when it carries
 ///   a value, else the sum of the [`dimm_sizes`](Self::dimm_sizes)
 ///   entries that carry a value (the non-meminfo fallback), else `Na`.
-/// - `dimm_sizes`: per-DIMM capacity in GiB (D-C3/D-C9), parallel to
-///   [`spd`](Self::spd) — entry `i` is `density_mbit × devices / 8192`
-///   for module `i` (`devices` = the module's total DRAM device
-///   count, D-2); `Na` when that module's density or devices is `Na`
-///   (carrying the offending source's reason).
+/// - `dimm_sizes`: per-DIMM capacity in GiB (D-C3/D-C9) — parallel to
+///   [`spd`](Self::spd) when the SPD is complete (entry `i` is
+///   `density_mbit × devices / 8192` for module `i`; `Na` when that
+///   module's density or devices is `Na`), else the SMBIOS Type 17
+///   per-device capacities (MiB → GiB) when the SPD is incomplete.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SystemMemoryTelemetry {
     /// The detected CPU (vendor + brand).
@@ -107,11 +111,13 @@ pub struct SystemMemoryTelemetry {
     /// [`dimm_sizes`](Self::dimm_sizes) entries (the non-meminfo
     /// fallback), else `Na`.
     pub total_capacity: Section<f64>,
-    /// Per-DIMM capacity in GiB (D-C3/D-C9), parallel to
-    /// [`spd`](Self::spd): entry `i` is `density_mbit × devices /
-    /// 8192` for module `i` (`devices` = the module's total DRAM
-    /// device count, D-2), `Na` when that module's density or
-    /// devices is `Na`.
+    /// Per-DIMM capacity in GiB (D-C3/D-C9): parallel to
+    /// [`spd`](Self::spd) when the SPD is complete (entry `i` is
+    /// `density_mbit × devices / 8192` for module `i`, `Na` when that
+    /// module's density or devices is `Na`); when the SPD is incomplete
+    /// (fewer bound modules than the SMBIOS populated-DIMM count) the
+    /// entries are the SMBIOS Type 17 per-device capacities (MiB → GiB)
+    /// instead, so the count and sizes reflect the full population.
     pub dimm_sizes: Vec<Section<f64>>,
     /// The single vCore source of truth (Chunk 3, **appended** after
     /// `dimm_sizes` — the OQ-10 append-only wire pattern): vendor-
@@ -147,6 +153,10 @@ pub struct SystemMemoryTelemetry {
 ///    `spd_decode::decode()` per image — collected before the Intel branch
 ///    because the server-uncore decode sources the SPD modules (real
 ///    EEPROM data).
+/// 2b. The SMBIOS Type 17 topology (vendor-neutral `dmi` export, all
+///     x86 hosts) — collected once and supplied both to the Intel branch
+///     (the 4-tier trust cross-check) and to the per-DIMM size computation
+///     (the SPD-incomplete fallback, step 7).
 /// 3. AMD branch (AMD silicon only): `amd_smu::acquire()` →
 ///    `amd_pm::parse()` → `amd_smn::apply_smn` (no-panic overlay) →
 ///    `amd_smn::read_all_channel_registers` + `decode_channel_registers`
@@ -173,7 +183,11 @@ pub struct SystemMemoryTelemetry {
 ///    never in `assemble`.
 /// 7. Per-DIMM capacities (D-C3/D-C9): `density_mbit × devices / 8192`
 ///    per SPD module (parallel to the SPD list; `Na` when that module's
-///    density or devices is `Na`).
+///    density or devices is `Na`). When the SPD is **incomplete** (fewer
+///    bound modules than the SMBIOS populated-DIMM count — a board that
+///    does not route every DIMM's SPD bus to an OS-visible I2C adapter),
+///    the per-DIMM sizes fall back to the SMBIOS per-device capacities
+///    (the firmware ground truth) so the count and sizes stay correct.
 /// 8. Total capacity (D-3/D-C3): the `/proc/meminfo` `MemTotal` (the
 ///    OS ground truth) when it carries a value, else the sum of the
 ///    DIMM capacities (the non-meminfo fallback).
@@ -186,11 +200,19 @@ pub fn collect() -> SystemMemoryTelemetry {
     //    sources the SPD modules (real EEPROM data) alongside the SMBIOS
     //    topology.
     let (spd, spd_status) = spd_branch();
+    // 2b. The SMBIOS Type 17 topology (vendor-neutral: the kernel `dmi`
+    //     export exists on every x86 host, Intel and AMD alike). Collected
+    //     once here and supplied both to the Intel branch (the 4-tier trust
+    //     cross-check) and to the per-DIMM size computation (the
+    //     SPD-incomplete fallback: a board that routes only some DIMMs' SPD
+    //     buses to an OS-visible I2C adapter still reports the full
+    //     population from the firmware ground truth).
+    let (smbios, smbios_status) = crate::intel_smbios::collect();
     // 3. AMD branch (gated on vendor before any provider I/O).
     let amd = amd_branch(&cpu);
     // 4. Intel branch (gated on vendor before any provider I/O; the server
     //    platforms source SMBIOS + SPD and never touch the MMIO path).
-    let intel = intel_branch(&cpu, &spd);
+    let intel = intel_branch(&cpu, &spd, &smbios, smbios_status);
     // 4b. H-8: thread the SPD acquire status into the Intel readout's
     //     annotation (a `Value` readout only) so the user knows *why* the
     //     SPD list is empty — not just *that* it is.
@@ -205,8 +227,10 @@ pub fn collect() -> SystemMemoryTelemetry {
     //    fallback (the in0 → Vcore resolution).
     let board_vrm =
         board_vrm::read_board_vrm(&platform.motherboard, platform::dmi_board_vendor().as_deref());
-    // 7. Per-DIMM capacities (D-C3/D-C9): parallel to the SPD modules.
-    let dimm_sizes = dimm_sizes(&spd);
+    // 7. Per-DIMM capacities (D-C3/D-C9): parallel to the SPD modules, with
+    //    the SMBIOS Type 17 fallback when the SPD is incomplete (fewer bound
+    //    `ee1004` modules than populated DIMMs).
+    let dimm_sizes = dimm_sizes(&spd, &smbios);
     // 8. Total capacity (D-3/D-C3): the meminfo `MemTotal` (the OS
     //    ground truth) when it carries a value, else the DIMM sum
     //    (the non-meminfo fallback).
@@ -295,10 +319,15 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
 /// **Server-uncore platforms** (Haswell-E / Broadwell-E / Skylake-X /
 /// Cascade Lake) take a third path: their memory-controller timing
 /// registers are not OS-accessible (no PCI BAR, unreachable via
-/// `/dev/mem`), so — after the vendor / generation gates and the SMBIOS
-/// collection — the branch returns `intel_readout::decode_server` (SMBIOS
+/// `/dev/mem`), so — after the vendor / generation gates — the branch
+/// returns `intel_readout::decode_server` (the caller-supplied SMBIOS
 /// topology + SPD-rated timings, the MC-live cells an honest N/A) and
 /// **never** touches the sysfs / `/dev/mem` MMIO path.
+///
+/// The SMBIOS Type 17 topology + source status are **supplied by the
+/// caller** ([`collect()`] collects them once — the same topology feeds
+/// both this branch's decode and the per-DIMM size fallback), so no
+/// double `dmi` read happens.
 ///
 /// Gated on the already-detected vendor: non-Intel silicon returns
 /// `Err(UnsupportedHardware)` before any provider call (zero I/O in
@@ -316,7 +345,12 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
 /// sources would mask a real fault. Both sources feed the same pure
 /// decode core (`decode` over `IntelImcRegs`), and a branch failure
 /// degrades only the Intel `Section` (via [`reason_from`]).
-fn intel_branch(cpu: &CpuInfo, spd: &[SpdModule]) -> TelemetryResult<IntelReadout> {
+fn intel_branch(
+    cpu: &CpuInfo,
+    spd: &[SpdModule],
+    smbios: &SmbiosTopology,
+    smbios_status: SmbiosSourceStatus,
+) -> TelemetryResult<IntelReadout> {
     // 1. Pure vendor gate (zero I/O): non-Intel silicon is rejected
     //    before any provider call (the branch's first line of defense).
     intel_sysfs::vendor_gate(cpu)?;
@@ -331,13 +365,11 @@ fn intel_branch(cpu: &CpuInfo, spd: &[SpdModule]) -> TelemetryResult<IntelReadou
     intel_readout::gen_gate(gen)?;
 
     // The SMBIOS Type 17 topology (the 4-tier trust procedure's firmware
-    // cross-check) — collected once and supplied to the decode on BOTH the
-    // sysfs / `/dev/mem` client arms and the server-uncore arm.
+    // cross-check) is supplied by the caller ([`collect()`]) and used on
+    // BOTH the sysfs / `/dev/mem` client arms and the server-uncore arm.
     // M-17: the source status (why the topology is empty) is threaded into
     // the readout's annotation so the user knows the L1 result was NOT
-    // firmware-verified. No-panic: a missing `dmi` dir yields the empty
-    // topology + `DirAbsent`.
-    let (smbios, smbios_status) = crate::intel_smbios::collect();
+    // firmware-verified.
 
     // Server platforms (Haswell-E / Broadwell-E / Skylake-X / Cascade
     // Lake): the memory-controller timing registers live in CPU-internal
@@ -346,7 +378,7 @@ fn intel_branch(cpu: &CpuInfo, spd: &[SpdModule]) -> TelemetryResult<IntelReadou
     // technology) + the SPD EEPROM (rated timings / speed) and NEVER
     // attempts the sysfs / `/dev/mem` MMIO path.
     if intel_readout::is_server_gen(gen) {
-        return Ok(intel_readout::decode_server(&smbios, spd, gen));
+        return Ok(intel_readout::decode_server(smbios, spd, gen));
     }
 
     // 4. Primary: the `ramsleuth_intel` sysfs kobject (plan §3.5).
@@ -354,7 +386,7 @@ fn intel_branch(cpu: &CpuInfo, spd: &[SpdModule]) -> TelemetryResult<IntelReadou
         // The raw set feeds the same pure decode core as the fallback.
         // L-10: all MAD data rides on `sysfs.regs` (the 3-arg decode).
         Ok(sysfs) => {
-            let mut ro = intel_readout::decode(&sysfs.regs, gen, &smbios);
+            let mut ro = intel_readout::decode(&sysfs.regs, gen, smbios);
             // ECC capability from the capid0a attribute (the sysfs-only
             // decode input; the /dev/mem fallback has none -> Unknown).
             ro.ecc_status = intel_readout::decode_ecc_status(sysfs.capid0a);
@@ -369,7 +401,7 @@ fn intel_branch(cpu: &CpuInfo, spd: &[SpdModule]) -> TelemetryResult<IntelReadou
         // already-detected vendor / generation through (no re-detect).
         Err(TelemetryError::DriverMissing { .. }) => {
             let bar = intel_mchbar::acquire_for(cpu.vendor)?;
-            let mut ro = intel_readout::read_intel_with(&bar, &smbios, gen)?;
+            let mut ro = intel_readout::read_intel_with(&bar, smbios, gen)?;
             // M-17: thread the SMBIOS source status into the annotation.
             ro.channel_annotation =
                 annotate_smbios_status(&ro.channel_annotation, smbios_status);
@@ -411,15 +443,37 @@ fn platform_branch() -> SystemPlatform {
     platform::collect_platform()
 }
 
-/// Per-DIMM capacities in GiB (D-C3/D-C9): one entry per SPD module,
-/// parallel to `spd`.
+/// Per-DIMM capacities in GiB (D-C3/D-C9).
 ///
-/// Pure: entry `i` is `density_mbit × devices / 8192` for module `i`
-/// (16384 Mbit × 8 devices / 8192 = 16 GiB). An entry degrades to `Na`
-/// — carrying the offending source's reason (density's when both are
+/// The primary source is the SPD modules: one entry per module, parallel
+/// to `spd`, where entry `i` is `density_mbit × devices / 8192` (16384
+/// Mbit × 8 devices / 8192 = 16 GiB). An SPD-derived entry degrades to
+/// `Na` — carrying the offending source's reason (density's when both are
 /// `Na`) — when that module's `density_mbit` or `devices` is `Na`.
-/// Never a panic, never an invented value.
-fn dimm_sizes(spd: &[SpdModule]) -> Vec<Section<f64>> {
+///
+/// **SPD-incomplete fallback:** a motherboard may route only some of its
+/// DIMMs' SPD buses to an OS-visible `ee1004` I2C adapter, so the bound
+/// SPD module count can be lower than the SMBIOS Type 17 populated-DIMM
+/// count (the Z690M-ITX/ax reports 2 DIMMs to SMBIOS but exposes only 1
+/// SPD device). When that happens (`spd.len() < smbios.populated_count`)
+/// the per-DIMM sizes fall back to the SMBIOS per-device capacities (the
+/// firmware ground truth, MiB → GiB), so the reported count and sizes are
+/// correct even when only some modules are SPD-visible. The total
+/// capacity is unaffected (it prefers `/proc/meminfo`); the SPD data that
+/// IS visible (maker / part / speed / profiles) is carried separately in
+/// the snapshot's `spd` list and stays intact.
+///
+/// Pure: never a panic, never an invented value.
+fn dimm_sizes(spd: &[SpdModule], smbios: &SmbiosTopology) -> Vec<Section<f64>> {
+    // SPD incomplete: fall back to the SMBIOS per-device sizes (MiB → GiB).
+    if spd.len() < smbios.populated_count as usize {
+        return smbios
+            .dimm_sizes
+            .iter()
+            .map(|mib| Section::Value((*mib as f64) / 1024.0))
+            .collect();
+    }
+    // SPD complete (or the SMBIOS source is empty): the SPD-derived sizes.
     spd
         .iter()
         .map(|module| match (&module.density_mbit, &module.devices) {
@@ -757,11 +811,16 @@ mod tests {
         assert_value_or_na("agesa", &t.platform.agesa);
         assert_value_or_na("smu_version", &t.platform.smu_version);
 
-        // dimm_sizes (D-C9): parallel to the SPD list, positionally.
+        // dimm_sizes (D-C9): the per-DIMM count is the larger of the SPD
+        // module count and the SMBIOS populated-DIMM count — the SMBIOS
+        // fallback fires when the board routes fewer SPD buses than DIMMs
+        // (the incomplete-SPD case), otherwise the sizes stay parallel to
+        // the SPD list.
+        let (smbios, _status) = crate::intel_smbios::collect();
         assert_eq!(
             t.dimm_sizes.len(),
-            t.spd.len(),
-            "dimm_sizes must be parallel to spd"
+            t.spd.len().max(smbios.populated_count as usize),
+            "dimm_sizes must be the larger of the SPD count and the SMBIOS populated count"
         );
 
         // total_capacity (D-C3): an in-band positive `Value` (the DIMM
@@ -798,7 +857,7 @@ mod tests {
         // capacities (the fixture modules carry Na density/devices),
         // and the derived total.
         let platform = fixture_platform();
-        let dimm_sizes = dimm_sizes(&spd);
+        let dimm_sizes = dimm_sizes(&spd, &SmbiosTopology::empty());
         let total_capacity = total_capacity(&dimm_sizes);
 
         let t = assemble(
@@ -846,7 +905,7 @@ mod tests {
         // The C6-06 fields carry through independently of the vendor
         // branches (same shape as the AMD-failure arm above).
         let platform = fixture_platform();
-        let dimm_sizes = dimm_sizes(&spd);
+        let dimm_sizes = dimm_sizes(&spd, &SmbiosTopology::empty());
         let total_capacity = total_capacity(&dimm_sizes);
 
         let t = assemble(
@@ -887,7 +946,8 @@ mod tests {
             vendor: CpuVendor::Intel(IntelGen::BroadwellE),
             brand: "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz".to_owned(),
         };
-        let ro = intel_branch(&cpu, &[]).expect("a server gen must decode (no Err)");
+        let ro = intel_branch(&cpu, &[], &SmbiosTopology::empty(), SmbiosSourceStatus::Ok)
+            .expect("a server gen must decode (no Err)");
         assert_eq!(ro.channels.len(), 4, "Broadwell-E is quad-channel");
         assert!(
             ro.channel_annotation.contains("Server uncore"),
@@ -1406,15 +1466,16 @@ mod tests {
             capacity_module(0x54, 12288, 8), // 12 GiB (non-power-of-two)
         ];
 
-        let sizes = dimm_sizes(&spd);
+        let sizes = dimm_sizes(&spd, &SmbiosTopology::empty());
 
         assert_eq!(sizes.len(), 3, "one entry per module, in order");
         assert_eq!(sizes[0], Section::Value(16.0));
         assert_eq!(sizes[1], Section::Value(4.0));
         assert_eq!(sizes[2], Section::Value(12.0));
 
-        // An empty SPD list yields an empty (still parallel) list.
-        assert_eq!(dimm_sizes(&[]), Vec::new());
+        // An empty SPD list (and an empty SMBIOS topology) yields an
+        // empty (still parallel) list.
+        assert_eq!(dimm_sizes(&[], &SmbiosTopology::empty()), Vec::new());
     }
 
     /// (f2) Na propagation is per-module: a capacity entry degrades to
@@ -1431,11 +1492,72 @@ mod tests {
         let mut devices_na = capacity_module(0x52, 16384, 8);
         devices_na.devices = Section::na(NaReason::ParseError("invalid rank config".to_owned()));
 
-        let sizes = dimm_sizes(&[density_na, ok, devices_na]);
+        let sizes = dimm_sizes(&[density_na, ok, devices_na], &SmbiosTopology::empty());
 
         assert_eq!(sizes[0], Section::na(NaReason::ParseError("fixture".to_owned())));
         assert_eq!(sizes[1], Section::Value(16.0));
         assert_eq!(sizes[2], Section::na(NaReason::ParseError("invalid rank config".to_owned())));
+    }
+
+    /// (f4) SPD-incomplete fallback: when the bound SPD module count is
+    /// lower than the SMBIOS Type 17 populated-DIMM count (a board that
+    /// does not route every DIMM's SPD bus to an OS-visible `ee1004`
+    /// adapter — the Z690M-ITX/ax reports 2 DIMMs to SMBIOS but exposes
+    /// only 1 SPD device), the per-DIMM sizes fall back to the SMBIOS
+    /// per-device capacities (the firmware ground truth, MiB → GiB) so the
+    /// count and the sizes are correct even when only some modules are
+    /// SPD-visible.
+    #[test]
+    fn dimm_sizes_falls_back_to_smbios_when_spd_incomplete() {
+        // 1 SPD module (its density/devices are irrelevant — the fallback
+        // ignores them), 2 SMBIOS DIMMs of 16384 MiB (16 GiB) each.
+        let spd = vec![fixture_module(0x50)];
+        let smbios = SmbiosTopology {
+            populated_count: 2,
+            dimm_sizes: vec![16384, 16384],
+            total_capacity_mib: 32768,
+            ..Default::default()
+        };
+
+        let sizes = dimm_sizes(&spd, &smbios);
+
+        assert_eq!(sizes.len(), 2, "the fallback must report both DIMMs");
+        assert_eq!(sizes[0], Section::Value(16.0), "16384 MiB = 16.0 GiB");
+        assert_eq!(sizes[1], Section::Value(16.0));
+    }
+
+    /// (f5) The fallback is one-directional: when the SPD module count
+    /// MEETS or EXCEEDS the SMBIOS populated-DIMM count (the normal
+    /// complete-SPD case, and the degenerate SPD-sees-more case), the
+    /// per-DIMM sizes stay SPD-derived — the SMBIOS topology is not used.
+    /// An empty SMBIOS topology (a VM / container) likewise never triggers
+    /// the fallback.
+    #[test]
+    fn dimm_sizes_uses_spd_when_not_incomplete() {
+        // 2 SPD modules, 2 SMBIOS DIMMs (complete) → the SPD-derived
+        // sizes (16 GiB and 4 GiB), NOT the SMBIOS 16 GiB each.
+        let spd = vec![
+            capacity_module(0x50, 16384, 8),
+            capacity_module(0x51, 8192, 4),
+        ];
+        let smbios = SmbiosTopology {
+            populated_count: 2,
+            dimm_sizes: vec![16384, 16384],
+            ..Default::default()
+        };
+        let sizes = dimm_sizes(&spd, &smbios);
+        assert_eq!(sizes[0], Section::Value(16.0), "SPD: 16384 Mbit × 8 / 8192");
+        assert_eq!(
+            sizes[1],
+            Section::Value(4.0),
+            "SPD: 8192 Mbit × 4 / 8192 (not the SMBIOS 16)"
+        );
+
+        // An empty SMBIOS topology (a VM / container) never triggers the
+        // fallback: the SPD-derived sizes stand.
+        let sizes = dimm_sizes(&spd, &SmbiosTopology::empty());
+        assert_eq!(sizes[0], Section::Value(16.0));
+        assert_eq!(sizes[1], Section::Value(4.0));
     }
 
     /// (f3) `sum_dimm_sizes` is the sum of the DIMM capacities that
@@ -1466,7 +1588,10 @@ mod tests {
         // The host shape (two 16 GiB DIMMs) through the full
         // spd → dimm_sizes → sum_dimm_sizes chain.
         let spd = vec![capacity_module(0x52, 16384, 8), capacity_module(0x53, 16384, 8)];
-        assert_eq!(sum_dimm_sizes(&dimm_sizes(&spd)), Section::Value(32.0));
+        assert_eq!(
+            sum_dimm_sizes(&dimm_sizes(&spd, &SmbiosTopology::empty())),
+            Section::Value(32.0)
+        );
     }
 
     /// (f3′) MemTotal preferred (D-3): the host shape (two 16 GiB
@@ -1514,7 +1639,7 @@ mod tests {
     fn total_capacity_falls_back_to_meminfo() {
         // No DIMM values (the fixture modules carry Na density/devices)
         // → the meminfo fallback, whatever this host reports.
-        let sizes = dimm_sizes(&[fixture_module(0x52), fixture_module(0x53)]);
+        let sizes = dimm_sizes(&[fixture_module(0x52), fixture_module(0x53)], &SmbiosTopology::empty());
         assert!(
             sizes.iter().all(Section::is_na),
             "fixture modules carry no capacity value"

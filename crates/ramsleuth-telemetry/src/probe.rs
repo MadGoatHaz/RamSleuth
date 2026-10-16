@@ -759,6 +759,15 @@ fn render_spd(out: &mut String, modules: &[SpdModule]) {
 
 /// The `### Platform` subsection: the vendor-neutral identity fields +
 /// the derived per-DIMM / total capacities.
+///
+/// The **SPD-incomplete annotation**: the facade's `dimm_sizes` fall back
+/// to the SMBIOS Type 17 per-device capacities when the board routes fewer
+/// SPD buses to an OS-visible `ee1004` adapter than there are populated
+/// DIMMs (the Z690M-ITX/ax reports 2 DIMMs to SMBIOS but exposes only 1
+/// SPD device). That fallback is detectable from the snapshot alone — no
+/// new wire field — as `dimm_sizes.len() > spd.len()`; when it fired, the
+/// Platform section notes that the SPD is partial and the per-DIMM
+/// capacities are the firmware ground truth.
 fn render_platform(out: &mut String, telemetry: &SystemMemoryTelemetry) {
     let platform = &telemetry.platform;
     out.push_str("### Platform\n\n");
@@ -789,6 +798,14 @@ fn render_platform(out: &mut String, telemetry: &SystemMemoryTelemetry) {
             ("per-DIMM sizes", dimm_sizes),
         ],
     );
+    // The SPD-incomplete annotation (see the fn doc).
+    if telemetry.spd.len() < telemetry.dimm_sizes.len() {
+        out.push_str(&format!(
+            "\n> _SPD: {} of {} modules visible (motherboard limitation); capacity from SMBIOS._\n\n",
+            telemetry.spd.len(),
+            telemetry.dimm_sizes.len(),
+        ));
+    }
 }
 
 /// A GiB capacity cell (one decimal), or the branch's `Na` text.
@@ -1831,6 +1848,151 @@ mod tests {
         )));
         assert!(md.contains("| channel mode | Dual-Channel (Symmetric) |"), "{md}");
         assert!(!md.contains("channel annotation"), "{md}");
+    }
+
+    /// (10) The SPD-incomplete annotation: when the facade's per-DIMM
+    /// sizes fell back to the SMBIOS topology (more DIMMs than the bound
+    /// SPD modules — a board that does not route every DIMM's SPD bus to an
+    /// OS-visible I2C adapter), the Platform section renders the full
+    /// (SMBIOS) population AND notes that the SPD is partial and the
+    /// capacity is the firmware ground truth.
+    #[test]
+    fn render_platform_annotates_spd_incomplete() {
+        let report = ProbeReport {
+            telemetry: SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                    brand: "Intel(R) Core(TM) i5-12600K CPU @ 3.70GHz".to_owned(),
+                },
+                amd: Section::na(NaReason::UnsupportedHardware),
+                intel: Section::na(NaReason::DriverMissing),
+                // 1 SPD module (0x50) …
+                spd: vec![SpdModule {
+                    index: 0x50,
+                    is_ddr5: false,
+                    maker: Section::Value("0xC1".to_owned()),
+                    die_maker: Section::na(NaReason::NotApplicable),
+                    die_type: Section::na(NaReason::NotApplicable),
+                    devices: Section::Value(8),
+                    part: Section::na(NaReason::NotApplicable),
+                    serial: Section::na(NaReason::NotApplicable),
+                    rank: Section::Value(1),
+                    density_mbit: Section::Value(16_384),
+                    speed_mts: Section::Value(3_200),
+                    profiles: Vec::new(),
+                }],
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::Value(3600.0),
+                    motherboard: Section::Value("Z690M-ITX/ax".to_owned()),
+                    bios: Section::Value("1.0".to_owned()),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                // … but 2 per-DIMM sizes (the SMBIOS fallback: 2 × 16 GiB);
+                // the total is the OS ground truth (31.2 GiB).
+                total_capacity: Section::Value(31.2),
+                dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
+            },
+            raw: None,
+            system: ProbeSystem {
+                cpu_brand: "Intel(R) Core(TM) i5-12600K CPU @ 3.70GHz".to_owned(),
+                cpu_vendor: "Intel".to_owned(),
+                cpu_gen: "AlderLake".to_owned(),
+                pci_host_bridge: None,
+                kernel: "6.6.0-1-cachyos".to_owned(),
+                os: "Linux / Arch".to_owned(),
+                arch: "x86_64".to_owned(),
+                ramsleuth_version: "2.4.13".to_owned(),
+                telemetry_source: "ramsleuth_intel".to_owned(),
+            },
+        };
+        let md = render_probe_report_md(&report);
+
+        // The per-DIMM sizes render the full (SMBIOS) population.
+        assert!(
+            md.contains("| per-DIMM sizes | 16.0 GiB, 16.0 GiB |"),
+            "{md}"
+        );
+        // The OS total capacity is carried through.
+        assert!(md.contains("| total capacity | 31.2 GiB |"), "{md}");
+        // The annotation names the partial SPD + the SMBIOS capacity source.
+        assert!(
+            md.contains(
+                "SPD: 1 of 2 modules visible (motherboard limitation); capacity from SMBIOS"
+            ),
+            "{md}"
+        );
+    }
+
+    /// (11) No SPD-incomplete annotation when the SPD is complete (the
+    /// per-DIMM sizes are parallel to the SPD modules — the normal 2-DIMM
+    /// board where both are SPD-visible): the Platform section renders the
+    /// sizes with no fallback note.
+    #[test]
+    fn render_platform_no_annotation_when_spd_complete() {
+        // A module factory for the two-SPD-module (complete) case.
+        let module = |index: u8| SpdModule {
+            index,
+            is_ddr5: false,
+            maker: Section::Value("0xC1".to_owned()),
+            die_maker: Section::na(NaReason::NotApplicable),
+            die_type: Section::na(NaReason::NotApplicable),
+            devices: Section::Value(8),
+            part: Section::na(NaReason::NotApplicable),
+            serial: Section::na(NaReason::NotApplicable),
+            rank: Section::Value(1),
+            density_mbit: Section::Value(16_384),
+            speed_mts: Section::Value(3_200),
+            profiles: Vec::new(),
+        };
+        let report = ProbeReport {
+            telemetry: SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                    brand: "Intel(R) Core(TM) i5-12600K CPU @ 3.70GHz".to_owned(),
+                },
+                amd: Section::na(NaReason::UnsupportedHardware),
+                intel: Section::na(NaReason::DriverMissing),
+                // 2 SPD modules …
+                spd: vec![module(0x50), module(0x51)],
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::Value(3600.0),
+                    motherboard: Section::Value("Z690M-ITX/ax".to_owned()),
+                    bios: Section::Value("1.0".to_owned()),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                // … and 2 parallel per-DIMM sizes (SPD-derived, complete).
+                total_capacity: Section::Value(31.2),
+                dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
+                vcore: Section::na(NaReason::NotApplicable),
+            },
+            raw: None,
+            system: ProbeSystem {
+                cpu_brand: "Intel(R) Core(TM) i5-12600K CPU @ 3.70GHz".to_owned(),
+                cpu_vendor: "Intel".to_owned(),
+                cpu_gen: "AlderLake".to_owned(),
+                pci_host_bridge: None,
+                kernel: "6.6.0-1-cachyos".to_owned(),
+                os: "Linux / Arch".to_owned(),
+                arch: "x86_64".to_owned(),
+                ramsleuth_version: "2.4.13".to_owned(),
+                telemetry_source: "ramsleuth_intel".to_owned(),
+            },
+        };
+        let md = render_probe_report_md(&report);
+
+        // The per-DIMM sizes render (2 entries, parallel to the SPD).
+        assert!(
+            md.contains("| per-DIMM sizes | 16.0 GiB, 16.0 GiB |"),
+            "{md}"
+        );
+        // No fallback annotation (the SPD is complete).
+        assert!(
+            !md.contains("modules visible (motherboard limitation)"),
+            "a complete SPD must not carry the fallback annotation: {md}"
+        );
     }
 
     /// An AMD [`ProbeRaw`] fixture: the 13 SMN words (the last a failed
