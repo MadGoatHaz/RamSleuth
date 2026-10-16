@@ -258,9 +258,22 @@ impl BenchJobManager {
             // `run_streamed` has returned, so its progress sender is
             // dropped: drain every buffered progress event (FIFO
             // order) into the owner channel before the terminal, so
-            // the terminal is always last.
-            while let Ok(p) = progress_rx.recv() {
-                let _ = tx.send(JobEvent::Progress(p));
+            // the terminal is always last. The drain's `recv` is a
+            // blocking call — run it on the blocking pool so it never
+            // occupies a runtime worker (Fix 3: under full-core load a
+            // blocking `recv` on a worker starves the runtime).
+            let drained = tokio::task::spawn_blocking(move || {
+                let mut events = Vec::new();
+                while let Ok(p) = progress_rx.recv() {
+                    events.push(p);
+                }
+                events
+            })
+            .await;
+            if let Ok(events) = drained {
+                for p in events {
+                    let _ = tx.send(JobEvent::Progress(p));
+                }
             }
             let terminal = match outcome {
                 Ok(Ok(grid)) => JobEvent::Result(grid),
@@ -368,9 +381,14 @@ impl BenchJobManager {
             // `run_start` (the bench crate stamps it from its own,
             // slightly-later start) so the whole stream is monotonic by
             // construction.
-            let forwarder = tokio::spawn({
+            // The forwarder is an inherently blocking loop (it must block
+            // on `recv` to stream ticks in real time), so it runs on the
+            // blocking pool, never a runtime worker (Fix 3: under
+            // full-core load a blocking `recv` on a worker starves the
+            // runtime).
+            let forwarder = tokio::task::spawn_blocking({
                 let tx = tx.clone();
-                async move {
+                move || {
                     while let Ok(mut tick) = tick_rx.recv() {
                         tick.elapsed_secs = (Instant::now() - run_start).as_secs_f64();
                         let _ = tx.send(JobEvent::BurnInTick(tick));
