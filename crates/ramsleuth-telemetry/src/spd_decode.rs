@@ -981,10 +981,50 @@ fn xmp2_header_valid(data: &[u8]) -> bool {
         && get(data, XMP2_BASE + 3) == Some(XMP2_VERSION)
 }
 
-/// The XMP 2.0 profile-1 data rate in MT/s (`16000 / tCK`, from the
-/// profile-1 `tCK` byte) when the module carries a valid XMP header and
-/// a non-blank profile 1 with a non-zero `tCK`; `None` otherwise. This
-/// is the DDR4 base-speed primary source.
+/// The standard DDR4 XMP 2.0 data rates (MT/s) a fine-corrected tCK is
+/// snapped to when the raw rate lands within 20 MT/s of one. A raw rate
+/// not within 20 of any standard (e.g. the 2000 JEDEC base) is reported
+/// as-is.
+const XMP2_STANDARD_SPEEDS: [u16; 9] =
+    [2133, 2400, 2666, 2933, 3200, 3466, 3600, 3866, 4000];
+
+/// Snap a raw XMP 2.0 data rate to the nearest standard DDR4 speed when it
+/// is within 20 MT/s of one; otherwise return it unchanged.
+fn xmp2_snap_speed(raw: u16) -> u16 {
+    XMP2_STANDARD_SPEEDS
+        .iter()
+        .copied()
+        .min_by_key(|&std| (std as i32 - raw as i32).abs())
+        .filter(|&std| (std as i32 - raw as i32).abs() <= 20)
+        .unwrap_or(raw)
+}
+
+/// The XMP 2.0 data rate in MT/s from a 47-byte profile block's tCK: the
+/// coarse `+0x03` byte (MTB, 125 ps each) plus the signed `+0x26` fine byte
+/// (FTB, ps, two's complement). `tCK_ps = +0x03 x 125 + i8(+0x26)`; the raw
+/// rate is `2_000_000 / tCK_ps` (MT/s = 2 x f_clock / 1e6; the old
+/// `16000 / tCK_mtb` is identical when the fine byte is 0). The result is
+/// snapped to the nearest standard speed within 20 MT/s. `None` when the
+/// coarse tCK is 0 or the corrected period is non-positive (implausible).
+///
+/// A DDR4-3600 kit stores tCK 5 (625 ps) with a -70 ps fine -> 555 ps ->
+/// 3603 -> snapped 3600 (the old coarse-only read gave 3200).
+fn xmp2_speed_from_block(block: &[u8]) -> Option<u16> {
+    let tck_coarse = u32::from(block[3]);
+    if tck_coarse == 0 {
+        return None;
+    }
+    let tck_ps = (tck_coarse * 125) as i32 + i32::from(block[0x26] as i8);
+    if tck_ps <= 0 {
+        return None;
+    }
+    Some(xmp2_snap_speed((2_000_000 / tck_ps as u32) as u16))
+}
+
+/// The XMP 2.0 profile-1 data rate in MT/s (the fine-corrected tCK, snapped
+/// to the nearest standard speed) when the module carries a valid XMP header
+/// and a non-blank profile 1 with a usable `tCK`; `None` otherwise. This is
+/// the DDR4 base-speed primary source.
 fn xmp1_speed(data: &[u8]) -> Option<Section<u16>> {
     if !xmp2_header_valid(data) {
         return None;
@@ -993,11 +1033,8 @@ fn xmp1_speed(data: &[u8]) -> Option<Section<u16>> {
     if block.iter().all(|&b| b == 0) {
         return None; // blank profile 1
     }
-    let tck = block[3];
-    if tck == 0 {
-        return None;
-    }
-    Some(Section::Value(16000 / u16::from(tck)))
+    let speed = xmp2_speed_from_block(&block)?;
+    Some(Section::Value(speed))
 }
 
 /// Decode the factory-rated profiles of one SPD image: XMP 2.0 (the
@@ -1034,15 +1071,16 @@ fn decode_profiles(data: &[u8], is_ddr5: bool) -> Vec<SpdProfile> {
 /// | +off | Field | Decode |
 /// |------|-------|--------|
 /// | `0x00` | VDD | bit 7 = +1 V, bits 6:0 = 1/100 V -> `mV = (b & 0x80 != 0) x 1000 + (b & 0x7F) x 10` (`0xA3` -> 1350 mV) |
-/// | `0x03` | tCK | MTB units -> `speed_mts = 16000 / tCK` (`tCK = 5` -> 3200 MT/s); `0` -> `Na` |
+/// | `0x03` / `0x26` | tCK | MTB at `+0x03` (125 ps) + signed FTB ps at `+0x26` -> `tCK_ps = +0x03 x 125 + i8(+0x26)`; `speed_mts = 2_000_000 / tCK_ps` snapped to the nearest standard within 20 (`tCK 5` + `-70` -> 555 ps -> 3603 -> 3600 MT/s); `0` -> `Na` |
 /// | `0x04..0x06` | CL supported bitmap | 24-bit LE, bit N = CL 7+N -> `cas = first set bit + 7` |
 /// | `0x09` / `0x24` | tRCD | MTB at `+0x09`, signed FTB at `+0x24`: `0x09 x 125 + i8(0x24)` ps -> ticks |
 /// | `0x0A` / `0x23` | tRP | MTB at `+0x0A`, signed FTB at `+0x23`: `0x0A x 125 + i8(0x23)` ps -> ticks |
 /// | `0x0B` / `0x0C` | tRAS | 16-bit MTB value: high nibble = `+0x0B` bits 3:0, low byte = `+0x0C`: `((+0x0B & 0x0F) << 8 \| +0x0C) x 125` ps -> ticks (`+0x0B` bits 7:4 + `+0x0D` = tRC - not carried by the frozen struct) |
 ///
-/// ps -> ticks: `floor(ps / (tCK x 125))` (the frozen `trcd`/`trp`/
-/// `tras` cells are tick counts; a zero-FTB timing is exactly
-/// `floor(MTB / tCK)`); `tCK = 0` -> the timing cells are `Na`.
+/// ps -> ticks: `floor(ps / (tCK_coarse x 125))` (the frozen `trcd`/`trp`/
+/// `tras` cells divide by the COARSE tCK; a zero-FTB timing is exactly
+/// `floor(MTB / tCK)`); `tCK = 0` -> the timing cells are `Na`. Only the
+/// data rate (`speed_mts`) uses the fine-corrected tCK.
 fn decode_xmp2_profile(data: &[u8], index: u8, base: usize) -> Option<SpdProfile> {
     let block = read_block(data, base, XMP2_LEN)?;
     if block.iter().all(|&b| b == 0) {
@@ -1051,9 +1089,12 @@ fn decode_xmp2_profile(data: &[u8], index: u8, base: usize) -> Option<SpdProfile
     // Voltage: bit 7 = 10s-of-volt, bits 6:0 = 1/100 V.
     let volt_byte = block[0];
     let voltage = (volt_byte & 0x80 != 0) as u16 * 1000 + (volt_byte & 0x7F) as u16 * 10;
-    // Speed: tCK in MTB units.
+    // tCK coarse (MTB) - the divisor for the tick counts below.
     let tck = block[3];
-    let speed = if tck > 0 { 16000 / u16::from(tck) } else { 0 };
+    // Speed: the fine-corrected tCK (coarse +0x03 + signed FTB +0x26)
+    // -> MT/s, snapped to the nearest standard speed within 20. 0 = no
+    // usable tCK (the profile's speed cell degrades to Na).
+    let speed = xmp2_speed_from_block(&block).unwrap_or(0);
     // CL: 24-bit LE bitmap, bit N = CL 7+N; the lowest set bit wins.
     let cl_bitmap = (block[4] as u32) | ((block[5] as u32) << 8) | ((block[6] as u32) << 16);
     let cas = (0..24)
@@ -1637,10 +1678,10 @@ mod tests {
     /// the live truth: maker **G.Skill** ((bank, code) (5, 0xCD)),
     /// density **16384 Mbit** (16 Gb, `0x04` code 6), rank **2**
     /// (`0x0C` bits 5:3 = 1 + 1), x8 width, **16 devices** (2 x 8 ->
-    /// 32 GiB per slot), **3200 MT/s** (XMP profile 1 tCK 5), part
-    /// `F4-3600C18-32GVK`, a blank serial (all-zero `0x145..0x148`),
+    /// 32 GiB per slot), **3600 MT/s** (XMP profile 1 tCK 5 - 70 ps fine),
+    /// part `F4-3600C18-32GVK`, a blank serial (all-zero `0x145..0x148`),
     /// the die maker **SK hynix** (1, 0xAD), and profile 1 =
-    /// 3200 / CL18 / 19-19-37 / 1350 mV.
+    /// 3600 / CL18 / 19-19-37 / 1350 mV.
     #[test]
     fn image_a_decodes_to_live_truth() {
         let m = decode(&image_a_gskill());
@@ -1652,8 +1693,9 @@ mod tests {
         assert_eq!(m.density_mbit, Section::Value(16384));
         assert_eq!(m.rank, Section::Value(2));
         assert_eq!(m.devices, Section::Value(16));
-        // XMP profile-1 tCK 5 -> 3200 MT/s (the primary base speed).
-        assert_eq!(m.speed_mts, Section::Value(3200));
+        // XMP profile-1 tCK 5 - 70 ps fine -> 3600 MT/s (the primary base
+        // speed; the old coarse-only read gave 3200).
+        assert_eq!(m.speed_mts, Section::Value(3600));
         assert_eq!(m.part, Section::Value("F4-3600C18-32GVK".to_owned()));
         // The live serial is all zero -> Na(NotApplicable).
         assert_eq!(m.serial, Section::Na(NaReason::NotApplicable));
@@ -1661,7 +1703,7 @@ mod tests {
         assert_eq!(m.profiles.len(), 1, "profile 1 valid, profile 2 blank");
         let p = &m.profiles[0];
         assert_eq!(p.index, 1);
-        assert_eq!(p.speed_mts, Section::Value(3200));
+        assert_eq!(p.speed_mts, Section::Value(3600));
         assert_eq!(p.cas, Section::Value(18));
         assert_eq!(p.voltage, Section::Value(1350));
         // The XMP 2.0 timings decode to floor(MTB / tCK) ticks (tCK 5):
@@ -2629,5 +2671,52 @@ mod tests {
         data[XMP2_P1 + 6] = 0x80;
         let m = decode(&SpdImage { index: 0x52, data });
         assert_eq!(m.profiles[0].cas, Section::Value(30));
+    }
+
+    /// A DDR4-3600 XMP 2.0 profile with a tCK fine correction decodes to
+    /// 3600 MT/s, not the coarse-only 3200: tCK 5 (625 ps) + -69 ps fine
+    /// -> 556 ps -> 3597 MT/s -> snapped to the standard 3600 (both the
+    /// module base speed and the profile speed carry the correction).
+    #[test]
+    fn xmp2_tck_fine_correction_3600() {
+        let mut data = ddr4_image().data;
+        data[XMP2_P1 + 3] = 5; // tCK coarse = 5 MTB (625 ps)
+        data[XMP2_P1 + 0x26] = 0xBB; // tCK fine = -69 ps
+        let m = decode(&SpdImage { index: 0x52, data });
+        assert_eq!(
+            m.profiles[0].speed_mts,
+            Section::Value(3600),
+            "tCK 5 - 69 ps -> 556 ps -> 3597 -> snapped 3600"
+        );
+        assert_eq!(m.speed_mts, Section::Value(3600));
+    }
+
+    /// A true DDR4-3200 profile (tCK 5, no fine correction) still decodes to
+    /// exactly 3200 MT/s - the fine-correction path is a no-op when the fine
+    /// byte is 0, so 3200 kits are unaffected.
+    #[test]
+    fn xmp2_tck_no_fine_stays_3200() {
+        let mut data = ddr4_image().data;
+        data[XMP2_P1 + 3] = 5; // tCK coarse = 5 MTB (625 ps), fine byte 0
+        let m = decode(&SpdImage { index: 0x52, data });
+        assert_eq!(
+            m.profiles[0].speed_mts,
+            Section::Value(3200),
+            "tCK 5 + 0 ps -> 625 ps -> 3200 MT/s (exact)"
+        );
+        assert_eq!(m.speed_mts, Section::Value(3200));
+    }
+
+    /// The snap is conservative: a raw rate not within 20 MT/s of any
+    /// standard speed (the 2000 JEDEC base, tCK 8) is reported as-is, not
+    /// forced onto a standard bin.
+    #[test]
+    fn xmp2_nonstandard_rate_not_snapped() {
+        let m = decode(&ddr4_image());
+        assert_eq!(
+            m.speed_mts,
+            Section::Value(2000),
+            "tCK 8 -> 1000 ps -> 2000 MT/s (not near a standard -> as-is)"
+        );
     }
 }
