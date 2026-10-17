@@ -17,7 +17,7 @@
  * base from the CPU *generation* (the effective 8-bit model from
  * boot_cpu_data, the SDM (ext<<4)|base rule), NOT the overlapping PCI
  * Device-ID ranges: 12th-gen+ -> 0xd800, everything else -> 0x5000. The
- * five MAD attribute offsets are therefore computed at probe time (base
+ * seven MAD attribute offsets are therefore computed at probe time (base
  * relative) and the wider 256 KiB window is mapped for the 12th-gen+
  * family. On a 12th-gen box the pre-Chunk-2 module read 0x5000 (unmapped
  * -> 0x0 / 0xFFFF_FFFF) and misreported the channel mode.
@@ -26,27 +26,37 @@
  * TC timing registers live at MCHBAR + 0xE000 (MC0) / + 0x1E000 (MC1;
  * +0x10000 inter-controller stride) — NOT the 0x4000/0x4400 Tier-1
  * mirror window (which returns 0xFFFFFFFF on DDR4) — per the Intel
- * 12th-Gen Datasheet Vol. 2, §3.2.66-3.2.87. They are exposed as a
- * second, nameless sysfs attribute group created only when the CPU is
- * the 12th-gen+ family (the same generation that selects the 256 KiB
- * Tier-3 window): the 10-word TC block per MC (the 64-bit TC_PRE split
- * into lo @ +0x00 / hi @ +0x04; plus TC_ACT/TC_RDRD/TC_RDWR/TC_WRRD/
- * TC_WRWR/TC_ODT/TC_RFP/TC_RFTP) and the 8-word native MCL block per
- * MC at 0xD000/0xD800 (the Tier-3 uncore fallback the userspace
- * reader already reads as mcl0_tc_* / mcl1_tc_*). The 0x4000/0x4400
- * Tier-1 mirror blocks stay for Tier-1 compatibility; the
- * pre-12th-gen surface is the core 25 attributes unchanged.
+ * 12th-Gen Datasheet Vol. 2, §3.2.66-3.2.87. N-01: the Phase 1d / M-1
+ * surface is exposed as TWO nameless sysfs attribute groups with
+ * independent gates (both land their attributes in the kobject root,
+ * next to the core 25): (1) the alk_d4_tc group — the 10-word TC block
+ * per MC (the 64-bit TC_PRE split into lo @ +0x00 / hi @ +0x04; plus
+ * TC_ACT/TC_RDRD/TC_RDWR/TC_WRRD/TC_WRWR/TC_ODT/TC_RFP/TC_RFTP) —
+ * created only on the DDR4 12th-gen+ subset (is_alder_raptor_ddr4:
+ * Alder/Raptor Lake; Meteor/Arrow/Lunar are DDR5-only and have no
+ * DDR4 TC surface); and (2) the tier3_extended group — the 8-word
+ * native MCL block per MC at 0xD000/0xD800 (the Tier-3 uncore fallback
+ * the userspace reader reads as mcl0_tc_* / mcl1_tc_*) plus the M-1
+ * ch2/ch3 TC mirror blocks and mad_dimm_ch2/3 raws — created on the
+ * whole 12th-gen+ family (is_12th_gen_plus; the same generation that
+ * selects the 256 KiB Tier-3 window). The 0x4000/0x4400 Tier-1 mirror
+ * blocks stay for Tier-1 compatibility; the pre-12th-gen surface is
+ * the core 25 attributes unchanged.
  *
  * M-1 (DDR5 4-subchannel surface): the 12th-gen+ DDR5 family splits each
  * legacy memory channel into two subchannels, so the per-channel TC timing
  * mirrors extend to ch2 (0x4800) and ch3 (0x4C00) — the 0x400-stride
  * mirrors of ch0 (0x4000) / ch1 (0x4400) — and the global MAD block gains
- * the mad_dimm_ch2/3 raws (the gen-keyed MAD base + 0x14/+ 0x18, the
- * 4-byte stride of mad_dimm_ch0/1). The userspace reader (intel_sysfs)
- * reads all 18 of these; the pre-M-1 module created none, so they read
- * 0xFFFFFFFF / were absent. They ride in the same gen-gated nameless group
- * as the Phase 1d DDR4 surface (12th-gen+ only); the pre-12th-gen surface
- * stays the core 25 attributes unchanged.
+ * the mad_dimm_ch2/3 raws (the gen-keyed MAD base + 0x60/+ 0x64 — NOT the
+ * +0x0C/+0x10 dimm0/dimm1 stride continued: on 12th-gen+ the 0xD800 page
+ * is shared with the native MCL1 block, whose TC_RFP/TC_RFP2 occupy
+ * +0x14/+0x18; see the N-02 note at mad_offs). The userspace reader
+ * (intel_sysfs) reads all 18 of these; the pre-M-1 module created none, so
+ * they read 0xFFFFFFFF / were absent. N-01: they ride in the
+ * tier3_extended group (is_12th_gen_plus gated) — separate from the
+ * DDR4-only alk_d4_tc group — so the DDR5-only parts (Meteor/Arrow/Lunar)
+ * get the ch2/ch3/mad_dimm surface too; the pre-12th-gen surface stays
+ * the core 25 attributes unchanged.
  *
  * This module performs no decoding: each register attribute is the raw
  * 32-bit value, little-endian, one line, "0x%08x".  The RamSleuth
@@ -250,10 +260,23 @@ static struct pci_dev *host_bridge;
 static struct kobject *ramsleuth_kobj;
 
 /*
- * Chunk 2: the gen-selected IMC base (0x5000 / 0xd800) and the five
+ * Chunk 2: the gen-selected IMC base (0x5000 / 0xd800) and the seven
  * base-relative MAD register offsets, computed at probe time. The
  * RAW_ATTR macro below takes these as runtime expressions (mchbar_mmio +
  * mad_offs.<field>), which is valid C for the sysfs show functions.
+ *
+ * N-02: mad_dimm_ch2/3 sit at +0x60/+0x64, NOT at the dimm0/dimm1
+ * +0x04 stride continued (+0x14/+0x18). On 12th-gen+ the MAD base is
+ * 0xD800 — the SAME page as the native MCL1 block (MCL1_BASE), whose
+ * TC_RFP / TC_RFP2 words occupy +0x14 / +0x18 — so the stride-continued
+ * position is occupied by MCL1 timing registers (a read there returns
+ * the MCL1 words, not the DIMM geometry). The /dev/mem producer
+ * (from_wide_reader in intel_readout.rs) reads MAD_DIMM_CH2/CH3 at the
+ * gen-keyed IMC base + 0x60/+0x64 (MAD_DIMM_CH2_INTRA/CH3_INTRA; the
+ * legacy 0x5060/0x5064 preserved for the 0x5000 pre-12th-gen base);
+ * the two producers MUST agree on the address.
+ *
+ * TODO(C-3): hardware-verify these addresses on a real 12th-gen+ system.
  */
 static u32 imc_base;
 static struct {
@@ -262,8 +285,8 @@ static struct {
 	u32 intra1;	/* MAD_INTRA_CH1     = imc_base + 0x08 */
 	u32 dimm0;	/* MAD_DIMM_CH0      = imc_base + 0x0C */
 	u32 dimm1;	/* MAD_DIMM_CH1      = imc_base + 0x10 */
-	u32 dimm2;	/* MAD_DIMM_CH2      = imc_base + 0x14 */
-	u32 dimm3;	/* MAD_DIMM_CH3      = imc_base + 0x18 */
+	u32 dimm2;	/* MAD_DIMM_CH2      = imc_base + 0x60 (N-02) */
+	u32 dimm3;	/* MAD_DIMM_CH3      = imc_base + 0x64 (N-02) */
 } mad_offs;
 
 /*
@@ -327,8 +350,10 @@ RAW_ATTR(mad_dimm_ch3, mad_offs.dimm3)
  * Phase 1d (Alder Lake DDR4): the per-MC TC blocks (the 64-bit TC_PRE
  * split into lo/hi; the datasheet §3.2.66-3.2.87 offsets) and the
  * native MCL blocks (the userspace mcl0/mcl1 contract names). Raw
- * words only, like the core set; created only on the 12th-gen+ family
- * (see alk_d4_group below).
+ * words only, like the core set. N-01: the 20 DDR4 TC attrs below are
+ * created only on the DDR4 12th-gen+ subset (is_alder_raptor_ddr4; see
+ * alk_d4_tc_group), and the 16 native MCL attrs are created on the
+ * whole 12th-gen+ family (is_12th_gen_plus; see tier3_extended_group).
  *
  * 64-bit TC_PRE split (L-15): TC_PRE is a 64-bit register exposed as two
  * 32-bit attributes (lo/hi).  A torn read is possible only during an
@@ -455,18 +480,29 @@ static struct attribute_group ramsleuth_group = {
 };
 
 /*
- * Phase 1d: the Alder Lake DDR4 attribute group — the two 0xE000/
- * 0x1E000 TC blocks (10 words each) + the two 0xD000/0xD800 native
- * MCL blocks (8 words each) + the M-1 DDR5 4-subchannel surface: the
- * ch2/ch3 TC mirror blocks (8 words each, 0x4800/0x4C00) and the
- * mad_dimm_ch2/3 raws (the gen-keyed MAD block + 0x14/+ 0x18). A nameless
- * group: its attributes land in the kobject root (the same
- * /sys/kernel/ramsleuth_intel/ directory as the core 25). Created only on
- * the 12th-gen+ family (the same generation that selects the 256 KiB
- * Tier-3 window); the pre-12th-gen surface stays the core 25. Removal is
- * implicit: the kobject_put in _exit deletes the whole directory tree.
+ * N-01: the former single alk_d4 group (54 attrs, gated on
+ * is_alder_raptor_ddr4) is split into TWO groups with independent
+ * gates. Both are nameless: their attributes land in the kobject root
+ * (the same /sys/kernel/ramsleuth_intel/ directory as the core 25).
+ * Removal is implicit: the kobject_put in _exit deletes the whole
+ * directory tree.
+ *
+ * (1) alk_d4_tc_group — the 20 DDR4-specific TC attrs (the two
+ * 0xE000/0x1E000 per-MC TC blocks, 10 words each). Gate:
+ * is_alder_raptor_ddr4 (Alder/Raptor Lake only — the DDR4 12th-gen+
+ * subset; these TC registers are not meaningful on DDR5-only parts).
+ *
+ * (2) tier3_extended_group — the 34 DDR5-generic attrs (the two
+ * 0xD000/0xD800 native MCL blocks, 8 words each; the ch2/ch3 TC mirror
+ * blocks, 8 words each at 0x4800/0x4C00; the mad_dimm_ch2/3 raws at
+ * the gen-keyed MAD base + 0x60/+0x64 — N-02). Gate: is_12th_gen_plus
+ * (every 12th-gen+ part needs these: Alder DDR5, Raptor DDR5, Meteor,
+ * Arrow, Lunar). Before the split the WHOLE group was gated on
+ * is_alder_raptor_ddr4, so the DDR5-only parts (Meteor/Arrow/Lunar)
+ * got NONE of the mcl/ch2/ch3/mad_dimm attrs and their channel-2
+ * decode had no data source (permanently all-N/A).
  */
-static struct attribute *alk_d4_attrs[] = {
+static struct attribute *alk_d4_tc_attrs[] = {
 	&dev_attr_alk_d4_mc0_tc_pre_lo.attr,
 	&dev_attr_alk_d4_mc0_tc_pre_hi.attr,
 	&dev_attr_alk_d4_mc0_tc_act.attr,
@@ -487,6 +523,13 @@ static struct attribute *alk_d4_attrs[] = {
 	&dev_attr_alk_d4_mc1_tc_odt.attr,
 	&dev_attr_alk_d4_mc1_tc_rfp.attr,
 	&dev_attr_alk_d4_mc1_tc_rftp.attr,
+	NULL,
+};
+static struct attribute_group alk_d4_tc_group = {
+	.attrs = alk_d4_tc_attrs,
+};
+
+static struct attribute *tier3_extended_attrs[] = {
 	&dev_attr_mcl0_tc_pre.attr,
 	&dev_attr_mcl0_tc_act.attr,
 	&dev_attr_mcl0_tc_act2.attr,
@@ -506,8 +549,8 @@ static struct attribute *alk_d4_attrs[] = {
 	/*
 	 * M-1: the DDR5 4-subchannel mirror blocks (ch2 @ 0x4800 / ch3 @
 	 * 0x4C00, 8 words each) + the mad_dimm_ch2/3 raws (the gen-keyed
-	 * MAD block + 0x14/+ 0x18) — the surface the userspace reader
-	 * reads but the pre-M-1 module never created.
+	 * MAD block + 0x60/+ 0x64 — N-02) — the surface the userspace
+	 * reader reads but the pre-M-1 module never created.
 	 */
 	&dev_attr_ch2_tc_dbp.attr,
 	&dev_attr_ch2_tc_rap.attr,
@@ -529,8 +572,8 @@ static struct attribute *alk_d4_attrs[] = {
 	&dev_attr_mad_dimm_ch3.attr,
 	NULL,
 };
-static struct attribute_group alk_d4_group = {
-	.attrs = alk_d4_attrs,
+static struct attribute_group tier3_extended_group = {
+	.attrs = tier3_extended_attrs,
 };
 
 /*
@@ -566,9 +609,11 @@ static bool is_12th_gen_plus(u32 model)
  * The DDR4 12th-gen+ subset (Alder/Raptor Lake) that exposes the
  * 0xE000/0x1E000 per-MC DDR4 TC blocks.  Meteor / Arrow / Lunar Lake are
  * 12th-gen+ (the 0xD800 MAD base + the 256 KiB window) but DDR5-only —
- * they have no DDR4 TC surface, so the alk_d4 group is created ONLY for
- * this subset (L-12: it was previously created for every is_12th_gen_plus
- * model, exposing misleading DDR4 attrs on DDR5-only parts).
+ * they have no DDR4 TC surface, so the alk_d4_tc group is created ONLY
+ * for this subset (L-12: it was previously created for every
+ * is_12th_gen_plus model, exposing misleading DDR4 attrs on DDR5-only
+ * parts). N-01: this gate no longer controls the DDR5-generic
+ * tier3_extended group (is_12th_gen_plus controls that one).
  */
 static bool is_alder_raptor_ddr4(u32 model)
 {
@@ -579,6 +624,31 @@ static bool is_alder_raptor_ddr4(u32 model)
 	default:
 		return false;
 	}
+}
+
+/*
+ * Create one sysfs attribute group on the module kobject. On failure
+ * unwind the whole probe (the kobject, the ioremap, the retained
+ * host-bridge ref) and return the -E* code so _init bails cleanly.
+ */
+static int create_sysfs_group(struct attribute_group *group,
+			      const char *label)
+{
+	int ret;
+
+	ret = sysfs_create_group(ramsleuth_kobj, group);
+	if (ret) {
+		kobject_put(ramsleuth_kobj);
+		ramsleuth_kobj = NULL;
+		iounmap(mchbar_mmio);
+		mchbar_mmio = NULL;
+		pr_err(DRIVER_NAME
+		       ": failed to create the %s sysfs attributes (%d)\n",
+		       label, ret);
+		pci_dev_put(host_bridge);
+		host_bridge = NULL;
+	}
+	return ret;
 }
 
 static int __init ramsleuth_intel_init(void)
@@ -641,8 +711,10 @@ static int __init ramsleuth_intel_init(void)
 	/*
 	 * Chunk 2: select the IMC base by CPU generation. The effective
 	 * 8-bit model is (ext << 4) | base (the SDM rule, mirroring the
-	 * userspace cpuid.rs). 12th-gen+ -> 0xd800, else 0x5000. The five
-	 * MAD offsets are base-relative (imc_base + 0x00/04/08/0C/10).
+	 * userspace cpuid.rs). 12th-gen+ -> 0xd800, else 0x5000. The
+	 * seven MAD offsets are base-relative (imc_base + 0x00/04/08/
+	 * 0C/10; dimm2/dimm3 at +0x60/+0x64 — N-02: the 0xD800 page is
+	 * shared with MCL1, whose TC_RFP/TC_RFP2 occupy +0x14/+0x18).
 	 */
 	{
 		u32 eax1 = cpuid_eax(1);
@@ -654,8 +726,15 @@ static int __init ramsleuth_intel_init(void)
 	mad_offs.intra1 = imc_base + 0x08;
 	mad_offs.dimm0 = imc_base + 0x0C;
 	mad_offs.dimm1 = imc_base + 0x10;
-	mad_offs.dimm2 = imc_base + 0x14;
-	mad_offs.dimm3 = imc_base + 0x18;
+	/*
+	 * MAD_DIMM_CH2/3 at imc_base+0x60/+0x64.
+	 * NOT at +0x14/+0x18 — those positions are occupied by MCL1_TC_RFP/MCL1_TC_RFP2
+	 * on 12th-gen+ (the 0xD800 page is shared between MAD and MCL1).
+	 * Must match from_wide_reader in intel_readout.rs (the /dev/mem path).
+	 * TODO(C-3): Hardware-verify these addresses on a real 12th-gen+ system.
+	 */
+	mad_offs.dimm2 = imc_base + 0x60;
+	mad_offs.dimm3 = imc_base + 0x64;
 
 	/*
 	 * Window size: 256 KiB for the 12th-gen+ family (the wider
@@ -723,45 +802,37 @@ static int __init ramsleuth_intel_init(void)
 	 * (<<1ms) that produces an honest all-N/A cycle.  The /dev/mem
 	 * fallback does NOT trigger (it requires dir-absent at gate time).
 	 */
-	ret = sysfs_create_group(ramsleuth_kobj, &ramsleuth_group);
-	if (ret) {
-		kobject_put(ramsleuth_kobj);
-		ramsleuth_kobj = NULL;
-		iounmap(mchbar_mmio);
-		mchbar_mmio = NULL;
-		pr_err(DRIVER_NAME
-		       ": failed to create sysfs attributes (%d)\n", ret);
-		pci_dev_put(host_bridge);
-		host_bridge = NULL;
+	ret = create_sysfs_group(&ramsleuth_group, "core");
+	if (ret)
 		return ret;
-	}
 
 	/*
-	 * Phase 1d: the Alder Lake DDR4 surface (the 0xE000/0x1E000 TC
-	 * blocks + the 0xD000/0xD800 MCL blocks) is exposed only on the
-	 * DDR4 12th-gen+ family (Alder/Raptor Lake — is_alder_raptor_ddr4;
-	 * L-12: Meteor/Arrow/Lunar are 12th-gen+ but DDR5-only and have no
-	 * DDR4 TC surface).  On a pre-12th-gen box or a DDR5-only 12th-gen+
-	 * box the surface stays the core 25 (the 0x4000/0x4400 Tier-1
-	 * mirror, kept for Tier-1 compatibility). The nameless group lands
-	 * its attributes in the kobject root.
+	 * N-01: the two extension groups are gated independently. On a
+	 * DDR4 Alder/Raptor box BOTH are created (20 DDR4 TC + 34
+	 * DDR5-generic = 54; the 79-attr surface the userspace reader
+	 * expects). On a DDR5-only 12th-gen+ box (Meteor/Arrow/Lunar)
+	 * only the tier3_extended group (34) — before the split the whole
+	 * surface was gated on is_alder_raptor_ddr4, so those parts got
+	 * none of the mcl/ch2/ch3/mad_dimm attrs and their channel-2
+	 * decode had no data source (permanently all-N/A). On a
+	 * pre-12th-gen box neither (the core 25, the 0x4000/0x4400
+	 * Tier-1 mirror, kept for Tier-1 compatibility). The nameless
+	 * groups land their attributes in the kobject root.
 	 */
 	attr_count = ARRAY_SIZE(ramsleuth_attrs) - 1;
 	if (is_alder_raptor_ddr4(model)) {
-		ret = sysfs_create_group(ramsleuth_kobj, &alk_d4_group);
-		if (ret) {
-			kobject_put(ramsleuth_kobj);
-			ramsleuth_kobj = NULL;
-			iounmap(mchbar_mmio);
-			mchbar_mmio = NULL;
-			pr_err(DRIVER_NAME
-			       ": failed to create the Alder Lake DDR4 sysfs attributes (%d)\n",
-			       ret);
-			pci_dev_put(host_bridge);
-			host_bridge = NULL;
+		ret = create_sysfs_group(&alk_d4_tc_group,
+					 "Alder Lake DDR4 TC");
+		if (ret)
 			return ret;
-		}
-		attr_count += ARRAY_SIZE(alk_d4_attrs) - 1;
+		attr_count += ARRAY_SIZE(alk_d4_tc_attrs) - 1;
+	}
+	if (is_12th_gen_plus(model)) {
+		ret = create_sysfs_group(&tier3_extended_group,
+					 "Tier-3 extended");
+		if (ret)
+			return ret;
+		attr_count += ARRAY_SIZE(tier3_extended_attrs) - 1;
 	}
 
 	pr_info(DRIVER_NAME
