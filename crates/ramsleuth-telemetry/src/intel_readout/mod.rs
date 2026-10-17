@@ -169,43 +169,58 @@
 //! reserved / overflow gates, the gen gate, and bincode round-trips —
 //! all without hardware, root, or I/O.
 //!
-//! # Module layout (step 1 of the directory split)
+//! # Module layout (step 2 of the directory split)
 //!
 //! The frozen type shapes live in [`types`] and the shared sanity
 //! gates / degenerate-word screening helpers in [`gates`] (both are
 //! re-exported at this module root, so every existing
-//! `crate::intel_readout::X` path is unchanged); the register readers,
-//! the field extractors, the pure decode core, and the 4-tier channel
-//! resolution stay in this file.
+//! `crate::intel_readout::X` path is unchanged). The decode paths are
+//! split by generation: [`legacy_ddr4`] (Tier-1 Skylake–Comet Lake),
+//! [`modern_ddr5`] (Tier-3 Alder/Meteor/Arrow DDR5), [`modern_ddr4`]
+//! (Alder Lake DDR4, Phase 1), and [`server_uncore`] (Haswell-E /
+//! Broadwell-E / Skylake-X / Cascade Lake). Channel resolution
+//! (the 4-tier trust procedure, the C-3 aliasing policy) lives in
+//! [`channel`]. The register readers, the shared MCLK / gear / uclk
+//! decoders, and the profile-dispatch [`decode`] entry point stay in
+//! this file.
 
+pub mod channel;
 pub mod gates;
+pub mod legacy_ddr4;
+pub mod modern_ddr4;
+pub mod modern_ddr5;
+pub mod server_uncore;
 pub mod types;
+
+#[cfg(test)]
+pub(crate) mod fixtures;
 
 // Re-export the public type shapes so external `use ...intel_readout::X`
 // paths still work (step 1 of the directory-module split).
 pub use types::*;
 
-// The gate helpers are module-local (`pub(super)` in `gates`); the two
-// degenerate-word screeners keep their crate-visible contract (N-05) at
-// this module root.
-pub(crate) use gates::is_degenerate_word;
+// Re-export the channel resolution helpers so external
+// `use ...intel_readout::resolve_channel` paths still work.
+pub use channel::*;
+
+// Re-export the server-uncore decode so external
+// `use ...intel_readout::decode_server` / `is_server_gen` paths still work.
+pub use server_uncore::*;
+
+// The gate helpers are module-local (`pub(super)` in `gates`); the
+// degenerate-word screeners keep their crate-visible contract (N-05)
+// at this module root.
 pub(crate) use gates::is_present_word;
 
 // Module-local imports for the decode paths and the tests below.
 use gates::*;
 
-use std::collections::HashMap;
-
-use crate::amd_readout::{CadBus, ClockReadout, EccStatus, GearMode, TimingSet, VoltageSet};
+use crate::amd_readout::{EccStatus, GearMode, TimingSet};
 use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
-use crate::intel_gen::{
-    AlderChannelMap, AlderDdr4Fields, ALDER_CHANNELS, ALDER_DDR4_CHANNELS, ALDER_DDR4_FIELDS,
-    ALDER_FIELDS, GearCap, GenMap, profile_for,
-};
+use crate::intel_gen::{ALDER_CHANNELS, GearCap, GenMap, profile_for};
 use crate::intel_mchbar::MchBar;
-use crate::intel_smbios::{DerivedMode, SmbiosTopology};
-use crate::spd_decode::SpdModule;
+use crate::intel_smbios::SmbiosTopology;
 
 // ---------------------------------------------------------------------------
 // Hardware-authoritative Tier-1 register table (MCHBAR-relative offsets).
@@ -504,53 +519,6 @@ impl IntelImcRegs {
             alk_d4_tc1,
         }
     }
-
-    /// OQ-5's tile-routing probe (IG-28): `true` when **every**
-    /// primary-window register in this set is degenerate — `None`
-    /// (failed / unreadable read) or a present-but-invalid word
-    /// (`0x0` = untrained, `0xFFFF_FFFF` = bus-fault readback — the two
-    /// degenerate encodings Research line 329 uses for the mirror
-    /// window). On Meteor / Arrow Lake this is the runtime signature
-    /// that the physical IMC sits behind the secondary SoC-tile uncore
-    /// range (MCHBAR + 0x180000) the module does not expose (Research
-    /// line 328) — see [`tile_routing_suspected`] and the pre-decode
-    /// probe in [`decode`].
-    pub fn primary_window_degenerate(&self) -> bool {
-        // N-05: the canonical degenerate screen — a slot is degenerate
-        // when it is absent (`None`) OR a present-but-invalid word
-        // (`0x0` / `0xFFFF_FFFF`), i.e. the negation of
-        // [`is_present_word`].
-        let degenerate = |v: &Option<u32>| !is_present_word(*v);
-        let channel_all = |c: &ChannelRegs| {
-            [&c.tc_dbp,
-                &c.tc_rap,
-                &c.tc_rfp,
-                &c.tc_rap2,
-                &c.tc_rdrd,
-                &c.tc_rdwr,
-                &c.tc_wrrd,
-                &c.tc_wrwr]
-                .iter()
-                .all(|v| degenerate(v))
-        };
-        let mcl_all = |m: &MclRegs| {
-            [&m.tc_pre,
-                &m.tc_act,
-                &m.tc_act2,
-                &m.tc_wtr,
-                &m.tc_rfp,
-                &m.tc_rfp2,
-                &m.tc_rdrd,
-                &m.tc_wrwr]
-                .iter()
-                .all(|v| degenerate(v))
-        };
-        [&self.mcbios_req, &self.mad_dimm_ch2, &self.mad_dimm_ch3]
-            .iter()
-            .all(|v| degenerate(v))
-            && [&self.ch0, &self.ch1, &self.ch2, &self.ch3].iter().all(|c| channel_all(c))
-            && [&self.mcl0, &self.mcl1].iter().all(|m| mcl_all(m))
-    }
 }
 
 /// Read one channel's eight raw registers through `read` into `regs`
@@ -748,315 +716,8 @@ pub fn channel_count(gen: IntelGen) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Pure bit-field decoders (the frozen Tier-1 decode contract; unit-tested
-// with synthetic register values — no I/O, no unsafe).
+// Shared MCLK / gear / uclk decoders (used by all three decode paths).
 // ---------------------------------------------------------------------------
-
-/// Extract the bit field `[hi:lo]` of `raw` as a `u16`.
-///
-/// Every frozen field is ≤ 12 bits wide, so the masked value converts
-/// losslessly; the `unwrap_or` fallback is an unreachable no-panic guard.
-fn field16(raw: u32, hi: u32, lo: u32) -> u16 {
-    let mask = (1u32 << (hi - lo + 1)) - 1;
-    u16::try_from((raw >> lo) & mask).unwrap_or(u16::MAX)
-}
-
-/// tCL — `TC_DBP` bits 5:0 (6-bit, integer DRAM clock cycles).
-pub fn tc_dbp_cl(reg: u32) -> u16 {
-    field16(reg, 5, 0)
-}
-
-/// tCWL — `TC_DBP` bits 13:8 (6-bit).
-pub fn tc_dbp_cwl(reg: u32) -> u16 {
-    field16(reg, 13, 8)
-}
-
-/// tRCD — `TC_DBP` bits 21:16 (6-bit). Intel enforces a *unified,
-/// symmetric* tRCD: the same value feeds both the `rcdrd` and `rcwdwr`
-/// display slots.
-pub fn tc_dbp_trcd(reg: u32) -> u16 {
-    field16(reg, 21, 16)
-}
-
-/// tRP — `TC_DBP` bits 29:24 (6-bit).
-pub fn tc_dbp_trp(reg: u32) -> u16 {
-    field16(reg, 29, 24)
-}
-
-/// tRRD_S — `TC_RAP` bits 5:0 (6-bit).
-pub fn tc_rap_rrds(reg: u32) -> u16 {
-    field16(reg, 5, 0)
-}
-
-/// tRTP — `TC_RAP` bits 11:6 (6-bit).
-pub fn tc_rap_rtp(reg: u32) -> u16 {
-    field16(reg, 11, 6)
-}
-
-/// tCKE — `TC_RAP` bits 15:12. **4-bit** (range 1–15; do not assume
-/// 6-bit). Decoded by the core but has no frozen display slot (not
-/// shown; the raw value stays available via the sysfs attributes).
-pub fn tc_rap_tcke(reg: u32) -> u16 {
-    field16(reg, 15, 12)
-}
-
-/// tFAW — `TC_RAP` bits 23:16 (8-bit).
-pub fn tc_rap_faw(reg: u32) -> u16 {
-    field16(reg, 23, 16)
-}
-
-/// tRAS — `TC_RAP` bits 31:24 (8-bit).
-pub fn tc_rap_tras(reg: u32) -> u16 {
-    field16(reg, 31, 24)
-}
-
-/// tRFC — `TC_RFP` bits 10:0 (11-bit, 1–2047).
-pub fn tc_rfp_rfc1(reg: u32) -> u16 {
-    field16(reg, 10, 0)
-}
-
-/// tREFI — `TC_RFP` bits 27:16 (12-bit). Decoded by the core but has no
-/// frozen display slot (not shown; the raw value stays available via
-/// the sysfs attributes).
-pub fn tc_rfp_refi(reg: u32) -> u16 {
-    field16(reg, 27, 16)
-}
-
-/// tRRD_L — `TC_RAP2` bits 5:0 (6-bit).
-pub fn tc_rap2_rrld(reg: u32) -> u16 {
-    field16(reg, 5, 0)
-}
-
-/// tWR — `TC_RAP2` bits 13:8 (6-bit).
-pub fn tc_rap2_wr(reg: u32) -> u16 {
-    field16(reg, 13, 8)
-}
-
-// ---------------------------------------------------------------------------
-// Tier-3 (Alder/Raptor Lake, DDR5) bitfield decoders — the widened
-// `ALDER_FIELDS` ranges transcribed verbatim from the Research Alder/Raptor
-// table (lines 111–132, IG-20). The table's bit ranges apply to
-// Controller 0 / Subchannel 0 (and Controller 1 / Subchannel 2) and are
-// reused per subchannel (Research line 107).
-// ---------------------------------------------------------------------------
-
-/// tCL — `TC_ACT` bits [23:16] (**8-bit**, widened to accommodate the DDR5
-/// CL40–CL56 latencies; Research line 111).
-pub fn tc_act_tcl(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.tcl.0, ALDER_FIELDS.tcl.1)
-}
-
-/// tFAW — `TC_ACT` bits [7:0] (8-bit; Research line 116).
-pub fn tc_act_tfaw(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.tfaw.0, ALDER_FIELDS.tfaw.1)
-}
-
-/// tRRD_S — `TC_ACT` bits [11:8] (4-bit; Research line 117).
-pub fn tc_act_trrd_s(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.trrd_s.0, ALDER_FIELDS.trrd_s.1)
-}
-
-/// tRRD_L — `TC_ACT` bits [15:12] (4-bit; Research line 118).
-pub fn tc_act_trrd_l(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.trrd_l.0, ALDER_FIELDS.trrd_l.1)
-}
-
-/// tPPD — `TC_ACT2` bits [3:0] (4-bit, DDR5-specific; Research line
-/// 125). Decoded by the core but has **no frozen display slot** (not
-/// shown; the raw value stays available via the sysfs attributes).
-pub fn tc_act2_tppd(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.tppd.0, ALDER_FIELDS.tppd.1)
-}
-
-/// tRCD — `TC_PRE` bits [14:8] (**7-bit**, widened; Research line 112).
-/// Intel enforces a *unified, symmetric* tRCD (as in Tier 1): the same
-/// value feeds both the `rcdrd` and `rcwdwr` display slots.
-pub fn tc_pre_trcd(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.trcd.0, ALDER_FIELDS.trcd.1)
-}
-
-/// tRP — `TC_PRE` bits [6:0] (**7-bit**, widened for the DDR5 precharge
-/// cycle requirements; Research line 113).
-pub fn tc_pre_trp(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.trp.0, ALDER_FIELDS.trp.1)
-}
-
-/// tRAS — `TC_PRE` bits [23:16] (**8-bit**, widened for the DDR5 row
-/// active constraints; Research line 114).
-pub fn tc_pre_tras(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.tras.0, ALDER_FIELDS.tras.1)
-}
-
-/// tCWL — `TC_PRE` bits [30:24] (7-bit; Research line 115).
-pub fn tc_pre_tcwl(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.tcwl.0, ALDER_FIELDS.tcwl.1)
-}
-
-/// tWTR_S — `TC_WTR` bits [6:0] (**7-bit**, widened; Research line 119).
-pub fn tc_wtr_twtr_s(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.twtr_s.0, ALDER_FIELDS.twtr_s.1)
-}
-
-/// tWTR_L — `TC_WTR` bits [14:8] (**7-bit**, widened; Research line 120).
-pub fn tc_wtr_twtr_l(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.twtr_l.0, ALDER_FIELDS.twtr_l.1)
-}
-
-/// tWR — `TC_WTR` bits [23:16] (**8-bit**, widened to absorb the on-die
-/// ECC write recovery penalties; Research line 121).
-pub fn tc_wtr_twr(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.twr.0, ALDER_FIELDS.twr.1)
-}
-
-/// tRTP — `TC_WTR` bits [30:24] (7-bit; Research line 122).
-pub fn tc_wtr_trtp(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.trtp.0, ALDER_FIELDS.trtp.1)
-}
-
-/// tRFC1 — `TC_RFP` bits [11:0] (**12-bit**, widened for the
-/// high-density DRAM refresh cycles; Research line 123).
-pub fn tc_rfp_trfc1(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.trfc1.0, ALDER_FIELDS.trfc1.1)
-}
-
-/// tRFCsb — `TC_RFP2` bits [10:0] (11-bit, **DDR5-specific** same-bank
-/// refresh; Research line 124). Feeds the `rfcsb` display slot
-/// (populated on Tier 3, unlike Tier 1).
-pub fn tc_rfp2_trfcsb(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.trfcsb.0, ALDER_FIELDS.trfcsb.1)
-}
-
-/// tWRWR_sg — `TC_WRWR` bits [5:0] (6-bit; Research line 131). Only the
-/// two documented Alder entries (sg / dg) are decoded — the Tier-1
-/// _dr/_dd rows are not extrapolated (IG-20).
-pub fn tc_wrwr_s(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.twrwr_sg.0, ALDER_FIELDS.twrwr_sg.1)
-}
-
-/// tWRWR_dg — `TC_WRWR` bits [11:6] (6-bit; Research line 132).
-pub fn tc_wrwr_d(reg: u32) -> u16 {
-    field16(reg, ALDER_FIELDS.twrwr_dg.0, ALDER_FIELDS.twrwr_dg.1)
-}
-
-/// The 4×6-bit turnaround quartet of one `TC_*` register:
-/// `(sg, dg, dr, dd)` — same channel / same bank group / different rank
-/// / different channel, per the frozen `TC_RDRD` / `TC_RDWR` / `TC_WRRD`
-/// / `TC_WRWR` layout (bits 5:0 / 11:6 / 17:12 / 23:18).
-pub fn turnaround_quartet(reg: u32) -> [u16; 4] {
-    [
-        field16(reg, 5, 0),
-        field16(reg, 11, 6),
-        field16(reg, 17, 12),
-        field16(reg, 23, 18),
-    ]
-}
-
-// ---------------------------------------------------------------------------
-// Phase 1 (Intel MC fix): the Alder Lake **DDR4** bitfield decoders — the
-// `ALDER_DDR4_FIELDS` ranges (Intel 12th Gen Datasheet Vol 2
-// §3.2.66–3.2.87). `TC_PRE` is a 64-bit register read as a low word
-// (`+0x00`) and a high word (`+0x04`): a field's datasheet `[hi:lo]`
-// position maps to the high word at `[hi-32 : lo-32]` when `lo >= 32`,
-// else to the low word at `[hi:lo]`. Every other register is a plain
-// 32-bit word. The 18-bit `tREFI` (`TC_RFTP [17:0]`) exceeds the `u16`
-// `field16` contract and has no frozen display slot, so it is not decoded
-// here (the raw word stays available via the sysfs attributes).
-//
-// N-09: every extractor here takes the field table as a parameter
-// (`&AlderDdr4Fields`; the live caller passes `&ALDER_DDR4_FIELDS`), so a
-// future DDR4 generation is a data change in `intel_gen.rs`, not a code
-// change in this module.
-// ---------------------------------------------------------------------------
-
-/// tRCD — `TC_PRE` 64-bit [58:51] = high word [26:19].
-pub fn alk_d4_pre_trcd(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.trcd.0 - TC_PRE_HI_WORD_SHIFT, f.trcd.1 - TC_PRE_HI_WORD_SHIFT)
-}
-
-/// tRAS — `TC_PRE` 64-bit [50:42] = high word [18:10].
-pub fn alk_d4_pre_tras(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.tras.0 - TC_PRE_HI_WORD_SHIFT, f.tras.1 - TC_PRE_HI_WORD_SHIFT)
-}
-
-/// tWRPRE — `TC_PRE` 64-bit [41:32] = high word [9:0] (decoded — no
-/// frozen display slot).
-pub fn alk_d4_pre_wrpre(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.twrpre.0 - TC_PRE_HI_WORD_SHIFT, f.twrpre.1 - TC_PRE_HI_WORD_SHIFT)
-}
-
-/// tPPD — `TC_PRE` 64-bit [23:20] (low word; decoded — no display slot).
-pub fn alk_d4_pre_tppd(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.tppd.0, f.tppd.1)
-}
-
-/// tRDPRE — `TC_PRE` 64-bit [19:13] (low word; decoded — no display slot).
-pub fn alk_d4_pre_rdpre(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.trdpre.0, f.trdpre.1)
-}
-
-/// tRP — `TC_PRE` 64-bit [7:0] (low word).
-pub fn alk_d4_pre_trp(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.trp.0, f.trp.1)
-}
-
-/// tRRD_DG — `TC_ACT` [21:15] (the DDR4 long row-to-row delay).
-pub fn alk_d4_act_trrd_dg(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.trrd_dg.0, f.trrd_dg.1)
-}
-
-/// tRRD_SG — `TC_ACT` [14:9] (the DDR4 short row-to-row delay).
-pub fn alk_d4_act_trrd_sg(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.trrd_sg.0, f.trrd_sg.1)
-}
-
-/// tFAW — `TC_ACT` [8:0] (9-bit).
-pub fn alk_d4_act_tfaw(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.tfaw.0, f.tfaw.1)
-}
-
-/// tCWL — `TC_ODT` [31:24].
-pub fn alk_d4_odt_tcwl(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.tcwl.0, f.tcwl.1)
-}
-
-/// tCL — `TC_ODT` [22:16].
-pub fn alk_d4_odt_tcl(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.tcl.0, f.tcl.1)
-}
-
-/// tRFC — `TC_RFTP` [30:18] (13-bit).
-pub fn alk_d4_rftp_trfc(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.trfc.0, f.trfc.1)
-}
-
-/// tREFI×9 — `TC_RFP` [31:24] (decoded — no frozen display slot).
-pub fn alk_d4_rfp_trefi9(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.trefi9.0, f.trefi9.1)
-}
-
-/// OREF_RI — `TC_RFP` [7:0] (rank-idle period; decoded — no display slot).
-pub fn alk_d4_rfp_oref_ri(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.oref_ri.0, f.oref_ri.1)
-}
-
-/// The Alder Lake DDR4 turnaround quartet of one `TC_*` register:
-/// `(sg, dg, dr, dd)`, each extracted from its own field-table range
-/// (the DDR4 widths differ per register — 7/8/9-bit — so this is not the
-/// Tier-1 4×6-bit [`turnaround_quartet`]).
-pub fn alk_d4_turnaround(reg: u32, which: WhichAlkD4Turnaround, f: &AlderDdr4Fields) -> [u16; 4] {
-    let (sg, dg, dr, dd) = match which {
-        WhichAlkD4Turnaround::Rdrd => (f.rdrd_sg, f.rdrd_dg, f.rdrd_dr, f.rdrd_dd),
-        WhichAlkD4Turnaround::Rdwr => (f.rdwr_sg, f.rdwr_dg, f.rdwr_dr, f.rdwr_dd),
-        WhichAlkD4Turnaround::Wrrd => (f.wrrd_sg, f.wrrd_dg, f.wrrd_dr, f.wrrd_dd),
-        WhichAlkD4Turnaround::Wrwr => (f.wrwr_sg, f.wrwr_dg, f.wrwr_dr, f.wrwr_dd),
-    };
-    [
-        field16(reg, sg.0, sg.1),
-        field16(reg, dg.0, dg.1),
-        field16(reg, dr.0, dr.1),
-        field16(reg, dd.0, dd.1),
-    ]
-}
 
 /// The `MC_BIOS_REQ` analog DRAM clock (MCLK) in MHz — the ratio
 /// semantics are generation-dependent (the Alder Lake MC_BIOS_REQ
@@ -1082,7 +743,7 @@ pub fn alk_d4_turnaround(reg: u32, which: WhichAlkD4Turnaround, f: &AlderDdr4Fie
 /// unconfigured → `Na(ParseError)`; the GEAR_RATIO bits (17:16,
 /// Rocket+ only) do not affect the MCLK decode — on the Rocket Lake
 /// profile they feed the gear cells via [`mcbios_gear`], not MCLK.
-fn decode_mclk(reg: Option<u32>, gen: IntelGen) -> Section<f64> {
+pub(crate) fn decode_mclk(reg: Option<u32>, gen: IntelGen) -> Section<f64> {
     match reg {
         None => Section::na(NaReason::ParseError(
             "MC_BIOS_REQ: register read failed".to_owned(),
@@ -1198,550 +859,36 @@ pub fn decode_uclk(mclk: f64, gear: &Section<GearMode>) -> Section<f64> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The pure decode core (hardware-authoritative Tier-1 map).
-// ---------------------------------------------------------------------------
-
-/// Decode one Tier-1 channel from its raw registers + the shared DRAM
-/// core clock (the per-channel heart of [`decode`]). Never panics (D5):
-/// every cell is a `Value`, an honest `Na(ParseError)` (a sourced
-/// register failed / a field is untrained), or a structural
-/// `Na(NotApplicable)`.
-fn decode_tier1_channel(index: u8, mclk: Section<f64>, regs: &ChannelRegs) -> IntelChannel {
-    // H-2: Normalize degenerate words to None so the turnaround-quartet
-    // path (which has no per-word degenerate screen) never fabricates
-    // values from a bus-fault readback.
-    let regs = ChannelRegs {
-        tc_dbp: regs.tc_dbp.filter(|&w| !is_degenerate_word(w)),
-        tc_rap: regs.tc_rap.filter(|&w| !is_degenerate_word(w)),
-        tc_rfp: regs.tc_rfp.filter(|&w| !is_degenerate_word(w)),
-        tc_rap2: regs.tc_rap2.filter(|&w| !is_degenerate_word(w)),
-        tc_rdrd: regs.tc_rdrd.filter(|&w| !is_degenerate_word(w)),
-        tc_rdwr: regs.tc_rdwr.filter(|&w| !is_degenerate_word(w)),
-        tc_wrrd: regs.tc_wrrd.filter(|&w| !is_degenerate_word(w)),
-        tc_wrwr: regs.tc_wrwr.filter(|&w| !is_degenerate_word(w)),
+/// The gear + uclk cells shared across channels (the same `MC_BIOS_REQ`
+/// word for every channel): decode once, layer on every channel.
+pub(crate) fn gear_uclk_cells(
+    gear_cap: GearCap,
+    mclk: &Section<f64>,
+    mcbios_req: Option<u32>,
+) -> (Section<GearMode>, Section<f64>) {
+    let gear = mcbios_req.and_then(|raw| mcbios_gear(raw, gear_cap));
+    let gear_mode = match gear {
+        Some(g) => Section::Value(g),
+        None => Section::na(NaReason::ParseError(
+            "MC_BIOS_REQ: gear unavailable (register read failed) or reserved/over-cap encoding"
+                .to_owned(),
+        )),
     };
-
-    // --- timings (integer DRAM clock cycles) ---------------------------
-    // TC_DBP: the unified symmetric tRCD feeds both the rcdrd and the
-    // rcwdwr slot (Intel exposes one tRCD, parity matrix: "Symmetrical
-    // decode").
-    let cl = timing_cell(regs.tc_dbp, "tCL", tc_dbp_cl);
-    let cwl = timing_cell(regs.tc_dbp, "tCWL", tc_dbp_cwl);
-    let trcd = timing_cell(regs.tc_dbp, "tRCD", tc_dbp_trcd);
-    let rcdrd = trcd.clone();
-    let rcwdwr = trcd;
-    let rp = timing_cell(regs.tc_dbp, "tRP", tc_dbp_trp);
-
-    // TC_RAP: tRRD_S / tRTP / tFAW / tRAS (tCKE is decoded — no display
-    // slot).
-    let ras = timing_cell(regs.tc_rap, "tRAS", tc_rap_tras);
-    let rrds = timing_cell(regs.tc_rap, "tRRD_S", tc_rap_rrds);
-    let rtp = timing_cell(regs.tc_rap, "tRTP", tc_rap_rtp);
-    let faw = timing_cell(regs.tc_rap, "tFAW", tc_rap_faw);
-
-    // tRC is synthesized (the JEDEC identity — Intel exposes no tRC
-    // register): `tRAS + tRP` when both decode.
-    let rc = match (ras.value().copied(), rp.value().copied()) {
-        (Some(a), Some(b)) => ticks_section(a.saturating_add(b), "tRC (tRAS + tRP)"),
-        _ => Section::na(NaReason::NotApplicable),
+    let uclk = match (gear, mclk.value().copied()) {
+        (Some(g), Some(m)) => decode_uclk(m, &Section::Value(g)),
+        (None, _) => Section::na(NaReason::ParseError(
+            "uclk = mclk / gear: gear unavailable or reserved encoding".to_owned(),
+        )),
+        (_, None) => Section::na(NaReason::ParseError(
+            "uclk = mclk / gear: mclk unavailable".to_owned(),
+        )),
     };
-
-    // TC_RAP2: tRRD_L / tWR.
-    let rrld = timing_cell(regs.tc_rap2, "tRRD_L", tc_rap2_rrld);
-    let wr = timing_cell(regs.tc_rap2, "tWR", tc_rap2_wr);
-
-    // TC_RFP: tRFC1 (tREFI is decoded — no display slot; the DDR4 client
-    // runs single-tRFC scheduling, so rfc2/rfcsb are not applicable).
-    let rfc1 = timing_cell(regs.tc_rfp, "tRFC", tc_rfp_rfc1);
-
-    // Turnaround quartets (4×6-bit sg / dg / dr / dd per register).
-    let rdrd = regs.tc_rdrd.map(turnaround_quartet);
-    let rdwr = regs.tc_rdwr.map(turnaround_quartet);
-    let wrrd = regs.tc_wrrd.map(turnaround_quartet);
-    let wrwr = regs.tc_wrwr.map(turnaround_quartet);
-    let rdrd_scl = quartet_cell(rdrd, "tRDRD(sg)", 0);
-    let rdrd_sc = quartet_cell(rdrd, "tRDRD(dg)", 1);
-    let rdrd_sd = quartet_cell(rdrd, "tRDRD(dr)", 2);
-    let rdrd_dd = quartet_cell(rdrd, "tRDRD(dd)", 3);
-    // `rdwr` ← TC_RDWR dg (the representative bank-group turnaround;
-    // documented choice).
-    let rdwr = quartet_cell(rdwr, "tRDWR(dg)", 1);
-    // tWTR_S = dg, tWTR_L = sg (research-doc parity matrix); the coarse
-    // `wrrd` slot is superseded by the finer pair.
-    let wtrs = quartet_cell(wrrd, "tWTR_S(dg)", 1);
-    let wtrl = quartet_cell(wrrd, "tWTR_L(sg)", 0);
-
-    // --- clocks: the shared map decodes mclk only; the Rocket Lake
-    // profile layers on gear_mode + uclk (MC_BIOS_REQ[17:16], Breakdown
-    // §3D) in [`decode`] after this call. The AMD-fabric slots have no
-    // IMC analog. N-06: the structural NAs come from the shared
-    // builder.
-    let mut clocks = na_clocks(&NaReason::NotApplicable);
-    clocks.mclk_mhz = mclk;
-
-    let timings = TimingSet {
-        cl,
-        rcwdwr,
-        rcdrd,
-        rp,
-        ras,
-        rc,
-        rrds,
-        rrld,
-        faw,
-        wtrs,
-        wtrl,
-        wr,
-        rfc1,
-        rfc2: Section::na(NaReason::NotApplicable),
-        rfcsb: Section::na(NaReason::NotApplicable),
-        cwl,
-        rtp,
-        rdwr,
-        wrrd: Section::na(NaReason::NotApplicable),
-        rdrd_sd,
-        rdrd_dd,
-        rdrd_scl,
-        rdrd_sc,
-        wrwr_sd: quartet_cell(wrwr, "tWRWR(dr)", 2),
-        wrwr_dd: quartet_cell(wrwr, "tWRWR(dd)", 3),
-        wrwr_scl: quartet_cell(wrwr, "tWRWR(sg)", 0),
-        wrwr_sc: quartet_cell(wrwr, "tWRWR(dg)", 1),
-    };
-
-    // The legacy skeleton's "RTL" was fiction — the real IMC table has
-    // no RTL. CAD bus + voltages: not exposed by the Intel IMC window
-    // (unchanged from the v2.2.1 model). N-06: the structural NAs come
-    // from the shared builders.
-    let rtl = na_rtl(&NaReason::NotApplicable);
-    let cad_bus = na_cad_bus(&NaReason::NotApplicable);
-    let voltages = na_voltages(&NaReason::NotApplicable);
-
-    IntelChannel {
-        index,
-        clocks,
-        timings,
-        cad_bus,
-        voltages,
-        rtl,
-    }
-}
-
-/// Decode one Tier-3 (Alder/Raptor Lake, DDR5) subchannel from its raw
-/// [`MclRegs`] register set + the shared DRAM core clock + the
-/// subchannel's [`AlderChannelMap`] descriptor (the per-subchannel heart
-/// of the Tier-3 decode path, IG-24). Never panics (D5): every cell is a
-/// `Value`, an honest `Na(ParseError)` (a sourced register failed / a
-/// field is untrained), or a structural `Na(NotApplicable)`.
-///
-/// The widened field extracts follow the Research Alder/Raptor table
-/// (lines 111–132, pinned in [`ALDER_FIELDS`]): tCL / tRAS / tWR 8-bit,
-/// tRCD / tRP 7-bit, tRFC1 12-bit, tRFCsb 11-bit → the `rfcsb` slot
-/// (populated on DDR5, unlike Tier 1), tPPD 4-bit (decoded — no display
-/// slot), and the `TC_RDRD` 4×6-bit quartet unchanged. The table's bit
-/// ranges apply to Controller 0 / Subchannel 0 (Research line 107) and
-/// are reused per subchannel — the extraction is map-invariant; the
-/// `map` parameter carries the subchannel's provenance (mirror / MCL
-/// bases) for the IG-25 fallback selection ([`tier3_mcl_for`]).
-///
-/// The same [1, 2048] tick / [1, 5333] MHz sanity gates as Tier 1 apply
-/// to every decoded cell, and the `rc = ras + rp` synthesis is preserved
-/// (Breakdown §6 — Intel exposes no tRC register). The gear cells
-/// (`gear_mode` / `uclk_mhz`) stay `Na(NotApplicable)` here, exactly as
-/// in [`decode_tier1_channel`] — the caller dispatch (IG-26) layers them
-/// on from `MC_BIOS_REQ[17:16]` via [`gear_uclk_cells`] on the
-/// `GearCap::Gear4` Alder profile.
-pub fn decode_tier3_channel(
-    index: u8,
-    mclk: Section<f64>,
-    regs: &MclRegs,
-    map: &AlderChannelMap,
-) -> IntelChannel {
-    // H-2: Normalize degenerate words to None so the turnaround-quartet
-    // path never fabricates values from a bus-fault readback.
-    let regs = MclRegs {
-        tc_pre: regs.tc_pre.filter(|&w| !is_degenerate_word(w)),
-        tc_act: regs.tc_act.filter(|&w| !is_degenerate_word(w)),
-        tc_act2: regs.tc_act2.filter(|&w| !is_degenerate_word(w)),
-        tc_wtr: regs.tc_wtr.filter(|&w| !is_degenerate_word(w)),
-        tc_rfp: regs.tc_rfp.filter(|&w| !is_degenerate_word(w)),
-        tc_rfp2: regs.tc_rfp2.filter(|&w| !is_degenerate_word(w)),
-        tc_rdrd: regs.tc_rdrd.filter(|&w| !is_degenerate_word(w)),
-        tc_wrwr: regs.tc_wrwr.filter(|&w| !is_degenerate_word(w)),
-    };
-
-    // --- timings (integer DRAM clock cycles) ---------------------------
-    // TC_PRE: tRCD (the unified symmetric tRCD feeds both the rcdrd and
-    // the rcwdwr slot, as in Tier 1) / tRP / tRAS / tCWL.
-    let rcdrd = timing_cell(regs.tc_pre, "tRCD", tc_pre_trcd);
-    let rcwdwr = rcdrd.clone();
-    let rp = timing_cell(regs.tc_pre, "tRP", tc_pre_trp);
-    let ras = timing_cell(regs.tc_pre, "tRAS", tc_pre_tras);
-    let cwl = timing_cell(regs.tc_pre, "tCWL", tc_pre_tcwl);
-
-    // TC_ACT: tCL / tFAW / tRRD_S / tRRD_L (widened).
-    let cl = timing_cell(regs.tc_act, "tCL", tc_act_tcl);
-    let faw = timing_cell(regs.tc_act, "tFAW", tc_act_tfaw);
-    let rrds = timing_cell(regs.tc_act, "tRRD_S", tc_act_trrd_s);
-    let rrld = timing_cell(regs.tc_act, "tRRD_L", tc_act_trrd_l);
-
-    // tRC is synthesized (the JEDEC identity — Intel exposes no tRC
-    // register): `tRAS + tRP` when both decode.
-    let rc = match (ras.value().copied(), rp.value().copied()) {
-        (Some(a), Some(b)) => ticks_section(a.saturating_add(b), "tRC (tRAS + tRP)"),
-        _ => Section::na(NaReason::NotApplicable),
-    };
-
-    // TC_WTR: tWTR_S / tWTR_L / tWR / tRTP (widened).
-    let wtrs = timing_cell(regs.tc_wtr, "tWTR_S", tc_wtr_twtr_s);
-    let wtrl = timing_cell(regs.tc_wtr, "tWTR_L", tc_wtr_twtr_l);
-    let wr = timing_cell(regs.tc_wtr, "tWR", tc_wtr_twr);
-    let rtp = timing_cell(regs.tc_wtr, "tRTP", tc_wtr_trtp);
-
-    // TC_RFP: tRFC1 (12-bit; tREFI is decoded — no display slot).
-    // H-4: the 12-bit tRFC1 field can reach 4095 for high-density dies,
-    // exceeding the shared TIMING_MAX_TICKS of 2048.
-    let rfc1 = timing_cell_max(regs.tc_rfp, "tRFC1", tc_rfp_trfc1, TRFC1_MAX_TICKS);
-
-    // TC_RFP2: tRFCsb — the DDR5-specific same-bank refresh feeds the
-    // `rfcsb` display slot (Tier 1 keeps it not-applicable).
-    let rfcsb = timing_cell(regs.tc_rfp2, "tRFCsb", tc_rfp2_trfcsb);
-
-    // TC_RDRD: the unchanged 4×6-bit sg / dg / dr / dd quartet.
-    let rdrd = regs.tc_rdrd.map(turnaround_quartet);
-    let rdrd_scl = quartet_cell(rdrd, "tRDRD(sg)", 0);
-    let rdrd_sc = quartet_cell(rdrd, "tRDRD(dg)", 1);
-    let rdrd_sd = quartet_cell(rdrd, "tRDRD(dr)", 2);
-    let rdrd_dd = quartet_cell(rdrd, "tRDRD(dd)", 3);
-
-    // TC_WRWR: only the two documented Alder entries (sg / dg) — the
-    // Tier-1 _dr/_dd rows are not extrapolated (IG-20).
-    let wrwr_scl = timing_cell(regs.tc_wrwr, "tWRWR(sg)", tc_wrwr_s);
-    let wrwr_sc = timing_cell(regs.tc_wrwr, "tWRWR(dg)", tc_wrwr_d);
-
-    // tPPD (TC_ACT2) is decoded by the core but has no frozen display
-    // slot (DDR5-specific; the raw stays available via sysfs).
-
-    // The extraction is map-invariant (Research line 107: the bit ranges
-    // are reused per subchannel) — `map` carries this subchannel's
-    // provenance (mirror / MCL bases) for the IG-25 fallback selection
-    // ([`tier3_mcl_for`]).
-    let _ = map;
-
-    // --- clocks: the shared map decodes mclk only; the gear cells layer
-    // on in the caller dispatch (as in Tier 1 / Rocket Lake). N-06: the
-    // structural NAs come from the shared builder.
-    let mut clocks = na_clocks(&NaReason::NotApplicable);
-    clocks.mclk_mhz = mclk;
-
-    let timings = TimingSet {
-        cl,
-        rcwdwr,
-        rcdrd,
-        rp,
-        ras,
-        rc,
-        rrds,
-        rrld,
-        faw,
-        wtrs,
-        wtrl,
-        wr,
-        rfc1,
-        rfc2: Section::na(NaReason::NotApplicable),
-        rfcsb,
-        cwl,
-        rtp,
-        rdwr: Section::na(NaReason::NotApplicable),
-        wrrd: Section::na(NaReason::NotApplicable),
-        rdrd_sd,
-        rdrd_dd,
-        rdrd_scl,
-        rdrd_sc,
-        wrwr_sd: Section::na(NaReason::NotApplicable),
-        wrwr_dd: Section::na(NaReason::NotApplicable),
-        wrwr_scl,
-        wrwr_sc,
-    };
-
-    // The legacy skeleton's "RTL" was fiction — the real IMC table has
-    // no RTL. CAD bus + voltages: not exposed by the Intel IMC window
-    // (unchanged from the v2.2.1 model). N-06: the structural NAs come
-    // from the shared builders.
-    let rtl = na_rtl(&NaReason::NotApplicable);
-    let cad_bus = na_cad_bus(&NaReason::NotApplicable);
-    let voltages = na_voltages(&NaReason::NotApplicable);
-
-    IntelChannel {
-        index,
-        clocks,
-        timings,
-        cad_bus,
-        voltages,
-        rtl,
-    }
+    (gear_mode, uclk)
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1 (Intel MC fix): the Alder Lake **DDR4** decode. One 64-bit
-// channel per memory controller (2 MCs, no subchannels) — the TC
-// registers are read from the `0xE000`/`0x1E000` blocks (NOT the legacy
-// `0x4000` mirror window) and decoded through `ALDER_DDR4_FIELDS`.
+// Shared readout builders.
 // ---------------------------------------------------------------------------
-
-/// Decode one Alder Lake DDR4 channel from its raw [`AlderDdr4TcRegs`]
-/// block + the shared DRAM core clock + the DDR4 field table (N-09:
-/// the caller passes `&ALDER_DDR4_FIELDS`, so a future DDR4 generation
-/// is a data change, not a code change) — the per-channel heart of the
-/// DDR4 decode path, Phase 1c. Never panics (D5): every cell is a
-/// `Value`, an honest `Na(ParseError)` (a sourced register failed / a
-/// field is untrained), or a structural `Na(NotApplicable)`.
-///
-/// The 64-bit `TC_PRE` is split: the high word (`+0x04`) sources
-/// tRCD / tRAS / tWRPRE; the low word (`+0x00`) sources tPPD / tRDPRE /
-/// tRP. `tCL` / `tCWL` come from `TC_ODT`; `tFAW` / `tRRD_SG` /
-/// `tRRD_DG` from `TC_ACT`; `tRFC` from `TC_RFTP`. The DDR4 turnaround
-/// quartets (`TC_RDRD` / `TC_RDWR` / `TC_WRRD` / `TC_WRWR`) use the
-/// per-register field-table widths (not the Tier-1 4×6-bit layout).
-/// `tWR` / `tRTP` / `rfc2` / `rfcsb` have no slot in the DDR4
-/// `TC` layout → `Na(NotApplicable)`. The `rc = ras + rp` synthesis and
-/// the [1, 2048] tick gate are preserved (Breakdown §6). The gear cells
-/// layer on in the caller dispatch (as in Tier 1 / Tier 3).
-///
-/// N-03: like the Tier-1 / Tier-3 siblings (H-2), the raw words are
-/// normalized through the canonical degenerate screen at the top — a
-/// bus-fault / untrained word never fabricates a turnaround-quartet
-/// value (the DDR4 quartet path has no per-word screen of its own).
-fn decode_alder_ddr4_channel(
-    index: u8,
-    mclk: Section<f64>,
-    regs: &AlderDdr4TcRegs,
-    fields: &AlderDdr4Fields,
-) -> IntelChannel {
-    // N-03: Screen degenerate words (bus-fault / untrained) — same as
-    // the Tier-1 and Tier-3 siblings (H-2).
-    let regs = AlderDdr4TcRegs {
-        tc_pre_lo: regs.tc_pre_lo.filter(|&w| !is_degenerate_word(w)),
-        tc_pre_hi: regs.tc_pre_hi.filter(|&w| !is_degenerate_word(w)),
-        tc_act: regs.tc_act.filter(|&w| !is_degenerate_word(w)),
-        tc_rdrd: regs.tc_rdrd.filter(|&w| !is_degenerate_word(w)),
-        tc_rdwr: regs.tc_rdwr.filter(|&w| !is_degenerate_word(w)),
-        tc_wrrd: regs.tc_wrrd.filter(|&w| !is_degenerate_word(w)),
-        tc_wrwr: regs.tc_wrwr.filter(|&w| !is_degenerate_word(w)),
-        tc_odt: regs.tc_odt.filter(|&w| !is_degenerate_word(w)),
-        tc_rfp: regs.tc_rfp.filter(|&w| !is_degenerate_word(w)),
-        tc_rftp: regs.tc_rftp.filter(|&w| !is_degenerate_word(w)),
-    };
-
-    // TC_PRE (64-bit): the unified symmetric tRCD feeds both the rcdrd and
-    // the rcwdwr slot; tRAS / tRP (the low word carries tRP).
-    let rcdrd = timing_cell(regs.tc_pre_hi, "tRCD", |w| alk_d4_pre_trcd(w, fields));
-    let rcwdwr = rcdrd.clone();
-    let ras = timing_cell(regs.tc_pre_hi, "tRAS", |w| alk_d4_pre_tras(w, fields));
-    let rp = timing_cell(regs.tc_pre_lo, "tRP", |w| alk_d4_pre_trp(w, fields));
-
-    // TC_ODT: tCL / tCWL.
-    let cl = timing_cell(regs.tc_odt, "tCL", |w| alk_d4_odt_tcl(w, fields));
-    let cwl = timing_cell(regs.tc_odt, "tCWL", |w| alk_d4_odt_tcwl(w, fields));
-
-    // TC_ACT: tRRD_SG (short) / tRRD_DG (long) / tFAW.
-    let rrds = timing_cell(regs.tc_act, "tRRD_SG", |w| alk_d4_act_trrd_sg(w, fields));
-    let rrld = timing_cell(regs.tc_act, "tRRD_DG", |w| alk_d4_act_trrd_dg(w, fields));
-    let faw = timing_cell(regs.tc_act, "tFAW", |w| alk_d4_act_tfaw(w, fields));
-
-    // tRC is synthesized (the JEDEC identity — Intel exposes no tRC
-    // register): `tRAS + tRP` when both decode.
-    let rc = match (ras.value().copied(), rp.value().copied()) {
-        (Some(a), Some(b)) => ticks_section(a.saturating_add(b), "tRC (tRAS + tRP)"),
-        _ => Section::na(NaReason::NotApplicable),
-    };
-
-    // TC_RFTP: tRFC (13-bit).
-    let rfc1 = timing_cell(regs.tc_rftp, "tRFC", |w| alk_d4_rftp_trfc(w, fields));
-
-    // The DDR4 turnaround quartets (per-register widths).
-    let rdrd = regs
-        .tc_rdrd
-        .map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Rdrd, fields));
-    let rdwr = regs
-        .tc_rdwr
-        .map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Rdwr, fields));
-    let wrrd = regs
-        .tc_wrrd
-        .map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Wrrd, fields));
-    let wrwr = regs
-        .tc_wrwr
-        .map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Wrwr, fields));
-    let rdrd_scl = quartet_cell(rdrd, "tRDRD(sg)", 0);
-    let rdrd_sc = quartet_cell(rdrd, "tRDRD(dg)", 1);
-    let rdrd_sd = quartet_cell(rdrd, "tRDRD(dr)", 2);
-    let rdrd_dd = quartet_cell(rdrd, "tRDRD(dd)", 3);
-    // `rdwr` ← TC_RDWR dg (the representative bank-group turnaround).
-    let rdwr = quartet_cell(rdwr, "tRDWR(dg)", 1);
-    // tWTR_S = dg, tWTR_L = sg (research-doc parity matrix).
-    let wtrs = quartet_cell(wrrd, "tWTR_S(dg)", 1);
-    let wtrl = quartet_cell(wrrd, "tWTR_L(sg)", 0);
-    let wrwr_scl = quartet_cell(wrwr, "tWRWR(sg)", 0);
-    let wrwr_sc = quartet_cell(wrwr, "tWRWR(dg)", 1);
-    let wrwr_sd = quartet_cell(wrwr, "tWRWR(dr)", 2);
-    let wrwr_dd = quartet_cell(wrwr, "tWRWR(dd)", 3);
-
-    // --- clocks: the shared map decodes mclk only; the gear cells layer
-    // on in the caller dispatch (GearCap::Gear4 — the Alder profile).
-    // N-06: the structural NAs come from the shared builder. ---
-    let mut clocks = na_clocks(&NaReason::NotApplicable);
-    clocks.mclk_mhz = mclk;
-
-    let timings = TimingSet {
-        cl,
-        rcwdwr,
-        rcdrd,
-        rp,
-        ras,
-        rc,
-        rrds,
-        rrld,
-        faw,
-        wtrs,
-        wtrl,
-        wr: Section::na(NaReason::NotApplicable),
-        rfc1,
-        rfc2: Section::na(NaReason::NotApplicable),
-        rfcsb: Section::na(NaReason::NotApplicable),
-        cwl,
-        rtp: Section::na(NaReason::NotApplicable),
-        rdwr,
-        wrrd: Section::na(NaReason::NotApplicable),
-        rdrd_sd,
-        rdrd_dd,
-        rdrd_scl,
-        rdrd_sc,
-        wrwr_sd,
-        wrwr_dd,
-        wrwr_scl,
-        wrwr_sc,
-    };
-
-    // The legacy skeleton's "RTL" was fiction — the real IMC table has
-    // no RTL. N-06: the structural NAs come from the shared builders.
-    let rtl = na_rtl(&NaReason::NotApplicable);
-    let cad_bus = na_cad_bus(&NaReason::NotApplicable);
-    let voltages = na_voltages(&NaReason::NotApplicable);
-
-    IntelChannel {
-        index,
-        clocks,
-        timings,
-        cad_bus,
-        voltages,
-        rtl,
-    }
-}
-
-/// Decode the full Alder Lake **DDR4** readout (Phase 1c): the two
-/// per-controller channels (`ALDER_DDR4_CHANNELS`) decoded through
-/// [`decode_alder_ddr4_channel`] from the `0xE000`/`0x1E000` TC blocks,
-/// with the gear cells layered on from `MC_BIOS_REQ[17:16]`
-/// (GearCap::Gear4). The channel-mode / tech / trust / annotation /
-/// dimm-count slots carry the 4-tier [`ChannelResolution`] the caller
-/// already computed (shared with the other decode arms).
-fn decode_alder_ddr4(
-    regs: &IntelImcRegs,
-    gen: IntelGen,
-    res: &ChannelResolution,
-) -> IntelReadout {
-    let mclk = decode_mclk(regs.mcbios_req, gen);
-    // The gear cells are shared across channels (the same MC_BIOS_REQ
-    // word): decode once, layer on every channel.
-    let (gear_mode, uclk) = gear_uclk_cells(GearCap::Gear4, &mclk, regs.mcbios_req);
-    let mut channels = Vec::with_capacity(ALDER_DDR4_CHANNELS.len());
-    for i in 0..ALDER_DDR4_CHANNELS.len() {
-        let tc = if i == 0 {
-            &regs.alk_d4_tc0
-        } else {
-            &regs.alk_d4_tc1
-        };
-        let mut channel = decode_alder_ddr4_channel(i as u8, mclk.clone(), tc, &ALDER_DDR4_FIELDS);
-        channel.clocks.gear_mode = gear_mode.clone();
-        channel.clocks.uclk_mhz = uclk.clone();
-        channels.push(channel);
-    }
-    decoded_readout(channels, res, EccStatus::Unknown)
-}
-
-/// The mirror → MCL fallback selector (Research line 329, verbatim
-/// rule): select `mirror_reg` unless `mirror ∈ {0x0, 0xFFFFFFFF}`, in
-/// which case select `mcl_reg` — the research doc's "verify 0xD004 if
-/// 0x4004 returns 0x0 or 0xFFFFFFFF" over the `Option<u32>` raws.
-///
-/// Some mobile / OEM boards disable the legacy mirror window; when a
-/// mirrored register then reads the disabled-mirror default `0x0` or
-/// the uncleared `0xFFFFFFFF`, the corresponding native-MCL register is
-/// selected instead (the research doc's example: 0x4004 → 0xD004).
-///
-/// Containment: a populated non-default mirror wins; a failed mirror
-/// read (`None`) is **not** a disabled mirror → no fallback (`None`);
-/// a disabled mirror with an absent MCL read → `None` (honest
-/// degradation, never a bogus zero).
-pub fn mirror_or_mcl(mirror: Option<u32>, mcl: Option<u32>) -> Option<u32> {
-    match mirror {
-        // A failed read is not a disabled mirror → no fallback.
-        None => None,
-        // H-3: A degenerate mirror word (0x0 / 0xFFFF_FFFF) falls back
-        // to the MCL register, which is *also* screened for degenerates
-        // (a bus-faulted MCL word is not a valid fallback source).
-        Some(w) if is_degenerate_word(w) => {
-            mcl.filter(|&w| !is_degenerate_word(w))
-        }
-        // A populated, non-degenerate mirror wins.
-        Some(v) => Some(v),
-    }
-}
-
-/// The effective Tier-3 [`MclRegs`] for one subchannel: the Research
-/// line 329 mirror → MCL fallback applied per controller (IG-25).
-///
-/// The legacy mirror block is the primary source; where the subchannel's
-/// controller has a documented MCL base (subchannels 0 and 2 — OQ-4),
-/// every mirrored register reading the disabled-mirror default
-/// (`0x0` / `0xFFFFFFFF`) falls back to the corresponding native-MCL
-/// register. Subchannels 1 and 3 carry no MCL base → mirror-only
-/// (their words are taken as-is; a disabled mirror degrades to `None`).
-///
-/// Register pairing is by MCHBAR-relative offset (the mirror is a
-/// legacy alias of the MCL block — the same words, under the Tier-1
-/// `ChannelRegs` names vs. the Alder `MclRegs` names): `+0x00` /
-/// `+0x04` / `+0x08` / `+0x20` / `+0x28` fall back per register; the
-/// MCL-only registers (`+0x10` `TC_WTR`, `+0x14` `TC_RFP`, `+0x18`
-/// `TC_RFP2`) have no word in the Tier-1 layout and ride the MCL block
-/// as-is (mirror-only subchannels: `None`).
-pub fn tier3_mcl_for(index: usize, map: &AlderChannelMap, regs: &IntelImcRegs) -> MclRegs {
-    let mirror = match index {
-        0 => &regs.ch0,
-        1 => &regs.ch1,
-        2 => &regs.ch2,
-        _ => &regs.ch3,
-    };
-    // OQ-4: the fallback applies only where the subchannel's controller
-    // has a documented MCL base (MC0 for subchannel 0, MC1 for
-    // subchannel 2); subchannels 1 and 3 are mirror-only.
-    let mcl: Option<&MclRegs> = match (index, map.mcl_base) {
-        (0, Some(_)) => Some(&regs.mcl0),
-        (2, Some(_)) => Some(&regs.mcl1),
-        _ => None,
-    };
-    MclRegs {
-        tc_pre: mirror_or_mcl(mirror.tc_dbp, mcl.and_then(|m| m.tc_pre)),
-        tc_act: mirror_or_mcl(mirror.tc_rap, mcl.and_then(|m| m.tc_act)),
-        tc_act2: mirror_or_mcl(mirror.tc_rfp, mcl.and_then(|m| m.tc_act2)),
-        tc_wtr: mcl.and_then(|m| m.tc_wtr),
-        tc_rfp: mcl.and_then(|m| m.tc_rfp),
-        tc_rfp2: mcl.and_then(|m| m.tc_rfp2),
-        tc_rdrd: mirror_or_mcl(mirror.tc_rdrd, mcl.and_then(|m| m.tc_rdrd)),
-        tc_wrwr: mirror_or_mcl(mirror.tc_wrrd, mcl.and_then(|m| m.tc_wrwr)),
-    }
-}
 
 /// One all-`Na(UnsupportedHardware)` channel: the degraded shape for a
 /// generation the v1 register map does not cover (plan §3.4 — never
@@ -1788,7 +935,72 @@ fn unsupported_channel(index: u8) -> IntelChannel {
     }
 }
 
-/// The pure decode core over the raw register set (the single decode
+/// An all-Na (terminal / unsupported) readout: the degraded shape for a
+/// generation the decode does not cover, or a fully degenerate primary
+/// window. Carries no channel-mode claim (mode / tech / trust all `None`)
+/// but preserves the resolved SMBIOS population count and a human
+/// annotation (L-2: the all-Na degradation no longer discards the
+/// resolved `dimm_count`).
+fn all_na_readout(
+    channels: Vec<IntelChannel>,
+    dimm_count: u8,
+    annotation: &str,
+) -> IntelReadout {
+    IntelReadout {
+        channels,
+        channel_mode: None,
+        ecc_status: EccStatus::Unknown,
+        memory_tech: None,
+        channel_trust: None,
+        channel_annotation: annotation.to_owned(),
+        dimm_count,
+    }
+}
+
+/// L-7: the structured all-Na readout a server platform gets when the
+/// MMIO [`decode`] / [`read_intel`] path is hit directly (bypassing the
+/// facade's `is_server_gen` routing to [`decode_server`]). Server uncore
+/// has no OS-accessible MC timing registers, so the honest degradation is
+/// the all-`Na(UnsupportedHardware)` shape at the generation's channel
+/// count, with a note pointing at the correct path and the resolved SMBIOS
+/// population preserved (L-2).
+fn server_all_na(gen: IntelGen, dimm_count: u8) -> IntelReadout {
+    let count = channel_count(gen);
+    let mut channels = Vec::with_capacity(usize::from(count));
+    for ch in 0..count {
+        channels.push(unsupported_channel(ch));
+    }
+    all_na_readout(
+        channels,
+        dimm_count,
+        "server platform: use decode_server (SMBIOS+SPD), not MMIO decode",
+    )
+}
+
+/// A decoded readout: the resolved channels + the 4-tier channel
+/// resolution (mode / tech / trust / annotation / dimm count) + the ECC
+/// state.
+pub(crate) fn decoded_readout(
+    channels: Vec<IntelChannel>,
+    res: &ChannelResolution,
+    ecc: EccStatus,
+) -> IntelReadout {
+    IntelReadout {
+        channels,
+        channel_mode: res.mode,
+        ecc_status: ecc,
+        memory_tech: res.tech,
+        channel_trust: res.trust,
+        channel_annotation: res.annotation.clone(),
+        dimm_count: res.dimm_count,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pure decode core (profile dispatch).
+// ---------------------------------------------------------------------------
+
+/// Decode the raw register set over the raw register set (the single decode
 /// implementation for both producers — the sysfs path and the `/dev/mem`
 /// fallback; plan §3.5).
 ///
@@ -1863,15 +1075,15 @@ pub fn decode(
     // MMIO decode. If called directly (bypassing the facade's
     // is_server_gen routing), return a structured all-Na readout — never a
     // decode of the (nonexistent) server MCHBAR window.
-    if is_server_gen(gen) {
+    if server_uncore::is_server_gen(gen) {
         return server_all_na(gen, smbios.populated_count);
     }
     // The 4-tier resolution (computed once; shared by the decoded arms).
     // L-10: all MAD data comes from `regs` (the decode inputs
     // `mad_inter_channel` / `mad_dimm_ch0/1` ride on the register set).
-    let mmio_mode = mmio_channel_mode(regs.mad_dimm_ch0, regs.mad_dimm_ch1);
+    let mmio_mode = channel::mmio_channel_mode(regs.mad_dimm_ch0, regs.mad_dimm_ch1);
     let mmio_tech = regs.mad_inter_channel.map(MemoryTech::from_mad_bits);
-    let res = resolve_channel(mmio_mode, mmio_tech, smbios);
+    let res = channel::resolve_channel(mmio_mode, mmio_tech, smbios);
 
     match profile_for(gen) {
         // Profiled with a live decode path: Tier 1 and Rocket Lake reuse
@@ -1898,7 +1110,7 @@ pub fn decode(
                         continue;
                     }
                 };
-                let mut channel = decode_tier1_channel(i, mclk.clone(), per);
+                let mut channel = legacy_ddr4::decode_tier1_channel(i, mclk.clone(), per);
                 if let Some((gear_mode, uclk)) = &gear_cells {
                     channel.clocks.gear_mode = gear_mode.clone();
                     channel.clocks.uclk_mhz = uclk.clone();
@@ -1990,7 +1202,7 @@ pub fn decode(
                 && !ddr5
                 && matches!(res.tech, Some(MemoryTech::Ddr4))
             {
-                return decode_alder_ddr4(regs, gen, &res);
+                return modern_ddr4::decode_alder_ddr4(regs, gen, &res);
             }
 
             // C-3: apply the aliasing policy so one interpretation of the
@@ -2017,17 +1229,17 @@ pub fn decode(
                 }
                 _ => res.tech,
             };
-            let policy = c3_alias_policy(policy_tech);
+            let policy = channel::c3_alias_policy(policy_tech);
 
             // The effective channel resolution: the Mcl1 (DDR5) policy does
             // not trust the MAD geometry words → recompute from SMBIOS
             // alone; the MadAnnotated (unknown) policy carries the aliasing
             // annotation; the Mad (DDR4) policy keeps `res`.
             match policy {
-                C3AliasPolicy::Mcl1 => {
-                    effective_res = resolve_channel(None, None, smbios);
+                channel::C3AliasPolicy::Mcl1 => {
+                    effective_res = channel::resolve_channel(None, None, smbios);
                 }
-                C3AliasPolicy::MadAnnotated => {
+                channel::C3AliasPolicy::MadAnnotated => {
                     if !effective_res.annotation.is_empty() {
                         effective_res.annotation.push(' ');
                     }
@@ -2035,7 +1247,7 @@ pub fn decode(
                         "[0xD800 page: MAD/MCL1 aliasing — geometry from MAD, timing unavailable]",
                     );
                 }
-                C3AliasPolicy::Mad => {}
+                channel::C3AliasPolicy::Mad => {}
             }
 
             // The effective register set: the Mad (DDR4) policy does not
@@ -2043,7 +1255,7 @@ pub fn decode(
             // them (the non-aliased mirror @ `0x4800` is still used via
             // [`mirror_or_mcl`]).
             let mut effective_regs = regs.clone();
-            if matches!(policy, C3AliasPolicy::Mad) {
+            if matches!(policy, channel::C3AliasPolicy::Mad) {
                 effective_regs.mcl1 = MclRegs::default();
             }
             let subch_indices: &[usize] = if ddr5 {
@@ -2059,8 +1271,8 @@ pub fn decode(
             let mut channels = Vec::with_capacity(subch_indices.len());
             for (pos, &i) in subch_indices.iter().enumerate() {
                 let map = &ALDER_CHANNELS[i];
-                let mcl = tier3_mcl_for(i, map, &effective_regs);
-                let mut channel = decode_tier3_channel(i as u8, mclk.clone(), &mcl, map);
+                let mcl = modern_ddr5::tier3_mcl_for(i, map, &effective_regs);
+                let mut channel = modern_ddr5::decode_tier3_channel(i as u8, mclk.clone(), &mcl, map);
                 channel.clocks.gear_mode = gear_mode.clone();
                 channel.clocks.uclk_mhz = uclk.clone();
                 // M-7: the display index is the channel's position in the
@@ -2089,82 +1301,6 @@ pub fn decode(
             all_na_readout(channels, res.dimm_count, &res.annotation)
         }
     }
-}
-
-// ============================================================================
-// C-3: MAD/MCL1 aliasing policy on 12th-gen+ (the `0xD800` page)
-// ============================================================================
-
-/// The C-3 MAD/MCL1 aliasing policy for 12th-gen+ (the `0xD800` page is
-/// read as both the MAD block and the MCL1 block). Keyed on the resolved
-/// memory technology ([`ChannelResolution::tech`]):
-///
-/// - [`C3AliasPolicy::Mad`] (DDR4) — the `0xD800` page is the MAD block:
-///   trust the MAD words for channel mode/geometry; the MCL1 timing words
-///   (the same page) are **not** decoded.
-/// - [`C3AliasPolicy::Mcl1`] (DDR5) — the `0xD800` page is the MCL1 block:
-///   trust the MCL1 words for timing; the MAD geometry words (the same
-///   page) do **not** drive the channel mode.
-/// - [`C3AliasPolicy::MadAnnotated`] (unknown tech) — trust the MAD words
-///   for geometry (the current behavior) and carry the aliasing
-///   annotation.
-///
-/// This is a **preparation** (no hardware verification yet): it prevents
-/// one interpretation from corrupting the other on 12th-gen+ while
-/// leaving pre-12th-gen (the `0x5000` IMC base, no aliasing) untouched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum C3AliasPolicy {
-    /// The `0xD800` page is the MAD block (DDR4): MAD geometry trusted,
-    /// MCL1 timing words not decoded.
-    Mad,
-    /// The `0xD800` page is the MCL1 block (DDR5): MCL1 timing trusted,
-    /// MAD geometry words do not drive the channel mode.
-    Mcl1,
-    /// The tech is unknown: MAD geometry trusted (the current behavior) and
-    /// the aliasing annotation is carried.
-    MadAnnotated,
-}
-
-/// Select the C-3 aliasing policy from the resolved memory technology.
-fn c3_alias_policy(tech: Option<MemoryTech>) -> C3AliasPolicy {
-    match tech {
-        Some(MemoryTech::Ddr4) => C3AliasPolicy::Mad,
-        Some(MemoryTech::Ddr5) => C3AliasPolicy::Mcl1,
-        _ => C3AliasPolicy::MadAnnotated,
-    }
-}
-
-/// The Rocket Lake gear cells (Breakdown §3D, Gear2 cap): `gear_mode`
-/// from `MC_BIOS_REQ[17:16]` via [`mcbios_gear`] and `uclk = mclk /
-/// gear` via [`decode_uclk`].
-///
-/// Containment mirrors the legacy uclk rule: an absent register, a
-/// reserved, or an over-cap encoding → `Na(ParseError)` gear (and thus
-/// uclk); an absent / out-of-band MCLK → `Na(ParseError)` uclk — never
-/// a bogus clock.
-fn gear_uclk_cells(
-    gear_cap: GearCap,
-    mclk: &Section<f64>,
-    mcbios_req: Option<u32>,
-) -> (Section<GearMode>, Section<f64>) {
-    let gear = mcbios_req.and_then(|raw| mcbios_gear(raw, gear_cap));
-    let gear_mode = match gear {
-        Some(g) => Section::Value(g),
-        None => Section::na(NaReason::ParseError(
-            "MC_BIOS_REQ: gear unavailable (register read failed) or reserved/over-cap encoding"
-                .to_owned(),
-        )),
-    };
-    let uclk = match (gear, mclk.value().copied()) {
-        (Some(g), Some(m)) => decode_uclk(m, &Section::Value(g)),
-        (None, _) => Section::na(NaReason::ParseError(
-            "uclk = mclk / gear: gear unavailable or reserved encoding".to_owned(),
-        )),
-        (_, None) => Section::na(NaReason::ParseError(
-            "uclk = mclk / gear: mclk unavailable".to_owned(),
-        )),
-    };
-    (gear_mode, uclk)
 }
 
 // ---------------------------------------------------------------------------
@@ -2225,7 +1361,7 @@ pub fn read_intel_with(
     // MMIO read — guard here (before any bar read) so a direct call
     // (bypassing the facade's is_server_gen routing) returns a structured
     // all-Na readout instead of reading the (nonexistent) server window.
-    if is_server_gen(gen) {
+    if server_uncore::is_server_gen(gen) {
         return Ok(server_all_na(gen, smbios.populated_count));
     }
     // Chunk 2 / L-10 / N-10: the gen-keyed MAD channel/geometry registers
@@ -2280,670 +1416,15 @@ pub fn read_regs(regs: &IntelImcRegs) -> IntelReadout {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Server-uncore decode (Haswell-E / Broadwell-E / Skylake-X / Cascade Lake):
-// no OS-accessible MC timing registers — the telemetry sources SMBIOS Type 17
-// + the SPD EEPROM, never the MCHBAR MMIO window.
-// ---------------------------------------------------------------------------
-
-/// The true reason a structurally-absent MC-live register field carries on
-/// server uncore (an honest N/A — never a placeholder zero, never a
-/// fabricated value). This is NOT a decode failure: on these platforms the
-/// memory-controller timing registers live in CPU-internal uncore (no PCI
-/// BAR, unreachable via `/dev/mem`) and the SPD EEPROM sits on the MC's
-/// internal I2C bus (not OS-visible), so there is **no OS-accessible source
-/// for the live timing data** — the data simply does not exist anywhere the
-/// OS can read it.
-pub const SERVER_NA_REASON: &str =
-    "server uncore: no OS-accessible timing source (no MC BAR, no SPD EEPROM)";
-
-/// `true` for a generation on the `Server` register-map family (the
-/// server-uncore platforms — Haswell-E / Broadwell-E / Skylake-X / Cascade
-/// Lake). These have no OS-accessible MC timing registers, so the decode
-/// sources SMBIOS + SPD (see [`decode_server`]) and never reads the MCHBAR
-/// MMIO window.
-pub fn is_server_gen(gen: IntelGen) -> bool {
-    matches!(profile_for(gen).map(|p| p.map), Some(GenMap::Server))
-}
-
-/// The channel-group key parsed from an SMBIOS Type 17 locator string
-/// (M-9): the designator that tells one memory channel apart from the next
-/// on a multi-DIMM-per-channel server. Recognizes the common forms — an
-/// explicit `Ch<N>` / `Channel <N>`, and a leading slot letter
-/// (`DIMM_A1` -> `A`, `B2` -> `B`) — and yields `None` when the locator
-/// carries no channel signal (the binding then keeps the legacy ordinal
-/// order rather than re-ordering on a guess).
-fn locator_channel_key(locator: &str) -> Option<String> {
-    let s = locator.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let lower = s.to_ascii_lowercase();
-    // Explicit numeric channel designator ("ch0", "channel 1", "ch 2").
-    for prefix in ["channel ", "ch ", "ch"] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).take(2).collect();
-            if !digits.is_empty() {
-                return Some(format!("ch{digits}"));
-            }
-        }
-    }
-    // A leading slot letter: drop the common non-channel word prefixes
-    // ("dimm", "memory", "module", "slot", "cpu", "channel", "ch") and take
-    // the first alphabetic designator of what remains (e.g. "DIMM_A1" ->
-    // "a1" -> "A").
-    for tok in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
-        if matches!(tok, "dimm" | "memory" | "module" | "slot" | "cpu" | "channel" | "ch") {
-            continue;
-        }
-        if let Some(c) = tok.chars().next() {
-            if c.is_ascii_alphabetic() {
-                return Some(c.to_ascii_uppercase().to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Bind the SPD modules to the decode's output channels by their SMBIOS
-/// channel group (M-9) instead of ordinal position. On a
-/// multi-DIMM-per-channel server the ordinal bind (`channel i <- SPD i`)
-/// mis-assigns: with 2 DIMMs per channel, channel 1 would take the second
-/// DIMM of channel 0. We group the SPD modules by the channel key parsed
-/// from each SMBIOS locator and, for output channel `i`, return the first
-/// module of that channel's group.
-///
-/// All-or-nothing: the grouping only activates when the SPD list aligns
-/// 1:1 with the SMBIOS locators AND every locator yields a channel key;
-/// otherwise `None` (the caller keeps the legacy ordinal bind — never a
-/// partial re-order on an ambiguous signal).
-fn spd_by_channel<'a>(
-    smbios: &'a SmbiosTopology,
-    spd: &'a [SpdModule],
-) -> Option<Vec<Option<&'a SpdModule>>> {
-    if spd.is_empty() || spd.len() != smbios.locators.len() {
-        return None;
-    }
-    let mut groups: Vec<Vec<&SpdModule>> = Vec::new();
-    let mut key_index: HashMap<String, usize> = HashMap::new();
-    for (idx, loc) in smbios.locators.iter().enumerate() {
-        let key = locator_channel_key(loc)?;
-        let g = *key_index.entry(key).or_insert_with(|| {
-            groups.push(Vec::new());
-            groups.len() - 1
-        });
-        groups[g].push(&spd[idx]);
-    }
-    Some(groups.iter().map(|g| g.first().copied()).collect())
-}
-
-/// The server-uncore decode: one [`IntelChannel`] per the generation's
-/// channel count, every cell sourced from real hardware — the SMBIOS Type 17
-/// topology (capacity / technology / population) and the SPD EEPROM (rated
-/// timings / speed) — with the MC-live register fields an honest N/A.
-///
-/// # Mapping (all real data, no fabrication)
-///
-/// - `clocks.mclk_mhz` ← the representative SPD module's rated data rate / 2
-///   (the analog DRAM clock — a DDR4-2400 module → 1200 MHz), falling back to
-///   the SMBIOS Type 17 Configured Memory Speed / 2 when no module carries a
-///   speed (the server-uncore case — the SPD EEPROM is not OS-visible, so the
-///   SMBIOS speed is the only source); `Na(NotApplicable)` when neither
-///   source carries a speed. `uclk_mhz` = `mclk_mhz` (the MC runs at the
-///   DRAM clock); every other clock / gear / command-rate cell is
-///   `Na(NotApplicable)` (no OS-accessible source).
-/// - `timings` — the four SPD-rated core timings (`cl` / `rcdrd` / `rcwdwr` /
-///   `rp` / `ras` + the synthesized `rc = ras + rp`) are `Value`s from the
-///   module's factory profile; every other MC-live timing is `Na` with
-///   [`SERVER_NA_REASON`]. A module with no usable profile degrades all its
-///   timing cells to the same honest reason.
-/// - `cad_bus` / `voltages` / `rtl` → `Na` with [`SERVER_NA_REASON`] (no
-///   OS-accessible source on server uncore — never the generic
-///   "not applicable").
-/// - `channel_mode` / `memory_tech` / `channel_trust` / `dimm_count` ← the
-///   SMBIOS Type 17 topology resolved with **no** MMIO input (the 4-tier
-///   [`resolve_channel`] firmware-verified L2 / L4 states).
-/// - `channel_annotation` ← the honest source note (timings SPD-rated,
-///   topology firmware-verified, the populated/total channel count).
-/// - `ecc_status` ← [`EccStatus::Unknown`] (no OS-accessible ECC source on
-///   server uncore; never fabricated).
-///
-/// # No-panic contract (D5)
-///
-/// Pure: no I/O, no `unsafe`. An empty SPD list degrades the timing / clock
-/// cells to N/A while the SMBIOS topology still carries the readout; a
-/// missing / ambiguous SMBIOS topology degrades the channel mode to the
-/// honest terminal state. Never a panic, never an invented value.
-pub fn decode_server(
-    smbios: &SmbiosTopology,
-    spd: &[SpdModule],
-    gen: IntelGen,
-) -> IntelReadout {
-    let count = channel_count(gen);
-
-    // The representative SPD module: the first one carrying usable rated
-    // data (a speed or a profile timing); `None` when no module is present.
-    let rep = spd.iter().find(|m| {
-        m.speed_mts.value().is_some()
-            || m.profiles
-                .iter()
-                .any(|p| p.cas.value().is_some() || p.trcd.value().is_some())
-    });
-
-    // The analog DRAM clock: the representative SPD module's rated data
-    // rate when present, else the SMBIOS Type 17 Configured Memory Speed
-    // (the server-uncore fallback — the SPD EEPROM is not OS-visible, so the
-    // SMBIOS speed is the only source). DDR: MT/s = MCLK × 2.
-    let mclk = rep
-        .and_then(|m| m.speed_mts.value().copied())
-        .or(smbios.speed_mts)
-        // M-10: gate the derived DRAM clock through the shared sanity
-        // gate — a corrupt SMBIOS speed (e.g. a 0xFFFF 16-bit readback)
-        // divides to an out-of-range MHz and is N/A'd with a proper
-        // reason instead of displayed as real data.
-        .map(|mts| clock_section(f64::from(mts) / 2.0))
-        .unwrap_or(Section::na(NaReason::NotApplicable));
-    let clocks = server_clocks(&mclk);
-
-    // M-9: bind each output channel to the FIRST SPD module of that
-    // channel's SMBIOS locator group (see [`spd_by_channel`]) instead of
-    // the ordinal position — on a multi-DIMM-per-channel server the
-    // ordinal bind would hand channel 1 the second DIMM of channel 0.
-    let by_channel = spd_by_channel(smbios, spd);
-
-    let mut channels = Vec::with_capacity(usize::from(count));
-    for i in 0..count {
-        // Per-channel: the module bound to this channel (by its SMBIOS
-        // channel group, else the representative when the grouping is
-        // unavailable). A matched kit runs every channel at the same
-        // rated timing. No module at all → the all-Na timing set.
-        let module = match &by_channel {
-            Some(groups) => groups.get(i as usize).copied().flatten().or(rep),
-            None => spd.get(i as usize).or(rep),
-        };
-        let timings = match module {
-            Some(m) => server_timings(m),
-            None => server_na_timings(),
-        };
-        channels.push(IntelChannel {
-            index: i,
-            clocks: clocks.clone(),
-            timings,
-            cad_bus: server_na_cad_bus(),
-            voltages: server_na_voltages(),
-            rtl: server_na_u16(),
-        });
-    }
-
-    // The SMBIOS Type 17 topology, resolved with NO MMIO input (the 4-tier
-    // procedure's firmware-verified L2 / L4 states).
-    let res = resolve_channel(None, smbios.memory_type, smbios);
-
-    // M-16: report the populated CHANNEL count (distinct channels with
-    // >=1 DIMM) separately from the raw DIMM count — the old text printed
-    // the DIMM count in the channel slot ("8 of 4 channels populated"),
-    // which is self-contradictory on a multi-DIMM-per-channel server.
-    let populated_channels = match &by_channel {
-        Some(groups) => groups.iter().filter(|m| m.is_some()).count() as u8,
-        None => res.dimm_count.min(count),
-    };
-    let annotation = format!(
-        "Server uncore: no OS-accessible timing source (no MC BAR, no SPD \
-         EEPROM) — timings are SPD-rated (module EEPROM) where visible, \
-         topology is SMBIOS Type 17 ({} of {} channels populated, {} DIMMs)",
-        populated_channels, count, res.dimm_count
-    );
-
-    IntelReadout {
-        channels,
-        channel_mode: res.mode,
-        ecc_status: EccStatus::Unknown,
-        memory_tech: res.tech,
-        channel_trust: res.trust,
-        channel_annotation: annotation,
-        dimm_count: res.dimm_count,
-    }
-}
-
-/// The server-uncore clock cells: `mclk` from the SPD rated data rate (or
-/// the SMBIOS Configured Memory Speed fallback) with `uclk` = `mclk` (the MC
-/// runs at the DRAM clock); every other clock / gear / command-rate cell
-/// `Na(NotApplicable)` (no OS-accessible source).
-fn server_clocks(mclk: &Section<f64>) -> ClockReadout {
-    // N-06: the structural NAs come from the shared builder; the server
-    // decode layers the (data-driven) mclk / uclk on top.
-    let mut clocks = na_clocks(&NaReason::NotApplicable);
-    clocks.mclk_mhz = mclk.clone();
-    clocks.uclk_mhz = mclk.clone();
-    clocks
-}
-
-/// An MC-live timing cell's honest server-uncore N/A ([`SERVER_NA_REASON`]).
-fn server_na_u16() -> Section<u16> {
-    na_rtl(&NaReason::ParseError(SERVER_NA_REASON.to_owned()))
-}
-
-/// The SPD-rated core timings for one module: the four JEDEC core timings
-/// (`cl` / `rcdrd` / `rcwdwr` / `rp` / `ras` + the synthesized `rc`) from the
-/// module's factory profile (profile 1); every other MC-live timing is
-/// [`server_na_u16`]. A module with no usable profile degrades all its
-/// timing cells to the same honest reason.
-fn server_timings(module: &SpdModule) -> TimingSet {
-    let rating = |v: Option<u8>| match v {
-        Some(t) if t > 0 => Section::Value(u16::from(t)),
-        _ => server_na_u16(),
-    };
-    let (cl, trcd, trp, tras) = match module.profiles.first() {
-        Some(p) => (
-            p.cas.value().copied(),
-            p.trcd.value().copied(),
-            p.trp.value().copied(),
-            p.tras.value().copied(),
-        ),
-        None => (None, None, None, None),
-    };
-    // tRC = tRAS + tRP (the JEDEC identity — Intel exposes no tRC register),
-    // when both decode.
-    let rc = match (tras, trp) {
-        (Some(a), Some(r)) if a > 0 && r > 0 => Section::Value(u16::from(a) + u16::from(r)),
-        _ => server_na_u16(),
-    };
-    TimingSet {
-        cl: rating(cl),
-        rcwdwr: rating(trcd),
-        rcdrd: rating(trcd),
-        rp: rating(trp),
-        ras: rating(tras),
-        rc,
-        rrds: server_na_u16(),
-        rrld: server_na_u16(),
-        faw: server_na_u16(),
-        wtrs: server_na_u16(),
-        wtrl: server_na_u16(),
-        wr: server_na_u16(),
-        rfc1: server_na_u16(),
-        rfc2: server_na_u16(),
-        rfcsb: server_na_u16(),
-        cwl: server_na_u16(),
-        rtp: server_na_u16(),
-        rdwr: server_na_u16(),
-        wrrd: server_na_u16(),
-        rdrd_sd: server_na_u16(),
-        rdrd_dd: server_na_u16(),
-        rdrd_scl: server_na_u16(),
-        rdrd_sc: server_na_u16(),
-        wrwr_sd: server_na_u16(),
-        wrwr_dd: server_na_u16(),
-        wrwr_scl: server_na_u16(),
-        wrwr_sc: server_na_u16(),
-    }
-}
-
-/// The server-uncore all-Na timing set (no SPD module present): every cell
-/// the honest server-uncore reason ([`SERVER_NA_REASON`]).
-fn server_na_timings() -> TimingSet {
-    TimingSet {
-        cl: server_na_u16(),
-        rcwdwr: server_na_u16(),
-        rcdrd: server_na_u16(),
-        rp: server_na_u16(),
-        ras: server_na_u16(),
-        rc: server_na_u16(),
-        rrds: server_na_u16(),
-        rrld: server_na_u16(),
-        faw: server_na_u16(),
-        wtrs: server_na_u16(),
-        wtrl: server_na_u16(),
-        wr: server_na_u16(),
-        rfc1: server_na_u16(),
-        rfc2: server_na_u16(),
-        rfcsb: server_na_u16(),
-        cwl: server_na_u16(),
-        rtp: server_na_u16(),
-        rdwr: server_na_u16(),
-        wrrd: server_na_u16(),
-        rdrd_sd: server_na_u16(),
-        rdrd_dd: server_na_u16(),
-        rdrd_scl: server_na_u16(),
-        rdrd_sc: server_na_u16(),
-        wrwr_sd: server_na_u16(),
-        wrwr_dd: server_na_u16(),
-        wrwr_scl: server_na_u16(),
-        wrwr_sc: server_na_u16(),
-    }
-}
-
-/// The server-uncore CAD-bus cells: every field the honest server-uncore
-/// reason ([`SERVER_NA_REASON`]) — the IMC window does not expose drive
-/// strengths and there is no OS-accessible source on these platforms.
-fn server_na_cad_bus() -> CadBus {
-    na_cad_bus(&NaReason::ParseError(SERVER_NA_REASON.to_owned()))
-}
-
-/// The server-uncore voltage cells: every rail the honest server-uncore
-/// reason ([`SERVER_NA_REASON`]) — the IMC window does not expose memory
-/// rails and there is no OS-accessible source on these platforms.
-fn server_na_voltages() -> VoltageSet {
-    na_voltages(&NaReason::ParseError(SERVER_NA_REASON.to_owned()))
-}
-
-impl ChannelMode {
-    /// The full human-readable channel label (the header channel slot).
-    pub fn label(&self) -> &'static str {
-        match self {
-            ChannelMode::DualSymmetric => "Dual-Channel (Symmetric)",
-            ChannelMode::DualFlex => "Dual-Channel (Flex)",
-            ChannelMode::Single => "Single-Channel",
-        }
-    }
-
-    /// Short string for the header "Mode:" slot.
-    pub fn mode_label(&self) -> &'static str {
-        match self {
-            ChannelMode::DualSymmetric => "Interleaved",
-            ChannelMode::DualFlex => "Flex",
-            ChannelMode::Single => "N/A",
-        }
-    }
-
-    /// The display label for a channel mode given the active memory
-    /// technology (the single source both frontends render): a DDR5
-    /// dual-channel configuration is **"Dual-Channel (4x 32-bit
-    /// Subchannels)"** — never "quad-channel" (research: a 128-bit
-    /// aggregate bus is dual-channel; true quad-channel is a 256-bit server
-    /// topology). A DDR4 (or unknown-tech) dual keeps its symmetric / flex
-    /// label.
-    pub fn display_label(&self, tech: Option<MemoryTech>) -> String {
-        match (self, tech) {
-            (ChannelMode::DualSymmetric, Some(MemoryTech::Ddr5))
-            | (ChannelMode::DualFlex, Some(MemoryTech::Ddr5)) => {
-                "Dual-Channel (4x 32-bit Subchannels)".to_owned()
-            }
-            _ => self.label().to_owned(),
-        }
-    }
-}
-
-impl MemoryTech {
-    /// Decode the `DDR_TYPE` field (`MAD_INTER_CHANNEL[2:0]`):
-    /// `000`=DDR4, `001`=DDR3/3L, `010`=LPDDR4, `011`=LPDDR5, `100`=DDR5;
-    /// any other (reserved) encoding → [`MemoryTech::Unknown`].
-    pub fn from_mad_bits(bits: u32) -> MemoryTech {
-        match bits & 0x7 {
-            0 => MemoryTech::Ddr4,
-            1 => MemoryTech::Ddr3,
-            2 => MemoryTech::Lpddr4,
-            3 => MemoryTech::Lpddr5,
-            4 => MemoryTech::Ddr5,
-            _ => MemoryTech::Unknown,
-        }
-    }
-
-    /// Decode a SMBIOS Type 17 memory-type byte (offset `0x12`):
-    /// `0x1A`=DDR4, `0x22`=DDR5; anything else → `None` (no recognized
-    /// technology — the caller keeps `None`).
-    pub fn from_smbios_type(t: u8) -> Option<MemoryTech> {
-        match t {
-            0x1A => Some(MemoryTech::Ddr4),
-            0x22 => Some(MemoryTech::Ddr5),
-            _ => None,
-        }
-    }
-}
-
-/// A channel's reported DIMM capacity (in GiB) from its `MAD_DIMM_CHx`
-/// raw, decoded with the **corrected** bit layout (Chunk 2):
-/// `DIMM_L_SIZE` (slot 0) at bits `[6:0]` + `DIMM_S_SIZE` (slot 1) at bits
-/// `[22:16]`, each a 7-bit index in **0.5 GiB** increments (research:
-/// `Value << 29 bytes` = value × 0.5 GiB). The sum of both slot sizes is
-/// returned; `None` when the raw is absent. A slot index of `0` means
-/// unpopulated.
-///
-/// **Correction:** the pre-Chunk-2 decode used a non-existent 1 GiB layout
-/// (`[5:0] + [21:16]`); the real register encodes 0.5 GiB granularity in
-/// 7-bit fields, so a 16 GiB DIMM is index `32` (`32 × 0.5`), not `16`.
-fn mad_dimm_capacity_gib(mad_dimm_ch: Option<u32>) -> Option<f64> {
-    let r = mad_dimm_ch?;
-    // M-11: Screen bus-fault and zero words — a degenerate MAD_DIMM
-    // word is not a valid capacity reading.
-    if is_degenerate_word(r) {
-        return None;
-    }
-    let dimm_l = (r & 0x7F) as f64; // [6:0]
-    let dimm_s = ((r >> 16) & 0x7F) as f64; // [22:16]
-    Some((dimm_l + dimm_s) * 0.5)
-}
-
-/// Decode the ECC capability from the raw CAPID0_A register (host-bridge
-/// config-space offset 0xE4, read in-kernel by the module): bit 17
-/// (ECC_DIS) set = the platform cannot do ECC (NotCapable); clear = the
-/// controller is ECC-capable but ECC is inactive (CapableButDisabled).
-/// An absent raw (no capid0a attribute / a read failure) yields Unknown.
-///
-/// The decode keys off the register bit, never the CPU vendor string
-/// (the i5-6600T Q170 box is ECC-capable despite being a client CPU).
-pub fn decode_ecc_status(capid0a: Option<u32>) -> EccStatus {
-    match capid0a {
-        None => EccStatus::Unknown,
-        // H-10 / N-05: a degenerate word — the kernel emits
-        // `0xFFFF_FFFF` when the config read fails, and a zero word is
-        // equally suspicious (untrained / cleared) — is NOT a valid
-        // capability assertion (the canonical degenerate screen).
-        Some(v) if is_degenerate_word(v) => EccStatus::Unknown,
-        Some(v) if v & 0x0002_0000 != 0 => EccStatus::NotCapable,
-        Some(_) => EccStatus::CapableButDisabled,
-    }
-}
-
-/// Derive the channel mode from the two per-channel capacities (GiB)
-/// (Chunk 2, the capacity-derived model that replaces the old 2-bit
-/// `MAD_INTER_CHANNEL[1:0]` decode):
-///
-/// - `CH_S == 0` → [`ChannelMode::Single`] (all memory on channel L);
-/// - `CH_S > 0 && CH_S == CH_L` → [`ChannelMode::DualSymmetric`];
-/// - `0 < CH_S < CH_L` → [`ChannelMode::DualFlex`] (Intel Flex Memory).
-///
-/// `None` when the pair is ill-formed (a negative / non-finite value, or
-/// `ch_s > ch_l` — the caller must pass `(smaller, larger)`).
-pub fn channel_mode_from_capacity(ch_s_gib: f64, ch_l_gib: f64) -> Option<ChannelMode> {
-    if !ch_s_gib.is_finite() || !ch_l_gib.is_finite() || ch_s_gib < 0.0 || ch_l_gib < 0.0 {
-        return None;
-    }
-    if ch_s_gib == 0.0 {
-        Some(ChannelMode::Single)
-    } else if ch_s_gib == ch_l_gib {
-        Some(ChannelMode::DualSymmetric)
-    } else if ch_s_gib < ch_l_gib {
-        Some(ChannelMode::DualFlex)
-    } else {
-        None
-    }
-}
-
-/// Compute the MMIO-decoded channel mode from the two `MAD_DIMM_CH0/1`
-/// raws (the capacity-derived model): both sums must be readable and at
-/// least one channel must report capacity — otherwise the MMIO is
-/// "blocked" (`None`), which routes [`resolve_channel`] to the SMBIOS
-/// tiers. `CH_L` / `CH_S` are the larger / smaller of the two channel
-/// sums (there is no `CH_L_SIZE` field in `MAD_INTER_CHANNEL`).
-fn mmio_channel_mode(mad_dimm_ch0: Option<u32>, mad_dimm_ch1: Option<u32>) -> Option<ChannelMode> {
-    let c0 = mad_dimm_capacity_gib(mad_dimm_ch0)?;
-    let c1 = mad_dimm_capacity_gib(mad_dimm_ch1)?;
-    let (ch_l, ch_s) = if c0 >= c1 { (c0, c1) } else { (c1, c0) };
-    if ch_l == 0.0 {
-        return None; // no population evidence -> the MMIO is blocked
-    }
-    channel_mode_from_capacity(ch_s, ch_l)
-}
-
-/// The 12th-gen+ (Alder Lake and later) generation set — the set whose
-/// IMC MAD registers moved to the `0xd800` base (Chunk 1's gen set;
-/// research: key on the CPU generation, NOT the overlapping PCI
-/// Device-ID ranges). The kernel module and this userspace decode must
-/// use the *same* set (plan cross-cutting §7.3 / risk note).
-pub fn is_12th_gen_plus(gen: IntelGen) -> bool {
-    matches!(
-        gen,
-        IntelGen::AlderLake
-            | IntelGen::RaptorLake
-            | IntelGen::MeteorLake
-            | IntelGen::ArrowLake
-            | IntelGen::LunarLake
-            | IntelGen::CoreSeries1Mobile
-    )
-}
-
 /// The MCHBAR-relative IMC base for a generation (Chunk 2): `0xd800` for
 /// the 12th-gen+ set, `0x5000` for everything else (6th–11th gen). The
 /// `/dev/mem` fallback ([`read_intel`]) and the kernel module both key
 /// off this, so the MAD registers are read at the correct location.
 pub fn imc_base_for(gen: IntelGen) -> usize {
-    if is_12th_gen_plus(gen) {
+    if channel::is_12th_gen_plus(gen) {
         0xD800
     } else {
         0x5000
-    }
-}
-
-/// The 4-tier trust procedure (research "Recommended Multi-Tier Decision
-/// Procedure"): reconcile the hardware MMIO decode against the SMBIOS Type
-/// 17 topology.
-///
-/// - **L1** ([`ChannelTrust::VerifiedHardware`]): the MMIO decoded a valid
-///   mode (a dual decode, or a single decode SMBIOS does not contradict) →
-///   the MMIO mode, no annotation. The hardware read is the primary
-///   authority.
-/// - **L3** ([`ChannelTrust::Override`]) — the **safety override** (the
-///   core fix): the MMIO decoded `Single` but SMBIOS confirms ≥ 2
-///   populated DIMMs across channels → report **Dual** (the MMIO read is
-///   marked untrusted — register offset drift / a vendor MRC
-///   customization / a stale field), with an "untrusted-MMIO mismatch"
-///   annotation. This fires even when the module is old/absent, because
-///   the MMIO decode and the SMBIOS cross-check are independent inputs.
-/// - **L2** ([`ChannelTrust::VerifiedFirmware`]): the MMIO is blocked
-///   (`None`) and SMBIOS shows ≥ 2 DIMMs in matched channels (→ Dual) or on
-///   one channel (→ Single), or exactly 1 DIMM (→ Single).
-/// - **L4** ([`ChannelTrust::Heuristic`]): the MMIO is blocked and the
-///   SMBIOS locators are ambiguous (→ a dual heuristic, "unverified").
-/// - **terminal** ([`ChannelTrust::None`]): neither source identified the
-///   topology.
-///
-/// The active memory technology is the MMIO `DDR_TYPE` when present, else
-/// the SMBIOS type. Pure (no I/O) — the facade / `/dev/mem` path supply
-/// the inputs.
-pub fn resolve_channel(
-    mmio: Option<ChannelMode>,
-    mmio_tech: Option<MemoryTech>,
-    smbios: &SmbiosTopology,
-) -> ChannelResolution {
-    let dimm_count = smbios.populated_count;
-    // M-6: MemoryTech::Unknown from a bus-faulted MAD word should not
-    // shadow a valid SMBIOS type. Normalize to None before the .or().
-    let mmio_tech_filtered = mmio_tech.filter(|t| !matches!(t, MemoryTech::Unknown));
-    let tech = mmio_tech_filtered.or(smbios.memory_type);
-
-    // L1 / L3: the MMIO decode is readable (a valid mode).
-    if let Some(mode) = mmio {
-        return match mode {
-            // L1: a dual decode is the hardware authority.
-            ChannelMode::DualSymmetric | ChannelMode::DualFlex => ChannelResolution {
-                mode: Some(mode),
-                tech,
-                trust: Some(ChannelTrust::VerifiedHardware),
-                annotation: String::new(),
-                dimm_count,
-            },
-            // L3 (override) / L1 (verified single).
-            ChannelMode::Single => {
-                if smbios.populated_count >= 2 && smbios.derived_mode == DerivedMode::Dual {
-                    ChannelResolution {
-                        mode: Some(ChannelMode::DualSymmetric),
-                        tech,
-                        trust: Some(ChannelTrust::Override),
-                        annotation: format!(
-                            "[Override: MCHBAR decoded Single-Channel, but SMBIOS Type 17 confirms {dimm_count} DIMMs across Channel A/B. Reporting Dual-Channel]"
-                        ),
-                        dimm_count,
-                    }
-                } else if smbios.populated_count >= 2
-                    && smbios.derived_mode == DerivedMode::Ambiguous
-                {
-                    // M-15: soft annotation fallback — the MMIO decoded
-                    // Single and SMBIOS confirms ≥ 2 DIMMs, but the locators
-                    // carry no channel designation, so the channel count is
-                    // unresolvable from firmware. Keep the MMIO Single
-                    // verdict (soft) and carry the annotation.
-                    ChannelResolution {
-                        mode: Some(ChannelMode::Single),
-                        tech,
-                        trust: Some(ChannelTrust::VerifiedHardware),
-                        annotation: format!(
-                            "MMIO reports single-channel with {dimm_count} DIMMs present — channel designations unresolvable from firmware locators"
-                        ),
-                        dimm_count,
-                    }
-                } else {
-                    ChannelResolution {
-                        mode: Some(ChannelMode::Single),
-                        tech,
-                        trust: Some(ChannelTrust::VerifiedHardware),
-                        annotation: String::new(),
-                        dimm_count,
-                    }
-                }
-            }
-        };
-    }
-
-    // L2 / L4: the MMIO is blocked (no valid decode) — fall to SMBIOS.
-    if smbios.populated_count >= 2 {
-        return match smbios.derived_mode {
-            // L2: matched channels, firmware-verified.
-            DerivedMode::Dual => ChannelResolution {
-                mode: Some(ChannelMode::DualSymmetric),
-                tech,
-                trust: Some(ChannelTrust::VerifiedFirmware),
-                annotation: "[MMIO Inaccessible: topology verified via SMBIOS Type 17]".to_owned(),
-                dimm_count,
-            },
-            // L4: ambiguous locators, dual heuristic.
-            DerivedMode::Ambiguous => ChannelResolution {
-                mode: Some(ChannelMode::DualSymmetric),
-                tech,
-                trust: Some(ChannelTrust::Heuristic),
-                annotation:
-                    "[Heuristic: 2 DIMMs detected on dual-channel processor; socket locators ambiguous]"
-                        .to_owned(),
-                dimm_count,
-            },
-            // L2 single: multiple DIMMs on the same channel.
-            DerivedMode::Single => ChannelResolution {
-                mode: Some(ChannelMode::Single),
-                tech,
-                trust: Some(ChannelTrust::VerifiedFirmware),
-                annotation: "[Single-Channel: multiple DIMMs installed on identical memory channel]"
-                    .to_owned(),
-                dimm_count,
-            },
-        };
-    }
-    if smbios.populated_count == 1 {
-        return ChannelResolution {
-            mode: Some(ChannelMode::Single),
-            tech,
-            trust: Some(ChannelTrust::VerifiedFirmware),
-            annotation: String::new(),
-            dimm_count,
-        };
-    }
-
-    // Terminal: neither MMIO nor SMBIOS identified the topology.
-    ChannelResolution {
-        mode: None,
-        tech,
-        trust: Some(ChannelTrust::None),
-        annotation: "[Error: unable to identify memory topology via MMIO or SMBIOS]".to_owned(),
-        dimm_count,
     }
 }
 
@@ -2964,67 +1445,6 @@ impl IntelReadout {
             label.push_str(" [unverified]");
         }
         Some(label)
-    }
-}
-
-/// An all-Na (terminal / unsupported) readout: the degraded shape for a
-/// generation the decode does not cover, or a fully degenerate primary
-/// window. Carries no channel-mode claim (mode / tech / trust all `None`)
-/// but preserves the resolved SMBIOS population count and a human
-/// annotation (L-2: the all-Na degradation no longer discards the
-/// resolved `dimm_count`).
-fn all_na_readout(
-    channels: Vec<IntelChannel>,
-    dimm_count: u8,
-    annotation: &str,
-) -> IntelReadout {
-    IntelReadout {
-        channels,
-        channel_mode: None,
-        ecc_status: EccStatus::Unknown,
-        memory_tech: None,
-        channel_trust: None,
-        channel_annotation: annotation.to_owned(),
-        dimm_count,
-    }
-}
-
-/// L-7: the structured all-Na readout a server platform gets when the
-/// MMIO [`decode`] / [`read_intel`] path is hit directly (bypassing the
-/// facade's `is_server_gen` routing to [`decode_server`]). Server uncore
-/// has no OS-accessible MC timing registers, so the honest degradation is
-/// the all-`Na(UnsupportedHardware)` shape at the generation's channel
-/// count, with a note pointing at the correct path and the resolved SMBIOS
-/// population preserved (L-2).
-fn server_all_na(gen: IntelGen, dimm_count: u8) -> IntelReadout {
-    let count = channel_count(gen);
-    let mut channels = Vec::with_capacity(usize::from(count));
-    for ch in 0..count {
-        channels.push(unsupported_channel(ch));
-    }
-    all_na_readout(
-        channels,
-        dimm_count,
-        "server platform: use decode_server (SMBIOS+SPD), not MMIO decode",
-    )
-}
-
-/// A decoded readout: the resolved channels + the 4-tier channel
-/// resolution (mode / tech / trust / annotation / dimm count) + the ECC
-/// state.
-fn decoded_readout(
-    channels: Vec<IntelChannel>,
-    res: &ChannelResolution,
-    ecc: EccStatus,
-) -> IntelReadout {
-    IntelReadout {
-        channels,
-        channel_mode: res.mode,
-        ecc_status: ecc,
-        memory_tech: res.tech,
-        channel_trust: res.trust,
-        channel_annotation: res.annotation.clone(),
-        dimm_count: res.dimm_count,
     }
 }
 
@@ -3100,6 +1520,10 @@ pub fn fixture_intel_readout(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Orchestration tests (the CI stand-in for the hardware acceptance).
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     //! Fixture tests — the CI stand-in for the hardware acceptance
@@ -3114,7 +1538,8 @@ mod tests {
     use super::*;
     use crate::cpuid::AmdZen;
     use crate::intel_gen::ALDER_CHANNELS;
-    use crate::spd_decode::SpdProfile;
+    use crate::intel_readout::fixtures::*;
+    use crate::intel_smbios::DerivedMode;
 
     // -----------------------------------------------------------------
     // The §6.1 acceptance fixture (Skylake i5-6600T, ratio 18 @
@@ -3435,28 +1860,14 @@ mod tests {
     /// {Rocket, Alder, Raptor, Meteor, Arrow}: one representative
     /// in-band `MC_BIOS_REQ` word per gen, each decoding to
     /// `ratio × refclk / 2`.
-    ///
-    /// Provenance (OQ-11 working-assumption pattern): **Alder Lake is
-    /// hardware-confirmed** (the real i5-12600KF word 0x79E00124 from
-    /// the reference device). **Rocket / Raptor / Meteor / Arrow Lake
-    /// carry documented representative words only — PENDING hardware
-    /// confirmation** on a real host of each gen. The generalization of
-    /// the half-step formula to the full 11th-gen+ set is therefore
-    /// explicit, not silent; the works-cited are community/forum
-    /// sources, not Intel datasheets (see the Alder Lake MC_BIOS_REQ
-    /// decode research note).
     #[test]
     fn decode_mclk_11th_gen_plus_half_step_is_generation_invariant() {
-        // One in-band representative word per gen. Provenance (OQ-11
-        // working assumption): Alder is hardware-confirmed (the real
-        // 12600KF word); Rocket/Raptor/Meteor/Arrow are documented
-        // representatives PENDING hardware confirmation.
         let cases = [
-            (IntelGen::RocketLake, 0x0000_0120), // ratio 32 @ 100 → 1600 MHz (pending HW)
-            (IntelGen::AlderLake, 0x79E0_0124), // ratio 36 @ 100 → 1800 MHz (CONFIRMED: real 12600KF)
-            (IntelGen::RaptorLake, 0x0001_012C), // ratio 44 @ 100 → 2200 MHz (pending HW)
-            (IntelGen::MeteorLake, 0x0002_0130), // ratio 48 @ 100 → 2400 MHz (pending HW)
-            (IntelGen::ArrowLake, 0x0003_0134), // ratio 52 @ 100 → 2600 MHz (pending HW)
+            (IntelGen::RocketLake, 0x0000_0120),
+            (IntelGen::AlderLake, 0x79E0_0124),
+            (IntelGen::RaptorLake, 0x0001_012C),
+            (IntelGen::MeteorLake, 0x0002_0130),
+            (IntelGen::ArrowLake, 0x0003_0134),
         ];
         for (gen, word) in cases {
             let ratio = f64::from(word & 0xFF);
@@ -3465,7 +1876,7 @@ mod tests {
             } else {
                 REF_CLK_133_MHZ
             };
-            let expected = ratio * refclk / 2.0; // the half-step formula
+            let expected = ratio * refclk / 2.0;
             assert_eq!(
                 decode_mclk(Some(word), gen),
                 Section::Value(expected),
@@ -3479,16 +1890,13 @@ mod tests {
     /// multiplier, no halving) is unchanged across the set {Skylake,
     /// Kaby, Coffee, Comet}: the control proving the 11th-gen+
     /// half-step restructure did not leak into the legacy generations.
-    /// One representative in-band word per gen, each decoding to
-    /// `ratio × refclk`.
     #[test]
     fn decode_mclk_tier1_full_step_is_unchanged() {
-        // One in-band representative word per gen (133.3333 MHz ref).
         let cases = [
-            (IntelGen::Skylake, 0x0000_0012), // ratio 18 @ 133.3333 → 2400 MHz
-            (IntelGen::KabyLake, 0x0000_0012), // ratio 18 @ 133.3333 → 2400 MHz
-            (IntelGen::CoffeeLake, 0x0000_0010), // ratio 16 @ 133.3333 → 2133.33 MHz
-            (IntelGen::CometLake, 0x0000_0010), // ratio 16 @ 133.3333 → 2133.33 MHz
+            (IntelGen::Skylake, 0x0000_0012),
+            (IntelGen::KabyLake, 0x0000_0012),
+            (IntelGen::CoffeeLake, 0x0000_0010),
+            (IntelGen::CometLake, 0x0000_0010),
         ];
         for (gen, word) in cases {
             let ratio = f64::from(word & 0xFF);
@@ -3497,7 +1905,7 @@ mod tests {
             } else {
                 REF_CLK_133_MHZ
             };
-            let expected = ratio * refclk; // the full-step formula (unchanged)
+            let expected = ratio * refclk;
             assert_eq!(
                 decode_mclk(Some(word), gen),
                 Section::Value(expected),
@@ -3543,14 +1951,7 @@ mod tests {
 
     /// Breakdown §4 example A, re-pinned per the Alder Lake
     /// MC_BIOS_REQ decode: DDR4-3200, gear 1 on a 100 MHz base on an
-    /// 11th-gen-and-later IMC (Rocket Lake) — `mcbios_req =
-    /// 0x00000020` (ratio 32 = 3200 / 100, REF_CLK = 100 MHz, bits
-    /// [17:16] = 00b) → gear One; mclk = 32 × 100 / 2 = 1600 MHz;
-    /// uclk = mclk (the 1:1 synchronous clock). The original
-    /// Breakdown word (ratio 16, `0x00000110`) was the
-    /// pre-restructure full-step encoding — on 11th-gen-and-later
-    /// hardware it decodes to 800 MHz / 1600 MT/s, so the DDR4-3200
-    /// configuration carries ratio 32.
+    /// 11th-gen-and-later IMC (Rocket Lake).
     #[test]
     fn breakdown_example_a_gear1_100_mhz_base() {
         let raw = 0x0000_0120;
@@ -3568,13 +1969,7 @@ mod tests {
     }
 
     /// Breakdown §4 example B, re-pinned per the Alder Lake
-    /// MC_BIOS_REQ decode: DDR4-3200, gear 1 on a 133.3333 MHz base on
-    /// an 11th-gen-and-later IMC (Rocket Lake) — `mcbios_req =
-    /// 0x00000018` (ratio 24 = 3200 / 133.3333, REF_CLK = 133.3333
-    /// MHz) → gear One; mclk = 24 × 133.3333 / 2 = 1600 MHz; uclk =
-    /// mclk. The original Breakdown word (ratio 12) is the
-    /// pre-restructure full-step encoding (800 MHz / 1600 MT/s on
-    /// 11th-gen-and-later hardware).
+    /// MC_BIOS_REQ decode: DDR4-3200, gear 1 on a 133.3333 MHz base.
     #[test]
     fn breakdown_example_b_gear1_133_mhz_base() {
         let raw = 0x0000_0018;
@@ -3592,13 +1987,7 @@ mod tests {
     }
 
     /// Breakdown §4 example C, re-pinned per the Alder Lake
-    /// MC_BIOS_REQ decode: DDR5-4800, gear 2 on a 133.3333 MHz base on
-    /// an Alder Lake IMC — `mcbios_req = 0x00010024` (ratio 36 = 4800
-    /// / 133.3333, REF_CLK = 133.3333 MHz, bit 16 = 1b) → gear Two;
-    /// mclk = 36 × 133.3333 / 2 = 2400 MHz; uclk = 2400 / 2 = 1200
-    /// MHz. The original Breakdown word (ratio 18) is the
-    /// pre-restructure full-step encoding (1200 MHz MCLK / 2400 MT/s
-    /// on 12th-gen-and-later hardware).
+    /// MC_BIOS_REQ decode: DDR5-4800, gear 2 on a 133.3333 MHz base.
     #[test]
     fn breakdown_example_c_gear2_133_mhz_base() {
         let raw = 0x0001_0024;
@@ -3616,13 +2005,7 @@ mod tests {
     }
 
     /// Breakdown §4 example D, pinned raw word `mcbios_req =
-    /// 0x0003001E`, re-pinned per the Alder Lake MC_BIOS_REQ decode:
-    /// bits [17:16] = 11b → the bit-16 rule = gear **Two** (not
-    /// Four); ratio 30, REF_CLK = 133.3333 MHz on an Alder Lake IMC →
-    /// mclk = 30 × 133.3333 / 2 = 2000 MHz (data rate 4000 MT/s);
-    /// uclk = mclk / 2 = 1000 MHz. The original Breakdown reading
-    /// (4000 MHz MCLK / 2000 MHz UCLK) was the pre-restructure
-    /// full-step model.
+    /// 0x0003001E`, re-pinned per the Alder Lake MC_BIOS_REQ decode.
     #[test]
     fn breakdown_example_d_gear2_11b_field() {
         let raw = 0x0003_001E;
@@ -3644,13 +2027,7 @@ mod tests {
     }
 
     /// Breakdown §4 example D narrative register settings (DDR5-6000,
-    /// gear 2 on a 100 MHz base), re-pinned per the Alder Lake
-    /// MC_BIOS_REQ decode: `mcbios_req = 0x0003013C` (ratio 60 = 6000
-    /// / 100, REF_CLK = 100 MHz, bits [17:16] = 11b → gear Two) →
-    /// mclk = 60 × 100 / 2 = 3000 MHz; uclk = 3000 / 2 = 1500 MHz.
-    /// The original Breakdown word (`0x0003011E`, ratio 30) is the
-    /// pre-restructure full-step encoding (1500 MHz MCLK on
-    /// 12th-gen-and-later hardware).
+    /// gear 2 on a 100 MHz base).
     #[test]
     fn breakdown_example_d_narrative_100_mhz_base() {
         let raw = 0x0003_013C;
@@ -3667,10 +2044,7 @@ mod tests {
         );
     }
 
-    /// `decode_uclk` containment + the gear-divisor semantics: an `Na`
-    /// gear cell degrades uclk to `Na(ParseError)` (never a bogus
-    /// clock); gears 1/2/4 divide mclk by 1/2/4; the [1, 5333] MHz
-    /// sanity gate bounds the displayed value.
+    /// `decode_uclk` containment + the gear-divisor semantics.
     #[test]
     fn decode_uclk_divides_and_degrades() {
         assert_eq!(
@@ -3694,49 +2068,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // The 4-bit tCKE field (decode-only, no display slot) + the 11-bit
-    // tRFC bound.
+    // The 4-bit tCKE field + the 11-bit tRFC bound.
     // -----------------------------------------------------------------
-
-    /// tCKE is a **4-bit** field (1–15): the acceptance raw
-    /// `0x27180204` carries 0 (untrained in this fixture — not
-    /// displayed, no gate impact), and the 4-bit mask never aliases
-    /// into neighboring fields.
-    #[test]
-    fn tc_rap_tcke_is_a_four_bit_field() {
-        assert_eq!(tc_rap_tcke(0x2718_0204), 0);
-        assert_eq!(tc_rap_tcke(0x0000_8000), 8);
-        // the 8-bit tFAW above it is unaffected by the tCKE mask.
-        assert_eq!(tc_rap_faw(0x2718_0204), 24);
-    }
-
-    /// tRFC is 11-bit: the maximum 2047 decodes (in-band for the [1,
-    /// 2048] tick gate); tREFI is 12-bit (decoded, not displayed).
-    #[test]
-    fn tc_rfp_field_widths() {
-        assert_eq!(tc_rfp_rfc1(0x0000_01A4), 420);
-        assert_eq!(tc_rfp_rfc1(0x0000_07FF), 2047);
-        assert_eq!(tc_rfp_refi(0x0FFF_0000), 4095);
-    }
-
-    // -----------------------------------------------------------------
-    // The turnaround quartet layout (4×6-bit sg / dg / dr / dd).
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn turnaround_quartet_layout() {
-        assert_eq!(
-            turnaround_quartet(0x0048_C286),
-            [6, 10, 12, 18],
-            "sg / dg / dr / dd at bits 5:0 / 11:6 / 17:12 / 23:18"
-        );
-    }
 
     /// IG-22 containment: the Tier-3 extension fields all default
-    /// to `None` (every `ChannelRegs` / `MclRegs` slot absent, both
-    /// `MAD_DIMM_CH2/3` raws `None`) — no Tier-1/2 producer sets
-    /// them, so the existing raw-set comparisons and the all-absent
-    /// degradation stay valid unchanged.
+    /// to `None`.
     #[test]
     fn ig22_extended_fields_default_to_all_none() {
         let regs = IntelImcRegs::default();
@@ -3749,481 +2085,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Tier-3 (Alder/Raptor Lake, DDR5) decode — `decode_tier3_channel`
-    // (IG-24): the widened fields per Research lines 111–132.
+    // The wide `/dev/mem` Tier-3 offset set (IG-25).
     // -----------------------------------------------------------------
-
-    /// The DDR5-4800 Tier-3 fixture raws: `mcbios_req = 0x12` (ratio 18
-    /// @ 133.3333 MHz → 2400 MHz MCLK / 4800 MT/s — the same word as
-    /// the Skylake acceptance test) + the widened DDR5-4800 40-class
-    /// timings (CL40-40-40-77 — a tCL 40 that only the 8-bit `TC_ACT`
-    /// field carries, and a 1200-class tRFC1 that only the 12-bit
-    /// field carries).
-    fn tier3_ddr5_4800_mcl() -> MclRegs {
-        MclRegs {
-            // TC_PRE: tRP 40 [6:0], tRCD 40 [14:8], tRAS 77 [23:16],
-            // tCWL 40 [30:24].
-            tc_pre: Some(0x284D_2828),
-            // TC_ACT: tFAW 16 [7:0], tRRD_S 4 [11:8], tRRD_L 8 [15:12],
-            // tCL 40 [23:16].
-            tc_act: Some(0x0028_8410),
-            // TC_ACT2: tPPD 4 [3:0] (decoded — no display slot).
-            tc_act2: Some(0x4),
-            // TC_WTR: tWTR_S 12 [6:0], tWTR_L 14 [14:8], tWR 40 [23:16],
-            // tRTP 8 [30:24].
-            tc_wtr: Some(0x0828_0E0C),
-            // TC_RFP: tRFC1 1200 [11:0], tREFI 8192 [31:16] (multiplier —
-            // no display slot).
-            tc_rfp: Some(0x2000_04B0),
-            // TC_RFP2: tRFCsb 135 [10:0] (DDR5-specific → the `rfcsb`
-            // slot).
-            tc_rfp2: Some(0x87),
-            // TC_RDRD: the unchanged 4×6-bit sg 6 / dg 10 / dr 12 / dd 18.
-            tc_rdrd: Some(0x0048_C286),
-            // TC_WRWR: only the two documented entries — sg 6 / dg 10.
-            tc_wrwr: Some(0x286),
-        }
-    }
-
-    /// The DDR5-4800 widened decode, pinned end to end: the 40-class
-    /// tCL / tCWL / tRCD / tRP / tWR across the widened fields, tRFC1
-    /// 1200 in the 12-bit field, tRFCsb 135 in the `rfcsb` slot, the
-    /// unchanged `TC_RDRD` quartet, the two documented `TC_WRWR`
-    /// entries (the _dr/_dd rows not-applicable), and `rc = tRAS + tRP
-    /// = 117`.
-    #[test]
-    fn tier3_ddr5_4800_pins_the_widened_40_class_values() {
-        let mcl = tier3_ddr5_4800_mcl();
-        // DDR5-4800 on the 133.3333 MHz ref (the 11th-gen-and-later
-        // half-step encoding): ratio 36 = 4800 / 133.3333 →
-        // 36 × 133.3333 / 2 = 2400 MHz MCLK.
-        let mclk = decode_mclk(Some(0x0000_0024), IntelGen::AlderLake);
-        assert_eq!(mclk, Section::Value(2400.0), "DDR5-4800: 2400 MHz MCLK");
-        let ch = decode_tier3_channel(0, mclk, &mcl, &ALDER_CHANNELS[0]);
-        assert_eq!(ch.index, 0);
-
-        // --- clocks (the shared mclk; the gear cells layer on later) ---
-        assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0));
-        assert_eq!(ch.clocks.uclk_mhz, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch.clocks.fclk_mhz, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch.clocks.div_mode, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch.clocks.gear_mode, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch.clocks.gdm, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch.clocks.pdm, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch.clocks.command_rate, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch.rtl, Section::na(NaReason::NotApplicable));
-
-        // --- the widened DDR5-4800 40-class timings --------------------
-        assert_eq!(ch.timings.cl, Section::Value(40), "tCL 8-bit [23:16]");
-        assert_eq!(ch.timings.cwl, Section::Value(40), "tCWL 7-bit [30:24]");
-        assert_eq!(ch.timings.rcdrd, Section::Value(40), "tRCD 7-bit [14:8]");
-        assert_eq!(
-            ch.timings.rcwdwr,
-            Section::Value(40),
-            "the unified symmetric tRCD feeds both rcdrd and rcwdwr"
-        );
-        assert_eq!(ch.timings.rp, Section::Value(40), "tRP 7-bit [6:0]");
-        assert_eq!(ch.timings.ras, Section::Value(77), "tRAS 8-bit [23:16]");
-        assert_eq!(
-            ch.timings.rc,
-            Section::Value(117),
-            "tRAS + tRP = 77 + 40 (synthesized — Intel exposes no tRC)"
-        );
-        assert_eq!(ch.timings.rrds, Section::Value(4), "tRRD_S 4-bit [11:8]");
-        assert_eq!(ch.timings.rrld, Section::Value(8), "tRRD_L 4-bit [15:12]");
-        assert_eq!(ch.timings.faw, Section::Value(16), "tFAW 8-bit [7:0]");
-        assert_eq!(ch.timings.wtrs, Section::Value(12), "tWTR_S 7-bit [6:0]");
-        assert_eq!(ch.timings.wtrl, Section::Value(14), "tWTR_L 7-bit [14:8]");
-        assert_eq!(ch.timings.wr, Section::Value(40), "tWR 8-bit [23:16]");
-        assert_eq!(ch.timings.rtp, Section::Value(8), "tRTP 7-bit [30:24]");
-        assert_eq!(ch.timings.rfc1, Section::Value(1200), "tRFC1 12-bit [11:0]");
-        assert_eq!(
-            ch.timings.rfcsb,
-            Section::Value(135),
-            "tRFCsb 11-bit [10:0] → the DDR5 `rfcsb` slot"
-        );
-
-        // --- the unchanged TC_RDRD quartet + the two TC_WRWR entries ----
-        assert_eq!(ch.timings.rdrd_scl, Section::Value(6), "sg");
-        assert_eq!(ch.timings.rdrd_sc, Section::Value(10), "dg");
-        assert_eq!(ch.timings.rdrd_sd, Section::Value(12), "dr");
-        assert_eq!(ch.timings.rdrd_dd, Section::Value(18), "dd");
-        assert_eq!(ch.timings.wrwr_scl, Section::Value(6), "sg (documented)");
-        assert_eq!(ch.timings.wrwr_sc, Section::Value(10), "dg (documented)");
-
-        // --- the slots with no Tier-3 source ----------------------------
-        for s in [
-            &ch.timings.rfc2,
-            &ch.timings.rdwr,
-            &ch.timings.wrrd,
-            &ch.timings.wrwr_sd,
-            &ch.timings.wrwr_dd,
-        ] {
-            assert_eq!(*s, Section::na(NaReason::NotApplicable), "{s:?}");
-        }
-
-        // --- CAD bus + voltages: never exposed by the IMC window --------
-        for s in [
-            &ch.cad_bus.proc_odt,
-            &ch.cad_bus.clk_drv,
-            &ch.cad_bus.addr_cmd_drv,
-            &ch.cad_bus.cs_odt_drv,
-            &ch.cad_bus.cke_drv,
-        ] {
-            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
-        }
-        for s in [&ch.cad_bus.rtt_nom, &ch.cad_bus.rtt_wr, &ch.cad_bus.rtt_park] {
-            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
-        }
-        for s in [
-            &ch.voltages.vddcr_soc_mv,
-            &ch.voltages.vddio_mem_mv,
-            &ch.voltages.vdd_misc_mv,
-            &ch.voltages.vpp_mv,
-            &ch.voltages.vcore_mv,
-        ] {
-            assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
-        }
-    }
-
-    /// The all-absent Tier-3 arm: every `MclRegs` register absent (and
-    /// an absent `MC_BIOS_REQ` → `Na` mclk) degrades the whole channel
-    /// to honest `Na` — no panic, no garbage values (D5).
-    #[test]
-    fn tier3_all_absent_degrades_all_na() {
-        let ch = decode_tier3_channel(
-            2,
-            decode_mclk(None, IntelGen::AlderLake),
-            &MclRegs::default(),
-            &ALDER_CHANNELS[2],
-        );
-        assert_eq!(ch.index, 2);
-        assert!(ch.clocks.mclk_mhz.is_na(), "{:?}", ch.clocks.mclk_mhz);
-        assert!(ch.clocks.uclk_mhz.is_na(), "{:?}", ch.clocks.uclk_mhz);
-        assert!(ch.clocks.fclk_mhz.is_na(), "{:?}", ch.clocks.fclk_mhz);
-        assert!(ch.clocks.gdm.is_na(), "{:?}", ch.clocks.gdm);
-        assert!(ch.clocks.pdm.is_na(), "{:?}", ch.clocks.pdm);
-        assert!(ch.clocks.div_mode.is_na(), "{:?}", ch.clocks.div_mode);
-        assert!(ch.clocks.gear_mode.is_na(), "{:?}", ch.clocks.gear_mode);
-        assert!(
-            ch.clocks.command_rate.is_na(),
-            "{:?}",
-            ch.clocks.command_rate
-        );
-        assert_eq!(ch.rtl, Section::na(NaReason::NotApplicable));
-        let cells: [&Section<u16>; 27] = [
-            &ch.timings.cl,
-            &ch.timings.rcwdwr,
-            &ch.timings.rcdrd,
-            &ch.timings.rp,
-            &ch.timings.ras,
-            &ch.timings.rc,
-            &ch.timings.rrds,
-            &ch.timings.rrld,
-            &ch.timings.faw,
-            &ch.timings.wtrs,
-            &ch.timings.wtrl,
-            &ch.timings.wr,
-            &ch.timings.rfc1,
-            &ch.timings.rfc2,
-            &ch.timings.rfcsb,
-            &ch.timings.cwl,
-            &ch.timings.rtp,
-            &ch.timings.rdwr,
-            &ch.timings.wrrd,
-            &ch.timings.rdrd_sd,
-            &ch.timings.rdrd_dd,
-            &ch.timings.rdrd_scl,
-            &ch.timings.rdrd_sc,
-            &ch.timings.wrwr_sd,
-            &ch.timings.wrwr_dd,
-            &ch.timings.wrwr_scl,
-            &ch.timings.wrwr_sc,
-        ];
-        for s in &cells {
-            assert!(s.is_na(), "{s:?}");
-        }
-    }
-
-    /// Per-register containment (Tier 3): only `tc_pre` unreadable →
-    /// only its sourced fields (tRCD / tRP / tRAS / tCWL — and the
-    /// derived `rc`) degrade to `Na(ParseError)`; every other
-    /// register's fields decode untouched.
-    #[test]
-    fn tier3_per_register_containment() {
-        let mut mcl = tier3_ddr5_4800_mcl();
-        mcl.tc_pre = None;
-        let ch = decode_tier3_channel(
-            1,
-            decode_mclk(Some(0x0000_0024), IntelGen::AlderLake),
-            &mcl,
-            &ALDER_CHANNELS[1],
-        );
-        assert_eq!(ch.index, 1);
-        for s in [
-            &ch.timings.rcdrd,
-            &ch.timings.rcwdwr,
-            &ch.timings.rp,
-            &ch.timings.ras,
-            &ch.timings.cwl,
-        ] {
-            assert!(matches!(s, Section::Na(NaReason::ParseError(_))), "{s:?}");
-        }
-        assert_eq!(ch.timings.rc, Section::na(NaReason::NotApplicable));
-        // The other registers' fields decode untouched.
-        assert_eq!(ch.timings.cl, Section::Value(40));
-        assert_eq!(ch.timings.faw, Section::Value(16));
-        assert_eq!(ch.timings.rrds, Section::Value(4));
-        assert_eq!(ch.timings.rrld, Section::Value(8));
-        assert_eq!(ch.timings.wtrs, Section::Value(12));
-        assert_eq!(ch.timings.wtrl, Section::Value(14));
-        assert_eq!(ch.timings.wr, Section::Value(40));
-        assert_eq!(ch.timings.rtp, Section::Value(8));
-        assert_eq!(ch.timings.rfc1, Section::Value(1200));
-        assert_eq!(ch.timings.rfcsb, Section::Value(135));
-        assert_eq!(ch.timings.rdrd_dd, Section::Value(18));
-        assert_eq!(ch.timings.wrwr_sc, Section::Value(10));
-    }
-
-    /// Research line 107: the widened bit ranges apply to Controller 0
-    /// / Subchannel 0 and are reused per subchannel — the same raws
-    /// decode to identical timings under every `ALDER_CHANNELS`
-    /// descriptor (the extraction is map-invariant; only the channel
-    /// index differs).
-    #[test]
-    fn tier3_extraction_is_map_invariant_across_subchannels() {
-        let mcl = tier3_ddr5_4800_mcl();
-        let mclk = decode_mclk(Some(0x0000_0024), IntelGen::AlderLake);
-        let mut decoded = Vec::new();
-        for (i, map) in ALDER_CHANNELS.iter().enumerate() {
-            let ch = decode_tier3_channel(i as u8, mclk.clone(), &mcl, map);
-            assert_eq!(ch.index, i as u8);
-            decoded.push(ch);
-        }
-        let ref_ch0 = decoded[0].clone();
-        for ch in &decoded[1..] {
-            assert_eq!(ch.timings, ref_ch0.timings, "map-invariant extraction");
-            assert_eq!(ch.clocks, ref_ch0.clocks);
-            assert_eq!(ch.cad_bus, ref_ch0.cad_bus);
-            assert_eq!(ch.voltages, ref_ch0.voltages);
-        }
-    }
-
-    /// The widened field widths, pinned at their maxima (the widening
-    /// over the Tier-1 6-bit fields is the point): tCL 8-bit → 255
-    /// (the 40–56 DDR5 class fits), tRCD / tRP / tWTR_S / tWTR_L
-    /// 7-bit → 127, tRFC1 12-bit → 4095, tRFCsb 11-bit → 2047, tPPD
-    /// 4-bit → 15 (decoded, no display slot) — and the masks never
-    /// alias into neighboring fields.
-    #[test]
-    fn tier3_widened_field_widths_at_maximums() {
-        // 8-bit tCL max (a 6-bit mask would truncate to 63).
-        assert_eq!(tc_act_tcl(0x00FF_0000), 255);
-        // 7-bit fields max.
-        assert_eq!(tc_pre_trcd(0x0000_7F00), 127);
-        assert_eq!(tc_pre_trp(0x7F), 127);
-        assert_eq!(tc_wtr_twtr_s(0x7F), 127);
-        assert_eq!(tc_wtr_twtr_l(0x0000_7F00), 127);
-        // 12-bit tRFC1 / 11-bit tRFCsb max.
-        assert_eq!(tc_rfp_trfc1(0x0000_0FFF), 4095);
-        assert_eq!(tc_rfp2_trfcsb(0x0000_07FF), 2047);
-        // 4-bit tPPD max (decoded, no display slot).
-        assert_eq!(tc_act2_tppd(0x0F), 15);
-        // The masks never alias into a neighboring field: the fixture
-        // words decode their fields independently of the rest.
-        assert_eq!(tc_act_tcl(0x0028_8410), 40);
-        assert_eq!(tc_pre_tcwl(0x284D_2828), 40);
-        assert_eq!(tc_wtr_twr(0x0828_0E0C), 40);
-        assert_eq!(tc_pre_tras(0x284D_2828), 77);
-    }
-
-    // -----------------------------------------------------------------
-    // Mirror → MCL fallback (Research line 329) + the wide `/dev/mem`
-    // Tier-3 offset set (IG-25).
-    // -----------------------------------------------------------------
-
-    /// The verbatim Research line 329 selector: a disabled-mirror word
-    /// (`0x0` / `0xFFFFFFFF`) selects the MCL register; a populated
-    /// mirror wins; a failed mirror read is not a disabled mirror (no
-    /// fallback); an absent MCL read yields nothing (never a bogus
-    /// zero).
-    #[test]
-    fn mirror_or_mcl_selects_per_research_line_329() {
-        assert_eq!(
-            mirror_or_mcl(Some(0xFFFF_FFFF), Some(0x0028_8410)),
-            Some(0x0028_8410),
-            "0x4004 = 0xFFFFFFFF + valid 0xD004 -> MCL wins"
-        );
-        assert_eq!(
-            mirror_or_mcl(Some(0x0), Some(0x0028_8410)),
-            Some(0x0028_8410),
-            "0x4004 = 0x0 + valid 0xD004 -> MCL wins"
-        );
-        assert_eq!(
-            mirror_or_mcl(Some(0x0028_8410), Some(0xDEAD_BEEF)),
-            Some(0x0028_8410),
-            "0x4004 valid -> mirror wins"
-        );
-        assert_eq!(
-            mirror_or_mcl(None, Some(0x0028_8410)),
-            None,
-            "a failed mirror read is not a disabled mirror"
-        );
-        assert_eq!(
-            mirror_or_mcl(Some(0xFFFF_FFFF), None),
-            None,
-            "disabled mirror + absent MCL -> nothing (no bogus zero)"
-        );
-        assert_eq!(mirror_or_mcl(None, None), None);
-    }
-
-    /// The brief's fallback arm, wired per controller: MC0 subchannel 0
-    /// with a disabled mirror word at 0x4004 (`TC_ACT` @ the `ch0`
-    /// block +0x04) and a valid native MCL word at 0xD004 → the MCL
-    /// value wins end to end through the Tier-3 decode (tCL 40 from
-    /// 0xD004, not the disabled mirror).
-    #[test]
-    fn mirror_fallback_disabled_mirror_selects_mcl() {
-        let regs = IntelImcRegs {
-            ch0: ChannelRegs {
-                tc_rap: Some(0xFFFF_FFFF), // 0x4004: mirror disabled
-                ..ChannelRegs::default()
-            },
-            mcl0: tier3_ddr5_4800_mcl(), // 0xD004 = 0x0028_8410 (valid)
-            ..IntelImcRegs::default()
-        };
-        let mcl = tier3_mcl_for(0, &ALDER_CHANNELS[0], &regs);
-        assert_eq!(
-            mcl.tc_act,
-            Some(0x0028_8410),
-            "0xD004 wins over the disabled 0x4004"
-        );
-        // The MCL-only registers ride the MCL block as-is.
-        assert_eq!(mcl.tc_wtr, Some(0x0828_0E0C));
-        assert_eq!(mcl.tc_rfp, Some(0x2000_04B0));
-        assert_eq!(mcl.tc_rfp2, Some(0x87));
-        // The un-fallen mirror registers (absent here) stay absent.
-        assert_eq!(mcl.tc_pre, None);
-        // End to end: the decoded channel carries the MCL-sourced tCL.
-        let ch = decode_tier3_channel(
-            0,
-            decode_mclk(Some(0x0000_0024), IntelGen::AlderLake),
-            &mcl,
-            &ALDER_CHANNELS[0],
-        );
-        assert_eq!(ch.timings.cl, Section::Value(40), "tCL from 0xD004");
-    }
-
-    /// The brief's mirror-wins arm: a populated mirror word beats the
-    /// MCL word (the retail-desktop default — the mirror is enabled);
-    /// pinned for both MCL-bearing controllers (MC0 subch0 and MC1
-    /// subch2).
-    #[test]
-    fn mirror_wins_when_populated() {
-        // MC0 subch0: a populated 0x4004 wins over the MCL 0xD004.
-        let regs = IntelImcRegs {
-            ch0: ChannelRegs {
-                tc_rap: Some(0x0028_8410), // 0x4004 valid
-                ..ChannelRegs::default()
-            },
-            mcl0: tier3_ddr5_4800_mcl(), // 0xD004
-            ..IntelImcRegs::default()
-        };
-        let mcl = tier3_mcl_for(0, &ALDER_CHANNELS[0], &regs);
-        assert_eq!(mcl.tc_act, Some(0x0028_8410), "0x4004 valid -> mirror wins");
-
-        // MC1 subch2: a distinct valid 0x4804 beats a distinct 0xD804.
-        let regs = IntelImcRegs {
-            ch2: ChannelRegs {
-                tc_rap: Some(0x0018_0410), // 0x4804 valid (tCL 24)
-                ..ChannelRegs::default()
-            },
-            mcl1: MclRegs {
-                tc_act: Some(0x0028_8410), // 0xD804 (tCL 40)
-                ..MclRegs::default()
-            },
-            ..IntelImcRegs::default()
-        };
-        let mcl2 = tier3_mcl_for(2, &ALDER_CHANNELS[2], &regs);
-        assert_eq!(mcl2.tc_act, Some(0x0018_0410), "0x4804 valid -> mirror wins");
-        let ch = decode_tier3_channel(
-            2,
-            decode_mclk(Some(0x0000_0024), IntelGen::AlderLake),
-            &mcl2,
-            &ALDER_CHANNELS[2],
-        );
-        assert_eq!(ch.timings.cl, Section::Value(24), "tCL 24 from the mirror");
-    }
-
-    /// The brief's both-absent arm: no mirror read and no MCL read →
-    /// the effective register set is all-`None` → the Tier-3 decode
-    /// degrades every sourced slot to `Na(ParseError)` (never a value,
-    /// never a panic); the mirror-only subchannels (OQ-4) degrade the
-    /// same way with no MCL base to fall back to.
-    #[test]
-    fn mirror_and_mcl_both_absent_degrade_to_parse_error() {
-        let mcl = tier3_mcl_for(0, &ALDER_CHANNELS[0], &IntelImcRegs::default());
-        assert_eq!(mcl, MclRegs::default());
-        let ch = decode_tier3_channel(
-            0,
-            decode_mclk(Some(0x0000_0024), IntelGen::AlderLake),
-            &mcl,
-            &ALDER_CHANNELS[0],
-        );
-        for s in [
-            &ch.timings.cl,
-            &ch.timings.rcdrd,
-            &ch.timings.rfc1,
-            &ch.timings.rdrd_scl,
-            &ch.timings.wrwr_sc,
-        ] {
-            assert!(matches!(s, Section::Na(NaReason::ParseError(_))), "{s:?}");
-        }
-        // OQ-4: the mirror-only subchannels — no MCL base → the same
-        // all-absent effective set.
-        assert_eq!(
-            tier3_mcl_for(1, &ALDER_CHANNELS[1], &IntelImcRegs::default()),
-            MclRegs::default()
-        );
-        assert_eq!(
-            tier3_mcl_for(3, &ALDER_CHANNELS[3], &IntelImcRegs::default()),
-            MclRegs::default()
-        );
-    }
-
-    /// Mirror-only subchannels (OQ-4): a populated mirror block is
-    /// taken as-is under the Alder layout naming (the mirror is a
-    /// legacy alias of the MCL block); the MCL-only registers have no
-    /// source and stay absent.
-    #[test]
-    fn mirror_only_subchannels_take_the_mirror_as_is() {
-        let regs = IntelImcRegs {
-            ch1: ChannelRegs {
-                tc_dbp: Some(0x284D_2828), // +0x00
-                tc_rap: Some(0x0028_8410), // +0x04
-                tc_rfp: Some(0x4),         // +0x08
-                tc_rdrd: Some(0x0048_C286), // +0x20
-                tc_wrrd: Some(0x286),      // +0x28
-                ..ChannelRegs::default()
-            },
-            ..IntelImcRegs::default()
-        };
-        let mcl = tier3_mcl_for(1, &ALDER_CHANNELS[1], &regs);
-        assert_eq!(mcl.tc_pre, Some(0x284D_2828));
-        assert_eq!(mcl.tc_act, Some(0x0028_8410));
-        assert_eq!(mcl.tc_act2, Some(0x4));
-        assert_eq!(mcl.tc_rdrd, Some(0x0048_C286));
-        assert_eq!(mcl.tc_wrwr, Some(0x286));
-        assert_eq!(mcl.tc_wtr, None);
-        assert_eq!(mcl.tc_rfp, None);
-        assert_eq!(mcl.tc_rfp2, None);
-    }
 
     /// The wide `/dev/mem` Tier-3 offset set (IG-25): the 256 KiB
     /// window constant matches the Alder profile window (IG-03,
-    /// `window_size` from `profile_for`) and every Tier-3 offset (the
-    /// four mirror bases, both MCL blocks, the global `MC_BIOS_REQ`,
-    /// the `MAD_DIMM_CH2/3` raws) fits it.
+    /// `window_size` from `profile_for`) and every Tier-3 offset fits it.
     #[test]
     fn devmem_wide_map_is_256_kib_for_tier3() {
         assert_eq!(MCHBAR_WINDOW_TIER3, 0x40000, "the Alder profile window (IG-03)");
@@ -4247,9 +2114,6 @@ mod tests {
                 "offset {off:#x} must fit the 256 KiB Tier-3 window"
             );
         }
-        // The MCL bases sit inside the wide window too (compile-proven
-        // by `_ASSERT_TIER3_READS_IN_WIDE_WINDOW` over MAX_MCL_OFFSET,
-        // which is the highest MCL read).
         for map in ALDER_CHANNELS {
             assert!(
                 map.mirror_base as usize + 4 <= MCHBAR_WINDOW_TIER3,
@@ -4261,39 +2125,10 @@ mod tests {
 
     // -----------------------------------------------------------------
     // The /dev/mem reader cores (IG-26 fix): `from_bar` /
-    // `from_bar_wide` over an abstract register reader — the read-set
-    // containment pins, no I/O.
+    // `from_bar_wide` over an abstract register reader.
     // -----------------------------------------------------------------
 
-    /// A buffer-backed twin of [`MchBar::read_u32`]: bounds-checked
-    /// 4-byte little-endian reads over `buf` (out-of-bounds → `None`,
-    /// mirroring `check_read_bounds`), recording every offset touched.
-    fn buffered_reader(
-        buf: Vec<u8>,
-        touched: &std::cell::RefCell<Vec<usize>>,
-    ) -> impl FnMut(usize) -> Option<u32> + '_ {
-        move |off| {
-            touched.borrow_mut().push(off);
-            let end = off.checked_add(4)?;
-            let w = buf.get(off..end)?;
-            Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-        }
-    }
-
-    /// Seed one 4-byte little-endian word at `off` in `buf` (test-only).
-    fn seed_word(buf: &mut [u8], off: usize, word: u32) {
-        buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
-    }
-
-    /// The wide `/dev/mem` read set (IG-25 + the IG-26 wiring):
-    /// `from_bar_wide` over a 256 KiB map (the Alder profile window)
-    /// reads the full Alder offset set — all four mirror blocks
-    /// (incl. the ch2/ch3 mirrors at `0x4800`/`0x4C00` that the
-    /// 9-register `from_bar` never touches), the two native MCL
-    /// blocks (`0xD000`/`0xD800`), the global `MC_BIOS_REQ`, and the
-    /// `MAD_DIMM_CH2/CH3` raws — landing every seeded word in its
-    /// 74-slot field, with exactly 71 distinct 4-byte reads, all
-    /// in-window.
+    /// The wide `/dev/mem` read set (IG-25 + the IG-26 wiring).
     #[test]
     fn from_bar_wide_reads_the_full_alder_offset_set() {
         let mut buf = vec![0u8; MCHBAR_WINDOW_TIER3];
@@ -4328,14 +2163,9 @@ mod tests {
                 seed_word(&mut buf, base + off, 0xB000_0000 | (i as u32) << 12 | (j as u32) << 8);
             }
         }
-        // H-12: the `MAD_DIMM_CH2/CH3` raws are gen-keyed — this is the
-        // Alder (12th-gen) map, so they sit at `imc_base` (`0xD800`) + the
-        // `0x60` / `0x64` intra-base offset (`0xD860` / `0xD864`).
         let gen = IntelGen::AlderLake;
         seed_word(&mut buf, imc_base_for(gen) + MAD_DIMM_CH2_INTRA, 1);
         seed_word(&mut buf, imc_base_for(gen) + MAD_DIMM_CH3_INTRA, 2);
-        // Phase 1: the two Alder Lake DDR4 TC blocks (10 reads each — the
-        // 64-bit TC_PRE split into a low + a high word).
         let alk_d4_offsets = [
             ALK_D4_TC_PRE,
             ALK_D4_TC_PRE_HI,
@@ -4357,10 +2187,6 @@ mod tests {
         let touched = std::cell::RefCell::new(Vec::new());
         let regs = IntelImcRegs::from_wide_reader(imc_base_for(gen), buffered_reader(buf, &touched));
 
-        // Every seeded word lands in its field — the full 74-slot set
-        // (71 read offsets; the 3 gen-keyed MAD raws stay `None` here),
-        // including the MCL blocks and the MAD raws the 9-register
-        // `from_bar` never reads.
         let expect_ch = |i: u32| {
             let w = |j: u32| 0xA000_0000 | (i << 12) | (j << 8);
             ChannelRegs {
@@ -4420,14 +2246,9 @@ mod tests {
                 alk_d4_tc0: expect_alk_d4(0),
                 alk_d4_tc1: expect_alk_d4(1),
             },
-            "the 256 KiB map populates the whole Tier-3 set (incl. the MCL blocks, the MAD raws, and the DDR4 TC blocks)"
+            "the 256 KiB map populates the whole Tier-3 set"
         );
 
-        // The read set is exactly the 71 distinct Alder offsets — all
-        // within the wide window — and it covers every offset class the
-        // 9-register `from_bar` skips: the ch2/ch3 mirrors, both MCL
-        // blocks, the MAD raws, and the two DDR4 TC blocks (10 reads each,
-        // Phase 1).
         let mut set = touched.into_inner();
         set.sort_unstable();
         set.dedup();
@@ -4464,14 +2285,7 @@ mod tests {
     }
 
     /// The 64 KiB `/dev/mem` read set is unchanged by the IG-26
-    /// wiring (only the Alder family routes to the wide map):
-    /// `from_bar` reads exactly the 9-register Tier-1 set (the global
-    /// `MC_BIOS_REQ` + the two `0x4000` / `0x4400` channel blocks — 17
-    /// distinct 4-byte reads, all within 64 KiB), lands the seeded
-    /// words, leaves every Tier-3 extension field `None` (including
-    /// the in-window `MAD_DIMM_CH2/CH3` raws, which `from_bar` never
-    /// touches), and never attempts a read outside the 64 KiB
-    /// Tier-1 window.
+    /// wiring.
     #[test]
     fn from_bar_keeps_the_64_kib_nine_register_set() {
         let mut buf = vec![0u8; MCHBAR_WINDOW];
@@ -4491,7 +2305,6 @@ mod tests {
                 seed_word(&mut buf, base + off, 0xC000_0000 | (i as u32) << 12 | (j as u32) << 8);
             }
         }
-        // In-window Tier-3 raws, seeded: `from_bar` must NOT read them.
         seed_word(&mut buf, MAD_DIMM_CH2_OFFSET, 0xDEAD_BEEF);
         seed_word(&mut buf, MAD_DIMM_CH3_OFFSET, 0xDEAD_BEEF);
 
@@ -4517,8 +2330,6 @@ mod tests {
                 mcbios_req: Some(0x0000_0012),
                 ch0: expect_ch(0),
                 ch1: expect_ch(1),
-                // Every Tier-3 extension field stays None (incl. the
-                // in-window MAD raws — `from_bar` never touches them).
                 ..IntelImcRegs::default()
             },
             "from_bar = the 9-register Tier-1 set only; every Tier-3 field stays None"
@@ -4545,43 +2356,26 @@ mod tests {
     }
 
     /// Containment of the wide read set on a map shorter than the
-    /// highest wide offsets (pinned by the IG-26 fix): on a 48 KiB
-    /// model map (0xC000 — the MCL blocks @ 0xD000/0xD800 are out of
-    /// bounds), every out-of-bounds MCL read degrades to `None`
-    /// through the bounds-checked reader, while the in-window offsets
-    /// (the mirror blocks, `MC_BIOS_REQ`, the `MAD_DIMM_CH2/CH3`
-    /// raws) still land — one bad read never poisons the rest and
-    /// never panics (D5). (The profile-sized maps are 64 / 256 KiB;
-    /// this models the general containment contract of the reader.)
+    /// highest wide offsets.
     #[test]
     fn from_bar_wide_on_a_short_map_contains_the_wide_offsets() {
-        // 48 KiB (0xC000): the MCL blocks @ 0xD000/0xD800 are past it.
         const SHORT_WINDOW: usize = 1 << 15;
         let mut buf = vec![0u8; SHORT_WINDOW];
         seed_word(&mut buf, MC_BIOS_REQ_OFFSET, 0x0001_0012);
         seed_word(&mut buf, MAD_DIMM_CH2_OFFSET, 7);
         seed_word(&mut buf, MAD_DIMM_CH3_OFFSET, 9);
-        // The ch2 mirror (0x4800, in the 48 KiB window) carries one
-        // word; the MCL blocks (0xD000 / 0xD800) are out of bounds.
         seed_word(&mut buf, 0x4800 + TC_DBP_OFFSET, 0x284D_2828);
 
-        // H-12: a pre-12th-gen (IMC base `0x5000`) — the seeded
-        // `MAD_DIMM_CH2/CH3` raws (at `0x5060` / `0x5064`) sit in-window,
-        // while the MCL blocks (`0xD000` / `0xD800`) are past the 48 KiB map.
         let gen = IntelGen::Skylake;
         let touched = std::cell::RefCell::new(Vec::new());
         let regs = IntelImcRegs::from_wide_reader(imc_base_for(gen), buffered_reader(buf, &touched));
 
-        // The in-window reads land.
         assert_eq!(regs.mcbios_req, Some(0x0001_0012));
         assert_eq!(regs.mad_dimm_ch2, Some(7));
         assert_eq!(regs.mad_dimm_ch3, Some(9));
         assert_eq!(regs.ch2.tc_dbp, Some(0x284D_2828));
-        // The out-of-bounds MCL reads are contained to None.
         assert_eq!(regs.mcl0, MclRegs::default());
         assert_eq!(regs.mcl1, MclRegs::default());
-        // The reader did attempt the out-of-bounds offsets (they just
-        // degraded).
         let mut set = touched.into_inner();
         set.sort_unstable();
         set.dedup();
@@ -4592,57 +2386,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // The Tier-3 decode dispatch (IG-26): OQ-11's DDR5 condition picks
-    // the subchannel set; the mirror → MCL fallback (IG-25) and the
-    // gear cells (IG-11, GearCap::Gear4) wire decode_tier3_channel
-    // into `decode`.
+    // The Tier-3 decode dispatch (IG-26).
     // -----------------------------------------------------------------
 
-    /// A populated mirror block under the Alder layout (the mirror is a
-    /// legacy alias of the MCL block — the same words, Tier-1 names):
-    /// the DDR5-4800 40-class fixture, so every MCL-paired mirror word
-    /// decodes; the MCL-only registers (+0x10 `TC_WTR` / +0x14 `TC_RFP`
-    /// / +0x18 `TC_RFP2`) have no mirror word and ride the MCL block
-    /// (absent here → `None`).
-    fn ddr5_mirror_block() -> ChannelRegs {
-        ChannelRegs {
-            tc_dbp: Some(0x284D_2828),  // +0x00 → tc_pre
-            tc_rap: Some(0x0028_8410),  // +0x04 → tc_act
-            tc_rfp: Some(0x0000_0004),  // +0x08 → tc_act2
-            tc_rdrd: Some(0x0048_C286), // +0x20 → tc_rdrd
-            tc_wrrd: Some(0x0000_0286), // +0x28 → tc_wrwr
-            ..ChannelRegs::default()
-        }
-    }
-
-    /// The Tier-3 dispatch fixture with OQ-11's DDR5 condition met:
-    /// all four mirror blocks populated, both `MAD_DIMM_CH2/CH3` raws
-    /// present and non-zero, `MC_BIOS_REQ = 0x0001_0024` (the 11th-
-    /// gen-and-later half-step encoding of DDR5-4800 on the 133.3333
-    /// MHz base: ratio 36 = 4800 / 133.3333 → 2400 MHz, bit 16 →
-    /// gear 2 — the Alder Lake MC_BIOS_REQ decode).
-    fn tier3_ddr5_condition_regs() -> IntelImcRegs {
-        IntelImcRegs {
-            mcbios_req: Some(0x0001_0024),
-            ch0: ddr5_mirror_block(),
-            ch1: ddr5_mirror_block(),
-            ch2: ddr5_mirror_block(),
-            ch3: ddr5_mirror_block(),
-            mad_dimm_ch2: Some(1),
-            mad_dimm_ch3: Some(1),
-            ..IntelImcRegs::default()
-        }
-    }
-
-    /// OQ-11's DDR5 condition met (both `MAD_DIMM_CH2/CH3` raws
-    /// present and non-zero) → the decode exposes the 4-subchannel
-    /// geometry under every Alder-family generation: indices 0–3, each
-    /// subchannel decodes from its mirror block through the widened
-    /// Tier-3 fields, the gear cells layer on (bit 16 → gear 2 →
-    /// uclk = 2400 / 2 = 1200), and `channel_mode` follows
-    /// `MAD_INTER_CHANNEL[1:0]` (Breakdown §7).
-    /// **OQ-11: confirm on hardware before shipping** (working
-    /// assumption).
+    /// OQ-11's DDR5 condition met → 4-subchannel geometry.
     #[test]
     fn decode_tier3_ddr5_condition_exposes_four_subchannels() {
         for gen in [
@@ -4660,24 +2407,16 @@ mod tests {
                 vec![0, 1, 2, 3],
                 "{gen:?}"
             );
-            // No `MAD_DIMM_CH0/1` population raws + no SMBIOS -> terminal
-            // channel mode (the DDR5 condition drives the *subchannel
-            // geometry*, not the channel mode).
             assert_eq!(ro.channel_mode, None, "{gen:?}: no population evidence");
             for ch in &ro.channels {
-                // The shared core clock + gear cells (Breakdown §3D,
-                // the profile's GearCap::Gear4).
                 assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
                 assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Two), "{gen:?}");
                 assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "{gen:?}: uclk = mclk / 2");
-                // The widened DDR5-4800 40-class timings decode from
-                // the mirror block (no MCL base populated here).
                 assert_eq!(ch.timings.cl, Section::Value(40), "{gen:?}");
                 assert_eq!(ch.timings.cwl, Section::Value(40), "{gen:?}");
                 assert_eq!(ch.timings.rc, Section::Value(117), "{gen:?}");
                 assert_eq!(ch.timings.rdrd_scl, Section::Value(6), "{gen:?}");
                 assert_eq!(ch.timings.wrwr_scl, Section::Value(6), "{gen:?}");
-                // MCL-only registers absent here -> Na(ParseError).
                 assert!(
                     matches!(ch.timings.rfc1, Section::Na(NaReason::ParseError(_))),
                     "{gen:?}"
@@ -4690,10 +2429,7 @@ mod tests {
         }
     }
 
-    /// OQ-11's DDR5 condition NOT met → the 2-channel DDR4 default
-    /// (MC0 subch0 + MC1 subch2) under every Alder-family generation,
-    /// for both absence forms: raws absent (`None` — the 64 KiB /
-    /// 24-attr build) and present-but-zero (`Some(0)`).
+    /// OQ-11's DDR5 condition NOT met → 2-channel DDR4 default.
     #[test]
     fn decode_tier3_ddr4_default_exposes_two_channels() {
         for gen in [
@@ -4712,16 +2448,11 @@ mod tests {
                 regs.mad_inter_channel = Some(1);
                 let ro = decode(&regs, gen, &SmbiosTopology::empty());
                 assert_eq!(ro.channels.len(), 2, "{gen:?} ({label}): DDR4 default");
-                // M-7: the display indices are sequential (0, 1), not the
-                // subchannel identities (0, 2) — the latter would render
-                // "ch 0 / ch 2" and imply a gapped 4-channel platform.
                 assert_eq!(
                     ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
                     vec![0, 1],
                     "{gen:?} ({label}): sequential display indices"
                 );
-                // No `MAD_DIMM_CH0/1` population raws + no SMBIOS ->
-                // terminal channel mode.
                 assert_eq!(
                     ro.channel_mode,
                     None,
@@ -4737,17 +2468,11 @@ mod tests {
         }
     }
 
-    /// Gear 4 (Breakdown §3D: Alder / Meteor / Arrow for LPDDR5X and
-    /// high-speed DDR5; Research line 145: >7200 MT/s) wires the
-    /// `GearCap::Gear4` cap into the Tier-3 dispatch:
-    /// `MC_BIOS_REQ = 0x0002_0024` (ratio 36 @ 133.3333 MHz — the
-    /// 11th-gen-and-later half-step encoding → 2400 MHz, bits
-    /// [17:16] = 10b) → gear **Four** → uclk = 2400 / 4 = **600 MHz**
-    /// on every decoded subchannel.
+    /// Gear 4 wires the `GearCap::Gear4` cap into the Tier-3 dispatch.
     #[test]
     fn decode_tier3_gear4_uclk_is_mclk_over_four() {
         let mut regs = tier3_ddr5_condition_regs();
-        regs.mcbios_req = Some(0x0002_0024); // 10b + ratio 36
+        regs.mcbios_req = Some(0x0002_0024);
         for gen in [
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
@@ -4767,11 +2492,7 @@ mod tests {
         }
     }
 
-    /// The 4-subchannel Tier-3 readout round-trips through bincode —
-    /// the wire-frozen shape: `IntelReadout` is the same
-    /// `Vec<IntelChannel>` + `Option<ChannelMode>` struct the
-    /// 2-channel and Tier-1/2 readouts use (no protocol change; only
-    /// which cells carry `Value` vs `Na` differs).
+    /// The 4-subchannel Tier-3 readout round-trips through bincode.
     #[test]
     fn decode_tier3_four_channel_readout_bincode_round_trip() {
         let mut regs = tier3_ddr5_condition_regs();
@@ -4785,32 +2506,14 @@ mod tests {
         assert_eq!(ro, back);
     }
 
-
-
     // -----------------------------------------------------------------
-    // Tier 3 acceptance fixtures (IG-27): Breakdown §4 Example C
-    // pinned end to end under the Alder-family dispatch, the DDR5
-    // widened-field raws (Research lines 111-124), the MCL fallback
-    // arm, and the widened-width degradation arms.
+    // Tier 3 acceptance fixtures (IG-27).
     // -----------------------------------------------------------------
 
     /// Breakdown §4 Example C, pinned under AlderLake through the full
-    /// Tier-3 `decode()` dispatch (DoD 3 — the CI stand-in for the
-    /// hardware acceptance), re-pinned per the Alder Lake
-    /// MC_BIOS_REQ decode: `MC_BIOS_REQ = 0x0001_0024` — bit 8 = 0b
-    /// (133.3333 MHz RefClk), multiplier ratio 36 (= 4800 / 133.3333)
-    /// in the widened [7:0] field, bit 16 = 1b (Gear 2):
-    /// Step 1: MCLK = 36 × 133.3333 / 2 = **2400.0 MHz**; Step 2: data
-    /// transfer rate = 2 × 2400 = **4800 MT/s** (Breakdown §3C);
-    /// Step 3: Gear 2 → uclk = 2400 / 2 = **1200.0 MHz** — every
-    /// decoded subchannel carries the identical shared cells.
-    /// (The original Breakdown word `0x0001_0012`, ratio 18, is the
-    /// pre-restructure full-step encoding — 1200 MHz MCLK / 2400
-    /// MT/s on 12th-gen-and-later hardware.)
+    /// Tier-3 `decode()` dispatch.
     #[test]
     fn tier3_acceptance_example_c_pinned_under_alderlake() {
-        // The dispatch fixture's `mcbios_req` is the Example C word
-        // (bit 8 = 0, ratio 36, bit 16 = 1).
         assert_eq!(
             tier3_ddr5_condition_regs().mcbios_req,
             Some(0x0001_0024),
@@ -4819,46 +2522,29 @@ mod tests {
         let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 4, "DDR5 condition met -> 4 subchannels");
         for ch in &ro.channels {
-            // Step 1 (memory clock): 18 x 133.3333 MHz = 2400 MHz.
             assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "MCLK 2400 MHz");
-            // Step 2 (transfer rate): DDR -> 2 x MCLK = 4800 MT/s.
             assert_eq!(
                 ch.clocks.mclk_mhz.value().copied().map(|v| v * 2.0),
                 Some(4800.0),
                 "4800 MT/s"
             );
-            // Step 3 (controller clock): Gear 2 -> MCLK / 2 = 1200 MHz.
             assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Two), "Gear 2");
             assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "uclk 1200 MHz");
         }
     }
 
-    /// The DDR5 widened-field acceptance raws (Research lines 111-124)
-    /// through the MCL fallback arm (Research line 329) of the full
-    /// dispatch: the 0x4004 mirror reads the disabled-mirror reserved
-    /// word (`0xFFFFFFFF`), the valid 0xD004 MCL word wins, and its
-    /// widened fields decode — tCL **40** in the 8-bit `[23:16]`
-    /// TC_ACT field, tRFC1 **1200** in the 12-bit `[11:0]` TC_RFP
-    /// field, tRFCsb **135** in the 11-bit `[10:0]` TC_RFP2 field →
-    /// the `rfcsb` slot (the MCL-only registers have no mirror word,
-    /// so they ride the MCL block as-is). The 2-channel DDR4 default
-    /// geometry is taken (no `MAD_DIMM_CH2/3` raws).
+    /// The DDR5 widened-field acceptance raws through the MCL fallback arm.
     #[test]
     fn tier3_acceptance_widened_fields_via_mcl_fallback() {
         let regs = IntelImcRegs {
-            // The Example C clock word (bit 8 = 0, ratio 36, bit 16 = 1).
             mcbios_req: Some(0x0001_0024),
             ch0: ChannelRegs {
-                tc_rap: Some(0xFFFF_FFFF), // 0x4004: mirror disabled
+                tc_rap: Some(0xFFFF_FFFF),
                 ..ChannelRegs::default()
             },
             mcl0: MclRegs {
-                // TC_ACT @ 0xD004: tCL 40 [23:16], tFAW 16 [7:0],
-                // tRRD_S 4 [11:8], tRRD_L 8 [15:12].
                 tc_act: Some(0x0028_8410),
-                // TC_RFP @ 0xD014: tRFC1 1200 [11:0].
                 tc_rfp: Some(0x0000_04B0),
-                // TC_RFP2 @ 0xD018: tRFCsb 135 [10:0] (DDR5-specific).
                 tc_rfp2: Some(0x0000_0087),
                 ..MclRegs::default()
             },
@@ -4883,24 +2569,13 @@ mod tests {
             Section::Value(135),
             "tRFCsb 135 in the 11-bit field -> the rfcsb slot"
         );
-        // The disabled mirror poisoned nothing: the un-sourced
-        // mirrored registers stay absent -> honest Na(ParseError).
         assert!(
             matches!(ch0.timings.rcdrd, Section::Na(NaReason::ParseError(_))),
             "tc_dbp absent -> tRCD Na"
         );
     }
 
-    /// The widened-width degradation arms through the full dispatch
-    /// (4-subchannel DDR5 geometry): (a) zero fields — every
-    /// mirrored register disabled (`0xFFFFFFFF`) → the all-zero MCL
-    /// words win (Research line 329) → every sourced slot degrades to
-    /// `Na(ParseError)` (0 ticks = untrained, outside [1, 2048]) —
-    /// never a bogus zero value; (b) the reserved quartet — the
-    /// TC_RDRD mirror word reads the disabled-mirror `0xFFFFFFFF`:
-    /// on the mirror-only subchannels (OQ-4: no MCL base) it degrades
-    /// to absent → the 4×6-bit quartet slots are `Na(ParseError)`.
-    /// The clocks stay valid: the degradation is per-register.
+    /// The widened-width degradation arms through the full dispatch.
     #[test]
     fn tier3_acceptance_widened_zero_and_reserved_degrade() {
         let zero_mcl = MclRegs {
@@ -4914,9 +2589,9 @@ mod tests {
             tc_wrwr: Some(0),
         };
         let regs = IntelImcRegs {
-            mcbios_req: Some(0x0001_0024), // the Example C clock word
+            mcbios_req: Some(0x0001_0024),
             ch0: ChannelRegs {
-                tc_dbp: Some(0xFFFF_FFFF), // all five paired mirrors disabled
+                tc_dbp: Some(0xFFFF_FFFF),
                 tc_rap: Some(0xFFFF_FFFF),
                 tc_rfp: Some(0xFFFF_FFFF),
                 tc_rdrd: Some(0xFFFF_FFFF),
@@ -4924,15 +2599,15 @@ mod tests {
                 ..ChannelRegs::default()
             },
             ch1: ChannelRegs {
-                tc_rdrd: Some(0xFFFF_FFFF), // mirror-only subchannel (OQ-4)
+                tc_rdrd: Some(0xFFFF_FFFF),
                 ..ChannelRegs::default()
             },
             ch3: ChannelRegs {
-                tc_rdrd: Some(0xFFFF_FFFF), // mirror-only subchannel (OQ-4)
+                tc_rdrd: Some(0xFFFF_FFFF),
                 ..ChannelRegs::default()
             },
             mcl0: zero_mcl,
-            mad_dimm_ch2: Some(1), // DDR5 condition met
+            mad_dimm_ch2: Some(1),
             mad_dimm_ch3: Some(1),
             ..IntelImcRegs::default()
         };
@@ -4942,15 +2617,10 @@ mod tests {
             ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
             vec![0, 1, 2, 3]
         );
-        // The clocks stay valid (the degradation is per-register, not
-        // wholesale).
         for ch in &ro.channels {
             assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0));
             assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0));
         }
-        // Every sourced slot of every subchannel degrades to Na:
-        // subch0 from the zero MCL words, subch1/3 from the reserved
-        // mirror words (no MCL base), subch2 all absent.
         fn assert_all_sourced_na(ch: &IntelChannel, why: &str) {
             let cells: [&Section<u16>; 18] = [
                 &ch.timings.cl,
@@ -4980,8 +2650,6 @@ mod tests {
         assert_all_sourced_na(&ro.channels[1], "subch1: mirror-only, reserved TC_RDRD word");
         assert_all_sourced_na(&ro.channels[2], "subch2: all registers absent");
         assert_all_sourced_na(&ro.channels[3], "subch3: mirror-only, reserved TC_RDRD word");
-        // `rc` is synthesized from tRAS + tRP — neither decodes from a
-        // zero word -> not applicable (never a bogus 0 + 0).
         assert_eq!(
             ro.channels[0].timings.rc,
             Section::na(NaReason::NotApplicable)
@@ -4992,48 +2660,8 @@ mod tests {
     // OQ-5 tile-routing probe (IG-28): Meteor / Arrow Lake.
     // -----------------------------------------------------------------
 
-    /// The probe fires on every fully degenerate form — all-`None`,
-    /// all-zero, all-bus-fault, and mixed 0x0 / 0xFFFF_FFFF raws —
-    /// and not when any single slot is valid (the populated Tier-3
-    /// fixture, and a lone valid `MC_BIOS_REQ` among zeros).
-    #[test]
-    fn ig28_primary_window_degenerate_probe() {
-        // The probe is generation-agnostic (the closures answer every
-        // offset the same), so any gen keys the reader; use Alder Lake.
-        let gen = IntelGen::AlderLake;
-        assert!(IntelImcRegs::default().primary_window_degenerate(), "all-None");
-        let all_zero = IntelImcRegs::from_wide_reader(imc_base_for(gen), |_off: usize| Some(0u32));
-        assert!(all_zero.primary_window_degenerate(), "all-zero");
-        let all_fault = IntelImcRegs::from_wide_reader(imc_base_for(gen), |_off: usize| Some(0xFFFF_FFFFu32));
-        assert!(all_fault.primary_window_degenerate(), "all-bus-fault");
-        let mixed = IntelImcRegs::from_wide_reader(imc_base_for(gen), |off: usize| {
-            if off & 1 == 0 {
-                Some(0u32)
-            } else {
-                Some(0xFFFF_FFFFu32)
-            }
-        });
-        assert!(mixed.primary_window_degenerate(), "mixed 0x0 / 0xFFFF_FFFF");
-        assert!(
-            !tier3_ddr5_condition_regs().primary_window_degenerate(),
-            "populated Tier-3 fixture"
-        );
-        let one_valid = IntelImcRegs::from_wide_reader(imc_base_for(gen), |off: usize| {
-            if off == MC_BIOS_REQ_OFFSET {
-                Some(0x0001_0012)
-            } else {
-                Some(0u32)
-            }
-        });
-        assert!(!one_valid.primary_window_degenerate(), "one valid slot");
-    }
-
-    /// All-degenerate primary-window raws (0x0 / 0xFFFF_FFFF / None)
-    /// on Meteor / Arrow Lake → the all-`Na(UnsupportedHardware)`
-    /// readout at the generation's channel count (2 — C-4 made both
-    /// dual-channel DDR5) — never a decode of the empty window — and the
-    /// branch-level [`tile_routing_suspected`] detail names the SoC-tile
-    /// routing (OQ-5, Research line 328).
+    /// All-degenerate primary-window raws on Meteor / Arrow Lake →
+    /// the all-`Na(UnsupportedHardware)` readout.
     #[test]
     fn ig28_all_degenerate_window_degrades_all_na_with_tile_detail() {
         type Fill = fn(usize) -> Option<u32>;
@@ -5091,13 +2719,7 @@ mod tests {
         }
     }
 
-    /// One valid primary-window register (the rest degenerate) keeps
-    /// the normal decode path for Meteor / Arrow Lake: the probe does
-    /// not fire, the valid `MC_BIOS_REQ` decodes (ratio 18 @
-    /// 133.3333 MHz → 2400 MHz MCLK, bit 16 → gear 2 → uclk 1200),
-    /// and the absent / zero registers degrade per-register
-    /// (`Na(ParseError)`) on the 2-channel DDR4 default shape —
-    /// never to the tile-routing all-Na readout.
+    /// One valid primary-window register keeps the normal decode path.
     #[test]
     fn ig28_one_valid_register_keeps_the_normal_decode_path() {
         for gen in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
@@ -5122,6 +2744,7 @@ mod tests {
             }
         }
     }
+
     // Degradation + containment (the no-panic contract, D5).
     // -----------------------------------------------------------------
 
@@ -5198,11 +2821,7 @@ mod tests {
         }
     }
 
-    /// Per-register containment: only `ch0.tc_rap` unreadable → only
-    /// its sourced fields (tRAS / tRRD_S / tRTP / tFAW) degrade to
-    /// `Na(ParseError)`; the derived `rc` follows to
-    /// `Na(NotApplicable)`; every other register's fields decode
-    /// untouched; ch1 (all registers intact) is fully decoded.
+    /// Per-register containment: only `ch0.tc_rap` unreadable.
     #[test]
     fn decode_per_register_containment() {
         let mut regs = acceptance_regs();
@@ -5234,10 +2853,7 @@ mod tests {
         assert_eq!(ch1.timings.rc, Section::Value(56));
     }
 
-    /// A decoded field of `0` is untrained → `Na(ParseError)` per
-    /// field: all-`0` `TC_DBP` / `TC_RAP` / `TC_RFP` registers degrade
-    /// every sourced field while the intact registers keep their
-    /// values.
+    /// A decoded field of `0` is untrained → `Na(ParseError)` per field.
     #[test]
     fn decode_zero_fields_degrade_to_parse_error() {
         let mut regs = acceptance_regs();
@@ -5257,7 +2873,6 @@ mod tests {
         ] {
             assert!(matches!(s, Section::Na(NaReason::ParseError(_))), "{s:?}");
         }
-        // ras (TC_RAP intact on ch0) decodes; rc needs both sources.
         assert_eq!(ch0.timings.ras, Section::Value(39));
         assert_eq!(ch0.timings.rc, Section::na(NaReason::NotApplicable));
 
@@ -5272,13 +2887,8 @@ mod tests {
     // The v1 Tier-1 generation gate.
     // -----------------------------------------------------------------
 
-    /// Every *unprofiled* generation (Ice Lake / Tiger Lake /
-    /// `Unrecognized`) degrades the whole readout to
-    /// `Na(UnsupportedHardware)` channels — the registers are not
-    /// decoded at all (never garbage from a mismatched map); the
-    /// channel count follows the frozen model. The profiled Tier-3
-    /// Alder family has a live decode path as of IG-26 (the dedicated
-    /// Tier-3 dispatch tests above pin its shapes).
+    /// Every *unprofiled* generation degrades the whole readout to
+    /// `Na(UnsupportedHardware)` channels.
     #[test]
     fn decode_non_tier1_gen_degrades_all_na() {
         let regs = acceptance_regs();
@@ -5339,8 +2949,7 @@ mod tests {
     }
 
     /// [`tier1_gate`]: Tier 1 passes; every other generation yields
-    /// `UnsupportedHardware` with a detail that names the generation
-    /// and its research-roadmap tier.
+    /// `UnsupportedHardware`.
     #[test]
     fn tier1_gate_dispatches_by_generation() {
         for gen in [
@@ -5370,30 +2979,16 @@ mod tests {
         assert!(!tier1_supported(IntelGen::Unrecognized));
     }
 
-    /// [`gen_gate`] (the facade's branch-level gate, IG-16): every
-    /// profiled generation — Tier 1, Rocket Lake (Tier 2), and the
-    /// Tier-3 Alder family (profiled as of IG-03) — passes; every
-    /// unprofiled generation yields `UnsupportedHardware` with a
-    /// detail that names the generation and the full profiled set it
-    /// is absent from (Tier 1 + Tier 2 + Tier 3 — the stale
-    /// "beyond Tier 2" wording is gone: the no-profile generations —
-    /// Ice Lake / Tiger Lake / Jasper Lake / Sapphire Rapids / Lunar
-    /// Lake / Core Series 1 Mobile / `Unrecognized` — all hit this
-    /// message). Rocket Lake now reaches [`decode`] (IG-12's profile
-    /// dispatch) through the live facade.
+    /// [`gen_gate`] (the facade's branch-level gate, IG-16).
     #[test]
     fn gen_gate_dispatches_by_generation() {
-        // H-1 (Ice / Tiger → Tier 1) + H-9 (Sapphire Rapids → Server)
-        // promoted these into the profiled set; the rest stay unprofiled.
         for gen in [
             IntelGen::Skylake,
             IntelGen::KabyLake,
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
-            // H-1: Ice Lake / Tiger Lake now resolve to the shared TIER1.
             IntelGen::IceLake,
             IntelGen::TigerLake,
-            // L-8: client Haswell / Broadwell resolve to the shared TIER1.
             IntelGen::Haswell,
             IntelGen::Broadwell,
             IntelGen::RocketLake,
@@ -5401,9 +2996,6 @@ mod tests {
             IntelGen::RaptorLake,
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
-            // Server uncore (H-9): Haswell-E / Broadwell-E / Skylake-X /
-            // Cascade Lake / Sapphire Rapids resolve to the no-MMIO Server
-            // profiles.
             IntelGen::HaswellE,
             IntelGen::BroadwellE,
             IntelGen::SkylakeX,
@@ -5412,8 +3004,6 @@ mod tests {
         ] {
             assert_eq!(gen_gate(gen), Ok(()), "{gen:?}");
         }
-        // Every unprofiled generation: the detail names it and the
-        // full profiled set (Tier 1 + 2 + 3 + Server).
         for gen in [
             IntelGen::JasperLake,
             IntelGen::LunarLake,
@@ -5432,23 +3022,16 @@ mod tests {
     // Profile dispatch (IG-12): Tier 1 is one case of the dispatcher.
     // -----------------------------------------------------------------
 
-    /// [`gen_supported`] mirrors [`intel_gen::profile_for`]: the Tier-1
-    /// set, Rocket Lake, and the Tier-3 Alder family (IG-03) are
-    /// profiled; every other generation is not.
+    /// [`gen_supported`] mirrors [`intel_gen::profile_for`].
     #[test]
     fn gen_supported_matches_profile_for() {
-        // H-1: Ice / Tiger Lake are now profiled (Tier 1), so they join
-        // the supported set; only the unprofiled generations remain
-        // unsupported.
         for gen in [
             IntelGen::Skylake,
             IntelGen::KabyLake,
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
-            // H-1: Ice Lake / Tiger Lake now resolve to the shared TIER1.
             IntelGen::IceLake,
             IntelGen::TigerLake,
-            // L-8: client Haswell / Broadwell resolve to the shared TIER1.
             IntelGen::Haswell,
             IntelGen::Broadwell,
             IntelGen::RocketLake,
@@ -5456,9 +3039,6 @@ mod tests {
             IntelGen::RaptorLake,
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
-            // Server uncore (H-9): Haswell-E / Broadwell-E / Skylake-X /
-            // Cascade Lake / Sapphire Rapids resolve to the no-MMIO Server
-            // profiles.
             IntelGen::HaswellE,
             IntelGen::BroadwellE,
             IntelGen::SkylakeX,
@@ -5478,24 +3058,15 @@ mod tests {
     }
 
     /// Rocket Lake through [`decode`]: the shared 64 KiB map decodes
-    /// identically for the same ratio raws (every timing / CAD /
-    /// voltage cell equal to the Tier-1 result), and the gear cells
-    /// layer on from `MC_BIOS_REQ[17:16]` (Breakdown §3D, Gear2 cap):
-    /// bit 16 set → gear Two → uclk = mclk / 2. The MCLK itself is
-    /// generation-keyed (the Alder Lake MC_BIOS_REQ decode): the same
-    /// ratio 18 @ 133.3333 MHz is 2400 MHz on Tier 1 (the legacy
-    /// physical multiplier) and 1200 MHz on Rocket Lake (the
-    /// 11th-gen-and-later half-step — ratio 18 = 2400 MT/s data rate).
+    /// identically for the same ratio raws, and the gear cells layer on.
     #[test]
     fn decode_rocket_lake_is_tier1_map_plus_gear() {
         let tier1 = decode(&acceptance_regs(), IntelGen::Skylake, &SmbiosTopology::empty());
         let mut regs = acceptance_regs();
-        regs.mcbios_req = Some(0x0001_0012); // ratio 18 + bit 16 (gear 2)
+        regs.mcbios_req = Some(0x0001_0012);
         let rocket = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(rocket.channels.len(), 2, "Rocket Lake: two channels");
         for (t, r) in tier1.channels.iter().zip(&rocket.channels) {
-            // The ratio cells are generation-keyed (see above); every
-            // other shared-map cell is identical for the same raws.
             assert_eq!(t.clocks.mclk_mhz, Section::Value(2400.0), "Tier 1: ratio 18 full-step");
             assert_eq!(r.clocks.mclk_mhz, Section::Value(1200.0), "Rocket: ratio 18 half-step");
             assert_eq!(t.clocks.fclk_mhz, r.clocks.fclk_mhz);
@@ -5507,7 +3078,6 @@ mod tests {
             assert_eq!(t.cad_bus, r.cad_bus);
             assert_eq!(t.voltages, r.voltages);
             assert_eq!(t.rtl, r.rtl);
-            // The Rocket gear cells (Tier 1 keeps them not-applicable).
             assert_eq!(t.clocks.gear_mode, Section::na(NaReason::NotApplicable));
             assert_eq!(t.clocks.uclk_mhz, Section::na(NaReason::NotApplicable));
             assert_eq!(r.clocks.gear_mode, Section::Value(GearMode::Two));
@@ -5515,15 +3085,10 @@ mod tests {
         }
     }
 
-    /// Rocket Lake gear containment: gear bits `00b` → gear One (uclk =
-    /// mclk, the synchronous default); an absent `MC_BIOS_REQ` degrades
-    /// mclk, gear, and uclk to `Na(ParseError)` (never a bogus clock).
-    /// The 0x12 word (ratio 18 @ 133.3333 MHz) is half-step on
-    /// 11th-gen-and-later hardware: 1200 MHz MCLK (the Alder Lake
-    /// MC_BIOS_REQ decode).
+    /// Rocket Lake gear containment.
     #[test]
     fn decode_rocket_lake_gear_containment() {
-        let sync = decode(&acceptance_regs(), IntelGen::RocketLake, &SmbiosTopology::empty()); // 0x12 → 00b
+        let sync = decode(&acceptance_regs(), IntelGen::RocketLake, &SmbiosTopology::empty());
         for ch in &sync.channels {
             assert_eq!(ch.clocks.mclk_mhz, Section::Value(1200.0), "ratio 18 half-step");
             assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
@@ -5547,7 +3112,7 @@ mod tests {
     }
 
     /// [`channel_count`] delegates the profiled generations to their
-    /// profile (same values as the legacy model — no wire change).
+    /// profile.
     #[test]
     fn channel_count_delegates_to_profile() {
         for gen in [
@@ -5564,22 +3129,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Tier 2 acceptance fixtures (IG-13): Breakdown §4 pinned verbatim
-    // end-to-end under `gen = RocketLake` through `decode` — the
-    // Rocket Lake profile is the Tier-1 shared map plus the §3D gear
-    // cells (IG-12), and Research line 346's 27-subtiming ryzen_smu
-    // parity (the 0x4020–0x402C turnaround quartets) is pinned below.
+    // Tier 2 acceptance fixtures (IG-13).
     // -----------------------------------------------------------------
 
-    /// Breakdown §4 Example A, end-to-end under Rocket Lake, re-pinned
-    /// per the Alder Lake MC_BIOS_REQ decode: `mcbios_req =
-    /// 0x00000120` (bit 8 = 1b → 100 MHz RefClk, ratio 32 = 3200 /
-    /// 100, bits [17:16] = 00b → Gear 1) → 32 × 100 / 2 = **1600 MHz**
-    /// MCLK / **3200 MT/s** (DDR: ×2), uclk = mclk = **1600 MHz**
-    /// (the 1:1 synchronous clock) — on both channels. (The original
-    /// Breakdown word `0x00000110`, ratio 16, is the pre-restructure
-    /// full-step encoding — 800 MHz MCLK / 1600 MT/s on 11th-gen-and-
-    /// later hardware.)
+    /// Breakdown §4 Example A, end-to-end under Rocket Lake.
     #[test]
     fn tier2_example_a_gear1_100_mhz_base_end_to_end() {
         let mut regs = acceptance_regs();
@@ -5587,7 +3140,6 @@ mod tests {
         let ro = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
-            // §4 Example A numbers, pinned exactly.
             assert_eq!(ch.clocks.mclk_mhz, Section::Value(1600.0), "mclk = 16 × 100 MHz");
             assert_eq!(
                 ch.clocks.mclk_mhz.value().copied().map(|v| v * 2.0),
@@ -5607,20 +3159,7 @@ mod tests {
         }
     }
 
-    /// Breakdown §4 Example D, end-to-end under Rocket Lake, re-pinned
-    /// per the Alder Lake MC_BIOS_REQ decode: the narrative register
-    /// settings — bit 8 = 1b (100 MHz RefClk), ratio 60 = 6000 / 100,
-    /// bit 16 = 1b (Gear 2), bit 17 clear — are the raw word
-    /// `mcbios_req = 0x0001013C` → 60 × 100 / 2 = **3000 MHz** MCLK /
-    /// **6000 MT/s**, gear **Two** (the 01b field on the Gear2 cap),
-    /// uclk = 3000 / 2 = **1500 MHz** (Gear 2). (The original
-    /// Breakdown word `0x0001011E`, ratio 30, is the pre-restructure
-    /// full-step encoding — 1500 MHz MCLK on 11th-gen-and-later
-    /// hardware; the 11b field variants `0x0003001E` / `0x0003003C`
-    /// follow the bit-16 rule to the same gear Two and stay
-    /// unit-pinned by IG-11's `breakdown_example_d_*` tests; this is
-    /// the Rocket arm's bit-16-set / bit-17-clear word, per plan
-    /// IG-13.)
+    /// Breakdown §4 Example D, end-to-end under Rocket Lake.
     #[test]
     fn tier2_example_d_gear2_100_mhz_base_end_to_end() {
         let mut regs = acceptance_regs();
@@ -5628,7 +3167,6 @@ mod tests {
         let ro = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
-            // §4 Example D numbers, pinned exactly.
             assert_eq!(ch.clocks.mclk_mhz, Section::Value(3000.0), "mclk = 60 × 100 / 2");
             assert_eq!(
                 ch.clocks.mclk_mhz.value().copied().map(|v| v * 2.0),
@@ -5648,74 +3186,44 @@ mod tests {
         }
     }
 
-    /// The Rocket Lake turnaround quartets (the 0x4020–0x402C bus
-    /// turnaround registers — Research line 346: decoding them
-    /// achieves the 27-subtiming ryzen_smu parity) decode end-to-end
-    /// through `decode` under `gen = RocketLake`: the existing
-    /// acceptance raws yield the pinned quartet slots on both channels,
-    /// with every shared-map cell identical to the Tier-1 decode of the
-    /// same raws (the quartet decoders are shared-map; Rocket Lake
-    /// only layers on the gear cells).
+    /// The Rocket Lake turnaround quartets decode end-to-end through `decode`.
     #[test]
     fn tier2_rocket_turnaround_quartets_end_to_end() {
         let regs = acceptance_regs();
-        // The 0x4020–0x402C raws → their 4×6-bit sg / dg / dr / dd
-        // quartets (bits 5:0 / 11:6 / 17:12 / 23:18).
-        assert_eq!(turnaround_quartet(0x0048_C286), [6, 10, 12, 18], "TC_RDRD");
-        assert_eq!(turnaround_quartet(0x0000_0280), [0, 10, 0, 0], "TC_RDWR");
-        assert_eq!(turnaround_quartet(0x0000_0308), [8, 12, 0, 0], "TC_WRRD");
-        assert_eq!(turnaround_quartet(0x0040_C204), [4, 8, 12, 16], "TC_WRWR");
+        assert_eq!(legacy_ddr4::turnaround_quartet(0x0048_C286), [6, 10, 12, 18], "TC_RDRD");
+        assert_eq!(legacy_ddr4::turnaround_quartet(0x0000_0280), [0, 10, 0, 0], "TC_RDWR");
+        assert_eq!(legacy_ddr4::turnaround_quartet(0x0000_0308), [8, 12, 0, 0], "TC_WRRD");
+        assert_eq!(legacy_ddr4::turnaround_quartet(0x0040_C204), [4, 8, 12, 16], "TC_WRWR");
 
         let ro = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
-            // TC_RDRD: the full sg / dg / dr / dd quartet.
             assert_eq!(ch.timings.rdrd_scl, Section::Value(6), "sg");
             assert_eq!(ch.timings.rdrd_sc, Section::Value(10), "dg");
             assert_eq!(ch.timings.rdrd_sd, Section::Value(12), "dr");
             assert_eq!(ch.timings.rdrd_dd, Section::Value(18), "dd");
-            // TC_RDWR: dg — the representative bank-group turnaround.
             assert_eq!(ch.timings.rdwr, Section::Value(10), "dg");
-            // TC_WRRD: tWTR_S = dg, tWTR_L = sg (parity matrix).
             assert_eq!(ch.timings.wtrs, Section::Value(12), "dg");
             assert_eq!(ch.timings.wtrl, Section::Value(8), "sg");
-            // TC_WRWR: the full sg / dg / dr / dd quartet.
             assert_eq!(ch.timings.wrwr_scl, Section::Value(4), "sg");
             assert_eq!(ch.timings.wrwr_sc, Section::Value(8), "dg");
             assert_eq!(ch.timings.wrwr_sd, Section::Value(12), "dr");
             assert_eq!(ch.timings.wrwr_dd, Section::Value(16), "dd");
-            // The 0x12 word (ratio 18 @ 133.3333 MHz, gear bits 00b)
-            // keeps the synchronous default; on 11th-gen-and-later
-            // hardware the ratio is half-step: 1200 MHz MCLK (the
-            // Alder Lake MC_BIOS_REQ decode).
             assert_eq!(ch.clocks.mclk_mhz, Section::Value(1200.0), "ratio 18 half-step");
             assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
             assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "gear 1: uclk = mclk");
         }
-        // Shared-map proof: identical raws decode identically under
-        // Tier 1 (only the gear cells differ — pinned above).
         let tier1 = decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty());
         for (r, t) in ro.channels.iter().zip(&tier1.channels) {
             assert_eq!(r.timings, t.timings, "all shared-map timings identical");
         }
     }
+
     // -----------------------------------------------------------------
     // Entry points: `read_regs` total + panic-free on this host.
     // -----------------------------------------------------------------
 
-    /// `read_regs` over all-absent raws is structural and panic-free on
-    /// any host (the AMD reference host, virtualized Intel CI runners, a
-    /// physical Intel box): every cell is an honest `Na` — never a
-    /// bogus `Value`, never a panic (vendor-conditional, per the
-    /// TELEMETRY-CI-FIX precedent).
-    ///
-    /// The decode-time subchannel **indices** are generation-shaped (not
-    /// assumed contiguous): the Tier-3 Alder/Raptor family decodes the
-    /// DDR4-default subchannel set `[0, 2]` (MC0 subch0 + MC1 subch2 —
-    /// `decode`'s OQ-11 dispatch) over an all-absent raw set, while
-    /// Tier 1 / Rocket Lake, the Meteor/Arrow Lake tile-routing
-    /// degenerate early-return, and the unprofiled fallbacks are
-    /// contiguous `0..count`.
+    /// `read_regs` over all-absent raws is structural and panic-free.
     #[test]
     fn read_regs_on_this_host_is_structural_and_panic_free() {
         let ro = read_regs(&IntelImcRegs::default());
@@ -5727,14 +3235,8 @@ mod tests {
                     "Intel host: the channel count follows the detected generation"
                 );
                 if matches!(gen, IntelGen::AlderLake | IntelGen::RaptorLake) {
-                    // The Tier-3 DDR4 default subchannel set (the
-                    // reference 12600KF host shape).
                     vec![0, 2]
                 } else {
-                    // Tier 1 / Rocket Lake (0..2), the Meteor/Arrow
-                    // Lake tile-routing degenerate early-return (0..4),
-                    // and the unprofiled fallbacks (0..count):
-                    // contiguous.
                     (0..channel_count(gen)).collect()
                 }
             }
@@ -5801,42 +3303,8 @@ mod tests {
         }
     }
 
-    /// The L3 firmware override on the real reference topology (BUG 2
-    /// end-to-end, without hardware): the 12600KF / Z690M-ITX/ax SMBIOS
-    /// Type 17 table — 2 × 16 GiB DDR4, both locators
-    /// `Controller<N>-ChannelA-DIMM0` (the channel is the Controller
-    /// index: 0→A, 1→B) → `DerivedMode::Dual` — against an MMIO decode
-    /// of `Single` (the `0xd800` residual) must resolve to
-    /// `DualSymmetric` with the `Override` trust tier, `dimm_count 2`,
-    /// and the non-empty override annotation.
-    #[test]
-    fn resolve_channel_l3_override_on_real_topology() {
-        let smbios = SmbiosTopology {
-            populated_count: 2,
-            dimm_sizes: vec![16384, 16384],
-            total_capacity_mib: 32768,
-            memory_type: Some(MemoryTech::Ddr4),
-            speed_mts: None,
-            locators: vec![
-                "Controller0-ChannelA-DIMM0".to_owned(),
-                "Controller1-ChannelA-DIMM0".to_owned(),
-            ],
-            derived_mode: DerivedMode::Dual,
-        };
-        let res = resolve_channel(Some(ChannelMode::Single), None, &smbios);
-        assert_eq!(res.mode, Some(ChannelMode::DualSymmetric));
-        assert_eq!(res.trust, Some(ChannelTrust::Override));
-        assert_eq!(res.tech, Some(MemoryTech::Ddr4));
-        assert_eq!(res.dimm_count, 2);
-        assert!(
-            !res.annotation.is_empty(),
-            "the L3 override carries the untrusted-MMIO annotation"
-        );
-    }
-
-    /// The decoded readout (every field type of `IntelChannel`) is
-    /// wire-safe: populated, fully degraded, and gen-gated shapes all
-    /// round-trip through bincode (the wire contract is unchanged).
+    /// The decoded readout is wire-safe: populated, fully degraded, and
+    /// gen-gated shapes all round-trip through bincode.
     #[test]
     fn decode_readout_bincode_round_trip() {
         for ro in [
@@ -5859,22 +3327,17 @@ mod tests {
     /// (c) The fixed channel-count model per [`IntelGen`].
     #[test]
     fn channel_count_model() {
-        // C-4: Meteor / Arrow Lake are dual-channel DDR5, so every
-        // desktop generation in this set is 2-channel.
         let two = [
             IntelGen::Skylake,
             IntelGen::KabyLake,
             IntelGen::CoffeeLake,
             IntelGen::CometLake,
-            // H-1: Ice Lake / Tiger Lake now resolve to the shared TIER1
-            // profile (2 channels).
             IntelGen::IceLake,
             IntelGen::TigerLake,
             IntelGen::Haswell,
             IntelGen::Broadwell,
             IntelGen::AlderLake,
             IntelGen::RaptorLake,
-            // C-4: Meteor / Arrow Lake are dual-channel DDR5 (2 channels).
             IntelGen::MeteorLake,
             IntelGen::ArrowLake,
             IntelGen::RocketLake,
@@ -5885,10 +3348,7 @@ mod tests {
         }
     }
 
-    /// The `/dev/mem` fallback map size is the 64 KiB (0x10000) Tier-1
-    /// datasheet window, and the highest Tier-1 register reads
-    /// (`MC_BIOS_REQ` @ `0x5E00`, a 4-byte access ending at `0x5E04`,
-    /// and ch1's `TC_WRWR`) both sit inside it.
+    /// The `/dev/mem` fallback map size is the 64 KiB Tier-1 window.
     #[test]
     fn devmem_fallback_map_is_64_kib() {
         assert_eq!(MCHBAR_WINDOW, 0x10000, "Tier-1 MCHBAR window is 64 KiB");
@@ -5898,8 +3358,7 @@ mod tests {
     }
 
     /// (e) The pure gate: Intel passes with its generation; AMD /
-    /// unknown yield `UnsupportedHardware` (the `read_intel`
-    /// short-circuit on any non-Intel host, no register access).
+    /// unknown yield `UnsupportedHardware`.
     #[test]
     fn intel_gen_gate_dispatches_by_vendor() {
         fn info(vendor: CpuVendor) -> CpuInfo {
@@ -5924,13 +3383,7 @@ mod tests {
         ));
     }
 
-    /// (e) The live gate behavior is vendor-consistent: on a non-Intel
-    /// host (the AMD reference host) it rejects with
-    /// `UnsupportedHardware` before any register could be read, and on
-    /// an Intel host it passes with the detected generation
-    /// (`intel_gen_gate(Intel(_)) -> Ok`). Vendor-neutral, so the test
-    /// passes on both the AMD reference host and the Intel CI runners
-    /// (CI portability).
+    /// (e) The live gate behavior is vendor-consistent.
     #[test]
     fn intel_gen_gate_behavior_is_vendor_consistent() {
         let detected = CpuInfo::detect();
@@ -5959,9 +3412,7 @@ mod tests {
         }
     }
 
-    /// The frozen readout types are `Clone` + `Debug` + `PartialEq`,
-    /// the live-decode fixture is deterministic, and an `IntelReadout`
-    /// holds the channel set.
+    /// The frozen readout types are `Clone` + `Debug` + `PartialEq`.
     #[test]
     fn readout_and_channel_traits() {
         fn bound<T: Clone + std::fmt::Debug + PartialEq>() {}
@@ -5979,7 +3430,6 @@ mod tests {
         let b = a.clone();
         assert_eq!(a, b);
         assert!(!format!("{a:?}").is_empty());
-        // deterministic: decoding the same registers twice is equal
         assert_eq!(
             a,
             fixture_intel_readout(
@@ -5997,10 +3447,7 @@ mod tests {
         assert_eq!(ro.channels[1].index, 1);
     }
 
-    /// (f) P3-04: a multi-channel `IntelReadout` — a fully populated
-    /// live-decoded channel plus an all-`Na` degradation channel —
-    /// round-trips through bincode, proving the Intel readout (every
-    /// field type of `IntelChannel`) is wire-safe.
+    /// (f) P3-04: a multi-channel `IntelReadout` round-trips through bincode.
     #[test]
     fn intel_readout_bincode_round_trip() {
         let mut ro = fixture_intel_readout(
@@ -6012,7 +3459,6 @@ mod tests {
         );
         ro.channel_mode = Some(ChannelMode::DualFlex);
         ro.ecc_status = EccStatus::CapableButDisabled;
-        // The Chunk 2 fields: a DDR4 Flex dual, verified-hardware trust.
         ro.memory_tech = Some(MemoryTech::Ddr4);
         ro.channel_trust = Some(ChannelTrust::VerifiedHardware);
         ro.dimm_count = 2;
@@ -6023,13 +3469,10 @@ mod tests {
             bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
         assert_eq!(ro, back);
         assert_eq!(back.ecc_status, EccStatus::CapableButDisabled);
-        // The Chunk 2 fields round-trip too.
         assert_eq!(back.memory_tech, Some(MemoryTech::Ddr4));
         assert_eq!(back.channel_trust, Some(ChannelTrust::VerifiedHardware));
         assert_eq!(back.dimm_count, 2);
 
-        // the fully degraded readout (every channel all-Na) is wire-safe
-        // too
         let all_na = fixture_intel_readout(
             IntelGen::Skylake,
             None,
@@ -6044,115 +3487,19 @@ mod tests {
         assert_eq!(all_na, back);
     }
 
-    /// Phase 1 confirming test (TC-ALK-DDR4): the Alder Lake **DDR4**
-    /// decode path. A DDR4 Alder Lake system (`MAD_INTER_CHANNEL[2:0] ==
-    /// 0`) routes to the `0xE000`/`0x1E000` TC blocks and decodes through
-    /// `ALDER_DDR4_FIELDS` — 2 channels (2 MCs × 1 channel, no
-    /// subchannels), the 64-bit `TC_PRE` split into low/high words, and
-    /// the DDR4 turnaround quartets. The seeded words decode to exactly
-    /// the timings placed in their documented bit positions
-    /// (self-consistent by construction).
-    #[test]
-    fn tc_alk_ddr4_decodes_alder_lake_ddr4_from_the_e000_blocks() {
-        let d4_tc = AlderDdr4TcRegs {
-            tc_pre_lo: Some(0x0051_0011), // tRP 17 / tRDPRE 8 / tPPD 5
-            tc_pre_hi: Some(0x0088_A019), // tRCD 17 / tRAS 40 / tWRPRE 25
-            tc_act: Some(0x0005_0C10), // tFAW 16 / tRRD_SG 6 / tRRD_DG 10
-            tc_rdrd: Some(0x140C_0806), // dd 20 / dr 12 / dg 8 / sg 6
-            tc_rdwr: Some(0x140C_0807), // dd 20 / dr 12 / dg 8 / sg 7
-            tc_wrrd: Some(0x2838_1404), // dd 20 / dr 14 / dg 10 / sg 4
-            tc_wrwr: Some(0x140C_0805), // dd 20 / dr 12 / dg 8 / sg 5
-            tc_odt: Some(0x1516_0000), // tCWL 21 / tCL 22
-            tc_rfp: Some(0x0200_0003), // tREFI9 2 / OREF_RI 3
-            tc_rftp: Some(0x02D0_1004), // tRFC 180 / tREFI 4100
-        };
-        let regs = IntelImcRegs {
-            mcbios_req: Some(0x0000_0120), // ratio 32 @ 100 MHz / 2 = 1600 MHz
-            mad_inter_channel: Some(0), // [2:0] == 0 -> DDR4 (the dispatch key)
-            alk_d4_tc0: d4_tc.clone(),
-            alk_d4_tc1: d4_tc,
-            ..IntelImcRegs::default()
-        };
-        let smbios = SmbiosTopology {
-            memory_type: Some(MemoryTech::Ddr4),
-            ..SmbiosTopology::empty()
-        };
-        // MAD_INTER_CHANNEL[2:0] == 0 -> DDR4 (the dispatch key).
-        let ro = decode(&regs, IntelGen::AlderLake, &smbios);
-
-        // 2 channels (2 MCs × 1 channel) — not the 4-subchannel DDR5
-        // geometry.
-        assert_eq!(ro.channels.len(), 2, "DDR4 Alder Lake = 2 channels");
-        assert_eq!(ro.memory_tech, Some(MemoryTech::Ddr4));
-
-        let ch = &ro.channels[0];
-        // MCLK = 32 @ 100 MHz / 2 = 1600 MHz (half-step, 11th-gen+ decode).
-        assert_eq!(ch.clocks.mclk_mhz, Section::Value(1600.0));
-        // The decoded DDR4 timings land exactly where the seed bits put
-        // them (TC_PRE high word: tRCD/tRAS; low word: tRP; TC_ODT:
-        // tCL/tCWL; TC_ACT: tFAW/tRRD_SG/tRRD_DG; TC_RFTP: tRFC).
-        assert_eq!(ch.timings.cl, Section::Value(22));
-        assert_eq!(ch.timings.cwl, Section::Value(21));
-        assert_eq!(ch.timings.rcdrd, Section::Value(17));
-        assert_eq!(ch.timings.rcwdwr, Section::Value(17));
-        assert_eq!(ch.timings.rp, Section::Value(17));
-        assert_eq!(ch.timings.ras, Section::Value(40));
-        assert_eq!(ch.timings.rc, Section::Value(57)); // tRAS 40 + tRP 17
-        assert_eq!(ch.timings.rrds, Section::Value(6));
-        assert_eq!(ch.timings.rrld, Section::Value(10));
-        assert_eq!(ch.timings.faw, Section::Value(16));
-        assert_eq!(ch.timings.rfc1, Section::Value(180));
-        // The DDR4 turnaround quartets (per-register widths).
-        assert_eq!(ch.timings.rdrd_scl, Section::Value(6));
-        assert_eq!(ch.timings.rdrd_sc, Section::Value(8));
-        assert_eq!(ch.timings.rdrd_sd, Section::Value(12));
-        assert_eq!(ch.timings.rdrd_dd, Section::Value(20));
-        assert_eq!(ch.timings.rdwr, Section::Value(8)); // TC_RDWR dg
-        assert_eq!(ch.timings.wtrs, Section::Value(10)); // TC_WRRD dg
-        assert_eq!(ch.timings.wtrl, Section::Value(4)); // TC_WRRD sg
-        assert_eq!(ch.timings.wrwr_scl, Section::Value(5));
-        assert_eq!(ch.timings.wrwr_sc, Section::Value(8));
-        assert_eq!(ch.timings.wrwr_sd, Section::Value(12));
-        assert_eq!(ch.timings.wrwr_dd, Section::Value(20));
-        // No tWR / tRTP / rfc2 / rfcsb slot in the DDR4 TC layout.
-        assert!(ch.timings.wr.is_na());
-        assert!(ch.timings.rtp.is_na());
-        assert!(ch.timings.rfc2.is_na());
-        assert!(ch.timings.rfcsb.is_na());
-        // Channel 1 decodes identically (the same seeded MC1 block).
-        assert_eq!(ro.channels[1].timings.cl, Section::Value(22));
-        assert_eq!(ro.channels[1].timings.rfc1, Section::Value(180));
-    }
-
     /// Phase 1 regression guard (TC-ALK-DDR5): a DDR5 Alder Lake system
-    /// (`MAD_INTER_CHANNEL[2:0] == 4`) still takes the 4-subchannel DDR5
-    /// path — the new DDR4 branch (keyed on `res.tech == Ddr4`) does not
-    /// steal it.
+    /// still takes the 4-subchannel DDR5 path.
     #[test]
     fn tc_alk_ddr5_still_routes_to_the_subchannel_path() {
         let mut regs = tier3_ddr5_condition_regs();
-        // MAD_INTER_CHANNEL[2:0] == 4 -> DDR5.
         regs.mad_inter_channel = Some(4);
         let ro = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 4, "DDR5 Alder Lake = 4 subchannels");
     }
 
-    /// TC-TEL4 (TEL-4): the known-wrong pre-v2.2.1 IMC skeleton is
-    /// gone — the legacy per-channel decode entry point, the legacy
-    /// frequency-ratio decoder, the legacy `decode_*` bit-field
-    /// helpers, and the legacy register table no longer exist in this
-    /// module's source; and the downstream fixture constructor
-    /// ([`fixture_intel_readout`]) builds its readout through the
-    /// **live** [`decode`] — the fixture's channel 0 decodes the
-    /// 1600 MHz MCLK from the `MC_BIOS_REQ` word (not the skeleton's
-    /// ratio register), channel 1 is the all-Na degradation, and the
-    /// readout carries the canonical empty resolution state.
+    /// TC-TEL4 (TEL-4): the known-wrong pre-v2.2.1 IMC skeleton is gone.
     #[test]
     fn tc_tel4_legacy_skeleton_is_gone_and_fixtures_use_the_live_decode() {
-        // (1) The legacy surface is gone from the module source. The
-        // identifiers are assembled from pairs at runtime so this test's
-        // own source never contains the literal (a self-reference would
-        // trip its own scan).
         let src = include_str!("mod.rs");
         let gone: Vec<String> = [
             ("decode", "channel"),
@@ -6185,26 +3532,19 @@ mod tests {
             );
         }
 
-        // (2) The fixture constructor builds through the live decode.
         let ro = fixture_intel_readout(
             IntelGen::Skylake,
-            Some(0x0000_000C), // ratio 12 @ 133.3333 MHz → 1600 MHz
+            Some(0x0000_000C),
             &fixture_channel_regs(),
             &ChannelRegs::default(),
             false,
         );
         assert_eq!(ro.channels.len(), 2);
-        // Channel 0: the live MCLK decode over the §6.1 acceptance raws.
         assert_eq!(ro.channels[0].clocks.mclk_mhz, Section::Value(1600.0));
         assert_eq!(ro.channels[0].timings.cl, Section::Value(17));
-        // Channel 1: the per-channel-register degradation — its timing
-        // cells are all Na (every `TC_*` register absent); the MCLK is
-        // the global `MC_BIOS_REQ` decode, shared by both channels (the
-        // live model).
         assert_eq!(ro.channels[1].clocks.mclk_mhz, Section::Value(1600.0));
         assert!(ro.channels[1].timings.cl.is_na());
         assert!(ro.channels[1].timings.ras.is_na());
-        // The canonical empty resolution state (no MAD raws, no SMBIOS).
         assert_eq!(ro.channel_mode, None);
         assert_eq!(ro.channel_trust, None);
         assert!(ro.channel_annotation.is_empty());
@@ -6212,323 +3552,15 @@ mod tests {
         assert_eq!(ro.ecc_status, EccStatus::Unknown);
     }
 
-    /// decode_ecc_status maps the raw CAPID0_A bit 17 (ECC_DIS) to the
-    /// EccStatus verdict (the i5-6600T live value 0x62012671 is
-    /// CapableButDisabled; a bit-17-set value is NotCapable; absent is
-    /// Unknown).
-    #[test]
-    fn decode_ecc_status_maps_capid0a_bit17() {
-        // Live-verified i5-6600T value: bit 17 clear -> CapableButDisabled.
-        assert_eq!(decode_ecc_status(Some(0x6201_2671)), EccStatus::CapableButDisabled);
-        // Bit 17 set (ECC_DIS) -> NotCapable.
-        assert_eq!(decode_ecc_status(Some(0x0002_0000)), EccStatus::NotCapable);
-        // H-10: bus-fault word is not a valid capability assertion.
-        assert_eq!(decode_ecc_status(Some(0xFFFF_FFFF)), EccStatus::Unknown);
-        // H-10: zero word is equally suspicious.
-        assert_eq!(decode_ecc_status(Some(0)), EccStatus::Unknown);
-        // Absent raw -> Unknown.
-        assert_eq!(decode_ecc_status(None), EccStatus::Unknown);
-    }
-
     // -----------------------------------------------------------------
-    // ChannelMode / MemoryTech (the capacity-derived + 4-tier model).
+    // C-3 aliasing policy tests.
     // -----------------------------------------------------------------
-
-    /// `MemoryTech::from_mad_bits` decodes the `DDR_TYPE` field
-    /// (`MAD_INTER_CHANNEL[2:0]`): 000=DDR4, 001=DDR3, 010=LPDDR4,
-    /// 011=LPDDR5, 100=DDR5; reserved (5-7) → Unknown; high bits masked.
-    #[test]
-    fn memory_tech_from_mad_bits() {
-        assert_eq!(MemoryTech::from_mad_bits(0x0), MemoryTech::Ddr4);
-        assert_eq!(MemoryTech::from_mad_bits(0x1), MemoryTech::Ddr3);
-        assert_eq!(MemoryTech::from_mad_bits(0x2), MemoryTech::Lpddr4);
-        assert_eq!(MemoryTech::from_mad_bits(0x3), MemoryTech::Lpddr5);
-        assert_eq!(MemoryTech::from_mad_bits(0x4), MemoryTech::Ddr5);
-        assert_eq!(MemoryTech::from_mad_bits(0x5), MemoryTech::Unknown);
-        assert_eq!(MemoryTech::from_mad_bits(0x6), MemoryTech::Unknown);
-        assert_eq!(MemoryTech::from_mad_bits(0x7), MemoryTech::Unknown);
-        // Only bits [2:0] are read (the rest is masked away).
-        assert_eq!(MemoryTech::from_mad_bits(0xFFFF_FFF4), MemoryTech::Ddr5);
-    }
-
-    /// `MemoryTech::from_smbios_type` decodes the SMBIOS Type 17
-    /// memory-type byte (offset `0x12`): 0x1A=DDR4, 0x22=DDR5; anything
-    /// else → None.
-    #[test]
-    fn memory_tech_from_smbios_type() {
-        assert_eq!(MemoryTech::from_smbios_type(0x1A), Some(MemoryTech::Ddr4));
-        assert_eq!(MemoryTech::from_smbios_type(0x22), Some(MemoryTech::Ddr5));
-        assert_eq!(MemoryTech::from_smbios_type(0x00), None);
-        assert_eq!(MemoryTech::from_smbios_type(0xFF), None);
-    }
-
-    /// The full channel label + the short "Mode:" label.
-    #[test]
-    fn channel_mode_labels() {
-        assert_eq!(ChannelMode::DualSymmetric.label(), "Dual-Channel (Symmetric)");
-        assert_eq!(ChannelMode::DualFlex.label(), "Dual-Channel (Flex)");
-        assert_eq!(ChannelMode::Single.label(), "Single-Channel");
-
-        assert_eq!(ChannelMode::DualSymmetric.mode_label(), "Interleaved");
-        assert_eq!(ChannelMode::DualFlex.mode_label(), "Flex");
-        assert_eq!(ChannelMode::Single.mode_label(), "N/A");
-    }
-
-    /// The DDR5 display label: a dual-channel DDR5 config renders
-    /// "Dual-Channel (4x 32-bit Subchannels)" — never "quad-channel"
-    /// (research: a 128-bit aggregate bus is dual-channel). DDR4 / unknown
-    /// / single keep their labels.
-    #[test]
-    fn channel_mode_display_label_ddr5_subchannels_not_quad() {
-        assert_eq!(
-            ChannelMode::DualSymmetric.display_label(Some(MemoryTech::Ddr5)),
-            "Dual-Channel (4x 32-bit Subchannels)"
-        );
-        assert_eq!(
-            ChannelMode::DualFlex.display_label(Some(MemoryTech::Ddr5)),
-            "Dual-Channel (4x 32-bit Subchannels)"
-        );
-        assert_eq!(
-            ChannelMode::DualSymmetric.display_label(Some(MemoryTech::Ddr4)),
-            "Dual-Channel (Symmetric)"
-        );
-        assert_eq!(
-            ChannelMode::DualSymmetric.display_label(None),
-            "Dual-Channel (Symmetric)"
-        );
-        assert_eq!(
-            ChannelMode::Single.display_label(Some(MemoryTech::Ddr5)),
-            "Single-Channel"
-        );
-    }
-
-    /// The corrected 0.5 GiB DIMM-size layout: `DIMM_L_SIZE [6:0]` +
-    /// `DIMM_S_SIZE [22:16]`, each a 7-bit index × 0.5 GiB (a 16 GiB DIMM
-    /// is index 32, not the pre-Chunk-2 1 GiB index 16).
-    #[test]
-    fn mad_dimm_capacity_gib_0_5gib_layout() {
-        assert_eq!(mad_dimm_capacity_gib(None), None);
-        // M-11: zero word is degenerate (screened out).
-        assert_eq!(mad_dimm_capacity_gib(Some(0x0)), None);
-        // M-11: bus-fault word is degenerate (screened out).
-        assert_eq!(mad_dimm_capacity_gib(Some(0xFFFF_FFFF)), None);
-        // 16 GiB in slot 0 (index 32: 32 * 0.5 = 16 GiB).
-        assert_eq!(mad_dimm_capacity_gib(Some(0x20)), Some(16.0));
-        // 8 GiB slot 0 (index 16) + 16 GiB slot 1 (index 32 << 16).
-        assert_eq!(mad_dimm_capacity_gib(Some(0x20_0010)), Some(24.0));
-        // 32 GiB slot 0 (index 64) alone.
-        assert_eq!(mad_dimm_capacity_gib(Some(0x40)), Some(32.0));
-    }
-
-    /// The capacity-derived mode table (Chunk 2): CH_S==0 → Single;
-    /// CH_S>0 && ==CH_L → DualSymmetric; 0<CH_S<CH_L → DualFlex;
-    /// ill-formed (ch_s>ch_l, negative, non-finite) → None.
-    #[test]
-    fn channel_mode_from_capacity_table() {
-        assert_eq!(channel_mode_from_capacity(0.0, 16.0), Some(ChannelMode::Single));
-        assert_eq!(channel_mode_from_capacity(0.0, 32.0), Some(ChannelMode::Single));
-        assert_eq!(
-            channel_mode_from_capacity(16.0, 16.0),
-            Some(ChannelMode::DualSymmetric)
-        );
-        assert_eq!(
-            channel_mode_from_capacity(32.0, 32.0),
-            Some(ChannelMode::DualSymmetric)
-        );
-        assert_eq!(channel_mode_from_capacity(8.0, 16.0), Some(ChannelMode::DualFlex));
-        assert_eq!(
-            channel_mode_from_capacity(16.0, 32.0),
-            Some(ChannelMode::DualFlex)
-        );
-        assert_eq!(channel_mode_from_capacity(16.0, 8.0), None);
-        assert_eq!(channel_mode_from_capacity(-1.0, 16.0), None);
-        assert_eq!(channel_mode_from_capacity(f64::NAN, 16.0), None);
-        assert_eq!(channel_mode_from_capacity(16.0, f64::INFINITY), None);
-    }
-
-    /// `mmio_channel_mode`: both channel sums readable + at least one
-    /// populated → the capacity-derived mode; both absent or both zero →
-    /// `None` (the MMIO is "blocked" → `resolve_channel` falls to SMBIOS).
-    #[test]
-    fn mmio_channel_mode_blocked_and_populated() {
-        // 2×16 GiB (index 32 each) -> DualSymmetric.
-        assert_eq!(
-            mmio_channel_mode(Some(0x20), Some(0x20)),
-            Some(ChannelMode::DualSymmetric)
-        );
-        // 8 + 16 GiB (index 16 + 32) -> DualFlex.
-        assert_eq!(
-            mmio_channel_mode(Some(0x10), Some(0x20)),
-            Some(ChannelMode::DualFlex)
-        );
-        // M-11: 16 GiB on ch0 + zero word on ch1 -> the zero is screened
-        // as degenerate, so the MMIO is blocked (None) — the SMBIOS tier
-        // handles the single-channel case.
-        assert_eq!(mmio_channel_mode(Some(0x20), Some(0x0)), None);
-        // Both absent -> blocked (None).
-        assert_eq!(mmio_channel_mode(None, None), None);
-        // Both zero (no population) -> blocked (None).
-        assert_eq!(mmio_channel_mode(Some(0x0), Some(0x0)), None);
-        // M-11: bus-fault word on one channel -> blocked (None).
-        assert_eq!(mmio_channel_mode(Some(0xFFFF_FFFF), Some(0x20)), None);
-    }
-
-    /// The IMC base selection is keyed on the CPU generation (NOT the
-    /// overlapping PCI Device-ID ranges): 12th-gen+ → 0xd800, 6th-11th
-    /// gen → 0x5000 (the kernel module uses the same set).
-    #[test]
-    fn imc_base_for_selects_by_generation() {
-        for gen in [
-            IntelGen::AlderLake,
-            IntelGen::RaptorLake,
-            IntelGen::MeteorLake,
-            IntelGen::ArrowLake,
-            IntelGen::LunarLake,
-            IntelGen::CoreSeries1Mobile,
-        ] {
-            assert_eq!(imc_base_for(gen), 0xD800, "{gen:?}");
-            assert!(is_12th_gen_plus(gen), "{gen:?}");
-        }
-        for gen in [
-            IntelGen::Skylake,
-            IntelGen::KabyLake,
-            IntelGen::CoffeeLake,
-            IntelGen::CometLake,
-            IntelGen::IceLake,
-            IntelGen::TigerLake,
-            IntelGen::RocketLake,
-            IntelGen::Unrecognized,
-        ] {
-            assert_eq!(imc_base_for(gen), 0x5000, "{gen:?}");
-            assert!(!is_12th_gen_plus(gen), "{gen:?}");
-        }
-    }
-
-    /// A synthetic SMBIOS topology fixture (the 4-tier tests).
-    fn smbios_topology(
-        populated: u8,
-        derived: DerivedMode,
-        tech: Option<MemoryTech>,
-    ) -> SmbiosTopology {
-        SmbiosTopology {
-            populated_count: populated,
-            dimm_sizes: (0..populated).map(|_| 16384).collect(),
-            total_capacity_mib: (populated as u32) * 16384,
-            memory_type: tech,
-            speed_mts: None,
-            locators: (0..populated).map(|i| format!("Ch{i}")).collect(),
-            derived_mode: derived,
-        }
-    }
-
-    /// The 4-tier trust procedure, one arm per tier (L1 verified-hardware,
-    /// L2 verified-firmware, L3 override, L4 heuristic, terminal):
-    /// `resolve_channel` pins `(mode, trust, annotation)` for each.
-    #[test]
-    fn resolve_channel_four_tiers_l1_l4() {
-        // L1: MMIO dual (the hardware authority), no annotation.
-        let r = resolve_channel(
-            Some(ChannelMode::DualSymmetric),
-            Some(MemoryTech::Ddr4),
-            &smbios_topology(2, DerivedMode::Dual, Some(MemoryTech::Ddr4)),
-        );
-        assert_eq!(r.mode, Some(ChannelMode::DualSymmetric));
-        assert_eq!(r.trust, Some(ChannelTrust::VerifiedHardware));
-        assert_eq!(r.tech, Some(MemoryTech::Ddr4));
-        assert_eq!(r.annotation, "");
-        assert_eq!(r.dimm_count, 2);
-
-        // L3 (the safety override): MMIO single + SMBIOS 2 DIMMs across
-        // channels -> Dual + Override + the untrusted-MMIO annotation.
-        let r = resolve_channel(
-            Some(ChannelMode::Single),
-            None,
-            &smbios_topology(2, DerivedMode::Dual, None),
-        );
-        assert_eq!(r.mode, Some(ChannelMode::DualSymmetric));
-        assert_eq!(r.trust, Some(ChannelTrust::Override));
-        assert!(r.annotation.contains("Override"), "{:?}", r.annotation);
-        assert!(r.annotation.contains("2 DIMMs"), "{:?}", r.annotation);
-
-        // L1 single: MMIO single + SMBIOS agrees (1 DIMM) -> Single, no
-        // override.
-        let r = resolve_channel(
-            Some(ChannelMode::Single),
-            None,
-            &smbios_topology(1, DerivedMode::Single, None),
-        );
-        assert_eq!(r.mode, Some(ChannelMode::Single));
-        assert_eq!(r.trust, Some(ChannelTrust::VerifiedHardware));
-        assert_eq!(r.annotation, "");
-
-        // L2: MMIO blocked (None) + SMBIOS 2 DIMMs across channels -> Dual,
-        // VerifiedFirmware.
-        let r = resolve_channel(
-            None,
-            Some(MemoryTech::Ddr5),
-            &smbios_topology(2, DerivedMode::Dual, Some(MemoryTech::Ddr5)),
-        );
-        assert_eq!(r.mode, Some(ChannelMode::DualSymmetric));
-        assert_eq!(r.trust, Some(ChannelTrust::VerifiedFirmware));
-        assert_eq!(r.tech, Some(MemoryTech::Ddr5));
-        assert!(r.annotation.contains("MMIO Inaccessible"));
-
-        // L2 single: MMIO blocked + SMBIOS 2 DIMMs on the same channel ->
-        // Single, VerifiedFirmware.
-        let r = resolve_channel(None, None, &smbios_topology(2, DerivedMode::Single, None));
-        assert_eq!(r.mode, Some(ChannelMode::Single));
-        assert_eq!(r.trust, Some(ChannelTrust::VerifiedFirmware));
-
-        // L4: MMIO blocked + SMBIOS ambiguous locators -> Dual heuristic.
-        let r = resolve_channel(None, None, &smbios_topology(2, DerivedMode::Ambiguous, None));
-        assert_eq!(r.mode, Some(ChannelMode::DualSymmetric));
-        assert_eq!(r.trust, Some(ChannelTrust::Heuristic));
-        assert!(r.annotation.contains("Heuristic"));
-
-        // Terminal: MMIO blocked + no SMBIOS population -> None mode,
-        // ChannelTrust::None.
-        let r = resolve_channel(None, None, &SmbiosTopology::empty());
-        assert_eq!(r.mode, None);
-        assert_eq!(r.trust, Some(ChannelTrust::None));
-        assert!(r.annotation.contains("Error"));
-    }
-
-    /// (M-15) The soft annotation fallback: the MMIO decoded Single and
-    /// SMBIOS confirms ≥ 2 DIMMs, but the locators carry no channel
-    /// designation (`Ambiguous`). The channel count is unresolvable from
-    /// firmware, so the Single verdict is kept (soft) and the M-15
-    /// annotation is carried.
-    #[test]
-    fn resolve_channel_m15_single_with_ambiguous_locators_annotates() {
-        let r = resolve_channel(
-            Some(ChannelMode::Single),
-            None,
-            &smbios_topology(2, DerivedMode::Ambiguous, None),
-        );
-        assert_eq!(r.mode, Some(ChannelMode::Single));
-        assert_eq!(r.trust, Some(ChannelTrust::VerifiedHardware));
-        assert!(
-            r.annotation.contains("unresolvable from firmware locators"),
-            "{:?}",
-            r.annotation
-        );
-        assert!(r.annotation.contains("2 DIMMs"), "{:?}", r.annotation);
-        assert_eq!(r.dimm_count, 2);
-    }
 
     /// (C-3) When the resolved tech is DDR4, the `0xD800` page is the MAD
-    /// block, so the MCL1 timing words (the same page) are **not** decoded:
-    /// a subchannel whose mirror is a disabled default falls back to the
-    /// (now nulled) MCL1 words and degrades to N/A, not a fabricated MCL1
-    /// timing. The MAD geometry (channel mode / tech) is still trusted.
+    /// block, so the MCL1 timing words are **not** decoded.
     #[test]
     fn c3_ddr4_mcl1_timing_not_decoded() {
-        // The mirror for subchannel 2 is a disabled default (bus-fault), so
-        // without the C-3 fix it would fall back to the MCL1 words; the MCL1
-        // block (0xD800) carries valid-looking timing words.
-        // MAD geometry (0xD800 page): mad_inter with DDR_TYPE bits = 000
-        // (DDR4). OQ-11: no MAD_DIMM_CH2/CH3 -> the 2-channel DDR4 geometry.
-        let mad_inter = 0x100u32; // [2:0] = 000 -> DDR4
+        let mad_inter = 0x100u32;
         let regs = IntelImcRegs {
             ch2: ChannelRegs {
                 tc_dbp: Some(0xFFFF_FFFF),
@@ -6554,21 +3586,14 @@ mod tests {
             ..Default::default()
         };
 
-        // L-10: the 3-arg decode (the MAD geometry rides on `regs`).
         let readout = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
 
-        // res.tech == Some(Ddr4) -> the C-3 Mad policy nulls the MCL1
-        // timing words; subchannel 2's mirror is a disabled default, so its
-        // timings are N/A (NOT decoded from the aliased MCL1 words).
         assert_eq!(readout.memory_tech, Some(MemoryTech::Ddr4));
-        // M-7: the 2-channel DDR4 default's second channel (subchannel 2)
-        // sits at display position 1.
         let ch2 = readout
             .channels
             .iter()
             .find(|c| c.index == 1)
             .expect("second channel (subchannel 2) present");
-        // tRCD (from TC_PRE) and tCL (from TC_ACT) must both be N/A.
         assert!(
             matches!(ch2.timings.rcdrd, Section::Na(_)),
             "MCL1 tRCD must not be decoded for DDR4: {:?}",
@@ -6581,14 +3606,7 @@ mod tests {
         );
     }
 
-    /// N-04: the C-3 circularity de-risk. The MAD word says DDR5
-    /// (`MAD_INTER_CHANNEL[2:0] = 100b` — a word read from the very
-    /// `0xD800` page whose ownership is in question) while the
-    /// independent SMBIOS Type 17 source says DDR4: the policy
-    /// selection trusts the firmware-written (not MMIO-read) SMBIOS
-    /// source (C3AliasPolicy::Mad — the `0xD800` page is the MAD
-    /// block), the aliased MCL1 timing words (the same page) are nulled
-    /// and NOT decoded, and the discrepancy is annotated.
+    /// N-04: the C-3 circularity de-risk.
     #[test]
     fn c3_smbios_crosscheck_trusts_smbios_on_disagreement() {
         let smbios = SmbiosTopology {
@@ -6596,36 +3614,24 @@ mod tests {
             ..SmbiosTopology::empty()
         };
         let regs = IntelImcRegs {
-            // Subchannel 2's mirror is a disabled default (bus-fault):
-            // without the SMBIOS-trusted Mad policy it would fall back
-            // to the aliased MCL1 words below.
             ch2: ChannelRegs {
                 tc_rap: Some(0xFFFF_FFFF),
                 ..ChannelRegs::default()
             },
-            // The aliased MCL1 block (same `0xD800` page) carries a
-            // valid-looking tCL 40 word.
             mcl1: MclRegs {
                 tc_act: Some(0x0028_8410),
                 ..MclRegs::default()
             },
-            // MAD says DDR5 (bits [2:0] = 100b).
             mad_inter_channel: Some(4),
             ..IntelImcRegs::default()
         };
         let ro = decode(&regs, IntelGen::AlderLake, &smbios);
-        // The readout keeps the resolved (MAD-first) tech for display...
         assert_eq!(ro.memory_tech, Some(MemoryTech::Ddr5));
-        // ...but the policy selection is annotated with the
-        // MAD/SMBIOS discrepancy.
         assert!(
             ro.channel_annotation.contains("disagrees with SMBIOS"),
             "the C-3 cross-check annotates the disagreement: {}",
             ro.channel_annotation
         );
-        // SMBIOS-trusted Mad policy: the MCL1 words (same page) are
-        // nulled, so the disabled mirror falls back to nothing — tCL is
-        // Na, NOT the fabricated 40.
         let ch2 = ro
             .channels
             .iter()
@@ -6639,8 +3645,7 @@ mod tests {
     }
 
     /// N-04: when the MAD-derived tech and the SMBIOS Type 17 tech
-    /// AGREE, the cross-check is silent (no discrepancy annotation) and
-    /// the policy keys on the agreed tech exactly as before.
+    /// AGREE, the cross-check is silent.
     #[test]
     fn c3_smbios_crosscheck_silent_when_agreeing() {
         let smbios = SmbiosTopology {
@@ -6648,7 +3653,6 @@ mod tests {
             ..SmbiosTopology::empty()
         };
         let mut regs = tier3_ddr5_condition_regs();
-        // MAD [2:0] = 000 -> DDR4, agreeing with the SMBIOS source.
         regs.mad_inter_channel = Some(0);
         let ro = decode(&regs, IntelGen::AlderLake, &smbios);
         assert_eq!(
@@ -6664,21 +3668,25 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // 4-tier channel resolution end-to-end.
+    // -----------------------------------------------------------------
+
     /// The exact user bug, end to end: a dual-channel 2×16 GiB system
-    /// whose MMIO is blocked (M-11: the zero word on ch1 is screened as
-    /// degenerate), while SMBIOS Type 17 confirms two populated DIMMs
-    /// across channels A/B. The L2 firmware-verified tier reports Dual
-    /// with the single-source display label.
-    ///
-    /// (The L3 override path — MMIO decodes Single + SMBIOS confirms
-    /// Dual — is pinned by `resolve_channel_l3_override_on_real_topology`
-    /// which calls `resolve_channel` directly.)
+    /// whose MMIO is blocked.
     #[test]
     fn decode_l3_override_single_mmio_dual_smbios() {
-        let smbios = smbios_topology(2, DerivedMode::Dual, Some(MemoryTech::Ddr4));
-        // 16 GiB on ch0 (index 32) + 0 on ch1 (M-11: screened) -> MMIO blocked.
+        let smbios = SmbiosTopology {
+            populated_count: 2,
+            dimm_sizes: vec![16384, 16384],
+            total_capacity_mib: 32768,
+            memory_type: Some(MemoryTech::Ddr4),
+            speed_mts: None,
+            locators: vec!["Ch0".to_owned(), "Ch1".to_owned()],
+            derived_mode: DerivedMode::Dual,
+        };
         let mut regs = acceptance_regs();
-        regs.mad_inter_channel = Some(0x0); // DDR_TYPE = DDR4
+        regs.mad_inter_channel = Some(0x0);
         regs.mad_dimm_ch0 = Some(0x20);
         regs.mad_dimm_ch1 = Some(0x0);
         let ro = decode(&regs, IntelGen::AlderLake, &smbios);
@@ -6690,7 +3698,6 @@ mod tests {
         assert_eq!(ro.channel_trust, Some(ChannelTrust::VerifiedFirmware));
         assert_eq!(ro.memory_tech, Some(MemoryTech::Ddr4));
         assert_eq!(ro.dimm_count, 2);
-        // The single source of truth both frontends render:
         assert_eq!(
             ro.channel_display_label(),
             Some("Dual-Channel (Symmetric)".to_owned())
@@ -6698,13 +3705,9 @@ mod tests {
     }
 
     /// End to end (the 4-tier model): the Tier-1 decode resolves the
-    /// channel mode through `resolve_channel`. A dual MMIO decode
-    /// (2×16 GiB) is L1 verified-hardware; a single MMIO decode (16 GiB on
-    /// ch0) with no SMBIOS is L1 verified-single; absent / zero MMIO raws
-    /// with no SMBIOS is the terminal `None`.
+    /// channel mode through `resolve_channel`.
     #[test]
     fn decode_tier1_channel_mode_4_tier() {
-        // 2×16 GiB (index 32 each) -> DualSymmetric, L1.
         let mut regs = acceptance_regs();
         regs.mad_inter_channel = Some(0x0);
         regs.mad_dimm_ch0 = Some(0x20);
@@ -6713,9 +3716,6 @@ mod tests {
         assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));
         assert_eq!(ro.channel_trust, Some(ChannelTrust::VerifiedHardware));
 
-        // M-11: 16 GiB on ch0 + zero word on ch1 -> the zero is screened
-        // as degenerate, so the MMIO is blocked; with no SMBIOS the
-        // resolution is the terminal state.
         let mut regs = acceptance_regs();
         regs.mad_inter_channel = Some(0x0);
         regs.mad_dimm_ch0 = Some(0x20);
@@ -6724,7 +3724,6 @@ mod tests {
         assert_eq!(ro.channel_mode, None);
         assert_eq!(ro.channel_trust, Some(ChannelTrust::None));
 
-        // Absent MMIO raws + no SMBIOS -> terminal None.
         let mut regs = acceptance_regs();
         regs.mad_inter_channel = Some(0x0);
         let ro = decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty());
@@ -6733,424 +3732,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Server-uncore decode (Haswell-E / Broadwell-E / Skylake-X /
-    // Cascade Lake): SMBIOS + SPD sourcing, honest N/A for MC-live.
+    // C-2 degenerate-word screening.
     // -----------------------------------------------------------------
 
-    /// A populated SMBIOS Type 17 topology (2 × 8 GiB DDR4 across two
-    /// channels — the x99 reference shape).
-    fn server_smbios() -> SmbiosTopology {
-        SmbiosTopology {
-            populated_count: 2,
-            dimm_sizes: vec![8192, 8192],
-            total_capacity_mib: 16384,
-            memory_type: Some(MemoryTech::Ddr4),
-            speed_mts: Some(2400),
-            locators: vec!["A1".to_owned(), "B1".to_owned()],
-            derived_mode: DerivedMode::Dual,
-        }
-    }
-
-    /// A DDR4 SPD module with a factory profile carrying the given rated
-    /// timings.
-    fn server_spd_module(
-        index: u8,
-        speed_mts: u16,
-        cl: u8,
-        trcd: u8,
-        trp: u8,
-        tras: u8,
-    ) -> SpdModule {
-        SpdModule {
-            index,
-            is_ddr5: false,
-            maker: Section::Value("Samsung".to_owned()),
-            die_maker: Section::Value("Samsung".to_owned()),
-            die_type: Section::na(NaReason::NotApplicable),
-            devices: Section::Value(16),
-            part: Section::Value("M393B2K40DB0-ITD".to_owned()),
-            serial: Section::Value("0ABC1234".to_owned()),
-            rank: Section::Value(1),
-            density_mbit: Section::Value(16384),
-            speed_mts: Section::Value(speed_mts),
-            profiles: vec![SpdProfile {
-                index: 1,
-                speed_mts: Section::Value(speed_mts),
-                cas: Section::Value(cl),
-                trcd: Section::Value(trcd),
-                trp: Section::Value(trp),
-                tras: Section::Value(tras),
-                voltage: Section::Value(1200),
-            }],
-        }
-    }
-
-    /// `is_server_gen` classifies the four server-uncore generations and
-    /// rejects every client / unprofiled generation.
-    #[test]
-    fn is_server_gen_classifies_server_platforms() {
-        for gen in [
-            IntelGen::HaswellE,
-            IntelGen::BroadwellE,
-            IntelGen::SkylakeX,
-            IntelGen::CascadeLake,
-        ] {
-            assert!(is_server_gen(gen), "{gen:?} is a server gen");
-        }
-        for gen in [
-            IntelGen::Skylake,
-            IntelGen::KabyLake,
-            IntelGen::CoffeeLake,
-            IntelGen::CometLake,
-            IntelGen::RocketLake,
-            IntelGen::AlderLake,
-            IntelGen::RaptorLake,
-            IntelGen::MeteorLake,
-            IntelGen::ArrowLake,
-            IntelGen::Unrecognized,
-        ] {
-            assert!(!is_server_gen(gen), "{gen:?} is not a server gen");
-        }
-    }
-
-    /// The Broadwell-E (x99 reference) server decode: 4 channels, MCLK from
-    /// the SPD rated speed (2400 MT/s → 1200 MHz), the four SPD-rated core
-    /// timings (+ the synthesized tRC) as `Value`s, every other MC-live
-    /// timing the honest server-uncore N/A, the SMBIOS topology carried
-    /// (dual-channel, DDR4, 2 DIMMs), and the honest source annotation.
-    #[test]
-    fn decode_server_broadwell_e_sources_smbios_and_spd() {
-        let smbios = server_smbios();
-        let spd = vec![
-            server_spd_module(0x50, 2400, 16, 16, 16, 32),
-            server_spd_module(0x51, 2400, 16, 16, 16, 32),
-        ];
-        let ro = decode_server(&smbios, &spd, IntelGen::BroadwellE);
-
-        // Quad-channel Broadwell-E.
-        assert_eq!(ro.channels.len(), 4, "Broadwell-E is quad-channel");
-        // MCLK = SPD rated speed / 2 (2400 MT/s → 1200 MHz); UCLK = MCLK
-        // (the MC runs at the DRAM clock).
-        assert_eq!(ro.channels[0].clocks.mclk_mhz, Section::Value(1200.0));
-        assert_eq!(ro.channels[0].clocks.uclk_mhz, Section::Value(1200.0));
-        // The four SPD-rated core timings + the synthesized tRC.
-        let t = &ro.channels[0].timings;
-        assert_eq!(t.cl, Section::Value(16));
-        assert_eq!(t.rcdrd, Section::Value(16));
-        assert_eq!(t.rcwdwr, Section::Value(16));
-        assert_eq!(t.rp, Section::Value(16));
-        assert_eq!(t.ras, Section::Value(32));
-        assert_eq!(t.rc, Section::Value(48), "tRC = tRAS + tRP");
-        // Every other MC-live timing: the honest server-uncore N/A.
-        let na = NaReason::ParseError(SERVER_NA_REASON.to_owned());
-        assert_eq!(t.rrds, Section::Na(na.clone()));
-        assert_eq!(t.faw, Section::Na(na.clone()));
-        assert_eq!(t.rfc1, Section::Na(na.clone()));
-        assert_eq!(t.rdrd_dd, Section::Na(na.clone()));
-        // CAD bus / voltages / RTL: the honest server-uncore reason (not a
-        // generic "not applicable" — there is no OS-accessible source).
-        assert_eq!(ro.channels[0].cad_bus.proc_odt, Section::Na(na.clone()));
-        assert_eq!(ro.channels[0].voltages.vddio_mem_mv, Section::Na(na.clone()));
-        assert_eq!(ro.channels[0].rtl, Section::Na(na));
-        // The SMBIOS topology is carried (dual-channel, DDR4, 2 DIMMs).
-        assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));
-        assert_eq!(ro.memory_tech, Some(MemoryTech::Ddr4));
-        assert_eq!(ro.dimm_count, 2);
-        assert_eq!(ro.ecc_status, EccStatus::Unknown);
-        // The honest source annotation names the server-uncore limitation,
-        // the SPD-rated provenance, and the populated/total channel count.
-        assert!(ro.channel_annotation.contains("Server uncore"));
-        assert!(ro.channel_annotation.contains("SPD-rated"));
-        assert!(ro.channel_annotation.contains("2 of 4"));
-    }
-
-    /// An empty SPD list: the MCLK / UCLK now come from the SMBIOS
-    /// Configured Memory Speed (the server-uncore fallback — the SPD EEPROM
-    /// is not OS-visible on these platforms), while the SPD-rated timings
-    /// degrade to the honest server-uncore N/A. The SMBIOS topology still
-    /// carries the readout (no panic, no invention).
-    #[test]
-    fn decode_server_empty_spd_degrades_timings_keeps_smbios() {
-        let smbios = server_smbios();
-        let ro = decode_server(&smbios, &[], IntelGen::BroadwellE);
-        assert_eq!(ro.channels.len(), 4);
-        // The SMBIOS speed (2400 MT/s) fills the MCLK / UCLK.
-        assert_eq!(ro.channels[0].clocks.mclk_mhz, Section::Value(1200.0));
-        assert_eq!(ro.channels[0].clocks.uclk_mhz, Section::Value(1200.0));
-        // The SPD-rated timings have no module → the honest server-uncore N/A.
-        assert!(ro.channels[0].timings.cl.is_na());
-        // The SMBIOS topology still resolves.
-        assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));
-        assert_eq!(ro.dimm_count, 2);
-        assert_eq!(ro.memory_tech, Some(MemoryTech::Ddr4));
-    }
-
-    /// No SPD module **and** no SMBIOS speed (the fully-degraded server
-    /// case): the MCLK / UCLK degrade to `Na(NotApplicable)` — never a
-    /// fabricated value — and the timings carry the honest server-uncore
-    /// reason.
-    #[test]
-    fn decode_server_no_speed_anywhere_degrades_clocks() {
-        let ro = decode_server(&SmbiosTopology::empty(), &[], IntelGen::BroadwellE);
-        assert_eq!(ro.channels.len(), 4);
-        assert_eq!(
-            ro.channels[0].clocks.mclk_mhz,
-            Section::na(NaReason::NotApplicable)
-        );
-        assert_eq!(
-            ro.channels[0].clocks.uclk_mhz,
-            Section::na(NaReason::NotApplicable)
-        );
-        let na = NaReason::ParseError(SERVER_NA_REASON.to_owned());
-        assert_eq!(ro.channels[0].timings.cl, Section::Na(na.clone()));
-        assert_eq!(ro.channels[0].rtl, Section::Na(na));
-    }
-
-    /// Cascade Lake is the hex-channel server profile (6 channels).
-    #[test]
-    fn decode_server_cascade_lake_is_hex_channel() {
-        let ro = decode_server(&SmbiosTopology::empty(), &[], IntelGen::CascadeLake);
-        assert_eq!(ro.channels.len(), 6, "Cascade Lake is hex-channel");
-    }
-
-    /// A module with a speed but no usable profile: the MCLK still decodes
-    /// from the rated speed, but the SPD-rated core timings degrade to the
-    /// honest server-uncore N/A (never a fabricated zero).
-    #[test]
-    fn decode_server_module_without_profile_degrades_to_na() {
-        let smbios = server_smbios();
-        let mut m = server_spd_module(0x50, 2400, 0, 0, 0, 0);
-        m.profiles.clear();
-        let ro = decode_server(&smbios, std::slice::from_ref(&m), IntelGen::HaswellE);
-        assert_eq!(ro.channels[0].clocks.mclk_mhz, Section::Value(1200.0));
-        assert!(ro.channels[0].timings.cl.is_na());
-        assert!(ro.channels[0].timings.ras.is_na());
-        // Haswell-E is quad-channel like Broadwell-E.
-        assert_eq!(ro.channels.len(), 4);
-    }
-
-    // Degenerate-word screening (C-2, H-2, H-3, H-14, M-6, M-11).
-    // -----------------------------------------------------------------
-
-    /// The degenerate-word screening helpers: `is_present_word` is true
-    /// only for non-zero, non-bus-fault words; `is_degenerate_word` is
-    /// true for `0` and `0xFFFF_FFFF`.
+    /// The degenerate-word screening helpers.
     #[test]
     fn degenerate_word_helpers() {
-        // is_present_word
         assert!(!is_present_word(None), "None is not present");
         assert!(!is_present_word(Some(0)), "zero is not present");
         assert!(!is_present_word(Some(0xFFFF_FFFF)), "bus-fault is not present");
         assert!(is_present_word(Some(1)), "non-zero non-fault is present");
         assert!(is_present_word(Some(0x1234_5678)), "arbitrary valid word is present");
 
-        // is_degenerate_word
         assert!(is_degenerate_word(0), "zero is degenerate");
         assert!(is_degenerate_word(0xFFFF_FFFF), "bus-fault is degenerate");
         assert!(!is_degenerate_word(1), "non-zero non-fault is not degenerate");
         assert!(!is_degenerate_word(0x1234_5678), "arbitrary valid word is not degenerate");
     }
 
-    /// H-2 + H-14: a Tier-1 channel whose every register is the
-    /// bus-fault word `0xFFFF_FFFF` produces all-`Na` timing cells —
-    /// never fabricated values from the all-ones bit pattern.
-    #[test]
-    fn tier1_all_bus_fault_produces_all_na() {
-        let fault = 0xFFFF_FFFF;
-        let regs = ChannelRegs {
-            tc_dbp: Some(fault),
-            tc_rap: Some(fault),
-            tc_rfp: Some(fault),
-            tc_rap2: Some(fault),
-            tc_rdrd: Some(fault),
-            tc_rdwr: Some(fault),
-            tc_wrrd: Some(fault),
-            tc_wrwr: Some(fault),
-        };
-        let ch = decode_tier1_channel(0, Section::Value(2400.0), &regs);
-        // Every timing cell must be Na (no fabricated values).
-        let cells: [&Section<u16>; 27] = [
-            &ch.timings.cl,
-            &ch.timings.rcwdwr,
-            &ch.timings.rcdrd,
-            &ch.timings.rp,
-            &ch.timings.ras,
-            &ch.timings.rc,
-            &ch.timings.rrds,
-            &ch.timings.rrld,
-            &ch.timings.faw,
-            &ch.timings.wtrs,
-            &ch.timings.wtrl,
-            &ch.timings.wr,
-            &ch.timings.rfc1,
-            &ch.timings.rfc2,
-            &ch.timings.rfcsb,
-            &ch.timings.cwl,
-            &ch.timings.rtp,
-            &ch.timings.rdwr,
-            &ch.timings.wrrd,
-            &ch.timings.rdrd_sd,
-            &ch.timings.rdrd_dd,
-            &ch.timings.rdrd_scl,
-            &ch.timings.rdrd_sc,
-            &ch.timings.wrwr_sd,
-            &ch.timings.wrwr_dd,
-            &ch.timings.wrwr_scl,
-            &ch.timings.wrwr_sc,
-        ];
-        for s in &cells {
-            assert!(s.is_na(), "bus-fault channel: {s:?} must be Na");
-        }
-        // The clocks stay valid (the mclk is shared, not per-channel).
-        assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0));
-    }
-
-    /// H-2 + H-14: a Tier-1 channel whose every register is zero
-    /// (untrained) produces all-`Na` timing cells.
-    #[test]
-    fn tier1_all_zero_produces_all_na() {
-        let regs = ChannelRegs {
-            tc_dbp: Some(0),
-            tc_rap: Some(0),
-            tc_rfp: Some(0),
-            tc_rap2: Some(0),
-            tc_rdrd: Some(0),
-            tc_rdwr: Some(0),
-            tc_wrrd: Some(0),
-            tc_wrwr: Some(0),
-        };
-        let ch = decode_tier1_channel(0, Section::Value(2400.0), &regs);
-        for s in [
-            &ch.timings.cl,
-            &ch.timings.cwl,
-            &ch.timings.rcdrd,
-            &ch.timings.rp,
-            &ch.timings.ras,
-            &ch.timings.rrds,
-            &ch.timings.rrld,
-            &ch.timings.faw,
-            &ch.timings.wr,
-            &ch.timings.rfc1,
-            &ch.timings.rdrd_scl,
-            &ch.timings.wrwr_scl,
-        ] {
-            assert!(s.is_na(), "zero channel: {s:?} must be Na");
-        }
-    }
-
-    /// N-03: an Alder Lake DDR4 channel whose every TC register is the
-    /// bus-fault word `0xFFFF_FFFF` produces all-`Na` timing cells — the
-    /// same degenerate-screening prologue as the Tier-1 / Tier-3
-    /// siblings (H-2), so the DDR4 turnaround-quartet path (which has no
-    /// per-word degenerate screen) never fabricates values from the
-    /// all-ones bit pattern.
-    #[test]
-    fn alder_ddr4_all_bus_fault_produces_all_na() {
-        let fault = 0xFFFF_FFFF;
-        let regs = AlderDdr4TcRegs {
-            tc_pre_lo: Some(fault),
-            tc_pre_hi: Some(fault),
-            tc_act: Some(fault),
-            tc_rdrd: Some(fault),
-            tc_rdwr: Some(fault),
-            tc_wrrd: Some(fault),
-            tc_wrwr: Some(fault),
-            tc_odt: Some(fault),
-            tc_rfp: Some(fault),
-            tc_rftp: Some(fault),
-        };
-        let ch =
-            decode_alder_ddr4_channel(0, Section::Value(1600.0), &regs, &ALDER_DDR4_FIELDS);
-        // Every timing cell must be Na (no fabricated values).
-        let cells: [&Section<u16>; 27] = [
-            &ch.timings.cl,
-            &ch.timings.rcwdwr,
-            &ch.timings.rcdrd,
-            &ch.timings.rp,
-            &ch.timings.ras,
-            &ch.timings.rc,
-            &ch.timings.rrds,
-            &ch.timings.rrld,
-            &ch.timings.faw,
-            &ch.timings.wtrs,
-            &ch.timings.wtrl,
-            &ch.timings.wr,
-            &ch.timings.rfc1,
-            &ch.timings.rfc2,
-            &ch.timings.rfcsb,
-            &ch.timings.cwl,
-            &ch.timings.rtp,
-            &ch.timings.rdwr,
-            &ch.timings.wrrd,
-            &ch.timings.rdrd_sd,
-            &ch.timings.rdrd_dd,
-            &ch.timings.rdrd_scl,
-            &ch.timings.rdrd_sc,
-            &ch.timings.wrwr_sd,
-            &ch.timings.wrwr_dd,
-            &ch.timings.wrwr_scl,
-            &ch.timings.wrwr_sc,
-        ];
-        for s in &cells {
-            assert!(s.is_na(), "bus-fault DDR4 channel: {s:?} must be Na");
-        }
-        // The clocks stay valid (the mclk is shared, not per-channel).
-        assert_eq!(ch.clocks.mclk_mhz, Section::Value(1600.0));
-    }
-
-    /// H-3: `mirror_or_mcl` screens the MCL fallback for degenerates
-    /// too — a bus-faulted MCL word is not a valid fallback source.
-    #[test]
-    fn mirror_or_mcl_screens_mcl_for_degenerates() {
-        // Degenerate mirror + degenerate MCL -> None (no bogus value).
-        assert_eq!(
-            mirror_or_mcl(Some(0xFFFF_FFFF), Some(0xFFFF_FFFF)),
-            None,
-            "bus-fault mirror + bus-fault MCL -> None"
-        );
-        assert_eq!(
-            mirror_or_mcl(Some(0), Some(0)),
-            None,
-            "zero mirror + zero MCL -> None"
-        );
-        // Degenerate mirror + valid MCL -> MCL wins.
-        assert_eq!(
-            mirror_or_mcl(Some(0xFFFF_FFFF), Some(0x0028_8410)),
-            Some(0x0028_8410),
-        );
-        // Valid mirror + degenerate MCL -> mirror wins (MCL not used).
-        assert_eq!(
-            mirror_or_mcl(Some(0x0028_8410), Some(0xFFFF_FFFF)),
-            Some(0x0028_8410),
-        );
-    }
-
-    /// M-6: a `MemoryTech::Unknown` from a bus-faulted MAD word does not
-    /// shadow a valid SMBIOS type — `resolve_channel` normalizes it to
-    /// `None` before the `.or()`.
-    #[test]
-    fn resolve_channel_normalizes_unknown_tech() {
-        let smbios = smbios_topology(2, DerivedMode::Dual, Some(MemoryTech::Ddr4));
-        // MMIO tech is Unknown (bus-faulted), SMBIOS has Ddr4.
-        let r = resolve_channel(
-            Some(ChannelMode::DualSymmetric),
-            Some(MemoryTech::Unknown),
-            &smbios,
-        );
-        assert_eq!(r.tech, Some(MemoryTech::Ddr4), "SMBIOS Ddr4 wins over MMIO Unknown");
-
-        // MMIO tech is valid (Ddr5), SMBIOS has Ddr4 -> MMIO wins.
-        let r = resolve_channel(
-            Some(ChannelMode::DualSymmetric),
-            Some(MemoryTech::Ddr5),
-            &smbios,
-        );
-        assert_eq!(r.tech, Some(MemoryTech::Ddr5), "valid MMIO Ddr5 wins");
-    }
-
-    /// C-2: OQ-11's DDR5 condition with bus-fault words — a
-    /// `0xFFFF_FFFF` MAD_DIMM word is not DDR5 evidence (it is a
-    /// bus-fault), so the decode stays on the 2-channel DDR4 default.
+    /// C-2: OQ-11's DDR5 condition with bus-fault words.
     #[test]
     fn c2_bus_fault_mad_words_are_not_ddr5_evidence() {
         let mut regs = tier3_ddr5_condition_regs();
@@ -7158,9 +3758,6 @@ mod tests {
         regs.mad_dimm_ch3 = Some(0xFFFF_FFFF);
         regs.mad_inter_channel = Some(0);
         let ro = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
-        // Bus-fault MAD words -> not DDR5 -> 2-channel DDR4 default
-        // (M-7: the display indices are positional [0, 1], not the
-        // subchannel identities [0, 2]).
         assert_eq!(ro.channels.len(), 2, "bus-fault MAD words -> DDR4 default");
         assert_eq!(
             ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
@@ -7168,9 +3765,7 @@ mod tests {
         );
     }
 
-    /// C-2: OQ-11's DDR5 condition with zero MAD words — a `0` MAD_DIMM
-    /// word is not DDR5 evidence, so the decode stays on the 2-channel
-    /// DDR4 default.
+    /// C-2: OQ-11's DDR5 condition with zero MAD words.
     #[test]
     fn c2_zero_mad_words_are_not_ddr5_evidence() {
         let mut regs = tier3_ddr5_condition_regs();
@@ -7178,64 +3773,13 @@ mod tests {
         regs.mad_dimm_ch3 = Some(0);
         regs.mad_inter_channel = Some(0);
         let ro = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
-        // Zero MAD words -> not DDR5 -> 2-channel DDR4 default.
         assert_eq!(ro.channels.len(), 2, "zero MAD words -> DDR4 default");
     }
 
-    /// H-4: the widened DDR5 tRFC1 field (12-bit, max 4095) decodes
-    /// values above the shared TIMING_MAX_TICKS of 2048 without
-    /// degrading to Na.
-    #[test]
-    fn h4_trfc1_12bit_exceeds_shared_max() {
-        // tRFC1 = 3000 (above 2048, within the 12-bit 4095 max).
-        let mcl = MclRegs {
-            tc_rfp: Some(0x0000_0BB8), // tRFC1 [11:0] = 3000
-            ..MclRegs::default()
-        };
-        let ch = decode_tier3_channel(
-            0,
-            Section::Value(2400.0),
-            &mcl,
-            &ALDER_CHANNELS[0],
-        );
-        assert_eq!(
-            ch.timings.rfc1,
-            Section::Value(3000),
-            "tRFC1 3000 is in-band for the 12-bit field (H-4)"
-        );
-
-        // tRFC1 = 4095 (the 12-bit max) is in-band.
-        let mcl = MclRegs {
-            tc_rfp: Some(0x0000_0FFF), // tRFC1 [11:0] = 4095
-            ..MclRegs::default()
-        };
-        let ch = decode_tier3_channel(
-            0,
-            Section::Value(2400.0),
-            &mcl,
-            &ALDER_CHANNELS[0],
-        );
-        assert_eq!(
-            ch.timings.rfc1,
-            Section::Value(4095),
-            "tRFC1 4095 is the 12-bit max (H-4)"
-        );
-    }
-
-    // Display / annotation fixes (M-7, M-10, M-16).
-    // -----------------------------------------------------------------
-
-    /// M-7: the Tier-3 2-channel default decodes subchannels `[0, 2]`
-    /// (MC0-subch0 + MC1-subch2), but the display index is the channel's
-    /// position in the output vector (`0`, `1`) — never the subchannel
-    /// identity, which would render "Intel ch 0 / ch 2" and imply a gapped
-    /// 4-channel platform.
+    /// M-7: the Tier-3 2-channel default decodes subchannels `[0, 2]`,
+    /// but the display index is the channel's position in the output vector.
     #[test]
     fn tier3_two_channel_default_indexes_are_sequential() {
-        // A valid MC_BIOS_REQ keeps the primary window non-degenerate (the
-        // Meteor / Arrow tile-routing probe does not fire); the MAD raws stay
-        // absent so the OQ-11 DDR5 condition is not met (the 2-channel
-        // default, subchannels [0, 2]).
         let regs = IntelImcRegs {
             mcbios_req: Some(0x0001_0012),
             ..IntelImcRegs::default()
@@ -7246,49 +3790,6 @@ mod tests {
         assert_eq!(
             ro.channels[1].index, 1,
             "second channel is display index 1 (not subchannel 2)"
-        );
-    }
-
-    /// M-10: a corrupt SMBIOS Configured Memory Speed (a `0xFFFF` 16-bit
-    /// readback → 65535 MT/s → 32767.5 MHz) is outside the plausible clock
-    /// range, so the derived MCLK is N/A'd with a proper reason instead of
-    /// being displayed as real data.
-    #[test]
-    fn decode_server_out_of_range_smbios_speed_is_na() {
-        let mut smbios = SmbiosTopology::empty();
-        smbios.speed_mts = Some(0xFFFF);
-        let ro = decode_server(&smbios, &[], IntelGen::BroadwellE);
-        assert!(
-            matches!(
-                ro.channels[0].clocks.mclk_mhz,
-                Section::Na(NaReason::ParseError(_))
-            ),
-            "out-of-range SMBIOS speed degrades the MCLK to Na(ParseError): {:?}",
-            ro.channels[0].clocks.mclk_mhz
-        );
-    }
-
-    /// M-16: the server-uncore annotation reports the populated CHANNEL
-    /// count and the raw DIMM count separately — never the old
-    /// self-contradictory "8 of 4 channels populated" (the DIMM count in
-    /// the channel slot).
-    #[test]
-    fn decode_server_annotation_reports_channels_and_dimms() {
-        let smbios = server_smbios(); // 2 DIMMs
-        let spd = vec![
-            server_spd_module(0x50, 2400, 16, 16, 16, 32),
-            server_spd_module(0x51, 2400, 16, 16, 16, 32),
-        ];
-        let ro = decode_server(&smbios, &spd, IntelGen::BroadwellE);
-        assert!(
-            ro.channel_annotation.contains("2 of 4"),
-            "the populated channel count is in the annotation: {}",
-            ro.channel_annotation
-        );
-        assert!(
-            ro.channel_annotation.contains("2 DIMMs"),
-            "the raw DIMM count is reported separately: {}",
-            ro.channel_annotation
         );
     }
 }

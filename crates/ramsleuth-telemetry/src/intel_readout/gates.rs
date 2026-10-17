@@ -196,3 +196,17 @@ pub(super) fn na_voltages(reason: &NaReason) -> VoltageSet {
 pub(super) fn na_rtl(reason: &NaReason) -> Section<u16> {
     Section::na(reason.clone())
 }
+
+// ---------------------------------------------------------------------------
+// Shared bit-field extraction primitive (used by all three decode paths:
+// Tier-1, Tier-3/DDR5, and Alder DDR4).
+// ---------------------------------------------------------------------------
+
+/// Extract the bit field `[hi:lo]` of `raw` as a `u16`.
+///
+/// Every frozen field is ≤ 12 bits wide, so the masked value converts
+/// losslessly; the `unwrap_or` fallback is an unreachable no-panic guard.
+pub(super) fn field16(raw: u32, hi: u32, lo: u32) -> u16 {
+    let mask = (1u32 << (hi - lo + 1)) - 1;
+    u16::try_from((raw >> lo) & mask).unwrap_or(u16::MAX)
+}
