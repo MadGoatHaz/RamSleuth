@@ -168,6 +168,31 @@
 //! all-absent degradation, per-register containment, zero-field /
 //! reserved / overflow gates, the gen gate, and bincode round-trips —
 //! all without hardware, root, or I/O.
+//!
+//! # Module layout (step 1 of the directory split)
+//!
+//! The frozen type shapes live in [`types`] and the shared sanity
+//! gates / degenerate-word screening helpers in [`gates`] (both are
+//! re-exported at this module root, so every existing
+//! `crate::intel_readout::X` path is unchanged); the register readers,
+//! the field extractors, the pure decode core, and the 4-tier channel
+//! resolution stay in this file.
+
+pub mod gates;
+pub mod types;
+
+// Re-export the public type shapes so external `use ...intel_readout::X`
+// paths still work (step 1 of the directory-module split).
+pub use types::*;
+
+// The gate helpers are module-local (`pub(super)` in `gates`); the two
+// degenerate-word screeners keep their crate-visible contract (N-05) at
+// this module root.
+pub(crate) use gates::is_degenerate_word;
+pub(crate) use gates::is_present_word;
+
+// Module-local imports for the decode paths and the tests below.
+use gates::*;
 
 use std::collections::HashMap;
 
@@ -335,196 +360,6 @@ const _ASSERT_TIER3_READS_IN_WIDE_WINDOW: () = {
         && MAX_ALK_D4_OFFSET <= MCHBAR_WINDOW_TIER3;
     let _proof: usize = 1 / if in_window { 1 } else { 0 };
 };
-
-// ---------------------------------------------------------------------------
-// Sanity ranges (mirroring the AMD display gates: the same plausible
-// bounds apply to the vendor-neutral display types, plan D3).
-// ---------------------------------------------------------------------------
-
-/// Plausible DRAM subtiming range (integer DRAM clock cycles).
-const TIMING_MIN_TICKS: u16 = 1;
-const TIMING_MAX_TICKS: u16 = 2048;
-
-/// tRFC1 on DDR5 can reach 4095 (12-bit field max) for high-density dies.
-const TRFC1_MAX_TICKS: u16 = 4095;
-
-/// Maximum plausible memory clock in MHz.
-/// DDR5-8800 → 4400 MHz; DDR5-10666 → 5333 MHz.
-/// Set to 5333 to cover all current and near-future DDR5 speeds.
-const CLOCK_MIN_MHZ: f64 = 1.0;
-const CLOCK_MAX_MHZ: f64 = 5333.0;
-
-// ---------------------------------------------------------------------------
-// Degenerate-word screening helpers (C-2, H-2, H-14, M-11).
-// ---------------------------------------------------------------------------
-
-/// A word is "present" only if it's non-zero AND not a bus-fault
-/// (`0xFFFF_FFFF`). This prevents degenerate reads from being
-/// misinterpreted as valid evidence (e.g. OQ-11's DDR5 condition).
-///
-/// The canonical degenerate-screening helpers for this module (N-05):
-/// every decode path screens raw words through these two functions
-/// (crate-visible so sibling decode modules can share the same
-/// contract).
-pub(crate) fn is_present_word(v: Option<u32>) -> bool {
-    matches!(v, Some(w) if w != 0 && w != 0xFFFF_FFFF)
-}
-
-/// A word is "degenerate" if it is `0` (untrained) or `0xFFFF_FFFF`
-/// (bus-fault readback) — the two degenerate encodings Research line 329
-/// uses for the mirror window. `None` (a failed read) is *not* degenerate
-/// in this sense; it is a separate containment case.
-pub(crate) fn is_degenerate_word(w: u32) -> bool {
-    w == 0 || w == 0xFFFF_FFFF
-}
-
-// ---------------------------------------------------------------------------
-// Raw register types (the module exposes raw values; THIS file decodes).
-// ---------------------------------------------------------------------------
-
-/// One channel's raw IMC registers (8 registers; `None` when the
-/// underlying read failed — per-register containment).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ChannelRegs {
-    /// `TC_DBP` (tCL / tCWL / tRCD / tRP).
-    pub tc_dbp: Option<u32>,
-    /// `TC_RAP` (tRRD_S / tRTP / tCKE / tFAW / tRAS).
-    pub tc_rap: Option<u32>,
-    /// `TC_RFP` (tRFC / tREFI).
-    pub tc_rfp: Option<u32>,
-    /// `TC_RAP2` (tRRD_L / tWR).
-    pub tc_rap2: Option<u32>,
-    /// `TC_RDRD` (4×6-bit sg / dg / dr / dd turnaround).
-    pub tc_rdrd: Option<u32>,
-    /// `TC_RDWR` (4×6-bit sg / dg / dr / dd turnaround).
-    pub tc_rdwr: Option<u32>,
-    /// `TC_WRRD` (4×6-bit sg / dg / dr / dd turnaround).
-    pub tc_wrrd: Option<u32>,
-    /// `TC_WRWR` (4×6-bit sg / dg / dr / dd turnaround).
-    pub tc_wrwr: Option<u32>,
-}
-
-/// The raw registers of one MCL (native uncore memory-controller)
-/// block: the eight `TC_*` registers of a Tier-3 (Alder/Raptor) native
-/// MCL block (MC0 @ `0xD000`, MC1 @ `0xD800`; register set per the
-/// Research Alder/Raptor table, offsets relative to the MCL base).
-/// OQ-4: retail desktops mirror MC0/MC1 into the legacy 64 KiB space
-/// (0x4000/0x4400/0x4800/0x4C00); the MCL blocks are the native-uncore
-/// fallback where the mirror is disabled (per-controller; the doc
-/// gives no MCL bases for subchannel 1/3). `None` when the underlying
-/// read failed — per-register containment.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct MclRegs {
-    /// `TC_PRE` @ +0x00 (tRCD / tRP / tRAS / tCWL — widened).
-    pub tc_pre: Option<u32>,
-    /// `TC_ACT` @ +0x04 (tCL / tFAW / tRRD_S / tRRD_L — widened).
-    pub tc_act: Option<u32>,
-    /// `TC_ACT2` @ +0x08 (tPPD — DDR5-specific).
-    pub tc_act2: Option<u32>,
-    /// `TC_WTR` @ +0x10 (tWTR_S / tWTR_L / tWR / tRTP — widened).
-    pub tc_wtr: Option<u32>,
-    /// `TC_RFP` @ +0x14 (tRFC1 12-bit / tREFI).
-    pub tc_rfp: Option<u32>,
-    /// `TC_RFP2` @ +0x18 (tRFCsb — DDR5-specific).
-    pub tc_rfp2: Option<u32>,
-    /// `TC_RDRD` @ +0x20 (4×6-bit sg / dg / dr / dd turnaround).
-    pub tc_rdrd: Option<u32>,
-    /// `TC_WRWR` @ +0x28 (tWRWR sg / dg — the two documented entries).
-    pub tc_wrwr: Option<u32>,
-}
-
-/// The raw registers of one Alder Lake **DDR4** memory controller's TC
-/// block (Phase 1): the nine `TC_*` registers at `MCHBAR + 0xE000` (MC0) /
-/// `MCHBAR + 0x1E000` (MC1). `TC_PRE` is a 64-bit register, read as a low
-/// word (`tc_pre_lo` @ `+0x00`) and a high word (`tc_pre_hi` @ `+0x04`);
-/// every other register is a single 32-bit word. `None` when the
-/// underlying read failed — per-register containment (D5).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct AlderDdr4TcRegs {
-    /// `TC_PRE` low word @ +0x00 (tRP [7:0] / tRDPRE [19:13] / tPPD [23:20]).
-    pub tc_pre_lo: Option<u32>,
-    /// `TC_PRE` high word @ +0x04 (tWRPRE [9:0] / tRAS [18:10] /
-    /// tRCD [26:19] — the 64-bit positions [41:32] / [50:42] / [58:51]).
-    pub tc_pre_hi: Option<u32>,
-    /// `TC_ACT` @ +0x08 (tFAW / tRRD_SG / tRRD_DG).
-    pub tc_act: Option<u32>,
-    /// `TC_RDRD` @ +0x0C (sg / dg / dr / dd turnaround).
-    pub tc_rdrd: Option<u32>,
-    /// `TC_RDWR` @ +0x10 (sg / dg / dr / dd turnaround).
-    pub tc_rdwr: Option<u32>,
-    /// `TC_WRRD` @ +0x14 (sg / dg / dr / dd turnaround).
-    pub tc_wrrd: Option<u32>,
-    /// `TC_WRWR` @ +0x18 (sg / dg / dr / dd turnaround).
-    pub tc_wrwr: Option<u32>,
-    /// `TC_ODT` @ +0x70 (tCL [22:16] / tCWL [31:24]).
-    pub tc_odt: Option<u32>,
-    /// `TC_RFP` @ +0x438 (tREFI9 [31:24] / OREF_RI [7:0]).
-    pub tc_rfp: Option<u32>,
-    /// `TC_RFTP` @ +0x43C (tRFC [30:18] / tREFI [17:0]).
-    pub tc_rftp: Option<u32>,
-}
-
-/// The full raw IMC register set the decode consumes: one global
-/// register, the four Tier-1/Tier-3 channel blocks (`ch0`–`ch3`), the
-/// two native MCL blocks (`mcl0` @ `0xD000` / `mcl1` @ `0xD800`, OQ-4),
-/// the five `MAD_*` channel/geometry raws (`mad_inter_channel` /
-/// `mad_dimm_ch0`–`ch3` — all decode inputs, L-10), and the two Alder
-/// Lake DDR4 TC blocks (`alk_d4_tc0` / `alk_d4_tc1`) — 74
-/// `Option<u32>` slots in total (`mchbar_base` / `mchbar_enabled` are
-/// diagnostics carried by the producer, not decode inputs).
-///
-/// Every Tier-3 field defaults to `None` (containment, IG-22): no
-/// Tier-1/2 producer sets them, so the existing raw-set comparisons
-/// and fixture tests stay valid unchanged.
-///
-/// Producers: `intel_sysfs::acquire()` (the `ramsleuth_intel` kobject)
-/// and the `/dev/mem` fallback readers ([`IntelImcRegs::from_bar`] —
-/// Tier 1 / Rocket Lake, 64 KiB; [`IntelImcRegs::from_bar_wide`] —
-/// the Tier-3 Alder family, 256 KiB; both routed by [`read_intel`]).
-/// All producers feed the same pure decode core ([`decode`] /
-/// [`read_regs`]).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct IntelImcRegs {
-    /// `MC_BIOS_REQ` @ `0x5E00` (the global DRAM clock word).
-    pub mcbios_req: Option<u32>,
-    /// Channel 0 (`0x4000` block).
-    pub ch0: ChannelRegs,
-    /// Channel 1 (`0x4400` block).
-    pub ch1: ChannelRegs,
-    /// Channel 2 (`0x4800` mirror block — Tier-3 subchannel 2).
-    pub ch2: ChannelRegs,
-    /// Channel 3 (`0x4C00` mirror block — Tier-3 subchannel 3).
-    pub ch3: ChannelRegs,
-    /// MC0 MCL block raws (`0xD000` — Tier-3 native-uncore fallback,
-    /// OQ-4).
-    pub mcl0: MclRegs,
-    /// MC1 MCL block raws (`0xD800` — Tier-3 native-uncore fallback,
-    /// OQ-4).
-    pub mcl1: MclRegs,
-    /// `MAD_INTER_CHANNEL` (the global channel-mode / DDR-type word —
-    /// decode input, L-10: the base is gen-keyed, so the `/dev/mem`
-    /// producer sets it; the sysfs producer reads the `mad_inter_channel`
-    /// attribute).
-    pub mad_inter_channel: Option<u32>,
-    /// `MAD_DIMM_CH0` (channel 0 DIMM capacity — decode input, L-10).
-    pub mad_dimm_ch0: Option<u32>,
-    /// `MAD_DIMM_CH1` (channel 1 DIMM capacity — decode input, L-10).
-    pub mad_dimm_ch1: Option<u32>,
-    /// `MAD_DIMM_CH2` @ `0x5060` (Alder/DDR5 subchannel 2 geometry,
-    /// raw).
-    pub mad_dimm_ch2: Option<u32>,
-    /// `MAD_DIMM_CH3` @ `0x5064` (Alder/DDR5 subchannel 3 geometry,
-    /// raw).
-    pub mad_dimm_ch3: Option<u32>,
-    /// MC0 Alder Lake DDR4 TC block raws (`0xE000` — Phase 1; the 64-bit
-    /// `TC_PRE` is split into `tc_pre_lo` / `tc_pre_hi`). Default (all
-    /// `None`) on the 64 KiB `from_bar` set and on module builds that do
-    /// not expose the `0xE000+` range.
-    pub alk_d4_tc0: AlderDdr4TcRegs,
-    /// MC1 Alder Lake DDR4 TC block raws (`0x1E000` = `0xE000 + 0x10000`
-    /// — Phase 1). See [`alk_d4_tc0`].
-    pub alk_d4_tc1: AlderDdr4TcRegs,
-}
 
 impl IntelImcRegs {
     /// Read the 9-register IMC set from a live, read-only [`MchBar`]
@@ -1133,12 +968,6 @@ pub fn turnaround_quartet(reg: u32) -> [u16; 4] {
 // change in this module.
 // ---------------------------------------------------------------------------
 
-/// Bit position offset from the 64-bit `TC_PRE` field spec to the high
-/// 32-bit word (N-08). The datasheet `TC_PRE` spec is a 64-bit `[63:0]`
-/// register; the high word holds `[63:32]`, so a field at spec position
-/// `P` sits at position `P - 32` in the hi word.
-const TC_PRE_HI_WORD_SHIFT: u32 = 32;
-
 /// tRCD — `TC_PRE` 64-bit [58:51] = high word [26:19].
 pub fn alk_d4_pre_trcd(reg: u32, f: &AlderDdr4Fields) -> u16 {
     field16(reg, f.trcd.0 - TC_PRE_HI_WORD_SHIFT, f.trcd.1 - TC_PRE_HI_WORD_SHIFT)
@@ -1227,16 +1056,6 @@ pub fn alk_d4_turnaround(reg: u32, which: WhichAlkD4Turnaround, f: &AlderDdr4Fie
         field16(reg, dr.0, dr.1),
         field16(reg, dd.0, dd.1),
     ]
-}
-
-/// Which DDR4 turnaround register a [`alk_d4_turnaround`] extraction
-/// targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WhichAlkD4Turnaround {
-    Rdrd,
-    Rdwr,
-    Wrrd,
-    Wrwr,
 }
 
 /// The `MC_BIOS_REQ` analog DRAM clock (MCLK) in MHz — the ratio
@@ -1376,67 +1195,6 @@ pub fn decode_uclk(mclk: f64, gear: &Section<GearMode>) -> Section<f64> {
         None => Section::na(NaReason::ParseError(
             "uclk = mclk / gear: gear unavailable or reserved encoding".to_owned(),
         )),
-    }
-}
-
-/// Decode one displayed tick field from an optionally-failed register
-/// read (the per-register containment rule): a failed read →
-/// `Na(ParseError)`; a degenerate word (`0` = untrained,
-/// `0xFFFF_FFFF` = bus-fault) → `Na(ParseError)`; a decoded value
-/// outside [1, max_ticks] → `Na(ParseError)`; otherwise the tick value.
-fn timing_cell(reg: Option<u32>, name: &str, extract: impl Fn(u32) -> u16) -> Section<u16> {
-    timing_cell_max(reg, name, extract, TIMING_MAX_TICKS)
-}
-
-/// [`timing_cell`] with an explicit per-field tick maximum (H-4):
-/// used for the widened DDR5 tRFC1 (12-bit, max 4095) and the DDR4
-/// tRFC (13-bit, max 8191) fields that exceed the shared
-/// [`TIMING_MAX_TICKS`] of 2048.
-fn timing_cell_max(
-    reg: Option<u32>,
-    name: &str,
-    extract: impl Fn(u32) -> u16,
-    max_ticks: u16,
-) -> Section<u16> {
-    match reg {
-        None => Section::na(NaReason::ParseError(format!("{name}: register read failed"))),
-        // H-14: Screen degenerate words (bus-fault / untrained) before
-        // any bit extraction.
-        Some(w) if is_degenerate_word(w) => {
-            let detail = if w == 0 { "untrained (0)" } else { "bus-fault (0xFFFFFFFF)" };
-            Section::na(NaReason::ParseError(format!("{name}: {detail}")))
-        }
-        Some(raw) => ticks_section_max(extract(raw), name, max_ticks),
-    }
-}
-
-/// Sanity-gate a decoded tick count to a [`Section<u16>`] using the
-/// shared [`TIMING_MAX_TICKS`] bound.
-fn ticks_section(ticks: u16, name: &str) -> Section<u16> {
-    ticks_section_max(ticks, name, TIMING_MAX_TICKS)
-}
-
-/// Sanity-gate a decoded tick count to a [`Section<u16>`] using an
-/// explicit `max_ticks` bound (H-4: per-field overrides for the
-/// widened DDR5 / DDR4 tRFC fields).
-fn ticks_section_max(ticks: u16, name: &str, max_ticks: u16) -> Section<u16> {
-    if (TIMING_MIN_TICKS..=max_ticks).contains(&ticks) {
-        Section::Value(ticks)
-    } else {
-        Section::na(NaReason::ParseError(format!(
-            "{name} {ticks} ticks outside plausible range [{TIMING_MIN_TICKS}, {max_ticks}]"
-        )))
-    }
-}
-
-/// Sanity-gate a decoded memory clock (MHz) to a [`Section<f64>`].
-fn clock_section(mhz: f64) -> Section<f64> {
-    if (CLOCK_MIN_MHZ..=CLOCK_MAX_MHZ).contains(&mhz) {
-        Section::Value(mhz)
-    } else {
-        Section::na(NaReason::ParseError(format!(
-            "memory clock {mhz} MHz outside plausible range [{CLOCK_MIN_MHZ:.0}, {CLOCK_MAX_MHZ:.0}]"
-        )))
     }
 }
 
@@ -1983,69 +1741,6 @@ pub fn tier3_mcl_for(index: usize, map: &AlderChannelMap, regs: &IntelImcRegs) -
         tc_rdrd: mirror_or_mcl(mirror.tc_rdrd, mcl.and_then(|m| m.tc_rdrd)),
         tc_wrwr: mirror_or_mcl(mirror.tc_wrrd, mcl.and_then(|m| m.tc_wrwr)),
     }
-}
-
-/// Decode one displayed slot from a per-register turnaround quartet
-/// (per-register containment: a failed register read →
-/// `Na(ParseError)` for every slot sourced from it).
-fn quartet_cell(quartet: Option<[u16; 4]>, name: &str, slot: usize) -> Section<u16> {
-    match quartet {
-        None => Section::na(NaReason::ParseError(format!("{name}: register read failed"))),
-        Some(q) => ticks_section(q[slot], name),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// N-06: the shared all-`Na(reason)` builders. The frozen display slots that
-// Intel never sources (the CAD bus, the voltages, the RTL, and the clock /
-// gear / command-rate cells on the live decode paths) used to be built by
-// five copy-pasted struct literals; these helpers are the single source
-// (pure refactor — the built values are byte-identical).
-// ---------------------------------------------------------------------------
-
-/// An all-`Na(reason)` [`ClockReadout`] (the eight frozen clock / gear /
-/// command-rate slots).
-fn na_clocks(reason: &NaReason) -> ClockReadout {
-    ClockReadout {
-        mclk_mhz: Section::na(reason.clone()),
-        uclk_mhz: Section::na(reason.clone()),
-        fclk_mhz: Section::na(reason.clone()),
-        div_mode: Section::na(reason.clone()),
-        gear_mode: Section::na(reason.clone()),
-        gdm: Section::na(reason.clone()),
-        pdm: Section::na(reason.clone()),
-        command_rate: Section::na(reason.clone()),
-    }
-}
-
-/// An all-`Na(reason)` [`CadBus`] (the eight frozen CAD slots).
-fn na_cad_bus(reason: &NaReason) -> CadBus {
-    CadBus {
-        proc_odt: Section::na(reason.clone()),
-        rtt_nom: Section::na(reason.clone()),
-        rtt_wr: Section::na(reason.clone()),
-        rtt_park: Section::na(reason.clone()),
-        clk_drv: Section::na(reason.clone()),
-        addr_cmd_drv: Section::na(reason.clone()),
-        cs_odt_drv: Section::na(reason.clone()),
-        cke_drv: Section::na(reason.clone()),
-    }
-}
-
-/// An all-`Na(reason)` [`VoltageSet`] (the five frozen rail slots).
-fn na_voltages(reason: &NaReason) -> VoltageSet {
-    VoltageSet {
-        vddcr_soc_mv: Section::na(reason.clone()),
-        vddio_mem_mv: Section::na(reason.clone()),
-        vdd_misc_mv: Section::na(reason.clone()),
-        vpp_mv: Section::na(reason.clone()),
-        vcore_mv: Section::na(reason.clone()),
-    }
-}
-
-/// An all-`Na(reason)` RTL slot.
-fn na_rtl(reason: &NaReason) -> Section<u16> {
-    Section::na(reason.clone())
 }
 
 /// One all-`Na(UnsupportedHardware)` channel: the degraded shape for a
@@ -2932,65 +2627,6 @@ fn server_na_voltages() -> VoltageSet {
     na_voltages(&NaReason::ParseError(SERVER_NA_REASON.to_owned()))
 }
 
-// ---------------------------------------------------------------------------
-// Frozen display types (shape unchanged — wire-safe, bincode round-trips
-// stay valid; only which cells carry `Value` vs `Na` changes).
-// ---------------------------------------------------------------------------
-
-/// One decoded memory channel of an Intel platform.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct IntelChannel {
-    /// 0-based channel index (`index < channel_count(gen)`).
-    pub index: u8,
-    /// Clocks and ratios: in the live decode `mclk` comes from
-    /// `MC_BIOS_REQ`; the Rocket Lake profile additionally decodes
-    /// `gear_mode` + `uclk_mhz` from `MC_BIOS_REQ[17:16]`, while on
-    /// Tier 1 (and for the AMD-fabric slots) those cells are
-    /// `Na(NotApplicable)`. The legacy compat path may populate the
-    /// gear / uclk cells.
-    pub clocks: ClockReadout,
-    /// DRAM subtimings in integer DRAM clock cycles: 24 populated /
-    /// derived slots + 3 structural `Na(NotApplicable)` in the live
-    /// Tier-1 decode (the full map in the module docs).
-    pub timings: TimingSet,
-    /// CAD bus: every field `Na(NotApplicable)` on Intel.
-    pub cad_bus: CadBus,
-    /// Memory rails: every field `Na(NotApplicable)` on Intel.
-    pub voltages: VoltageSet,
-    /// RTL (ticks): `Na(NotApplicable)` in the live Tier-1 decode — the
-    /// legacy skeleton's "RTL" register was fiction; the legacy compat
-    /// path may carry a `Value`.
-    pub rtl: Section<u16>,
-}
-
-/// The hardware channel / interleave mode.
-///
-/// **Chunk 2 correction:** the mode is *not* a 2-bit field of
-/// `MAD_INTER_CHANNEL` — bits `[2:0]` of that register are the `DDR_TYPE`
-/// (the physical memory technology, see [`MemoryTech`]), not a mode. The
-/// true operating mode is derived from the *capacity* mapped to each
-/// channel: [`channel_mode_from_capacity`] computes it from the two
-/// `MAD_DIMM_CH0/1` register sums (there is no `CH_L_SIZE` field in
-/// `MAD_INTER_CHANNEL`). A Flex-Mode box (asymmetric DIMMs, e.g. 16 + 8 GB)
-/// may bind only a single SPD yet run in Dual-Flex, so the SPD-count label
-/// is authoritative only as a frontend fallback.
-///
-/// Wire-safe (serde + bincode). The mode is population-conditional, and the
-/// Skylake-family firmware is not reliable in maintaining it, so the decode
-/// cross-checks it against the `MAD_DIMM_CH0/1` population **and** the
-/// SMBIOS Type 17 topology ([`resolve_channel`], the 4-tier trust
-/// procedure — the L3 safety override is the core fix for the
-/// misreported-single-channel bug).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ChannelMode {
-    /// Dual-channel, symmetric interleaving (both channels equal capacity).
-    DualSymmetric,
-    /// Dual-channel, flex mode (asymmetric DIMMs).
-    DualFlex,
-    /// Single-channel.
-    Single,
-}
-
 impl ChannelMode {
     /// The full human-readable channel label (the header channel slot).
     pub fn label(&self) -> &'static str {
@@ -3028,30 +2664,6 @@ impl ChannelMode {
     }
 }
 
-/// The physical DRAM technology the IMC is running (decoded from
-/// `MAD_INTER_CHANNEL[2:0]` — the `DDR_TYPE` field, **not** a channel mode
-/// — or, when MMIO access is blocked, from the SMBIOS Type 17 memory-type
-/// field).
-///
-/// Wire-safe (serde + bincode). [`MemoryTech::Unknown`] is the honest
-/// fallback for a reserved / unrecognizable encoding; [`None`] (on the
-/// [`IntelReadout`]) means no source carried a technology.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MemoryTech {
-    /// DDR3 / DDR3L (`001b`).
-    Ddr3,
-    /// DDR4 (`000b`).
-    Ddr4,
-    /// LPDDR4 (`010b`).
-    Lpddr4,
-    /// LPDDR5 (`011b`).
-    Lpddr5,
-    /// DDR5 (`100b`).
-    Ddr5,
-    /// A reserved / unrecognizable encoding.
-    Unknown,
-}
-
 impl MemoryTech {
     /// Decode the `DDR_TYPE` field (`MAD_INTER_CHANNEL[2:0]`):
     /// `000`=DDR4, `001`=DDR3/3L, `010`=LPDDR4, `011`=LPDDR5, `100`=DDR5;
@@ -3077,31 +2689,6 @@ impl MemoryTech {
             _ => None,
         }
     }
-}
-
-/// The trust tier of a resolved channel mode (the 4-tier decision
-/// procedure, research "Recommended Multi-Tier Decision Procedure").
-///
-/// Wire-safe (serde + bincode). [`ChannelTrust::None`] (the variant,
-/// carried as `Option<ChannelTrust>` on [`IntelReadout`]) is the terminal
-/// "unresolvable" state — both MMIO and SMBIOS yielded nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ChannelTrust {
-    /// L1 — the MMIO decode is readable, internally consistent, and matches
-    /// SMBIOS. The hardware read is the primary authority.
-    VerifiedHardware,
-    /// L2 — MMIO is inaccessible; the topology is verified from SMBIOS
-    /// Type 17 alone.
-    VerifiedFirmware,
-    /// L3 — SAFETY OVERRIDE: MMIO decoded single-channel but SMBIOS
-    /// confirms two DIMMs across channels; the MMIO read is marked
-    /// untrusted and the result is reported dual-channel.
-    Override,
-    /// L4 — MMIO is inaccessible and the SMBIOS locators are ambiguous; a
-    /// dual-channel heuristic is applied (the "unverified" annotation).
-    Heuristic,
-    /// Terminal — neither MMIO nor SMBIOS identified the topology.
-    None,
 }
 
 /// A channel's reported DIMM capacity (in GiB) from its `MAD_DIMM_CHx`
@@ -3216,24 +2803,6 @@ pub fn imc_base_for(gen: IntelGen) -> usize {
     } else {
         0x5000
     }
-}
-
-/// The resolved channel topology: the trust-resolved mode, the active
-/// memory technology, the trust tier, a human annotation (the
-/// "untrusted-MMIO mismatch" / "heuristic" note), and the SMBIOS-confirmed
-/// populated DIMM count. Wire-safe fields (see [`IntelReadout`]).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChannelResolution {
-    /// The trust-resolved channel mode (`None` for the terminal state).
-    pub mode: Option<ChannelMode>,
-    /// The active memory technology (MMIO `DDR_TYPE` else SMBIOS).
-    pub tech: Option<MemoryTech>,
-    /// The trust tier (`None` for the terminal state).
-    pub trust: Option<ChannelTrust>,
-    /// A human annotation (empty for the clean L1 cases).
-    pub annotation: String,
-    /// The SMBIOS-confirmed populated DIMM count.
-    pub dimm_count: u8,
 }
 
 /// The 4-tier trust procedure (research "Recommended Multi-Tier Decision
@@ -3376,39 +2945,6 @@ pub fn resolve_channel(
         annotation: "[Error: unable to identify memory topology via MMIO or SMBIOS]".to_owned(),
         dimm_count,
     }
-}
-
-/// The full Intel readout: one [`IntelChannel`] per detected channel.
-///
-/// Wire-safe (serde + bincode); the struct shape is append-only (OQ-10
-/// pattern) — the three original field positions are frozen, and the
-/// Chunk 2 fields (`memory_tech` / `channel_trust` / `channel_annotation`
-/// / `dimm_count`) are appended after `ecc_status`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct IntelReadout {
-    /// Decoded channels (0-based indices, `channels.len() == channel_count`).
-    pub channels: Vec<IntelChannel>,
-    /// The trust-resolved channel mode ([`resolve_channel`], the 4-tier
-    /// procedure): the capacity-derived MMIO mode cross-checked against the
-    /// SMBIOS Type 17 topology. `None` on the terminal / all-Na
-    /// degradation.
-    pub channel_mode: Option<ChannelMode>,
-    /// ECC state (the CAPID0_A bit-17 decode). OQ-10 wire append.
-    pub ecc_status: EccStatus,
-    /// The active memory technology (Chunk 2): the MMIO `DDR_TYPE`
-    /// (`MAD_INTER_CHANNEL[2:0]`) else the SMBIOS Type 17 memory type.
-    /// `None` when no source carried a technology.
-    pub memory_tech: Option<MemoryTech>,
-    /// The trust tier of the resolved channel mode (Chunk 2): `L1`
-    /// verified-hardware, `L2` verified-firmware, `L3` override, `L4`
-    /// heuristic, or `None` (terminal). `None` (the `Option` outer) on the
-    /// all-Na degradation.
-    pub channel_trust: Option<ChannelTrust>,
-    /// A human annotation for the resolution (the "untrusted-MMIO
-    /// mismatch" / "heuristic" note); empty for the clean L1 cases.
-    pub channel_annotation: String,
-    /// The SMBIOS-confirmed populated DIMM count.
-    pub dimm_count: u8,
 }
 
 impl IntelReadout {
@@ -6617,7 +6153,7 @@ mod tests {
         // identifiers are assembled from pairs at runtime so this test's
         // own source never contains the literal (a self-reference would
         // trip its own scan).
-        let src = include_str!("intel_readout.rs");
+        let src = include_str!("mod.rs");
         let gone: Vec<String> = [
             ("decode", "channel"),
             ("decode", "freq_ratio"),
