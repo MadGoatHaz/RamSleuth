@@ -581,7 +581,7 @@ const char *getCodeName(enum smu_processor_codename codename) {
   case CODENAME_THREADRIPPER:
     return "ThreadRipper";
   case CODENAME_CASTLEPEAK:
-    return "CastelPeak";
+    return "CastlePeak";
   case CODENAME_RAVENRIDGE:
     return "RavenRidge";
   case CODENAME_RAVENRIDGE2:

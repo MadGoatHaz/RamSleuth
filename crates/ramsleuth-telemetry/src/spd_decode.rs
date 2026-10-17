@@ -1018,7 +1018,14 @@ fn xmp2_speed_from_block(block: &[u8]) -> Option<u16> {
     if tck_ps <= 0 {
         return None;
     }
-    Some(xmp2_snap_speed((2_000_000 / tck_ps as u32) as u16))
+    let raw_rate = 2_000_000 / tck_ps as u32;
+    // F-01: Plausibility cap — max real DDR4 XMP is ~4400 MT/s.
+    // Anything above 8000 indicates a corrupt/erased XMP block.
+    if raw_rate > 8000 {
+        return None;
+    }
+    let speed = raw_rate as u16;
+    Some(xmp2_snap_speed(speed))
 }
 
 /// The XMP 2.0 profile-1 data rate in MT/s (the fine-corrected tCK, snapped
