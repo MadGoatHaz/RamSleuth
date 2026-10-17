@@ -358,45 +358,75 @@ pub fn classify_io_error(e: &std::io::Error) -> TelemetryError {
 // `acquire()` to the platform error above and exclude this whole section.
 // ---------------------------------------------------------------------------
 
+/// The outcome of a PM-table acquisition attempt at one candidate path.
+/// Derived by [`classify_pm_state`] from the observed filesystem state.
+#[cfg(target_os = "linux")]
+enum PmAcquireState {
+    /// The `pm_table` blob was read successfully.
+    Available(Vec<u8>),
+    /// The kobject directory exists (the driver is loaded) but the
+    /// `pm_table` attribute is not exposed — the PM table is unsupported
+    /// on this platform (e.g. Castle Peak / Threadripper 2990X). The SMN
+    /// path still works; the PM fields degrade to an honest N/A.
+    DriverPresentNoPm,
+    /// The kobject directory is absent — the driver is truly not loaded
+    /// at this candidate; try the next.
+    DriverMissing,
+    /// A raw I/O failure (not `NotFound`) — permission denied, EIO, etc.
+    IoError(std::io::Error),
+}
+
+/// Determine the acquisition outcome given the observed filesystem state.
+/// Pure function — testable without I/O.
+#[cfg(target_os = "linux")]
+fn classify_pm_state(
+    dir_exists: bool,
+    pm_table_read: Result<Vec<u8>, std::io::Error>,
+) -> PmAcquireState {
+    match pm_table_read {
+        Ok(data) => PmAcquireState::Available(data),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if dir_exists {
+                // Driver is loaded (kobject dir exists) but PM table attribute
+                // is not exposed. This happens on platforms where RSMU/PM-table
+                // is not supported (e.g., Castle Peak / Threadripper 2990X).
+                PmAcquireState::DriverPresentNoPm
+            } else {
+                // Directory absent — driver truly not loaded
+                PmAcquireState::DriverMissing
+            }
+        }
+        Err(e) => PmAcquireState::IoError(e),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn acquire_linux() -> TelemetryResult<SmuContext> {
     // Primary path: the sysfs PM-table blob — try the canonical kobject
     // name first, then the legacy one.
     let mut found: Option<TelemetryResult<SmuContext>> = None;
     for &path in SYSFS_PM_TABLE_CANDIDATES.iter() {
-        match std::fs::read(path) {
-            Ok(blob) => {
+        let dir = kobj_dir_for(path);
+        let dir_exists = dir.exists();
+        let read_result = std::fs::read(path);
+        match classify_pm_state(dir_exists, read_result) {
+            PmAcquireState::Available(blob) => {
                 found = Some(context_from_blob(blob));
                 break;
             }
-            Err(e) => match classify_io_error(&e) {
-                // The `pm_table` attribute is absent at this candidate. Two
-                // distinct cases:
-                //  (a) the kobject directory itself is absent -> the driver
-                //      is truly not loaded here; try the next candidate (and,
-                //      if this was the last, fall through to the char device —
-                //      the module may expose only one of the two interfaces).
-                //  (b) the directory exists but the `pm_table` attribute is
-                //      not exposed -> the driver IS loaded but the PM table is
-                //      unsupported on this platform (e.g. Castle Peak /
-                //      Threadripper 2990X). This is NOT "driver missing":
-                //      return a context with `pm: None` so the SMN path still
-                //      works and the PM fields degrade to an honest N/A.
-                TelemetryError::DriverMissing { .. } => {
-                    let dir = kobj_dir_for(path);
-                    if dir.exists() {
-                        found = Some(Ok(SmuContext {
-                            version: read_pm_version_attr(&dir),
-                            pm: None,
-                        }));
-                        break;
-                    }
-                    continue;
-                }
-                // Present but unreadable (-> InsufficientPrivilege) or some
-                // other raw failure (-> Io): report as classified.
-                other => return Err(other),
-            },
+            PmAcquireState::DriverPresentNoPm => {
+                found = Some(Ok(SmuContext {
+                    version: read_pm_version_attr(&dir),
+                    pm: None,
+                }));
+                break;
+            }
+            PmAcquireState::DriverMissing => {
+                continue;
+            }
+            PmAcquireState::IoError(e) => {
+                return Err(classify_io_error(&e));
+            }
         }
     }
     match found {
@@ -842,5 +872,35 @@ mod tests {
         assert_eq!(read_pm_version_attr(&dir), 0x0038_0805);
         // Cleanup.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // F-03: `classify_pm_state` is a pure function — the branch decision
+    // is testable without I/O.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pm_state_dir_exists_no_pm() {
+        assert!(matches!(
+            classify_pm_state(true, Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            PmAcquireState::DriverPresentNoPm
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pm_state_dir_absent_no_pm() {
+        assert!(matches!(
+            classify_pm_state(false, Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            PmAcquireState::DriverMissing
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pm_state_dir_exists_pm_present() {
+        assert!(matches!(
+            classify_pm_state(true, Ok(vec![0x01, 0x02])),
+            PmAcquireState::Available(_)
+        ));
     }
 }

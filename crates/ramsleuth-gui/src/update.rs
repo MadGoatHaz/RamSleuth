@@ -2793,6 +2793,16 @@ mod tests {
                     bandwidth: None,
                     latency_ns: Some(1.2),
                 }),
+                // F-06: (None, None) elapsed-update tick — the burn-in
+                // fix arm. `iteration` unchanged, `elapsed_secs` advances,
+                // no error, stream continues.
+                Response::BurnInProgress(BurnInTick {
+                    iteration: 1,
+                    elapsed_secs: 2.5,
+                    tier: Tier::Memory,
+                    bandwidth: None,
+                    latency_ns: None,
+                }),
                 // A later tick over the same cell: the newest value
                 // wins in `latest` (the `live_grid` rule).
                 Response::BurnInProgress(BurnInTick {
