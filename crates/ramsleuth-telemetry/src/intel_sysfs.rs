@@ -10,7 +10,7 @@
 //! map, so both producers feed one decode (plan §3.5: module-first,
 //! devmem-fallback, single decode core).
 //!
-//! **The v2.4.16 attribute surface (L-18).** On a 12th-gen+ (Alder /
+//! **The v2.4.17 attribute surface (L-18).** On a 12th-gen+ (Alder /
 //! Raptor Lake DDR4) module build the kobject exposes **79** attributes:
 //! the **25 core** (the `mchbar_base` / `mchbar_enabled` diagnostics,
 //! `mcbios_req`, the two Tier-1 `ch0_tc_*` / `ch1_tc_*` mirror blocks

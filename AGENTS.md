@@ -1,6 +1,6 @@
 # RamSleuth — Project Notes
 
-RamSleuth is a Rust Cargo workspace (v2.4.16) providing live RAM telemetry plus a
+RamSleuth is a Rust Cargo workspace (v2.4.17) providing live RAM telemetry plus a
 Memory & Latency Benchmark for AMD/Intel desktops: a privileged root daemon
 (`CAP_SYS_RAWIO` only, Unix-socket IPC) feeding dual frontends (ratatui TUI + egui
 GUI), with CLI and standalone tools.

@@ -6,6 +6,37 @@ All notable per-release changes to RamSleuth. Newest first.
 
 ## [Unreleased]
 
+## [2.4.17] - 2026-10-17
+
+### Intel Memory Controller — Major Overhaul
+
+**New Platform Support:**
+- Alder Lake / Raptor Lake DDR4: Full MC timing register decode (0xE000+ MCHBAR layout)
+- Server platforms (Haswell-E, Broadwell-E/X99, Skylake-X, Cascade Lake, Sapphire Rapids): SMBIOS+SPD-based telemetry with honest N/A for unavailable MC registers
+- Ice Lake (10th gen) and Tiger Lake (11th gen): Tier-1 DDR4 profile
+- Arrow Lake / Meteor Lake: Corrected to dual-channel (was incorrectly 4-channel)
+- Castle Peak (Threadripper 2990X): ryzen-smu PM table support
+
+**Bug Fixes:**
+- XMP 2.0: tCK fine-timebase correction now applied (DDR4-3600+ kits no longer misreport as 3200)
+- XMP 3.0 / EXPO: Frequency read corrected from 8-bit to 16-bit (was off by 25×)
+- Channel mode: Generalized L3 SMBIOS override (no longer limited to one board)
+- GUI burn-in: Fixed socket disconnect on elapsed-update ticks
+- Daemon: Blocking recv moved to spawn_blocking (prevents runtime starvation under load)
+- 3990X: "Driver missing" misclassification fixed (distinguishes PM-table-absent from driver-absent)
+- SPD/SMBIOS: Per-DIMM size falls back to SMBIOS when SPD enumeration is incomplete
+- Degenerate register words (0x0, 0xFFFFFFFF) now properly screened across all decode paths
+- MAD/MCL1 register aliasing on 12th-gen+: Heuristic policy with SMBIOS cross-check
+
+**Architecture:**
+- `intel_readout.rs` (7758 lines) split into 9 focused modules
+- Kernel module: Attribute groups split (alk_d4_tc for DDR4, tier3_extended for 12th-gen+)
+- 1111 tests, 0 clippy warnings
+
+### AMD
+- Castle Peak (2990X) PM table support in vendored ryzen-smu driver
+- "Driver missing" vs "PM table unsupported" distinction in telemetry
+
 ## [2.4.16] - 2026-10-11
 
 ### Added
