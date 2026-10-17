@@ -57,13 +57,18 @@ memory controller's own state and shows it in a dense dashboard:
   synchronous or 1:2 asynchronous), the DRAM command rate (1T/2T), and the
   CPU's live core frequency.
 - **Live DRAM subtimings** — on AMD, all 27 (tCL, tRCD, tRP, tRAS, tRFC, …)
-  straight from the SMU PM table; on Intel, the subset its MCHBAR registers
-  expose, decoded from the memory controller (Section 8.2) — per-channel on
-  the Tier 1 / Tier 2 generations (Skylake through Rocket Lake, the 64 KiB
-  register window) and per-subchannel on the Tier 3 generations (Alder /
-  Raptor / Meteor / Arrow Lake, the 256 KiB window: two subchannels on a
-  DDR4 box, four on a DDR5 one). Not the values baked into an XMP profile —
-  the values the controller is *actually running right now*.
+  straight from the SMU PM table; on Intel client silicon, the subset its
+  MCHBAR registers expose, decoded from the memory controller (Section 8.2) —
+  per-channel on the Tier 1 / Tier 2 generations (Haswell / Broadwell through
+  Rocket Lake, the 64 KiB register window) and per-subchannel on the Tier 3
+  generations (Alder / Raptor / Meteor / Arrow Lake, the 256 KiB window: two
+  subchannels on a DDR4 box, four on a DDR5 one). On Intel **server / HEDT**
+  silicon (Haswell-E / Broadwell-E / Skylake-X / Cascade Lake / Sapphire
+  Rapids) the MC timing registers are not OS-accessible, so the readout sources
+  the SMBIOS Type 17 topology + the SPD rated timings instead — speed,
+  capacity, channel count, and the factory timings, with the live MC cells an
+  honest `N/A`. Not the values baked into an XMP profile (where the controller
+  exposes them) — the values the controller is *actually running right now*.
 - **Signal integrity settings** — CAD-bus ODT and driver strengths (in ohms,
   RZQ-relative) and the RTT modes.
 - **Voltages** — the VDDCR_CPU (Vcore), VDDCR_SOC, VDDIO_MEM, VDD_MISC, and
@@ -190,8 +195,10 @@ What makes it worth using:
   it is mutually exclusive with the app, see §2.2).
   **Intel host?** It prints an optional next-step note: the built-in `/dev/mem`
   MCHBAR decode already gives live Intel subtimings on any supported
-  generation (Tier 1 – 3, Skylake through Arrow Lake), and the
-  `ramsleuth_intel` DKMS module is the preferred source for them —
+  client generation (Tier 1–3, Haswell / Broadwell through Arrow Lake), and
+  server / HEDT platforms (Haswell-E through Sapphire Rapids) decode from
+  SMBIOS + SPD; the `ramsleuth_intel` DKMS module is the preferred source
+  for the client subtimings —
   `sudo ramsleuth-install-intel-dkms` (the built-in helper), one-click
   `sudo ramsleuth-setup --with-dkms` (which routes by CPU vendor), or
   `sudo scripts/install-intel-dkms.sh` from a source checkout (Section
@@ -1174,9 +1181,16 @@ memory-type code and are told apart by image length. Per slot you get:
   module: **XMP 2.0** (DDR4; two 47-byte profile blocks at `0x189` /
   `0x1B8`, under the `0x180` header gate) or **XMP 3.0 / EXPO** (DDR5;
   the 256-byte region at `0x300`, four 32-byte profile blocks), each
-  rendered as `<speed> MT/s <CL>-<tRCD>-<tRP>-<tRAS> @ <volts>`. Enabling
-  one in BIOS is what moves the live data rate — and the dashboard then
-  shows you *what the controller actually settled on* live.
+  rendered as `<speed> MT/s <CL>-<tRCD>-<tRP>-<tRAS> @ <volts>`. Two
+  decode details keep the rates honest: the DDR4 XMP 2.0 data rate is
+  read from the profile's **fine-corrected tCK** (the coarse 125 ps
+  memory-time-base byte *plus* the signed fine-timebase byte), so a
+  DDR4-3600 kit (tCK 5 with a −70 ps fine) reports **3600**, not the 3200
+  a coarse-only read would give; and the DDR5 XMP 3.0 / EXPO frequency is
+  read as a **16-bit** little-endian MHz value (×2 for MT/s, sanity-gated
+  to 3200–10666), not the old 8-bit field that read it off by 25×.
+  Enabling one in BIOS is what moves the live data rate — and the
+  dashboard then shows you *what the controller actually settled on* live.
 
 ### 8.6 Channel mode & the RAM summary
 
@@ -1285,7 +1299,7 @@ anything but the six variants.
 | Reason (wire name · CLI phrase) | What it means | What to do |
 |---|---|---|
 | **`DriverMissing`** — *driver missing* | A required kernel driver is not loaded. On **AMD** this is the `ryzen_smu` module absent, so the live AMD subtimings cannot be read. On **Intel** it means the `ramsleuth_intel` module is absent **and** the `/dev/mem` fallback is unavailable — neither `/dev/mem` nor `/dev/fmem` exists (or the host-bridge PCI config device is absent, so MCHBAR cannot even be decoded). | **AMD:** install the driver — `sudo ramsleuth-setup --with-dkms`, `sudo ramsleuth-install-ryzen-smu-dkms`, or the `ryzen-smu-dkms` AUR extra + `sudo ryzen-smu-dkms-install` (Section 10). **Intel:** install the module — `sudo ramsleuth-install-intel-dkms`, the vendor-aware `sudo ramsleuth-setup --with-dkms` (or the Intel-only fast path `sudo ramsleuth-setup --with-intel-dkms`), or the `ramsleuth-intel-dkms` AUR extra + `sudo ramsleuth-intel-dkms-install` (Section 10.5). Everything else in RamSleuth works without it. |
-| **`UnsupportedHardware`** — *unsupported hardware* | The detected hardware is not supported by this telemetry source. On Intel there are two canonical cases: a **virtualized** host whose MCHBAR (BAR5) is unpopulated (`0` — there is no physical memory controller in the VM), and a generation **outside the Tier 1 – 3 profile set** — the unprofiled generations (Ice Lake / Tiger Lake, and anything unrecognized) degrade the whole Intel section before a register is read, while every generation from Skylake through Arrow Lake decodes live (Tier 1: Skylake / Kaby Lake / Coffee Lake / Comet Lake; Tier 2: Rocket Lake; Tier 3: Alder / Raptor / Meteor / Arrow Lake — Section 10.5). A **physical** Intel system of a supported generation works (Section 10.5); non-Intel silicon is rejected by the other branch the same way. | Nothing — this is the expected, honest outcome in that environment (VMs, or silicon outside the supported set). The other sections of the snapshot remain fully live. |
+| **`UnsupportedHardware`** — *unsupported hardware* | The detected hardware is not supported by this telemetry source. On Intel there are two canonical cases: a **virtualized** host whose MCHBAR (BAR5) is unpopulated (`0` — there is no physical memory controller in the VM), and a generation **outside the profile set** — the unprofiled generations (Jasper Lake, Lunar Lake, Core Series 1 Mobile, and anything unrecognized) degrade the whole Intel section before a register is read, while every profiled generation decodes live: the client line (Tier 1: Haswell / Broadwell / Skylake / Kaby Lake / Coffee Lake / Comet Lake / Ice Lake / Tiger Lake; Tier 2: Rocket Lake; Tier 3: Alder / Raptor / Meteor / Arrow Lake) and the server / HEDT line (Haswell-E / Broadwell-E / Skylake-X / Cascade Lake / Sapphire Rapids, decoded from SMBIOS + SPD — Section 10.5). A **physical** Intel system of a supported generation works (Section 10.5); non-Intel silicon is rejected by the other branch the same way. | Nothing — this is the expected, honest outcome in that environment (VMs, or silicon outside the supported set). The other sections of the snapshot remain fully live. |
 | **`InsufficientPrivilege`** — *insufficient privilege* | The operation needs more privilege than the caller has (e.g. a `/dev/mem` open/map permission denial, or a `STRICT_DEVMEM` range rejection). | Run the read through the **daemon** (it holds the one capability this needs) — i.e. use the GUI/TUI/`ramsleuth-client` against a running `ramsleuth.service` rather than a bare unprivileged read. |
 | **`UnknownPmTableVersion`** — *unknown PM table version* | The AMD SMU PM-table version the firmware reports is outside the layout set RamSleuth knows how to parse. | Update the **AGESA/firmware** (the table versions move with the SMU firmware) or the `ryzen_smu` driver, and retry. If it persists, it is a genuine "newer firmware than supported" case — report the version word upstream. |
 | **`NotApplicable`** — *not applicable* | This field does not apply to the detected platform by design — e.g. Intel does not expose the CAD bus or voltage rails through MCHBAR, AMD does not report gear mode, Intel voltages are out of the readout's scope. | Nothing — it is a *correct* blank, not a failure. |
@@ -1377,28 +1391,38 @@ mapping, so on those systems the fallback is dead and the
 `ramsleuth_intel` module is required; only a kernel that exposes
 `/dev/mem` unblocked (no `STRICT_DEVMEM`, no integrity lockdown) gets
 live per-subchannel IMC subtimings out of the box. The supported set
-spans three tiers: **Tier 1**
-(Skylake / Kaby Lake / Coffee Lake / Comet Lake) and **Tier 2** (Rocket
-Lake) decode the two-channel register set from the 64 KiB window — Rocket
-Lake additionally decodes the Gear Mode (Gear2) and the controller clock
+spans the full client line plus the server / HEDT line. **Tier 1**
+(Haswell / Broadwell / Skylake / Kaby Lake / Coffee Lake / Comet Lake /
+Ice Lake / Tiger Lake) and **Tier 2** (Rocket Lake) decode the
+two-channel register set from the 64 KiB window — Rocket Lake
+additionally decodes the Gear Mode (Gear2) and the controller clock
 from the `MC_BIOS_REQ` word; **Tier 3** (Alder / Raptor / Meteor / Arrow
-Lake) decodes from the 256 KiB window — two subchannels on a DDR4 box,
-four on a DDR5 one (the `MAD_DIMM_CH2` / `CH3` geometry shows the extra
-subchannels populated), each subchannel reading its timing registers from
-the legacy mirror block with a fallback into the native MCL clock blocks
-(MC0 @ `0xD000`, MC1 @ `0xD800`), and the Meteor / Arrow Lake
-tile-routing guard degrading a fully degenerate window to an honest
-`N/A` instead of decoding it.
+Lake) decodes from the 256 KiB window — two channels on a DDR4 box
+(the per-MC TC blocks at `0xE000` / `0x1E000`), four 32-bit
+subchannels on a DDR5 one (the `MAD_DIMM_CH2` / `CH3` geometry shows the
+extra subchannels populated), each subchannel reading its timing
+registers from the legacy mirror block with a fallback into the native
+MCL clock blocks (MC0 @ `0xD000`, MC1 @ `0xD800`), and the Meteor /
+Arrow Lake tile-routing guard degrading a fully degenerate window to an
+honest `N/A` instead of decoding it. **Server / HEDT** (Haswell-E /
+Broadwell-E / Skylake-X → 4-channel, Cascade Lake → 6-channel, Sapphire
+Rapids → 8-channel) takes no MMIO path at all — their MC timing
+registers are not OS-accessible — so the readout sources the SMBIOS
+Type 17 topology (speed, capacity, channel count) + the SPD rated
+timings, with the live MC cells an honest `N/A` (Section 11.5).
 
 The optional **`ramsleuth_intel`** DKMS module is the **preferred** source:
-it maps the same MCHBAR window in-kernel — **64 KiB on the 6th–11th-gen
-parts, 256 KiB on the 12th-gen+ family** (the window *and* the MAD register
-base are keyed on the CPU generation, which the module computes via
+it maps the same MCHBAR window in-kernel — **64 KiB on the pre-12th-gen
+client parts, 256 KiB on the 12th-gen+ family** (the window *and* the MAD
+register base are keyed on the CPU generation, which the module computes via
 `cpuid_eax(1)`) — and publishes the raw registers as
 world-readable sysfs attributes under `/sys/kernel/ramsleuth_intel/`
-(25 read-only attributes — see `kernel/ramsleuth-intel/README.md`),
-including the host-bridge `capid0a` attribute (config offset `0xE4`, raw
-`0x%08x`) — the input for the ECC-capability decode (Section 8.6). The
+(25 read-only core attributes, plus two generation-gated groups on
+12th-gen+ silicon — the DDR4 `alk_d4_tc` block and the `tier3_extended`
+block — taking an Alder / Raptor DDR4 box to 79; see
+`kernel/ramsleuth-intel/README.md`), including the host-bridge `capid0a`
+attribute (config offset `0xE4`, raw `0x%08x`) — the input for the
+ECC-capability decode (Section 8.6). The
 daemon uses it whenever it is loaded (the sysfs path needs no `/dev/mem` at
 all) and falls back to `/dev/mem` **only** when the module is absent —
 never the other way round: with the module loaded, a `/dev/mem` fault is
@@ -1609,8 +1633,9 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   source (Section 10.5). The two honest `N/A (unsupported hardware)` cases
   that remain (Section 9): **virtualized** Intel, where the MCHBAR window is
   unpopulated (there is no physical memory controller in the VM), and
-  **generations outside the Tier 1 – 3 profile set** (the unprofiled
-  generations — e.g. Ice Lake / Tiger Lake).
+  **generations outside the profile set** (the unprofiled generations —
+  Jasper Lake, Lunar Lake, Core Series 1 Mobile, and anything unrecognized;
+  the full client line and the server / HEDT line are all supported).
 - **Intel voltage rails & CAD** (other than the vCore) are `N/A (not
   applicable)` by design — the MCHBAR window does not expose them the way
   the AMD SMU does. The one Intel voltage, the **vCore**, is now
@@ -1626,6 +1651,17 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   memory controller can sit behind a tile whose MCHBAR window is fully
   degenerate; the guard degrades the Intel section to an honest `N/A`
   rather than decoding it (Section 10.5).
+- **Intel server / HEDT live MC registers** — on Haswell-E / Broadwell-E /
+  Skylake-X / Cascade Lake / Sapphire Rapids the memory-controller timing
+  registers live in CPU-internal uncore space that is not PCI-BAR-mapped and
+  is unreachable via `/dev/mem`, and the SPD EEPROM sits on the MC's internal
+  I2C bus (not OS-visible). So the readout is honest about what it can and
+  cannot show: the **speed, capacity, channel count, and memory technology
+  come from SMBIOS Type 17**, and the **rated data rate + factory profile
+  timings (tCL / tRCD / tRP / tRAS) come from the SPD EEPROM**, while every
+  *live* MC register cell renders `N/A (server uncore: no OS-accessible
+  timing source)` — a platform condition, not a RamSleuth fault
+  (Section 10.5).
 - **SPD sees only bound modules**: if the OS total exceeds the SPD-visible
   sum, the header's slot note (`2 of 4 slots SPD-visible`) tells you — that
   is the platform, not a bug. On **Intel** the daemon now *attempts* to

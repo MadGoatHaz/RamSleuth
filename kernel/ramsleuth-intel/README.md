@@ -23,11 +23,16 @@ selection includes `<asm/cpuid/api.h>` — see "Building + installing").
 The raw register attributes each emit the 32-bit register exactly as read
 — one line, `0x%08x`, little-endian — plus the two MCHBAR diagnostic
 attributes and `capid0a` (25 core attributes, listed below; on the
-12th-gen+ family a second, gen-gated group adds 36 more — the Alder Lake
-DDR4 `0xE000`/`0x1E000` TC blocks and the `0xD000`/`0xD800` native MCL
-blocks — see "The Alder Lake DDR4 attributes" below). Nothing is ever
-written to the register space (read-only `ioread32`), so the module is safe
-to load on any Intel client host.
+12th-gen+ family **two** gen-gated groups add 54 more — the `alk_d4_tc`
+group (20 attributes, the Alder / Raptor Lake DDR4 `0xE000`/`0x1E000`
+per-MC TC blocks) and the `tier3_extended` group (34 attributes, the
+`0xD000`/`0xD800` native MCL blocks, the `0x4800`/`0x4C00` DDR5 ch2 / ch3
+mirror blocks, and the `mad_dimm_ch2`/`mad_dimm_ch3` raws) — see "The
+12th-gen+ attribute groups" below). Nothing is ever written to the register
+space (read-only `ioread32`), so the module is safe to load on any Intel
+client host. On a 12th-gen+ Alder / Raptor DDR4 box the full surface is
+**79** attributes; on a DDR5-only box (Meteor / Arrow Lake) **59**; on a
+pre-12th-gen box the core **25**.
 
 ## When it loads (probe sequence)
 
@@ -49,7 +54,7 @@ succeed**; every failure path unmaps/drops refs and leaves no kobject:
    mapped window and the MAD register base on it: **12th-gen+** (Alder /
    Raptor / Meteor / Arrow / Lunar Lake — `is_12th_gen_plus`) → the
    **256 KiB** window, with the five global MAD channel/geometry registers
-   read at `MCHBAR + 0xd800`; everything else (6th–11th gen) → the
+   read at `MCHBAR + 0xd800`; everything else (pre-12th-gen) → the
    **64 KiB** window and `MCHBAR + 0x5000`. (The pre-fix module read
    `0x5000` on *every* box, so a 12th-gen+ host's MAD registers were
    unmapped — `0x0` / `0xFFFF_FFFF` — and the channel mode misreported;
@@ -60,8 +65,10 @@ succeed**; every failure path unmaps/drops refs and leaves no kobject:
    (`raw & 0x7FFFFFF000`, bits 38:16, 64 KiB-aligned); a zero base means
    unpopulated/virtualized → `-ENODEV`.
 7. **`ioremap(base, map_size)`**, then create the `ramsleuth_intel` kobject
-   (and, on the 12th-gen+ family, the Alder Lake DDR4 attribute group —
-   see below).
+   with the core 25 attributes, and — on the 12th-gen+ family — the two
+   gen-gated groups: `alk_d4_tc` (Alder / Raptor Lake DDR4 only) and
+   `tier3_extended` (the whole 12th-gen+ family) — see "The 12th-gen+
+   attribute groups" below.
 
 ## MCHBAR decode
 
@@ -76,11 +83,12 @@ The 64-bit raw value (config `0x48` low / `0x4C` high):
 Worked example: an enabled Skylake raw value `0x0000_0000_FED1_0001` →
 `MCHBAR_EN=1`, base `0xFED10000`.
 
-## The 25 attributes (what each register is)
+## The 25 core attributes (what each register is)
 
-25 read-only attributes, all `0444`, under `/sys/kernel/ramsleuth_intel/`
-(the frozen contract the Rust reader parses — name, source, and line format
-are stable):
+The **core** set — 25 read-only attributes, all `0444`, under
+`/sys/kernel/ramsleuth_intel/`, present on every supported host (the frozen
+contract the Rust reader parses — name, source, and line format are stable;
+the 12th-gen+ groups below are additive):
 
 - `mchbar_base` / `mchbar_enabled` — diagnostics: the masked MCHBAR physical
   base in 16 hex digits, no prefix (e.g. `00000000fed10000`), and a constant
@@ -102,7 +110,7 @@ are stable):
     synthesizes tRC = tRAS + tRP.**
 - `mad_inter_channel` / `mad_intra_ch0` / `mad_intra_ch1` / `mad_dimm_ch0`
   / `mad_dimm_ch1` @ the gen-keyed IMC base + `0x00/0x04/0x08/0x0C/0x10`
-  (`MCHBAR + 0x5000` on 6th–11th gen, `MCHBAR + 0xd800` on the 12th-gen+
+  (`MCHBAR + 0x5000` on pre-12th-gen, `MCHBAR + 0xd800` on the 12th-gen+
   family — step 5).
   **MAD_INTER_CHANNEL**: `[2:0]` is the **DDR_TYPE** memory-technology field
   (userspace decodes `000`=DDR4, `001`=DDR3/3L, `010`=LPDDR4, `011`=LPDDR5,
@@ -139,7 +147,7 @@ are stable):
 | `ch1_tc_rdwr` | MCHBAR + `0x4424` | `0x%08x` |
 | `ch1_tc_wrrd` | MCHBAR + `0x4428` | `0x%08x` |
 | `ch1_tc_wrwr` | MCHBAR + `0x442C` | `0x%08x` |
-| `mad_inter_channel` | MCHBAR + IMC base + `0x00` (base `0x5000` 6th–11th gen / `0xd800` 12th-gen+) | `0x%08x` |
+| `mad_inter_channel` | MCHBAR + IMC base + `0x00` (base `0x5000` pre-12th-gen / `0xd800` 12th-gen+) | `0x%08x` |
 | `mad_intra_ch0` | MCHBAR + IMC base + `0x04` | `0x%08x` |
 | `mad_intra_ch1` | MCHBAR + IMC base + `0x08` | `0x%08x` |
 | `mad_dimm_ch0` | MCHBAR + IMC base + `0x0C` | `0x%08x` |
@@ -152,33 +160,57 @@ five `mad_*` attributes are global (not per-channel) IMC registers. The
 single `capid0a` attribute is read from PCI config space rather than the
 MCHBAR window — the input to the userspace ECC decode.
 
-## The Alder Lake DDR4 attributes (12th-gen+ only)
+## The 12th-gen+ attribute groups
 
 On the 12th-gen+ family (the same generation that selects the 256 KiB
-window, step 5) the module creates a second, gen-gated attribute group in
-the same kobject directory: 36 more read-only `0444` attributes — the
+window, step 5) the module creates **two** gen-gated attribute groups in the
+same kobject directory — 54 more read-only `0444` attributes on top of the
+core 25. On a pre-12th-gen box neither group is created; the surface is the
+core 25 (the `0x4000`/`0x4400` Tier-1 mirror blocks stay for Tier-1
+compatibility). All are raw words only — no decoding (the userspace reader
+owns the bitfields).
+
+### `alk_d4_tc` group (20 attributes — Alder / Raptor Lake DDR4 only)
+
+Gated on the **DDR4** 12th-gen+ subset (`is_alder_raptor_ddr4` — Alder /
+Raptor Lake; the DDR5-only parts — Meteor / Arrow / Lunar Lake — have no
+DDR4 TC surface, so this group is not created for them). These are the
 per-MC TC timing registers of the **DDR4** Alder/Raptor layout (Intel
-12th-Gen Datasheet Vol. 2, §3.2.66-3.2.87) and the native MCL blocks.
-On a pre-12th-gen box the group is not created; the surface is the core
-25 (the `0x4000`/`0x4400` Tier-1 mirror blocks stay for Tier-1
-compatibility). All are raw words only — no decoding (the userspace
-reader owns the bitfields).
+12th-Gen Datasheet Vol. 2, §3.2.66-3.2.87):
 
 - **The TC blocks** — `alk_d4_mc0_tc_*` @ MCHBAR+`0xE000` and
   `alk_d4_mc1_tc_*` @ MCHBAR+`0x1E000` (`0xE000` + the `0x10000`
-  inter-controller stride). **`TC_PRE` is a 64-bit register**, exposed as
-  two 32-bit words — `tc_pre_lo` @ `+0x00` (tRP / tRDPRE / tPPD) and
-  `tc_pre_hi` @ `+0x04` (tWRPRE / tRAS / tRCD) — since x86 MMIO is
-  32-bit granular. These are **not** the `0x4000`/`0x4400` mirror window
-  (which returns `0xFFFFFFFF` on DDR4).
+  inter-controller stride), 10 words each. **`TC_PRE` is a 64-bit
+  register**, exposed as two 32-bit words — `tc_pre_lo` @ `+0x00`
+  (tRP / tRDPRE / tPPD) and `tc_pre_hi` @ `+0x04` (tWRPRE / tRAS / tRCD) —
+  since x86 MMIO is 32-bit granular. These are **not** the
+  `0x4000`/`0x4400` mirror window (which returns `0xFFFFFFFF` on DDR4).
+
+### `tier3_extended` group (34 attributes — all 12th-gen+)
+
+Gated on the **whole** 12th-gen+ family (`is_12th_gen_plus` — every
+Alder / Raptor / Meteor / Arrow / Lunar Lake part needs these). This group
+supplies the data the userspace reader needs for the Tier-3 decode that the
+core 25 alone cannot provide:
+
 - **The native MCL blocks** — `mcl0_tc_*` @ MCHBAR+`0xD000` and
-  `mcl1_tc_*` @ MCHBAR+`0xD800` (the Tier-3 uncore fallback). The
-  `mcl0_tc_*` / `mcl1_tc_*` names are the frozen contract the userspace
-  reader already reads (8 words each: `pre` / `act` / `act2` / `wtr` /
-  `rfp` / `rfp2` / `rdrd` / `wrwr`); on the 12th-gen+ family the MCL1
-  block shares its `0xD800` page with the gen-keyed MAD block, so the
-  overlapping words are the same raw registers (the userspace decode
-  disambiguates by generation).
+  `mcl1_tc_*` @ MCHBAR+`0xD800` (the Tier-3 uncore fallback), 8 words each
+  (`pre` / `act` / `act2` / `wtr` / `rfp` / `rfp2` / `rdrd` / `wrwr`). On
+  the 12th-gen+ family the MCL1 block shares its `0xD800` page with the
+  gen-keyed MAD block, so the overlapping words are the same raw registers
+  (the userspace decode disambiguates by generation).
+- **The DDR5 ch2 / ch3 mirror blocks** — `ch2_tc_*` @ MCHBAR+`0x4800` and
+  `ch3_tc_*` @ MCHBAR+`0x4C00` (8 words each — `dbp` / `rap` / `rfp` /
+  `rap2` / `rdrd` / `rdwr` / `wrrd` / `wrwr`), the legacy-compatibility
+  mirror window the 4-subchannel DDR5 decode reads.
+- **The `mad_dimm_ch2` / `mad_dimm_ch3` raws** — at the gen-keyed MAD base +
+  `0x60` / `+0x64` (the `MAD_DIMM_CH2_INTRA` / `CH3_INTRA` words; **not**
+  the `+0x0C`/`+0x10` stride-continued positions, which on the `0xD800`
+  page are occupied by the MCL1 `TC_RFP` / `TC_RFP2` words — the N-02
+  collision-free placement). These are the OQ-11 DDR5-subchannel geometry
+  input.
+
+**`alk_d4_tc` group (20 attributes):**
 
 | Attribute | Source | Line format |
 |---|---|---|
@@ -202,6 +234,11 @@ reader owns the bitfields).
 | `alk_d4_mc1_tc_odt` | MCHBAR + `0x1E000` + `0x70` | `0x%08x` |
 | `alk_d4_mc1_tc_rfp` | MCHBAR + `0x1E000` + `0x438` | `0x%08x` |
 | `alk_d4_mc1_tc_rftp` | MCHBAR + `0x1E000` + `0x43C` | `0x%08x` |
+
+**`tier3_extended` group (34 attributes):**
+
+| Attribute | Source | Line format |
+|---|---|---|
 | `mcl0_tc_pre` | MCHBAR + `0xD000` + `0x00` | `0x%08x` |
 | `mcl0_tc_act` | MCHBAR + `0xD000` + `0x04` | `0x%08x` |
 | `mcl0_tc_act2` | MCHBAR + `0xD000` + `0x08` | `0x%08x` |
@@ -218,29 +255,52 @@ reader owns the bitfields).
 | `mcl1_tc_rfp2` | MCHBAR + `0xD800` + `0x18` | `0x%08x` |
 | `mcl1_tc_rdrd` | MCHBAR + `0xD800` + `0x20` | `0x%08x` |
 | `mcl1_tc_wrwr` | MCHBAR + `0xD800` + `0x28` | `0x%08x` |
+| `ch2_tc_dbp` | MCHBAR + `0x4800` + `0x00` | `0x%08x` |
+| `ch2_tc_rap` | MCHBAR + `0x4800` + `0x04` | `0x%08x` |
+| `ch2_tc_rfp` | MCHBAR + `0x4800` + `0x08` | `0x%08x` |
+| `ch2_tc_rap2` | MCHBAR + `0x4800` + `0x0C` | `0x%08x` |
+| `ch2_tc_rdrd` | MCHBAR + `0x4800` + `0x20` | `0x%08x` |
+| `ch2_tc_rdwr` | MCHBAR + `0x4800` + `0x24` | `0x%08x` |
+| `ch2_tc_wrrd` | MCHBAR + `0x4800` + `0x28` | `0x%08x` |
+| `ch2_tc_wrwr` | MCHBAR + `0x4800` + `0x2C` | `0x%08x` |
+| `ch3_tc_dbp` | MCHBAR + `0x4C00` + `0x00` | `0x%08x` |
+| `ch3_tc_rap` | MCHBAR + `0x4C00` + `0x04` | `0x%08x` |
+| `ch3_tc_rfp` | MCHBAR + `0x4C00` + `0x08` | `0x%08x` |
+| `ch3_tc_rap2` | MCHBAR + `0x4C00` + `0x0C` | `0x%08x` |
+| `ch3_tc_rdrd` | MCHBAR + `0x4C00` + `0x20` | `0x%08x` |
+| `ch3_tc_rdwr` | MCHBAR + `0x4C00` + `0x24` | `0x%08x` |
+| `ch3_tc_wrrd` | MCHBAR + `0x4C00` + `0x28` | `0x%08x` |
+| `ch3_tc_wrwr` | MCHBAR + `0x4C00` + `0x2C` | `0x%08x` |
+| `mad_dimm_ch2` | gen-keyed MAD base + `0x60` | `0x%08x` |
+| `mad_dimm_ch3` | gen-keyed MAD base + `0x64` | `0x%08x` |
 
-## Tier 1 / 2 / 3 (and the honest gap)
+## Tier 1 / 2 / 3 (and the server line)
 
 The module is generation-agnostic; tier logic lives in userspace
 `intel_gen::profile_for`:
 
-- **Tier 1** = Skylake / Kaby / Coffee / Comet (64 KiB, 2-channel, no gear)
+- **Tier 1** = Haswell / Broadwell / Skylake / Kaby / Coffee / Comet / Ice /
+  Tiger Lake (64 KiB, 2-channel, no gear — the shared 64 KiB map)
 - **Tier 2** = Rocket Lake (64 KiB, Gear2)
-- **Tier 3** = Alder / Raptor / Meteor / Arrow (256 KiB, DDR5 4-subchannel,
-  MCL fallback, Gear4)
+- **Tier 3** = Alder / Raptor / Meteor / Arrow (256 KiB, DDR4 2-channel or
+  DDR5 4-subchannel, MCL fallback, Gear4)
+- **Server / HEDT** = Haswell-E / Broadwell-E / Skylake-X / Cascade Lake /
+  Sapphire Rapids (no MMIO — userspace decodes from SMBIOS + SPD; the module
+  is not the data source for these)
 
-**Honest gap:** on a pre-12th-gen host the module exposes the Tier-1-shaped
-surface (the two `0x4000/0x4400` channel blocks) over the 64 KiB window. On
-a 12th-gen+ host it *also* exposes the native MCL blocks
-(`0xD000/0xD800` — `mcl0_tc_*` / `mcl1_tc_*`) and the Alder Lake DDR4 TC
-blocks (`0xE000`/`0x1E000` — `alk_d4_mc0/1_tc_*`; see "The Alder Lake DDR4
-attributes"), so a DDR4 Tier-3 host (e.g. an i5-12600KF) gets full timing
-decode from the module. It does **NOT** expose the Tier-3 ch2/ch3 mirror
-blocks (`0x4800/0x4C00`) or `mad_dimm_ch2/3` (`0x5060/0x5064`); userspace
-defines those extra attributes and degrades them to `None` when absent — so
-a DDR5 4-subchannel host's mirror-window decode still exists only via the
-`/dev/mem` 256 KiB path. The module maps the full 256 KiB window on a
-12th-gen+ host (gen-keyed, step 5).
+**What the module exposes by generation:** on a pre-12th-gen host the module
+exposes the Tier-1-shaped surface (the two `0x4000/0x4400` channel blocks)
+over the 64 KiB window — the core 25 attributes. On a 12th-gen+ host it
+*also* exposes both gen-gated groups: the `alk_d4_tc` DDR4 TC blocks
+(`0xE000`/`0x1E000`, Alder / Raptor DDR4 only) and the `tier3_extended`
+block (the `0xD000`/`0xD800` native MCL blocks, the `0x4800`/`0x4C00` DDR5
+ch2 / ch3 mirror blocks, and the `mad_dimm_ch2`/`mad_dimm_ch3` raws at the
+gen-keyed MAD base + `0x60`/`+0x64`; the whole 12th-gen+ family) — so a DDR4
+Tier-3 host (e.g. an i5-12600KF) **and** a DDR5 4-subchannel host both get
+full timing decode from the module. The module maps the full 256 KiB window
+on a 12th-gen+ host (gen-keyed, step 5). The `/dev/mem` 256 KiB path remains
+the fallback only where the module is absent (e.g. an unsigned-module /
+Secure-Boot host).
 
 ## Building + installing (DKMS)
 
@@ -287,6 +347,12 @@ Manual one-off (the recommended path is the DKMS helper):
   no MCHBAR decode / SPD not bound → the module loads (host bridge present)
   but the userspace readout is a clean `N/A (unsupported hardware)` —
   expected, not an error.
+- **Server / HEDT platforms (Haswell-E → Sapphire Rapids):** the module may
+  load (the Intel vendor gate passes), but the userspace server decode does
+  **not** use its MMIO attributes — these platforms' MC timing registers are
+  not OS-accessible, so the readout sources the SMBIOS Type 17 topology + the
+  SPD EEPROM instead. The module is the data source for the *client* decode
+  only.
 - **Meteor/Arrow Lake tile routing (OQ-5):** where the physical IMC sits
   behind the secondary SoC-tile range the module doesn't expose → clean
   N/A, never a fabricated decode.

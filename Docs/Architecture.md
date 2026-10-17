@@ -121,14 +121,20 @@ no direct MMIO from userspace* — the daemon reads:
 - **channel mode + ECC state** from the UMC channel-population register set
   (per-channel CS base/mask words + `UmcCapHi`, §10.2).
 
-**Intel.** Two raw sources feed one decode (§10.3). The **primary** is the
-`ramsleuth_intel` kernel module, which maps the host-bridge **MCHBAR** window
-in kernel space and publishes the raw IMC registers as 25 world-readable sysfs
-attributes under `/sys/kernel/ramsleuth_intel/` (including the host-bridge
-`CAPID0_A` word — the ECC-decode input) — no C-side decoding; all bit-field
-semantics live in Rust. The **fallback** is a read-only `mmap` of
-the same window via `/dev/mem` (the operation that forces `CAP_SYS_RAWIO`),
-taken only when the module's kobject is absent. The decode **dispatches on
+**Intel.** The client decode has two raw MMIO sources feeding one pure decode
+core (§10.3); the server / HEDT decode takes a third, non-MMIO path. The
+**primary** is the `ramsleuth_intel` kernel module, which maps the
+host-bridge **MCHBAR** window in kernel space and publishes the raw IMC
+registers as world-readable sysfs attributes under
+`/sys/kernel/ramsleuth_intel/` — the 25-attribute core set (including the
+host-bridge `CAPID0_A` word, the ECC-decode input) plus two generation-gated
+groups on 12th-gen+ silicon (up to 79 attributes on an Alder / Raptor DDR4
+box) — no C-side decoding; all bit-field semantics live in Rust. The
+**fallback** is a read-only `mmap` of the same window via `/dev/mem` (the
+operation that forces `CAP_SYS_RAWIO`), taken only when the module's kobject is
+absent. The **server** path (Haswell-E → Sapphire Rapids) reads no MMIO at
+all — its MC registers are not OS-accessible — and decodes from the
+unprivileged SMBIOS Type 17 topology + the SPD EEPROM. The decode **dispatches on
 `intel_gen::profile_for`** ("Tier 1 is one case of the dispatcher", §10.3):
 Tier 1 and Rocket Lake decode the 64 KiB register map (Rocket additionally
 decodes `gear_mode` + `uclk_mhz` from `MC_BIOS_REQ[17:16]`, the Gear2 cap),
@@ -334,16 +340,16 @@ section is N/A, exit 2 on a bad flag).
 | `src/` file | Responsibility |
 |-------------|----------------|
 | `lib.rs` | Crate root: re-exports `collect`, `SystemMemoryTelemetry`, and the public provider types. |
-| `cpuid.rs` | `CpuInfo::detect()` — vendor (`AuthenticAMD` / `GenuineIntel` / unknown), microarchitecture (`AmdZen` Zen1–Zen5 by CPUID family; `IntelGen` Skylake–Arrow Lake), brand string. Pure `__cpuid` intrinsic; the dispatch key of the whole crate. |
+| `cpuid.rs` | `CpuInfo::detect()` — vendor (`AuthenticAMD` / `GenuineIntel` / unknown), microarchitecture (`AmdZen` Zen1–Zen5 by CPUID family; `IntelGen` the 22-variant set — client Skylake–Arrow Lake *and* the server / HEDT line Haswell-E / Broadwell-E / Skylake-X / Cascade Lake / Sapphire Rapids), brand string. Pure `__cpuid` intrinsic; the dispatch key of the whole crate. |
 | `error.rs` | The contract types: `TelemetryError` (rich cause: vendor, driver, privilege hint, PM-table version, `io::Error`, parse detail), `NaReason` (the six display reasons, §3.3), `Section<T>` (`Value`/`Na`). |
 | `amd_smu.rs` | The single privileged gateway to the `ryzen_smu` driver: sysfs-first PM-blob acquisition, version sourcing, the char-device fallback, and safe `nix` wrappers (no `unsafe`). |
 | `amd_pm.rs` | **Generation-first** parse of the raw PM blob (dispatch on the CPUID `AmdZen` family; the `TableVersionId` is a **per-generation plausibility filter, not a closed allowlist**) into clocks (MCLK/UCLK/FCLK) and voltages (VDDCR_VDD/VDDCR_SOC). |
 | `amd_smn.rs` | The `smn` accessor protocol plus the verified SMN register tables — the 13-register timing block (the 27 subtimings, GDM, command rate) and the 14-register channel set (per-UMC CS base/mask + `UmcCapHi` → channel mode + ECC). |
 | `amd_readout.rs` | The four vendor-neutral display types (`ClockReadout`, `TimingSet`, `CadBus`, `VoltageSet`) and the AMD mapping onto them, with sanity gating. |
-| `intel_gen.rs` | The per-generation decode-profile dispatcher (IG-01/IG-03): `profile_for(IntelGen)` → the static `GenProfile` (window size — 64 KiB for Tier 1 / Rocket Lake, 256 KiB for the Alder family; channel count 2/2/2/4; `GearCap` None / Gear2 / Gear4; `GenMap` family), plus the Tier-3 `ALDER_CHANNELS` subchannel descriptors and the widened DDR5 `ALDER_FIELDS` bit ranges. Pure data, no I/O — the foundation every generational decode dispatches on. |
+| `intel_gen.rs` | The per-generation decode-profile dispatcher (IG-01/IG-03/H-9): `profile_for(IntelGen)` → one of seven static `GenProfile`s — `TIER1` (64 KiB, 2-channel, no gear: Skylake / Kaby / Coffee / Comet / Ice / Tiger Lake + the client Haswell / Broadwell), `ROCKET` (64 KiB, 2-channel, Gear2), `ALDER_2CH` (256 KiB, 2-channel DDR4 default, Gear4: Alder / Raptor Lake), `ALDER_DDR5` (256 KiB, dual-channel DDR5, Gear4: Meteor / Arrow Lake), and the three no-MMIO server-uncore profiles `SERVER_4CH` / `SERVER_6CH` / `SERVER_8CH` (Haswell-E / Broadwell-E / Skylake-X → 4ch; Cascade Lake → 6ch; Sapphire Rapids → 8ch) — each carrying window size, channel count, `GearCap`, and the `GenMap` family; plus the Tier-3 `ALDER_CHANNELS` subchannel descriptors, the widened DDR5 `ALDER_FIELDS` bit ranges, and the Alder/Raptor DDR4 `ALDER_DDR4_FIELDS` / `ALDER_DDR4_CHANNELS` tables (the `0xE000` / `0x1E000` per-MC blocks). Pure data, no I/O — the foundation every generational decode dispatches on. |
 | `intel_mchbar.rs` | MCHBAR location in PCI config space + the read-only `/dev/mem` RAII window (profile-sized: 64 KiB Tier 1 / Rocket Lake, 256 KiB the Alder family) — the fallback source (the one `unsafe` cluster in the crate). |
-| `intel_readout.rs` | The hardware-authoritative IMC register maps (MCHBAR-relative: the 64 KiB Tier-1 / Rocket Lake set and the 256 KiB Tier-3 Alder set) + the single pure decode core (`decode`, dispatched on `intel_gen::profile_for`) fed by both raw sources, into the same display types. |
-| `intel_sysfs.rs` | The primary raw reader: the `ramsleuth_intel` kobject's 25 attributes (the 19 IMC-register attributes — 2 MCHBAR diagnostics, `MC_BIOS_REQ`, 16 per-channel `TC_*` — the 5 MAD channel/geometry, and the host-bridge `CAPID0_A`) under `/sys/kernel/ramsleuth_intel/` → the raw `IntelImcRegs` set + the MAD words + `capid0a` (per-attribute containment: absent / malformed → `None`). |
+| `intel_readout/` | The Intel IMC decode as a **9-module directory** (split out of the former single `intel_readout.rs` monolith). `mod.rs` — the orchestration: the generation gate (`intel_gen_gate` / `gen_gate`), the `decode` / `read_intel` / `read_intel_with` entry points, and the `profile_for` dispatch; `legacy_ddr4.rs` — the Tier-1 (Skylake–Comet Lake, plus Ice / Tiger / Haswell / Broadwell) 64 KiB decode; `modern_ddr5.rs` — the Tier-3 (Alder / Raptor / Meteor / Arrow Lake) DDR5 256 KiB subchannel decode with the mirror → MCL fallback and the OQ-5 tile-routing probe; `modern_ddr4.rs` — the Alder / Raptor Lake DDR4 decode over the `0xE000` / `0x1E000` per-MC TC blocks; `server_uncore.rs` — the server / HEDT decode (SMBIOS Type 17 topology + SPD rated timings, **no** MCHBAR MMIO); `channel.rs` — the 4-tier channel-resolution trust procedure + the C-3 `0xD800` MAD/MCL1 aliasing policy; `types.rs` — the frozen wire shapes (`IntelImcRegs`, `IntelReadout`, `IntelChannel`); `gates.rs` — the plausibility / degenerate-word sanity gates; `fixtures.rs` — the shared test fixtures. Fed by both raw sources (the `ramsleuth_intel` sysfs reader and the `/dev/mem` MCHBAR map), into the same vendor-neutral display types. |
+| `intel_sysfs.rs` | The primary raw reader: the `ramsleuth_intel` kobject's attributes under `/sys/kernel/ramsleuth_intel/` → the raw `IntelImcRegs` set + the MAD words + `capid0a` (per-attribute containment: absent / malformed → `None`). The surface is the **25-attribute core** (2 MCHBAR diagnostics, `MC_BIOS_REQ`, the 16 per-channel `TC_*`, the 5 MAD channel/geometry, and the host-bridge `CAPID0_A`) **plus two generation-gated groups** on 12th-gen+ silicon — the `alk_d4_tc` DDR4 TC block (20 attributes, Alder / Raptor Lake DDR4 only) and the `tier3_extended` block (34 attributes: the `0xD000` / `0xD800` native MCL blocks, the `0x4800` / `0x4C00` DDR5 ch2 / ch3 mirror blocks, and the `mad_dimm_ch2` / `mad_dimm_ch3` raws at the gen-keyed MAD base + `0x60` / `+0x64`) — so a 12th-gen+ Alder / Raptor DDR4 box exposes **79** attributes and a DDR5-only box (Meteor / Arrow Lake) **59**. |
 | `spd_eeprom.rs` | Unprivileged enumeration + raw-image acquisition of every bound `ee1004` device. |
 | `spd_decode.rs` | Pure decode of the raw image: JEP106 makers, rank/density/speed, part/serial, XMP 2.0 / XMP 3.0-EXPO profiles. |
 | `platform.rs` | The vendor-neutral identity branch: DMI, `/proc/cpuinfo`, `/proc/meminfo`, the `ryzen_smu` version attribute. |
@@ -880,9 +886,12 @@ byte-pinned by unit tests: the `messages.rs` OQ-10 pin asserts that every
 pre-existing arm keeps its leading discriminant bytes unchanged and that the
 two appended arms land at the next discriminants only (`Request::
 GetProbeReport` at 4, `Response::ProbeReport` at 7), and the `cpuid.rs` IG-10
-pin applies the same rule to the wire-riding `IntelGen` enum (`RocketLake`
-appended at discriminant 11 — the eleven pre-existing variants 0–10
-byte-unchanged). The **enforcement** is the frame's `PROTOCOL_VERSION`
+pin applies the same rule to the wire-riding `IntelGen` enum (the original
+twelve variants 0–11 — Skylake → Arrow Lake, `Unrecognized`, and `RocketLake`
+at 11 — are byte-unchanged, and the server-uncore / HEDT line plus the client
+Haswell / Broadwell are **appended** at 12–21: Sapphire Rapids, Jasper Lake,
+Lunar Lake, Core Series 1 Mobile, Broadwell-E, Haswell-E, Skylake-X, Cascade
+Lake, Haswell, Broadwell). The **enforcement** is the frame's `PROTOCOL_VERSION`
 (bumped on any payload layout change) *plus* the `TC-DAEMON1` byte-pinning
 tests — an appended field / arm therefore never shifts a pre-existing
 encoding, and a layout change is a version bump, never a silent change, so
@@ -1193,15 +1202,23 @@ A vendor branch runs **only on matching silicon**: the AMD branch gates on
 `CpuVendor::Amd(_)` and the Intel branch on `CpuVendor::Intel(_)` *before any
 provider call*, so a non-matching vendor yields `Na(UnsupportedHardware)`
 with **zero I/O** in that branch. The Intel branch additionally gates on the
-profile-based **`gen_gate`** (IG-16) before either raw source is touched: it
+profile-based **`gen_gate`** (IG-16) before any raw source is touched: it
 passes every generation that resolves to a decode profile — Tier 1
-(`Skylake`–`CometLake`), Rocket Lake (Tier 2), and the Tier-3 Alder family
-(`Alder` / `Raptor` / `Meteor` / `ArrowLake` — profiled IG-03, decoded on the
-Tier-3 subchannel path IG-26) — and **only** the remaining unprofiled
-generations (Ice Lake / Tiger Lake / `Unrecognized`) degrade the whole branch
-to `Na(UnsupportedHardware)` — never garbage from a mismatched register map.
-The SPD and platform branches run on every vendor (unprivileged sysfs / DMI
-+ `/proc` reads).
+(`Skylake` / `Kaby` / `Coffee` / `Comet` / `Ice` / `Tiger` Lake, plus the
+client `Haswell` / `Broadwell`), Rocket Lake (Tier 2), the Tier-3 Alder
+family (`Alder` / `Raptor` / `Meteor` / `ArrowLake` — profiled IG-03, decoded
+on the Tier-3 subchannel path IG-26), and the server-uncore platforms
+(`HaswellE` / `BroadwellE` / `SkylakeX` → 4-channel, `CascadeLake` →
+6-channel, `SapphireRapids` → 8-channel) — and **only** the remaining
+unprofiled generations (`JasperLake` / `LunarLake` / `CoreSeries1Mobile` /
+`Unrecognized`) degrade the whole branch to `Na(UnsupportedHardware)` — never
+garbage from a mismatched register map. A server-uncore generation that passes
+the gate is then routed to the **`decode_server`** path (`is_server_gen`)
+*before* the sysfs / `/dev/mem` acquisition: its MC timing registers live in
+CPU-internal uncore (no OS-accessible BAR), so the readout sources the
+SMBIOS Type 17 topology + the SPD EEPROM rated timings and **never** reads the
+MCHBAR MMIO window. The SPD and platform branches run on every vendor
+(unprivileged sysfs / DMI + `/proc` reads).
 
 The snapshot's shape: `cpu` (vendor + brand — the dispatch key), `amd`
 (`Section<AmdReadout>`), `intel` (`Section<IntelReadout>`), `spd` (one decoded
@@ -1314,13 +1331,14 @@ of the daemon keeps serving.
 
 ### 10.3 The Intel path — the `ramsleuth_intel` module, with the `/dev/mem` MCHBAR fallback
 
-**CPU generation resolution — the full collision-set disambiguation (Chunk 1).** The Intel branch keys every decode on `IntelGen`, resolved by `CpuInfo::detect()` from CPUID leaf 1. A model number **alone** is not a safe generation key: several retail parts share one `0x1` model field across marketing generations (the `0x8E` / `0x9E` / `0xA5` / `0x97` / `0x9A` / `0xBA` collision set — the model numbers that span two marketing generations; `0xB7` / `0xBF` Raptor Lake are non-colliding and stay model-authoritative). The pre-Chunk-1 table was model-only and mis-bucketed the collision members — most consequentially `0x97` (Alder Lake-S, the i5-12600KF reference part) as **Tiger Lake**, which has no IMC decode profile and so degraded the whole Intel readout to `Na(UnsupportedHardware)`. The fix resolves every collision against the CPUID **brand string's marketing generation** (`intel_gen_from_brand`): the model table is the conservative base, and for a colliding model the brand's generation token decides — `0x97` + a 13th-gen brand → Raptor Lake, `0x97` + a 12th-gen or absent brand → Alder Lake (the i5-12600KF fix), `0xA5` + an 11th-gen brand → Rocket Lake, a Core-Ultra-Series-1 token on `0x9A` / `0xBA` → Core Series 1 Mobile, and so on; every **non-colliding** model stays model-authoritative. `IntelGen` is **append-only and wire-pinned to indices 0–15**: the original 0–10 (Skylake → Arrow Lake + `Unrecognized`) are byte-pinned, and Rocket Lake / Sapphire Rapids / Jasper Lake / Lunar Lake / Core Series 1 Mobile were **appended** at 11–15, so the frozen wire encoding is never reordered. An unlisted model, or an engineering-sample / non-Intel brand, degrades to `Unrecognized`, and `detect()` never panics.
+**CPU generation resolution — the full collision-set disambiguation (Chunk 1).** The Intel branch keys every decode on `IntelGen`, resolved by `CpuInfo::detect()` from CPUID leaf 1. A model number **alone** is not a safe generation key: several retail parts share one `0x1` model field across marketing generations (the `0x8E` / `0x9E` / `0xA5` / `0x97` / `0x9A` / `0xBA` collision set — the model numbers that span two marketing generations; `0xB7` / `0xBF` Raptor Lake are non-colliding and stay model-authoritative). The pre-Chunk-1 table was model-only and mis-bucketed the collision members — most consequentially `0x97` (Alder Lake-S, the i5-12600KF reference part) as **Tiger Lake**, which at the time had no IMC decode profile and so degraded the whole Intel readout to `Na(UnsupportedHardware)`. The fix resolves every collision against the CPUID **brand string's marketing generation** (`intel_gen_from_brand`): the model table is the conservative base, and for a colliding model the brand's generation token decides — `0x97` + a 13th-gen brand → Raptor Lake, `0x97` + a 12th-gen or absent brand → Alder Lake (the i5-12600KF fix), `0xA5` + an 11th-gen brand → Rocket Lake, a Core-Ultra-Series-1 token on `0x9A` / `0xBA` → Core Series 1 Mobile, a `v3` / `v4` server token on the `Haswell-E` / `Broadwell-E` models → the server-uncore line, and so on; every **non-colliding** model stays model-authoritative. `IntelGen` is **append-only and wire-pinned to indices 0–21**: the original 0–10 (Skylake → Arrow Lake + `Unrecognized`) are byte-pinned, and Rocket Lake (11), Sapphire Rapids (12), Jasper Lake (13), Lunar Lake (14), Core Series 1 Mobile (15), and the server-uncore / HEDT line — Broadwell-E (16), Haswell-E (17), Skylake-X (18), Cascade Lake (19) — plus the client Haswell (20) / Broadwell (21) were **appended**, so the frozen wire encoding is never reordered. An unlisted model, or an engineering-sample / non-Intel brand, degrades to `Unrecognized`, and `detect()` never panics.
 
-**MCHBAR, raw-exposes / Rust-decodes, two sources.** The branch is
+**MCHBAR, raw-exposes / Rust-decodes — two MMIO sources plus the server path.** The branch is
 vendor-gated on `CpuInfo::detect()` — **on AMD hosts this gate is the entire
 behavior: no PCI config is read, no kobject is probed, and `/dev/mem` is
-never opened.** On Intel, the raw IMC registers come from two sources that
-feed **one** pure decode core:
+never opened.** On Intel, the client decode's raw IMC registers come from two
+sources that feed **one** pure decode core (and the server / HEDT decode takes
+a third, non-MMIO path — see the server-uncore note below):
 
 1. **primary — the `ramsleuth_intel` kernel module** (GPL-2.0, the project's
    own original work — no upstream project, no pin — in the in-repo
@@ -1331,29 +1349,38 @@ feed **one** pure decode core:
    (64 KiB for Tier 1 / Rocket Lake; 256 KiB on the 12th-gen+ family —
    selected in-kernel from the CPU model the module computes via
    `cpuid_eax(1)`, the same 12th-gen+ set the userspace decode keys on),
-   and publishes
-    the raw IMC registers as **25 world-readable (`0444`) sysfs attributes**
-   under `/sys/kernel/ramsleuth_intel/` — the 19 IMC-register attributes
-   (the 2 MCHBAR diagnostics, `MC_BIOS_REQ`, and the 16 per-channel `TC_*`)
-   plus the 5 MAD channel/geometry registers (`0x5000`–`0x5010`) plus the
-   host-bridge `CAPID0_A` word (config offset `0xE4`, read in-kernel — the
-   host-bridge `/sys/.../config` space is 64-byte-truncated, so the
-   in-kernel read is the only path; an unreadable read prints the
-   `0xffffffff` sentinel, which degrades to `None`) — each register
-   attribute the raw word, one line, `0x%08x` (the MCHBAR diagnostics as
-   `%016llx` and a constant `1`). **No C-side decoding**:
-   the module exposes raw values and
-   Rust owns the bit-field semantics, so one module spans the supported
-   client generations. The kobject exists **only on a fully successful
-   probe** (Intel vendor, MCHBAR_EN set, non-zero masked base, `ioremap`
-   OK); any probe failure leaves no kobject behind, and on a non-Intel host
-   the load fails `-ENODEV` by design — the module is Intel-only. The Rust
-   reader (`intel_sysfs`) takes the 25 attributes with per-attribute
-   containment: an **absent** attribute and a **malformed** payload both
-   degrade to `None` for that register only; only a permission / other-I/O
-   failure on a present attribute is reported as a structured
-   `TelemetryError`. A missing kobject is the `DriverMissing` outcome that
-   triggers the fallback.
+    and publishes
+     the raw IMC registers as **world-readable (`0444`) sysfs attributes**
+    under `/sys/kernel/ramsleuth_intel/` — a **25-attribute core set** (the 19
+    IMC-register attributes: the 2 MCHBAR diagnostics, `MC_BIOS_REQ`, and the
+    16 per-channel `TC_*`; the 5 MAD channel/geometry registers at the
+    gen-keyed base `0x5000`–`0x5010` (pre-12th-gen) / `0xd800`+ (12th-gen+);
+    and the host-bridge `CAPID0_A` word (config offset `0xE4`, read in-kernel
+    — the host-bridge `/sys/.../config` space is 64-byte-truncated, so the
+    in-kernel read is the only path; an unreadable read prints the
+    `0xffffffff` sentinel, which degrades to `None`)), **plus two
+    generation-gated groups** created on 12th-gen+ silicon: the `alk_d4_tc`
+    group (20 attributes — the Alder / Raptor Lake **DDR4** per-MC TC blocks
+    at `0xE000` / `0x1E000`, gated on the DDR4 12th-gen+ subset) and the
+    `tier3_extended` group (34 attributes — the `0xD000` / `0xD800` native MCL
+    blocks, the `0x4800` / `0x4C00` DDR5 ch2 / ch3 mirror blocks, and the
+    `mad_dimm_ch2` / `mad_dimm_ch3` raws at the gen-keyed MAD base +
+    `0x60` / `+0x64`, gated on the whole 12th-gen+ family) — so a 12th-gen+
+    Alder / Raptor DDR4 box exposes **79** attributes and a DDR5-only box
+    (Meteor / Arrow Lake) **59**. Each register attribute the raw word, one
+    line, `0x%08x` (the MCHBAR diagnostics as `%016llx` and a constant `1`).
+    **No C-side decoding**: the module exposes raw values and Rust owns the
+    bit-field semantics, so one module spans the supported client
+    generations. The kobject exists **only on a fully successful
+    probe** (Intel vendor, MCHBAR_EN set, non-zero masked base, `ioremap`
+    OK); any probe failure leaves no kobject behind, and on a non-Intel host
+    the load fails `-ENODEV` by design — the module is Intel-only. The Rust
+    reader (`intel_sysfs`) takes the attributes with per-attribute
+    containment: an **absent** attribute and a **malformed** payload both
+    degrade to `None` for that register only; only a permission / other-I/O
+    failure on a present attribute is reported as a structured
+    `TelemetryError`. A missing kobject is the `DriverMissing` outcome that
+    triggers the fallback.
 2. **fallback — `/dev/mem` MCHBAR, taken ONLY when the kobject is absent.**
    Any other sysfs outcome (`Parse` / `InsufficientPrivilege` / `Io`)
    propagates as-is: the module being loaded means the hardware is
@@ -1401,31 +1428,69 @@ page-aligned, and every register read is bounds-checked against the mapped
 window (the module's attributes need none of this: they are plain sysfs
 reads).
 
-**The register-map families (MCHBAR-relative).** The decode dispatches on
-the generation's profile, and three register-map families are in play:
+**The server-uncore path (no MMIO at all).** The two sources above serve the
+*client* decode. The server / HEDT platforms (Haswell-E / Broadwell-E /
+Skylake-X / Cascade Lake / Sapphire Rapids) take a third path that reads
+**no** MCHBAR window: their memory-controller timing registers live in
+CPU-internal uncore space that is not PCI-BAR-mapped and is unreachable via
+`/dev/mem` (a 16 MiB MCH-window sweep on the x99 reference found only a
+sparse page-0 cluster), and the SPD EEPROM sits on the MC's internal I2C bus
+(not OS-visible). The facade routes a generation that passes `gen_gate` and
+matches `is_server_gen` straight to `decode_server(smbios, spd, gen)` — it
+never calls the sysfs reader or opens `/dev/mem`. The readout assembles, per
+the generation's channel count (4 / 6 / 8): the MCLK / UCLK from the
+representative SPD module's rated data rate (falling back to the SMBIOS Type 17
+*Configured Memory Speed* when no module is visible), the four SPD-rated core
+timings (tCL / tRCD / tRP / tRAS + the synthesized tRC) from each channel's
+factory profile, the SMBIOS-resolved channel mode / memory technology / DIMM
+count (the 4-tier procedure with **no** MMIO input — the L2 / L4 firmware-only
+states), and every other MC live cell (the remaining subtimings, the CAD bus,
+the voltage rails, the RTL) as an honest `N/A` carrying
+`server uncore: no OS-accessible timing source (no MC BAR, no SPD EEPROM)`.
+ECC reads `Unknown` (no `CAPID0_A` input on this path).
 
-- **Tier 1** = Skylake / Kaby Lake / Coffee Lake / Comet Lake: one memory
-  controller, two channels, DDR4, the 64 KiB window — the hardware-
-  authoritative table below (one global register, two per-channel blocks —
-  channel 0 at `0x4000`, channel 1 at `0x4400`, stride `0x400` — and the
-  MAD channel/geometry block at `0x5000`);
+**The register-map families (MCHBAR-relative).** The decode dispatches on
+the generation's profile, and four register-map families are in play:
+
+- **Tier 1** = Skylake / Kaby Lake / Coffee Lake / Comet Lake, plus the
+  10 nm Ice Lake / Tiger Lake derivatives and the client Haswell / Broadwell
+  (all share the identical 64 KiB map): one memory controller, two channels,
+  DDR4 — the hardware-authoritative table below (one global register, two
+  per-channel blocks — channel 0 at `0x4000`, channel 1 at `0x4400`, stride
+  `0x400` — and the MAD channel/geometry block at `0x5000`);
 - **Rocket Lake**: the same 64 KiB window and offsets (the shared layout)
   plus the gear-ratio decoding of `MC_BIOS_REQ[17:16]` (the `Gear2` cap);
 - **the Tier-3 Alder family** = Alder / Raptor / Meteor / Arrow Lake: the
-  256 KiB window (`0x40000`) and the widened DDR5 offset set — the four
+  256 KiB window (`0x40000`). The DDR5 decode (Meteor / Arrow Lake, and the
+  Alder / Raptor Lake DDR5 kits) uses the widened offset set — the four
   `ALDER_CHANNELS` subchannel descriptors (MC0 hosts subchannels 0 / 1, MC1
   hosts 2 / 3: the legacy mirror blocks at `0x4000` / `0x4400` / `0x4800` /
   `0x4C00`, with the native uncore-MCL fallback bases `0xD000` (MC0) and
   `0xD800` (MC1) on subchannels 0 and 2 only — subchannels 1 and 3 are
   mirror-only) and the 22 widened DDR5 timing bitfields of `ALDER_FIELDS`
   (tCL / tRAS / tWR 8-bit, tRCD / tRP / tWTR_S / tWTR_L / tRTP 7-bit,
-  tRFC1 12-bit, tRFCsb 11-bit, plus the DDR5-specific tPPD).
+  tRFC1 12-bit, tRFCsb 11-bit, plus the DDR5-specific tPPD). The Alder /
+  Raptor Lake **DDR4** decode (the 2-channel default when the DDR5
+  subchannel condition is not met) instead reads the per-MC TC blocks at
+  `0xE000` (MC0) / `0x1E000` (MC1) through the `ALDER_DDR4_FIELDS` bitfields.
+- **Server uncore** = Haswell-E / Broadwell-E / Skylake-X (4-channel),
+  Cascade Lake (6-channel), Sapphire Rapids (8-channel): **no** MCHBAR MMIO
+  window at all — the memory-controller timing registers live in CPU-internal
+  uncore space that is not PCI-BAR-mapped and is unreachable via `/dev/mem`.
+  The decode sources the SMBIOS Type 17 topology (capacity / technology /
+  channel count) + the SPD EEPROM (the rated data rate and the factory
+  profile timings) and renders every MC live-register cell an honest
+  `N/A (server uncore: no OS-accessible timing source)`.
 
-**Coverage honesty (Tier 3):** the module path supplies *less* decode
-coverage than the `/dev/mem` path on Tier-3 hosts — the module exposes
-only the Tier-1-shaped 2-channel surface, so the DDR5 4-subchannel +
-MCL-fallback decode exists only via `/dev/mem` (the module's extra
-attributes are an open work item).
+**Coverage note (Tier 3):** the `ramsleuth_intel` module and the `/dev/mem`
+path now expose the *same* Tier-3 surface — the module's `tier3_extended`
+group publishes the `0xD000` / `0xD800` native MCL blocks, the `0x4800` /
+`0x4C00` DDR5 ch2 / ch3 mirror blocks, and the `mad_dimm_ch2` / `mad_dimm_ch3`
+raws (at the gen-keyed MAD base + `0x60` / `+0x64`), and its `alk_d4_tc` group
+publishes the Alder / Raptor DDR4 `0xE000` / `0x1E000` TC blocks — so the
+DDR5 4-subchannel + MCL-fallback decode and the DDR4 per-MC decode both run
+from the sysfs path (the `/dev/mem` fallback is only needed where the module
+is absent, e.g. an unsigned-module / Secure-Boot host).
 
 **The Tier-1 table** (shared with Rocket Lake):
 
@@ -1523,19 +1588,25 @@ and **UCLK:MCLK** — `Na` where the uncore ratio is not populated. Each
 is a structured `N/A (<reason>)`, never a silent zero, and none
 indicates a RamSleuth defect.
 
-**The profile-based generation gate.** The decode runs for **Tier 1–3**
-(Skylake → Arrow Lake) through the GenProfile dispatcher: Tier 1 (Skylake /
-Kaby Lake / Coffee Lake / Comet Lake) and Rocket Lake (Tier 2) on the
-64 KiB map, and the Tier-3 Alder family (Alder / Raptor / Meteor / Arrow
-Lake — dual-MC, DDR4/DDR5; the tier numbering is the research roadmap's:
-Rocket Lake = Tier 2, the Alder family = Tier 3) on the 256 KiB subchannel
-path. Only the unprofiled generations — Ice Lake / Tiger Lake /
-`Unrecognized` — degrade the **whole** readout to
-`Na(UnsupportedHardware)`, never garbage data from a mismatched register
-map. The channel **count** is the static `GenProfile.channel_count` (Tier 1
-/ Rocket Lake: 2; Alder / Raptor Lake: 2 — the DDR4 default; Meteor / Arrow
-Lake: 4), with OQ-11's decode-time flip to the 4-subchannel geometry when
-both `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws are present and non-zero. The
+**The profile-based generation gate.** The decode runs for every
+profiled generation through the `GenProfile` dispatcher: Tier 1 (Skylake /
+Kaby Lake / Coffee Lake / Comet Lake, plus the 10 nm Ice Lake / Tiger Lake
+and the client Haswell / Broadwell) and Rocket Lake (Tier 2) on the 64 KiB
+map, the Tier-3 Alder family (Alder / Raptor / Meteor / Arrow Lake — dual-MC,
+DDR4/DDR5; the tier numbering is the research roadmap's: Rocket Lake = Tier
+2, the Alder family = Tier 3) on the 256 KiB subchannel path, and the
+server-uncore line (Haswell-E / Broadwell-E / Skylake-X → 4-channel,
+Cascade Lake → 6-channel, Sapphire Rapids → 8-channel) on the no-MMIO
+SMBIOS + SPD path. Only the unprofiled generations — `JasperLake` /
+`LunarLake` / `CoreSeries1Mobile` / `Unrecognized` — degrade the **whole**
+readout to `Na(UnsupportedHardware)`, never garbage data from a mismatched
+register map. The channel **count** is the static `GenProfile.channel_count`
+(Tier 1 / Rocket Lake: 2; Alder / Raptor Lake: 2 — the DDR4 default; Meteor /
+Arrow Lake: 2 — the dual-channel DDR5 default, with OQ-11's decode-time flip
+to the 4-subchannel geometry when both `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws
+are present and non-zero; the server profiles: 4 / 6 / 8), and the server
+decode reports the *populated* channel count separately from the raw DIMM
+count. The
 channel-**mode field** is hardware-derived, not derived from the count:
 `decode` maps `MAD_INTER_CHANNEL[1:0]` onto `IntelReadout.channel_mode` —
 `00b` = Dual-Channel Symmetric (fully interleaved), `01b` = Dual-Channel
@@ -1546,7 +1617,7 @@ against the `MAD_DIMM_CH0/1` DIMM population (`channel_mode_with_population`
 asymmetric boxes, where it is demoted to `Single` / `DualFlex`), and when
 the module is absent the label falls back to the installed-DIMM count.
 
-**The channel-detection trust procedure (Chunk 2).** The user-visible channel mode is no longer read straight off a single IMC register; it is **capacity-derived** and reconciled across two independent sources by a **4-tier trust procedure** (`resolve_channel`). The hardware MMIO decode and the **SMBIOS Type 17** cross-check are separate inputs: the new `intel_smbios` module reads the kernel-exported `/sys/firmware/dmi/entries/17-<n>` "Memory Device" structures **unprivileged** (`std::fs`-only, no EDAC — EDAC is absent on consumer Intel client silicon) and derives the populated-DIMM count, the per-DIMM sizes, the active technology (DDR4 / DDR5), and a locator-based channel class (Dual / Single / Ambiguous). The tiers: **L1 VerifiedHardware** — the MMIO decoded a mode SMBIOS does not contradict (the hardware read is the primary authority, no annotation); **L3 Override** — the **safety override** and core fix: the MMIO decoded `Single` but SMBIOS confirms ≥ 2 populated DIMMs across channels, so the readout reports **Dual** with an "untrusted-MMIO mismatch" annotation (the MMIO word is flagged as offset-drift / vendor-MRC-customized / stale); this fires even when the module is old or absent, because the two inputs are independent; **L2 VerifiedFirmware** — the MMIO is blocked and SMBIOS shows a clean population (matched channels → Dual, one channel or a single DIMM → Single); **L4 Heuristic** — the MMIO is blocked and the SMBIOS locators are ambiguous (a dual heuristic, marked "unverified"); and a **terminal** state when neither source identifies the topology. The DDR5 geometry is labelled **`Dual-Channel (4x 32-bit Subchannels)`** (never "quad-channel" — it is a 128-bit dual-channel configuration) by the single-source `display_label`, which both the TUI and the GUI consume. The register base the decode reads from is **keyed on the generation**: the global MAD channel/geometry registers moved from `MCHBAR + 0x5000` (6th–11th gen) to `MCHBAR + 0xd800` (Alder Lake and later) with the System-Agent/arbiter redesign, and the `ramsleuth_intel` module now selects that base **in-kernel** from the CPU model it computes via `cpuid_eax(1)` (`is_12th_gen_plus(model) ? 0xd800 : 0x5000`, mirroring the userspace `IntelGen` set) and maps the wider 256 KiB window for the 12th-gen+ family.
+**The channel-detection trust procedure (Chunk 2).** The user-visible channel mode is no longer read straight off a single IMC register; it is **capacity-derived** and reconciled across two independent sources by a **4-tier trust procedure** (`resolve_channel`). The hardware MMIO decode and the **SMBIOS Type 17** cross-check are separate inputs: the new `intel_smbios` module reads the kernel-exported `/sys/firmware/dmi/entries/17-<n>` "Memory Device" structures **unprivileged** (`std::fs`-only, no EDAC — EDAC is absent on consumer Intel client silicon) and derives the populated-DIMM count, the per-DIMM sizes, the active technology (DDR4 / DDR5), and a locator-based channel class (Dual / Single / Ambiguous). The tiers: **L1 VerifiedHardware** — the MMIO decoded a mode SMBIOS does not contradict (the hardware read is the primary authority, no annotation); **L3 Override** — the **safety override** and core fix: the MMIO decoded `Single` but SMBIOS confirms ≥ 2 populated DIMMs across channels, so the readout reports **Dual** with an "untrusted-MMIO mismatch" annotation (the MMIO word is flagged as offset-drift / vendor-MRC-customized / stale); this fires even when the module is old or absent, because the two inputs are independent; **L2 VerifiedFirmware** — the MMIO is blocked and SMBIOS shows a clean population (matched channels → Dual, one channel or a single DIMM → Single); **L4 Heuristic** — the MMIO is blocked and the SMBIOS locators are ambiguous (a dual heuristic, marked "unverified"); and a **terminal** state when neither source identifies the topology. The DDR5 geometry is labelled **`Dual-Channel (4x 32-bit Subchannels)`** (never "quad-channel" — it is a 128-bit dual-channel configuration) by the single-source `display_label`, which both the TUI and the GUI consume. The register base the decode reads from is **keyed on the generation**: the global MAD channel/geometry registers moved from `MCHBAR + 0x5000` (pre-12th-gen) to `MCHBAR + 0xd800` (Alder Lake and later) with the System-Agent/arbiter redesign, and the `ramsleuth_intel` module now selects that base **in-kernel** from the CPU model it computes via `cpuid_eax(1)` (`is_12th_gen_plus(model) ? 0xd800 : 0x5000`, mirroring the userspace `IntelGen` set) and maps the wider 256 KiB window for the 12th-gen+ family.
 
 ### 10.4 The SPD path — fully unprivileged
 
@@ -1939,8 +2010,10 @@ fallback remains available where unblocked. When present:
   will be used"); the at-boot load entry
   (`/etc/modules-load.d/ramsleuth_intel.conf`) is written **only** on a
   successful Intel load (a stale one is removed on the non-Intel path);
-- the **frozen kobject contract** is the 25 world-readable attributes under
-  `/sys/kernel/ramsleuth_intel/` (§10.3): the module creates the kobject
+- the **frozen kobject contract** is the world-readable attributes under
+  `/sys/kernel/ramsleuth_intel/` (§10.3) — the 25-attribute core set plus the
+  two generation-gated groups on 12th-gen+ silicon (`alk_d4_tc` +
+  `tier3_extended`, up to 79 total): the module creates the kobject
   only on a fully successful probe, and any probe failure leaves no kobject
   behind;
 - like the AMD unit contract, the **systemd unit never loads the module** —
@@ -1980,9 +2053,11 @@ so the interesting surfaces are pure and testable headlessly:
   `request_response_bincode_byte_pinning_oq10`: `Request::GetProbeReport`
    must land at discriminant 4 and `Response::ProbeReport` at the appended
    discriminant 7, with every pre-existing arm's leading discriminant bytes
-   byte-unchanged; the `cpuid.rs` IG-10 serde pin: `IntelGen::RocketLake` at
-   discriminant 11, the eleven pre-existing variants 0–10 unchanged — and
-   the pins are reinforced by the **frame's `PROTOCOL_VERSION`**, under
+    byte-unchanged; the `cpuid.rs` IG-10 serde pin: the twelve pre-existing
+    `IntelGen` variants 0–11 (Skylake → Arrow Lake, `Unrecognized`,
+    `RocketLake`) unchanged, with the server-uncore / HEDT line and the client
+    Haswell / Broadwell appended at 12–21 — and
+    the pins are reinforced by the **frame's `PROTOCOL_VERSION`**, under
    which a payload layout change is a version bump); the
    `probe.rs` round-trip suite pins the `ProbeReport` / `ProbeRaw` /
    `ProbeSystem` wire shapes (incl. the OQ-10 AMD section appended after
