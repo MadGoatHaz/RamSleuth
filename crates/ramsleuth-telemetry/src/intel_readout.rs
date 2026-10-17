@@ -175,8 +175,8 @@ use crate::amd_readout::{CadBus, ClockReadout, EccStatus, GearMode, TimingSet, V
 use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_gen::{
-    AlderChannelMap, ALDER_CHANNELS, ALDER_DDR4_CHANNELS, ALDER_DDR4_FIELDS, ALDER_FIELDS, GearCap,
-    GenMap, profile_for,
+    AlderChannelMap, AlderDdr4Fields, ALDER_CHANNELS, ALDER_DDR4_CHANNELS, ALDER_DDR4_FIELDS,
+    ALDER_FIELDS, GearCap, GenMap, profile_for,
 };
 use crate::intel_mchbar::MchBar;
 use crate::intel_smbios::{DerivedMode, SmbiosTopology};
@@ -361,7 +361,12 @@ const CLOCK_MAX_MHZ: f64 = 5333.0;
 /// A word is "present" only if it's non-zero AND not a bus-fault
 /// (`0xFFFF_FFFF`). This prevents degenerate reads from being
 /// misinterpreted as valid evidence (e.g. OQ-11's DDR5 condition).
-fn is_present_word(v: Option<u32>) -> bool {
+///
+/// The canonical degenerate-screening helpers for this module (N-05):
+/// every decode path screens raw words through these two functions
+/// (crate-visible so sibling decode modules can share the same
+/// contract).
+pub(crate) fn is_present_word(v: Option<u32>) -> bool {
     matches!(v, Some(w) if w != 0 && w != 0xFFFF_FFFF)
 }
 
@@ -369,7 +374,7 @@ fn is_present_word(v: Option<u32>) -> bool {
 /// (bus-fault readback) — the two degenerate encodings Research line 329
 /// uses for the mirror window. `None` (a failed read) is *not* degenerate
 /// in this sense; it is a separate containment case.
-fn is_degenerate_word(w: u32) -> bool {
+pub(crate) fn is_degenerate_word(w: u32) -> bool {
     w == 0 || w == 0xFFFF_FFFF
 }
 
@@ -587,14 +592,14 @@ impl IntelImcRegs {
     /// degrades independently to `None` on failure (bounds, unmap, …) —
     /// one bad read never poisons the rest and never panics. The thin
     /// `MchBar` shell of the pure reader core [`from_wide_reader`].
-    pub fn from_bar_wide(bar: &MchBar) -> Self {
-        // H-12: routed only for the Alder family (all 12th-gen+), so the
-        // IMC base is always `imc_base_for`'s 12th-gen+ value (`0xD800`)
-        // — the `MAD_DIMM_CH2/CH3` raws key off it.
-        Self::from_wide_reader(
-            imc_base_for(IntelGen::AlderLake),
-            |off| bar.read_u32(off).ok(),
-        )
+    ///
+    /// `imc_base` is the gen-keyed IMC MAD base the caller derives
+    /// ([`imc_base_for`]: `0xD800` for 12th-gen+, `0x5000` for
+    /// pre-12th-gen) — the `MAD_DIMM_CH2/CH3` raws key off it (N-10:
+    /// the base is caller-supplied, mirroring [`from_wide_reader`],
+    /// never hard-coded to one generation's value).
+    pub fn from_bar_wide(bar: &MchBar, imc_base: usize) -> Self {
+        Self::from_wide_reader(imc_base, |off| bar.read_u32(off).ok())
     }
 
     /// The [`from_bar_wide`] read set over an abstract register reader:
@@ -676,9 +681,11 @@ impl IntelImcRegs {
     /// line 328) — see [`tile_routing_suspected`] and the pre-decode
     /// probe in [`decode`].
     pub fn primary_window_degenerate(&self) -> bool {
-        fn degenerate(v: &Option<u32>) -> bool {
-            matches!(v, None | Some(0) | Some(0xFFFF_FFFF))
-        }
+        // N-05: the canonical degenerate screen — a slot is degenerate
+        // when it is absent (`None`) OR a present-but-invalid word
+        // (`0x0` / `0xFFFF_FFFF`), i.e. the negation of
+        // [`is_present_word`].
+        let degenerate = |v: &Option<u32>| !is_present_word(*v);
         let channel_all = |c: &ChannelRegs| {
             [&c.tc_dbp,
                 &c.tc_rap,
@@ -1119,85 +1126,95 @@ pub fn turnaround_quartet(reg: u32) -> [u16; 4] {
 // 32-bit word. The 18-bit `tREFI` (`TC_RFTP [17:0]`) exceeds the `u16`
 // `field16` contract and has no frozen display slot, so it is not decoded
 // here (the raw word stays available via the sysfs attributes).
+//
+// N-09: every extractor here takes the field table as a parameter
+// (`&AlderDdr4Fields`; the live caller passes `&ALDER_DDR4_FIELDS`), so a
+// future DDR4 generation is a data change in `intel_gen.rs`, not a code
+// change in this module.
 // ---------------------------------------------------------------------------
 
+/// Bit position offset from the 64-bit `TC_PRE` field spec to the high
+/// 32-bit word (N-08). The datasheet `TC_PRE` spec is a 64-bit `[63:0]`
+/// register; the high word holds `[63:32]`, so a field at spec position
+/// `P` sits at position `P - 32` in the hi word.
+const TC_PRE_HI_WORD_SHIFT: u32 = 32;
+
 /// tRCD — `TC_PRE` 64-bit [58:51] = high word [26:19].
-pub fn alk_d4_pre_trcd(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.trcd.0 - 32, ALDER_DDR4_FIELDS.trcd.1 - 32)
+pub fn alk_d4_pre_trcd(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.trcd.0 - TC_PRE_HI_WORD_SHIFT, f.trcd.1 - TC_PRE_HI_WORD_SHIFT)
 }
 
 /// tRAS — `TC_PRE` 64-bit [50:42] = high word [18:10].
-pub fn alk_d4_pre_tras(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.tras.0 - 32, ALDER_DDR4_FIELDS.tras.1 - 32)
+pub fn alk_d4_pre_tras(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.tras.0 - TC_PRE_HI_WORD_SHIFT, f.tras.1 - TC_PRE_HI_WORD_SHIFT)
 }
 
 /// tWRPRE — `TC_PRE` 64-bit [41:32] = high word [9:0] (decoded — no
 /// frozen display slot).
-pub fn alk_d4_pre_wrpre(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.twrpre.0 - 32, ALDER_DDR4_FIELDS.twrpre.1 - 32)
+pub fn alk_d4_pre_wrpre(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.twrpre.0 - TC_PRE_HI_WORD_SHIFT, f.twrpre.1 - TC_PRE_HI_WORD_SHIFT)
 }
 
 /// tPPD — `TC_PRE` 64-bit [23:20] (low word; decoded — no display slot).
-pub fn alk_d4_pre_tppd(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.tppd.0, ALDER_DDR4_FIELDS.tppd.1)
+pub fn alk_d4_pre_tppd(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.tppd.0, f.tppd.1)
 }
 
 /// tRDPRE — `TC_PRE` 64-bit [19:13] (low word; decoded — no display slot).
-pub fn alk_d4_pre_rdpre(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.trdpre.0, ALDER_DDR4_FIELDS.trdpre.1)
+pub fn alk_d4_pre_rdpre(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.trdpre.0, f.trdpre.1)
 }
 
 /// tRP — `TC_PRE` 64-bit [7:0] (low word).
-pub fn alk_d4_pre_trp(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.trp.0, ALDER_DDR4_FIELDS.trp.1)
+pub fn alk_d4_pre_trp(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.trp.0, f.trp.1)
 }
 
 /// tRRD_DG — `TC_ACT` [21:15] (the DDR4 long row-to-row delay).
-pub fn alk_d4_act_trrd_dg(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.trrd_dg.0, ALDER_DDR4_FIELDS.trrd_dg.1)
+pub fn alk_d4_act_trrd_dg(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.trrd_dg.0, f.trrd_dg.1)
 }
 
 /// tRRD_SG — `TC_ACT` [14:9] (the DDR4 short row-to-row delay).
-pub fn alk_d4_act_trrd_sg(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.trrd_sg.0, ALDER_DDR4_FIELDS.trrd_sg.1)
+pub fn alk_d4_act_trrd_sg(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.trrd_sg.0, f.trrd_sg.1)
 }
 
 /// tFAW — `TC_ACT` [8:0] (9-bit).
-pub fn alk_d4_act_tfaw(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.tfaw.0, ALDER_DDR4_FIELDS.tfaw.1)
+pub fn alk_d4_act_tfaw(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.tfaw.0, f.tfaw.1)
 }
 
 /// tCWL — `TC_ODT` [31:24].
-pub fn alk_d4_odt_tcwl(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.tcwl.0, ALDER_DDR4_FIELDS.tcwl.1)
+pub fn alk_d4_odt_tcwl(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.tcwl.0, f.tcwl.1)
 }
 
 /// tCL — `TC_ODT` [22:16].
-pub fn alk_d4_odt_tcl(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.tcl.0, ALDER_DDR4_FIELDS.tcl.1)
+pub fn alk_d4_odt_tcl(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.tcl.0, f.tcl.1)
 }
 
 /// tRFC — `TC_RFTP` [30:18] (13-bit).
-pub fn alk_d4_rftp_trfc(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.trfc.0, ALDER_DDR4_FIELDS.trfc.1)
+pub fn alk_d4_rftp_trfc(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.trfc.0, f.trfc.1)
 }
 
 /// tREFI×9 — `TC_RFP` [31:24] (decoded — no frozen display slot).
-pub fn alk_d4_rfp_trefi9(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.trefi9.0, ALDER_DDR4_FIELDS.trefi9.1)
+pub fn alk_d4_rfp_trefi9(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.trefi9.0, f.trefi9.1)
 }
 
 /// OREF_RI — `TC_RFP` [7:0] (rank-idle period; decoded — no display slot).
-pub fn alk_d4_rfp_oref_ri(reg: u32) -> u16 {
-    field16(reg, ALDER_DDR4_FIELDS.oref_ri.0, ALDER_DDR4_FIELDS.oref_ri.1)
+pub fn alk_d4_rfp_oref_ri(reg: u32, f: &AlderDdr4Fields) -> u16 {
+    field16(reg, f.oref_ri.0, f.oref_ri.1)
 }
 
 /// The Alder Lake DDR4 turnaround quartet of one `TC_*` register:
-/// `(sg, dg, dr, dd)`, each extracted from its own `ALDER_DDR4_FIELDS`
-/// range (the DDR4 widths differ per register — 7/8/9-bit — so this is
-/// not the Tier-1 4×6-bit [`turnaround_quartet`]).
-pub fn alk_d4_turnaround(reg: u32, which: WhichAlkD4Turnaround) -> [u16; 4] {
-    let f = ALDER_DDR4_FIELDS;
+/// `(sg, dg, dr, dd)`, each extracted from its own field-table range
+/// (the DDR4 widths differ per register — 7/8/9-bit — so this is not the
+/// Tier-1 4×6-bit [`turnaround_quartet`]).
+pub fn alk_d4_turnaround(reg: u32, which: WhichAlkD4Turnaround, f: &AlderDdr4Fields) -> [u16; 4] {
     let (sg, dg, dr, dd) = match which {
         WhichAlkD4Turnaround::Rdrd => (f.rdrd_sg, f.rdrd_dg, f.rdrd_dr, f.rdrd_dd),
         WhichAlkD4Turnaround::Rdwr => (f.rdwr_sg, f.rdwr_dg, f.rdwr_dr, f.rdwr_dd),
@@ -1367,7 +1384,7 @@ pub fn decode_uclk(mclk: f64, gear: &Section<GearMode>) -> Section<f64> {
 /// `Na(ParseError)`; a degenerate word (`0` = untrained,
 /// `0xFFFF_FFFF` = bus-fault) → `Na(ParseError)`; a decoded value
 /// outside [1, max_ticks] → `Na(ParseError)`; otherwise the tick value.
-fn timing_cell(reg: Option<u32>, name: &str, extract: fn(u32) -> u16) -> Section<u16> {
+fn timing_cell(reg: Option<u32>, name: &str, extract: impl Fn(u32) -> u16) -> Section<u16> {
     timing_cell_max(reg, name, extract, TIMING_MAX_TICKS)
 }
 
@@ -1378,7 +1395,7 @@ fn timing_cell(reg: Option<u32>, name: &str, extract: fn(u32) -> u16) -> Section
 fn timing_cell_max(
     reg: Option<u32>,
     name: &str,
-    extract: fn(u32) -> u16,
+    extract: impl Fn(u32) -> u16,
     max_ticks: u16,
 ) -> Section<u16> {
     match reg {
@@ -1500,17 +1517,10 @@ fn decode_tier1_channel(index: u8, mclk: Section<f64>, regs: &ChannelRegs) -> In
     // --- clocks: the shared map decodes mclk only; the Rocket Lake
     // profile layers on gear_mode + uclk (MC_BIOS_REQ[17:16], Breakdown
     // §3D) in [`decode`] after this call. The AMD-fabric slots have no
-    // IMC analog -------------------------------------------------------
-    let clocks = ClockReadout {
-        mclk_mhz: mclk,
-        uclk_mhz: Section::na(NaReason::NotApplicable),
-        fclk_mhz: Section::na(NaReason::NotApplicable),
-        div_mode: Section::na(NaReason::NotApplicable),
-        gear_mode: Section::na(NaReason::NotApplicable),
-        gdm: Section::na(NaReason::NotApplicable),
-        pdm: Section::na(NaReason::NotApplicable),
-        command_rate: Section::na(NaReason::NotApplicable),
-    };
+    // IMC analog. N-06: the structural NAs come from the shared
+    // builder.
+    let mut clocks = na_clocks(&NaReason::NotApplicable);
+    clocks.mclk_mhz = mclk;
 
     let timings = TimingSet {
         cl,
@@ -1543,28 +1553,12 @@ fn decode_tier1_channel(index: u8, mclk: Section<f64>, regs: &ChannelRegs) -> In
     };
 
     // The legacy skeleton's "RTL" was fiction — the real IMC table has
-    // no RTL.
-    let rtl = Section::na(NaReason::NotApplicable);
-
-    // CAD bus + voltages: not exposed by the Intel IMC window (unchanged
-    // from the v2.2.1 model).
-    let cad_bus = CadBus {
-        proc_odt: Section::na(NaReason::NotApplicable),
-        rtt_nom: Section::na(NaReason::NotApplicable),
-        rtt_wr: Section::na(NaReason::NotApplicable),
-        rtt_park: Section::na(NaReason::NotApplicable),
-        clk_drv: Section::na(NaReason::NotApplicable),
-        addr_cmd_drv: Section::na(NaReason::NotApplicable),
-        cs_odt_drv: Section::na(NaReason::NotApplicable),
-        cke_drv: Section::na(NaReason::NotApplicable),
-    };
-    let voltages = VoltageSet {
-        vddcr_soc_mv: Section::na(NaReason::NotApplicable),
-        vddio_mem_mv: Section::na(NaReason::NotApplicable),
-        vdd_misc_mv: Section::na(NaReason::NotApplicable),
-        vpp_mv: Section::na(NaReason::NotApplicable),
-        vcore_mv: Section::na(NaReason::NotApplicable),
-    };
+    // no RTL. CAD bus + voltages: not exposed by the Intel IMC window
+    // (unchanged from the v2.2.1 model). N-06: the structural NAs come
+    // from the shared builders.
+    let rtl = na_rtl(&NaReason::NotApplicable);
+    let cad_bus = na_cad_bus(&NaReason::NotApplicable);
+    let voltages = na_voltages(&NaReason::NotApplicable);
 
     IntelChannel {
         index,
@@ -1678,17 +1672,10 @@ pub fn decode_tier3_channel(
     let _ = map;
 
     // --- clocks: the shared map decodes mclk only; the gear cells layer
-    // on in the caller dispatch (as in Tier 1 / Rocket Lake) -----------
-    let clocks = ClockReadout {
-        mclk_mhz: mclk,
-        uclk_mhz: Section::na(NaReason::NotApplicable),
-        fclk_mhz: Section::na(NaReason::NotApplicable),
-        div_mode: Section::na(NaReason::NotApplicable),
-        gear_mode: Section::na(NaReason::NotApplicable),
-        gdm: Section::na(NaReason::NotApplicable),
-        pdm: Section::na(NaReason::NotApplicable),
-        command_rate: Section::na(NaReason::NotApplicable),
-    };
+    // on in the caller dispatch (as in Tier 1 / Rocket Lake). N-06: the
+    // structural NAs come from the shared builder.
+    let mut clocks = na_clocks(&NaReason::NotApplicable);
+    clocks.mclk_mhz = mclk;
 
     let timings = TimingSet {
         cl,
@@ -1721,28 +1708,12 @@ pub fn decode_tier3_channel(
     };
 
     // The legacy skeleton's "RTL" was fiction — the real IMC table has
-    // no RTL.
-    let rtl = Section::na(NaReason::NotApplicable);
-
-    // CAD bus + voltages: not exposed by the Intel IMC window (unchanged
-    // from the v2.2.1 model).
-    let cad_bus = CadBus {
-        proc_odt: Section::na(NaReason::NotApplicable),
-        rtt_nom: Section::na(NaReason::NotApplicable),
-        rtt_wr: Section::na(NaReason::NotApplicable),
-        rtt_park: Section::na(NaReason::NotApplicable),
-        clk_drv: Section::na(NaReason::NotApplicable),
-        addr_cmd_drv: Section::na(NaReason::NotApplicable),
-        cs_odt_drv: Section::na(NaReason::NotApplicable),
-        cke_drv: Section::na(NaReason::NotApplicable),
-    };
-    let voltages = VoltageSet {
-        vddcr_soc_mv: Section::na(NaReason::NotApplicable),
-        vddio_mem_mv: Section::na(NaReason::NotApplicable),
-        vdd_misc_mv: Section::na(NaReason::NotApplicable),
-        vpp_mv: Section::na(NaReason::NotApplicable),
-        vcore_mv: Section::na(NaReason::NotApplicable),
-    };
+    // no RTL. CAD bus + voltages: not exposed by the Intel IMC window
+    // (unchanged from the v2.2.1 model). N-06: the structural NAs come
+    // from the shared builders.
+    let rtl = na_rtl(&NaReason::NotApplicable);
+    let cad_bus = na_cad_bus(&NaReason::NotApplicable);
+    let voltages = na_voltages(&NaReason::NotApplicable);
 
     IntelChannel {
         index,
@@ -1762,8 +1733,10 @@ pub fn decode_tier3_channel(
 // ---------------------------------------------------------------------------
 
 /// Decode one Alder Lake DDR4 channel from its raw [`AlderDdr4TcRegs`]
-/// block + the shared DRAM core clock (the per-channel heart of the
-/// DDR4 decode path, Phase 1c). Never panics (D5): every cell is a
+/// block + the shared DRAM core clock + the DDR4 field table (N-09:
+/// the caller passes `&ALDER_DDR4_FIELDS`, so a future DDR4 generation
+/// is a data change, not a code change) — the per-channel heart of the
+/// DDR4 decode path, Phase 1c. Never panics (D5): every cell is a
 /// `Value`, an honest `Na(ParseError)` (a sourced register failed / a
 /// field is untrained), or a structural `Na(NotApplicable)`.
 ///
@@ -1772,27 +1745,52 @@ pub fn decode_tier3_channel(
 /// tRP. `tCL` / `tCWL` come from `TC_ODT`; `tFAW` / `tRRD_SG` /
 /// `tRRD_DG` from `TC_ACT`; `tRFC` from `TC_RFTP`. The DDR4 turnaround
 /// quartets (`TC_RDRD` / `TC_RDWR` / `TC_WRRD` / `TC_WRWR`) use the
-/// per-register `ALDER_DDR4_FIELDS` widths (not the Tier-1 4×6-bit
-/// layout). `tWR` / `tRTP` / `rfc2` / `rfcsb` have no slot in the DDR4
+/// per-register field-table widths (not the Tier-1 4×6-bit layout).
+/// `tWR` / `tRTP` / `rfc2` / `rfcsb` have no slot in the DDR4
 /// `TC` layout → `Na(NotApplicable)`. The `rc = ras + rp` synthesis and
 /// the [1, 2048] tick gate are preserved (Breakdown §6). The gear cells
 /// layer on in the caller dispatch (as in Tier 1 / Tier 3).
-fn decode_alder_ddr4_channel(index: u8, mclk: Section<f64>, regs: &AlderDdr4TcRegs) -> IntelChannel {
+///
+/// N-03: like the Tier-1 / Tier-3 siblings (H-2), the raw words are
+/// normalized through the canonical degenerate screen at the top — a
+/// bus-fault / untrained word never fabricates a turnaround-quartet
+/// value (the DDR4 quartet path has no per-word screen of its own).
+fn decode_alder_ddr4_channel(
+    index: u8,
+    mclk: Section<f64>,
+    regs: &AlderDdr4TcRegs,
+    fields: &AlderDdr4Fields,
+) -> IntelChannel {
+    // N-03: Screen degenerate words (bus-fault / untrained) — same as
+    // the Tier-1 and Tier-3 siblings (H-2).
+    let regs = AlderDdr4TcRegs {
+        tc_pre_lo: regs.tc_pre_lo.filter(|&w| !is_degenerate_word(w)),
+        tc_pre_hi: regs.tc_pre_hi.filter(|&w| !is_degenerate_word(w)),
+        tc_act: regs.tc_act.filter(|&w| !is_degenerate_word(w)),
+        tc_rdrd: regs.tc_rdrd.filter(|&w| !is_degenerate_word(w)),
+        tc_rdwr: regs.tc_rdwr.filter(|&w| !is_degenerate_word(w)),
+        tc_wrrd: regs.tc_wrrd.filter(|&w| !is_degenerate_word(w)),
+        tc_wrwr: regs.tc_wrwr.filter(|&w| !is_degenerate_word(w)),
+        tc_odt: regs.tc_odt.filter(|&w| !is_degenerate_word(w)),
+        tc_rfp: regs.tc_rfp.filter(|&w| !is_degenerate_word(w)),
+        tc_rftp: regs.tc_rftp.filter(|&w| !is_degenerate_word(w)),
+    };
+
     // TC_PRE (64-bit): the unified symmetric tRCD feeds both the rcdrd and
     // the rcwdwr slot; tRAS / tRP (the low word carries tRP).
-    let rcdrd = timing_cell(regs.tc_pre_hi, "tRCD", alk_d4_pre_trcd);
+    let rcdrd = timing_cell(regs.tc_pre_hi, "tRCD", |w| alk_d4_pre_trcd(w, fields));
     let rcwdwr = rcdrd.clone();
-    let ras = timing_cell(regs.tc_pre_hi, "tRAS", alk_d4_pre_tras);
-    let rp = timing_cell(regs.tc_pre_lo, "tRP", alk_d4_pre_trp);
+    let ras = timing_cell(regs.tc_pre_hi, "tRAS", |w| alk_d4_pre_tras(w, fields));
+    let rp = timing_cell(regs.tc_pre_lo, "tRP", |w| alk_d4_pre_trp(w, fields));
 
     // TC_ODT: tCL / tCWL.
-    let cl = timing_cell(regs.tc_odt, "tCL", alk_d4_odt_tcl);
-    let cwl = timing_cell(regs.tc_odt, "tCWL", alk_d4_odt_tcwl);
+    let cl = timing_cell(regs.tc_odt, "tCL", |w| alk_d4_odt_tcl(w, fields));
+    let cwl = timing_cell(regs.tc_odt, "tCWL", |w| alk_d4_odt_tcwl(w, fields));
 
     // TC_ACT: tRRD_SG (short) / tRRD_DG (long) / tFAW.
-    let rrds = timing_cell(regs.tc_act, "tRRD_SG", alk_d4_act_trrd_sg);
-    let rrld = timing_cell(regs.tc_act, "tRRD_DG", alk_d4_act_trrd_dg);
-    let faw = timing_cell(regs.tc_act, "tFAW", alk_d4_act_tfaw);
+    let rrds = timing_cell(regs.tc_act, "tRRD_SG", |w| alk_d4_act_trrd_sg(w, fields));
+    let rrld = timing_cell(regs.tc_act, "tRRD_DG", |w| alk_d4_act_trrd_dg(w, fields));
+    let faw = timing_cell(regs.tc_act, "tFAW", |w| alk_d4_act_tfaw(w, fields));
 
     // tRC is synthesized (the JEDEC identity — Intel exposes no tRC
     // register): `tRAS + tRP` when both decode.
@@ -1802,13 +1800,21 @@ fn decode_alder_ddr4_channel(index: u8, mclk: Section<f64>, regs: &AlderDdr4TcRe
     };
 
     // TC_RFTP: tRFC (13-bit).
-    let rfc1 = timing_cell(regs.tc_rftp, "tRFC", alk_d4_rftp_trfc);
+    let rfc1 = timing_cell(regs.tc_rftp, "tRFC", |w| alk_d4_rftp_trfc(w, fields));
 
     // The DDR4 turnaround quartets (per-register widths).
-    let rdrd = regs.tc_rdrd.map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Rdrd));
-    let rdwr = regs.tc_rdwr.map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Rdwr));
-    let wrrd = regs.tc_wrrd.map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Wrrd));
-    let wrwr = regs.tc_wrwr.map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Wrwr));
+    let rdrd = regs
+        .tc_rdrd
+        .map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Rdrd, fields));
+    let rdwr = regs
+        .tc_rdwr
+        .map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Rdwr, fields));
+    let wrrd = regs
+        .tc_wrrd
+        .map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Wrrd, fields));
+    let wrwr = regs
+        .tc_wrwr
+        .map(|r| alk_d4_turnaround(r, WhichAlkD4Turnaround::Wrwr, fields));
     let rdrd_scl = quartet_cell(rdrd, "tRDRD(sg)", 0);
     let rdrd_sc = quartet_cell(rdrd, "tRDRD(dg)", 1);
     let rdrd_sd = quartet_cell(rdrd, "tRDRD(dr)", 2);
@@ -1824,17 +1830,10 @@ fn decode_alder_ddr4_channel(index: u8, mclk: Section<f64>, regs: &AlderDdr4TcRe
     let wrwr_dd = quartet_cell(wrwr, "tWRWR(dd)", 3);
 
     // --- clocks: the shared map decodes mclk only; the gear cells layer
-    // on in the caller dispatch (GearCap::Gear4 — the Alder profile) ---
-    let clocks = ClockReadout {
-        mclk_mhz: mclk,
-        uclk_mhz: Section::na(NaReason::NotApplicable),
-        fclk_mhz: Section::na(NaReason::NotApplicable),
-        div_mode: Section::na(NaReason::NotApplicable),
-        gear_mode: Section::na(NaReason::NotApplicable),
-        gdm: Section::na(NaReason::NotApplicable),
-        pdm: Section::na(NaReason::NotApplicable),
-        command_rate: Section::na(NaReason::NotApplicable),
-    };
+    // on in the caller dispatch (GearCap::Gear4 — the Alder profile).
+    // N-06: the structural NAs come from the shared builder. ---
+    let mut clocks = na_clocks(&NaReason::NotApplicable);
+    clocks.mclk_mhz = mclk;
 
     let timings = TimingSet {
         cl,
@@ -1867,28 +1866,10 @@ fn decode_alder_ddr4_channel(index: u8, mclk: Section<f64>, regs: &AlderDdr4TcRe
     };
 
     // The legacy skeleton's "RTL" was fiction — the real IMC table has
-    // no RTL.
-    let rtl = Section::na(NaReason::NotApplicable);
-
-    // CAD bus + voltages: not exposed by the Intel IMC window (unchanged
-    // from the v2.2.1 model).
-    let cad_bus = CadBus {
-        proc_odt: Section::na(NaReason::NotApplicable),
-        rtt_nom: Section::na(NaReason::NotApplicable),
-        rtt_wr: Section::na(NaReason::NotApplicable),
-        rtt_park: Section::na(NaReason::NotApplicable),
-        clk_drv: Section::na(NaReason::NotApplicable),
-        addr_cmd_drv: Section::na(NaReason::NotApplicable),
-        cs_odt_drv: Section::na(NaReason::NotApplicable),
-        cke_drv: Section::na(NaReason::NotApplicable),
-    };
-    let voltages = VoltageSet {
-        vddcr_soc_mv: Section::na(NaReason::NotApplicable),
-        vddio_mem_mv: Section::na(NaReason::NotApplicable),
-        vdd_misc_mv: Section::na(NaReason::NotApplicable),
-        vpp_mv: Section::na(NaReason::NotApplicable),
-        vcore_mv: Section::na(NaReason::NotApplicable),
-    };
+    // no RTL. N-06: the structural NAs come from the shared builders.
+    let rtl = na_rtl(&NaReason::NotApplicable);
+    let cad_bus = na_cad_bus(&NaReason::NotApplicable);
+    let voltages = na_voltages(&NaReason::NotApplicable);
 
     IntelChannel {
         index,
@@ -1923,7 +1904,7 @@ fn decode_alder_ddr4(
         } else {
             &regs.alk_d4_tc1
         };
-        let mut channel = decode_alder_ddr4_channel(i as u8, mclk.clone(), tc);
+        let mut channel = decode_alder_ddr4_channel(i as u8, mclk.clone(), tc, &ALDER_DDR4_FIELDS);
         channel.clocks.gear_mode = gear_mode.clone();
         channel.clocks.uclk_mhz = uclk.clone();
         channels.push(channel);
@@ -2014,6 +1995,59 @@ fn quartet_cell(quartet: Option<[u16; 4]>, name: &str, slot: usize) -> Section<u
     }
 }
 
+// ---------------------------------------------------------------------------
+// N-06: the shared all-`Na(reason)` builders. The frozen display slots that
+// Intel never sources (the CAD bus, the voltages, the RTL, and the clock /
+// gear / command-rate cells on the live decode paths) used to be built by
+// five copy-pasted struct literals; these helpers are the single source
+// (pure refactor — the built values are byte-identical).
+// ---------------------------------------------------------------------------
+
+/// An all-`Na(reason)` [`ClockReadout`] (the eight frozen clock / gear /
+/// command-rate slots).
+fn na_clocks(reason: &NaReason) -> ClockReadout {
+    ClockReadout {
+        mclk_mhz: Section::na(reason.clone()),
+        uclk_mhz: Section::na(reason.clone()),
+        fclk_mhz: Section::na(reason.clone()),
+        div_mode: Section::na(reason.clone()),
+        gear_mode: Section::na(reason.clone()),
+        gdm: Section::na(reason.clone()),
+        pdm: Section::na(reason.clone()),
+        command_rate: Section::na(reason.clone()),
+    }
+}
+
+/// An all-`Na(reason)` [`CadBus`] (the eight frozen CAD slots).
+fn na_cad_bus(reason: &NaReason) -> CadBus {
+    CadBus {
+        proc_odt: Section::na(reason.clone()),
+        rtt_nom: Section::na(reason.clone()),
+        rtt_wr: Section::na(reason.clone()),
+        rtt_park: Section::na(reason.clone()),
+        clk_drv: Section::na(reason.clone()),
+        addr_cmd_drv: Section::na(reason.clone()),
+        cs_odt_drv: Section::na(reason.clone()),
+        cke_drv: Section::na(reason.clone()),
+    }
+}
+
+/// An all-`Na(reason)` [`VoltageSet`] (the five frozen rail slots).
+fn na_voltages(reason: &NaReason) -> VoltageSet {
+    VoltageSet {
+        vddcr_soc_mv: Section::na(reason.clone()),
+        vddio_mem_mv: Section::na(reason.clone()),
+        vdd_misc_mv: Section::na(reason.clone()),
+        vpp_mv: Section::na(reason.clone()),
+        vcore_mv: Section::na(reason.clone()),
+    }
+}
+
+/// An all-`Na(reason)` RTL slot.
+fn na_rtl(reason: &NaReason) -> Section<u16> {
+    Section::na(reason.clone())
+}
+
 /// One all-`Na(UnsupportedHardware)` channel: the degraded shape for a
 /// generation the v1 register map does not cover (plan §3.4 — never
 /// garbage data from a mismatched register map).
@@ -2022,16 +2056,8 @@ fn unsupported_channel(index: u8) -> IntelChannel {
     let na_timing = || Section::na(NaReason::UnsupportedHardware);
     IntelChannel {
         index,
-        clocks: ClockReadout {
-            mclk_mhz: Section::na(na.clone()),
-            uclk_mhz: Section::na(na.clone()),
-            fclk_mhz: Section::na(na.clone()),
-            div_mode: Section::na(na.clone()),
-            gear_mode: Section::na(na.clone()),
-            gdm: Section::na(na.clone()),
-            pdm: Section::na(na.clone()),
-            command_rate: Section::na(na.clone()),
-        },
+        // N-06: the structural NAs come from the shared builders.
+        clocks: na_clocks(&na),
         timings: TimingSet {
             cl: na_timing(),
             rcwdwr: na_timing(),
@@ -2061,24 +2087,9 @@ fn unsupported_channel(index: u8) -> IntelChannel {
             wrwr_scl: na_timing(),
             wrwr_sc: na_timing(),
         },
-        cad_bus: CadBus {
-            proc_odt: Section::na(na.clone()),
-            rtt_nom: Section::na(na.clone()),
-            rtt_wr: Section::na(na.clone()),
-            rtt_park: Section::na(na.clone()),
-            clk_drv: Section::na(na.clone()),
-            addr_cmd_drv: Section::na(na.clone()),
-            cs_odt_drv: Section::na(na.clone()),
-            cke_drv: Section::na(na.clone()),
-        },
-        voltages: VoltageSet {
-            vddcr_soc_mv: Section::na(na.clone()),
-            vddio_mem_mv: Section::na(na.clone()),
-            vdd_misc_mv: Section::na(na.clone()),
-            vpp_mv: Section::na(na.clone()),
-            vcore_mv: Section::na(na.clone()),
-        },
-        rtl: Section::na(na),
+        cad_bus: na_cad_bus(&na),
+        voltages: na_voltages(&na),
+        rtl: na_rtl(&na),
     }
 }
 
@@ -2220,6 +2231,14 @@ pub fn decode(
             // The current code consumes BOTH interpretations in a single decode call.
             // This is KNOWN to be incorrect — one of the two mappings is wrong.
             //
+            // KNOWN CIRCULARITY: This policy keys on `res.tech`, which is resolved by
+            // `resolve_channel` from `MAD_INTER_CHANNEL[2:0]` — a word read from the
+            // very 0xD800 page whose ownership is in question. The policy is
+            // self-consistent only if the initial MAD read is correct. To de-risk:
+            // cross-check `res.tech` against the independent SMBIOS Type 17 memory
+            // type before committing (applied in the policy selection below, N-04:
+            // on disagreement the firmware-written SMBIOS source wins).
+            //
             // Until hardware verification determines the true ownership of the 0xD800
             // page, the code uses the following heuristic:
             //   - If SMBIOS confirms DDR4: prefer MAD interpretation for geometry,
@@ -2281,13 +2300,34 @@ pub fn decode(
 
             // C-3: apply the aliasing policy so one interpretation of the
             // shared `0xD800` page does not corrupt the other.
-            let policy = c3_alias_policy(res.tech);
+            //
+            // N-04: cross-check the MAD-derived tech against the
+            // independent SMBIOS Type 17 memory type (the C-3 circularity
+            // de-risk). `res.tech` comes from `resolve_channel`, which
+            // prefers the MMIO `MAD_INTER_CHANNEL[2:0]` word — read from
+            // the very `0xD800` page whose ownership is in question. On
+            // disagreement, trust the firmware-written (not MMIO-read)
+            // SMBIOS source for the policy selection and annotate the
+            // discrepancy.
+            let mut effective_res = res.clone();
+            let policy_tech = match (res.tech, smbios.memory_type) {
+                (Some(mad), Some(smb)) if mad != smb => {
+                    if !effective_res.annotation.is_empty() {
+                        effective_res.annotation.push(' ');
+                    }
+                    effective_res.annotation.push_str(&format!(
+                        "[C-3: MAD-derived tech {mad:?} disagrees with SMBIOS Type 17 ({smb:?}) — trusting the firmware-written SMBIOS source for the 0xD800 page policy]"
+                    ));
+                    Some(smb)
+                }
+                _ => res.tech,
+            };
+            let policy = c3_alias_policy(policy_tech);
 
             // The effective channel resolution: the Mcl1 (DDR5) policy does
             // not trust the MAD geometry words → recompute from SMBIOS
             // alone; the MadAnnotated (unknown) policy carries the aliasing
             // annotation; the Mad (DDR4) policy keeps `res`.
-            let mut effective_res = res.clone();
             match policy {
                 C3AliasPolicy::Mcl1 => {
                     effective_res = resolve_channel(None, None, smbios);
@@ -2493,20 +2533,23 @@ pub fn read_intel_with(
     if is_server_gen(gen) {
         return Ok(server_all_na(gen, smbios.populated_count));
     }
+    // Chunk 2 / L-10 / N-10: the gen-keyed MAD channel/geometry registers
+    // (0xd800 for 12th-gen+, 0x5000 otherwise — [`imc_base_for`], the same
+    // base the kernel module selects) ride on the register set (all MAD
+    // data comes from `regs` in [`decode`]). The base is derived once and
+    // threaded to the wide reader (whose `MAD_DIMM_CH2/CH3` raws key off
+    // it) — N-10: the reader no longer hard-codes one generation's base.
+    // Per-register containment: an out-of-bounds / failed read degrades
+    // to `None` (never a panic).
+    let base = imc_base_for(gen);
     // The /dev/mem read set follows the generation's register-map
     // family (IG-26 fix): the Alder family takes the 256 KiB wide set
     // (its map is the 256 KiB profile window); Tier 1 / Rocket Lake
     // (and any future 64 KiB family) keep the 9-register Tier-1 set.
     let mut regs = match profile_for(gen).map(|p| p.map) {
-        Some(GenMap::Alder) => IntelImcRegs::from_bar_wide(bar),
+        Some(GenMap::Alder) => IntelImcRegs::from_bar_wide(bar, base),
         _ => IntelImcRegs::from_bar(bar),
     };
-    // Chunk 2 / L-10: the gen-keyed MAD channel/geometry registers
-    // (0xd800 for 12th-gen+, 0x5000 otherwise — [`imc_base_for`], the same
-    // base the kernel module selects) ride on the register set (all MAD
-    // data comes from `regs` in [`decode`]). Per-register containment: an
-    // out-of-bounds / failed read degrades to `None` (never a panic).
-    let base = imc_base_for(gen);
     regs.mad_inter_channel = bar.read_u32(base).ok();
     regs.mad_dimm_ch0 = bar.read_u32(base + 0x0C).ok();
     regs.mad_dimm_ch1 = bar.read_u32(base + 0x10).ok();
@@ -2772,21 +2815,17 @@ pub fn decode_server(
 /// runs at the DRAM clock); every other clock / gear / command-rate cell
 /// `Na(NotApplicable)` (no OS-accessible source).
 fn server_clocks(mclk: &Section<f64>) -> ClockReadout {
-    ClockReadout {
-        mclk_mhz: mclk.clone(),
-        uclk_mhz: mclk.clone(),
-        fclk_mhz: Section::na(NaReason::NotApplicable),
-        div_mode: Section::na(NaReason::NotApplicable),
-        gear_mode: Section::na(NaReason::NotApplicable),
-        gdm: Section::na(NaReason::NotApplicable),
-        pdm: Section::na(NaReason::NotApplicable),
-        command_rate: Section::na(NaReason::NotApplicable),
-    }
+    // N-06: the structural NAs come from the shared builder; the server
+    // decode layers the (data-driven) mclk / uclk on top.
+    let mut clocks = na_clocks(&NaReason::NotApplicable);
+    clocks.mclk_mhz = mclk.clone();
+    clocks.uclk_mhz = mclk.clone();
+    clocks
 }
 
 /// An MC-live timing cell's honest server-uncore N/A ([`SERVER_NA_REASON`]).
 fn server_na_u16() -> Section<u16> {
-    Section::na(NaReason::ParseError(SERVER_NA_REASON.to_owned()))
+    na_rtl(&NaReason::ParseError(SERVER_NA_REASON.to_owned()))
 }
 
 /// The SPD-rated core timings for one module: the four JEDEC core timings
@@ -2883,32 +2922,14 @@ fn server_na_timings() -> TimingSet {
 /// reason ([`SERVER_NA_REASON`]) — the IMC window does not expose drive
 /// strengths and there is no OS-accessible source on these platforms.
 fn server_na_cad_bus() -> CadBus {
-    let ohms = || Section::na(NaReason::ParseError(SERVER_NA_REASON.to_owned()));
-    let rtt = || Section::na(NaReason::ParseError(SERVER_NA_REASON.to_owned()));
-    CadBus {
-        proc_odt: ohms(),
-        rtt_nom: rtt(),
-        rtt_wr: rtt(),
-        rtt_park: rtt(),
-        clk_drv: ohms(),
-        addr_cmd_drv: ohms(),
-        cs_odt_drv: ohms(),
-        cke_drv: ohms(),
-    }
+    na_cad_bus(&NaReason::ParseError(SERVER_NA_REASON.to_owned()))
 }
 
 /// The server-uncore voltage cells: every rail the honest server-uncore
 /// reason ([`SERVER_NA_REASON`]) — the IMC window does not expose memory
 /// rails and there is no OS-accessible source on these platforms.
 fn server_na_voltages() -> VoltageSet {
-    let mv = || Section::na(NaReason::ParseError(SERVER_NA_REASON.to_owned()));
-    VoltageSet {
-        vddcr_soc_mv: mv(),
-        vddio_mem_mv: mv(),
-        vdd_misc_mv: mv(),
-        vpp_mv: mv(),
-        vcore_mv: mv(),
-    }
+    na_voltages(&NaReason::ParseError(SERVER_NA_REASON.to_owned()))
 }
 
 // ---------------------------------------------------------------------------
@@ -3117,11 +3138,11 @@ fn mad_dimm_capacity_gib(mad_dimm_ch: Option<u32>) -> Option<f64> {
 pub fn decode_ecc_status(capid0a: Option<u32>) -> EccStatus {
     match capid0a {
         None => EccStatus::Unknown,
-        // H-10: The kernel emits 0xFFFF_FFFF when the config read
-        // fails. This is NOT a valid capability assertion.
-        Some(0xFFFF_FFFF) => EccStatus::Unknown,
-        // A zero word is equally suspicious (untrained / cleared).
-        Some(0) => EccStatus::Unknown,
+        // H-10 / N-05: a degenerate word — the kernel emits
+        // `0xFFFF_FFFF` when the config read fails, and a zero word is
+        // equally suspicious (untrained / cleared) — is NOT a valid
+        // capability assertion (the canonical degenerate screen).
+        Some(v) if is_degenerate_word(v) => EccStatus::Unknown,
         Some(v) if v & 0x0002_0000 != 0 => EccStatus::NotCapable,
         Some(_) => EccStatus::CapableButDisabled,
     }
@@ -7024,6 +7045,89 @@ mod tests {
         );
     }
 
+    /// N-04: the C-3 circularity de-risk. The MAD word says DDR5
+    /// (`MAD_INTER_CHANNEL[2:0] = 100b` — a word read from the very
+    /// `0xD800` page whose ownership is in question) while the
+    /// independent SMBIOS Type 17 source says DDR4: the policy
+    /// selection trusts the firmware-written (not MMIO-read) SMBIOS
+    /// source (C3AliasPolicy::Mad — the `0xD800` page is the MAD
+    /// block), the aliased MCL1 timing words (the same page) are nulled
+    /// and NOT decoded, and the discrepancy is annotated.
+    #[test]
+    fn c3_smbios_crosscheck_trusts_smbios_on_disagreement() {
+        let smbios = SmbiosTopology {
+            memory_type: Some(MemoryTech::Ddr4),
+            ..SmbiosTopology::empty()
+        };
+        let regs = IntelImcRegs {
+            // Subchannel 2's mirror is a disabled default (bus-fault):
+            // without the SMBIOS-trusted Mad policy it would fall back
+            // to the aliased MCL1 words below.
+            ch2: ChannelRegs {
+                tc_rap: Some(0xFFFF_FFFF),
+                ..ChannelRegs::default()
+            },
+            // The aliased MCL1 block (same `0xD800` page) carries a
+            // valid-looking tCL 40 word.
+            mcl1: MclRegs {
+                tc_act: Some(0x0028_8410),
+                ..MclRegs::default()
+            },
+            // MAD says DDR5 (bits [2:0] = 100b).
+            mad_inter_channel: Some(4),
+            ..IntelImcRegs::default()
+        };
+        let ro = decode(&regs, IntelGen::AlderLake, &smbios);
+        // The readout keeps the resolved (MAD-first) tech for display...
+        assert_eq!(ro.memory_tech, Some(MemoryTech::Ddr5));
+        // ...but the policy selection is annotated with the
+        // MAD/SMBIOS discrepancy.
+        assert!(
+            ro.channel_annotation.contains("disagrees with SMBIOS"),
+            "the C-3 cross-check annotates the disagreement: {}",
+            ro.channel_annotation
+        );
+        // SMBIOS-trusted Mad policy: the MCL1 words (same page) are
+        // nulled, so the disabled mirror falls back to nothing — tCL is
+        // Na, NOT the fabricated 40.
+        let ch2 = ro
+            .channels
+            .iter()
+            .find(|c| c.index == 1)
+            .expect("second channel (subchannel 2) present");
+        assert!(
+            matches!(ch2.timings.cl, Section::Na(_)),
+            "MCL1 tCL must not be decoded on an SMBIOS-DDR4 platform: {:?}",
+            ch2.timings.cl
+        );
+    }
+
+    /// N-04: when the MAD-derived tech and the SMBIOS Type 17 tech
+    /// AGREE, the cross-check is silent (no discrepancy annotation) and
+    /// the policy keys on the agreed tech exactly as before.
+    #[test]
+    fn c3_smbios_crosscheck_silent_when_agreeing() {
+        let smbios = SmbiosTopology {
+            memory_type: Some(MemoryTech::Ddr4),
+            ..SmbiosTopology::empty()
+        };
+        let mut regs = tier3_ddr5_condition_regs();
+        // MAD [2:0] = 000 -> DDR4, agreeing with the SMBIOS source.
+        regs.mad_inter_channel = Some(0);
+        let ro = decode(&regs, IntelGen::AlderLake, &smbios);
+        assert_eq!(
+            ro.channels.len(),
+            4,
+            "OQ-11 DDR5 condition met -> 4 subchannels"
+        );
+        assert_eq!(ro.memory_tech, Some(MemoryTech::Ddr4));
+        assert!(
+            !ro.channel_annotation.contains("disagrees with SMBIOS"),
+            "agreement is silent: {}",
+            ro.channel_annotation
+        );
+    }
+
     /// The exact user bug, end to end: a dual-channel 2×16 GiB system
     /// whose MMIO is blocked (M-11: the zero word on ch1 is screened as
     /// degenerate), while SMBIOS Type 17 confirms two populated DIMMs
@@ -7396,6 +7500,66 @@ mod tests {
         ] {
             assert!(s.is_na(), "zero channel: {s:?} must be Na");
         }
+    }
+
+    /// N-03: an Alder Lake DDR4 channel whose every TC register is the
+    /// bus-fault word `0xFFFF_FFFF` produces all-`Na` timing cells — the
+    /// same degenerate-screening prologue as the Tier-1 / Tier-3
+    /// siblings (H-2), so the DDR4 turnaround-quartet path (which has no
+    /// per-word degenerate screen) never fabricates values from the
+    /// all-ones bit pattern.
+    #[test]
+    fn alder_ddr4_all_bus_fault_produces_all_na() {
+        let fault = 0xFFFF_FFFF;
+        let regs = AlderDdr4TcRegs {
+            tc_pre_lo: Some(fault),
+            tc_pre_hi: Some(fault),
+            tc_act: Some(fault),
+            tc_rdrd: Some(fault),
+            tc_rdwr: Some(fault),
+            tc_wrrd: Some(fault),
+            tc_wrwr: Some(fault),
+            tc_odt: Some(fault),
+            tc_rfp: Some(fault),
+            tc_rftp: Some(fault),
+        };
+        let ch =
+            decode_alder_ddr4_channel(0, Section::Value(1600.0), &regs, &ALDER_DDR4_FIELDS);
+        // Every timing cell must be Na (no fabricated values).
+        let cells: [&Section<u16>; 27] = [
+            &ch.timings.cl,
+            &ch.timings.rcwdwr,
+            &ch.timings.rcdrd,
+            &ch.timings.rp,
+            &ch.timings.ras,
+            &ch.timings.rc,
+            &ch.timings.rrds,
+            &ch.timings.rrld,
+            &ch.timings.faw,
+            &ch.timings.wtrs,
+            &ch.timings.wtrl,
+            &ch.timings.wr,
+            &ch.timings.rfc1,
+            &ch.timings.rfc2,
+            &ch.timings.rfcsb,
+            &ch.timings.cwl,
+            &ch.timings.rtp,
+            &ch.timings.rdwr,
+            &ch.timings.wrrd,
+            &ch.timings.rdrd_sd,
+            &ch.timings.rdrd_dd,
+            &ch.timings.rdrd_scl,
+            &ch.timings.rdrd_sc,
+            &ch.timings.wrwr_sd,
+            &ch.timings.wrwr_dd,
+            &ch.timings.wrwr_scl,
+            &ch.timings.wrwr_sc,
+        ];
+        for s in &cells {
+            assert!(s.is_na(), "bus-fault DDR4 channel: {s:?} must be Na");
+        }
+        // The clocks stay valid (the mclk is shared, not per-channel).
+        assert_eq!(ch.clocks.mclk_mhz, Section::Value(1600.0));
     }
 
     /// H-3: `mirror_or_mcl` screens the MCL fallback for degenerates
