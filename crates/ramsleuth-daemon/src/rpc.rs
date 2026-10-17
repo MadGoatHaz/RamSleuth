@@ -770,8 +770,13 @@ fn acquire_devmem(info: &CpuInfo) -> RawAcquisition {
         Ok(gen) => gen,
         Err(_) => return RawAcquisition::Unavailable,
     };
+    // N-10: the wide reader's gen-keyed MAD base is derived from the
+    // detected generation (the same `imc_base_for` the kernel module and
+    // `read_intel_with` use), not hard-coded to one generation.
     let regs = match intel_gen::profile_for(gen).map(|p| p.map) {
-        Some(GenMap::Alder) => IntelImcRegs::from_bar_wide(&bar),
+        Some(GenMap::Alder) => {
+            IntelImcRegs::from_bar_wide(&bar, ramsleuth_telemetry::intel_readout::imc_base_for(gen))
+        }
         _ => IntelImcRegs::from_bar(&bar),
     };
     RawAcquisition::DevMem(ProbeRawSource {
