@@ -1733,6 +1733,8 @@ mod tests {
     fn populated_snapshot(mclk_mhz: u16) -> SystemMemoryTelemetry {
         let readout = map_amd(&AmdPmSnapshot {
             version: 0x0007_0B02,
+            pm_exposed: true,
+            smn_setpoint_unverified: false,
             mclk_mhz,
             uclk_mhz: 1600,
             fclk_mhz: 1600,

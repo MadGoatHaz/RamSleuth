@@ -592,6 +592,8 @@ mod tests {
     fn fixture_amd(soc_mv: u16, vcore_mv: u16) -> AmdReadout {
         map_amd(&AmdPmSnapshot {
             version: 0x0007_0B02,
+            pm_exposed: true,
+            smn_setpoint_unverified: false,
             mclk_mhz: 1800,
             uclk_mhz: 1600,
             fclk_mhz: 1600,

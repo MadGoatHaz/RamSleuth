@@ -1165,6 +1165,8 @@ mod tests {
     fn pm_only_snapshot() -> AmdPmSnapshot {
         AmdPmSnapshot {
             version: 0x38_08_05,
+            pm_exposed: true,
+            smn_setpoint_unverified: false,
             mclk_mhz: 1800,
             uclk_mhz: 1800,
             fclk_mhz: 1792,

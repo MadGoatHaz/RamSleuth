@@ -37,7 +37,16 @@
 //!   → [`NaReason::NotApplicable`]. GDM/PDM map `0`/`1` to `false`/`true`,
 //!   else [`NaReason::ParseError`]. DRAM command rate maps `0`→
 //!   [`CommandRate::OneT`], `1`→[`CommandRate::TwoT`], else
-//!   [`NaReason::ParseError`].
+//!   [`NaReason::ParseError`]. **Two source-state gates override the value
+//!   mapping**: when `AmdPmSnapshot::pm_exposed` is `false` (the driver is
+//!   loaded but the `pm_table` attribute is not exposed — e.g. Castle Peak
+//!   / Threadripper 3990X), every PM-derived field (MCLK / UCLK / FCLK /
+//!   divide mode / voltages) carries the specific "PM table not exposed by
+//!   driver" reason instead of the generic out-of-range text; and when
+//!   `smn_setpoint_unverified` is `true` (the SMN `0x50200` word was read
+//!   but its set-point decodes to `0` MHz — impossible on a running
+//!   system), GDM / command rate carry the specific "0x50200 layout
+//!   unverified on this platform" reason instead of the coincidental bits.
 //! - **Timings** — raw tick counts pass through as `u16` (the plan's display
 //!   unit is ticks); `0` or above the plausible ceiling →
 //!   [`NaReason::ParseError`].
@@ -98,6 +107,23 @@ const TIMING_MAX_TICKS: u16 = 2048;
 /// Plausible memory-rail range in millivolts.
 const VOLTAGE_MIN_MV: u16 = 100;
 const VOLTAGE_MAX_MV: u16 = 4000;
+
+/// The specific N/A reason for PM-derived fields when the driver is
+/// loaded but the `pm_table` attribute is not exposed
+/// (`AmdPmSnapshot::pm_exposed == false` — e.g. Castle Peak /
+/// Threadripper 3990X, whose AGESA version the `ryzen-smu` driver does
+/// not table): names the missing data source, not a decode failure
+/// (the old generic "0 outside plausible range" text implied a
+/// decode bug where the table itself is absent).
+const PM_NOT_EXPOSED_REASON: &str =
+    "PM table not exposed by driver (AGESA version may be unsupported by ryzen-smu)";
+
+/// The specific N/A reason for the `0x50200`-derived fields (GDM,
+/// command rate) when the word was read but its decoded MCLK set-point
+/// is `0` MHz — impossible for a running system, so the word's field
+/// layout is unverified on this platform (Castle Peak reads
+/// `0x00000100`; the Vermeer / Renoir layout does not apply).
+const SMN_50200_UNVERIFIED_REASON: &str = "0x50200 layout unverified on this platform";
 
 // ---------------------------------------------------------------------------
 // Vendor-neutral display types (frozen here; P2-07 + P2-10 consume them).
@@ -510,6 +536,38 @@ fn map_voltage(mv: u16) -> Section<u16> {
     }
 }
 
+/// A PM-derived clock: the specific "PM table not exposed by driver" N/A
+/// when `pm_exposed` is `false` (the driver is loaded but the `pm_table`
+/// attribute is absent — e.g. Castle Peak / Threadripper 3990X), else the
+/// usual sanity gate.
+fn pm_clock(mhz: u16, pm_exposed: bool) -> Section<f64> {
+    if !pm_exposed {
+        return Section::na(pm_not_exposed_na());
+    }
+    map_clock(mhz)
+}
+
+/// A PM-derived voltage: the same gate as [`pm_clock`].
+fn pm_voltage(mv: u16, pm_exposed: bool) -> Section<u16> {
+    if !pm_exposed {
+        return Section::na(pm_not_exposed_na());
+    }
+    map_voltage(mv)
+}
+
+/// The N/A cell for a PM-derived field whose data source is absent
+/// (names the driver / AGESA cause — not a decode failure).
+fn pm_not_exposed_na() -> NaReason {
+    NaReason::ParseError(PM_NOT_EXPOSED_REASON.to_owned())
+}
+
+/// The N/A cell for a `0x50200`-derived field (GDM / command rate) whose
+/// word proved unverified on this platform (a `0` MHz set-point is
+/// impossible for a running system).
+fn smn_50200_na() -> NaReason {
+    NaReason::ParseError(SMN_50200_UNVERIFIED_REASON.to_owned())
+}
+
 /// Maps the frozen [`AmdPmSnapshot`] (P2-04) to the vendor-neutral
 /// [`AmdReadout`].
 ///
@@ -544,16 +602,36 @@ fn build_readout(snap: &AmdPmSnapshot, ch: &ChannelSmnFields) -> AmdReadout {
 
     AmdReadout {
         clocks: ClockReadout {
-            mclk_mhz: map_clock(snap.mclk_mhz),
-            uclk_mhz: map_clock(snap.uclk_mhz),
-            fclk_mhz: map_clock(snap.fclk_mhz),
-            div_mode: map_div_mode(snap.div_mode),
+            // PM-derived: the specific "not exposed by driver" N/A when
+            // `pm_exposed` is false (the Castle Peak / Threadripper
+            // 3990X case — a missing data source, not a decode failure),
+            // else the usual sanity gate.
+            mclk_mhz: pm_clock(snap.mclk_mhz, snap.pm_exposed),
+            uclk_mhz: pm_clock(snap.uclk_mhz, snap.pm_exposed),
+            fclk_mhz: pm_clock(snap.fclk_mhz, snap.pm_exposed),
+            div_mode: if snap.pm_exposed {
+                map_div_mode(snap.div_mode)
+            } else {
+                Section::na(pm_not_exposed_na())
+            },
             // AMD PM tables report the UCLK:MCLK divide mode, not an
             // Intel-style SA:MEM gear multiplier → not applicable.
             gear_mode: Section::na(NaReason::NotApplicable),
-            gdm: map_mode_flag(snap.gdm),
+            // The `0x50200` gate: a present word whose set-point
+            // decodes to `0` MHz is unverified on this platform —
+            // GDM / command rate render N/A with the specific reason
+            // instead of the coincidental bits ("off" / "1T").
+            gdm: if snap.smn_setpoint_unverified {
+                Section::na(smn_50200_na())
+            } else {
+                map_mode_flag(snap.gdm)
+            },
             pdm: map_mode_flag(snap.pdm),
-            command_rate: map_command_rate(snap.command_rate),
+            command_rate: if snap.smn_setpoint_unverified {
+                Section::na(smn_50200_na())
+            } else {
+                map_command_rate(snap.command_rate)
+            },
         },
         timings: TimingSet {
             cl: map_timing(t.cl),
@@ -594,12 +672,14 @@ fn build_readout(snap: &AmdPmSnapshot, ch: &ChannelSmnFields) -> AmdReadout {
             cs_odt_drv: map_code_to_ohms(c.cs_odt_drv),
             cke_drv: map_code_to_ohms(c.cke_drv),
         },
+        // PM-derived rails: the specific "not exposed by driver" N/A
+        // when `pm_exposed` is false, else the usual sanity gate.
         voltages: VoltageSet {
-            vddcr_soc_mv: map_voltage(v.vddcr_soc_mv),
-            vddio_mem_mv: map_voltage(v.vddio_mem_mv),
-            vdd_misc_mv: map_voltage(v.vdd_misc_mv),
-            vpp_mv: map_voltage(v.vpp_mv),
-            vcore_mv: map_voltage(v.vcore_mv),
+            vddcr_soc_mv: pm_voltage(v.vddcr_soc_mv, snap.pm_exposed),
+            vddio_mem_mv: pm_voltage(v.vddio_mem_mv, snap.pm_exposed),
+            vdd_misc_mv: pm_voltage(v.vdd_misc_mv, snap.pm_exposed),
+            vpp_mv: pm_voltage(v.vpp_mv, snap.pm_exposed),
+            vcore_mv: pm_voltage(v.vcore_mv, snap.pm_exposed),
         },
         channel_mode: ch.mode,
         ecc_status: ch.ecc,
@@ -615,6 +695,8 @@ mod tests {
     fn good_snapshot() -> AmdPmSnapshot {
         AmdPmSnapshot {
             version: 0x0007_0B02, // 7.11.2 — the test-host family
+            pm_exposed: true,
+            smn_setpoint_unverified: false,
             mclk_mhz: 1600,
             uclk_mhz: 1600,
             fclk_mhz: 1600,
@@ -949,6 +1031,113 @@ mod tests {
         for mhz in [0u16, 4097, 65535] {
             assert!(matches!(map_clock(mhz), Section::Na(NaReason::ParseError(_))), "{mhz}");
         }
+    }
+
+    /// The `ParseError` detail of one cell (`None` for any other shape) —
+    /// the assertion helper for the two source-state gates below.
+    fn parse_error_detail<T>(cell: &Section<T>) -> Option<&str> {
+        match cell {
+            Section::Na(NaReason::ParseError(detail)) => Some(detail.as_str()),
+            _ => None,
+        }
+    }
+
+    /// (i) PM table not exposed (Castle Peak / Threadripper 3990X:
+    /// `pm_exposed == false` — the all-zero snapshot `parse` returns when
+    /// the driver is loaded but the `pm_table` attribute is absent):
+    /// EVERY PM-derived field (MCLK / UCLK / FCLK / divide mode / the
+    /// five rails) carries the specific "PM table not exposed by driver"
+    /// reason — the missing data source named, not a decode failure
+    /// (the old generic "0 outside plausible range" text), and the
+    /// divide mode no longer displays a false "1:1". The SMN-overlay
+    /// fields keep their own independent gates.
+    #[test]
+    fn pm_table_not_exposed_carries_the_specific_reason() {
+        let mut s = good_snapshot();
+        s.pm_exposed = false;
+        s.mclk_mhz = 0;
+        s.uclk_mhz = 0;
+        s.fclk_mhz = 0;
+        s.div_mode = 0;
+        s.voltages = AmdPmVoltages {
+            vddcr_soc_mv: 0,
+            vddio_mem_mv: 0,
+            vdd_misc_mv: 0,
+            vpp_mv: 0,
+            vcore_mv: 0,
+        };
+        let ro = map_amd(&s);
+
+        for cell in [&ro.clocks.mclk_mhz, &ro.clocks.uclk_mhz, &ro.clocks.fclk_mhz] {
+            let detail = parse_error_detail(cell)
+                .expect("a PM clock with no table must be Na(ParseError)");
+            assert!(
+                detail.contains("PM table not exposed by driver"),
+                "the reason names the driver: {detail}"
+            );
+            assert!(
+                !detail.contains("outside plausible range"),
+                "no generic parse-error text: {detail}"
+            );
+        }
+        // The divide mode: a false "1:1" is gone.
+        let detail = parse_error_detail(&ro.clocks.div_mode)
+            .expect("the divide mode with no table must be Na(ParseError)");
+        assert!(detail.contains("PM table not exposed by driver"), "{detail}");
+
+        for cell in [
+            &ro.voltages.vddcr_soc_mv,
+            &ro.voltages.vddio_mem_mv,
+            &ro.voltages.vdd_misc_mv,
+            &ro.voltages.vpp_mv,
+            &ro.voltages.vcore_mv,
+        ] {
+            let detail = parse_error_detail(cell)
+                .expect("a PM rail with no table must be Na(ParseError)");
+            assert!(detail.contains("PM table not exposed by driver"), "{detail}");
+            assert!(!detail.contains("outside plausible range"), "{detail}");
+        }
+
+        // The SMN-overlay fields are gated independently (not PM
+        // derived): the unverified flag is clear here, so the values
+        // map as before (the fixture's `gdm: 1` → on).
+        assert_eq!(ro.clocks.gdm, Section::Value(true));
+        assert_eq!(ro.clocks.command_rate, Section::Value(CommandRate::OneT));
+    }
+
+    /// (i′) The `0x50200` gate (the 3990X word `0x00000100` — read
+    /// successfully, set-point `0` MHz): GDM / command rate render N/A
+    /// with the specific "0x50200 layout unverified on this platform"
+    /// reason — never the coincidental bits ("off" / "1T"). A valid
+    /// word (the flag clear) keeps the normal mapping (regression check
+    /// for the Vermeer / Renoir path).
+    #[test]
+    fn unverified_50200_word_nas_gdm_and_command_rate() {
+        let mut s = good_snapshot();
+        s.smn_setpoint_unverified = true;
+        let ro = map_amd(&s);
+
+        let detail = parse_error_detail(&ro.clocks.gdm)
+            .expect("an unverified 0x50200 word must Na the GDM");
+        assert!(
+            detail.contains("0x50200 layout unverified on this platform"),
+            "{detail}"
+        );
+        let detail = parse_error_detail(&ro.clocks.command_rate)
+            .expect("an unverified 0x50200 word must Na the command rate");
+        assert!(
+            detail.contains("0x50200 layout unverified on this platform"),
+            "{detail}"
+        );
+        // Every other field is untouched by the gate.
+        assert_eq!(ro.clocks.pdm, Section::Value(false));
+        assert_eq!(ro.clocks.mclk_mhz, Section::Value(1600.0));
+        assert_eq!(ro.voltages.vddcr_soc_mv, Section::Value(1050));
+
+        // A valid word: the conservative gate never fires.
+        let ro = map_amd(&good_snapshot());
+        assert_eq!(ro.clocks.gdm, Section::Value(true));
+        assert_eq!(ro.clocks.command_rate, Section::Value(CommandRate::OneT));
     }
 
     /// The RZQ code table resolves known divisors to `240/N` ohms and rejects

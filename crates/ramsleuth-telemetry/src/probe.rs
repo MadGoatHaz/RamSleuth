@@ -273,8 +273,8 @@ pub fn render_probe_report_md(report: &ProbeReport) -> String {
     // 3. The decoded telemetry in the dashboard display form.
     out.push_str("## Decoded Telemetry\n\n");
     render_cpu(&mut out, &report.telemetry.cpu, &report.telemetry.vcore);
-    render_amd(&mut out, &report.telemetry.amd);
-    render_intel(&mut out, &report.telemetry.intel);
+    render_amd(&mut out, &report.telemetry.cpu.vendor, &report.telemetry.amd);
+    render_intel(&mut out, &report.telemetry.cpu.vendor, &report.telemetry.intel);
     render_spd(&mut out, &report.telemetry.spd);
     render_platform(&mut out, &report.telemetry);
     // 4. The raw registers: the Intel IMC table when Intel raw is the
@@ -563,12 +563,23 @@ fn cad_rows(cad: &CadBus) -> Vec<(&str, String)> {
 /// primary rail is NOT here — it is the snapshot-root's single
 /// `vcore` field (Chunk 3, the vendor-aware source of truth), rendered
 /// in the `### CPU` subsection via [`vcore_display`].
-fn voltages_rows(voltages: &VoltageSet) -> Vec<(&str, String)> {
+///
+/// The labels are vendor-aware: on Intel the board Super-I/O vCore is
+/// the only rail the platform exposes, so the four AMD SMU rail slots
+/// (all structurally N/A there) carry generic rail descriptions — the
+/// AMD names (VDDCR_…) would be a mislabel on Intel. On AMD (and
+/// `Unknown`) the existing SMU rail names stay.
+fn voltages_rows(voltages: &VoltageSet, vendor: &CpuVendor) -> Vec<(&'static str, String)> {
+    let (soc, mem, misc, vpp) = if matches!(vendor, CpuVendor::Intel(_)) {
+        ("SoC", "Memory I/O", "Misc", "VPP")
+    } else {
+        ("VDDCR_SOC", "VDDIO_MEM", "VDD_MISC", "VPP")
+    };
     vec![
-        ("VDDCR_SOC", volts(&voltages.vddcr_soc_mv)),
-        ("VDDIO_MEM", volts(&voltages.vddio_mem_mv)),
-        ("VDD_MISC", volts(&voltages.vdd_misc_mv)),
-        ("VPP", volts(&voltages.vpp_mv)),
+        (soc, volts(&voltages.vddcr_soc_mv)),
+        (mem, volts(&voltages.vddio_mem_mv)),
+        (misc, volts(&voltages.vdd_misc_mv)),
+        (vpp, volts(&voltages.vpp_mv)),
     ]
 }
 
@@ -615,6 +626,7 @@ fn md_table(out: &mut String, h1: &str, h2: &str, rows: &[(&str, String)]) {
 /// and the voltages — plus the channel-level RTL row on Intel.
 fn render_display_sets(
     out: &mut String,
+    vendor: &CpuVendor,
     clocks: &ClockReadout,
     timings: &TimingSet,
     cad: &CadBus,
@@ -624,7 +636,7 @@ fn render_display_sets(
     md_table(out, "Clock", "Value", &clocks_rows(clocks));
     md_table(out, "Timing (ticks)", "Value", &timings_rows(timings));
     md_table(out, "CAD bus (ohms)", "Value", &cad_rows(cad));
-    md_table(out, "Rail (V)", "Value", &voltages_rows(voltages));
+    md_table(out, "Rail (V)", "Value", &voltages_rows(voltages, vendor));
     if let Some(rtl) = rtl {
         md_table(out, "RTL (ticks)", "Value", &[("RTL", cell(rtl))]);
     }
@@ -651,12 +663,13 @@ fn render_cpu(out: &mut String, cpu: &CpuInfo, vcore: &Section<VoltageTelemetry>
 
 /// The `### AMD` subsection: the four display sets, or one
 /// `N/A (<reason>)` line when the branch degraded.
-fn render_amd(out: &mut String, section: &Section<AmdReadout>) {
+fn render_amd(out: &mut String, vendor: &CpuVendor, section: &Section<AmdReadout>) {
     out.push_str("### AMD\n\n");
     match section {
         Section::Na(reason) => out.push_str(&format!("{}\n\n", na_cell(reason))),
         Section::Value(readout) => render_display_sets(
             out,
+            vendor,
             &readout.clocks,
             &readout.timings,
             &readout.cad_bus,
@@ -676,7 +689,7 @@ fn render_amd(out: &mut String, section: &Section<AmdReadout>) {
 /// diagnostics surface for *why* a trust override fired) when one is
 /// present, then one `#### Channel n` block per decoded IMC channel,
 /// or one `N/A (<reason>)` line when the branch degraded.
-fn render_intel(out: &mut String, section: &Section<IntelReadout>) {
+fn render_intel(out: &mut String, vendor: &CpuVendor, section: &Section<IntelReadout>) {
     out.push_str("### Intel\n\n");
     match section {
         Section::Na(reason) => out.push_str(&format!("{}\n\n", na_cell(reason))),
@@ -697,6 +710,7 @@ fn render_intel(out: &mut String, section: &Section<IntelReadout>) {
                 out.push_str(&format!("#### Channel {}\n\n", channel.index));
                 render_display_sets(
                     out,
+                    vendor,
                     &channel.clocks,
                     &channel.timings,
                     &channel.cad_bus,
@@ -1759,11 +1773,132 @@ mod tests {
         assert!(md.contains("`intel.ch0.clocks.fclk` — N/A (not applicable)"), "{md}");
         assert!(md.contains("`intel.ch0.timings.rfc2` — N/A (not applicable)"), "{md}");
         assert!(md.contains("`intel.ch1.rtl` — N/A (not applicable)"), "{md}");
+        // The Intel rail labels are the generic descriptions (the AMD
+        // SMU names would be a mislabel on Intel — Issue 3): each
+        // structurally-Na rail renders with its generic label.
+        assert!(md.contains("| SoC | N/A (not applicable) |"), "{md}");
+        assert!(md.contains("| Memory I/O | N/A (not applicable) |"), "{md}");
+        assert!(md.contains("| Misc | N/A (not applicable) |"), "{md}");
+        assert!(md.contains("| VPP | N/A (not applicable) |"), "{md}");
+        assert!(!md.contains("| VDDCR_SOC |"), "no AMD rail names in the Intel section: {md}");
+        assert!(!md.contains("| VDDIO_MEM |"), "no AMD rail names in the Intel section: {md}");
         // raw: None renders the not-captured note + the raw N/A reason.
         assert!(md.contains("not captured"), "{md}");
         assert!(md.contains("`raw (whole dump)` — not captured"), "{md}");
         // The empty SPD list note.
         assert!(md.contains("no modules"), "{md}");
+    }
+
+    /// (10) The 3990X / Castle Peak end-to-end: the driver is loaded
+    /// but the `pm_table` attribute is not exposed (`parse`'s `pm: None`
+    /// short-circuit → the all-zero snapshot with `pm_exposed: false`),
+    /// and the SMN `0x50200` word (`0x00000100`) proves unverified
+    /// (set-point `0` MHz). The report's `### AMD` section renders
+    /// every PM-derived cell (MCLK / UCLK / FCLK / UCLK:MCLK / the
+    /// rails) with the specific "PM table not exposed by driver"
+    /// reason — the missing data source named, not the generic
+    /// "0 outside plausible range" parse error — and GDM / command
+    /// rate with the unverified-layout reason. The N/A Reasons section
+    /// carries the full detail.
+    #[test]
+    fn probe_report_pm_not_exposed_carries_specific_reasons() {
+        use crate::amd_pm::parse as pm_parse;
+        use crate::amd_readout::map_amd;
+        use crate::amd_smu::SmuContext;
+
+        // The 3990X state: no PM table (the `pm: None` short-circuit) +
+        // the unverified `0x50200` word (the SMN overlay's gate).
+        let mut snap =
+            pm_parse(&SmuContext { version: 0, pm: None }, AmdZen::Zen2)
+                .expect("pm: None short-circuits to the all-zero snapshot");
+        snap.smn_setpoint_unverified = true;
+        let readout = map_amd(&snap);
+
+        let report = ProbeReport {
+            telemetry: SystemMemoryTelemetry {
+                cpu: CpuInfo {
+                    vendor: CpuVendor::Amd(AmdZen::Zen2),
+                    brand: "AMD Ryzen Threadripper 3990X".to_owned(),
+                },
+                amd: Section::Value(readout),
+                intel: Section::na(NaReason::UnsupportedHardware),
+                spd: Vec::new(),
+                platform: SystemPlatform {
+                    cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                    motherboard: Section::na(NaReason::NotApplicable),
+                    bios: Section::na(NaReason::NotApplicable),
+                    agesa: Section::na(NaReason::NotApplicable),
+                    smu_version: Section::na(NaReason::NotApplicable),
+                },
+                total_capacity: Section::na(NaReason::NotApplicable),
+                dimm_sizes: Vec::new(),
+                vcore: Section::na(NaReason::NotApplicable),
+            },
+            raw: None,
+            system: ProbeSystem {
+                cpu_brand: "AMD Ryzen Threadripper 3990X".to_owned(),
+                cpu_vendor: "AMD".to_owned(),
+                cpu_gen: "Zen2".to_owned(),
+                pci_host_bridge: None,
+                kernel: "6.6.0-1-cachyos".to_owned(),
+                os: "Linux / Arch".to_owned(),
+                arch: "x86_64".to_owned(),
+                ramsleuth_version: "2.4.13".to_owned(),
+                telemetry_source: "ryzen_smu".to_owned(),
+            },
+        };
+        let md = render_probe_report_md(&report);
+
+        // PM-derived cells: the specific driver reason — a missing data
+        // source, never the generic out-of-range parse text.
+        let pm_reason = "N/A (parse error: PM table not exposed by driver (AGESA version may be unsupported by ryzen-smu))";
+        for row in ["MCLK", "UCLK", "FCLK", "UCLK:MCLK"] {
+            assert!(
+                md.contains(&format!("| {row} | {pm_reason} |")),
+                "{row}: {md}"
+            );
+        }
+        for row in ["VDDCR_SOC", "VDDIO_MEM", "VDD_MISC", "VPP"] {
+            assert!(
+                md.contains(&format!("| {row} | {pm_reason} |")),
+                "{row}: {md}"
+            );
+        }
+        // The PM-derived cells no longer carry the old generic
+        // "0 outside plausible range" parse-error text (a missing
+        // data source is not a decode failure). (The 27 SMN-overlay
+        // timings legitimately read `0` in this synthetic readout —
+        // the live 3990X's SMN overlay populates them — so the
+        // timing-specific range text is out of scope here.)
+        assert!(
+            !md.contains("clock 0 MHz outside plausible range"),
+            "no generic clock parse-error text: {md}"
+        );
+        assert!(
+            !md.contains("voltage 0 mV outside plausible range"),
+            "no generic voltage parse-error text: {md}"
+        );
+
+        // The unverified `0x50200` word: GDM + command rate carry the
+        // unverified-layout reason (never the coincidental "off" / "1T").
+        let unverified = "N/A (parse error: 0x50200 layout unverified on this platform)";
+        assert!(md.contains(&format!("| GDM | {unverified} |")), "{md}");
+        assert!(
+            md.contains(&format!("| command rate | {unverified} |")),
+            "{md}"
+        );
+
+        // The N/A Reasons section carries the full detail.
+        assert!(
+            md.contains(
+                "`amd.clocks.mclk` — N/A (parse error: PM table not exposed by driver"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains("`amd.clocks.gdm` — N/A (parse error: 0x50200 layout unverified on this platform)"),
+            "{md}"
+        );
     }
 
     /// (9) The Intel section renders the single-source channel label

@@ -309,6 +309,24 @@ pub struct AmdPmSnapshot {
     /// The PM-table `TableVersionId` this snapshot was parsed from
     /// ([`SmuContext::version`]).
     pub version: u32,
+    /// `true` when this snapshot was parsed from a PM-table blob the
+    /// driver exposed; `false` when the driver is loaded but the
+    /// `pm_table` attribute is not (`SmuContext::pm == None` — e.g.
+    /// Castle Peak / Threadripper 3990X) and the snapshot is the
+    /// all-zero short-circuit. The P2-05 mapping (`map_amd`) turns a
+    /// `false` flag into the specific "PM table not exposed by driver"
+    /// N/A reason on every PM-derived field, instead of the generic
+    /// "0 outside plausible range" parse-error text.
+    pub pm_exposed: bool,
+    /// `true` when the SMN `0x50200` word was read successfully but its
+    /// decoded MCLK set-point is `0` MHz — impossible for a running
+    /// system, so the word's field layout (set-point 6:0 / GDM 11 /
+    /// command rate 10) is unverified on this platform (e.g. Castle
+    /// Peak reads `0x00000100`). Set by the SMN overlay
+    /// ([`crate::amd_smn::apply_smn`]); the P2-05 mapping then renders
+    /// `gdm` / `command_rate` as N/A with the unverified-layout reason
+    /// instead of the coincidental bits.
+    pub smn_setpoint_unverified: bool,
     /// Memory clock (MCLK) in MHz.
     pub mclk_mhz: u16,
     /// Memory controller clock (UCLK) in MHz.
@@ -434,6 +452,11 @@ pub fn parse(ctx: &SmuContext, zen: AmdZen) -> TelemetryResult<AmdPmSnapshot> {
 
     Ok(AmdPmSnapshot {
         version: ctx.version,
+        // A present blob is an exposed table; the set-point flag starts
+        // `false` — the SMN overlay sets it when `0x50200` proves
+        // unverified.
+        pm_exposed: true,
+        smn_setpoint_unverified: false,
         mclk_mhz: to_u16(mclk),
         uclk_mhz: to_u16(uclk),
         fclk_mhz: to_u16(fclk),
@@ -504,16 +527,22 @@ pub fn parse(ctx: &SmuContext, zen: AmdZen) -> TelemetryResult<AmdPmSnapshot> {
     })
 }
 
-/// An all-zero [`AmdPmSnapshot`]: every field degrades to an honest
-/// `N/A` / `Disabled` under the P2-05 sanity gates. Used by [`parse`] when
-/// the driver is loaded but the PM table is unavailable
-/// (`SmuContext::pm == None`, e.g. Castle Peak / Threadripper 2990X) — the
-/// PM-derived fields are N/A while the SMN overlay (timings / GDM / channel
-/// registers) still populates its own slots downstream, so the readout is
-/// not all-N/A.
+/// An all-zero [`AmdPmSnapshot`] with `pm_exposed: false`: the PM-derived
+/// fields (clocks / divide mode / voltages) carry the specific
+/// "PM table not exposed by driver" N/A reason under the P2-05 mapping
+/// (not the generic "0 outside plausible range" parse error), while the
+/// SMN-overlay slots (timings / GDM / command rate / channel registers)
+/// still populate downstream, so the readout is not all-N/A. Used by
+/// [`parse`] when the driver is loaded but the PM table is unavailable
+/// (`SmuContext::pm == None`, e.g. Castle Peak / Threadripper 3990X).
 fn all_zero_snapshot(version: u32) -> AmdPmSnapshot {
     AmdPmSnapshot {
         version,
+        // No table: the PM-derived fields are N/A with the specific
+        // "not exposed by driver" reason (the mapping keys on this flag),
+        // never the generic "0 outside plausible range" parse error.
+        pm_exposed: false,
+        smn_setpoint_unverified: false,
         mclk_mhz: 0,
         uclk_mhz: 0,
         fclk_mhz: 0,
@@ -609,6 +638,8 @@ mod tests {
     ) -> AmdPmSnapshot {
         AmdPmSnapshot {
             version,
+            pm_exposed: true,
+            smn_setpoint_unverified: false,
             mclk_mhz,
             uclk_mhz,
             fclk_mhz,
