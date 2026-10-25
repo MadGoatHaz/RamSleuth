@@ -24,9 +24,10 @@
 //!   never a point (the `record_history_sample` precedent).
 //! - the `cpu_temp_c` series is the shared `ramsleuth-display`
 //!   `read_cpu_temp_c` scan (FE-7 — the same ordered scan the GUI
-//!   renders through: the `k10temp` / `zenpower` hwmon `temp1_input`
-//!   first, the `cpu_thermal` thermal-zone fallback; every failure
-//!   class → `f64::NAN`, std `fs` only, poller-thread — plan D6).
+//!   renders through: the `coretemp` / `k10temp` / `zenpower` hwmon
+//!   `temp1_input` first, the `x86_pkg_temp` / `cpu_thermal`
+//!   thermal-zone fallback; every failure class → `f64::NAN`, std `fs`
+//!   only, poller-thread — plan D6).
 //! - [`window_samples`] — the `[w]` time-window filter: the
 //!   samples with `t ≥ newest_t − window_min·60` (the GUI presets
 //!   1/5/15/60 min; the newest stamp is the ring's last — `t` is

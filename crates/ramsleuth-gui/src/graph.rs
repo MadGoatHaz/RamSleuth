@@ -18,9 +18,10 @@
 //! - `VDDCR_SOC (mV)` — the AMD SOC rail
 //!   (`AmdReadout.voltages.vddcr_soc_mv`).
 //! - `CPU TEMP (°C)` — the ordered CPU-temp source scan
-//!   ([`read_cpu_temp_c`] — C9-04, D-3: the `k10temp` / `zenpower`
-//!   hwmon `temp1_input` first, the `cpu_thermal` thermal zone as
-//!   the fallback), else an honest no-source row (D-4).
+//!   ([`read_cpu_temp_c`] — C9-04, D-3: the `coretemp` / `k10temp` /
+//!   `zenpower` hwmon `temp1_input` first, the `x86_pkg_temp` /
+//!   `cpu_thermal` thermal zone as the fallback), else an honest
+//!   no-source row (D-4).
 //! - `MEM BANDWIDTH (GB/s)` — a step series from the latest bench /
 //!   burn-in `Memory · Read` figure (D-5 — it rides the existing
 //!   bench state, never a continuous sampler): a no-source row
@@ -41,12 +42,13 @@
 //!   panel D6 precedent).
 //! - [`read_cpu_temp_c`] — the ordered CPU-temp source scan (the
 //!   runtime source of D-4, extended by C9-04 / D-3 — the
-//!   `k10temp` / `zenpower` hwmon `temp1_input` first, the
-//!   `cpu_thermal` thermal zone as the fallback): every failure
-//!   class (no hwmon class, no matching sensor, no matching zone,
-//!   an unreadable / non-numeric reading) degrades to `f64::NAN`;
-//!   nothing panics (std `fs` only — poller-thread I/O, D6: it
-//!   runs in the poller, never the render thread).
+//!   `coretemp` / `k10temp` / `zenpower` hwmon `temp1_input` first,
+//!   the `x86_pkg_temp` / `cpu_thermal` thermal zone as the
+//!   fallback): every failure class (no hwmon class, no matching
+//!   sensor, no matching zone, an unreadable / non-numeric reading)
+//!   degrades to `f64::NAN`; nothing panics (std `fs` only —
+//!   poller-thread I/O, D6: it runs in the poller, never the render
+//!   thread).
 //! - [`render_graphs_window`] — the interactive render: a
 //!   `CentralPanel` (SLATE fill, the zone idiom) with the title + a
 //!   dim subtitle (the live window + the sample count), the

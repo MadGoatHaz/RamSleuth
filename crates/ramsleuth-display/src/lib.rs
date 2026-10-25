@@ -393,49 +393,67 @@ pub fn cpu_gen_text(vendor: &CpuVendor) -> String {
 }
 
 /// The CPU temperature in °C (FE-7, the shared scan): first the hwmon
-/// sensor ([`read_hwmon_temp_c`] — the AMD `k10temp` / `zenpower`
-/// `temp1_input`), then the `cpu_thermal` thermal-zone scan (the
-/// pre-C9-04 fallback). The first finite reading wins.
+/// sensor ([`read_hwmon_temp_c`] — the Intel `coretemp` or the AMD
+/// `k10temp` / `zenpower` `temp1_input`), then the thermal-zone scan
+/// (the Intel `x86_pkg_temp` or the AMD `cpu_thermal` — the pre-C9-04
+/// fallback). The first finite reading wins; both sources are matched by
+/// sensor name only, never by `hwmonN` / `thermal_zoneN` slot.
 ///
 /// Every failure class degrades to `f64::NAN`: no hwmon class at all, no
-/// matching sensor name, no matching `cpu_thermal` zone, an unreadable
+/// matching sensor name, no matching CPU thermal zone, an unreadable
 /// `name` / `type`, or an unreadable / non-numeric reading (the ENODATA
 /// sensor case). Nothing panics — std `fs` reads only. Runs on the poller
 /// thread (never the render thread).
 pub fn read_cpu_temp_c() -> f64 {
     let hwmon = read_hwmon_temp_c();
     if hwmon.is_finite() {
-        return hwmon; // the hwmon source (k10temp/zenpower) wins.
+        return hwmon; // the hwmon source (coretemp/k10temp/zenpower) wins.
     }
-    // The fallback: the `cpu_thermal` thermal-zone scan.
+    // The fallback: the thermal-zone scan (the Intel `x86_pkg_temp` or the
+    // AMD `cpu_thermal`), matched by the zone's `type` name only — never by
+    // the `thermal_zoneN` slot (its number is unstable across boards; a wifi
+    // / GPU zone can occupy a low slot).
     let Ok(zones) = fs::read_dir("/sys/class/thermal") else {
         return f64::NAN; // no thermal class at all.
     };
+    let mut types: Vec<String> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
     for entry in zones.flatten() {
         let Ok(name) = entry.file_name().into_string() else {
-            continue; // a non-UTF-8 zone name: not the CPU zone.
+            continue; // a non-UTF-8 zone name: not a zone we read.
         };
         if !name.starts_with("thermal_zone") {
-            continue;
+            continue; // not a thermal zone dir.
         }
         let dir = entry.path();
         let Ok(zone_type) = fs::read_to_string(dir.join("type")) else {
             continue; // the zone's type is unreadable: not it.
         };
-        if zone_type.trim().eq_ignore_ascii_case("cpu_thermal") {
-            // The first matching zone wins.
-            return read_zone_temp_c(&dir);
-        }
+        types.push(zone_type.trim().to_string());
+        dirs.push(dir);
     }
-    f64::NAN // no `cpu_thermal` zone (the iwlwifi-only case).
+    let type_refs: Vec<&str> = types.iter().map(String::as_str).collect();
+    let Some(selected) = select_thermal_zone(&type_refs) else {
+        return f64::NAN; // no `x86_pkg_temp` / `cpu_thermal` zone.
+    };
+    let Some(dir) = types
+        .iter()
+        .position(|t| t == selected)
+        .and_then(|i| dirs.get(i))
+    else {
+        // `selected` came from `types`: not expected, still degrades.
+        return f64::NAN;
+    };
+    read_zone_temp_c(dir)
 }
 
 /// The hwmon CPU-temperature scan: walk `/sys/class/hwmon/`, read each
 /// `hwmon*` device's `name` (the kernel sensor name, trimmed +
 /// case-insensitive), select the preferred one by name only
-/// ([`select_hwmon_dir`] — `k10temp` first, else `zenpower`, never a fixed
-/// `hwmonN` index — the index is unstable across boots/CPUs), and return
-/// that device's `temp1_input` (millidegrees ÷ 1000) in °C.
+/// ([`select_hwmon_dir`] — `coretemp` first, else `k10temp`, else
+/// `zenpower`, never a fixed `hwmonN` index — the index is unstable
+/// across boots/CPUs), and return that device's `temp1_input`
+/// (millidegrees ÷ 1000) in °C.
 ///
 /// Every failure class degrades to `f64::NAN`. Nothing panics — std `fs`
 /// reads only.
@@ -461,7 +479,7 @@ fn read_hwmon_temp_c() -> f64 {
     }
     let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let Some(selected) = select_hwmon_dir(&name_refs) else {
-        return f64::NAN; // no `k10temp` / `zenpower` device.
+        return f64::NAN; // no CPU-temp hwmon device.
     };
     let Some(dir) = names.iter().position(|name| name == selected).and_then(|i| dirs.get(i))
     else {
@@ -471,22 +489,56 @@ fn read_hwmon_temp_c() -> f64 {
     read_hwmon_temp1_c(dir)
 }
 
-/// The hwmon name selection (pure, I/O-free): prefer `k10temp` (the AMD
-/// classic CPU sensor) over `zenpower` (the newer AMD sensor) over no
-/// match. Case-insensitive on the trimmed name; by name only — a fixed
-/// `hwmonN` index is never matched (it is unstable across boots/CPUs).
+/// The known CPU-temperature hwmon sensor names, in priority order: the
+/// Intel `coretemp` (per-core + package — the most accurate) first, then
+/// the AMD `k10temp` (classic) and `zenpower` (newer). On a real host
+/// only one vendor's sensors exist, so the order is a tiebreaker, not a
+/// cross-vendor preference.
+const CPU_TEMP_HWMON_NAMES: &[&str] = &["coretemp", "k10temp", "zenpower"];
+
+/// The known CPU-temperature thermal-zone types, in priority order: the
+/// Intel `x86_pkg_temp` (package) first, then the AMD `cpu_thermal`.
+/// Matched by the zone's `type` name only — never by the `thermal_zoneN`
+/// slot (that number is unstable across boards; a wifi / GPU zone can
+/// occupy a low slot).
+const CPU_TEMP_TZ_NAMES: &[&str] = &["x86_pkg_temp", "cpu_thermal"];
+
+/// The hwmon name selection (pure, I/O-free): walk
+/// [`CPU_TEMP_HWMON_NAMES`] in priority order — `coretemp` (the Intel
+/// per-core + package sensor) first, then `k10temp` (the AMD classic),
+/// then `zenpower` (the newer AMD) — and return the first known name
+/// present, else no match. Case-insensitive on the trimmed name; by name
+/// only — a fixed `hwmonN` index is never matched (it is unstable across
+/// boots/CPUs).
 fn select_hwmon_dir<'a>(names: &'a [&'a str]) -> Option<&'a str> {
-    let mut zenpower: Option<&str> = None;
-    for name in names {
-        let trimmed = name.trim();
-        if trimmed.eq_ignore_ascii_case("k10temp") {
-            return Some(trimmed); // the preferred sensor wins.
-        }
-        if trimmed.eq_ignore_ascii_case("zenpower") {
-            zenpower.get_or_insert(trimmed); // the fallback: first wins.
+    for wanted in CPU_TEMP_HWMON_NAMES {
+        for name in names {
+            let trimmed = name.trim();
+            if trimmed.eq_ignore_ascii_case(wanted) {
+                return Some(trimmed); // the highest-priority present sensor wins.
+            }
         }
     }
-    zenpower
+    None
+}
+
+/// The thermal-zone type selection (pure, I/O-free): walk
+/// [`CPU_TEMP_TZ_NAMES`] in priority order — `x86_pkg_temp` (the Intel
+/// package sensor) first, then `cpu_thermal` (the AMD zone) — and return
+/// the first known type present, else no match. Case-insensitive on the
+/// trimmed type; by type name only — a fixed `thermal_zoneN` slot is
+/// never matched (it is unstable across boards; a wifi / GPU zone can
+/// occupy a low slot).
+fn select_thermal_zone<'a>(types: &'a [&'a str]) -> Option<&'a str> {
+    for wanted in CPU_TEMP_TZ_NAMES {
+        for t in types {
+            let trimmed = t.trim();
+            if trimmed.eq_ignore_ascii_case(wanted) {
+                return Some(trimmed); // the highest-priority present zone wins.
+            }
+        }
+    }
+    None
 }
 
 /// One hwmon device's `temp1_input` (millidegrees) in °C; every failure
@@ -723,17 +775,56 @@ mod tests {
         assert_eq!(bench_cell_text(&grid, Tier::L2, Metric::Write), "N/A");
     }
 
-    // --- read_cpu_temp_c (TC-FE7): the pure selection helper.
+    // --- read_cpu_temp_c (TC-FE7): the pure selection helpers.
 
     #[test]
-    fn select_hwmon_dir_prefers_k10temp() {
+    fn select_hwmon_dir_is_vendor_agnostic() {
+        // Intel `coretemp` outranks the AMD sensors when both are present.
+        assert_eq!(
+            select_hwmon_dir(&["k10temp", "coretemp", "asus"]),
+            Some("coretemp")
+        );
+        // AMD `k10temp` is preferred over `zenpower` (the pre-existing order).
         assert_eq!(
             select_hwmon_dir(&["zenpower", "k10temp", "asus"]),
             Some("k10temp")
         );
+        // `zenpower` alone.
         assert_eq!(select_hwmon_dir(&["asus", "zenpower"]), Some("zenpower"));
-        assert_eq!(select_hwmon_dir(&["asus", "iwlwifi"]), None);
+        // Case-insensitive + trimmed match on the name.
+        assert_eq!(select_hwmon_dir(&["  CoreTemp  "]), Some("CoreTemp"));
+        // No CPU sensor (only non-CPU hwmon devices) → None.
+        assert_eq!(select_hwmon_dir(&["asus", "iwlwifi", "nct6798"]), None);
         assert_eq!(select_hwmon_dir(&[]), None);
+    }
+
+    #[test]
+    fn select_thermal_zone_is_vendor_agnostic() {
+        // Intel `x86_pkg_temp` outranks the AMD zone when both are present.
+        assert_eq!(
+            select_thermal_zone(&["cpu_thermal", "x86_pkg_temp", "acpitz"]),
+            Some("x86_pkg_temp")
+        );
+        // AMD `cpu_thermal` alone.
+        assert_eq!(
+            select_thermal_zone(&["acpitz", "cpu_thermal"]),
+            Some("cpu_thermal")
+        );
+        // Case-insensitive + trimmed match on the type.
+        assert_eq!(
+            select_thermal_zone(&["  X86_PKG_TEMP  "]),
+            Some("X86_PKG_TEMP")
+        );
+        // No CPU zone (only non-CPU zones — the wifi / acpi cases) → None.
+        assert_eq!(select_thermal_zone(&["iwlwifi_1", "acpitz", "acpu"]), None);
+        assert_eq!(select_thermal_zone(&[]), None);
+    }
+
+    #[test]
+    fn cpu_temp_sensor_lists_pin_the_priority_order() {
+        // The exact priority lists the scan matches against (name, not slot).
+        assert_eq!(CPU_TEMP_HWMON_NAMES, &["coretemp", "k10temp", "zenpower"]);
+        assert_eq!(CPU_TEMP_TZ_NAMES, &["x86_pkg_temp", "cpu_thermal"]);
     }
 
     // --- TC-FE6 (the N/A symmetry confirming test): every [`NaReason`]
