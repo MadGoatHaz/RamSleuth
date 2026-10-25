@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# install.sh — RamSleuth v2 self-contained GitHub installer (AUR-parity).
+# install.sh — RamSleuth v2 self-contained GitHub installer (any distro with
+# pacman, apt, or dnf — the preflight installs the build prerequisites; the
+# install body itself is the distro-agnostic AUR-parity layout).
 # Plan: PLAN-CYCLE18.md chunk C18-08, design D-18.2.
 #
 # Lands RamSleuth in the EXACT state of the AUR (ramsleuth): the 6 binaries +
@@ -28,7 +30,8 @@
 #   git clone https://github.com/MadGoatHaz/RamSleuth && cd RamSleuth && ./install.sh
 #
 # Exit codes:  0 = installed, or declined (no change)   1 = hard failure
-#              2 = bad usage / preflight refusal (not a checkout, non-Arch, no Rust)
+#              2 = bad usage / preflight refusal (not a checkout, no supported
+#                  package manager, no Rust)
 #
 # Every step is idempotent; a re-run is always safe; a failure prints a clear
 # message + exits non-zero (never a silent half-state).
@@ -95,18 +98,44 @@ banner() {
   printf '\n'
 }
 preflight() {
-  header "Preflight — unprivileged (no system changes yet)"
+  header "Preflight — build prerequisites + Rust check (escalates via sudo; no RamSleuth files touched yet)"
   # Must be a valid RamSleuth checkout (this file lives at the repo root).
   [[ -n "$REPO_ROOT" ]] || die "Not run from a git checkout (git rev-parse --show-toplevel failed)." 2
   [[ "$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null)" == "$REPO_ROOT" ]] || die "'$SCRIPT_DIR' is not the root of a git checkout." 2
   [[ -f "$REPO_ROOT/Cargo.toml" ]] || die "No Cargo.toml — not a RamSleuth checkout." 2
   [[ -d "$REPO_ROOT/packaging/ramsleuth" ]] || die "No packaging/ramsleuth/ — not a RamSleuth checkout." 2
-  # Arch-based (the Arch/AUR-parity path; no partial install on other distros).
-  if ! command -v pacman >/dev/null 2>&1; then
-    die "Non-Arch host (no pacman) — this installer is the Arch/AUR-parity path.
+  # Distro-aware build prerequisites (the install body below is distro-agnostic:
+  # install -D, groupadd, systemctl). Preflight runs UNPRIVILEGED (the sudo
+  # re-exec happens later, after the transparency block + Proceed), so the
+  # package installs escalate with sudo.
+  if command -v pacman >/dev/null 2>&1; then
+    # Arch/AUR path (existing behavior): base-devel carries the toolchain;
+    # --needed makes a re-run a no-op.
+    step "ensuring base-devel (pacman, idempotent)"
+    sudo pacman -S --needed --noconfirm base-devel \
+      || die "pacman prerequisite install failed — fix the error above and re-run." 1
+    ok "Arch-based system (pacman present; base-devel ensured)"
+  elif command -v apt-get >/dev/null 2>&1; then
+    # Debian/Ubuntu/Mint: the C toolchain + pkg-config + the X11/Wayland/GL dev
+    # libs the egui GUI links against.
+    step "installing build prerequisites (apt-get)"
+    sudo apt-get install -y build-essential pkgconf acl \
+         libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev \
+         libxi-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev \
+      || die "apt-get prerequisite install failed — fix the error above and re-run." 1
+    ok "Debian-based system (apt-get prerequisites installed)"
+  elif command -v dnf >/dev/null 2>&1; then
+    # Fedora: the -devel counterparts of the same toolchain + GUI dev libs.
+    step "installing build prerequisites (dnf)"
+    sudo dnf install -y gcc pkgconf acl \
+         libxkbcommon-devel wayland-devel libX11-devel libXrandr-devel \
+         libXi-devel libXcursor-devel libXinerama-devel mesa-libGL-devel \
+      || die "dnf prerequisite install failed — fix the error above and re-run." 1
+    ok "Fedora system (dnf prerequisites installed)"
+  else
+    die "No supported package manager found (need pacman, apt-get, or dnf).
 See Docs/User_Guide.md §2.6 'Manual install (any distro)' for the distro-agnostic flow." 2
   fi
-  ok "Arch-based system (pacman present)"
   # Rust toolchain (never auto-installed — we only print the command).
   if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
     die "Rust toolchain (cargo/rustc) not found — this installer does NOT auto-install Rust.
