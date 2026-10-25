@@ -648,7 +648,7 @@ mod tests {
         );
         assert_eq!(
             cards[0][4],
-            ("part".to_owned(), "N/A (decode failed)".to_owned())
+            ("part".to_owned(), "N/A (part number: byte 0x149 outside image bounds)".to_owned())
         );
         assert_eq!(
             cards[0][5],
@@ -660,7 +660,7 @@ mod tests {
         );
         assert_eq!(
             cards[0][7],
-            ("speed".to_owned(), "N/A (decode failed)".to_owned())
+            ("speed".to_owned(), "N/A (base speed byte 0x20 is 0 (no minimum data rate recorded))".to_owned())
         );
         // The all-Na EXPO profile line: every field degrades to bare N/A
         // (the structurally not-applicable form).

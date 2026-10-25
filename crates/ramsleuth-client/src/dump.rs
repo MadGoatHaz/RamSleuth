@@ -766,9 +766,10 @@ mod tests {
         // source: `NotApplicable` keeps the one bare `N/A`, not the
         // verbose old form).
         assert!(!text.contains("N/A (not applicable)"));
-        // AMD primary + tertiary timings
+        // AMD primary + tertiary timings (the rfc2 `ParseError("fixture")`
+        // cell now surfaces its detail — the fix).
         assert!(text.contains("tCL     16"));
-        assert!(text.contains("N/A (decode failed)"));
+        assert!(text.contains("N/A (fixture)"));
         // AMD CAD bus (RZQ code resolved to ohms + a direct-ohms RTT)
         assert!(text.contains("RZQ/10 (24.0 Ω)"));
         assert!(text.contains("45.0 Ω"));
@@ -843,7 +844,9 @@ mod tests {
         // channel 0: decoded clocks (1600 MHz MCLK) + gear 1×
         assert!(text.contains("1600.00 MHz"));
         assert!(text.contains("1x")); // gear 1 (MC_BIOS_REQ gear bits 00b)
-        assert!(text.contains("N/A (decode failed)"));
+        // The SPD module's `ParseError("fixture")` cells now surface their
+        // detail (the fix).
+        assert!(text.contains("N/A (fixture)"));
         // channel 0 RTL: the live map has no RTL register (the
         // `NotApplicable` cell keeps the one bare `N/A`, D-4).
         assert!(text.contains("RTL (ticks)  N/A"));

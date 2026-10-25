@@ -341,13 +341,21 @@ fn cad_rows(cad: &CadBus) -> [(&str, String); 8] {
     ]
 }
 
-/// The four memory-rail rows of a [`VoltageSet`] (volts).
-fn voltages_rows(voltages: &VoltageSet) -> [(&str, String); 4] {
+/// The four memory-rail rows of a [`VoltageSet`] (volts). The labels are
+/// vendor-aware (mirrors `probe.rs`): on Intel the four AMD SMU rail
+/// slots (all structurally N/A there) carry generic rail descriptions —
+/// the AMD names (VDDCR_…) would be a mislabel on Intel. On AMD (and
+/// `Unknown`) the existing SMU rail names stay.
+fn voltages_rows(voltages: &VoltageSet, vendor: &CpuVendor) -> [(&'static str, String); 4] {
+    let (l1, l2, l3, l4) = match vendor {
+        CpuVendor::Intel(_) => ("SoC", "Memory I/O", "Misc", "VPP"),
+        _ => ("VDDCR_SOC", "VDDIO_MEM", "VDD_MISC", "VPP"),
+    };
     [
-        ("VDDCR_SOC", volts(&voltages.vddcr_soc_mv)),
-        ("VDDIO_MEM", volts(&voltages.vddio_mem_mv)),
-        ("VDD_MISC", volts(&voltages.vdd_misc_mv)),
-        ("VPP", volts(&voltages.vpp_mv)),
+        (l1, volts(&voltages.vddcr_soc_mv)),
+        (l2, volts(&voltages.vddio_mem_mv)),
+        (l3, volts(&voltages.vdd_misc_mv)),
+        (l4, volts(&voltages.vpp_mv)),
     ]
 }
 
@@ -414,7 +422,7 @@ fn vcore_section_text(vcore: &Section<VoltageTelemetry>) -> String {
 
 /// The `=== AMD ===` section: the four display sets in dashboard order, or
 /// one `N/A (<reason>)` line when the branch degraded.
-fn amd_section_text(section: &Section<AmdReadout>) -> String {
+fn amd_section_text(section: &Section<AmdReadout>, vendor: &CpuVendor) -> String {
     let mut out = String::new();
     header(&mut out, "AMD");
     match section {
@@ -435,7 +443,7 @@ fn amd_section_text(section: &Section<AmdReadout>) -> String {
             subheader(&mut out, "CAD bus (ohms)");
             rows(&mut out, "  ", &cad_rows(&readout.cad_bus));
             subheader(&mut out, "Voltages");
-            rows(&mut out, "  ", &voltages_rows(&readout.voltages));
+            rows(&mut out, "  ", &voltages_rows(&readout.voltages, vendor));
             out.push('\n');
         }
     }
@@ -464,7 +472,11 @@ fn dimm_line(sizes: &[u64]) -> String {
 /// SMBIOS Type 17 capacity (total + per-DIMM — the firmware ground truth),
 /// then one `--- Channel n ---` block per decoded IMC channel, or one
 /// `N/A (<reason>)` line when the branch degraded.
-fn intel_section_text(section: &Section<IntelReadout>, smbios: &SmbiosTopology) -> String {
+fn intel_section_text(
+    section: &Section<IntelReadout>,
+    smbios: &SmbiosTopology,
+    vendor: &CpuVendor,
+) -> String {
     let mut out = String::new();
     header(&mut out, "Intel");
     match section {
@@ -503,7 +515,7 @@ fn intel_section_text(section: &Section<IntelReadout>, smbios: &SmbiosTopology) 
                 return out;
             }
             for channel in &readout.channels {
-                out.push_str(&intel_channel_text(channel));
+                out.push_str(&intel_channel_text(channel, vendor));
             }
             out.push('\n');
         }
@@ -513,7 +525,7 @@ fn intel_section_text(section: &Section<IntelReadout>, smbios: &SmbiosTopology) 
 
 /// One `--- Channel n ---` block: the shared display sets plus the
 /// channel-level RTL row.
-fn intel_channel_text(channel: &IntelChannel) -> String {
+fn intel_channel_text(channel: &IntelChannel, vendor: &CpuVendor) -> String {
     let index = channel.index;
     let mut out = String::new();
     subheader(&mut out, &format!("Channel {index}"));
@@ -528,7 +540,7 @@ fn intel_channel_text(channel: &IntelChannel) -> String {
     subheader(&mut out, "CAD bus (ohms)");
     rows(&mut out, "  ", &cad_rows(&channel.cad_bus));
     subheader(&mut out, "Voltages");
-    rows(&mut out, "  ", &voltages_rows(&channel.voltages));
+    rows(&mut out, "  ", &voltages_rows(&channel.voltages, vendor));
     subheader(&mut out, "RTL");
     rows(&mut out, "  ", &[("RTL (ticks)", cell(&channel.rtl))]);
     out
@@ -618,8 +630,8 @@ pub(crate) fn render_dashboard(t: &SystemMemoryTelemetry, smbios: &SmbiosTopolog
     out.push('\n');
     out.push_str(&cpu_section_text(&t.cpu));
     out.push_str(&vcore_section_text(&t.vcore));
-    out.push_str(&amd_section_text(&t.amd));
-    out.push_str(&intel_section_text(&t.intel, smbios));
+    out.push_str(&amd_section_text(&t.amd, &t.cpu.vendor));
+    out.push_str(&intel_section_text(&t.intel, smbios, &t.cpu.vendor));
     out.push_str(&spd_section_text(&t.spd));
     out
 }
@@ -653,11 +665,14 @@ fn json_escape(s: &str) -> String {
 pub(crate) fn to_json(t: &SystemMemoryTelemetry, smbios: &SmbiosTopology) -> String {
     let amd = match &t.amd {
         Section::Na(_) => "null".to_owned(),
-        _ => format!("\"{}\"", json_escape(&amd_section_text(&t.amd))),
+        _ => format!("\"{}\"", json_escape(&amd_section_text(&t.amd, &t.cpu.vendor))),
     };
     let intel = match &t.intel {
         Section::Na(_) => "null".to_owned(),
-        _ => format!("\"{}\"", json_escape(&intel_section_text(&t.intel, smbios))),
+        _ => format!(
+            "\"{}\"",
+            json_escape(&intel_section_text(&t.intel, smbios, &t.cpu.vendor))
+        ),
     };
     let spd = t
         .spd
@@ -1165,5 +1180,41 @@ mod tests {
         assert!(out.contains("total capacity"), "{out}");
         assert!(out.contains("24.0 GiB"), "total 24 GiB: {out}");
         assert!(out.contains("8.0 GiB × 3"), "per-DIMM 8 GiB × 3: {out}");
+    }
+
+    /// The voltage rail labels are vendor-aware (mirrors `probe.rs`): Intel
+    /// silicon shows the generic rail descriptions (SoC / Memory I/O / Misc /
+    /// VPP) — the AMD SMU names (VDDCR_…) would be a mislabel on Intel; AMD
+    /// (and `Unknown`) keep the SMU rail names.
+    #[test]
+    fn voltages_rows_are_vendor_aware() {
+        let voltages = VoltageSet {
+            vddcr_soc_mv: Section::Value(1150),
+            vddio_mem_mv: Section::Value(1350),
+            vdd_misc_mv: Section::Value(1100),
+            vpp_mv: Section::Value(1800),
+            vcore_mv: Section::na(NaReason::NotApplicable),
+        };
+        // Intel → the generic rail descriptions (NOT the AMD VDDCR_* names).
+        let intel_rows = voltages_rows(&voltages, &CpuVendor::Intel(IntelGen::AlderLake));
+        assert_eq!(intel_rows[0].0, "SoC");
+        assert_eq!(intel_rows[1].0, "Memory I/O");
+        assert_eq!(intel_rows[2].0, "Misc");
+        assert_eq!(intel_rows[3].0, "VPP");
+        for amd_name in ["VDDCR_SOC", "VDDIO_MEM", "VDD_MISC"] {
+            assert!(
+                !intel_rows.iter().any(|(label, _)| *label == amd_name),
+                "no AMD rail name on Intel: {amd_name}"
+            );
+        }
+        // AMD → the SMU rail names.
+        let amd_rows = voltages_rows(&voltages, &CpuVendor::Amd(AmdZen::Zen3));
+        assert_eq!(amd_rows[0].0, "VDDCR_SOC");
+        assert_eq!(amd_rows[1].0, "VDDIO_MEM");
+        assert_eq!(amd_rows[2].0, "VDD_MISC");
+        assert_eq!(amd_rows[3].0, "VPP");
+        // Unknown → the non-Intel arm (the SMU rail names).
+        let unknown_rows = voltages_rows(&voltages, &CpuVendor::Unknown);
+        assert_eq!(unknown_rows[0].0, "VDDCR_SOC");
     }
 }

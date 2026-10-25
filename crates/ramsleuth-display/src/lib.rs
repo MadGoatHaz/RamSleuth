@@ -310,15 +310,24 @@ pub fn cell_text<T: std::fmt::Display>(cell: &Section<T>) -> String {
 /// The human text of one **per-cell** absent [`NaReason`] (the compact
 /// form): the terse, user-friendly reason tag — `N/A (unsupported CPU)`,
 /// `N/A (driver missing)`, `N/A (insufficient privilege)`,
-/// `N/A (new PM table)`, `N/A (decode failed)`; a structurally
-/// not-applicable cell ([`NaReason::NotApplicable`]) keeps the one bare
-/// `N/A` (explaining every structurally-absent field would be noise in a
-/// dense grid). Built from the [`NaReason`] `Display` phrase
-/// (DAEMON-2), so a variant rename is a test failure, not a silent
-/// `Debug` drift.
+/// `N/A (new PM table)`. A [`NaReason::ParseError`] with a **non-empty**
+/// detail surfaces that detail verbatim (the true reason — e.g. "PM table
+/// not exposed by driver…"), falling back to the terse `N/A (decode
+/// failed)` tag for an empty detail. A structurally not-applicable cell
+/// ([`NaReason::NotApplicable`]) keeps the one bare `N/A` (explaining
+/// every structurally-absent field would be noise in a dense grid). Built
+/// from the [`NaReason`] `Display` phrase (DAEMON-2), so a variant rename
+/// is a test failure, not a silent `Debug` drift.
 pub fn na_cell_text(reason: &NaReason) -> String {
     match reason {
         NaReason::NotApplicable => "N/A".to_owned(),
+        NaReason::ParseError(detail) => {
+            if detail.is_empty() {
+                "N/A (decode failed)".to_owned()
+            } else {
+                format!("N/A ({detail})")
+            }
+        }
         r => format!("N/A ({r})"),
     }
 }
@@ -340,8 +349,12 @@ pub fn na_section_text(reason: &NaReason) -> String {
             "No data — this CPU's memory-firmware version isn't in the supported set yet. The driver is loaded and working."
                 .to_owned()
         }
-        NaReason::ParseError(_) => {
-            "No data — the register values couldn't be decoded on this platform.".to_owned()
+        NaReason::ParseError(detail) => {
+            if detail.is_empty() {
+                "No data — the register values couldn't be decoded on this platform.".to_owned()
+            } else {
+                format!("No data — {detail}")
+            }
         }
         NaReason::DriverMissing => {
             "No data — the required kernel driver isn't loaded. The daemon is up; use the Setup prompt to install it."
@@ -718,7 +731,34 @@ mod tests {
             na_cell_text(&NaReason::UnknownPmTableVersion),
             "N/A (new PM table)"
         );
-        assert_eq!(na_cell_text(&NaReason::ParseError("x".to_owned())), "N/A (decode failed)");
+        // A non-empty `ParseError` detail is surfaced verbatim (the fix).
+        assert_eq!(na_cell_text(&NaReason::ParseError("x".to_owned())), "N/A (x)");
+        // An empty detail falls back to the terse "decode failed" tag.
+        assert_eq!(
+            na_cell_text(&NaReason::ParseError(String::new())),
+            "N/A (decode failed)"
+        );
+    }
+
+    /// A non-empty [`NaReason::ParseError`] detail is surfaced verbatim in
+    /// the per-cell form (the fix) — a 3990X user sees the true reason
+    /// (e.g. the PM-table-not-exposed note), not a generic "decode failed".
+    /// An empty detail falls back to the terse tag; `NotApplicable` stays
+    /// the one bare `N/A` (unchanged).
+    #[test]
+    fn na_cell_text_surfaces_the_parse_error_detail() {
+        let detail =
+            "PM table not exposed by driver (AGESA version may be unsupported by ryzen-smu)";
+        let text = na_cell_text(&NaReason::ParseError(detail.to_owned()));
+        assert!(text.contains("PM table not exposed"), "{text}");
+        assert_eq!(text, format!("N/A ({detail})"));
+        // Empty detail → the terse fallback.
+        assert_eq!(
+            na_cell_text(&NaReason::ParseError(String::new())),
+            "N/A (decode failed)"
+        );
+        // `NotApplicable` → the one bare `N/A` (unchanged).
+        assert_eq!(na_cell_text(&NaReason::NotApplicable), "N/A");
     }
 
     #[test]
@@ -729,12 +769,22 @@ mod tests {
             NaReason::InsufficientPrivilege,
             NaReason::UnknownPmTableVersion,
             NaReason::NotApplicable,
-            NaReason::ParseError("x".to_owned()),
         ] {
             let text = na_section_text(&reason);
             assert!(text.starts_with("No data —"), "{reason:?}: {text}");
             assert!(text.contains("not an error") || text.contains("daemon") || text.contains("platform") || text.contains("driver") || text.contains("privilege") || text.contains("decoded"), "{reason:?}: {text}");
         }
+        // A non-empty `ParseError` detail is surfaced verbatim (the fix);
+        // an empty one falls back to the generic decode-failure note.
+        let detail = "PM table not exposed by driver";
+        assert_eq!(
+            na_section_text(&NaReason::ParseError(detail.to_owned())),
+            format!("No data — {detail}")
+        );
+        assert_eq!(
+            na_section_text(&NaReason::ParseError(String::new())),
+            "No data — the register values couldn't be decoded on this platform."
+        );
         // The section form is the verbose one (distinct from the compact).
         assert_ne!(na_section_text(&NaReason::DriverMissing), na_cell_text(&NaReason::DriverMissing));
     }
