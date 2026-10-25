@@ -98,6 +98,32 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"    # this scr
 log() { printf '[ryzen-smu-dkms] %s\n' "$*"; }
 die() { printf '[ryzen-smu-dkms] ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Distro-aware build-dep install (pacman / apt / dnf): DKMS + the compiler
+# toolchain + the running kernel's headers package.
+install_build_deps() {
+    if command -v pacman &>/dev/null; then
+        pacman -S --needed --noconfirm dkms base-devel
+    elif command -v apt-get &>/dev/null; then
+        apt-get install -y dkms build-essential "linux-headers-$(uname -r)"
+    elif command -v dnf &>/dev/null; then
+        dnf install -y dkms "gcc-c++" make "kernel-devel-$(uname -r)"
+    else
+        die "No supported package manager found (need pacman, apt-get, or dnf)"
+    fi
+}
+
+# List the installed kernel-headers candidate packages (distro-aware) for the
+# missing-build-tree diagnostic.
+list_kernel_headers() {
+    if command -v pacman &>/dev/null; then
+        pacman -Qs linux-api-headers 2>/dev/null || pacman -Qs headers 2>/dev/null
+    elif command -v apt-get &>/dev/null; then
+        apt list --installed 2>/dev/null | grep "linux-headers"
+    elif command -v dnf &>/dev/null; then
+        dnf list installed 2>/dev/null | grep "kernel-devel"
+    fi
+}
+
 # Secure Boot detection (read-only): prints "enabled" or "disabled".
 # Primary: `mokutil --sb-state` (the authoritative UEFI-side answer: "SecureBoot
 # enabled" / "SecureBoot disabled"). Fallback (mokutil absent): an EFI system
@@ -219,15 +245,15 @@ if [[ "${SB_STATE}" == "enabled" ]]; then
 fi
 
 # --- Step 1: prereqs + kernel build tree ---------------------------------------
-log "Installing build tooling: dkms + base-devel (pacman, idempotent)..."
-pacman -S --needed --noconfirm dkms base-devel
+log "Installing build tooling: dkms + kernel headers (distro-aware, idempotent)..."
+install_build_deps
 # DKMS needs a kernel build tree; we never guess a custom-kernel headers
 # package (HANDOVER §7 step 1) — list candidates and stop with instructions.
 if [[ ! -d "/lib/modules/${KERNEL}/build" ]]; then
   log "Kernel build tree MISSING for ${KERNEL} — candidate headers packages:"
-  CANDIDATES="$(pacman -Qs headers 2>/dev/null | grep -iE 'cachyos|custom|linux-headers' || true)"
+  CANDIDATES="$(list_kernel_headers 2>/dev/null | grep -iE 'cachyos|custom|linux-headers|kernel-devel' || true)"
   [[ -n "${CANDIDATES}" ]] && printf '%s\n' "${CANDIDATES}"
-  die "cannot determine the ${KERNEL} headers package automatically — install the matching 'linux-headers' / cachyos-custom package, then re-run this script"
+  die "cannot determine the ${KERNEL} headers package automatically — install the matching headers package (Debian/Ubuntu: 'linux-headers-<kernel>'; Fedora: 'kernel-devel-<kernel>'; Arch: 'linux-api-headers' / cachyos-custom), then re-run this script"
 fi
 log "Kernel build tree OK: /lib/modules/${KERNEL}/build"
 

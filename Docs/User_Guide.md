@@ -30,7 +30,8 @@ policy, version-bump process, CI) see `packaging/README.md`.
    - [2.2 Arch User Repository — the published packages](#22-arch-user-repository-the-published-packages)
    - [2.3 Manual install from a source checkout (`makepkg`)](#23-manual-install-from-a-source-checkout-makepkg)
    - [2.4 Build from source (`cargo`)](#24-build-from-source-cargo)
-   - [2.5 Optional extra: `ryzen-smu-dkms` (AMD live subtimings)](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings)
+    - [2.5 Optional extra: `ryzen-smu-dkms` (AMD live subtimings)](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings)
+    - [2.6 Manual install (any distro)](#26-manual-install-any-distro)
 3. [First run & one-click setup](#3-first-run--one-click-setup)
 4. [Running the GUI (`ramsleuth`)](#4-running-the-gui-ramsleuth)
 5. [Running the TUI (`ramsleuth-tui`)](#5-running-the-tui-ramsleuth-tui)
@@ -386,6 +387,74 @@ you **offline** (`sudo ramsleuth-setup --with-dkms`, or the GUI's
 + driver in one action). The AUR extra is **mutually exclusive** with the
 app (shared vendored source — installing it removes a main package), so it
 is the standalone path only.
+
+### 2.6 Manual install (any distro)
+
+For systems without pacman (Debian, Ubuntu, Fedora, Linux Mint, etc.).
+
+**Prerequisites:**
+```sh
+# Debian/Ubuntu/Mint:
+sudo apt install build-essential pkgconf acl dkms linux-headers-$(uname -r) \
+     libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev \
+     libxi-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev
+
+# Fedora:
+sudo dnf install gcc pkgconf acl dkms "kernel-devel-$(uname -r)" \
+     libxkbcommon-devel wayland-devel libX11-devel libXrandr-devel \
+     libXi-devel libXcursor-devel libXinerama-devel mesa-libGL-devel
+
+# Rust (if not installed):
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+**Build:**
+```sh
+git clone https://github.com/MadGoatHaz/RamSleuth.git
+cd RamSleuth
+cargo build --workspace --release
+```
+
+**Install:**
+```sh
+# Binaries
+sudo install -Dm755 target/release/ramsleuth-daemon /usr/bin/
+sudo install -Dm755 target/release/ramsleuth-client /usr/bin/
+sudo install -Dm755 target/release/ramsleuth-tui /usr/bin/
+sudo install -Dm755 target/release/ramsleuth /usr/bin/
+sudo install -Dm755 target/release/ramsleuth-bench /usr/bin/
+sudo install -Dm755 target/release/ramsleuth-telemetry /usr/bin/
+
+# Systemd unit
+sudo install -Dm644 systemd/ramsleuth.service /etc/systemd/system/ramsleuth.service
+
+# Setup helper (distro-agnostic — no pacman needed)
+sudo install -Dm755 scripts/ramsleuth-setup.sh /usr/bin/ramsleuth-setup
+
+# Polkit policy (optional — enables GUI setup prompt)
+sudo install -Dm644 packaging/polkit/90-ramsleuth-setup.policy /usr/share/polkit-1/actions/
+
+# Activate (creates group, adds user, enables service, sets socket ACL)
+sudo ramsleuth-setup
+
+# Log out and back in (or: newgrp ramsleuth) for group membership to take effect
+```
+
+**Optional: kernel module for live subtimings**
+```sh
+# AMD (Ryzen/Threadripper):
+sudo scripts/install-ryzen-smu-dkms.sh
+
+# Intel:
+sudo scripts/install-intel-dkms.sh
+```
+
+**Verify:**
+```sh
+ramsleuth probe
+# or
+ramsleuth-tui
+```
 
 ---
 

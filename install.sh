@@ -104,7 +104,7 @@ preflight() {
   # Arch-based (the Arch/AUR-parity path; no partial install on other distros).
   if ! command -v pacman >/dev/null 2>&1; then
     die "Non-Arch host (no pacman) — this installer is the Arch/AUR-parity path.
-See README.md ('Manual build') for the distro-agnostic flow." 2
+See Docs/User_Guide.md §2.6 'Manual install (any distro)' for the distro-agnostic flow." 2
   fi
   ok "Arch-based system (pacman present)"
   # Rust toolchain (never auto-installed — we only print the command).

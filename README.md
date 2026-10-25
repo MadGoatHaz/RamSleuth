@@ -41,6 +41,8 @@ Every privileged read flows through a single root daemon that holds only `CAP_SY
 git clone https://github.com/MadGoatHaz/RamSleuth && cd RamSleuth && ./install.sh
 ```
 
+> **Non-Arch?** See [User Guide §2.6](Docs/User_Guide.md#26-manual-install-any-distro) for the manual install path.
+
 Self-contained and idempotent: it prints every source it uses and the exact commit it installs before doing anything, and a re-run after any failure is safe.
 
 **AUR (Arch) — pick exactly one:**
