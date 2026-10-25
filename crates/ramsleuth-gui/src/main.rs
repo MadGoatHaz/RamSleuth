@@ -3457,6 +3457,8 @@ mod tests {
         fn amd_readout(mode: MemoryChannelMode, ecc: EccStatus) -> AmdReadout {
             let mut readout = map_amd(&AmdPmSnapshot {
                 version: 0x0007_0B02,
+                pm_exposed: true,
+                smn_setpoint_unverified: false,
                 mclk_mhz: 0,
                 uclk_mhz: 1600,
                 fclk_mhz: 1600,
@@ -3631,6 +3633,8 @@ mod tests {
         fn amd_snapshot(mclk_mhz: u16) -> AmdPmSnapshot {
             AmdPmSnapshot {
                 version: 0x0007_0B02,
+                pm_exposed: true,
+                smn_setpoint_unverified: false,
                 mclk_mhz,
                 uclk_mhz: 1600,
                 fclk_mhz: 1600,

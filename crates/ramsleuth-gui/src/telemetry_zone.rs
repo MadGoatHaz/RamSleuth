@@ -191,6 +191,7 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<Ven
                         units,
                         &telemetry.vcore,
                         true,
+                        &telemetry.cpu.vendor,
                     ),
                     degraded: None,
                 });
@@ -221,6 +222,7 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<Ven
                                 // snapshot root's `vcore` field): shown
                                 // once, on the first channel.
                                 idx == 0,
+                                &telemetry.cpu.vendor,
                             ),
                             degraded: None,
                         });
@@ -274,6 +276,7 @@ fn readout_sections(
     units: &Units,
     vcore: &Section<VoltageTelemetry>,
     vcore_here: bool,
+    vendor: &CpuVendor,
 ) -> Vec<TimingSection> {
     // The first three stored sections.
     let mut clocks_rows: Vec<(String, String)> = vec![
@@ -355,14 +358,28 @@ fn readout_sections(
     // first Intel channel); a heuristic reading carries the
     // `[est]` badge, an `Na` vCore renders bare `N/A` (the D-4
     // per-row degradation).
+    // Vendor-aware rail labels: on Intel the board Super-I/O vCore is
+    // the only rail the platform exposes, so the primary row carries the
+    // generic "CPU Core Voltage" name and the four AMD SMU rail slots
+    // (all structurally N/A there) use generic rail descriptions — the
+    // AMD names (VDDCR_…) would be a mislabel on Intel. On AMD the
+    // existing SMU rail names stay.
+    let is_intel = matches!(vendor, CpuVendor::Intel(_));
+    let (soc, mem, misc, vpp) = if is_intel {
+        ("SoC", "Memory I/O", "Misc", "VPP")
+    } else {
+        ("VDDCR_SOC", "VDDIO_MEM", "VDD_MISC", "VPP")
+    };
+
     let mut voltage_rows: Vec<(String, String)> = Vec::new();
     if vcore_here {
-        voltage_rows.push(("VDDCR_VDD".to_owned(), vcore_display(vcore)));
+        let vcore_label = if is_intel { "CPU Core Voltage" } else { "VDDCR_VDD" };
+        voltage_rows.push((vcore_label.to_owned(), vcore_display(vcore)));
     }
-    voltage_rows.push(row("VDDCR_SOC", volts(&voltages.vddcr_soc_mv)));
-    voltage_rows.push(row("VDDIO_MEM", volts(&voltages.vddio_mem_mv)));
-    voltage_rows.push(row("VDD_MISC", volts(&voltages.vdd_misc_mv)));
-    voltage_rows.push(row("VPP", volts(&voltages.vpp_mv)));
+    voltage_rows.push(row(soc, volts(&voltages.vddcr_soc_mv)));
+    voltage_rows.push(row(mem, volts(&voltages.vddio_mem_mv)));
+    voltage_rows.push(row(misc, volts(&voltages.vdd_misc_mv)));
+    voltage_rows.push(row(vpp, volts(&voltages.vpp_mv)));
 
     vec![
         TimingSection {
@@ -701,7 +718,9 @@ fn render_section(
                 // reading (the canonical `[est]` badge) carries the
                 // explanatory tooltip on hover; the other rows render
                 // plain.
-                if label == "VDDCR_VDD" && display.contains("[est]") {
+                if (label == "VDDCR_VDD" || label == "CPU Core Voltage")
+                    && display.contains("[est]")
+                {
                     ui.add(
                         egui::Label::new(egui::RichText::new(display.as_str()).color(AMBER))
                             .sense(egui::Sense::hover()),
@@ -745,10 +764,12 @@ fn cell_color(label: &str, display: &str) -> egui::Color32 {
                 _ => CYAN,
             }
         }
-        "VDDCR_VDD" => {
-            // The vCore (Chunk 3): a heuristic (vendor-fallback) reading
-            // with the `[est]` badge is dimmed amber (measured, not a
-            // verified profile); a verified reading is CYAN.
+        // The vCore primary rail (Chunk 3): the AMD SMU name
+        // `VDDCR_VDD` on AMD, the generic `CPU Core Voltage` on Intel.
+        // A heuristic (vendor-fallback) reading with the `[est]` badge
+        // is dimmed amber (measured, not a verified profile); a
+        // verified reading is CYAN.
+        label if label == "VDDCR_VDD" || label == "CPU Core Voltage" => {
             if display.contains("[est]") {
                 AMBER
             } else {
@@ -1062,9 +1083,9 @@ mod tests {
         );
         let rows = all_rows(&blocks);
         assert_eq!(
-            displays(&rows, "VDDCR_VDD"),
+            displays(&rows, "CPU Core Voltage"),
             vec!["1.216 V [est]"],
-            "a heuristic vCore carries the [est] badge"
+            "a heuristic vCore carries the [est] badge (the Intel label)"
         );
 
         // Verified -> plain (no badge), mV precision.
@@ -1080,9 +1101,9 @@ mod tests {
         );
         let rows = all_rows(&blocks);
         assert_eq!(
-            displays(&rows, "VDDCR_VDD"),
+            displays(&rows, "CPU Core Voltage"),
             vec!["1.216 V"],
-            "a verified vCore renders plain at mV precision"
+            "a verified vCore renders plain at mV precision (the Intel label)"
         );
 
         // Na (unknown / enterprise / out-of-bounds) -> bare N/A.
@@ -1091,7 +1112,9 @@ mod tests {
             &Units::default(),
         );
         let rows = all_rows(&blocks);
-        assert_eq!(displays(&rows, "VDDCR_VDD"), vec!["N/A"]);
+        assert_eq!(displays(&rows, "CPU Core Voltage"), vec!["N/A"]);
+        // The AMD rail name is gone from the Intel block.
+        assert!(displays(&rows, "VDDCR_VDD").is_empty());
     }
 
     /// (b) The fully all-Na snapshot with an `Unknown` vendor: one
@@ -1206,8 +1229,9 @@ mod tests {
         // the `GDM / CR` split adds one row (`GEAR_DOWN` + `CR` vs the
         // single combined row) + the channel-level RTL — 9 clocks
         // rows vs the AMD 7; the voltages section carries the
-        // VDDCR_VDD row (C12 — bare `N/A` on Intel, D-4), the rest of
-        // the six sections are unchanged.
+        // `CPU Core Voltage` row (the Intel label for the C12 vCore —
+        // bare `N/A` when absent, D-4), the rest of the six sections
+        // are unchanged.
         let counts: Vec<usize> = blocks[0].sections.iter().map(|s| s.rows.len()).collect();
         assert_eq!(counts, vec![9, 18, 4, 8, 5, 5]);
 
@@ -1245,14 +1269,23 @@ mod tests {
             "one CR row per channel, both not-applicable (D-C11)"
         );
 
-        // VDDIO_MEM Na path (C12-05): the Intel voltage is structurally
-        // all-Na, so each VDDIO_MEM row renders bare `N/A` (one per
+        // The memory-rail Na path (C12-05): the Intel voltage is
+        // structurally all-Na, so each row renders bare `N/A` (one per
         // channel) — the all-Na state the C12-04-fed slot degrades to.
+        // The Intel labels are the generic rail descriptions (the AMD
+        // SMU names are a mislabel on Intel).
         assert_eq!(
-            displays(&rows, "VDDIO_MEM"),
+            displays(&rows, "Memory I/O"),
             vec!["N/A", "N/A"],
-            "one VDDIO_MEM row per channel, both bare N/A (all-Na voltage, D-4)"
+            "one Memory I/O row per channel, both bare N/A (all-Na voltage, D-4)"
         );
+        assert_eq!(displays(&rows, "SoC"), vec!["N/A", "N/A"]);
+        assert_eq!(displays(&rows, "Misc"), vec!["N/A", "N/A"]);
+        assert_eq!(displays(&rows, "VPP"), vec!["N/A", "N/A"]);
+        // The AMD rail names are gone from the Intel block.
+        assert!(displays(&rows, "VDDIO_MEM").is_empty());
+        assert!(displays(&rows, "VDDCR_SOC").is_empty());
+        assert!(displays(&rows, "VDD_MISC").is_empty());
     }
 
     /// (f) The split `GEAR_DOWN` + `CR` rows (D-6): each row carries

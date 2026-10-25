@@ -289,12 +289,23 @@ fn cad_rows(cad: &CadBus) -> [(&str, String); 8] {
 }
 
 /// The four memory-rail rows of a [`VoltageSet`] (volts).
-fn voltages_rows(voltages: &VoltageSet) -> [(&str, String); 4] {
+///
+/// The labels are vendor-aware: on Intel the board Super-I/O vCore is
+/// the only rail the platform exposes, so the four AMD SMU rail slots
+/// (all structurally N/A there) carry generic rail descriptions — the
+/// AMD names (VDDCR_…) would be a mislabel on Intel. On AMD (and
+/// `Unknown`) the existing SMU rail names stay.
+fn voltages_rows(voltages: &VoltageSet, vendor: &CpuVendor) -> [(&'static str, String); 4] {
+    let (soc, mem, misc, vpp) = if matches!(vendor, CpuVendor::Intel(_)) {
+        ("SoC", "Memory I/O", "Misc", "VPP")
+    } else {
+        ("VDDCR_SOC", "VDDIO_MEM", "VDD_MISC", "VPP")
+    };
     [
-        ("VDDCR_SOC", volts(&voltages.vddcr_soc_mv)),
-        ("VDDIO_MEM", volts(&voltages.vddio_mem_mv)),
-        ("VDD_MISC", volts(&voltages.vdd_misc_mv)),
-        ("VPP", volts(&voltages.vpp_mv)),
+        (soc, volts(&voltages.vddcr_soc_mv)),
+        (mem, volts(&voltages.vddio_mem_mv)),
+        (misc, volts(&voltages.vdd_misc_mv)),
+        (vpp, volts(&voltages.vpp_mv)),
     ]
 }
 
@@ -327,7 +338,7 @@ fn cpu_section(out: &mut String, cpu: &CpuInfo) {
 
 /// The `=== AMD ===` section: the four display sets in dashboard order, or
 /// one `N/A (<reason>)` line when the branch degraded.
-fn amd_section(out: &mut String, section: &Section<AmdReadout>) {
+fn amd_section(out: &mut String, section: &Section<AmdReadout>, vendor: &CpuVendor) {
     header(out, "AMD");
     match section {
         Section::Na(reason) => {
@@ -347,7 +358,7 @@ fn amd_section(out: &mut String, section: &Section<AmdReadout>) {
             subheader(out, "CAD bus (ohms)");
             rows(out, "  ", &cad_rows(&readout.cad_bus));
             subheader(out, "Voltages");
-            rows(out, "  ", &voltages_rows(&readout.voltages));
+            rows(out, "  ", &voltages_rows(&readout.voltages, vendor));
             out.push('\n');
         }
     }
@@ -359,7 +370,7 @@ fn amd_section(out: &mut String, section: &Section<AmdReadout>) {
 /// decoded IMC channel (clocks + all 27 timings + CAD + voltages, then
 /// the channel-level RTL row group), or one `N/A (<reason>)` line when
 /// the branch degraded.
-fn intel_section(out: &mut String, section: &Section<IntelReadout>) {
+fn intel_section(out: &mut String, section: &Section<IntelReadout>, vendor: &CpuVendor) {
     header(out, "Intel");
     match section {
         Section::Na(reason) => {
@@ -380,7 +391,7 @@ fn intel_section(out: &mut String, section: &Section<IntelReadout>) {
                 return;
             }
             for channel in &readout.channels {
-                intel_channel(out, channel);
+                intel_channel(out, channel, vendor);
             }
             out.push('\n');
         }
@@ -389,7 +400,7 @@ fn intel_section(out: &mut String, section: &Section<IntelReadout>) {
 
 /// One `--- Channel n ---` block: the shared display sets plus the
 /// channel-level RTL row.
-fn intel_channel(out: &mut String, channel: &IntelChannel) {
+fn intel_channel(out: &mut String, channel: &IntelChannel, vendor: &CpuVendor) {
     let index = channel.index;
     subheader(out, &format!("Channel {index}"));
     rows(out, "  ", &clocks_rows(&channel.clocks));
@@ -403,7 +414,7 @@ fn intel_channel(out: &mut String, channel: &IntelChannel) {
     subheader(out, "CAD bus (ohms)");
     rows(out, "  ", &cad_rows(&channel.cad_bus));
     subheader(out, "Voltages");
-    rows(out, "  ", &voltages_rows(&channel.voltages));
+    rows(out, "  ", &voltages_rows(&channel.voltages, vendor));
     subheader(out, "RTL");
     rows(out, "  ", &[("RTL (ticks)", cell(&channel.rtl))]);
 }
@@ -486,8 +497,8 @@ pub fn render(telemetry: &SystemMemoryTelemetry) -> String {
     out.push('\n');
     cpu_section(&mut out, &telemetry.cpu);
     vcore_section(&mut out, &telemetry.vcore);
-    amd_section(&mut out, &telemetry.amd);
-    intel_section(&mut out, &telemetry.intel);
+    amd_section(&mut out, &telemetry.amd, &telemetry.cpu.vendor);
+    intel_section(&mut out, &telemetry.intel, &telemetry.cpu.vendor);
     spd_section(&mut out, &telemetry.spd);
     out
 }
@@ -836,6 +847,19 @@ mod tests {
         // channel 0 RTL: the live map has no RTL register (the
         // `NotApplicable` cell keeps the one bare `N/A`, D-4).
         assert!(text.contains("RTL (ticks)  N/A"));
+        // The Intel rail labels are the generic descriptions (Issue 3):
+        // the board Super-I/O vCore is the only rail Intel exposes, so
+        // the four structurally-Na AMD SMU rail slots carry generic
+        // names — the AMD names would be a mislabel.
+        // (`rows` pads to the longest key — `Memory I/O` — then two
+        // spaces.)
+        assert!(text.contains("SoC         N/A"), "generic Intel SoC rail: {text}");
+        assert!(text.contains("Memory I/O  N/A"), "generic Intel memory rail: {text}");
+        assert!(text.contains("Misc        N/A"), "generic Intel misc rail: {text}");
+        assert!(text.contains("VPP         N/A"), "generic Intel VPP rail: {text}");
+        assert!(!text.contains("VDDCR_SOC"), "no AMD rail names in the Intel dump: {text}");
+        assert!(!text.contains("VDDIO_MEM"), "no AMD rail names in the Intel dump: {text}");
+        assert!(!text.contains("VDD_MISC"), "no AMD rail names in the Intel dump: {text}");
     }
 
     /// (f) `dump` over a live in-process daemon stand-in: a `Telemetry`

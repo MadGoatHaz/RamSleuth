@@ -927,6 +927,7 @@ fn zone1_columns(
                 None,
                 &telemetry.vcore,
                 true,
+                &telemetry.cpu.vendor,
             );
             left.extend(l);
             right.extend(r);
@@ -954,6 +955,7 @@ fn zone1_columns(
                         // root's `vcore` field): shown once, on the
                         // first channel.
                         channel_index == 0,
+                        &telemetry.cpu.vendor,
                     );
                     left.extend(l);
                     right.extend(r);
@@ -988,6 +990,7 @@ fn readout_columns(
     rtl: Option<&Section<u16>>,
     vcore: &Section<VoltageTelemetry>,
     vcore_here: bool,
+    vendor: &CpuVendor,
 ) -> (Vec<ListItem<'static>>, Vec<ListItem<'static>>) {
     let mut left = vec![sub_item(label)];
 
@@ -1069,7 +1072,7 @@ fn readout_columns(
     // it is shown once per readout (the AMD block, or the first Intel
     // channel) and an `Na` vCore drops the row (the all-Na-drop rule).
     if vcore_here {
-        push_vcore(&mut right, vcore);
+        push_vcore(&mut right, vcore, vendor);
     }
     // A SOC rail above 1.30 V is out of spec on AM5 -> amber warning.
     let soc_color = match &voltages.vddcr_soc_mv {
@@ -1819,7 +1822,16 @@ fn push_cell<T>(
 /// is dropped (the TUI's all-Na drop rule). When a VID is present (never
 /// for Intel, but the display is total), the SVID target + the signed
 /// (negative) active drop render as dimmed indented sub-rows.
-fn push_vcore(items: &mut Vec<ListItem<'static>>, vcore: &Section<VoltageTelemetry>) {
+///
+/// The row label is vendor-aware: the AMD SMU rail name `VDDCR_VDD` on
+/// AMD, the generic `CPU Core Voltage` on Intel (where the board
+/// Super-I/O read is the only rail the platform exposes — the AMD SMU
+/// name would be a mislabel).
+fn push_vcore(
+    items: &mut Vec<ListItem<'static>>,
+    vcore: &Section<VoltageTelemetry>,
+    vendor: &CpuVendor,
+) {
     let Some(v) = vcore.value() else {
         return; // Na → dropped (the all-Na drop rule).
     };
@@ -1831,7 +1843,12 @@ fn push_vcore(items: &mut Vec<ListItem<'static>>, vcore: &Section<VoltageTelemet
     if let Some(badge) = v.confidence.badge() {
         value = format!("~ {value} {badge}");
     }
-    items.push(row("VDDCR_VDD", &value, color));
+    let label = if matches!(vendor, CpuVendor::Intel(_)) {
+        "CPU Core Voltage"
+    } else {
+        "VDDCR_VDD"
+    };
+    items.push(row(label, &value, color));
     if let Some(vid) = v.requested_vid {
         items.push(row("SVID Target", &format!("{vid:.3} V"), DIM));
         if let Some(delta) = v.delta_volts {
@@ -3737,6 +3754,76 @@ mod tests {
         let state = state_with_vcore(Section::na(NaReason::NotApplicable));
         let text = draw_at(&state, 200, 62);
         assert!(!text.contains("VDDCR_VDD"), "{text}");
+    }
+
+    /// (u3) Issue 3 — the vendor-aware vCore label: on an Intel host
+    /// the board Super-I/O vCore row carries the generic
+    /// `CPU Core Voltage` name (the AMD SMU rail name `VDDCR_VDD` is a
+    /// mislabel on Intel); on AMD the SMU name stays.
+    #[test]
+    fn vcore_label_is_vendor_aware() {
+        fn state_with_vcore(
+            cpu: CpuInfo,
+            amd: Section<AmdReadout>,
+            intel: Section<IntelReadout>,
+        ) -> AppState {
+            AppState {
+                telemetry: Some(SystemMemoryTelemetry {
+                    cpu,
+                    amd,
+                    intel,
+                    spd: Vec::new(),
+                    platform: SystemPlatform {
+                        cpu_clock_mhz: Section::na(NaReason::NotApplicable),
+                        motherboard: Section::na(NaReason::NotApplicable),
+                        bios: Section::na(NaReason::NotApplicable),
+                        agesa: Section::na(NaReason::NotApplicable),
+                        smu_version: Section::na(NaReason::NotApplicable),
+                    },
+                    total_capacity: Section::na(NaReason::NotApplicable),
+                    dimm_sizes: Vec::new(),
+                    vcore: Section::Value(VoltageTelemetry {
+                        rail_name: "CPU Vcore".to_owned(),
+                        delivered_volts: 1.216,
+                        requested_vid: None,
+                        delta_volts: None,
+                        confidence: RailConfidence::VerifiedProfile,
+                    }),
+                }),
+                ..Default::default()
+            }
+        }
+
+        // Intel host: the row is labeled `CPU Core Voltage`.
+        let state = state_with_vcore(
+            CpuInfo {
+                vendor: CpuVendor::Intel(IntelGen::AlderLake),
+                brand: "Intel Core i7-12700K".to_owned(),
+            },
+            Section::na(NaReason::NotApplicable),
+            Section::Value(fixture_intel_readout(
+                IntelGen::AlderLake,
+                Some(0x0000_0120),
+                &fixture_channel_regs(),
+                &ChannelRegs::default(),
+                false,
+            )),
+        );
+        let text = draw_at(&state, 200, 62);
+        assert!(text.contains("CPU Core Voltage: 1.216 V"), "{text}");
+        assert!(!text.contains("VDDCR_VDD"), "the AMD SMU name must not appear on Intel: {text}");
+
+        // AMD host: the SMU name stays.
+        let state = state_with_vcore(
+            CpuInfo {
+                vendor: CpuVendor::Amd(AmdZen::Zen3),
+                brand: "Ryzen 9 5950X".to_owned(),
+            },
+            Section::Value(fixture_amd()),
+            Section::na(NaReason::NotApplicable),
+        );
+        let text = draw_at(&state, 200, 62);
+        assert!(text.contains("VDDCR_VDD: 1.216 V"), "{text}");
     }
 
     /// (v) The CR row (the GUI's D-6 form): the command rate's bare

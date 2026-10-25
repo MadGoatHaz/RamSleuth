@@ -20,7 +20,7 @@
 //!
 //! | SMN reg | fields (bits) | snapshot slot(s) |
 //! |---|---|---|
-//! | `0x50200` | MCLK set-point `(v & 0x7F) / 3 × 100` MHz (6:0); **GDM** (11); command rate 1T/2T (10) | `gdm` + `command_rate` (set-point: decoded, not stored) |
+//! | `0x50200` | MCLK set-point `(v & 0x7F) / 3 × 100` MHz (6:0); **GDM** (11); command rate 1T/2T (10) — layout verified on Vermeer / Renoir; a word that decodes to a `0` MHz set-point is impossible on a running system and marks the whole word unverified on this platform (Castle Peak reads `0x00000100`): `gdm` / `command_rate` then render N/A with the unverified-layout reason | `gdm` + `command_rate` + the unverified flag (set-point: decoded, not stored) |
 //! | `0x50204` | tCL (5:0); tRAS (14:8); tRCDRD (20:16); tRCDWR (28:24) | `cl` / `ras` / `rcdrd` / `rcwdwr` |
 //! | `0x50208` | tRC (7:0); tRP (21:16) | `rc` / `rp` |
 //! | `0x5020C` | tRRDS (4:0); tRRDL (12:8); tRTP (28:24) | `rrds` / `rrld` / `rtp` |
@@ -390,6 +390,17 @@ pub struct SmnFields {
     pub command_rate: u8,
     /// The 27 DRAM subtimings in ticks (the verified reference table).
     pub timings: AmdPmTimings,
+    /// `true` when the `0x50200` word was read successfully but its
+    /// decoded MCLK set-point is `0` MHz — impossible for a running
+    /// system, so the word's field layout (set-point 6:0 / GDM 11 /
+    /// command rate 10, verified on Vermeer / Renoir) is unverified on
+    /// this platform (e.g. Castle Peak reads `0x00000100`). The overlay
+    /// carries the flag to the snapshot; the P2-05 mapping then renders
+    /// `gdm` / `command_rate` as N/A with the unverified-layout reason
+    /// instead of the coincidental bits (which would read "GDM off" /
+    /// "1T"). An absent / failed word (`None`) is NOT unverified — it
+    /// keeps the P6-10 parse-value behavior.
+    pub setpoint_unverified: bool,
 }
 
 /// The raw word for `addr` in a register list: `None` when the address
@@ -436,9 +447,23 @@ pub fn decode_smn(regs: &[(u32, Option<u32>)]) -> SmnFields {
         w_rfc
     };
 
+    // 0x50200 gate (Castle Peak / Threadripper 3990X): the word was read
+    // successfully but its MCLK set-point decodes to `0` MHz — impossible
+    // for a running system. The Vermeer / Renoir field layout does not
+    // apply to this platform (the 3990X reads `0x00000100`), so the whole
+    // word is unverified: `gdm` / `command_rate` render N/A downstream
+    // (the coincidental bits would read "GDM off" / "1T"). Conservative
+    // by design — only an exactly-`0` decoded set-point (never an
+    // unusual-but-nonzero one) trips the gate, and an absent / failed
+    // word (`None`) is not unverified (the P6-10 parse-value behavior
+    // is preserved).
+    let setpoint_unverified =
+        word_opt(regs, SMN_MCLK).map(|w| mclk_setpoint_mhz(w) == 0).unwrap_or(false);
+
     SmnFields {
         gdm: gdm_flag(word_at(regs, SMN_MCLK)),
         command_rate: command_rate(word_at(regs, SMN_MCLK)),
+        setpoint_unverified,
         timings: AmdPmTimings {
             cl: tcl(word_at(regs, SMN_CMD0)),
             rcwdwr: trcdwr(word_at(regs, SMN_CMD0)),
@@ -942,9 +967,13 @@ fn smn_protocol_read<T: std::os::unix::io::AsFd + std::os::unix::io::AsRawFd>(
 ///   that register's fields stay zeroed (honest `Disabled` / `Na` under
 ///   the P2-05 gates); the other registers proceed independently.
 /// - **Written fields**: `gdm` (`0x50200` bit 11) + `command_rate`
-///   (`0x50200` bit 10) + the 27 `timings` — and only those. PM-table
-///   fields (version, clocks, div mode, voltages) are never touched;
-///   `pdm` / `cad_bus` stay zeroed (unconfirmed bitfields, plan D3).
+///   (`0x50200` bit 10) + the 27 `timings` + `smn_setpoint_unverified`
+///   (the `0x50200` gate: a present word whose set-point decodes to
+///   `0` MHz — impossible on a running system — marks the word
+///   unverified on this platform, e.g. Castle Peak's `0x00000100`) —
+///   and only those. PM-table fields (version, clocks, div mode,
+///   voltages) are never touched; `pdm` / `cad_bus` stay zeroed
+///   (unconfirmed bitfields, plan D3).
 pub fn apply_smn(snap: &mut AmdPmSnapshot) {
     if vendor_gate(&CpuInfo::detect()).is_err() {
         return;
@@ -1023,6 +1052,11 @@ fn apply_smn_with<R: FnMut(u32) -> TelemetryResult<u32>>(
     snap.gdm = fields.gdm;
     snap.command_rate = fields.command_rate;
     snap.timings = fields.timings;
+    // The 0x50200 gate: a present word whose set-point decodes to `0`
+    // MHz marks the word unverified — the P2-05 mapping renders
+    // `gdm` / `command_rate` N/A with the specific reason instead of the
+    // coincidental bits (Castle Peak / Threadripper 3990X).
+    snap.smn_setpoint_unverified = fields.setpoint_unverified;
 }
 
 #[cfg(test)]
@@ -1037,6 +1071,8 @@ mod tests {
     fn base_snapshot() -> AmdPmSnapshot {
         AmdPmSnapshot {
             version: 0x38_08_05,
+            pm_exposed: true,
+            smn_setpoint_unverified: false,
             mclk_mhz: 1800,
             uclk_mhz: 1800,
             fclk_mhz: 1792,
@@ -1274,6 +1310,103 @@ mod tests {
         assert_eq!(decode_smn(&[(SMN_MCLK, Some(SMN_READ_FAILURE_SENTINEL))]).command_rate, 0);
     }
 
+    /// (b) The `0x50200` gate (Castle Peak / Threadripper 3990X): a word
+    /// that is PRESENT but whose MCLK set-point decodes to `0` MHz is
+    /// impossible for a running system — the Vermeer / Renoir field
+    /// layout does not apply to this platform, so the whole word is
+    /// unverified (the flag the P2-05 mapping renders as N/A for
+    /// `gdm` / `command_rate`). `0x00000100` is the word observed on the
+    /// 3990X.
+    #[test]
+    fn setpoint_zero_marks_50200_unverified() {
+        // The 3990X word: set-point `(0x100 & 0x7F) / 3 × 100` = 0 MHz.
+        let f = decode_smn(&[(SMN_MCLK, Some(0x0000_0100))]);
+        assert!(
+            f.setpoint_unverified,
+            "a 0 MHz set-point is impossible on a running system — the word is unverified"
+        );
+        // The raw bits still decode (the mapping gate, not the
+        // extraction, is what changes): bit 11 = 0, bit 10 = 0.
+        assert_eq!(f.gdm, 0);
+        assert_eq!(f.command_rate, 0);
+
+        // Any present word with a zero set-point field (e.g. the bare
+        // GDM bit) is unverified the same way.
+        assert!(decode_smn(&[(SMN_MCLK, Some(0x0000_0800))]).setpoint_unverified);
+    }
+
+    /// (b) The `0x50200` gate is conservative: a valid Vermeer / Renoir
+    /// word (a nonzero set-point) decodes normally and the flag stays
+    /// clear — the regression check for the working 3900X / 5950X path.
+    #[test]
+    fn valid_vermeer_word_stays_verified() {
+        // The README live example: 1900 MHz, GDM off, 2T.
+        let f = decode_smn(&[(SMN_MCLK, Some(0x0000_1539))]);
+        assert!(!f.setpoint_unverified);
+        assert_eq!(f.gdm, 0);
+        assert_eq!(f.command_rate, 1);
+        assert_eq!(mclk_setpoint_mhz(0x0000_1539), 1900);
+
+        // An unusual-but-nonzero set-point (one step = 100 MHz) is NOT
+        // unverified — the gate fires on exactly `0` only.
+        assert!(!decode_smn(&[(SMN_MCLK, Some(0x0000_0003))]).setpoint_unverified);
+    }
+
+    /// (b) The `0x50200` gate does NOT fire on an absent / failed word:
+    /// `None` keeps the P6-10 parse-value behavior (decodes to `0` = the
+    /// PM parse value, the word was never read).
+    #[test]
+    fn absent_or_failed_word_is_not_unverified() {
+        assert!(!decode_smn(&[]).setpoint_unverified);
+        assert!(!decode_smn(&[(SMN_MCLK, None)]).setpoint_unverified);
+        assert!(!decode_smn(&[(SMN_MCLK, Some(SMN_READ_FAILURE_SENTINEL))]).setpoint_unverified);
+    }
+
+    /// (d) The overlay carries the unverified flag to the snapshot: a
+    /// 3990X `0x50200` feed (`0x100`) sets it while every other register
+    /// decodes normally (the gate is scoped to `0x50200` only); a valid
+    /// feed leaves it clear.
+    #[test]
+    fn apply_smn_with_carries_the_unverified_flag() {
+        // 3990X feed: `0x50200` = `0x100` -> unverified.
+        let mut snap = base_snapshot();
+        apply_smn_with(
+            |addr| {
+                if addr == SMN_MCLK {
+                    Ok(0x0000_0100)
+                } else {
+                    fixture_regs()
+                        .into_iter()
+                        .find(|(a, _)| *a == addr)
+                        .map(|(_, w)| Ok(w.expect("fixture words are all Some")))
+                        .unwrap_or(Ok(0))
+                }
+            },
+            &mut snap,
+        );
+        assert!(snap.smn_setpoint_unverified);
+        // The other registers decode normally (gate scoped to 0x50200).
+        assert_eq!(snap.timings.cl, 16);
+        assert_eq!(snap.timings.rfc1, 160);
+
+        // Valid feed (the fixture's `0x1539`): the flag stays clear and
+        // the bits land as decoded.
+        let mut snap = base_snapshot();
+        apply_smn_with(
+            |addr| {
+                fixture_regs()
+                    .into_iter()
+                    .find(|(a, _)| *a == addr)
+                    .map(|(_, w)| Ok(w.expect("fixture words are all Some")))
+                    .unwrap_or(Ok(0))
+            },
+            &mut snap,
+        );
+        assert!(!snap.smn_setpoint_unverified);
+        assert_eq!(snap.gdm, 0);
+        assert_eq!(snap.command_rate, 1);
+    }
+
     /// (c) The `0x50264` mirror/sentinel rule (reference lines 275–277):
     /// sentinel + differing mirror → the mirror word; sentinel + equal →
     /// no swap; no sentinel → `0x50260`; absent mirror → zeros (never a
@@ -1325,6 +1458,7 @@ mod tests {
         let zero = SmnFields {
             gdm: 0,
             command_rate: 0,
+            setpoint_unverified: false,
             timings: AmdPmTimings {
                 cl: 0, rcwdwr: 0, rcdrd: 0, rp: 0, ras: 0, rc: 0, rrds: 0, rrld: 0,
                 faw: 0, wtrs: 0, wtrl: 0, wr: 0, rfc1: 0, rfc2: 0, rfcsb: 0,
