@@ -6,6 +6,19 @@ All notable per-release changes to RamSleuth. Newest first.
 
 ## [Unreleased]
 
+## [2.4.18] - 2026-10-25
+
+### Bug Fixes
+
+- **Intel CPU temperature regression**: Restored `coretemp` hwmon and `x86_pkg_temp` thermal zone detection (broken in v2.4.17). Now vendor-agnostic — works on both Intel and AMD. Matches by sensor name, never by slot number.
+- **3990X (Castle Peak) 0x50200 decode**: When the MCLK set-point decodes to 0 (impossible on a running system), GDM and command rate now show N/A "layout unverified on this platform" instead of false "GDM off / 1T".
+- **3990X PM table absent messaging**: All PM-derived fields (clocks, voltages) now show "PM table not exposed by driver (AGESA version may be unsupported by ryzen-smu)" instead of generic "0 outside plausible range".
+- **Voltage labels vendor-aware**: Intel platforms show "CPU Core Voltage" + generic rail names; AMD keeps SMU-specific names. Fixed in all 5 display paths (TUI, GUI, CLI probe, CLI dump, CLI dashboard).
+- **Specific N/A reasons now visible in TUI/GUI**: `ParseError` details (e.g., "PM table not exposed by driver") are no longer flattened to "decode failed" in the shared display layer.
+
+### Tests
+- 1123 tests passing, 0 clippy warnings
+
 ## [2.4.17] - 2026-10-17
 
 ### Intel Memory Controller — Major Overhaul
