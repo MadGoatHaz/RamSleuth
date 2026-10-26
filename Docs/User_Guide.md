@@ -405,7 +405,18 @@ no build dependencies required**. (On an architecture that has no published
 release binary today — all aarch64 hosts — it transparently falls back to
 building from source, and you can force that path with `--build`.)
 
-**Quick install:**
+**Debian/Ubuntu/Mint — `.deb` package (simplest, no clone):**
+```sh
+wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.18/ramsleuth_2.4.18_amd64.deb
+sudo dpkg -i ramsleuth_2.4.18_amd64.deb
+sudo usermod -aG ramsleuth $USER
+newgrp ramsleuth
+ramsleuth-tui
+```
+
+`dpkg -i` pulls in the `systemd` + `acl` dependencies automatically; the package creates the `ramsleuth` group, installs the 6 binaries + the frozen systemd unit + the setup helper + the polkit policy, and enables the daemon. Log out and back in (or run `newgrp ramsleuth`) for the group membership to take effect.
+
+**Any other distro — the `install.sh` one-liner:**
 ```sh
 git clone https://github.com/MadGoatHaz/RamSleuth.git
 cd RamSleuth

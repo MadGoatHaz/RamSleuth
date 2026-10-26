@@ -3,6 +3,11 @@
 # install.sh — RamSleuth v2 self-contained installer (any distro with
 # pacman, apt, or dnf).
 #
+# NOTE: on Debian/Ubuntu/Mint an official `.deb` package is published on
+# the GitHub Release (ramsleuth_<version>_amd64.deb) — `dpkg -i` is the
+# simplest install there. This script remains the universal, any-distro
+# path (and the one used on the other distros).
+#
 # PRIMARY PATH (the default): downloads the PRECOMPILED release binary
 # tarball from the official GitHub Release and installs it as-is — NO
 # Rust toolchain, NO build, NO git clone required. The tarball's sha256

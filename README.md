@@ -54,6 +54,18 @@ yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest i
 
 (`paru -S …` works in place of `yay`.)
 
+**Debian/Ubuntu/Mint — `.deb` package:**
+
+```sh
+wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.18/ramsleuth_2.4.18_amd64.deb
+sudo dpkg -i ramsleuth_2.4.18_amd64.deb
+sudo usermod -aG ramsleuth $USER
+newgrp ramsleuth        # or log out and back in
+ramsleuth-tui
+```
+
+`dpkg -i` pulls in the `systemd` + `acl` dependencies automatically; the package creates the `ramsleuth` group, installs the 6 binaries + the frozen systemd unit + the setup helper + the polkit policy, and enables the daemon. (The `install.sh` one-liner above is equivalent and works on any distro.)
+
 **AMD live subtimings:** the driver is **bundled** with the app — the in-app one-click (or `sudo ramsleuth-setup --with-dkms` / `sudo ramsleuth-install-ryzen-smu-dkms`) builds the pinned third-party `ryzen_smu` module **offline** from the vendored source; without it the AMD fields read `N/A (DriverMissing)` and everything else keeps serving. The standalone `ryzen-smu-dkms` AUR extra is **mutually exclusive** with the app packages — full details in the [User Guide](Docs/User_Guide.md).
 
 **Intel live subtimings (optional extra):** `yay -S ramsleuth-intel-dkms` provides RamSleuth's own in-repo `ramsleuth_intel` kernel module — DKMS-built for your running kernel, exposing the raw IMC registers over world-readable sysfs (the 25-attribute core set, plus two generation-gated groups on 12th-gen+ silicon — the DDR4 `alk_d4_tc` block and the `tier3_extended` block — taking a 12th-gen+ Alder/Raptor DDR4 box to 79 attributes); source and dev-branch installs ship the helper directly (`sudo ramsleuth-install-intel-dkms`), and the one-click setup routes to it automatically on Intel hosts (the v2.4.18 release tarball and the `ramsleuth-bin` binary ship the `ramsleuth_intel` source + the helper). Without it the daemon falls back to the read-only `/dev/mem` MCHBAR map where the kernel permits, and the Intel fields read `N/A (DriverMissing)` where it does not — everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
