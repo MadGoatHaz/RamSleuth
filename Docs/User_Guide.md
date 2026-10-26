@@ -31,7 +31,7 @@ policy, version-bump process, CI) see `packaging/README.md`.
    - [2.3 Manual install from a source checkout (`makepkg`)](#23-manual-install-from-a-source-checkout-makepkg)
    - [2.4 Build from source (`cargo`)](#24-build-from-source-cargo)
     - [2.5 Optional extra: `ryzen-smu-dkms` (AMD live subtimings)](#25-optional-extra-ryzen-smu-dkms-amd-live-subtimings)
-    - [2.6 Manual install (any distro)](#26-manual-install-any-distro)
+     - [2.6 Install (any distro)](#26-install-any-distro)
 3. [First run & one-click setup](#3-first-run--one-click-setup)
 4. [Running the GUI (`ramsleuth`)](#4-running-the-gui-ramsleuth)
 5. [Running the TUI (`ramsleuth-tui`)](#5-running-the-tui-ramsleuth-tui)
@@ -154,9 +154,13 @@ git clone https://github.com/MadGoatHaz/RamSleuth && cd RamSleuth && ./install.s
 ```
 
 That is the whole install. `install.sh` lives at the root of the repository and
-is **self-contained** — it does not reach for any other AUR package, and it
-builds *only this repository* with `cargo build --release --workspace --locked`
-(locked to the committed `Cargo.lock`, from the exact commit you cloned).
+is **self-contained** — it does not reach for any other AUR package. By default
+it downloads the **precompiled release binary** from the official GitHub Release
+(verified against the published `sha256` sidecar before anything is installed);
+with `--build` — or automatically, when no release binary is published for your
+architecture (today, aarch64) — it instead builds *only this repository* with
+`cargo build --release --workspace --locked` (locked to the committed
+`Cargo.lock`, from the exact commit you cloned).
 
 What makes it worth using:
 
@@ -207,11 +211,15 @@ What makes it worth using:
 
 Prerequisites and exit codes:
 
-- The script must run from a genuine git checkout of RamSleuth (it refuses
-  otherwise — exit 2), on an Arch-based system (it checks for `pacman` —
-  exit 2 on anything else), and with a Rust toolchain present (`cargo` +
-  `rustc`). It **never auto-installs Rust**; if it is missing it prints the
-  rustup one-liner and exits 2:
+- The script runs from a git checkout of RamSleuth (you clone it, then run
+  `./install.sh`) and works on **any Linux distro with systemd** — there is no
+  `pacman` requirement and no Arch-only gate. The **default (binary) path needs
+  only `git`, `curl`, and a `.tar.zst` extractor** — no Rust toolchain, no build
+  dependencies. The **source path** (`--build`, or automatic when no release
+  binary is published for your architecture) is the only one that needs Rust
+  (`cargo` + `rustc`) plus the build dependencies from
+  [§2.4](#24-build-from-source-cargo); it **never auto-installs Rust** and
+  prints the rustup one-liner if it is missing:
   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - Exit codes: **0** = installed (or you declined — no change), **1** = hard
   failure (a clear message says why — never a silent half-state), **2** =
@@ -388,9 +396,51 @@ you **offline** (`sudo ramsleuth-setup --with-dkms`, or the GUI's
 app (shared vendored source — installing it removes a main package), so it
 is the standalone path only.
 
-### 2.6 Manual install (any distro)
+### 2.6 Install (any distro)
 
-For systems without pacman (Debian, Ubuntu, Fedora, Linux Mint, etc.).
+The `install.sh` script works on **any Linux distro** with systemd. By default
+it downloads the **precompiled release binary** from the official GitHub Release
+and verifies it against the published `sha256` sidecar — **no Rust toolchain and
+no build dependencies required**. (On an architecture that has no published
+release binary today — all aarch64 hosts — it transparently falls back to
+building from source, and you can force that path with `--build`.)
+
+**Quick install:**
+```sh
+git clone https://github.com/MadGoatHaz/RamSleuth.git
+cd RamSleuth
+./install.sh
+```
+
+That's it. The script will:
+
+1. Detect your architecture and download the latest release binary
+2. Install all binaries to `/usr/bin/`
+3. Install the systemd service unit
+4. Create the `ramsleuth` system group and add your user
+5. Enable and start the daemon
+6. Set socket permissions for your user
+
+After installing, log out and back in (or run `newgrp ramsleuth`), then:
+
+```sh
+ramsleuth-tui        # interactive TUI
+ramsleuth probe      # one-shot report
+```
+
+**Options:**
+
+```sh
+./install.sh --build             # build from source instead of downloading
+./install.sh --version 2.4.18    # install a specific version
+```
+
+**Manual install (if you prefer full control):**
+
+The steps below build from source and install by hand — the same file set
+`install.sh` lays down, minus the automation. You need the build prerequisites
+from [§2.4](#24-build-from-source-cargo) (a Rust toolchain plus the
+X11/Wayland/GL dev libraries for the GUI).
 
 **Prerequisites:**
 ```sh

@@ -318,7 +318,7 @@ Get one with: git clone https://github.com/$REPO && cd RamSleuth && ./install.sh
     ok "Fedora system (dnf prerequisites installed)"
   else
     die "No supported package manager found (need pacman, apt-get, or dnf).
-See Docs/User_Guide.md §2.6 'Manual install (any distro)' for the distro-agnostic flow." 2
+See Docs/User_Guide.md §2.6 'Install (any distro)' for the distro-agnostic flow." 2
   fi
   # Rust toolchain (never auto-installed — we only print the command).
   if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
