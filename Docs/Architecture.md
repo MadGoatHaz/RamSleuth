@@ -1310,6 +1310,23 @@ and a failed SMU read leaves the `0xFFFFFFFF` failed-read sentinel — the
 overlay treats that word as a failed read (per-register containment: its
 fields decode to `0`, never as data).
 
+**Threadripper / Castle Peak note.** The `0x50200` bit layout above is
+verified on desktop Matisse (Zen 2) and Vermeer (Zen 3). On Threadripper
+(Castle Peak, TRX40 / WRX80) the same address can read a word whose decoded
+set-point is `0` MHz (e.g. `0x00000100`) — impossible on a running system —
+indicating a different field layout. When the decode yields a `0` MHz
+set-point, the overlay flags the word unverified and GDM / command rate
+render `N/A` with the reason "0x50200 layout not validated for
+Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable"
+(only the two fields in that word are affected; the 27 subtimings in the
+other registers decode normally). Similarly, the `ryzen_smu` driver does
+not expose the `pm_table` attribute on some Threadripper AGESA versions;
+the `pm_exposed` flag then carries the specific "PM table not exposed by
+ryzen-smu driver on this platform (known limitation for Threadripper
+3000/WRX80)" reason on every PM-derived field. Both are detected via the
+CPUID brand string ("Threadripper") and are platform limitations, not
+decode failures.
+
 **Channel mode + ECC (the 14-register channel set).** Complementary to the
 timing block: per UMC channel (base `0x00050000` / `0x00150000` — the fixed
 `+0x00100000` stride, so the `+0x100000` offset rule does *not* apply) the

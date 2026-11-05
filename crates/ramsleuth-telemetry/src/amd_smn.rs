@@ -1073,6 +1073,7 @@ mod tests {
             version: 0x38_08_05,
             pm_exposed: true,
             smn_setpoint_unverified: false,
+            threadripper: false,
             mclk_mhz: 1800,
             uclk_mhz: 1800,
             fclk_mhz: 1792,

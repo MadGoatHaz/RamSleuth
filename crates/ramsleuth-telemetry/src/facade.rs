@@ -52,7 +52,7 @@ use crate::amd_readout::{self, AmdReadout};
 use crate::amd_smn;
 use crate::amd_smu;
 use crate::board_vrm::{self, BoardVrmReadout, RailConfidence, VoltageTelemetry};
-use crate::cpuid::{CpuInfo, CpuVendor};
+use crate::cpuid::{self, CpuInfo, CpuVendor};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_mchbar;
 use crate::intel_readout::{self, IntelReadout};
@@ -315,6 +315,12 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
     };
     let ctx = amd_smu::acquire()?;
     let mut snap = amd_pm::parse(&ctx, zen)?;
+    // Threadripper / Castle Peak detection from the CPUID brand string
+    // (the only software-visible signal that splits workstation TRX40
+    // from desktop Matisse on the same CPUID family `0x17`). Used by the
+    // P2-05 mapping to emit platform-specific N/A reasons for the known
+    // PM-table and `0x50200` limitations.
+    snap.threadripper = cpuid::is_threadripper(&cpu.brand);
     // The no-panic overlay (P6-02, frozen): populates `gdm` + the 27
     // `timings` from the driver `smn` attribute when readable; never
     // fails the branch and never touches the PM-table fields.
@@ -1255,6 +1261,7 @@ mod tests {
             version: 0x38_08_05,
             pm_exposed: true,
             smn_setpoint_unverified: false,
+            threadripper: false,
             mclk_mhz: 1800,
             uclk_mhz: 1800,
             fclk_mhz: 1792,

@@ -1807,11 +1807,13 @@ mod tests {
         use crate::amd_smu::SmuContext;
 
         // The 3990X state: no PM table (the `pm: None` short-circuit) +
-        // the unverified `0x50200` word (the SMN overlay's gate).
+        // the unverified `0x50200` word (the SMN overlay's gate) + the
+        // Threadripper flag (the brand string identifies a 3990X).
         let mut snap =
             pm_parse(&SmuContext { version: 0, pm: None }, AmdZen::Zen2)
                 .expect("pm: None short-circuits to the all-zero snapshot");
         snap.smn_setpoint_unverified = true;
+        snap.threadripper = true;
         let readout = map_amd(&snap);
 
         let report = ProbeReport {
@@ -1850,8 +1852,11 @@ mod tests {
         let md = render_probe_report_md(&report);
 
         // PM-derived cells: the specific driver reason — a missing data
-        // source, never the generic out-of-range parse text.
-        let pm_reason = "N/A (parse error: PM table not exposed by driver (AGESA version may be unsupported by ryzen-smu))";
+        // source, never the generic out-of-range parse text. On a
+        // Threadripper (the 3990X case) the reason is the platform-
+        // specific "known limitation for Threadripper 3000/WRX80".
+        let pm_reason =
+            "N/A (parse error: PM table not exposed by ryzen-smu driver on this platform (known limitation for Threadripper 3000/WRX80))";
         for row in ["MCLK", "UCLK", "FCLK", "UCLK:MCLK"] {
             assert!(
                 md.contains(&format!("| {row} | {pm_reason} |")),
@@ -1880,8 +1885,10 @@ mod tests {
         );
 
         // The unverified `0x50200` word: GDM + command rate carry the
-        // unverified-layout reason (never the coincidental "off" / "1T").
-        let unverified = "N/A (parse error: 0x50200 layout unverified on this platform)";
+        // platform-specific unvalidated-layout reason (never the
+        // coincidental "off" / "1T").
+        let unverified =
+            "N/A (parse error: 0x50200 layout not validated for Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)";
         assert!(md.contains(&format!("| GDM | {unverified} |")), "{md}");
         assert!(
             md.contains(&format!("| command rate | {unverified} |")),
@@ -1891,12 +1898,12 @@ mod tests {
         // The N/A Reasons section carries the full detail.
         assert!(
             md.contains(
-                "`amd.clocks.mclk` — N/A (parse error: PM table not exposed by driver"
+                "`amd.clocks.mclk` — N/A (parse error: PM table not exposed by ryzen-smu driver"
             ),
             "{md}"
         );
         assert!(
-            md.contains("`amd.clocks.gdm` — N/A (parse error: 0x50200 layout unverified on this platform)"),
+            md.contains("`amd.clocks.gdm` — N/A (parse error: 0x50200 layout not validated for Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)"),
             "{md}"
         );
     }

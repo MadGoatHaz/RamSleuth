@@ -386,6 +386,22 @@ fn vendor_kind_from_words(bx: u32, cx: u32, dx: u32) -> VendorKind {
     }
 }
 
+/// Returns `true` when the CPUID brand string identifies an AMD
+/// Threadripper (Castle Peak / TRX40, Threadripper PRO, or any
+/// Threadripper-branded part).
+///
+/// The brand string is the only reliable software-visible signal that
+/// distinguishes workstation/server Threadripper silicon from desktop
+/// Ryzen on the same CPUID family (e.g. family `0x17` covers both
+/// Matisse desktop and Castle Peak Threadripper 3000). Platform-specific
+/// telemetry limitations (PM-table absence, `0x50200` layout divergence)
+/// are keyed on this helper.
+///
+/// Pure, never panics.
+pub fn is_threadripper(brand: &str) -> bool {
+    brand.contains("Threadripper")
+}
+
 /// Map an AMD CPUID family to an [`AmdZen`] generation.
 ///
 /// `family` is the 4-bit family field (EAX bits 11:8) and `ext_family` the
@@ -949,6 +965,19 @@ mod tests {
             info.vendor,
             CpuVendor::Amd(_) | CpuVendor::Intel(_) | CpuVendor::Unknown
         ));
+    }
+
+    /// `is_threadripper` recognizes Threadripper brand strings (TRX40 /
+    /// Castle Peak, Threadripper PRO) and rejects desktop Ryzen / Intel.
+    #[test]
+    fn is_threadripper_recognizes_brands() {
+        assert!(is_threadripper("AMD Ryzen Threadripper 3990X"));
+        assert!(is_threadripper("AMD Ryzen Threadripper PRO 5995WX"));
+        assert!(is_threadripper("AMD Ryzen Threadripper 7995WX"));
+        assert!(!is_threadripper("AMD Ryzen 9 5950X"));
+        assert!(!is_threadripper("AMD Ryzen 9 3900X"));
+        assert!(!is_threadripper("Intel(R) Core(TM) i9-12900K"));
+        assert!(!is_threadripper(""));
     }
 
     /// (P3-02) The CPUID types are wire-serializable: the live
