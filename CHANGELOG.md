@@ -2,9 +2,35 @@
 
 All notable per-release changes to RamSleuth. Newest first.
 
-**Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project — with one deliberate exception: the `ryzen-smu-dkms` extra keeps its own `1.0` pkgver line (re-pinned per release wave via the commit pin + `pkgrel`, not version-bumped) and does not track the workspace version.
+**Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing four artifacts: the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`, and the Debian/Ubuntu/Mint package `ramsleuth_<ver>_amd64.deb` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project — with one deliberate exception: the `ryzen-smu-dkms` extra keeps its own `1.0` pkgver line (re-pinned per release wave via the commit pin + `pkgrel`, not version-bumped) and does not track the workspace version.
 
 ## [Unreleased]
+
+## [2.4.19] - 2026-11-05
+
+### New
+
+- **Official `.deb` package** — the release workflow now builds a ready-to-install Debian/Ubuntu/Mint package (`packaging/build-deb.sh`), shipping the complete file set (6 binaries, systemd unit + preset, both DKMS helpers, the one-click `ramsleuth-setup`, the polkit policy, `install.sh`, the desktop entry, the hicolor icon tree, the Intel DKMS source tree, and the AMD `ryzen_smu` vendor tree) with proper `DEBIAN/control` metadata and `preinst`/`postinst`/`postrm` scripts mirroring the AUR `.install` hooks. One `dpkg -i` and you're running — no clone, no build.
+- **SMBIOS fallback for SPD data** — on platforms where the `ee1004` I²C driver cannot enumerate the SPD EEPROMs (most commonly TRX40 / older Threadripper boards, or systems whose I²C buses never expose the SPD devices), the SPD path now falls back to the unprivileged SMBIOS Type 17 DMI records. The fallback reports per-DIMM capacity, rated speed, part number, serial, rank, and slot locator; the SPD-only decode (die maker, device geometry, XMP/EXPO profiles, fine tCK) remains `N/A` — profiles require an actually readable SPD image. No wire-format change; the fallback is never used when `ee1004` works normally.
+- **Improved Threadripper / TRX40 platform detection** — platform-specific N/A messaging distinguishes the two known TRX40 limitations from a missing driver: (1) PM table not exposed by certain AGESA versions (all PM-derived fields read `N/A (PM table not exposed by ryzen-smu driver on this platform (known limitation for Threadripper 3000/WRX80))`), and (2) unvalidated `0x50200` bit layout (GDM and command rate read `N/A (0x50200 layout not validated for Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)`). Detection uses the CPUID brand string ("Threadripper") and is platform-specific, not a generic error.
+
+### Changed
+
+- **GLIBC 2.39 compatibility** — the CI test/build jobs and the release workflow now run on `ubuntu-24.04` (GLIBC 2.39) instead of `ubuntu-latest`, so the published binaries work on Ubuntu 24.04+ and any modern distro (fixes the earlier "GLIBC_2.43 not found" failure on 24.04 hosts).
+
+### Bug Fixes (from the 2026-11-05 code audit)
+
+- **`build-deb.sh`** — four fixes: correct relative path resolution when run from a non-root directory, version read from `Cargo.toml` when `--version` is omitted, input validation for the version argument, and a clear hint when `dpkg-deb` is missing (fall back to the manual `ar`/`tar` path).
+- **`intel_smbios.rs`** — the DMI entries reader now uses a single-pass read instead of re-opening the directory per entry (reduces syscalls and avoids race conditions on entries appearing/disappearing).
+- **DIMM size labels** — five display files (TUI, GUI, CLI dump, CLI dashboard, CLI probe) now format per-DIMM sizes with proper decimal separators (e.g. `8 GiB` not `8GiB`), matching the established display style.
+- **`amd_smn.rs`** — the driver-assumption comment for the SMN overlay registers was corrected to match the actual access pattern.
+- **`cpuid.rs`** — the Threadripper brand-string detection now uses a `starts_with` guard to avoid false matches on non-Threadripper CPUs containing the substring.
+- **Cargo fmt** — the entire workspace was reformatted with `cargo fmt` for consistency (80 files).
+- **Flaky test** — the GUI reconnect integration test was made deterministic (no more timing-dependent flakes).
+
+### Tests
+
+- 1131 tests passing, 0 clippy warnings, 0 fmt warnings
 
 ## [2.4.18] - 2026-10-25
 

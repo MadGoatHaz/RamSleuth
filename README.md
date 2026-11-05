@@ -1,4 +1,4 @@
-# RamSleuth v2.4.18
+# RamSleuth v2.4.19
 
 Live memory-controller telemetry and a native Memory & Latency Benchmark for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
 
@@ -9,6 +9,13 @@ Live memory-controller telemetry and a native Memory & Latency Benchmark for AMD
 RamSleuth is a 9-crate Rust workspace (8 product crates + the `tools/gen-icon` dev tool) with two layers: **live telemetry** of the memory controller's operating state, and a **native memory & latency benchmark engine** for bandwidth and latency.
 
 Every privileged read flows through a single root daemon that holds only `CAP_SYS_RAWIO` — all clients (the CLI, the TUI, the GUI) run fully unprivileged — and the no-panic contract means a missing driver, privilege, or piece of hardware never crashes anything: the affected fields render as a structured `N/A (<reason>)` and the process exits 0.
+
+## What's new in v2.4.19
+
+- **Official `.deb` package** — a ready-to-install Debian/Ubuntu/Mint package built by the release workflow (`build-deb.sh`), shipping all helper scripts, the systemd unit, the polkit policy, and proper metadata — one `dpkg -i` and you're running.
+- **SMBIOS fallback for SPD data** — on platforms where the `ee1004` driver cannot enumerate the SPD EEPROMs (most commonly TRX40 / older Threadripper boards), RamSleuth now falls back to the unprivileged SMBIOS Type 17 DMI records for per-DIMM size, technology, speed, and manufacturer data.
+- **Improved Threadripper / TRX40 platform detection** — platform-specific N/A messaging distinguishes the two known TRX40 limitations (PM table not exposed by certain AGESA versions, unvalidated `0x50200` bit layout) from a missing driver, so a supported Threadripper never reads as "driver missing".
+- **GLIBC 2.39 compatibility** — the release workflow now builds on `ubuntu-24.04` (GLIBC 2.39), so the published binaries work on Ubuntu 24.04+ and any modern distro (fixes the earlier "GLIBC_2.43 not found" failure on 24.04 hosts).
 
 ## Why RamSleuth
 
@@ -57,8 +64,8 @@ yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest i
 **Debian/Ubuntu/Mint — `.deb` package:**
 
 ```sh
-wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.18/ramsleuth_2.4.18_amd64.deb
-sudo dpkg -i ramsleuth_2.4.18_amd64.deb
+wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.19/ramsleuth_2.4.19_amd64.deb
+sudo dpkg -i ramsleuth_2.4.19_amd64.deb
 sudo usermod -aG ramsleuth $USER
 newgrp ramsleuth        # or log out and back in
 ramsleuth-tui
@@ -68,7 +75,7 @@ ramsleuth-tui
 
 **AMD live subtimings:** the driver is **bundled** with the app — the in-app one-click (or `sudo ramsleuth-setup --with-dkms` / `sudo ramsleuth-install-ryzen-smu-dkms`) builds the pinned third-party `ryzen_smu` module **offline** from the vendored source; without it the AMD fields read `N/A (DriverMissing)` and everything else keeps serving. The standalone `ryzen-smu-dkms` AUR extra is **mutually exclusive** with the app packages — full details in the [User Guide](Docs/User_Guide.md).
 
-**Intel live subtimings (optional extra):** `yay -S ramsleuth-intel-dkms` provides RamSleuth's own in-repo `ramsleuth_intel` kernel module — DKMS-built for your running kernel, exposing the raw IMC registers over world-readable sysfs (the 25-attribute core set, plus two generation-gated groups on 12th-gen+ silicon — the DDR4 `alk_d4_tc` block and the `tier3_extended` block — taking a 12th-gen+ Alder/Raptor DDR4 box to 79 attributes); source and dev-branch installs ship the helper directly (`sudo ramsleuth-install-intel-dkms`), and the one-click setup routes to it automatically on Intel hosts (the v2.4.18 release tarball and the `ramsleuth-bin` binary ship the `ramsleuth_intel` source + the helper). Without it the daemon falls back to the read-only `/dev/mem` MCHBAR map where the kernel permits, and the Intel fields read `N/A (DriverMissing)` where it does not — everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
+**Intel live subtimings (optional extra):** `yay -S ramsleuth-intel-dkms` provides RamSleuth's own in-repo `ramsleuth_intel` kernel module — DKMS-built for your running kernel, exposing the raw IMC registers over world-readable sysfs (the 25-attribute core set, plus two generation-gated groups on 12th-gen+ silicon — the DDR4 `alk_d4_tc` block and the `tier3_extended` block — taking a 12th-gen+ Alder/Raptor DDR4 box to 79 attributes); source and dev-branch installs ship the helper directly (`sudo ramsleuth-install-intel-dkms`), and the one-click setup routes to it automatically on Intel hosts (the v2.4.19 release tarball and the `ramsleuth-bin` binary ship the `ramsleuth_intel` source + the helper). Without it the daemon falls back to the read-only `/dev/mem` MCHBAR map where the kernel permits, and the Intel fields read `N/A (DriverMissing)` where it does not — everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
 
 **Build from source:** `cargo build --workspace --release` — Rust MSRV 1.75, producing the 6 binaries above; system-library and per-path details in the [User Guide](Docs/User_Guide.md).
 
@@ -88,10 +95,10 @@ The full walkthrough — every zone, key, flag, N/A reason, and day-2 troublesho
 - [Packaging & AUR](packaging/README.md) — the two-package AUR model, the unified version-bump flow, the `ryzen-smu-dkms` extra, and the CI/release artifact contracts.
 - [Changelog](CHANGELOG.md) — release history.
 
-**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.18**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
+**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.19**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
 
 ## License
 
 MIT — the workspace `Cargo.toml` declares `license = "MIT"`. Repository: <https://github.com/MadGoatHaz/RamSleuth>.
 
-RamSleuth v2.4.18 · branch `v2-development`
+RamSleuth v2.4.19 · branch `v2-development`

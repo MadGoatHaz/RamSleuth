@@ -1,7 +1,7 @@
 # RamSleuth — Architecture
 
 **Document:** `Docs/Architecture.md` (part of the RamSleuth v2 repository-facing documentation)
-**Applies to:** workspace v2.4.18 (branch `v2-development`)
+**Applies to:** workspace v2.4.19 (branch `v2-development`)
 **Audience:** expert readers — kernel-aware systems programmers, packagers, and maintainers who need the full design rationale behind RamSleuth.
 
 Companion documents: [`README.md`](../README.md) (entry point), [`Docs/User_Guide.md`](User_Guide.md) (operational guide), [`packaging/README.md`](../packaging/README.md) (packaging and operator guide).
@@ -281,7 +281,7 @@ one development tool — all inheriting a single version:
 
 | Workspace fact | Value |
 |----------------|-------|
-| Version | **2.4.18** (`[workspace.package].version`) |
+| Version | **2.4.19** (`[workspace.package].version`) |
 | Edition | 2021 |
 | MSRV | **1.75** (`rust-version`) |
 | Resolver | 2 |
@@ -1916,17 +1916,34 @@ group membership (persistent, next login) + the `authorized-users` seed
 (current-session socket access) + a daemon restart so the ACL applies
 immediately.
 
+**Debian/Ubuntu/Mint — the `.deb` package.** The release workflow also
+builds a ready-to-install Debian binary package
+(`ramsleuth_<ver>_amd64.deb`) via [`packaging/build-deb.sh`](../packaging/build-deb.sh),
+which assembles the same file set as the AUR main packages (6 binaries,
+systemd unit + preset, both DKMS helpers, the one-click setup helper, the
+polkit policy, `install.sh`, the desktop entry, the hicolor icon tree, the
+Intel DKMS source tree, and the AMD `ryzen_smu` vendor tree) with a
+`DEBIAN/control` carrying `Maintainer`, `Depends` (systemd, acl, and the
+runtime libraries), `Recommends` (dkms, linux-headers), and
+`preinst`/`postinst`/`postrm` scripts mirroring the `.install` hooks
+(group creation, daemon-reload, polkit restart, service enable, zero-touch
+user setup, clean removal). The script uses `dpkg-deb --build` on
+Debian/Ubuntu hosts and falls back to the manual `ar`/`tar` format
+elsewhere. It is published as a GitHub Release artifact alongside the
+tarball (§13.3), so a `.deb` install is a single `dpkg -i` with no clone
+or build required.
+
 The full install file set (see `packaging/README.md` for the operator
 reference): 6 binaries → `/usr/bin/`; the unit → `/usr/lib/systemd/system/`
 (+ preset); the `ramsleuth` group (idempotent `groupadd -r` in the `.install`
 hooks); the AMD DKMS helper → `/usr/bin/ramsleuth-install-ryzen-smu-dkms`;
 the Intel DKMS helper → `/usr/bin/ramsleuth-install-intel-dkms` (guarded —
-the v2.4.18 source tree and the re-cut `-bin` tarball carry it, skipped with
+the v2.4.19 source tree and the re-cut `-bin` tarball carry it, skipped with
 a note only on a pre-2.3.0 asset); **the in-repo `ramsleuth_intel` source
 tree → `/usr/share/ramsleuth-intel-dkms/src/`** (guarded the same way —
 the exact path the Intel helper resolves, so the one-click Intel DKMS
 install works from a bare AUR install with no manual source step; the
-published `-bin` tarball (the v2.4.18 re-cut) carries the helper + tree, and
+published `-bin` tarball (the v2.4.19 re-cut) carries the helper + tree, and
 the existence guard covers only pre-2.4.2 assets); **the vendored
 `ryzen_smu` source tree → `/usr/share/ryzen-smu-dkms/vendor/`** (guarded
 for pre-vendor tags — the exact path the AMD helper resolves as its
@@ -2014,7 +2031,7 @@ fallback remains available where unblocked. When present:
   network and no upstream pin;
 - **both main packages bundle that source tree** (to
   `/usr/share/ramsleuth-intel-dkms/src/` — guarded like the Intel helper:
-  the published `-bin` tarball (the v2.4.18 re-cut) carries it and installs
+  the published `-bin` tarball (the v2.4.19 re-cut) carries it and installs
   it, and the existence guard covers only pre-2.4.2 assets, which ship
   nothing and skip cleanly), which is the exact path the helper resolves as
   its installed copy: the **one-click Intel DKMS install works from a bare
@@ -2163,9 +2180,14 @@ tree ships as a bundle), then
 packages the **deterministic tarball `ramsleuth-<ver>-x86_64.tar.zst`**
 (fixed file order `tar --sort=name`, fixed ownership `--owner=0 --group=0
 --numeric-owner`, fixed mtime `--mtime=@0`, zstd) with its **`.sha256`
-companion** (sha256sum format), and publishes both as the GitHub Release.
-**The tarball is the `ramsleuth-bin` download source** — the AUR package
-pins it by `sha256sums`. The internal layout (top-level `ramsleuth-<ver>/`,
+companion** (sha256sum format), then runs
+[`packaging/build-deb.sh`](../packaging/build-deb.sh) against the tarball
+to produce the **`ramsleuth_<ver>_amd64.deb`** (Debian/Ubuntu/Mint install
+package) + its **`.sha256`** sidecar, and publishes all four artifacts as
+the GitHub Release. **The tarball is the `ramsleuth-bin` download source**
+— the AUR package pins it by `sha256sums`; the `.deb` is the direct
+install path for Debian-family distros (§12.2). The internal layout
+(top-level `ramsleuth-<ver>/`,
 mirroring the AUR install): `bin/` (the 6 binaries), `systemd/` (the unit +
 preset), `scripts/` (both DKMS helpers), `kernel/ramsleuth-intel/` (the
 module source tree), and the top-level `install.sh`, `LICENSE`,
