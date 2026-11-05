@@ -46,7 +46,7 @@ on:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -192,6 +192,12 @@ jobs:
           sha256sum "ramsleuth-$VER-x86_64.tar.zst" > "ramsleuth-$VER-x86_64.tar.zst.sha256"
           cat "ramsleuth-$VER-x86_64.tar.zst.sha256"
 
+      - name: Build .deb package
+        run: |
+          set -euo pipefail
+          packaging/build-deb.sh --version "$VER" --tarball "ramsleuth-$VER-x86_64.tar.zst"
+          ls -l "ramsleuth_${VER}_amd64.deb"
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -199,4 +205,6 @@ jobs:
           files: |
             ramsleuth-${{ env.VER }}-x86_64.tar.zst
             ramsleuth-${{ env.VER }}-x86_64.tar.zst.sha256
+            ramsleuth-${{ env.VER }}_amd64.deb
+            ramsleuth-${{ env.VER }}_amd64.deb.sha256
           fail_on_duplicate: false
