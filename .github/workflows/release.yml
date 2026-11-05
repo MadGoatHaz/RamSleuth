@@ -56,6 +56,8 @@ jobs:
           fetch-depth: 0
 
       - name: Derive version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
           if [ -n "${INPUT_VERSION:-}" ]; then
