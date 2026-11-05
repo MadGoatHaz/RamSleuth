@@ -129,6 +129,14 @@ const USAGE: &str = concat!(
     "\n",
     "Signals: SIGTERM and SIGINT stop the daemon gracefully (stop\n",
     "accepting, remove the socket file, exit 0).\n",
+    "\n",
+    "Related tools:\n",
+    "  ramsleuth              Desktop GUI (egui)\n",
+    "  ramsleuth-tui          Terminal dashboard (ratatui)\n",
+    "  ramsleuth-client       CLI client (probe, dump, status, bench, burn)\n",
+    "  ramsleuth-bench        Standalone memory & latency benchmark\n",
+    "  ramsleuth-telemetry    Standalone telemetry snapshot (no daemon)\n",
+    "  ramsleuth-daemon       Privileged root daemon (CAP_SYS_RAWIO)\n",
 );
 
 /// The `--version`/`-V` output line: `ramSleuth <bin> v<version>` —
@@ -170,6 +178,23 @@ where
         }
     }
     ShortCircuit::None
+}
+
+/// Suggest a related RamSleuth binary when the user types a flag or
+/// positional that looks like they meant to invoke a different tool.
+fn suggest_for_unknown(arg: &str) -> Option<&'static str> {
+    let normalized = arg.trim_start_matches('-');
+    match normalized {
+        "tui" => Some("Did you mean `ramsleuth-tui`? (run `ramsleuth-tui --help`)"),
+        "client" => Some("Did you mean `ramsleuth-client`? (run `ramsleuth-client --help`)"),
+        "bench" => Some("Did you mean `ramsleuth-bench`? (run `ramsleuth-bench --help`)"),
+        "telemetry" => {
+            Some("Did you mean `ramsleuth-telemetry`? (run `ramsleuth-telemetry --help`)")
+        }
+        "daemon" => Some("Did you mean `ramsleuth-daemon`? (run `ramsleuth-daemon --help`)"),
+        "gui" => Some("Did you mean `ramsleuth` (the GUI)? (run `ramsleuth --help`)"),
+        _ => None,
+    }
 }
 
 /// Parse `--socket <path>`, `--max-age <secs>`, and
@@ -225,9 +250,13 @@ where
                 parsed.spd_autobind = false;
             }
             other => {
-                return Err(format!(
+                let mut msg = format!(
                     "unknown argument `{other}` (expected `--socket <path>`, `--max-age <secs>`, `--no-spd-autobind`, or `--help`)"
-                ));
+                );
+                if let Some(sug) = suggest_for_unknown(other) {
+                    msg.push_str(&format!("\n  {sug}"));
+                }
+                return Err(msg);
             }
         }
     }

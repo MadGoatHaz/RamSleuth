@@ -47,6 +47,16 @@ const USAGE: &str = concat!(
     "               latency — no bandwidth cells)\n",
     "  -h, --help   Print this help and exit\n",
     "  -V, --version Print the version and exit\n",
+    "\n",
+    "Exit codes: 0 success, 1 runtime error, 2 usage error\n",
+    "\n",
+    "Related tools:\n",
+    "  ramsleuth              Desktop GUI (egui)\n",
+    "  ramsleuth-tui          Terminal dashboard (ratatui)\n",
+    "  ramsleuth-client       CLI client (probe, dump, status, bench, burn)\n",
+    "  ramsleuth-bench        Standalone memory & latency benchmark\n",
+    "  ramsleuth-telemetry    Standalone telemetry snapshot (no daemon)\n",
+    "  ramsleuth-daemon       Privileged root daemon (CAP_SYS_RAWIO)\n",
 );
 
 /// The `--version`/`-V` output line: `ramSleuth <bin> v<version>` —
@@ -90,6 +100,23 @@ where
     ShortCircuit::None
 }
 
+/// Suggest a related RamSleuth binary when the user types a flag or
+/// positional that looks like they meant to invoke a different tool.
+fn suggest_for_unknown(arg: &str) -> Option<&'static str> {
+    let normalized = arg.trim_start_matches('-');
+    match normalized {
+        "tui" => Some("Did you mean `ramsleuth-tui`? (run `ramsleuth-tui --help`)"),
+        "client" => Some("Did you mean `ramsleuth-client`? (run `ramsleuth-client --help`)"),
+        "bench" => Some("Did you mean `ramsleuth-bench`? (run `ramsleuth-bench --help`)"),
+        "telemetry" => {
+            Some("Did you mean `ramsleuth-telemetry`? (run `ramsleuth-telemetry --help`)")
+        }
+        "daemon" => Some("Did you mean `ramsleuth-daemon`? (run `ramsleuth-daemon --help`)"),
+        "gui" => Some("Did you mean `ramsleuth` (the GUI)? (run `ramsleuth --help`)"),
+        _ => None,
+    }
+}
+
 /// Parse CLI flags from `args` (program name already removed).
 ///
 /// `--help`/`-h` / `--version`/`-V` are recognized here (the entrypoint
@@ -109,7 +136,13 @@ pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
             // recognized; the entrypoint short-circuits them (help →
             // usage, version → the version line)
             "--help" | "-h" | "--version" | "-V" => {}
-            other => return Err(format!("unknown flag: {other} (see --help)")),
+            other => {
+                let mut msg = format!("unknown flag: {other} (see --help)");
+                if let Some(sug) = suggest_for_unknown(other) {
+                    msg.push_str(&format!("\n  {sug}"));
+                }
+                return Err(msg);
+            }
         }
     }
     Ok(opts)

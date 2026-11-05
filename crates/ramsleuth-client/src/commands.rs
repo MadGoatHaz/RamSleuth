@@ -167,6 +167,31 @@ pub fn render_grid(grid: &BenchmarkGrid) -> String {
     out
 }
 
+/// Serialize a [`BenchmarkGrid`] as a JSON object matching the
+/// standalone `ramsleuth-bench` `--json` form:
+/// `{"read_gbps":[...],"write_gbps":[...],"copy_gbps":[...],"latency_ns":[...]}`
+/// — hand-rolled, no serde.
+pub fn to_json(grid: &BenchmarkGrid) -> String {
+    let json_num = |v: &f64| {
+        if v.is_finite() {
+            v.to_string()
+        } else {
+            "null".to_string()
+        }
+    };
+    let json_array = |values: &[f64; 4]| {
+        let items = values.iter().map(&json_num).collect::<Vec<_>>().join(", ");
+        format!("[{items}]")
+    };
+    format!(
+        "{{\"read_gbps\":{},\"write_gbps\":{},\"copy_gbps\":{},\"latency_ns\":{}}}",
+        json_array(&grid.read_gbps),
+        json_array(&grid.write_gbps),
+        json_array(&grid.copy_gbps),
+        json_array(&grid.latency_ns),
+    )
+}
+
 /// Start a benchmark run over `client` and stream its progress.
 ///
 /// Sends one `StartBenchmark { target, mode }`, then reads the daemon's
@@ -175,7 +200,8 @@ pub fn render_grid(grid: &BenchmarkGrid) -> String {
 /// - `BenchStarted { run_id }` → `benchmark started (run {run_id})`;
 /// - `BenchProgress` → one live line per completed bandwidth cell,
 ///   `  [{cell}/{total}] {tier}/{op}: {value} GB/s`;
-/// - `BenchResult { grid }` → [`render_grid`] of the terminal grid;
+/// - `BenchResult { grid }` → [`render_grid`] of the terminal grid
+///   (plus the [`to_json`] form when `json` is set);
 /// - `BenchCancelled { run_id }` → `benchmark cancelled (run {run_id})`;
 /// - `Error(msg)` → [`ClientError::Protocol`] with the daemon's text;
 /// - `BurnInProgress` → [`ClientError::Protocol`] (a burn-in frame in
@@ -191,6 +217,7 @@ pub fn bench(
     client: &mut Client,
     target: StreamTarget,
     mode: BenchMode,
+    json: bool,
 ) -> Result<String, ClientError> {
     client.send(&Request::StartBenchmark { target, mode })?;
     let mut out = String::new();
@@ -212,6 +239,12 @@ pub fn bench(
                 let grid_text = render_grid(&grid);
                 println!("{grid_text}");
                 out.push_str(&grid_text);
+                if json {
+                    let json_text = to_json(&grid);
+                    println!("{json_text}");
+                    out.push_str(&json_text);
+                    out.push('\n');
+                }
                 return Ok(out);
             }
             Response::BenchCancelled { run_id } => {
@@ -669,6 +702,19 @@ mod tests {
         }
     }
 
+    /// `to_json` emits the exact expected object matching the standalone
+    /// `ramsleuth-bench` `--json` form: key names plus values in Tier
+    /// order (Memory, L1, L2, L3).
+    #[test]
+    fn to_json_emits_the_expected_object() {
+        let json = to_json(&full_grid());
+        assert_eq!(
+            json,
+            "{\"read_gbps\":[512, 897.5, 402, 198.5],\"write_gbps\":[410, 823, 311.5, 152],\
+             \"copy_gbps\":[455, 851.5, 349, 176.5],\"latency_ns\":[88, 1.1, 3.4, 12.7]}"
+        );
+    }
+
     /// (a) `bench` over the stand-in: the `StartBenchmark` request goes
     /// out, the `BenchStarted` ack + one progress + the terminal grid
     /// stream back; the returned text carries every printed line
@@ -700,7 +746,7 @@ mod tests {
             ],
         );
         let mut client = Client::connect(sock.path()).expect("must connect");
-        let text = bench(&mut client, StreamTarget::Full, BenchMode::Full)
+        let text = bench(&mut client, StreamTarget::Full, BenchMode::Full, false)
             .expect("bench must succeed on a result terminal");
         handle.join().expect("stand-in thread must not panic");
 
@@ -729,6 +775,63 @@ mod tests {
         );
     }
 
+    /// (a-json) `bench` with `json=true`: the terminal grid renders as
+    /// text AND the `to_json` form is appended (matching the standalone
+    /// `ramsleuth-bench` `--json` output).
+    #[test]
+    fn bench_json_emits_the_grid_as_json() {
+        let sock = TempSocket::new("bench-json");
+        let progress = StreamProgress {
+            cell_index: 0,
+            total_cells: 12,
+            tier: Tier::Memory,
+            op: BenchOp::Read,
+            value: 512.0,
+            label: "Memory · Read (GB/s)".to_owned(),
+        };
+        let handle = spawn_standin(
+            &sock,
+            Request::StartBenchmark {
+                target: StreamTarget::Full,
+                mode: BenchMode::Full,
+            },
+            vec![
+                Response::BenchStarted { run_id: 1 },
+                Response::BenchProgress(progress),
+                Response::BenchResult {
+                    run_id: 1,
+                    grid: full_grid(),
+                },
+            ],
+        );
+        let mut client = Client::connect(sock.path()).expect("must connect");
+        let text = bench(&mut client, StreamTarget::Full, BenchMode::Full, true)
+            .expect("bench must succeed on a result terminal");
+        handle.join().expect("stand-in thread must not panic");
+
+        // The JSON object is present with the correct key names.
+        assert!(
+            text.contains("\"read_gbps\""),
+            "JSON key read_gbps, got: {text}"
+        );
+        assert!(
+            text.contains("\"write_gbps\""),
+            "JSON key write_gbps, got: {text}"
+        );
+        assert!(
+            text.contains("\"copy_gbps\""),
+            "JSON key copy_gbps, got: {text}"
+        );
+        assert!(
+            text.contains("\"latency_ns\""),
+            "JSON key latency_ns, got: {text}"
+        );
+        // The values match the full_grid() fixture.
+        assert!(text.contains("512"), "JSON read value, got: {text}");
+        assert!(text.contains("897.5"), "JSON read value, got: {text}");
+        assert!(text.contains("88"), "JSON latency value, got: {text}");
+    }
+
     /// (b) `bench` on a cancelled run: the stand-in answers
     /// `BenchStarted` + `BenchCancelled`; the returned text carries the
     /// cancel line and the call is `Ok` (a clean cancel is a terminal,
@@ -752,6 +855,7 @@ mod tests {
             &mut client,
             StreamTarget::Tier(Tier::L1),
             BenchMode::MemoryOnly,
+            false,
         )
         .expect("a cancelled run is a clean terminal");
         handle.join().expect("stand-in thread must not panic");
@@ -775,7 +879,7 @@ mod tests {
             vec![Response::Error("benchmark already running".to_owned())],
         );
         let mut client = Client::connect(sock.path()).expect("must connect");
-        let err = bench(&mut client, StreamTarget::Full, BenchMode::Full)
+        let err = bench(&mut client, StreamTarget::Full, BenchMode::Full, false)
             .expect_err("an Error reply must fail bench");
         handle.join().expect("stand-in thread must not panic");
 
@@ -810,7 +914,7 @@ mod tests {
             ],
         );
         let mut client = Client::connect(sock.path()).expect("must connect");
-        let err = bench(&mut client, StreamTarget::Full, BenchMode::Full)
+        let err = bench(&mut client, StreamTarget::Full, BenchMode::Full, false)
             .expect_err("a BurnInProgress frame must fail bench");
         handle.join().expect("stand-in thread must not panic");
 

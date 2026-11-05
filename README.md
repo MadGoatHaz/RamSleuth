@@ -86,6 +86,17 @@ ramsleuth-tui
 3. **One click** — on first launch the `SETUP` strip offers **Set up RamSleuth**: one polkit password prompt enables + starts the daemon, joins your user to the `ramsleuth` group, grants a current-session socket ACL (no re-login), and — on AMD/Intel silicon — builds + loads the telemetry driver (`ryzen_smu` / `ramsleuth_intel`) in the same action: no reboot, no app restart — the app auto-reconnects and the strip disappears on its own. No desktop? The same one step from a terminal is `sudo ramsleuth-setup --with-dkms` (AMD: the `ryzen_smu` driver; Intel: the `ramsleuth_intel` module).
 4. **Read and run** — the dashboard is live from the first second: telemetry matrix, benchmark grid, and hardware/SPD status; start a benchmark from either frontend, or run the standalone tools.
 
+The six RamSleuth binaries:
+
+```bash
+ramsleuth              # desktop GUI
+ramsleuth-tui          # terminal dashboard
+ramsleuth-client probe # one-line RAM summary
+ramsleuth-client dump  # full decoded dump
+ramsleuth-bench        # 4×4 memory & latency benchmark
+ramsleuth-telemetry    # standalone snapshot (no daemon)
+```
+
 The full walkthrough — every zone, key, flag, N/A reason, and day-2 troubleshooting — is in the [User Guide](Docs/User_Guide.md).
 
 ## Documentation
