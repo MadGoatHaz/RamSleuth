@@ -207,6 +207,6 @@ jobs:
           files: |
             ramsleuth-${{ env.VER }}-x86_64.tar.zst
             ramsleuth-${{ env.VER }}-x86_64.tar.zst.sha256
-            ramsleuth-${{ env.VER }}_amd64.deb
-            ramsleuth-${{ env.VER }}_amd64.deb.sha256
+            ramsleuth_${{ env.VER }}_amd64.deb
+            ramsleuth_${{ env.VER }}_amd64.deb.sha256
           fail_on_duplicate: false
