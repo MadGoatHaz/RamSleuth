@@ -200,10 +200,34 @@ jobs:
           packaging/build-deb.sh --version "$VER" --tarball "ramsleuth-$VER-x86_64.tar.zst"
           ls -l "ramsleuth_${VER}_amd64.deb"
 
+      - name: Extract release notes from CHANGELOG
+        run: |
+          set -euo pipefail
+          # Capture the section for this version (handles "## [x.y.z] - date",
+          # "## [vx.y.z] - date", "## vx.y.z (date)", and "## x.y.z (date)")
+          # through the next "## " header, so the release body always matches
+          # the changelog.
+          awk -v ver="$VER" '
+            BEGIN { found = 0; gsub(/\./, "\\.", ver) }
+            $0 ~ ("^## \\[" ver "\\]") || $0 ~ ("^## \\[v" ver "\\]") { found=1; print; next }
+            $0 ~ ("^## v" ver " ") || $0 ~ ("^## " ver " ") { found=1; print; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          # Trim trailing blank lines (GNU sed idiom; the runner is ubuntu-24.04)
+          sed -i -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "WARNING: no CHANGELOG section found for version $VER; using minimal body"
+            echo "## RamSleuth $VER" > release-notes.md
+          fi
+          echo "--- release-notes.md (${VER}) ---"
+          cat release-notes.md
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VER }}
+          body_path: release-notes.md
           files: |
             ramsleuth-${{ env.VER }}-x86_64.tar.zst
             ramsleuth-${{ env.VER }}-x86_64.tar.zst.sha256
