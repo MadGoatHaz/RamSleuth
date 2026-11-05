@@ -92,9 +92,7 @@ const RZQ_BASE_OHMS: f64 = 240.0;
 /// The known RZQ divisor codes (the denominator `N` in "RZQ/N"). Any code not
 /// in this set is not a recognized RZQ/ODT encoding → `Na(NotApplicable)`.
 /// Each maps to `RZQ_BASE_OHMS / code` ohms.
-const RZQ_KNOWN_CODES: [u16; 16] = [
-    1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 16, 20, 24, 30, 40, 60,
-];
+const RZQ_KNOWN_CODES: [u16; 16] = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 16, 20, 24, 30, 40, 60];
 
 /// Plausible memory/fabric clock range in MHz.
 const CLOCK_MIN_MHZ: f64 = 1.0;
@@ -845,9 +843,15 @@ mod tests {
 
         assert!(ro.clocks.mclk_mhz.is_na());
         assert_eq!(ro.clocks.mclk_mhz.value(), None);
-        assert!(matches!(ro.clocks.mclk_mhz, Section::Na(NaReason::ParseError(_))));
+        assert!(matches!(
+            ro.clocks.mclk_mhz,
+            Section::Na(NaReason::ParseError(_))
+        ));
         assert!(ro.clocks.fclk_mhz.is_na());
-        assert!(matches!(ro.clocks.fclk_mhz, Section::Na(NaReason::ParseError(_))));
+        assert!(matches!(
+            ro.clocks.fclk_mhz,
+            Section::Na(NaReason::ParseError(_))
+        ));
 
         // the valid clock and unrelated sections are unaffected
         assert_eq!(ro.clocks.uclk_mhz, Section::Value(1600.0));
@@ -945,8 +949,11 @@ mod tests {
             assert!(!s.is_na(), "good-snapshot ohm field must be Value");
             assert!(s.value().is_some());
         }
-        let rtt_secs: [&Section<RttValue>; 3] =
-            [&ro.cad_bus.rtt_nom, &ro.cad_bus.rtt_wr, &ro.cad_bus.rtt_park];
+        let rtt_secs: [&Section<RttValue>; 3] = [
+            &ro.cad_bus.rtt_nom,
+            &ro.cad_bus.rtt_wr,
+            &ro.cad_bus.rtt_park,
+        ];
         for s in &rtt_secs {
             assert!(!s.is_na(), "good-snapshot RTT field must be Value");
             assert!(s.value().is_some());
@@ -1001,19 +1008,28 @@ mod tests {
             assert_eq!(map_div_mode(raw), Section::Value(expected));
         }
         for raw in [2u8, 7, 255] {
-            assert!(matches!(map_div_mode(raw), Section::Na(NaReason::ParseError(_))));
+            assert!(matches!(
+                map_div_mode(raw),
+                Section::Na(NaReason::ParseError(_))
+            ));
         }
 
         assert_eq!(map_mode_flag(0), Section::Value(false));
         assert_eq!(map_mode_flag(1), Section::Value(true));
         for raw in [2u8, 9, 255] {
-            assert!(matches!(map_mode_flag(raw), Section::Na(NaReason::ParseError(_))));
+            assert!(matches!(
+                map_mode_flag(raw),
+                Section::Na(NaReason::ParseError(_))
+            ));
         }
 
         assert_eq!(map_command_rate(0), Section::Value(CommandRate::OneT));
         assert_eq!(map_command_rate(1), Section::Value(CommandRate::TwoT));
         for raw in [2u8, 9, 255] {
-            assert!(matches!(map_command_rate(raw), Section::Na(NaReason::ParseError(_))));
+            assert!(matches!(
+                map_command_rate(raw),
+                Section::Na(NaReason::ParseError(_))
+            ));
         }
     }
 
@@ -1025,10 +1041,16 @@ mod tests {
     fn command_rate_maps_through_map_amd() {
         let mut s = good_snapshot();
         s.command_rate = 0;
-        assert_eq!(map_amd(&s).clocks.command_rate, Section::Value(CommandRate::OneT));
+        assert_eq!(
+            map_amd(&s).clocks.command_rate,
+            Section::Value(CommandRate::OneT)
+        );
 
         s.command_rate = 1;
-        assert_eq!(map_amd(&s).clocks.command_rate, Section::Value(CommandRate::TwoT));
+        assert_eq!(
+            map_amd(&s).clocks.command_rate,
+            Section::Value(CommandRate::TwoT)
+        );
 
         for raw in [2u8, 7, 255] {
             s.command_rate = raw;
@@ -1046,9 +1068,15 @@ mod tests {
     fn timing_and_voltage_sanity_gates() {
         // timings
         assert_eq!(map_timing(16), Section::Value(16));
-        assert_eq!(map_timing(TIMING_MAX_TICKS), Section::Value(TIMING_MAX_TICKS));
+        assert_eq!(
+            map_timing(TIMING_MAX_TICKS),
+            Section::Value(TIMING_MAX_TICKS)
+        );
         for t in [0u16, TIMING_MAX_TICKS + 1, 65535] {
-            assert!(matches!(map_timing(t), Section::Na(NaReason::ParseError(_))), "{t}");
+            assert!(
+                matches!(map_timing(t), Section::Na(NaReason::ParseError(_))),
+                "{t}"
+            );
         }
 
         // voltages
@@ -1056,7 +1084,10 @@ mod tests {
         assert_eq!(map_voltage(VOLTAGE_MIN_MV), Section::Value(VOLTAGE_MIN_MV));
         assert_eq!(map_voltage(VOLTAGE_MAX_MV), Section::Value(VOLTAGE_MAX_MV));
         for mv in [0u16, VOLTAGE_MIN_MV - 1, VOLTAGE_MAX_MV + 1, 65535] {
-            assert!(matches!(map_voltage(mv), Section::Na(NaReason::ParseError(_))), "{mv}");
+            assert!(
+                matches!(map_voltage(mv), Section::Na(NaReason::ParseError(_))),
+                "{mv}"
+            );
         }
     }
 
@@ -1067,7 +1098,10 @@ mod tests {
         assert_eq!(map_clock(1600), Section::Value(1600.0));
         assert_eq!(map_clock(4096), Section::Value(4096.0));
         for mhz in [0u16, 4097, 65535] {
-            assert!(matches!(map_clock(mhz), Section::Na(NaReason::ParseError(_))), "{mhz}");
+            assert!(
+                matches!(map_clock(mhz), Section::Na(NaReason::ParseError(_))),
+                "{mhz}"
+            );
         }
     }
 
@@ -1106,9 +1140,13 @@ mod tests {
         };
         let ro = map_amd(&s);
 
-        for cell in [&ro.clocks.mclk_mhz, &ro.clocks.uclk_mhz, &ro.clocks.fclk_mhz] {
-            let detail = parse_error_detail(cell)
-                .expect("a PM clock with no table must be Na(ParseError)");
+        for cell in [
+            &ro.clocks.mclk_mhz,
+            &ro.clocks.uclk_mhz,
+            &ro.clocks.fclk_mhz,
+        ] {
+            let detail =
+                parse_error_detail(cell).expect("a PM clock with no table must be Na(ParseError)");
             assert!(
                 detail.contains("PM table not exposed by driver"),
                 "the reason names the driver: {detail}"
@@ -1121,7 +1159,10 @@ mod tests {
         // The divide mode: a false "1:1" is gone.
         let detail = parse_error_detail(&ro.clocks.div_mode)
             .expect("the divide mode with no table must be Na(ParseError)");
-        assert!(detail.contains("PM table not exposed by driver"), "{detail}");
+        assert!(
+            detail.contains("PM table not exposed by driver"),
+            "{detail}"
+        );
 
         for cell in [
             &ro.voltages.vddcr_soc_mv,
@@ -1130,9 +1171,12 @@ mod tests {
             &ro.voltages.vpp_mv,
             &ro.voltages.vcore_mv,
         ] {
-            let detail = parse_error_detail(cell)
-                .expect("a PM rail with no table must be Na(ParseError)");
-            assert!(detail.contains("PM table not exposed by driver"), "{detail}");
+            let detail =
+                parse_error_detail(cell).expect("a PM rail with no table must be Na(ParseError)");
+            assert!(
+                detail.contains("PM table not exposed by driver"),
+                "{detail}"
+            );
             assert!(!detail.contains("outside plausible range"), "{detail}");
         }
 
@@ -1155,8 +1199,8 @@ mod tests {
         s.smn_setpoint_unverified = true;
         let ro = map_amd(&s);
 
-        let detail = parse_error_detail(&ro.clocks.gdm)
-            .expect("an unverified 0x50200 word must Na the GDM");
+        let detail =
+            parse_error_detail(&ro.clocks.gdm).expect("an unverified 0x50200 word must Na the GDM");
         assert!(
             detail.contains("0x50200 layout unverified on this platform"),
             "{detail}"
@@ -1200,9 +1244,13 @@ mod tests {
         };
         let ro = map_amd(&s);
 
-        for cell in [&ro.clocks.mclk_mhz, &ro.clocks.uclk_mhz, &ro.clocks.fclk_mhz] {
-            let detail = parse_error_detail(cell)
-                .expect("a PM clock with no table must be Na(ParseError)");
+        for cell in [
+            &ro.clocks.mclk_mhz,
+            &ro.clocks.uclk_mhz,
+            &ro.clocks.fclk_mhz,
+        ] {
+            let detail =
+                parse_error_detail(cell).expect("a PM clock with no table must be Na(ParseError)");
             assert!(
                 detail.contains("PM table not exposed by ryzen-smu driver"),
                 "the TRX40 reason names the driver: {detail}"
@@ -1227,8 +1275,8 @@ mod tests {
             &ro.voltages.vpp_mv,
             &ro.voltages.vcore_mv,
         ] {
-            let detail = parse_error_detail(cell)
-                .expect("a PM rail with no table must be Na(ParseError)");
+            let detail =
+                parse_error_detail(cell).expect("a PM rail with no table must be Na(ParseError)");
             assert!(
                 detail.contains("known limitation for Threadripper 3000/WRX80"),
                 "{detail}"
@@ -1246,8 +1294,8 @@ mod tests {
         s.threadripper = true;
         let ro = map_amd(&s);
 
-        let detail = parse_error_detail(&ro.clocks.gdm)
-            .expect("an unverified 0x50200 word must Na the GDM");
+        let detail =
+            parse_error_detail(&ro.clocks.gdm).expect("an unverified 0x50200 word must Na the GDM");
         assert!(
             detail.contains("0x50200 layout not validated for Threadripper/TRX40"),
             "{detail}"
@@ -1378,18 +1426,15 @@ mod tests {
         assert!(ro.cad_bus.proc_odt.is_na());
         assert!(ro.clocks.gear_mode.is_na());
 
-        let bytes = bincode::serialize(&ro)
-            .expect("AmdReadout must serialize (no-panic contract)");
-        let back: AmdReadout =
-            bincode::deserialize(&bytes).expect("AmdReadout must deserialize");
+        let bytes = bincode::serialize(&ro).expect("AmdReadout must serialize (no-panic contract)");
+        let back: AmdReadout = bincode::deserialize(&bytes).expect("AmdReadout must deserialize");
         assert_eq!(ro, back);
 
         // the fully degraded state must be wire-safe too
         let all_na = all_na_readout();
-        let bytes = bincode::serialize(&all_na)
-            .expect("AmdReadout must serialize (no-panic contract)");
-        let back: AmdReadout =
-            bincode::deserialize(&bytes).expect("AmdReadout must deserialize");
+        let bytes =
+            bincode::serialize(&all_na).expect("AmdReadout must serialize (no-panic contract)");
+        let back: AmdReadout = bincode::deserialize(&bytes).expect("AmdReadout must deserialize");
         assert_eq!(all_na, back);
 
         // the OQ-10 appended fields: a DualFlex 8 + 16 GiB class readout
@@ -1404,10 +1449,9 @@ mod tests {
         );
         assert_eq!(flex.channel_mode, MemoryChannelMode::DualFlex);
         assert_eq!(flex.ecc_status, EccStatus::CapableButDisabled);
-        let bytes = bincode::serialize(&flex)
-            .expect("AmdReadout must serialize (no-panic contract)");
-        let back: AmdReadout =
-            bincode::deserialize(&bytes).expect("AmdReadout must deserialize");
+        let bytes =
+            bincode::serialize(&flex).expect("AmdReadout must serialize (no-panic contract)");
+        let back: AmdReadout = bincode::deserialize(&bytes).expect("AmdReadout must deserialize");
         assert_eq!(flex, back);
     }
 
@@ -1416,15 +1460,10 @@ mod tests {
     /// `Section` cells the CAD bus fields use.
     #[test]
     fn rtt_value_arms_round_trip() {
-        let values = vec![
-            RttValue::Disabled,
-            RttValue::Rzq(2),
-            RttValue::Ohms(33.5),
-        ];
-        let bytes = bincode::serialize(&values)
-            .expect("RttValue must serialize (no-panic contract)");
-        let back: Vec<RttValue> =
-            bincode::deserialize(&bytes).expect("RttValue must deserialize");
+        let values = vec![RttValue::Disabled, RttValue::Rzq(2), RttValue::Ohms(33.5)];
+        let bytes =
+            bincode::serialize(&values).expect("RttValue must serialize (no-panic contract)");
+        let back: Vec<RttValue> = bincode::deserialize(&bytes).expect("RttValue must deserialize");
         assert_eq!(values, back);
 
         let sections: Vec<Section<RttValue>> = vec![
@@ -1445,8 +1484,8 @@ mod tests {
     #[test]
     fn command_rate_arms_round_trip() {
         let values = vec![CommandRate::OneT, CommandRate::TwoT];
-        let bytes = bincode::serialize(&values)
-            .expect("CommandRate must serialize (no-panic contract)");
+        let bytes =
+            bincode::serialize(&values).expect("CommandRate must serialize (no-panic contract)");
         let back: Vec<CommandRate> =
             bincode::deserialize(&bytes).expect("CommandRate must deserialize");
         assert_eq!(values, back);

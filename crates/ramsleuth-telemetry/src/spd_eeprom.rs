@@ -263,7 +263,10 @@ fn acquire_linux() -> TelemetryResult<(Vec<SpdImage>, SpdAcquireStatus)> {
         );
         return Ok((Vec::new(), SpdAcquireStatus::NoDevices));
     }
-    let skipped = devices.iter().filter(|(_, data)| !validate_image(data)).count();
+    let skipped = devices
+        .iter()
+        .filter(|(_, data)| !validate_image(data))
+        .count();
     if skipped > 0 {
         eprintln!(
             "warning: {skipped} SPD image(s) skipped (length neither {SPD_DDR4_LEN} nor {SPD_DDR5_LEN} bytes)"
@@ -370,11 +373,26 @@ mod tests {
     /// The frozen `SpdImage` derives: `Clone` + `PartialEq` + `Debug`.
     #[test]
     fn spd_image_derives_clone_partial_eq_debug() {
-        let a = SpdImage { index: 0x50, data: vec![1, 2, 3] };
+        let a = SpdImage {
+            index: 0x50,
+            data: vec![1, 2, 3],
+        };
         let b = a.clone();
         assert_eq!(a, b);
-        assert_ne!(a, SpdImage { index: 0x51, data: vec![1, 2, 3] });
-        assert_ne!(a, SpdImage { index: 0x50, data: vec![1, 2, 4] });
+        assert_ne!(
+            a,
+            SpdImage {
+                index: 0x51,
+                data: vec![1, 2, 3]
+            }
+        );
+        assert_ne!(
+            a,
+            SpdImage {
+                index: 0x50,
+                data: vec![1, 2, 4]
+            }
+        );
         assert!(format!("{a:?}").contains("SpdImage"));
     }
 

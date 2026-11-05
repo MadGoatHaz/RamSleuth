@@ -12,23 +12,23 @@
 // Phase 2 modules land one per chunk (wiring only, not counted against the
 // per-chunk line budget). Each is `pub mod` so its frozen interface is
 // reachable (`crate::cpuid::CpuInfo`, …); P2-10 adds root re-exports.
-pub mod cpuid; // P2-01 — CPUID vendor + family/generation detection (interface freeze).
-pub mod error; // P2-02 — Telemetry error + Section<T> no-panic contract (interface freeze).
-pub mod amd_smu; // P2-03 — privilege-guarded AMD SMU access (sysfs pm_table -> char-dev read).
 pub mod amd_pm; // P2-04 — version-guarded, bounds-checked AMD PM-table parse (AmdPmSnapshot).
 pub mod amd_readout; // P2-05 — shared display types + AMD mapping (sanity-gated, no I/O).
 pub mod amd_smn; // P6-02 — ryzen_smu `smn` sysfs accessor + verified SMN bitfield table + no-panic overlay.
+pub mod amd_smu; // P2-03 — privilege-guarded AMD SMU access (sysfs pm_table -> char-dev read).
+pub mod board_vrm; // C12-03 — DMI-keyed board VRM profiles + the nct6798 hwmon binder (board-specific Super I/O rails; graceful all-Na on unknown board).
+pub mod cpuid; // P2-01 — CPUID vendor + family/generation detection (interface freeze).
+pub mod error; // P2-02 — Telemetry error + Section<T> no-panic contract (interface freeze).
+pub mod facade; // P2-10 — SystemMemoryTelemetry facade + collect() (per-branch containment).
+pub mod intel_gen; // IG-01 — per-generation MCHBAR decode profiles (Tier 1 + Rocket Lake; CRITICAL-PATH foundation).
 pub mod intel_mchbar; // P2-06 — Intel MCHBAR PCI decode + read-only /dev/mem mmap guard.
 pub mod intel_readout; // P2-07 — Intel per-channel IMC register decode -> shared display types.
 pub mod intel_smbios; // Chunk 2 — SMBIOS Type 17 cross-check (the 4-tier trust procedure's firmware source; unprivileged, no-panic).
 pub mod intel_sysfs; // INTEL-03 — ramsleuth_intel sysfs raw reader (IntelImcRegs producer; per-register containment).
-pub mod intel_gen; // IG-01 — per-generation MCHBAR decode profiles (Tier 1 + Rocket Lake; CRITICAL-PATH foundation).
-pub mod spd_eeprom; // P2-08 — ee1004 raw SPD image acquisition (sysfs, unprivileged).
-pub mod spd_decode; // P2-09 — pure SPD decode: JEP106 / rank / density / speed + XMP 2.0 / EXPO profiles.
-pub mod facade; // P2-10 — SystemMemoryTelemetry facade + collect() (per-branch containment).
 pub mod platform; // C6-01 — SystemPlatform: DMI + /proc sourced vendor-neutral branch (D-C1; per-field Na degradation).
-pub mod board_vrm; // C12-03 — DMI-keyed board VRM profiles + the nct6798 hwmon binder (board-specific Super I/O rails; graceful all-Na on unknown board).
-pub mod probe; // probe-1a — consent-gated "Submit Probe Report" wire types (ProbeReport/ProbeRaw/ProbeSystem; CRITICAL-PATH foundation).
+pub mod probe;
+pub mod spd_decode; // P2-09 — pure SPD decode: JEP106 / rank / density / speed + XMP 2.0 / EXPO profiles.
+pub mod spd_eeprom; // P2-08 — ee1004 raw SPD image acquisition (sysfs, unprivileged). // probe-1a — consent-gated "Submit Probe Report" wire types (ProbeReport/ProbeRaw/ProbeSystem; CRITICAL-PATH foundation).
 
 // P2-10: the crate's public snapshot API, re-exported at the root.
 pub use facade::{collect, SystemMemoryTelemetry};
@@ -41,4 +41,3 @@ pub use board_vrm::{
     VendorClass, VoltageTelemetry,
 };
 pub use probe::{ProbeRaw, ProbeReport, ProbeSystem};
-

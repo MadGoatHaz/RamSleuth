@@ -165,8 +165,7 @@ fn dkms_requirement() -> Requirement {
 /// builds the bundled `ramsleuth_intel` source).
 fn intel_dkms_requirement() -> Requirement {
     Requirement {
-        summary: "Install the `ramsleuth_intel` kernel module (live Intel subtimings)"
-            .to_owned(),
+        summary: "Install the `ramsleuth_intel` kernel module (live Intel subtimings)".to_owned(),
         detail: "the helper builds the bundled `ramsleuth_intel` DKMS module — shown + \
                  confirmed before any build; RamSleuth runs without it"
             .to_owned(),
@@ -335,33 +334,84 @@ const KEY_GROUPS: [KeyGroup; 3] = [
     KeyGroup {
         heading: "DATA",
         rows: &[
-            KeyRow { key: "r", text: "Refresh — force poll" },
-            KeyRow { key: "s", text: "Snapshot — .txt → CWD" },
-            KeyRow { key: "e", text: "Export — JSON → $HOME" },
-            KeyRow { key: "p", text: "Poll — 100 ms → 60 s" },
-            KeyRow { key: "a", text: "Auto refresh — on ↔ off" },
-            KeyRow { key: "f", text: "Probe report — consent" },
+            KeyRow {
+                key: "r",
+                text: "Refresh — force poll",
+            },
+            KeyRow {
+                key: "s",
+                text: "Snapshot — .txt → CWD",
+            },
+            KeyRow {
+                key: "e",
+                text: "Export — JSON → $HOME",
+            },
+            KeyRow {
+                key: "p",
+                text: "Poll — 100 ms → 60 s",
+            },
+            KeyRow {
+                key: "a",
+                text: "Auto refresh — on ↔ off",
+            },
+            KeyRow {
+                key: "f",
+                text: "Probe report — consent",
+            },
         ],
     },
     KeyGroup {
         heading: "BENCH",
         rows: &[
-            KeyRow { key: "b", text: "Bench — full run" },
-            KeyRow { key: "m", text: "Bench — memory only" },
-            KeyRow { key: "x", text: "Burn-in — 5 min soak" },
-            KeyRow { key: "c", text: "Cancel — in-flight run" },
+            KeyRow {
+                key: "b",
+                text: "Bench — full run",
+            },
+            KeyRow {
+                key: "m",
+                text: "Bench — memory only",
+            },
+            KeyRow {
+                key: "x",
+                text: "Burn-in — 5 min soak",
+            },
+            KeyRow {
+                key: "c",
+                text: "Cancel — in-flight run",
+            },
         ],
     },
     KeyGroup {
         heading: "VIEWS",
         rows: &[
-            KeyRow { key: "g", text: "Graphs — 5-series panel" },
-            KeyRow { key: "t", text: "Settings — the strip" },
-            KeyRow { key: "d", text: "Info — this screen" },
-            KeyRow { key: "u", text: "Capacity — GiB ↔ GB" },
-            KeyRow { key: "k", text: "Clock — MHz ↔ GHz" },
-            KeyRow { key: "w", text: "Window — 1 → 60 min" },
-            KeyRow { key: "q", text: "Quit — exit 0" },
+            KeyRow {
+                key: "g",
+                text: "Graphs — 5-series panel",
+            },
+            KeyRow {
+                key: "t",
+                text: "Settings — the strip",
+            },
+            KeyRow {
+                key: "d",
+                text: "Info — this screen",
+            },
+            KeyRow {
+                key: "u",
+                text: "Capacity — GiB ↔ GB",
+            },
+            KeyRow {
+                key: "k",
+                text: "Clock — MHz ↔ GHz",
+            },
+            KeyRow {
+                key: "w",
+                text: "Window — 1 → 60 min",
+            },
+            KeyRow {
+                key: "q",
+                text: "Quit — exit 0",
+            },
         ],
     },
 ];
@@ -421,12 +471,8 @@ fn column_sequence(columns: usize, column: usize) -> Vec<Cell> {
         .iter()
         .flat_map(|&group_index| {
             let group = &KEY_GROUPS[group_index];
-            std::iter::once(Cell::Heading(group.heading)).chain(
-                group
-                    .rows
-                    .iter()
-                    .map(|row| Cell::Row(*row)),
-            )
+            std::iter::once(Cell::Heading(group.heading))
+                .chain(group.rows.iter().map(|row| Cell::Row(*row)))
         })
         .collect()
 }
@@ -515,9 +561,7 @@ fn about_lines(width: u16) -> Vec<Line<'static>> {
                                 display,
                                 Style::default().fg(LIGHT_GREY).add_modifier(Modifier::BOLD),
                             ));
-                            spans.push(Span::raw(" ".repeat(
-                                column_width as usize - cells,
-                            )));
+                            spans.push(Span::raw(" ".repeat(column_width as usize - cells)));
                         }
                     }
                     Some(Cell::Row(KeyRow { key, text })) => {
@@ -531,17 +575,12 @@ fn about_lines(width: u16) -> Vec<Line<'static>> {
                                     .collect::<String>(),
                             ));
                         } else {
-                            spans.push(Span::styled(
-                                format!("[{key}]"),
-                                Style::default().fg(CYAN),
-                            ));
+                            spans.push(Span::styled(format!("[{key}]"), Style::default().fg(CYAN)));
                             spans.push(Span::styled(
                                 format!(" {text}"),
                                 Style::default().fg(LIGHT_GREY),
                             ));
-                            spans.push(Span::raw(
-                                " ".repeat(column_width as usize - cells),
-                            ));
+                            spans.push(Span::raw(" ".repeat(column_width as usize - cells)));
                         }
                     }
                     // A shorter column: the rest of the row is blank.
@@ -744,7 +783,10 @@ mod tests {
             requirements[0].summary,
             "Install the `ramsleuth_intel` kernel module (live Intel subtimings)"
         );
-        assert_eq!(requirements[0].command.as_deref(), Some(DKMS_INSTALL_CMD_INTEL));
+        assert_eq!(
+            requirements[0].command.as_deref(),
+            Some(DKMS_INSTALL_CMD_INTEL)
+        );
         assert!(
             requirements[0].detail.contains("bundled `ramsleuth_intel`"),
             "the detail names the bundled module: {}",
@@ -839,10 +881,7 @@ mod tests {
             .flat_map(|group| group.rows)
             .map(|row| row.key.chars().next().expect("a key row has a key"))
             .collect();
-        let contract_keys: BTreeSet<char> = contract
-            .iter()
-            .map(|&(key, _)| key)
-            .collect();
+        let contract_keys: BTreeSet<char> = contract.iter().map(|&(key, _)| key).collect();
         assert_eq!(
             about_keys, contract_keys,
             "the controls block must list exactly the frozen 17-key contract"
@@ -1004,7 +1043,13 @@ mod tests {
         let text = join(&about_lines(60));
         assert_eq!(
             text[0],
-            format!("{}{}  {}{}", "DATA", " ".repeat(24), "VIEWS", " ".repeat(23))
+            format!(
+                "{}{}  {}{}",
+                "DATA",
+                " ".repeat(24),
+                "VIEWS",
+                " ".repeat(23)
+            )
         );
         assert_eq!(
             text[1],

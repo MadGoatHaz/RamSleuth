@@ -23,11 +23,11 @@ pub use features::CpuFeatures;
 
 // P1-02: /sys CPU topology enumeration with SMT filter (interface freeze).
 mod topology;
-pub use topology::{CpuTopology, TopologyError, detect};
+pub use topology::{detect, CpuTopology, TopologyError};
 
 // P1-03: cache-hierarchy buffer sizing (L1/L2/L3/DRAM + latency ring).
 mod buffers;
-pub use buffers::{BufferPlan, plan};
+pub use buffers::{plan, BufferPlan};
 
 // P1-04: AVX2 streaming read kernel (256-bit aligned loads, P1-01 dispatch).
 mod kernel_read;
@@ -57,8 +57,8 @@ pub use kernel_512::{
 // fallback). The write/copy store leg is tier-aware (BENCH-1/3).
 mod worker;
 pub use worker::{
-    BenchOp, CopyKernel, StoreKind, WorkerError, WorkerResult, WriteKernel, run_pinned,
-    select_copy_kernel, select_write_kernel, write_store_kind,
+    run_pinned, select_copy_kernel, select_write_kernel, write_store_kind, BenchOp, CopyKernel,
+    StoreKind, WorkerError, WorkerResult, WriteKernel,
 };
 
 // P1-09: pointer-chase latency ring builder (single-cycle ring, 64-byte chase
@@ -71,7 +71,7 @@ pub use latency::build_chase_ring;
 // 4×4 grid, and materializes the 64-byte-strided chase buffer
 // for true DRAM latency.
 mod orchestrator;
-pub use orchestrator::{BenchmarkGrid, Metric, OrchestratorError, Tier, run_all};
+pub use orchestrator::{run_all, BenchmarkGrid, Metric, OrchestratorError, Tier};
 
 // P3-09: targeted streaming runs — the wire-ready streaming contract
 // (`StreamTarget`/`StreamOptions`/`StreamProgress`/`StreamError` +
@@ -81,6 +81,6 @@ pub use orchestrator::{BenchmarkGrid, Metric, OrchestratorError, Tier, run_all};
 // (`run_burn_in` + `BurnInOptions` / `BurnInTick`).
 mod streamed;
 pub use streamed::{
-    BurnInOptions, BurnInTick, StreamError, StreamOptions, StreamProgress, StreamTarget,
-    run_burn_in, run_streamed,
+    run_burn_in, run_streamed, BurnInOptions, BurnInTick, StreamError, StreamOptions,
+    StreamProgress, StreamTarget,
 };

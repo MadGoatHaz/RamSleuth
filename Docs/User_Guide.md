@@ -1210,6 +1210,19 @@ Lower is generally faster, but the *set* must match the DRAM's spec at the
 running speed — a mismatch (e.g. aggressive XMP timings the controller
 cannot honour) is how stability problems start.
 
+**What these timings actually mean.** The values shown are what the
+memory controller is *currently* programming into the DRAM — the live
+hardware state — not what a BIOS/UEFI screen *says* is configured. If
+your BIOS shows a custom XMP/EXPO/DOCP profile but RamSleuth reports
+JEDEC-default timings (e.g. the module's rated 3600 MT/s shows as a
+lower base speed with looser timings), the most likely explanation is
+that **the motherboard did not actually apply the custom profile** — a
+BIOS that saved the setting but failed to train/commit it, a profile
+incompatible with the current memory population, or a setting that only
+applies after a full power cycle. The live readout is the ground truth
+of what the RAM is running at; use it to verify that a profile you
+enabled in BIOS actually took effect.
+
 ### 8.3 GDM, CAD, voltages
 
 - **GDM (Gear Down Mode)** — covered under clocks; a flag, not a value.
@@ -1320,7 +1333,22 @@ memory-type code and are told apart by image length. Per slot you get:
   read as a **16-bit** little-endian MHz value (×2 for MT/s, sanity-gated
   to 3200–10666), not the old 8-bit field that read it off by 25×.
   Enabling one in BIOS is what moves the live data rate — and the
-  dashboard then shows you *what the controller actually settled on* live.
+   dashboard then shows you *what the controller actually settled on* live.
+
+**SMBIOS fallback (when the SPD EEPROM is absent).** On some platforms —
+most commonly TRX40 / older Threadripper boards, or systems where the
+`ee1004` I²C driver does not enumerate the SPD EEPROMs — the raw SPD
+image cannot be read. RamSleuth then falls back to **SMBIOS Type 17**
+(DMI) to populate the DIMM list from the firmware's memory map. The
+fallback reports the basics the firmware knows: **capacity (size), rated
+speed, part number, serial, rank, and slot locator**. It does *not*
+provide the full SPD image, so the detailed decode (die maker, device
+geometry, XMP/EXPO profiles, fine tCK) is unavailable in fallback mode —
+**XMP/EXPO profiles require an actually readable SPD EEPROM.** When the
+fallback is active the UI shows the DIMMs with the fields it has and
+marks the SPD-only fields `N/A`, and a one-time notice explains the
+source. On a normal system with working `ee1004` you see the full SPD
+decode and no fallback occurs.
 
 ### 8.6 Channel mode & the RAM summary
 

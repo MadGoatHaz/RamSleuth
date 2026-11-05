@@ -13,9 +13,9 @@ use super::types::*;
 /// (absent here → `None`).
 pub(crate) fn ddr5_mirror_block() -> ChannelRegs {
     ChannelRegs {
-        tc_dbp: Some(0x284D_2828), // +0x00 → tc_pre
-        tc_rap: Some(0x0028_8410), // +0x04 → tc_act
-        tc_rfp: Some(0x0000_0004), // +0x08 → tc_act2
+        tc_dbp: Some(0x284D_2828),  // +0x00 → tc_pre
+        tc_rap: Some(0x0028_8410),  // +0x04 → tc_act
+        tc_rfp: Some(0x0000_0004),  // +0x08 → tc_act2
         tc_rdrd: Some(0x0048_C286), // +0x20 → tc_rdrd
         tc_wrrd: Some(0x0000_0286), // +0x28 → tc_wrwr
         ..ChannelRegs::default()

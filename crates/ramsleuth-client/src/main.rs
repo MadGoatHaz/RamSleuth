@@ -344,21 +344,15 @@ where
         if arg.starts_with("--") {
             match arg {
                 "--socket" => {
-                    let value = iter
-                        .next()
-                        .map(|v| v.as_ref().to_owned())
-                        .ok_or_else(|| {
-                            "--socket requires a value (the daemon's Unix socket path)".to_owned()
-                        })?;
+                    let value = iter.next().map(|v| v.as_ref().to_owned()).ok_or_else(|| {
+                        "--socket requires a value (the daemon's Unix socket path)".to_owned()
+                    })?;
                     parsed.socket = PathBuf::from(value);
                 }
                 "--tier" => {
-                    let value = iter
-                        .next()
-                        .map(|v| v.as_ref().to_owned())
-                        .ok_or_else(|| {
-                            "--tier requires a value (memory | l1 | l2 | l3 | full)".to_owned()
-                        })?;
+                    let value = iter.next().map(|v| v.as_ref().to_owned()).ok_or_else(|| {
+                        "--tier requires a value (memory | l1 | l2 | l3 | full)".to_owned()
+                    })?;
                     parsed.target = parse_target(&value)?;
                 }
                 "--mode" => {
@@ -375,12 +369,9 @@ where
                     parsed.probe_json = true;
                 }
                 "--duration" => {
-                    let value = iter
-                        .next()
-                        .map(|v| v.as_ref().to_owned())
-                        .ok_or_else(|| {
-                            "--duration requires a value (minutes; 0 = infinite)".to_owned()
-                        })?;
+                    let value = iter.next().map(|v| v.as_ref().to_owned()).ok_or_else(|| {
+                        "--duration requires a value (minutes; 0 = infinite)".to_owned()
+                    })?;
                     parsed.burn_duration = parse_duration(&value)?;
                 }
                 other => {
@@ -533,8 +524,7 @@ mod tests {
     #[test]
     fn bench_tier_memory_mode_memory_only() {
         let args =
-            parse_cli(["bench", "--tier", "memory", "--mode", "memory-only"])
-                .expect("must parse");
+            parse_cli(["bench", "--tier", "memory", "--mode", "memory-only"]).expect("must parse");
         assert_eq!(args.subcommand, Subcommand::Bench);
         assert_eq!(args.target, StreamTarget::Tier(Tier::Memory));
         assert_eq!(args.mode, BenchMode::MemoryOnly);
@@ -561,8 +551,7 @@ mod tests {
     /// (f) An unknown subcommand is rejected with its name.
     #[test]
     fn unknown_subcommand_is_rejected() {
-        let err = parse_cli(["frobnicate"])
-            .expect_err("an unknown subcommand must be rejected");
+        let err = parse_cli(["frobnicate"]).expect_err("an unknown subcommand must be rejected");
         assert!(
             err.contains("frobnicate"),
             "the error must name the subcommand: {err}"
@@ -573,17 +562,20 @@ mod tests {
     /// flag.
     #[test]
     fn missing_tier_value_is_rejected() {
-        let err = parse_cli(["bench", "--tier"])
-            .expect_err("`--tier` without a value must be rejected");
-        assert!(err.contains("--tier"), "the error must name the flag: {err}");
+        let err =
+            parse_cli(["bench", "--tier"]).expect_err("`--tier` without a value must be rejected");
+        assert!(
+            err.contains("--tier"),
+            "the error must name the flag: {err}"
+        );
     }
 
     /// (h) `--tier bogus` is rejected with a message naming the
     /// offending value.
     #[test]
     fn bad_tier_value_is_rejected() {
-        let err = parse_cli(["--tier", "bogus"])
-            .expect_err("a bad `--tier` value must be rejected");
+        let err =
+            parse_cli(["--tier", "bogus"]).expect_err("a bad `--tier` value must be rejected");
         assert!(
             err.contains("bogus") && err.contains("--tier"),
             "the error must name the flag and the value: {err}"
@@ -594,8 +586,8 @@ mod tests {
     /// offending value.
     #[test]
     fn bad_mode_value_is_rejected() {
-        let err = parse_cli(["--mode", "bogus"])
-            .expect_err("a bad `--mode` value must be rejected");
+        let err =
+            parse_cli(["--mode", "bogus"]).expect_err("a bad `--mode` value must be rejected");
         assert!(
             err.contains("bogus") && err.contains("--mode"),
             "the error must name the flag and the value: {err}"
@@ -617,7 +609,9 @@ mod tests {
     #[test]
     fn all_tier_values_map() {
         assert_eq!(
-            parse_cli(["--tier", "memory"]).expect("memory must parse").target,
+            parse_cli(["--tier", "memory"])
+                .expect("memory must parse")
+                .target,
             StreamTarget::Tier(Tier::Memory)
         );
         assert_eq!(
@@ -633,7 +627,9 @@ mod tests {
             StreamTarget::Tier(Tier::L3)
         );
         assert_eq!(
-            parse_cli(["--tier", "full"]).expect("full must parse").target,
+            parse_cli(["--tier", "full"])
+                .expect("full must parse")
+                .target,
             StreamTarget::Full
         );
     }
@@ -642,8 +638,7 @@ mod tests {
     /// subcommand is accepted — flags do not count as positionals).
     #[test]
     fn extra_positional_is_rejected() {
-        let err = parse_cli(["dump", "bench"])
-            .expect_err("a second positional must be rejected");
+        let err = parse_cli(["dump", "bench"]).expect_err("a second positional must be rejected");
         assert!(
             err.contains("bench"),
             "the error must name the offending argument: {err}"
@@ -665,12 +660,19 @@ mod tests {
     /// bound is exercised with owned values, as `env::args` yields).
     #[test]
     fn owned_string_args_parse() {
-        let args: Vec<String> =
-            ["bench", "--socket", "/tmp/y.sock", "--tier", "l2", "--mode", "memory-only"]
-                .iter()
-                .copied()
-                .map(str::to_owned)
-                .collect();
+        let args: Vec<String> = [
+            "bench",
+            "--socket",
+            "/tmp/y.sock",
+            "--tier",
+            "l2",
+            "--mode",
+            "memory-only",
+        ]
+        .iter()
+        .copied()
+        .map(str::to_owned)
+        .collect();
         let parsed = parse_cli(args).expect("owned String args must parse");
         assert_eq!(parsed.subcommand, Subcommand::Bench);
         assert_eq!(parsed.socket, PathBuf::from("/tmp/y.sock"));

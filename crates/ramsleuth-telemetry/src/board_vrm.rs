@@ -492,7 +492,10 @@ pub fn classify_vendor(vendor: &str) -> VendorClass {
     let lowered = vendor.to_ascii_lowercase();
     if CONSUMER_VENDORS.iter().any(|token| lowered.contains(token)) {
         VendorClass::Consumer
-    } else if ENTERPRISE_VENDORS.iter().any(|token| lowered.contains(token)) {
+    } else if ENTERPRISE_VENDORS
+        .iter()
+        .any(|token| lowered.contains(token))
+    {
         VendorClass::Enterprise
     } else {
         VendorClass::Unknown
@@ -521,10 +524,7 @@ pub fn classify_vendor(vendor: &str) -> VendorClass {
 /// the documented trade-off of the `[est]`-badged fallback. A curated
 /// profile, when present, is authoritative and bypasses this heuristic
 /// (it applies only the general envelope).
-pub fn vcore_fallback(
-    board_vendor: Option<&str>,
-    in0_mv: Option<u16>,
-) -> Option<VoltageTelemetry> {
+pub fn vcore_fallback(board_vendor: Option<&str>, in0_mv: Option<u16>) -> Option<VoltageTelemetry> {
     let vendor = board_vendor?;
     if classify_vendor(vendor) != VendorClass::Consumer {
         return None; // enterprise / unknown → no heuristic vCore.
@@ -671,7 +671,9 @@ mod tests {
     #[test]
     fn profile_for_returns_none_for_unknown_or_na_board() {
         assert_eq!(
-            profile_for(&Section::Value("ASUS TUF GAMING X570-PLUS (WI-FI)".to_owned())),
+            profile_for(&Section::Value(
+                "ASUS TUF GAMING X570-PLUS (WI-FI)".to_owned()
+            )),
             None
         );
         assert_eq!(
@@ -698,9 +700,10 @@ mod tests {
         }
         assert_eq!(gate_mv(Rail::Vcore, 1152), Section::Value(1152));
         assert_eq!(gate_mv(Rail::Soc, 1128), Section::Value(1128));
-        assert!(
-            matches!(gate_mv(Rail::Vcore, 4001), Section::Na(NaReason::ParseError(_)))
-        );
+        assert!(matches!(
+            gate_mv(Rail::Vcore, 4001),
+            Section::Na(NaReason::ParseError(_))
+        ));
     }
 
     /// (4) The all-Na constructor: every rail `Na(NotApplicable)` and no
@@ -720,10 +723,8 @@ mod tests {
     /// containment, §9) while the other two stand.
     #[test]
     fn read_rails_synthetic_device_carries_and_contains() {
-        let dir =
-            std::env::temp_dir().join(format!("ramsleuth-c12-03-{}", std::process::id()));
-        fs::create_dir_all(&dir)
-            .expect("temp dir creation must succeed in the test sandbox");
+        let dir = std::env::temp_dir().join(format!("ramsleuth-c12-03-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir creation must succeed in the test sandbox");
         for (name, value) in [
             ("in13_input", "1200\n"),
             ("in0_input", "1152\n"),
@@ -817,13 +818,15 @@ mod tests {
             let profile = profile_for(&Section::Value(name.to_owned()))
                 .unwrap_or_else(|| panic!("the Intel seed {name:?} must match a profile"));
             assert_eq!(
-                profile.rails,
-                INTEL_VCORE_RAILS,
+                profile.rails, INTEL_VCORE_RAILS,
                 "the {name:?} profile maps in0 → Vcore"
             );
             assert_eq!(
                 profile.rails,
-                &[RailMap { index: 0, rail: Rail::Vcore }]
+                &[RailMap {
+                    index: 0,
+                    rail: Rail::Vcore
+                }]
             );
             // The lower-case form matches too (case-insensitive).
             let lowered = name.to_ascii_lowercase();
@@ -922,8 +925,7 @@ mod tests {
         }
         // In the CPU band (the edges + a mid value) → HeuristicDefault.
         for mv in [600u16, 1200, 1600] {
-            let vcore =
-                vcore_fallback(Some("ASUSTeK COMPUTER INC."), Some(mv)).expect("in-bounds");
+            let vcore = vcore_fallback(Some("ASUSTeK COMPUTER INC."), Some(mv)).expect("in-bounds");
             assert_eq!(vcore.confidence, RailConfidence::HeuristicDefault);
             assert!((vcore.delivered_volts - f64::from(mv) / 1000.0).abs() < 1e-9);
         }

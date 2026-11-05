@@ -97,7 +97,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use egui::{Align2, Area, Color32, FontId, Id, Order, PointerButton, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+use egui::{
+    Align2, Area, Color32, FontId, Id, Order, PointerButton, Pos2, Rect, RichText, Sense, Stroke,
+    Vec2,
+};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 
 use crate::history::RingBuffer;
@@ -107,7 +110,6 @@ use crate::{AMBER, CYAN, SLATE};
 /// poll cadence (C7-20 — bounded memory, the `HISTORY_CAPACITY`
 /// precedent: the `history.rs` `RingBuffer` reused, generic).
 pub const GRAPH_CAPACITY: usize = 1800;
-
 
 /// The supported time-window lengths (minutes) in the resolution
 /// row (C7-22 item 7f): 1 / 5 / 15 / 60 min.
@@ -223,7 +225,9 @@ pub struct GraphState {
 
 impl Default for GraphState {
     fn default() -> Self {
-        Self { samples: RingBuffer::with_capacity(GRAPH_CAPACITY) }
+        Self {
+            samples: RingBuffer::with_capacity(GRAPH_CAPACITY),
+        }
     }
 }
 
@@ -463,8 +467,7 @@ fn window_points(
     in_window
         .iter()
         .map(|(t, value)| {
-            let x =
-                rect.left() + rect.width() * (((*t - t_start) / (t_end - t_start)) as f32);
+            let x = rect.left() + rect.width() * (((*t - t_start) / (t_end - t_start)) as f32);
             let y = if span == 0.0 {
                 rect.center().y
             } else {
@@ -496,7 +499,10 @@ fn window_seconds_for(minutes: u32) -> f64 {
 /// (a hand-edited Settings value — the presets stay selectable, the
 /// button shows the live knob).
 fn poll_interval_display(ms: u64) -> String {
-    match POLL_INTERVAL_PRESETS.iter().find(|(preset, _)| *preset == ms) {
+    match POLL_INTERVAL_PRESETS
+        .iter()
+        .find(|(preset, _)| *preset == ms)
+    {
         Some((_, label)) => (*label).to_owned(),
         None => format!("{ms} ms"),
     }
@@ -873,22 +879,63 @@ pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState, poll_interv
                 }
                 if resp.dragged_by(PointerButton::Primary) {
                     let width = resp.rect.width().max(1.0);
-                    view.pan_offset_s += f64::from(resp.drag_delta().x) * (window_secs / f64::from(width));
+                    view.pan_offset_s +=
+                        f64::from(resp.drag_delta().x) * (window_secs / f64::from(width));
                 }
             };
-            add_row(ui, &|s| s.cpu_freq_mhz, "CPU FREQ (MHz)", AMBER, &samples, false, (t_start, t_end));
+            add_row(
+                ui,
+                &|s| s.cpu_freq_mhz,
+                "CPU FREQ (MHz)",
+                AMBER,
+                &samples,
+                false,
+                (t_start, t_end),
+            );
             ui.add_space(2.0);
             // The Vcore row (C12: data-driven from the C12-01 frozen
             // `vcore_mv` field — PM table 0x0A0, board-agnostic):
             // the no-source note self-clears when Vcore data appears
             // (like `CPU TEMP` — `note_in_label` is `false`).
-            add_row(ui, &|s| s.vddcr_cpu_mv, "VDDCR_CPU (mV)", AMBER, &samples, false, (t_start, t_end));
+            add_row(
+                ui,
+                &|s| s.vddcr_cpu_mv,
+                "VDDCR_CPU (mV)",
+                AMBER,
+                &samples,
+                false,
+                (t_start, t_end),
+            );
             ui.add_space(2.0);
-            add_row(ui, &|s| s.vddcr_soc_mv, "VDDCR_SOC (mV)", AMBER, &samples, false, (t_start, t_end));
+            add_row(
+                ui,
+                &|s| s.vddcr_soc_mv,
+                "VDDCR_SOC (mV)",
+                AMBER,
+                &samples,
+                false,
+                (t_start, t_end),
+            );
             ui.add_space(2.0);
-            add_row(ui, &|s| s.cpu_temp_c, "CPU TEMP (°C)", CYAN, &samples, false, (t_start, t_end));
+            add_row(
+                ui,
+                &|s| s.cpu_temp_c,
+                "CPU TEMP (°C)",
+                CYAN,
+                &samples,
+                false,
+                (t_start, t_end),
+            );
             ui.add_space(2.0);
-            add_row(ui, &|s| s.bandwidth_gbps, "MEM BANDWIDTH (GB/s)", CYAN, &samples, false, (t_start, t_end));
+            add_row(
+                ui,
+                &|s| s.bandwidth_gbps,
+                "MEM BANDWIDTH (GB/s)",
+                CYAN,
+                &samples,
+                false,
+                (t_start, t_end),
+            );
             // Clamp the accumulated pan back into the data (never a
             // negative or past-the-data allocation), then persist
             // the (possibly dragged / re-resolved) view.
@@ -912,8 +959,14 @@ pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState, poll_interv
             ) else {
                 return;
             };
-            let top = row_rects.iter().map(|r| r.top()).fold(f32::INFINITY, f32::min);
-            let bottom = row_rects.iter().map(|r| r.bottom()).fold(f32::NEG_INFINITY, f32::max);
+            let top = row_rects
+                .iter()
+                .map(|r| r.top())
+                .fold(f32::INFINITY, f32::min);
+            let bottom = row_rects
+                .iter()
+                .map(|r| r.bottom())
+                .fold(f32::NEG_INFINITY, f32::max);
             if bottom > top {
                 ui.painter().line_segment(
                     [Pos2::new(pos.x, top), Pos2::new(pos.x, bottom)],
@@ -937,7 +990,9 @@ pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState, poll_interv
                 if x + est_w > screen.right() {
                     x = (pos.x - 12.0 - est_w).max(screen.left());
                 }
-                let y = (pos.y + 12.0).min(screen.bottom() - est_h).max(screen.top());
+                let y = (pos.y + 12.0)
+                    .min(screen.bottom() - est_h)
+                    .max(screen.top());
                 Area::new(Id::new("ramsleuth_graph_tooltip"))
                     .order(Order::Foreground)
                     .fixed_pos(Pos2::new(x, y))
@@ -1127,15 +1182,30 @@ mod tests {
     #[test]
     fn record_graph_sample_populated_appends_one_sample_with_the_right_fields() {
         let mut graph = GraphState::default();
-        record_graph_sample(&mut graph, &Some(snapshot(Some(3600.0), Some(1150))), 47.3, 26.35);
-        assert_eq!(graph.len(), 1, "one recorded poll appends exactly one sample");
+        record_graph_sample(
+            &mut graph,
+            &Some(snapshot(Some(3600.0), Some(1150))),
+            47.3,
+            26.35,
+        );
+        assert_eq!(
+            graph.len(),
+            1,
+            "one recorded poll appends exactly one sample"
+        );
         let s = graph.samples.last().expect("the sample landed");
         assert!(s.t.is_finite() && s.t > 0.0, "the t stamp is unix seconds");
         assert_eq!(s.cpu_freq_mhz, 3600.0, "the clock lands in MHz");
         assert_eq!(s.vddcr_soc_mv, 1150.0, "VDDCR_SOC lands in mV");
-        assert_eq!(s.vddcr_cpu_mv, 1150.0, "Vcore (the frozen vcore_mv) lands in mV");
+        assert_eq!(
+            s.vddcr_cpu_mv, 1150.0,
+            "Vcore (the frozen vcore_mv) lands in mV"
+        );
         assert_eq!(s.cpu_temp_c, 47.3, "the passed temp lands in °C");
-        assert_eq!(s.bandwidth_gbps, 26.35, "the passed bandwidth lands in GB/s");
+        assert_eq!(
+            s.bandwidth_gbps, 26.35,
+            "the passed bandwidth lands in GB/s"
+        );
     }
 
     /// (b) No sample lands when every field is absent: no snapshot
@@ -1164,7 +1234,10 @@ mod tests {
             f64::INFINITY,
             f64::NEG_INFINITY,
         );
-        assert!(graph.is_empty(), "non-finite readings never count as a field");
+        assert!(
+            graph.is_empty(),
+            "non-finite readings never count as a field"
+        );
     }
 
     /// (c) A finite clock alone appends a sample with the rest NaN
@@ -1173,7 +1246,12 @@ mod tests {
     #[test]
     fn record_graph_sample_finite_clock_alone_appends_the_rest_nan() {
         let mut graph = GraphState::default();
-        record_graph_sample(&mut graph, &Some(snapshot(Some(3600.0), None)), f64::NAN, f64::NAN);
+        record_graph_sample(
+            &mut graph,
+            &Some(snapshot(Some(3600.0), None)),
+            f64::NAN,
+            f64::NAN,
+        );
         assert_eq!(graph.len(), 1, "a finite clock alone appends a sample");
         let s = graph.samples.last().expect("the sample landed");
         assert_eq!(s.cpu_freq_mhz, 3600.0);
@@ -1196,7 +1274,12 @@ mod tests {
         // 1150`): the sample carries it in mV, next to the paired
         // SOC rail.
         let mut graph = GraphState::default();
-        record_graph_sample(&mut graph, &Some(snapshot(Some(3600.0), Some(1150))), f64::NAN, f64::NAN);
+        record_graph_sample(
+            &mut graph,
+            &Some(snapshot(Some(3600.0), Some(1150))),
+            f64::NAN,
+            f64::NAN,
+        );
         assert_eq!(graph.len(), 1, "the vcore-present snapshot lands a sample");
         let s = graph.samples.last().expect("the sample landed");
         assert_eq!(s.vddcr_cpu_mv, 1150.0, "the frozen vcore_mv lands in mV");
@@ -1205,8 +1288,17 @@ mod tests {
         // Vcore Na (the AMD branch is Na whole): the field degrades
         // to NaN, the sample still lands via the finite clock.
         let mut graph = GraphState::default();
-        record_graph_sample(&mut graph, &Some(snapshot(Some(3600.0), None)), f64::NAN, f64::NAN);
-        assert_eq!(graph.len(), 1, "a vcore-Na snapshot still lands via its finite clock");
+        record_graph_sample(
+            &mut graph,
+            &Some(snapshot(Some(3600.0), None)),
+            f64::NAN,
+            f64::NAN,
+        );
+        assert_eq!(
+            graph.len(),
+            1,
+            "a vcore-Na snapshot still lands via its finite clock"
+        );
         let s = graph.samples.last().expect("the sample landed");
         assert!(s.vddcr_cpu_mv.is_nan(), "an absent vcore stays NaN");
         assert!(s.vddcr_soc_mv.is_nan(), "an absent SOC stays NaN");
@@ -1226,12 +1318,7 @@ mod tests {
         assert_eq!(graph.samples.capacity(), GRAPH_CAPACITY);
         for i in 0..(GRAPH_CAPACITY + 5) {
             graph.samples.push(sample(
-                i as f64,
-                i as f64,
-                i as f64,
-                i as f64,
-                i as f64,
-                i as f64,
+                i as f64, i as f64, i as f64, i as f64, i as f64, i as f64,
             ));
         }
         assert_eq!(graph.len(), GRAPH_CAPACITY, "the ring caps at the capacity");
@@ -1264,7 +1351,14 @@ mod tests {
         );
         let all_nan = vec![
             sample(1010.0, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
-            sample(1050.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, f64::NAN, f64::NAN),
+            sample(
+                1050.0,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+            ),
         ];
         assert!(
             window_points(&all_nan, |s| s.cpu_freq_mhz, t_start, t_end, plot_rect()).is_empty(),
@@ -1295,11 +1389,17 @@ mod tests {
         let points = window_points(&samples, |s| s.cpu_freq_mhz, t_start, t_end, plot_rect());
         assert_eq!(points.len(), 3);
         for point in &points {
-            assert!(close(point.y, 25.0), "a flat window must sit on the midline");
+            assert!(
+                close(point.y, 25.0),
+                "a flat window must sit on the midline"
+            );
         }
         assert!(close(points[0].x, 10.0));
         assert!(close(points[1].x, 50.0));
-        assert!(close(points[2].x, 100.0), "the newest sample sits at the right edge");
+        assert!(
+            close(points[2].x, 100.0),
+            "the newest sample sits at the right edge"
+        );
     }
 
     /// (h) Two extremes normalize onto the rect's corners: the min at
@@ -1341,7 +1441,10 @@ mod tests {
         let points = window_points(&samples, |s| s.bandwidth_gbps, t_start, t_end, plot_rect());
         assert_eq!(points.len(), 1, "only the in-window sample plots");
         assert!(close(points[0].x, 50.0));
-        assert!(close(points[0].y, 25.0), "a lone in-window value sits on the midline");
+        assert!(
+            close(points[0].y, 25.0),
+            "a lone in-window value sits on the midline"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1400,7 +1503,14 @@ mod tests {
         // VDDCR_CPU, VDDCR_SOC, CPU TEMP, MEM BANDWIDTH — are their
         // no-source notes).
         let mut sparse = GraphState::default();
-        sparse.samples.push(sample(1000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN, f64::NAN));
+        sparse.samples.push(sample(
+            1000.0,
+            3600.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ));
         run_headless_frame(|ctx| {
             render_graphs_window(ctx, &sparse, &mut iv);
         });
@@ -1408,7 +1518,8 @@ mod tests {
         // A single sample: the dot path (one in-window point per
         // finite series).
         let mut one = GraphState::default();
-        one.samples.push(sample(1000.0, 3600.0, 1150.0, 1150.0, 45.0, 26.35));
+        one.samples
+            .push(sample(1000.0, 3600.0, 1150.0, 1150.0, 45.0, 26.35));
         run_headless_frame(|ctx| {
             render_graphs_window(ctx, &one, &mut iv);
         });
@@ -1492,7 +1603,11 @@ mod tests {
         assert_eq!(window_seconds_for(5), 300.0);
         assert_eq!(window_seconds_for(15), 900.0);
         assert_eq!(window_seconds_for(60), 3600.0);
-        assert_eq!(window_seconds_for(7), 300.0, "an unsupported value falls back to the default");
+        assert_eq!(
+            window_seconds_for(7),
+            300.0,
+            "an unsupported value falls back to the default"
+        );
         assert_eq!(window_seconds_for(0), 300.0);
         assert_eq!(window_seconds_for(u32::MAX), 300.0);
     }
@@ -1508,17 +1623,35 @@ mod tests {
     #[test]
     fn clamp_pan_stays_inside_the_data() {
         // A 10-min span (600 s) against a 5-min window: max pan 300.
-        let ten = vec![sample(1000.0, 1.0, 1.0, f64::NAN, 1.0, 1.0), sample(1600.0, 2.0, 2.0, f64::NAN, 2.0, 2.0)];
-        assert_eq!(clamp_pan(-50.0, &ten, 300.0), 0.0, "a negative pan clamps to 0");
-        assert_eq!(clamp_pan(100.0, &ten, 300.0), 100.0, "an in-range pan is kept");
+        let ten = vec![
+            sample(1000.0, 1.0, 1.0, f64::NAN, 1.0, 1.0),
+            sample(1600.0, 2.0, 2.0, f64::NAN, 2.0, 2.0),
+        ];
+        assert_eq!(
+            clamp_pan(-50.0, &ten, 300.0),
+            0.0,
+            "a negative pan clamps to 0"
+        );
+        assert_eq!(
+            clamp_pan(100.0, &ten, 300.0),
+            100.0,
+            "an in-range pan is kept"
+        );
         assert_eq!(
             clamp_pan(9999.0, &ten, 300.0),
             300.0,
             "a past-the-data pan clamps to span − window"
         );
         // The span fits the window: nothing to pan.
-        let two = vec![sample(1000.0, 1.0, 1.0, f64::NAN, 1.0, 1.0), sample(1240.0, 2.0, 2.0, f64::NAN, 2.0, 2.0)];
-        assert_eq!(clamp_pan(999.0, &two, 300.0), 0.0, "a span that fits the window never pans");
+        let two = vec![
+            sample(1000.0, 1.0, 1.0, f64::NAN, 1.0, 1.0),
+            sample(1240.0, 2.0, 2.0, f64::NAN, 2.0, 2.0),
+        ];
+        assert_eq!(
+            clamp_pan(999.0, &two, 300.0),
+            0.0,
+            "a span that fits the window never pans"
+        );
         // No data / one sample: no pan.
         assert_eq!(clamp_pan(50.0, &[], 300.0), 0.0, "no samples never pan");
         assert_eq!(
@@ -1527,8 +1660,16 @@ mod tests {
             "one sample never pans"
         );
         // A non-finite pan degrades to 0 (no panic).
-        assert_eq!(clamp_pan(f64::NAN, &ten, 300.0), 0.0, "a NaN pan degrades to 0");
-        assert_eq!(clamp_pan(f64::INFINITY, &ten, 300.0), 0.0, "an infinite pan degrades to 0");
+        assert_eq!(
+            clamp_pan(f64::NAN, &ten, 300.0),
+            0.0,
+            "a NaN pan degrades to 0"
+        );
+        assert_eq!(
+            clamp_pan(f64::INFINITY, &ten, 300.0),
+            0.0,
+            "an infinite pan degrades to 0"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1587,7 +1728,11 @@ mod tests {
             "the panned window shifts the mapping back"
         );
         // Degenerate inputs: no panic, None.
-        assert_eq!(hover_timestamp(&[], w, 0.0, 50.0, 100.0), None, "no samples → no crosshair");
+        assert_eq!(
+            hover_timestamp(&[], w, 0.0, 50.0, 100.0),
+            None,
+            "no samples → no crosshair"
+        );
         assert_eq!(
             hover_timestamp(&samples, w, 0.0, 50.0, 0.0),
             None,
@@ -1626,16 +1771,32 @@ mod tests {
         let lines = tooltip_lines(&samples, 1_700_000_000.0);
         assert_eq!(lines.len(), 2, "the timestamp line + the values line");
         assert_eq!(lines[0], "22:13:20");
-        assert_eq!(lines[1], "3600 MHz · VDDCR_CPU 1150 mV · VDDCR_SOC 1150 mV · 47.3 °C · 26.35 GB/s");
+        assert_eq!(
+            lines[1],
+            "3600 MHz · VDDCR_CPU 1150 mV · VDDCR_SOC 1150 mV · 47.3 °C · 26.35 GB/s"
+        );
         // The nearest sample wins (t + 31 → the second, 29 s away).
         let lines = tooltip_lines(&samples, 1_700_000_031.0);
         assert_eq!(lines[0], "22:14:20");
-        assert_eq!(lines[1], "3700 MHz · VDDCR_CPU 1160 mV · VDDCR_SOC 1160 mV · 48.0 °C · 26.40 GB/s");
+        assert_eq!(
+            lines[1],
+            "3700 MHz · VDDCR_CPU 1160 mV · VDDCR_SOC 1160 mV · 48.0 °C · 26.40 GB/s"
+        );
         // A partial sample: the missing fields degrade to N/A (D-4),
         // the present one keeps its value.
-        let partial = vec![sample(1_700_000_000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN, f64::NAN)];
+        let partial = vec![sample(
+            1_700_000_000.0,
+            3600.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        )];
         let lines = tooltip_lines(&partial, 1_700_000_000.0);
-        assert_eq!(lines[1], "3600 MHz · VDDCR_CPU N/A mV · VDDCR_SOC N/A mV · N/A °C · N/A GB/s");
+        assert_eq!(
+            lines[1],
+            "3600 MHz · VDDCR_CPU N/A mV · VDDCR_SOC N/A mV · N/A °C · N/A GB/s"
+        );
         // Degenerate inputs: no lines, no panic.
         assert!(tooltip_lines(&[], 1.0).is_empty());
         assert!(tooltip_lines(&samples, f64::NAN).is_empty());
@@ -1670,12 +1831,10 @@ mod tests {
     /// backgrounds (`ROW_BG` fills — the rows are the only shapes
     /// painted with that color).
     fn first_row_rect(out: &egui::FullOutput) -> Option<Rect> {
-        out.shapes
-            .iter()
-            .find_map(|cs| match &cs.shape {
-                egui::Shape::Rect(r) if r.fill == ROW_BG => Some(r.rect),
-                _ => None,
-            })
+        out.shapes.iter().find_map(|cs| match &cs.shape {
+            egui::Shape::Rect(r) if r.fill == ROW_BG => Some(r.rect),
+            _ => None,
+        })
     }
 
     /// Whether the output carries the full-height crosshair line at
@@ -1686,9 +1845,7 @@ mod tests {
         out.shapes.iter().any(|cs| match &cs.shape {
             egui::Shape::LineSegment {
                 points: [p0, p1], ..
-            } => {
-                (p0.x - x).abs() < 0.5 && (p1.x - x).abs() < 0.5 && (p1.y - p0.y).abs() > 100.0
-            }
+            } => (p0.x - x).abs() < 0.5 && (p1.x - x).abs() < 0.5 && (p1.y - p0.y).abs() > 100.0,
             _ => false,
         })
     }
@@ -1713,7 +1870,8 @@ mod tests {
     fn tc_fe8_gui_window_carries_the_parity_note() {
         let mut iv = 2000u64;
         let mut full = GraphState::default();
-        full.samples.push(sample(1000.0, 3600.0, 1150.0, 1150.0, 45.0, 26.35));
+        full.samples
+            .push(sample(1000.0, 3600.0, 1150.0, 1150.0, 45.0, 26.35));
         let ctx = egui::Context::default();
         ctx.begin_frame(egui::RawInput::default());
         render_graphs_window(&ctx, &full, &mut iv);
@@ -1773,14 +1931,20 @@ mod tests {
         ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(hover)], None));
         render_graphs_window(&ctx, &GraphState::default(), &mut iv);
         let out = ctx.end_frame();
-        assert!(!has_crosshair_line(&out, hover.x), "no samples → no crosshair");
+        assert!(
+            !has_crosshair_line(&out, hover.x),
+            "no samples → no crosshair"
+        );
 
         // The full state + hover: the crosshair at the pointer x.
         // The tooltip area is new this frame — not painted yet.
         ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(hover)], None));
         render_graphs_window(&ctx, &full, &mut iv);
         let out = ctx.end_frame();
-        assert!(has_crosshair_line(&out, hover.x), "the crosshair line paints at the hover x");
+        assert!(
+            has_crosshair_line(&out, hover.x),
+            "the crosshair line paints at the hover x"
+        );
 
         // The pointer stays: the tooltip now paints (the mid-row
         // hover maps to t = 1040 = the exact 5th sample:
@@ -1789,7 +1953,10 @@ mod tests {
         ctx.begin_frame(egui::RawInput::default());
         render_graphs_window(&ctx, &full, &mut iv);
         let out = ctx.end_frame();
-        assert!(has_crosshair_line(&out, hover.x), "the crosshair persists while hovering");
+        assert!(
+            has_crosshair_line(&out, hover.x),
+            "the crosshair persists while hovering"
+        );
         let texts = painted_texts(&out);
         assert!(
             texts.contains(&"00:17:20"),
@@ -1806,21 +1973,34 @@ mod tests {
         ctx.begin_frame(pointer_input(vec![egui::Event::PointerGone], None));
         render_graphs_window(&ctx, &full, &mut iv);
         let out = ctx.end_frame();
-        assert!(!has_crosshair_line(&out, hover.x), "no hover → no crosshair");
+        assert!(
+            !has_crosshair_line(&out, hover.x),
+            "no hover → no crosshair"
+        );
 
         // The partial state (one sample with only a finite clock):
         // the crosshair + the tooltip with the N/A fields (D-4) —
         // the tooltip area reappears fresh, so two hover frames
         // again.
         let mut partial = GraphState::default();
-        partial.samples.push(sample(1000.0, 3600.0, f64::NAN, f64::NAN, f64::NAN, f64::NAN));
+        partial.samples.push(sample(
+            1000.0,
+            3600.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ));
         ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(hover)], None));
         render_graphs_window(&ctx, &partial, &mut iv);
         let _out = ctx.end_frame();
         ctx.begin_frame(egui::RawInput::default());
         render_graphs_window(&ctx, &partial, &mut iv);
         let out = ctx.end_frame();
-        assert!(has_crosshair_line(&out, hover.x), "a partial sample still raises the crosshair");
+        assert!(
+            has_crosshair_line(&out, hover.x),
+            "a partial sample still raises the crosshair"
+        );
         let texts = painted_texts(&out);
         assert!(
             texts.contains(&"3600 MHz · VDDCR_CPU N/A mV · VDDCR_SOC N/A mV · N/A °C · N/A GB/s"),
@@ -1868,14 +2048,23 @@ mod tests {
         let _out = ctx.end_frame();
         // … then drag the pointer to the center of the row.
         let drag_to = Pos2::new(row.center().x, row.center().y);
-        ctx.begin_frame(pointer_input(vec![egui::Event::PointerMoved(drag_to)], screen));
+        ctx.begin_frame(pointer_input(
+            vec![egui::Event::PointerMoved(drag_to)],
+            screen,
+        ));
         render_graphs_window(&ctx, &history, &mut iv);
         let _out = ctx.end_frame();
         // The pan = the drag × (window / width): far beyond the max
         // (50 s) → clamped to exactly span − window.
         let view = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(view_id(), GraphView::default));
-        assert_eq!(view.pan_offset_s, 50.0, "the pan clamps to span − window, got {view:?}");
-        assert_eq!(view.window_minutes, 5, "the window resolution is untouched by the pan");
+        assert_eq!(
+            view.pan_offset_s, 50.0,
+            "the pan clamps to span − window, got {view:?}"
+        );
+        assert_eq!(
+            view.window_minutes, 5,
+            "the window resolution is untouched by the pan"
+        );
 
         // Release + a pointer-less frame: the pan persists.
         ctx.begin_frame(pointer_input(vec![button_event(drag_to, false)], screen));
@@ -1885,7 +2074,10 @@ mod tests {
         render_graphs_window(&ctx, &history, &mut iv);
         let _out = ctx.end_frame();
         let view = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(view_id(), GraphView::default));
-        assert_eq!(view.pan_offset_s, 50.0, "the pan persists after the release, got {view:?}");
+        assert_eq!(
+            view.pan_offset_s, 50.0,
+            "the pan persists after the release, got {view:?}"
+        );
     }
 
     /// (q) The window-resolution buttons: clicking `60 min`
@@ -1965,15 +2157,13 @@ mod tests {
     /// The click point of a painted text shape (its galley center —
     /// the `TextShape` `pos` is the top-left of the laid-out text).
     fn text_click_pos(out: &egui::FullOutput, text: &str) -> Option<Pos2> {
-        out.shapes
-            .iter()
-            .find_map(|cs| match &cs.shape {
-                egui::Shape::Text(t) if t.galley.text() == text => Some(Pos2::new(
-                    t.pos.x + t.galley.size().x / 2.0,
-                    t.pos.y + t.galley.size().y / 2.0,
-                )),
-                _ => None,
-            })
+        out.shapes.iter().find_map(|cs| match &cs.shape {
+            egui::Shape::Text(t) if t.galley.text() == text => Some(Pos2::new(
+                t.pos.x + t.galley.size().x / 2.0,
+                t.pos.y + t.galley.size().y / 2.0,
+            )),
+            _ => None,
+        })
     }
 
     /// (s) The `Poll` combo (C9-03, D-2): the resolution row carries
@@ -2054,7 +2244,10 @@ mod tests {
         ctx.begin_frame(pointer_input(vec![button_event(pick, false)], None));
         render_graphs_window(&ctx, &full, &mut iv);
         let _ = ctx.end_frame();
-        assert_eq!(iv, 5000, "selecting the `5 s` preset writes the shared knob");
+        assert_eq!(
+            iv, 5000,
+            "selecting the `5 s` preset writes the shared knob"
+        );
 
         // A non-preset stored value (a hand-edited Settings figure):
         // the button shows the exact millisecond figure (the
@@ -2068,8 +2261,8 @@ mod tests {
             texts.contains(&"750 ms"),
             "a non-preset value shows its exact figure, got {texts:?}"
         );
-        let click = text_click_pos(&out, "750 ms")
-            .expect("the combo button painted its custom text");
+        let click =
+            text_click_pos(&out, "750 ms").expect("the combo button painted its custom text");
         ctx.begin_frame(pointer_input(vec![button_event(click, true)], None));
         render_graphs_window(&ctx, &full, &mut iv);
         let _ = ctx.end_frame();
@@ -2086,7 +2279,10 @@ mod tests {
         ctx.begin_frame(pointer_input(vec![button_event(pick, false)], None));
         render_graphs_window(&ctx, &full, &mut iv);
         let _ = ctx.end_frame();
-        assert_eq!(iv, 10000, "a preset pick from a non-preset value writes the knob");
+        assert_eq!(
+            iv, 10000,
+            "a preset pick from a non-preset value writes the knob"
+        );
     }
 
     /// (t) The `Poll` combo's selected text (the pure display rule):

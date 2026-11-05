@@ -50,14 +50,31 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Validate version (or read from Cargo.toml if not given)
+# Validate version (or read from Cargo.toml if not given).
+# The script lives in packaging/; resolve the workspace Cargo.toml by
+# walking up from the current directory (repo root, packaging/, or a
+# nested subdir). Prefer `cargo metadata` (authoritative workspace
+# version) and fall back to a targeted grep on the [workspace.package]
+# version key.
 if [ -z "$VERSION" ]; then
-    CARGO_TOML="Cargo.toml"
-    if [ ! -f "$CARGO_TOML" ]; then
-        CARGO_TOML="../../Cargo.toml"
-    fi
-    if [ -f "$CARGO_TOML" ]; then
-        VERSION=$(grep -m1 '^version' "$CARGO_TOML" | sed 's/version = "\(.*\)"/\1/')
+    CARGO_TOML=""
+    for rel in "" ".." "../.."; do
+        candidate="${rel:+$rel/}Cargo.toml"
+        if [ -f "$candidate" ]; then
+            CARGO_TOML="$candidate"
+            break
+        fi
+    done
+    if [ -n "$CARGO_TOML" ]; then
+        # Authoritative: ask cargo for the workspace version (fast with
+        # --no-deps; first package shares [workspace.package] version).
+        VERSION=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+                  | grep -o '"version":"[^"]*"' | head -1 \
+                  | sed 's/"version":"//;s/"//')
+        # Fallback: grep the [workspace.package] version key directly.
+        if [ -z "$VERSION" ]; then
+            VERSION=$(grep -m1 '^version = ' "$CARGO_TOML" | sed 's/version = "\(.*\)"/\1/')
+        fi
     fi
 fi
 
@@ -107,11 +124,19 @@ if [ -f "$TARBALL" ]; then
     # The tarball's top-level dir is ramsleuth-<ver>/
     SRC_ROOT=$(find "$EXTRACT_DIR" -maxdepth 1 -type d -name "ramsleuth-$VERSION" | head -1)
     if [ -z "$SRC_ROOT" ]; then
-        # Fallback: any top-level dir
+        # Fallback: any top-level dir (tarball layout changed)
         SRC_ROOT=$(find "$EXTRACT_DIR" -maxdepth 1 -type d | head -1)
     fi
     if [ -z "$SRC_ROOT" ] || [ ! -d "$SRC_ROOT" ]; then
         echo "Error: could not find extracted tarball contents" >&2
+        exit 1
+    fi
+    # Validate the source root actually looks like a RamSleuth checkout:
+    # it must contain at least one of the known top-level dirs, otherwise
+    # an unexpected layout would silently produce a broken package.
+    if [ ! -d "$SRC_ROOT/bin" ] && [ ! -d "$SRC_ROOT/systemd" ] \
+       && [ ! -d "$SRC_ROOT/crates" ] && [ ! -f "$SRC_ROOT/Cargo.toml" ]; then
+        echo "Error: extracted dir '$SRC_ROOT' does not look like a RamSleuth source tree (no bin/, systemd/, crates/, or Cargo.toml)" >&2
         exit 1
     fi
     echo "Source root: $SRC_ROOT"
@@ -151,6 +176,7 @@ for b in ramsleuth-daemon ramsleuth-client ramsleuth-tui ramsleuth ramsleuth-ben
         install -Dm755 "$SRC_ROOT/target/release/$b" "$PKG_DIR/usr/bin/$b"
     else
         echo "Error: binary $b not found" >&2
+        echo "Hint: run 'cargo build --release --workspace' first, or pass --tarball pointing to a release tarball." >&2
         exit 1
     fi
 done

@@ -249,8 +249,8 @@ mod tests {
     fn tc_bench4_dram_chase_is_the_bandwidth_size_not_a_128mib_ring() {
         use crate::orchestrator::normalize_size;
         let plan = plan(&synthetic_topo(32 * MIB, 32 * MIB)); // dram = 256 MiB
-        // The DRAM chase buffer is sized from `plan.dram` (the bandwidth
-        // size), rounded to a 64-byte multiple.
+                                                              // The DRAM chase buffer is sized from `plan.dram` (the bandwidth
+                                                              // size), rounded to a 64-byte multiple.
         let dram_chase = normalize_size(plan.dram);
         assert_eq!(
             dram_chase, plan.dram,
@@ -323,7 +323,11 @@ mod tests {
     #[test]
     fn parse_cache_size_malformed() {
         for bad in ["", "K", "-4", "1.5M", "12X", "99999999999999999999999G"] {
-            assert_eq!(parse_cache_size(bad), None, "expected {bad:?} to be rejected");
+            assert_eq!(
+                parse_cache_size(bad),
+                None,
+                "expected {bad:?} to be rejected"
+            );
         }
     }
 
@@ -336,11 +340,9 @@ mod tests {
             return; // non-sysfs host: nothing to check
         };
         let plan = plan(&topo);
-        let expected_dram =
-            DRAM_FLOOR.max(topo.total_l3_bytes.saturating_mul(DRAM_L3_MULTIPLIER));
+        let expected_dram = DRAM_FLOOR.max(topo.total_l3_bytes.saturating_mul(DRAM_L3_MULTIPLIER));
         assert_eq!(
-            plan.dram as u64,
-            expected_dram,
+            plan.dram as u64, expected_dram,
             "dram sizing deviates from max(256 MiB, 3x total L3)"
         );
         assert!(plan.l3 as u64 >= topo.ccd_l3_bytes);

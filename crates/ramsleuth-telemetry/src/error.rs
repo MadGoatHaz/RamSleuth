@@ -66,9 +66,9 @@ impl Clone for TelemetryError {
             },
             Self::DriverMissing { driver } => Self::DriverMissing { driver },
             Self::InsufficientPrivilege { hint } => Self::InsufficientPrivilege { hint },
-            Self::UnknownPmTableVersion { version } => Self::UnknownPmTableVersion {
-                version: *version,
-            },
+            Self::UnknownPmTableVersion { version } => {
+                Self::UnknownPmTableVersion { version: *version }
+            }
             // `std::io::Error` is not `Clone`: reconstruct from the raw OS
             // code when present (keeps the platform message), otherwise from
             // kind + text.
@@ -86,15 +86,13 @@ impl Clone for TelemetryError {
 impl PartialEq for TelemetryError {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (
-                Self::UnsupportedHardware { vendor: a },
-                Self::UnsupportedHardware { vendor: b },
-            ) => a == b,
+            (Self::UnsupportedHardware { vendor: a }, Self::UnsupportedHardware { vendor: b }) => {
+                a == b
+            }
             (Self::DriverMissing { driver: a }, Self::DriverMissing { driver: b }) => a == b,
-            (
-                Self::InsufficientPrivilege { hint: a },
-                Self::InsufficientPrivilege { hint: b },
-            ) => a == b,
+            (Self::InsufficientPrivilege { hint: a }, Self::InsufficientPrivilege { hint: b }) => {
+                a == b
+            }
             (
                 Self::UnknownPmTableVersion { version: a },
                 Self::UnknownPmTableVersion { version: b },
@@ -245,9 +243,15 @@ mod tests {
             TelemetryError::UnsupportedHardware {
                 vendor: "Unknown".to_owned(),
             },
-            TelemetryError::DriverMissing { driver: "ryzen_smu" },
-            TelemetryError::InsufficientPrivilege { hint: "run as root" },
-            TelemetryError::UnknownPmTableVersion { version: 0x0711_0300 },
+            TelemetryError::DriverMissing {
+                driver: "ryzen_smu",
+            },
+            TelemetryError::InsufficientPrivilege {
+                hint: "run as root",
+            },
+            TelemetryError::UnknownPmTableVersion {
+                version: 0x0711_0300,
+            },
             TelemetryError::Io(io_err()),
             TelemetryError::Parse {
                 detail: "truncated PM blob at offset 0x1A".to_owned(),
@@ -281,18 +285,30 @@ mod tests {
             "unsupported hardware: arm"
         );
         assert_eq!(
-            TelemetryError::DriverMissing { driver: "ryzen_smu" }.to_string(),
+            TelemetryError::DriverMissing {
+                driver: "ryzen_smu"
+            }
+            .to_string(),
             "required driver not loaded: ryzen_smu"
         );
         assert_eq!(
-            TelemetryError::InsufficientPrivilege { hint: "run as root" }.to_string(),
+            TelemetryError::InsufficientPrivilege {
+                hint: "run as root"
+            }
+            .to_string(),
             "insufficient privilege: run as root"
         );
         assert_eq!(
-            TelemetryError::UnknownPmTableVersion { version: 0x0711_0300 }.to_string(),
+            TelemetryError::UnknownPmTableVersion {
+                version: 0x0711_0300
+            }
+            .to_string(),
             "unknown SMU PM table version: 0x07110300"
         );
-        assert_eq!(TelemetryError::Io(io_err()).to_string(), "I/O error: denied");
+        assert_eq!(
+            TelemetryError::Io(io_err()).to_string(),
+            "I/O error: denied"
+        );
         assert_eq!(
             TelemetryError::Parse {
                 detail: "bad header".to_owned()
@@ -318,8 +334,12 @@ mod tests {
             TelemetryError::UnsupportedHardware {
                 vendor: "x".to_owned(),
             },
-            TelemetryError::DriverMissing { driver: "ryzen_smu" },
-            TelemetryError::InsufficientPrivilege { hint: "run as root" },
+            TelemetryError::DriverMissing {
+                driver: "ryzen_smu",
+            },
+            TelemetryError::InsufficientPrivilege {
+                hint: "run as root",
+            },
             TelemetryError::UnknownPmTableVersion { version: 1 },
             TelemetryError::Parse {
                 detail: "d".to_owned(),
@@ -377,7 +397,10 @@ mod tests {
 
         let dbg = format!("{b:?}");
         assert!(!dbg.is_empty());
-        assert!(dbg.contains("ParseError"), "Debug must name the variant: {dbg}");
+        assert!(
+            dbg.contains("ParseError"),
+            "Debug must name the variant: {dbg}"
+        );
 
         for r in [
             NaReason::UnsupportedHardware,
@@ -398,12 +421,18 @@ mod tests {
         fn bound<T: Clone + PartialEq + Eq>() {}
         bound::<TelemetryError>();
 
-        let e = TelemetryError::DriverMissing { driver: "ryzen_smu" };
+        let e = TelemetryError::DriverMissing {
+            driver: "ryzen_smu",
+        };
         assert_eq!(e.clone(), e);
         assert_ne!(e, TelemetryError::DriverMissing { driver: "i915" });
         assert_eq!(
-            TelemetryError::UnknownPmTableVersion { version: 0x0711_0300 },
-            TelemetryError::UnknownPmTableVersion { version: 0x0711_0300 }
+            TelemetryError::UnknownPmTableVersion {
+                version: 0x0711_0300
+            },
+            TelemetryError::UnknownPmTableVersion {
+                version: 0x0711_0300
+            }
         );
     }
 
@@ -415,16 +444,27 @@ mod tests {
         let cloned = raw.clone();
         assert_eq!(raw, cloned);
         assert_eq!(
-            raw.source().expect("cloned raw err must expose a source").to_string(),
-            cloned.source().expect("cloned raw err must expose a source").to_string()
+            raw.source()
+                .expect("cloned raw err must expose a source")
+                .to_string(),
+            cloned
+                .source()
+                .expect("cloned raw err must expose a source")
+                .to_string()
         );
 
         let custom = TelemetryError::Io(io_err());
         let cloned = custom.clone();
         assert_eq!(custom, cloned);
         assert_eq!(
-            custom.source().expect("cloned custom err must expose a source").to_string(),
-            cloned.source().expect("cloned custom err must expose a source").to_string()
+            custom
+                .source()
+                .expect("cloned custom err must expose a source")
+                .to_string(),
+            cloned
+                .source()
+                .expect("cloned custom err must expose a source")
+                .to_string()
         );
     }
 
@@ -436,7 +476,9 @@ mod tests {
             Ok(1)
         }
         fn err() -> TelemetryResult<u32> {
-            Err(TelemetryError::DriverMissing { driver: "ryzen_smu" })
+            Err(TelemetryError::DriverMissing {
+                driver: "ryzen_smu",
+            })
         }
         assert_eq!(ok(), Ok(1));
         assert!(err().is_err());
@@ -456,10 +498,9 @@ mod tests {
             NaReason::NotApplicable,
             NaReason::ParseError("truncated at 0x1A".to_owned()),
         ];
-        let bytes = bincode::serialize(&reasons)
-            .expect("NaReason must serialize (no-panic contract)");
-        let back: Vec<NaReason> =
-            bincode::deserialize(&bytes).expect("NaReason must deserialize");
+        let bytes =
+            bincode::serialize(&reasons).expect("NaReason must serialize (no-panic contract)");
+        let back: Vec<NaReason> = bincode::deserialize(&bytes).expect("NaReason must deserialize");
         assert_eq!(reasons, back);
     }
 
@@ -472,8 +513,8 @@ mod tests {
             Section::Na(NaReason::DriverMissing),
             Section::na(NaReason::ParseError("bad nibble".to_owned())),
         ];
-        let bytes = bincode::serialize(&sections)
-            .expect("Section must serialize (no-panic contract)");
+        let bytes =
+            bincode::serialize(&sections).expect("Section must serialize (no-panic contract)");
         let back: Vec<Section<u16>> =
             bincode::deserialize(&bytes).expect("Section must deserialize");
         assert_eq!(sections, back);
@@ -492,12 +533,18 @@ mod tests {
         // The pinned stable names.
         assert_eq!(IntelGen::AlderLake.to_string(), "Alder Lake");
         assert_eq!(IntelGen::SapphireRapids.to_string(), "Sapphire Rapids");
-        assert_eq!(IntelGen::CoreSeries1Mobile.to_string(), "Core Series 1 Mobile");
+        assert_eq!(
+            IntelGen::CoreSeries1Mobile.to_string(),
+            "Core Series 1 Mobile"
+        );
         assert_eq!(AmdZen::Zen5.to_string(), "Zen 5");
         assert_eq!(NaReason::DriverMissing.to_string(), "driver missing");
         assert_eq!(NaReason::UnsupportedHardware.to_string(), "unsupported CPU");
         assert_eq!(NaReason::UnknownPmTableVersion.to_string(), "new PM table");
-        assert_eq!(NaReason::ParseError("x".to_owned()).to_string(), "decode failed");
+        assert_eq!(
+            NaReason::ParseError("x".to_owned()).to_string(),
+            "decode failed"
+        );
         // Display is NOT the Debug form (the silent-drift guard):
         let ald_debug = format!("{:?}", IntelGen::AlderLake);
         assert_ne!(

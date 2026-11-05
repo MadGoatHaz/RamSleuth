@@ -373,7 +373,11 @@ fn readout_sections(
 
     let mut voltage_rows: Vec<(String, String)> = Vec::new();
     if vcore_here {
-        let vcore_label = if is_intel { "CPU Core Voltage" } else { "VDDCR_VDD" };
+        let vcore_label = if is_intel {
+            "CPU Core Voltage"
+        } else {
+            "VDDCR_VDD"
+        };
         voltage_rows.push((vcore_label.to_owned(), vcore_display(vcore)));
     }
     voltage_rows.push(row(soc, volts(&voltages.vddcr_soc_mv)));
@@ -630,7 +634,9 @@ pub fn render_telemetry_zone(ui: &mut egui::Ui, data: &TelemetryData) {
 /// of a degraded whole branch (NA_GRAY via [`cell_color`], D-5).
 fn render_vendor_block(ui: &mut egui::Ui, index: usize, block: &VendorTiming) {
     ui.add(egui::Label::new(
-        egui::RichText::new(block.header.as_str()).strong().color(CYAN),
+        egui::RichText::new(block.header.as_str())
+            .strong()
+            .color(CYAN),
     ));
     match &block.degraded {
         Some(display) => {
@@ -704,7 +710,9 @@ fn render_section(
     // column.
     ui.add(
         egui::Label::new(
-            egui::RichText::new(section.title.as_str()).strong().color(CYAN),
+            egui::RichText::new(section.title.as_str())
+                .strong()
+                .color(CYAN),
         )
         .wrap(true),
     );
@@ -796,7 +804,7 @@ mod tests {
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::intel_readout::{
-        ChannelRegs, IntelReadout, fixture_channel_regs, fixture_intel_readout,
+        fixture_channel_regs, fixture_intel_readout, ChannelRegs, IntelReadout,
     };
     use ramsleuth_telemetry::SystemMemoryTelemetry;
     use ramsleuth_telemetry::{RailConfidence, SystemPlatform};
@@ -968,7 +976,12 @@ mod tests {
     fn all_rows(blocks: &[VendorTiming]) -> Vec<(String, String)> {
         blocks
             .iter()
-            .flat_map(|block| block.sections.iter().flat_map(|section| section.rows.iter().cloned()))
+            .flat_map(|block| {
+                block
+                    .sections
+                    .iter()
+                    .flat_map(|section| section.rows.iter().cloned())
+            })
             .collect()
     }
 
@@ -982,7 +995,11 @@ mod tests {
 
     /// The §3.1 section titles of one block, in layout order.
     fn section_titles(block: &VendorTiming) -> Vec<String> {
-        block.sections.iter().map(|section| section.title.clone()).collect()
+        block
+            .sections
+            .iter()
+            .map(|section| section.title.clone())
+            .collect()
     }
 
     /// (a) A representative snapshot: the AMD-detected host renders
@@ -1003,7 +1020,8 @@ mod tests {
         let rows = all_rows(&blocks);
         assert!(!rows.is_empty(), "the rows must not be empty");
         assert!(
-            rows.iter().any(|(_, display)| !display.is_empty() && !display.contains("N/A")),
+            rows.iter()
+                .any(|(_, display)| !display.is_empty() && !display.contains("N/A")),
             "at least one formatted (non-N/A) value is expected: {rows:?}"
         );
 
@@ -1020,8 +1038,11 @@ mod tests {
                 "Active System Voltages",
             ]
         );
-        let row_counts: Vec<usize> =
-            blocks[0].sections.iter().map(|section| section.rows.len()).collect();
+        let row_counts: Vec<usize> = blocks[0]
+            .sections
+            .iter()
+            .map(|section| section.rows.len())
+            .collect();
         assert_eq!(
             row_counts,
             vec![7, 18, 4, 8, 5, 5],
@@ -1033,7 +1054,10 @@ mod tests {
         assert_eq!(displays(&rows, "UCLK:MCLK"), vec!["1:2"]);
         // The AMD `gear` row is omitted entirely (D-6): no `gear`
         // label survives in the AMD block.
-        assert!(displays(&rows, "gear").is_empty(), "the AMD block omits the `gear` row (D-6)");
+        assert!(
+            displays(&rows, "gear").is_empty(),
+            "the AMD block omits the `gear` row (D-6)"
+        );
         assert_eq!(displays(&rows, "GEAR_DOWN"), vec!["Enabled"]);
         assert_eq!(displays(&rows, "CR"), vec!["1T"]);
         assert_eq!(displays(&rows, "PDM"), vec!["off"]);
@@ -1141,7 +1165,10 @@ mod tests {
             blocks[1].degraded.as_deref(),
             Some("No data — this read needs more privilege than the daemon has.")
         );
-        assert!(all_rows(&blocks).is_empty(), "a degraded block carries no section rows");
+        assert!(
+            all_rows(&blocks).is_empty(),
+            "a degraded block carries no section rows"
+        );
     }
 
     /// (c) Deterministic: two calls on the same snapshot are equal (all
@@ -1150,9 +1177,9 @@ mod tests {
     fn cells_are_deterministic() {
         for snapshot in [representative(), intel_populated(), all_na()] {
             assert_eq!(
-            timing_cells(&snapshot, &Units::default()),
-            timing_cells(&snapshot, &Units::default())
-        );
+                timing_cells(&snapshot, &Units::default()),
+                timing_cells(&snapshot, &Units::default())
+            );
         }
     }
 
@@ -1184,7 +1211,9 @@ mod tests {
         // omitted.
         let blocks = timing_cells(&intel_populated(), &Units::default());
         assert!(
-            blocks.iter().any(|block| block.header.starts_with("Intel ch ")),
+            blocks
+                .iter()
+                .any(|block| block.header.starts_with("Intel ch ")),
             "the Intel channel block headers are expected: {blocks:?}"
         );
         assert!(
@@ -1249,7 +1278,10 @@ mod tests {
 
         let rtl = displays(&rows, "RTL");
         assert_eq!(rtl.len(), 2, "one RTL row per channel");
-        assert_eq!(rtl[0], "N/A", "the live IMC map has no RTL register (D-4 bare N/A)");
+        assert_eq!(
+            rtl[0], "N/A",
+            "the live IMC map has no RTL register (D-4 bare N/A)"
+        );
         assert!(rtl[1].contains("N/A"), "channel 1's degraded RTL");
 
         // The split GEAR_DOWN / CR rows across the two Intel channel
@@ -1311,8 +1343,16 @@ mod tests {
 
         // Per-row N/A degradation: the absent token renders its own
         // row as bare `N/A` (D-4), the other row keeps its value.
-        assert_eq!(gdm_text(&gdm_na), "N/A", "the gear-down row degrades on its own");
-        assert_eq!(cr_text(&rate_na), "N/A", "the command-rate row degrades on its own");
+        assert_eq!(
+            gdm_text(&gdm_na),
+            "N/A",
+            "the gear-down row degrades on its own"
+        );
+        assert_eq!(
+            cr_text(&rate_na),
+            "N/A",
+            "the command-rate row degrades on its own"
+        );
     }
 
     /// (g) The semantic color picks (the renderer's cell coloring):
@@ -1440,8 +1480,13 @@ mod tests {
             Some(all_na()),
             None,
         ] {
-            let blocks = telemetry.as_ref().map(|t| timing_cells(t, &Units::default()));
-            let data = TelemetryData { telemetry, ..Default::default() };
+            let blocks = telemetry
+                .as_ref()
+                .map(|t| timing_cells(t, &Units::default()));
+            let data = TelemetryData {
+                telemetry,
+                ..Default::default()
+            };
             run_headless_frame(|ui| {
                 ui.allocate_ui_with_layout(
                     egui::Vec2::new(ZONE_W, ZONE_H),
@@ -1506,7 +1551,10 @@ mod tests {
         // `gear` row omitted, D-6; the split `GEAR_DOWN` / `CR` rows
         // carry their bare values).
         assert_eq!(displays(&rows, "UCLK:MCLK"), vec!["1:2"]);
-        assert!(displays(&rows, "gear").is_empty(), "the AMD block omits the `gear` row (D-6)");
+        assert!(
+            displays(&rows, "gear").is_empty(),
+            "the AMD block omits the `gear` row (D-6)"
+        );
         assert_eq!(displays(&rows, "GEAR_DOWN"), vec!["Enabled"]);
         assert_eq!(displays(&rows, "CR"), vec!["1T"]);
         assert_eq!(displays(&rows, "PDM"), vec!["off"]);
@@ -1526,16 +1574,28 @@ mod tests {
         // The six per-cell arms: terse reason tags (one bare form for
         // the structurally not-applicable cells).
         assert_eq!(na_text(&NaReason::NotApplicable), "N/A");
-        assert_eq!(na_text(&NaReason::UnsupportedHardware), "N/A (unsupported CPU)");
+        assert_eq!(
+            na_text(&NaReason::UnsupportedHardware),
+            "N/A (unsupported CPU)"
+        );
         assert_eq!(na_text(&NaReason::DriverMissing), "N/A (driver missing)");
-        assert_eq!(na_text(&NaReason::InsufficientPrivilege), "N/A (insufficient privilege)");
-        assert_eq!(na_text(&NaReason::UnknownPmTableVersion), "N/A (new PM table)");
+        assert_eq!(
+            na_text(&NaReason::InsufficientPrivilege),
+            "N/A (insufficient privilege)"
+        );
+        assert_eq!(
+            na_text(&NaReason::UnknownPmTableVersion),
+            "N/A (new PM table)"
+        );
         assert_eq!(
             na_text(&NaReason::ParseError("truncated at 0x1A".to_owned())),
             "N/A (truncated at 0x1A)"
         );
         // An empty `ParseError` detail falls back to the terse tag.
-        assert_eq!(na_text(&NaReason::ParseError(String::new())), "N/A (decode failed)");
+        assert_eq!(
+            na_text(&NaReason::ParseError(String::new())),
+            "N/A (decode failed)"
+        );
 
         // The six whole-branch arms: the friendly one-liners.
         for reason in [
@@ -1582,7 +1642,9 @@ mod tests {
         {
             let displays = all_rows(&timing_cells(&representative(), &Units::default()));
             assert!(
-                displays.iter().any(|(_, display)| display == "N/A (fixture)"),
+                displays
+                    .iter()
+                    .any(|(_, display)| display == "N/A (fixture)"),
                 "the non-empty ParseError detail must be surfaced: {displays:?}"
             );
         }
@@ -1619,7 +1681,11 @@ mod tests {
             vcore: Section::na(NaReason::NotApplicable),
         };
         let blocks = timing_cells(&n100, &Units::default());
-        assert_eq!(blocks.len(), 1, "the Intel host renders only the Intel block (C7-14)");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "the Intel host renders only the Intel block (C7-14)"
+        );
         assert_eq!(blocks[0].header, "Intel");
         assert!(blocks[0].sections.is_empty());
         assert_eq!(
@@ -1650,7 +1716,11 @@ mod tests {
             vcore: Section::na(NaReason::NotApplicable),
         };
         let blocks = timing_cells(&pm, &Units::default());
-        assert_eq!(blocks.len(), 1, "the AMD host renders only the AMD block (C7-14)");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "the AMD host renders only the AMD block (C7-14)"
+        );
         assert_eq!(blocks[0].header, "AMD");
         assert_eq!(
             blocks[0].degraded.as_deref(),
@@ -1724,7 +1794,10 @@ mod tests {
     /// fault-red).
     #[test]
     fn no_telemetry_placeholder_renders_bare_gray_na() {
-        let data = TelemetryData { telemetry: None, ..Default::default() };
+        let data = TelemetryData {
+            telemetry: None,
+            ..Default::default()
+        };
         let ctx = egui::Context::default();
         ctx.begin_frame(egui::RawInput::default());
         egui::CentralPanel::default().show(&ctx, |ui| render_telemetry_zone(ui, &data));
@@ -1762,7 +1835,10 @@ mod tests {
                 _ => Vec::new(),
             })
             .collect::<Vec<_>>();
-        assert!(!colors.is_empty(), "the placeholder galley must carry sections");
+        assert!(
+            !colors.is_empty(),
+            "the placeholder galley must carry sections"
+        );
         assert!(
             colors.iter().all(|c| *c == NA_GRAY),
             "the placeholder N/A must be muted gray, got {colors:?}"
@@ -1789,7 +1865,10 @@ mod tests {
         // the parent the frame allocates into.
         let screen = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(600.0, 500.0));
         for telemetry in [Some(representative()), None] {
-            let data = TelemetryData { telemetry, ..Default::default() };
+            let data = TelemetryData {
+                telemetry,
+                ..Default::default()
+            };
             let ctx = egui::Context::default();
             ctx.begin_frame(egui::RawInput {
                 screen_rect: Some(screen),

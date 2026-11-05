@@ -78,7 +78,11 @@ pub(crate) fn is_degenerate_word(w: u32) -> bool {
 /// `Na(ParseError)`; a degenerate word (`0` = untrained,
 /// `0xFFFF_FFFF` = bus-fault) → `Na(ParseError)`; a decoded value
 /// outside [1, max_ticks] → `Na(ParseError)`; otherwise the tick value.
-pub(super) fn timing_cell(reg: Option<u32>, name: &str, extract: impl Fn(u32) -> u16) -> Section<u16> {
+pub(super) fn timing_cell(
+    reg: Option<u32>,
+    name: &str,
+    extract: impl Fn(u32) -> u16,
+) -> Section<u16> {
     timing_cell_max(reg, name, extract, TIMING_MAX_TICKS)
 }
 
@@ -93,11 +97,17 @@ pub(super) fn timing_cell_max(
     max_ticks: u16,
 ) -> Section<u16> {
     match reg {
-        None => Section::na(NaReason::ParseError(format!("{name}: register read failed"))),
+        None => Section::na(NaReason::ParseError(format!(
+            "{name}: register read failed"
+        ))),
         // H-14: Screen degenerate words (bus-fault / untrained) before
         // any bit extraction.
         Some(w) if is_degenerate_word(w) => {
-            let detail = if w == 0 { "untrained (0)" } else { "bus-fault (0xFFFFFFFF)" };
+            let detail = if w == 0 {
+                "untrained (0)"
+            } else {
+                "bus-fault (0xFFFFFFFF)"
+            };
             Section::na(NaReason::ParseError(format!("{name}: {detail}")))
         }
         Some(raw) => ticks_section_max(extract(raw), name, max_ticks),
@@ -139,7 +149,9 @@ pub(super) fn clock_section(mhz: f64) -> Section<f64> {
 /// `Na(ParseError)` for every slot sourced from it).
 pub(super) fn quartet_cell(quartet: Option<[u16; 4]>, name: &str, slot: usize) -> Section<u16> {
     match quartet {
-        None => Section::na(NaReason::ParseError(format!("{name}: register read failed"))),
+        None => Section::na(NaReason::ParseError(format!(
+            "{name}: register read failed"
+        ))),
         Some(q) => ticks_section(q[slot], name),
     }
 }

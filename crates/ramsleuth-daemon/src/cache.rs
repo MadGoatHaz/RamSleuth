@@ -425,7 +425,10 @@ mod tests {
             3,
             "the fresh poll must not re-collect"
         );
-        assert_eq!(snap2, snap, "the fresh poll returns the just-collected snapshot");
+        assert_eq!(
+            snap2, snap,
+            "the fresh poll returns the just-collected snapshot"
+        );
         assert!(
             fast_elapsed < Duration::from_millis(SLOW_MS),
             "the post-re-collect poll must be fast (shared read): {fast_elapsed:?}"

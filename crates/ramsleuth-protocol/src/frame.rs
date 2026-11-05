@@ -117,7 +117,10 @@ impl fmt::Display for FrameError {
                 write!(f, "incomplete frame: not enough buffered bytes yet")
             }
             FrameError::Oversized => {
-                write!(f, "frame payload length exceeds the {MAX_FRAME_SIZE}-byte maximum")
+                write!(
+                    f,
+                    "frame payload length exceeds the {MAX_FRAME_SIZE}-byte maximum"
+                )
             }
             FrameError::VersionMismatch { expected, found } => {
                 write!(
@@ -244,7 +247,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<Frame, FrameError> {
 mod tests {
     use super::*;
     use crate::messages::{BenchMode, Request, Response};
-    use ramsleuth_bench::{BenchmarkGrid, BenchOp, StreamProgress, StreamTarget, Tier};
+    use ramsleuth_bench::{BenchOp, BenchmarkGrid, StreamProgress, StreamTarget, Tier};
 
     fn grid() -> BenchmarkGrid {
         BenchmarkGrid {
@@ -280,7 +283,10 @@ mod tests {
                 value: 349.0,
                 label: "Memory · Copy (GB/s)".to_owned(),
             })),
-            Message::Response(Response::BenchResult { run_id: 9, grid: grid() }),
+            Message::Response(Response::BenchResult {
+                run_id: 9,
+                grid: grid(),
+            }),
             Message::Response(Response::BenchCancelled { run_id: 9 }),
             Message::Response(Response::Error("boom".to_owned())),
         ];
@@ -320,7 +326,10 @@ mod tests {
         assert_eq!(decode_frame(b""), Err(FrameError::Incomplete));
         assert_eq!(decode_frame(b"\x04\x00"), Err(FrameError::Incomplete));
         assert_eq!(decode_frame(b"\x04\x00\x00"), Err(FrameError::Incomplete));
-        assert_eq!(decode_frame(b"\x04\x00\x00\x00\x01\x00"), Err(FrameError::Incomplete));
+        assert_eq!(
+            decode_frame(b"\x04\x00\x00\x00\x01\x00"),
+            Err(FrameError::Incomplete)
+        );
 
         let frame = encode_frame(&Message::Response(Response::BenchResult {
             run_id: 3,
@@ -374,7 +383,10 @@ mod tests {
         let mut bad = frame;
         bad[HEADER_SIZE] = 0xFF;
         let err = decode_frame(&bad).expect_err("corrupt payload must not decode");
-        assert!(matches!(err, FrameError::Decode(_)), "expected Decode, got {err:?}");
+        assert!(
+            matches!(err, FrameError::Decode(_)),
+            "expected Decode, got {err:?}"
+        );
         assert!(!err.to_string().is_empty());
     }
 
@@ -394,7 +406,8 @@ mod tests {
         assert_eq!(decoded1.message, first);
         assert_eq!(decoded1.consumed, f1.len());
 
-        let decoded2 = decode_frame(&stream[decoded1.consumed..]).expect("second frame must decode");
+        let decoded2 =
+            decode_frame(&stream[decoded1.consumed..]).expect("second frame must decode");
         assert_eq!(decoded2.message, second);
         assert_eq!(decoded2.consumed, f2.len());
         assert_eq!(decoded1.consumed + decoded2.consumed, stream.len());
@@ -425,7 +438,10 @@ mod tests {
     /// payloads in both directions.
     #[test]
     fn tc_daemon1_frame_carries_the_protocol_version_and_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 1, "the versioned frame format is schema generation 1");
+        assert_eq!(
+            PROTOCOL_VERSION, 1,
+            "the versioned frame format is schema generation 1"
+        );
 
         let messages = vec![
             Message::Request(Request::GetTelemetry),
@@ -433,7 +449,10 @@ mod tests {
                 target: StreamTarget::Tier(Tier::L2),
                 mode: BenchMode::Full,
             }),
-            Message::Response(Response::BenchResult { run_id: 9, grid: grid() }),
+            Message::Response(Response::BenchResult {
+                run_id: 9,
+                grid: grid(),
+            }),
             Message::Response(Response::Error("boom".to_owned())),
         ];
         for msg in &messages {
@@ -445,8 +464,14 @@ mod tests {
                 "the encoded frame must carry PROTOCOL_VERSION in its header"
             );
             let decoded = decode_frame(&frame).expect("encoded frame must decode");
-            assert_eq!(decoded.version, PROTOCOL_VERSION, "the decoded frame keeps the version");
-            assert_eq!(&decoded.message, msg, "the payload round-trips with the version intact");
+            assert_eq!(
+                decoded.version, PROTOCOL_VERSION,
+                "the decoded frame keeps the version"
+            );
+            assert_eq!(
+                &decoded.message, msg,
+                "the payload round-trips with the version intact"
+            );
         }
     }
 

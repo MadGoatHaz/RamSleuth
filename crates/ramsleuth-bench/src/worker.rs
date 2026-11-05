@@ -281,21 +281,10 @@ impl std::error::Error for WorkerError {}
 /// impl for [`WorkerError`] below.
 #[derive(serde::Deserialize)]
 enum WorkerErrorMirror {
-    LengthMismatch {
-        src: usize,
-        dst: usize,
-    },
-    Misaligned {
-        buffer: String,
-        required: usize,
-    },
-    NotBlockMultiple {
-        len: usize,
-        block: usize,
-    },
-    WorkerPanic {
-        index: usize,
-    },
+    LengthMismatch { src: usize, dst: usize },
+    Misaligned { buffer: String, required: usize },
+    NotBlockMultiple { len: usize, block: usize },
+    WorkerPanic { index: usize },
 }
 
 impl<'de> serde::Deserialize<'de> for WorkerError {
@@ -390,7 +379,11 @@ pub fn run_pinned(
             dst: dst.len(),
         });
     }
-    let block = if use_avx512 { AVX512_BLOCK_BYTES } else { AVX2_BLOCK_BYTES };
+    let block = if use_avx512 {
+        AVX512_BLOCK_BYTES
+    } else {
+        AVX2_BLOCK_BYTES
+    };
     if src.as_ptr() as usize % block != 0 {
         return Err(WorkerError::Misaligned {
             buffer: "src",
@@ -460,9 +453,7 @@ pub fn run_pinned(
     let barrier = Barrier::new(n_workers);
     let outcomes = std::thread::scope(|s| -> Result<Vec<(bool, u64, u64)>, WorkerError> {
         let mut handles = Vec::with_capacity(n_workers);
-        for (i, (src_slice, dst_slice)) in
-            src_slices.into_iter().zip(dst_slices).enumerate()
-        {
+        for (i, (src_slice, dst_slice)) in src_slices.into_iter().zip(dst_slices).enumerate() {
             let pin_target = if pin_usable { Some(cores[i]) } else { None };
             let gate = &barrier;
             handles.push(s.spawn(move || {
@@ -535,16 +526,14 @@ pub fn run_pinned(
 ///   `dst` after the copy. The copy's write leg is selected by `tier`
 ///   (BENCH-3), pairing with the write kernel's policy; its read leg
 ///   stays cache-aligned.
-fn run_kernel(
-    op: BenchOp,
-    tier: Tier,
-    src: &[u8],
-    dst: &mut [u8],
-    use_avx512: bool,
-) -> (u64, u64) {
+fn run_kernel(op: BenchOp, tier: Tier, src: &[u8], dst: &mut [u8], use_avx512: bool) -> (u64, u64) {
     match op {
         BenchOp::Read => {
-            let checksum = if use_avx512 { avx512_read(src) } else { avx2_read(src) };
+            let checksum = if use_avx512 {
+                avx512_read(src)
+            } else {
+                avx2_read(src)
+            };
             (src.len() as u64, checksum)
         }
         BenchOp::Write => {
@@ -578,7 +567,10 @@ fn run_kernel(
 ///
 /// Debug builds assert `total % block == 0` and `n_workers >= 1`.
 fn slice_boundaries(total: usize, block: usize, n_workers: usize) -> Vec<(usize, usize)> {
-    debug_assert!(total % block == 0, "slice_boundaries: total must be a block multiple");
+    debug_assert!(
+        total % block == 0,
+        "slice_boundaries: total must be a block multiple"
+    );
     debug_assert!(n_workers >= 1, "slice_boundaries: need at least one worker");
     let units = total / block;
     let base_units = units / n_workers;
@@ -644,8 +636,7 @@ fn pin_to_cpu(cpu: usize) -> bool {
     // struct is ever created, so the type's (possibly private) field
     // layout is irrelevant.
     unsafe {
-        libc::sched_setaffinity(0, CPU_SET_BYTES, mask.as_ptr().cast::<libc::cpu_set_t>())
-            == 0
+        libc::sched_setaffinity(0, CPU_SET_BYTES, mask.as_ptr().cast::<libc::cpu_set_t>()) == 0
     }
 }
 
@@ -696,7 +687,7 @@ fn preflight_pin(cpu: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::{CpuTopology, detect};
+    use crate::topology::{detect, CpuTopology};
     use core::alloc::Layout;
 
     /// Allocate `len` zeroed bytes with guaranteed 64-byte alignment
@@ -743,17 +734,30 @@ mod tests {
     #[test]
     fn slice_boundaries_cover_the_buffer_exactly_once() {
         for n in [1usize, 2, 3, 5, 8, 16] {
-            for total in [64usize, 128, 4096, 1024 * 1024, 64 * (n * 32 + 1), 64 * (n - 1) + 64] {
+            for total in [
+                64usize,
+                128,
+                4096,
+                1024 * 1024,
+                64 * (n * 32 + 1),
+                64 * (n - 1) + 64,
+            ] {
                 let bounds = slice_boundaries(total, 64, n);
                 assert_eq!(bounds.len(), n, "n workers, n slices");
                 let mut offset = 0usize;
                 for (i, (off, len)) in bounds.iter().enumerate() {
-                    assert_eq!(*off, offset, "slices must be contiguous (worker {i}, n={n}, total={total})");
+                    assert_eq!(
+                        *off, offset,
+                        "slices must be contiguous (worker {i}, n={n}, total={total})"
+                    );
                     assert!(*off % 64 == 0, "slice bases must be 64-aligned");
                     assert!(*len % 64 == 0, "slice lengths must be block multiples");
                     offset += len;
                 }
-                assert_eq!(offset, total, "slices must cover the buffer exactly once (n={n}, total={total})");
+                assert_eq!(
+                    offset, total,
+                    "slices must cover the buffer exactly once (n={n}, total={total})"
+                );
             }
         }
     }
@@ -812,8 +816,7 @@ mod tests {
                     BenchOp::Write => (LEN as u64).wrapping_mul(iters as u64), // write checksum = byte counter
                 };
                 assert_eq!(
-                    res.checksum,
-                    expected_checksum,
+                    res.checksum, expected_checksum,
                     "{op:?} 512={use_avx512}: combined checksum across `iters` passes"
                 );
             }
@@ -852,8 +855,8 @@ mod tests {
         };
 
         let iters = small_tier_iters(LEN);
-        let r32 =
-            run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), false).expect("Read/AVX2");
+        let r32 = run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), false)
+            .expect("Read/AVX2");
         assert_eq!(
             r32.total_bytes,
             (LEN as u64).wrapping_mul(iters as u64),
@@ -870,8 +873,8 @@ mod tests {
             "AVX2 aggregate must equal `iters x` the word-sum reference"
         );
 
-        let r512 =
-            run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), true).expect("Read/AVX-512");
+        let r512 = run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), true)
+            .expect("Read/AVX-512");
         assert_eq!(
             r512.checksum,
             avx512_read(src).wrapping_mul(iters as u64),
@@ -879,7 +882,10 @@ mod tests {
         );
         // On a host without AVX-512F, `avx512_read` falls back to the
         // AVX2 kernel → both aggregates must agree either way.
-        assert_eq!(r512.checksum, r32.checksum, "512-fallback aggregate must equal the AVX2 one");
+        assert_eq!(
+            r512.checksum, r32.checksum,
+            "512-fallback aggregate must equal the AVX2 one"
+        );
         dealloc_aligned(src_ptr, LEN);
         dealloc_aligned(dst_ptr, LEN);
     }
@@ -893,7 +899,11 @@ mod tests {
         let n = topo.physical_cores.len().max(1);
 
         for use_avx512 in [false, true] {
-            let block = if use_avx512 { AVX512_BLOCK_BYTES } else { AVX2_BLOCK_BYTES };
+            let block = if use_avx512 {
+                AVX512_BLOCK_BYTES
+            } else {
+                AVX2_BLOCK_BYTES
+            };
             // `m % n != 0` for n > 1 → uneven split; base chunk is
             // `floor(m / n) == 32` blocks, tail worker gets 33.
             let m = n * 32 + 1;
@@ -935,8 +945,7 @@ mod tests {
                     BenchOp::Write => (len as u64).wrapping_mul(iters as u64),
                 };
                 assert_eq!(
-                    res.checksum,
-                    expected_checksum,
+                    res.checksum, expected_checksum,
                     "{op:?} 512={use_avx512}: combined checksum"
                 );
             }
@@ -976,8 +985,8 @@ mod tests {
         };
 
         let iters = small_tier_iters(LEN);
-        let res =
-            run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), false).expect("fallback run");
+        let res = run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), false)
+            .expect("fallback run");
         assert!(!res.pinned, "no physical cores → no pinning to report");
         assert_eq!(res.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
         assert_eq!(
@@ -1001,12 +1010,10 @@ mod tests {
         // SAFETY: fresh allocations of the stated sizes.
         let a = unsafe { std::slice::from_raw_parts(a_ptr, 64) };
         let b = unsafe { std::slice::from_raw_parts_mut(b_ptr, 128) };
-        assert!(
-            matches!(
-                run_pinned(&topo, BenchOp::Read, Tier::Memory, a, b, false),
-                Err(WorkerError::LengthMismatch { .. })
-            )
-        );
+        assert!(matches!(
+            run_pinned(&topo, BenchOp::Read, Tier::Memory, a, b, false),
+            Err(WorkerError::LengthMismatch { .. })
+        ));
 
         // Misaligned base: a 127-byte window starting at byte 1 of a
         // 64-aligned 128-byte allocation.
@@ -1015,12 +1022,10 @@ mod tests {
         // is never reached (the error returns before any kernel call).
         let c_src = unsafe { std::slice::from_raw_parts(c_ptr.add(1), 127) };
         let c_dst = unsafe { std::slice::from_raw_parts_mut(c_ptr.add(1), 127) };
-        assert!(
-            matches!(
-                run_pinned(&topo, BenchOp::Read, Tier::Memory, c_src, c_dst, false),
-                Err(WorkerError::Misaligned { buffer: "src", .. })
-            )
-        );
+        assert!(matches!(
+            run_pinned(&topo, BenchOp::Read, Tier::Memory, c_src, c_dst, false),
+            Err(WorkerError::Misaligned { buffer: "src", .. })
+        ));
 
         // Aligned bases but a length that is not a block multiple.
         let d_ptr = aligned_zeroed(128);
@@ -1029,12 +1034,10 @@ mod tests {
         // kernel is never reached.
         let d = unsafe { std::slice::from_raw_parts(d_ptr, 120) };
         let e = unsafe { std::slice::from_raw_parts_mut(e_ptr, 120) };
-        assert!(
-            matches!(
-                run_pinned(&topo, BenchOp::Read, Tier::Memory, d, e, false),
-                Err(WorkerError::NotBlockMultiple { .. })
-            )
-        );
+        assert!(matches!(
+            run_pinned(&topo, BenchOp::Read, Tier::Memory, d, e, false),
+            Err(WorkerError::NotBlockMultiple { .. })
+        ));
 
         dealloc_aligned(a_ptr, 64);
         dealloc_aligned(b_ptr, 128);
@@ -1066,11 +1069,14 @@ mod tests {
             std::slice::from_raw_parts_mut(dst_ptr, LEN)
         };
         let iters = small_tier_iters(LEN);
-        let res =
-            run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), false).expect("post-probe run");
+        let res = run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), false)
+            .expect("post-probe run");
         assert!(res.pinned, "run must still be fully pinned after the probe");
         assert_eq!(res.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
-        assert_eq!(res.checksum, 0, "zeroed buffer checksums to 0 across all inner iterations");
+        assert_eq!(
+            res.checksum, 0,
+            "zeroed buffer checksums to 0 across all inner iterations"
+        );
         dealloc_aligned(src_ptr, LEN);
         dealloc_aligned(dst_ptr, LEN);
     }
@@ -1083,9 +1089,21 @@ mod tests {
         assert_eq!(small_tier_iters(32 * 1024), 1024, "L1 32 KiB -> 1024");
         assert_eq!(small_tier_iters(1024 * 1024), 32, "L2 1 MiB -> 32");
         assert_eq!(small_tier_iters(64), 65536, "64 B hits the 65536 cap");
-        assert_eq!(small_tier_iters(3 * 1024 * 1024), 10, "3 MiB -> floor(32/3) = 10");
-        assert_eq!(small_tier_iters(4 * 1024 * 1024 - 64), 8, "just under 4 MiB -> 8");
-        assert_eq!(small_tier_iters(4 * 1024 * 1024), 1, "4 MiB boundary -> large tier");
+        assert_eq!(
+            small_tier_iters(3 * 1024 * 1024),
+            10,
+            "3 MiB -> floor(32/3) = 10"
+        );
+        assert_eq!(
+            small_tier_iters(4 * 1024 * 1024 - 64),
+            8,
+            "just under 4 MiB -> 8"
+        );
+        assert_eq!(
+            small_tier_iters(4 * 1024 * 1024),
+            1,
+            "4 MiB boundary -> large tier"
+        );
         assert_eq!(small_tier_iters(8 * 1024 * 1024), 1, "L3 8 MiB -> 1");
         assert_eq!(small_tier_iters(256 * 1024 * 1024), 1, "DRAM 256 MiB -> 1");
     }
@@ -1122,7 +1140,10 @@ mod tests {
                 BenchOp::Read | BenchOp::Copy => expected,
                 BenchOp::Write => LEN as u64, // write checksum = byte counter
             };
-            assert_eq!(res.checksum, expected_checksum, "{op:?}: single-pass checksum");
+            assert_eq!(
+                res.checksum, expected_checksum,
+                "{op:?}: single-pass checksum"
+            );
         }
         dealloc_aligned(src_ptr, LEN);
         dealloc_aligned(dst_ptr, LEN);
@@ -1156,7 +1177,10 @@ mod tests {
         let single_pass = avx2_read(src);
         let res_read =
             run_pinned(&topo, BenchOp::Read, Tier::Memory, src, dst_view(), false).expect("Read");
-        assert_eq!(res_read.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
+        assert_eq!(
+            res_read.total_bytes,
+            (LEN as u64).wrapping_mul(iters as u64)
+        );
         assert_eq!(
             res_read.checksum,
             single_pass.wrapping_mul(iters as u64),
@@ -1164,8 +1188,14 @@ mod tests {
         );
         let res_write =
             run_pinned(&topo, BenchOp::Write, Tier::Memory, src, dst_view(), false).expect("Write");
-        assert_eq!(res_write.total_bytes, (LEN as u64).wrapping_mul(iters as u64));
-        assert_eq!(res_write.checksum, res_write.total_bytes, "write: checksum == total_bytes");
+        assert_eq!(
+            res_write.total_bytes,
+            (LEN as u64).wrapping_mul(iters as u64)
+        );
+        assert_eq!(
+            res_write.checksum, res_write.total_bytes,
+            "write: checksum == total_bytes"
+        );
         dealloc_aligned(src_ptr, LEN);
         dealloc_aligned(dst_ptr, LEN);
     }
@@ -1229,12 +1259,30 @@ mod tests {
 
         // The chosen kernel fn (not just the flag): Memory → NT, L1/L3 →
         // resident, for both the AVX2 and AVX-512 widths.
-        assert_eq!(select_write_kernel(Tier::Memory, false), WriteKernel::Avx2NonTemporal);
-        assert_eq!(select_write_kernel(Tier::Memory, true), WriteKernel::Avx512NonTemporal);
-        assert_eq!(select_write_kernel(Tier::L1, false), WriteKernel::Avx2Resident);
-        assert_eq!(select_write_kernel(Tier::L1, true), WriteKernel::Avx512Resident);
-        assert_eq!(select_write_kernel(Tier::L2, false), WriteKernel::Avx2Resident);
-        assert_eq!(select_write_kernel(Tier::L3, true), WriteKernel::Avx512Resident);
+        assert_eq!(
+            select_write_kernel(Tier::Memory, false),
+            WriteKernel::Avx2NonTemporal
+        );
+        assert_eq!(
+            select_write_kernel(Tier::Memory, true),
+            WriteKernel::Avx512NonTemporal
+        );
+        assert_eq!(
+            select_write_kernel(Tier::L1, false),
+            WriteKernel::Avx2Resident
+        );
+        assert_eq!(
+            select_write_kernel(Tier::L1, true),
+            WriteKernel::Avx512Resident
+        );
+        assert_eq!(
+            select_write_kernel(Tier::L2, false),
+            WriteKernel::Avx2Resident
+        );
+        assert_eq!(
+            select_write_kernel(Tier::L3, true),
+            WriteKernel::Avx512Resident
+        );
     }
 
     /// TC-BENCH3 (BENCH-3): the copy kernel's write leg is tier-aware
@@ -1245,12 +1293,30 @@ mod tests {
     /// used NT stores uniformly (a cache-read + DRAM-write composite).
     #[test]
     fn tc_bench3_copy_write_leg_is_tier_aware() {
-        assert_eq!(select_copy_kernel(Tier::L1, false), CopyKernel::Avx2Resident);
-        assert_eq!(select_copy_kernel(Tier::L2, false), CopyKernel::Avx2Resident);
-        assert_eq!(select_copy_kernel(Tier::L3, false), CopyKernel::Avx2Resident);
-        assert_eq!(select_copy_kernel(Tier::Memory, false), CopyKernel::Avx2NonTemporal);
-        assert_eq!(select_copy_kernel(Tier::L1, true), CopyKernel::Avx512Resident);
-        assert_eq!(select_copy_kernel(Tier::Memory, true), CopyKernel::Avx512NonTemporal);
+        assert_eq!(
+            select_copy_kernel(Tier::L1, false),
+            CopyKernel::Avx2Resident
+        );
+        assert_eq!(
+            select_copy_kernel(Tier::L2, false),
+            CopyKernel::Avx2Resident
+        );
+        assert_eq!(
+            select_copy_kernel(Tier::L3, false),
+            CopyKernel::Avx2Resident
+        );
+        assert_eq!(
+            select_copy_kernel(Tier::Memory, false),
+            CopyKernel::Avx2NonTemporal
+        );
+        assert_eq!(
+            select_copy_kernel(Tier::L1, true),
+            CopyKernel::Avx512Resident
+        );
+        assert_eq!(
+            select_copy_kernel(Tier::Memory, true),
+            CopyKernel::Avx512NonTemporal
+        );
         // The copy's write leg shares the write kernel's tier-aware
         // predicate (same `write_store_kind` mapping).
         for tier in [Tier::Memory, Tier::L1, Tier::L2, Tier::L3] {

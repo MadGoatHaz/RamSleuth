@@ -218,7 +218,7 @@ use gates::*;
 use crate::amd_readout::{EccStatus, GearMode, TimingSet};
 use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
-use crate::intel_gen::{ALDER_CHANNELS, GearCap, GenMap, profile_for};
+use crate::intel_gen::{profile_for, GearCap, GenMap, ALDER_CHANNELS};
 use crate::intel_mchbar::MchBar;
 use crate::intel_smbios::SmbiosTopology;
 
@@ -632,9 +632,7 @@ pub fn tier1_gate(gen: IntelGen) -> TelemetryResult<()> {
         IntelGen::MeteorLake | IntelGen::ArrowLake => {
             "Tier 3 (DDR5, decoded on the Alder profile — outside this Tier-1 gate)"
         }
-        IntelGen::RocketLake => {
-            "Tier 2 (Gear Mode + turnaround parity; outside this Tier-1 gate)"
-        }
+        IntelGen::RocketLake => "Tier 2 (Gear Mode + turnaround parity; outside this Tier-1 gate)",
         _ => "beyond Tier 1",
     };
     Err(TelemetryError::UnsupportedHardware {
@@ -941,11 +939,7 @@ fn unsupported_channel(index: u8) -> IntelChannel {
 /// but preserves the resolved SMBIOS population count and a human
 /// annotation (L-2: the all-Na degradation no longer discards the
 /// resolved `dimm_count`).
-fn all_na_readout(
-    channels: Vec<IntelChannel>,
-    dimm_count: u8,
-    annotation: &str,
-) -> IntelReadout {
+fn all_na_readout(channels: Vec<IntelChannel>, dimm_count: u8, annotation: &str) -> IntelReadout {
     IntelReadout {
         channels,
         channel_mode: None,
@@ -1066,11 +1060,7 @@ pub(crate) fn decoded_readout(
 /// reported `Dual` (the misreported-single-channel bug).
 ///
 /// Never panics (D5): a `None` register degrades only its sourced fields.
-pub fn decode(
-    regs: &IntelImcRegs,
-    gen: IntelGen,
-    smbios: &SmbiosTopology,
-) -> IntelReadout {
+pub fn decode(regs: &IntelImcRegs, gen: IntelGen, smbios: &SmbiosTopology) -> IntelReadout {
     // L-7: server platforms use decode_server (SMBIOS + SPD), never the
     // MMIO decode. If called directly (bypassing the facade's
     // is_server_gen routing), return a structured all-Na readout — never a
@@ -1094,8 +1084,8 @@ pub fn decode(
             // L-5: the gear cells are loop-invariant (the same MC_BIOS_REQ
             // word for every channel) — decode once, layer on every channel
             // (the Tier-3 pattern).
-            let gear_cells = (p.gear != GearCap::None)
-                .then(|| gear_uclk_cells(p.gear, &mclk, regs.mcbios_req));
+            let gear_cells =
+                (p.gear != GearCap::None).then(|| gear_uclk_cells(p.gear, &mclk, regs.mcbios_req));
             let mut channels = Vec::with_capacity(usize::from(p.channel_count));
             for i in 0..p.channel_count {
                 // L-4: explicit per-index handling — the Tier-1 register set
@@ -1186,8 +1176,7 @@ pub fn decode(
             // C-2: A word is "present" only if it's non-zero AND not a
             // bus-fault (0xFFFF_FFFF). This prevents degenerate reads
             // from being misinterpreted as DDR5 evidence.
-            let ddr5 = is_present_word(regs.mad_dimm_ch2)
-                && is_present_word(regs.mad_dimm_ch3);
+            let ddr5 = is_present_word(regs.mad_dimm_ch2) && is_present_word(regs.mad_dimm_ch3);
             // Phase 1 (Intel MC fix): the Alder / Raptor Lake **DDR4**
             // path. Taken only when the OQ-11 DDR5 subchannel condition is
             // NOT met (the 2-channel DDR4 default) AND the resolved memory
@@ -1258,11 +1247,7 @@ pub fn decode(
             if matches!(policy, channel::C3AliasPolicy::Mad) {
                 effective_regs.mcl1 = MclRegs::default();
             }
-            let subch_indices: &[usize] = if ddr5 {
-                &[0, 1, 2, 3]
-            } else {
-                &[0, 2]
-            };
+            let subch_indices: &[usize] = if ddr5 { &[0, 1, 2, 3] } else { &[0, 2] };
             let mclk = decode_mclk(regs.mcbios_req, gen);
             // The gear cells are shared across subchannels (the same
             // MC_BIOS_REQ word): decode once, layer on every channel
@@ -1272,7 +1257,8 @@ pub fn decode(
             for (pos, &i) in subch_indices.iter().enumerate() {
                 let map = &ALDER_CHANNELS[i];
                 let mcl = modern_ddr5::tier3_mcl_for(i, map, &effective_regs);
-                let mut channel = modern_ddr5::decode_tier3_channel(i as u8, mclk.clone(), &mcl, map);
+                let mut channel =
+                    modern_ddr5::decode_tier3_channel(i as u8, mclk.clone(), &mcl, map);
                 channel.clocks.gear_mode = gear_mode.clone();
                 channel.clocks.uclk_mhz = uclk.clone();
                 // M-7: the display index is the channel's position in the
@@ -1558,7 +1544,7 @@ mod tests {
             // tRRD_S 4, tRTP 8, tCKE 0 (4-bit; not displayed), tFAW 24,
             // tRAS 39.
             tc_rap: Some(0x2718_0204),
-            tc_rfp: Some(0x0000_01A4), // tRFC 420, tREFI 0 (not displayed)
+            tc_rfp: Some(0x0000_01A4),  // tRFC 420, tREFI 0 (not displayed)
             tc_rap2: Some(0x0000_0C0A), // tRRD_L 10, tWR 12
             tc_rdrd: Some(0x0048_C286), // sg 6, dg 10, dr 12, dd 18
             tc_rdwr: Some(0x0000_0280), // dg 10 (the representative turnaround)
@@ -1600,7 +1586,10 @@ mod tests {
         let mclk = decode_mclk(Some(0x0000_0008), IntelGen::Skylake);
         assert_eq!(mclk, Section::Value(8.0 * REF_CLK_133_MHZ));
         let mhz = mclk.value().copied().expect("ratio 8 decodes in-band");
-        assert!((mhz - 1066.67).abs() < 0.01, "MCLK ≈ 1066.67 MHz, got {mhz}");
+        assert!(
+            (mhz - 1066.67).abs() < 0.01,
+            "MCLK ≈ 1066.67 MHz, got {mhz}"
+        );
     }
 
     /// The §6.1 acceptance decode, pinned end to end: ch0 every decoded
@@ -1627,7 +1616,10 @@ mod tests {
         assert_eq!(ch0.clocks.gear_mode, Section::na(NaReason::NotApplicable));
         assert_eq!(ch0.clocks.gdm, Section::na(NaReason::NotApplicable));
         assert_eq!(ch0.clocks.pdm, Section::na(NaReason::NotApplicable));
-        assert_eq!(ch0.clocks.command_rate, Section::na(NaReason::NotApplicable));
+        assert_eq!(
+            ch0.clocks.command_rate,
+            Section::na(NaReason::NotApplicable)
+        );
         assert_eq!(ch0.rtl, Section::na(NaReason::NotApplicable));
 
         // --- timings (the acceptance numbers, pinned exactly) ----------
@@ -1677,7 +1669,11 @@ mod tests {
         ] {
             assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
         }
-        for s in [&ch0.cad_bus.rtt_nom, &ch0.cad_bus.rtt_wr, &ch0.cad_bus.rtt_park] {
+        for s in [
+            &ch0.cad_bus.rtt_nom,
+            &ch0.cad_bus.rtt_wr,
+            &ch0.cad_bus.rtt_park,
+        ] {
             assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
         }
         for s in [
@@ -1927,26 +1923,59 @@ mod tests {
     #[test]
     fn mcbios_gear_maps_the_3d_field() {
         for cap in [GearCap::None, GearCap::Gear2, GearCap::Gear4] {
-            assert_eq!(mcbios_gear(0x0000_0000, cap), Some(GearMode::One), "00b, {cap:?}");
+            assert_eq!(
+                mcbios_gear(0x0000_0000, cap),
+                Some(GearMode::One),
+                "00b, {cap:?}"
+            );
             assert_eq!(
                 mcbios_gear(0x0112, cap),
                 Some(GearMode::One),
                 "00b + junk bits, {cap:?}"
             );
         }
-        assert_eq!(mcbios_gear(0x0001_0000, GearCap::None), None, "01b over-cap (Tier 1)");
-        assert_eq!(mcbios_gear(0x0001_0000, GearCap::Gear2), Some(GearMode::Two));
-        assert_eq!(mcbios_gear(0x0001_0000, GearCap::Gear4), Some(GearMode::Two));
-        assert_eq!(mcbios_gear(0x0002_0000, GearCap::None), None, "10b over-cap (Tier 1)");
+        assert_eq!(
+            mcbios_gear(0x0001_0000, GearCap::None),
+            None,
+            "01b over-cap (Tier 1)"
+        );
+        assert_eq!(
+            mcbios_gear(0x0001_0000, GearCap::Gear2),
+            Some(GearMode::Two)
+        );
+        assert_eq!(
+            mcbios_gear(0x0001_0000, GearCap::Gear4),
+            Some(GearMode::Two)
+        );
+        assert_eq!(
+            mcbios_gear(0x0002_0000, GearCap::None),
+            None,
+            "10b over-cap (Tier 1)"
+        );
         assert_eq!(
             mcbios_gear(0x0002_0000, GearCap::Gear2),
             None,
             "10b over-cap (Rocket, documented)"
         );
-        assert_eq!(mcbios_gear(0x0002_0000, GearCap::Gear4), Some(GearMode::Four));
-        assert_eq!(mcbios_gear(0x0003_0000, GearCap::None), None, "11b over-cap (Tier 1)");
-        assert_eq!(mcbios_gear(0x0003_0000, GearCap::Gear2), Some(GearMode::Two), "11b (Gear2)");
-        assert_eq!(mcbios_gear(0x0003_0000, GearCap::Gear4), Some(GearMode::Two), "11b (Gear4)");
+        assert_eq!(
+            mcbios_gear(0x0002_0000, GearCap::Gear4),
+            Some(GearMode::Four)
+        );
+        assert_eq!(
+            mcbios_gear(0x0003_0000, GearCap::None),
+            None,
+            "11b over-cap (Tier 1)"
+        );
+        assert_eq!(
+            mcbios_gear(0x0003_0000, GearCap::Gear2),
+            Some(GearMode::Two),
+            "11b (Gear2)"
+        );
+        assert_eq!(
+            mcbios_gear(0x0003_0000, GearCap::Gear4),
+            Some(GearMode::Two),
+            "11b (Gear4)"
+        );
     }
 
     /// Breakdown §4 example A, re-pinned per the Alder Lake
@@ -2009,7 +2038,11 @@ mod tests {
     #[test]
     fn breakdown_example_d_gear2_11b_field() {
         let raw = 0x0003_001E;
-        assert_eq!(mcbios_gear(raw, GearCap::Gear4), Some(GearMode::Two), "11b → gear 2");
+        assert_eq!(
+            mcbios_gear(raw, GearCap::Gear4),
+            Some(GearMode::Two),
+            "11b → gear 2"
+        );
         let mclk = decode_mclk(Some(raw), IntelGen::AlderLake)
             .value()
             .copied()
@@ -2093,7 +2126,10 @@ mod tests {
     /// `window_size` from `profile_for`) and every Tier-3 offset fits it.
     #[test]
     fn devmem_wide_map_is_256_kib_for_tier3() {
-        assert_eq!(MCHBAR_WINDOW_TIER3, 0x40000, "the Alder profile window (IG-03)");
+        assert_eq!(
+            MCHBAR_WINDOW_TIER3, 0x40000,
+            "the Alder profile window (IG-03)"
+        );
         assert_eq!(
             MCHBAR_WINDOW_TIER3,
             profile_for(IntelGen::AlderLake).unwrap().window_size,
@@ -2143,9 +2179,16 @@ mod tests {
             TC_WRRD_OFFSET,
             TC_WRWR_OFFSET,
         ];
-        for (i, base) in [CHANNEL0_BASE, CHANNEL1_BASE, 0x4800, 0x4C00].into_iter().enumerate() {
+        for (i, base) in [CHANNEL0_BASE, CHANNEL1_BASE, 0x4800, 0x4C00]
+            .into_iter()
+            .enumerate()
+        {
             for (j, off) in ch_offsets.iter().enumerate() {
-                seed_word(&mut buf, base + off, 0xA000_0000 | (i as u32) << 12 | (j as u32) << 8);
+                seed_word(
+                    &mut buf,
+                    base + off,
+                    0xA000_0000 | (i as u32) << 12 | (j as u32) << 8,
+                );
             }
         }
         let mcl_offsets = [
@@ -2160,7 +2203,11 @@ mod tests {
         ];
         for (i, base) in [MCL0_BASE, MCL1_BASE].into_iter().enumerate() {
             for (j, off) in mcl_offsets.iter().enumerate() {
-                seed_word(&mut buf, base + off, 0xB000_0000 | (i as u32) << 12 | (j as u32) << 8);
+                seed_word(
+                    &mut buf,
+                    base + off,
+                    0xB000_0000 | (i as u32) << 12 | (j as u32) << 8,
+                );
             }
         }
         let gen = IntelGen::AlderLake;
@@ -2180,12 +2227,17 @@ mod tests {
         ];
         for (i, base) in [ALK_D4_TC0_BASE, ALK_D4_TC1_BASE].into_iter().enumerate() {
             for (j, off) in alk_d4_offsets.iter().enumerate() {
-                seed_word(&mut buf, base + off, 0xD000_0000 | (i as u32) << 12 | (j as u32) << 8);
+                seed_word(
+                    &mut buf,
+                    base + off,
+                    0xD000_0000 | (i as u32) << 12 | (j as u32) << 8,
+                );
             }
         }
 
         let touched = std::cell::RefCell::new(Vec::new());
-        let regs = IntelImcRegs::from_wide_reader(imc_base_for(gen), buffered_reader(buf, &touched));
+        let regs =
+            IntelImcRegs::from_wide_reader(imc_base_for(gen), buffered_reader(buf, &touched));
 
         let expect_ch = |i: u32| {
             let w = |j: u32| 0xA000_0000 | (i << 12) | (j << 8);
@@ -2252,7 +2304,11 @@ mod tests {
         let mut set = touched.into_inner();
         set.sort_unstable();
         set.dedup();
-        assert_eq!(set.len(), 71, "exactly the full 71-slot Alder read set (51 + 20 DDR4 TC)");
+        assert_eq!(
+            set.len(),
+            71,
+            "exactly the full 71-slot Alder read set (51 + 20 DDR4 TC)"
+        );
         for &off in &set {
             assert!(
                 off + 4 <= MCHBAR_WINDOW_TIER3,
@@ -2302,7 +2358,11 @@ mod tests {
         ];
         for (i, base) in [CHANNEL0_BASE, CHANNEL1_BASE].into_iter().enumerate() {
             for (j, off) in ch_offsets.iter().enumerate() {
-                seed_word(&mut buf, base + off, 0xC000_0000 | (i as u32) << 12 | (j as u32) << 8);
+                seed_word(
+                    &mut buf,
+                    base + off,
+                    0xC000_0000 | (i as u32) << 12 | (j as u32) << 8,
+                );
             }
         }
         seed_word(&mut buf, MAD_DIMM_CH2_OFFSET, 0xDEAD_BEEF);
@@ -2368,7 +2428,8 @@ mod tests {
 
         let gen = IntelGen::Skylake;
         let touched = std::cell::RefCell::new(Vec::new());
-        let regs = IntelImcRegs::from_wide_reader(imc_base_for(gen), buffered_reader(buf, &touched));
+        let regs =
+            IntelImcRegs::from_wide_reader(imc_base_for(gen), buffered_reader(buf, &touched));
 
         assert_eq!(regs.mcbios_req, Some(0x0001_0012));
         assert_eq!(regs.mad_dimm_ch2, Some(7));
@@ -2401,7 +2462,11 @@ mod tests {
             let mut regs = tier3_ddr5_condition_regs();
             regs.mad_inter_channel = Some(0);
             let ro = decode(&regs, gen, &SmbiosTopology::empty());
-            assert_eq!(ro.channels.len(), 4, "{gen:?}: DDR5 condition met -> 4 subchannels");
+            assert_eq!(
+                ro.channels.len(),
+                4,
+                "{gen:?}: DDR5 condition met -> 4 subchannels"
+            );
             assert_eq!(
                 ro.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
                 vec![0, 1, 2, 3],
@@ -2410,8 +2475,16 @@ mod tests {
             assert_eq!(ro.channel_mode, None, "{gen:?}: no population evidence");
             for ch in &ro.channels {
                 assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
-                assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Two), "{gen:?}");
-                assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "{gen:?}: uclk = mclk / 2");
+                assert_eq!(
+                    ch.clocks.gear_mode,
+                    Section::Value(GearMode::Two),
+                    "{gen:?}"
+                );
+                assert_eq!(
+                    ch.clocks.uclk_mhz,
+                    Section::Value(1200.0),
+                    "{gen:?}: uclk = mclk / 2"
+                );
                 assert_eq!(ch.timings.cl, Section::Value(40), "{gen:?}");
                 assert_eq!(ch.timings.cwl, Section::Value(40), "{gen:?}");
                 assert_eq!(ch.timings.rc, Section::Value(117), "{gen:?}");
@@ -2454,14 +2527,25 @@ mod tests {
                     "{gen:?} ({label}): sequential display indices"
                 );
                 assert_eq!(
-                    ro.channel_mode,
-                    None,
+                    ro.channel_mode, None,
                     "{gen:?} ({label}): no population evidence"
                 );
                 for ch in &ro.channels {
-                    assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?} ({label})");
-                    assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Two), "{gen:?} ({label})");
-                    assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "{gen:?} ({label})");
+                    assert_eq!(
+                        ch.clocks.mclk_mhz,
+                        Section::Value(2400.0),
+                        "{gen:?} ({label})"
+                    );
+                    assert_eq!(
+                        ch.clocks.gear_mode,
+                        Section::Value(GearMode::Two),
+                        "{gen:?} ({label})"
+                    );
+                    assert_eq!(
+                        ch.clocks.uclk_mhz,
+                        Section::Value(1200.0),
+                        "{gen:?} ({label})"
+                    );
                     assert_eq!(ch.timings.cl, Section::Value(40), "{gen:?} ({label})");
                 }
             }
@@ -2482,7 +2566,11 @@ mod tests {
             let ro = decode(&regs, gen, &SmbiosTopology::empty());
             for ch in &ro.channels {
                 assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
-                assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Four), "{gen:?}");
+                assert_eq!(
+                    ch.clocks.gear_mode,
+                    Section::Value(GearMode::Four),
+                    "{gen:?}"
+                );
                 assert_eq!(
                     ch.clocks.uclk_mhz,
                     Section::Value(600.0),
@@ -2499,8 +2587,8 @@ mod tests {
         regs.mad_inter_channel = Some(0);
         let ro = decode(&regs, IntelGen::AlderLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 4, "the 4-subchannel DDR5 shape");
-        let bytes = bincode::serialize(&ro)
-            .expect("IntelReadout must serialize (no-panic contract)");
+        let bytes =
+            bincode::serialize(&ro).expect("IntelReadout must serialize (no-panic contract)");
         let back: IntelReadout =
             bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
         assert_eq!(ro, back);
@@ -2519,7 +2607,11 @@ mod tests {
             Some(0x0001_0024),
             "Example C register settings: 133.3333 MHz base, ratio 36, Gear 2"
         );
-        let ro = decode(&tier3_ddr5_condition_regs(), IntelGen::AlderLake, &SmbiosTopology::empty());
+        let ro = decode(
+            &tier3_ddr5_condition_regs(),
+            IntelGen::AlderLake,
+            &SmbiosTopology::empty(),
+        );
         assert_eq!(ro.channels.len(), 4, "DDR5 condition met -> 4 subchannels");
         for ch in &ro.channels {
             assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "MCLK 2400 MHz");
@@ -2562,8 +2654,16 @@ mod tests {
             Section::Value(40),
             "tCL 40 in the 8-bit field, 0xD004 winning over the disabled 0x4004"
         );
-        assert_eq!(ch0.timings.faw, Section::Value(16), "tFAW 16 in the 8-bit field");
-        assert_eq!(ch0.timings.rfc1, Section::Value(1200), "tRFC1 1200 in the 12-bit field");
+        assert_eq!(
+            ch0.timings.faw,
+            Section::Value(16),
+            "tFAW 16 in the 8-bit field"
+        );
+        assert_eq!(
+            ch0.timings.rfc1,
+            Section::Value(1200),
+            "tRFC1 1200 in the 12-bit field"
+        );
         assert_eq!(
             ch0.timings.rfcsb,
             Section::Value(135),
@@ -2646,10 +2746,19 @@ mod tests {
                 assert!(s.is_na(), "{why}: {s:?}");
             }
         }
-        assert_all_sourced_na(&ro.channels[0], "subch0: zero MCL words win (mirrors disabled)");
-        assert_all_sourced_na(&ro.channels[1], "subch1: mirror-only, reserved TC_RDRD word");
+        assert_all_sourced_na(
+            &ro.channels[0],
+            "subch0: zero MCL words win (mirrors disabled)",
+        );
+        assert_all_sourced_na(
+            &ro.channels[1],
+            "subch1: mirror-only, reserved TC_RDRD word",
+        );
         assert_all_sourced_na(&ro.channels[2], "subch2: all registers absent");
-        assert_all_sourced_na(&ro.channels[3], "subch3: mirror-only, reserved TC_RDRD word");
+        assert_all_sourced_na(
+            &ro.channels[3],
+            "subch3: mirror-only, reserved TC_RDRD word",
+        );
         assert_eq!(
             ro.channels[0].timings.rc,
             Section::na(NaReason::NotApplicable)
@@ -2675,7 +2784,11 @@ mod tests {
                 let regs = IntelImcRegs::from_wide_reader(imc_base_for(gen), fill);
                 assert!(regs.primary_window_degenerate(), "{gen:?} ({label})");
                 let ro = decode(&regs, gen, &SmbiosTopology::empty());
-                assert_eq!(ro.channels.len(), 2, "{gen:?} ({label}) (C-4: dual-channel)");
+                assert_eq!(
+                    ro.channels.len(),
+                    2,
+                    "{gen:?} ({label}) (C-4: dual-channel)"
+                );
                 for ch in &ro.channels {
                     assert_eq!(
                         ch.clocks.mclk_mhz,
@@ -2732,10 +2845,18 @@ mod tests {
             });
             assert!(!regs.primary_window_degenerate(), "{gen:?}");
             let ro = decode(&regs, gen, &SmbiosTopology::empty());
-            assert_eq!(ro.channels.len(), 2, "{gen:?}: DDR4 default (MAD raws zero)");
+            assert_eq!(
+                ro.channels.len(),
+                2,
+                "{gen:?}: DDR4 default (MAD raws zero)"
+            );
             for ch in &ro.channels {
                 assert_eq!(ch.clocks.mclk_mhz, Section::Value(2400.0), "{gen:?}");
-                assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::Two), "{gen:?}");
+                assert_eq!(
+                    ch.clocks.gear_mode,
+                    Section::Value(GearMode::Two),
+                    "{gen:?}"
+                );
                 assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "{gen:?}");
                 assert!(
                     matches!(ch.timings.cl, Section::Na(NaReason::ParseError(_))),
@@ -2752,7 +2873,11 @@ mod tests {
     /// whole channel to honest `Na` — no panic, no garbage values.
     #[test]
     fn decode_all_absent_degrades_without_panic() {
-        let ro = decode(&IntelImcRegs::default(), IntelGen::Skylake, &SmbiosTopology::empty());
+        let ro = decode(
+            &IntelImcRegs::default(),
+            IntelGen::Skylake,
+            &SmbiosTopology::empty(),
+        );
         for ch in &ro.channels {
             assert!(ch.clocks.mclk_mhz.is_na(), "{:?}", ch.clocks.mclk_mhz);
             for s in [&ch.clocks.uclk_mhz, &ch.clocks.fclk_mhz] {
@@ -2829,7 +2954,12 @@ mod tests {
         let ro = decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty());
         let ch0 = &ro.channels[0];
 
-        for s in [&ch0.timings.ras, &ch0.timings.rrds, &ch0.timings.rtp, &ch0.timings.faw] {
+        for s in [
+            &ch0.timings.ras,
+            &ch0.timings.rrds,
+            &ch0.timings.rtp,
+            &ch0.timings.faw,
+        ] {
             assert!(matches!(s, Section::Na(NaReason::ParseError(_))), "{s:?}");
         }
         assert_eq!(ch0.timings.rc, Section::na(NaReason::NotApplicable));
@@ -2877,7 +3007,12 @@ mod tests {
         assert_eq!(ch0.timings.rc, Section::na(NaReason::NotApplicable));
 
         let ch1 = &ro.channels[1];
-        for s in [&ch1.timings.ras, &ch1.timings.rrds, &ch1.timings.rtp, &ch1.timings.faw] {
+        for s in [
+            &ch1.timings.ras,
+            &ch1.timings.rrds,
+            &ch1.timings.rtp,
+            &ch1.timings.faw,
+        ] {
             assert!(matches!(s, Section::Na(NaReason::ParseError(_))), "{s:?}");
         }
         assert_eq!(ch1.timings.cl, Section::Value(17));
@@ -2907,7 +3042,11 @@ mod tests {
                     Section::na(NaReason::UnsupportedHardware),
                     "{gen:?}"
                 );
-                assert_eq!(ch.rtl, Section::na(NaReason::UnsupportedHardware), "{gen:?}");
+                assert_eq!(
+                    ch.rtl,
+                    Section::na(NaReason::UnsupportedHardware),
+                    "{gen:?}"
+                );
                 let cells: [&Section<u16>; 27] = [
                     &ch.timings.cl,
                     &ch.timings.rcwdwr,
@@ -2962,10 +3101,7 @@ mod tests {
             assert!(tier1_supported(gen), "{gen:?}");
         }
         let ald = tier1_gate(IntelGen::AlderLake).unwrap_err();
-        assert!(matches!(
-            ald,
-            TelemetryError::UnsupportedHardware { .. }
-        ));
+        assert!(matches!(ald, TelemetryError::UnsupportedHardware { .. }));
         let ald_msg = ald.to_string();
         assert!(ald_msg.contains("AlderLake"), "{ald_msg}");
         assert!(ald_msg.contains("Tier 3"), "{ald_msg}");
@@ -3013,7 +3149,10 @@ mod tests {
             let msg = gen_gate(gen).unwrap_err().to_string();
             assert!(msg.contains(&format!("{gen:?}")), "{msg}");
             assert!(msg.contains("has no decode profile"), "{msg}");
-            assert!(msg.contains("Tier 3 (Alder/Raptor/Meteor/Arrow Lake)"), "{msg}");
+            assert!(
+                msg.contains("Tier 3 (Alder/Raptor/Meteor/Arrow Lake)"),
+                "{msg}"
+            );
             assert!(msg.contains("Server (Sapphire Rapids)"), "{msg}");
         }
     }
@@ -3061,14 +3200,26 @@ mod tests {
     /// identically for the same ratio raws, and the gear cells layer on.
     #[test]
     fn decode_rocket_lake_is_tier1_map_plus_gear() {
-        let tier1 = decode(&acceptance_regs(), IntelGen::Skylake, &SmbiosTopology::empty());
+        let tier1 = decode(
+            &acceptance_regs(),
+            IntelGen::Skylake,
+            &SmbiosTopology::empty(),
+        );
         let mut regs = acceptance_regs();
         regs.mcbios_req = Some(0x0001_0012);
         let rocket = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(rocket.channels.len(), 2, "Rocket Lake: two channels");
         for (t, r) in tier1.channels.iter().zip(&rocket.channels) {
-            assert_eq!(t.clocks.mclk_mhz, Section::Value(2400.0), "Tier 1: ratio 18 full-step");
-            assert_eq!(r.clocks.mclk_mhz, Section::Value(1200.0), "Rocket: ratio 18 half-step");
+            assert_eq!(
+                t.clocks.mclk_mhz,
+                Section::Value(2400.0),
+                "Tier 1: ratio 18 full-step"
+            );
+            assert_eq!(
+                r.clocks.mclk_mhz,
+                Section::Value(1200.0),
+                "Rocket: ratio 18 half-step"
+            );
             assert_eq!(t.clocks.fclk_mhz, r.clocks.fclk_mhz);
             assert_eq!(t.clocks.div_mode, r.clocks.div_mode);
             assert_eq!(t.clocks.gdm, r.clocks.gdm);
@@ -3088,13 +3239,29 @@ mod tests {
     /// Rocket Lake gear containment.
     #[test]
     fn decode_rocket_lake_gear_containment() {
-        let sync = decode(&acceptance_regs(), IntelGen::RocketLake, &SmbiosTopology::empty());
+        let sync = decode(
+            &acceptance_regs(),
+            IntelGen::RocketLake,
+            &SmbiosTopology::empty(),
+        );
         for ch in &sync.channels {
-            assert_eq!(ch.clocks.mclk_mhz, Section::Value(1200.0), "ratio 18 half-step");
+            assert_eq!(
+                ch.clocks.mclk_mhz,
+                Section::Value(1200.0),
+                "ratio 18 half-step"
+            );
             assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
-            assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "uclk = mclk (gear 1)");
+            assert_eq!(
+                ch.clocks.uclk_mhz,
+                Section::Value(1200.0),
+                "uclk = mclk (gear 1)"
+            );
         }
-        let absent = decode(&IntelImcRegs::default(), IntelGen::RocketLake, &SmbiosTopology::empty());
+        let absent = decode(
+            &IntelImcRegs::default(),
+            IntelGen::RocketLake,
+            &SmbiosTopology::empty(),
+        );
         for ch in &absent.channels {
             assert!(matches!(
                 ch.clocks.mclk_mhz,
@@ -3122,8 +3289,7 @@ mod tests {
             IntelGen::CometLake,
             IntelGen::RocketLake,
         ] {
-            let p = profile_for(gen)
-                .unwrap_or_else(|| panic!("{gen:?} must be profiled"));
+            let p = profile_for(gen).unwrap_or_else(|| panic!("{gen:?} must be profiled"));
             assert_eq!(channel_count(gen), p.channel_count, "{gen:?}");
         }
     }
@@ -3140,7 +3306,11 @@ mod tests {
         let ro = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
-            assert_eq!(ch.clocks.mclk_mhz, Section::Value(1600.0), "mclk = 16 × 100 MHz");
+            assert_eq!(
+                ch.clocks.mclk_mhz,
+                Section::Value(1600.0),
+                "mclk = 16 × 100 MHz"
+            );
             assert_eq!(
                 ch.clocks.mclk_mhz.value().copied().map(|v| v * 2.0),
                 Some(3200.0),
@@ -3167,7 +3337,11 @@ mod tests {
         let ro = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
         for ch in &ro.channels {
-            assert_eq!(ch.clocks.mclk_mhz, Section::Value(3000.0), "mclk = 60 × 100 / 2");
+            assert_eq!(
+                ch.clocks.mclk_mhz,
+                Section::Value(3000.0),
+                "mclk = 60 × 100 / 2"
+            );
             assert_eq!(
                 ch.clocks.mclk_mhz.value().copied().map(|v| v * 2.0),
                 Some(6000.0),
@@ -3190,10 +3364,26 @@ mod tests {
     #[test]
     fn tier2_rocket_turnaround_quartets_end_to_end() {
         let regs = acceptance_regs();
-        assert_eq!(legacy_ddr4::turnaround_quartet(0x0048_C286), [6, 10, 12, 18], "TC_RDRD");
-        assert_eq!(legacy_ddr4::turnaround_quartet(0x0000_0280), [0, 10, 0, 0], "TC_RDWR");
-        assert_eq!(legacy_ddr4::turnaround_quartet(0x0000_0308), [8, 12, 0, 0], "TC_WRRD");
-        assert_eq!(legacy_ddr4::turnaround_quartet(0x0040_C204), [4, 8, 12, 16], "TC_WRWR");
+        assert_eq!(
+            legacy_ddr4::turnaround_quartet(0x0048_C286),
+            [6, 10, 12, 18],
+            "TC_RDRD"
+        );
+        assert_eq!(
+            legacy_ddr4::turnaround_quartet(0x0000_0280),
+            [0, 10, 0, 0],
+            "TC_RDWR"
+        );
+        assert_eq!(
+            legacy_ddr4::turnaround_quartet(0x0000_0308),
+            [8, 12, 0, 0],
+            "TC_WRRD"
+        );
+        assert_eq!(
+            legacy_ddr4::turnaround_quartet(0x0040_C204),
+            [4, 8, 12, 16],
+            "TC_WRWR"
+        );
 
         let ro = decode(&regs, IntelGen::RocketLake, &SmbiosTopology::empty());
         assert_eq!(ro.channels.len(), 2, "Rocket Lake: two channels");
@@ -3209,9 +3399,17 @@ mod tests {
             assert_eq!(ch.timings.wrwr_sc, Section::Value(8), "dg");
             assert_eq!(ch.timings.wrwr_sd, Section::Value(12), "dr");
             assert_eq!(ch.timings.wrwr_dd, Section::Value(16), "dd");
-            assert_eq!(ch.clocks.mclk_mhz, Section::Value(1200.0), "ratio 18 half-step");
+            assert_eq!(
+                ch.clocks.mclk_mhz,
+                Section::Value(1200.0),
+                "ratio 18 half-step"
+            );
             assert_eq!(ch.clocks.gear_mode, Section::Value(GearMode::One));
-            assert_eq!(ch.clocks.uclk_mhz, Section::Value(1200.0), "gear 1: uclk = mclk");
+            assert_eq!(
+                ch.clocks.uclk_mhz,
+                Section::Value(1200.0),
+                "gear 1: uclk = mclk"
+            );
         }
         let tier1 = decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty());
         for (r, t) in ro.channels.iter().zip(&tier1.channels) {
@@ -3313,11 +3511,19 @@ mod tests {
                 regs.mad_inter_channel = Some(1);
                 decode(&regs, IntelGen::Skylake, &SmbiosTopology::empty())
             },
-            decode(&IntelImcRegs::default(), IntelGen::Skylake, &SmbiosTopology::empty()),
-            decode(&acceptance_regs(), IntelGen::AlderLake, &SmbiosTopology::empty()),
+            decode(
+                &IntelImcRegs::default(),
+                IntelGen::Skylake,
+                &SmbiosTopology::empty(),
+            ),
+            decode(
+                &acceptance_regs(),
+                IntelGen::AlderLake,
+                &SmbiosTopology::empty(),
+            ),
         ] {
-            let bytes = bincode::serialize(&ro)
-                .expect("IntelReadout must serialize (no-panic contract)");
+            let bytes =
+                bincode::serialize(&ro).expect("IntelReadout must serialize (no-panic contract)");
             let back: IntelReadout =
                 bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
             assert_eq!(ro, back);
@@ -3353,7 +3559,10 @@ mod tests {
     fn devmem_fallback_map_is_64_kib() {
         assert_eq!(MCHBAR_WINDOW, 0x10000, "Tier-1 MCHBAR window is 64 KiB");
         for off in [MAX_IMC_OFFSET, MAX_CHANNEL_OFFSET] {
-            assert!(off <= MCHBAR_WINDOW, "offset {off:#x} must fit the 64 KiB window");
+            assert!(
+                off <= MCHBAR_WINDOW,
+                "offset {off:#x} must fit the 64 KiB window"
+            );
         }
     }
 
@@ -3406,9 +3615,16 @@ mod tests {
         assert_eq!(clock_section(1600.0), Section::Value(1600.0));
         assert_eq!(clock_section(1.0), Section::Value(1.0));
         assert_eq!(clock_section(4096.0), Section::Value(4096.0));
-        assert_eq!(clock_section(5333.0), Section::Value(5333.0), "H-6: DDR5-10666 upper bound");
+        assert_eq!(
+            clock_section(5333.0),
+            Section::Value(5333.0),
+            "H-6: DDR5-10666 upper bound"
+        );
         for mhz in [0.0, 0.5, 5333.1, 65535.0] {
-            assert!(matches!(clock_section(mhz), Section::Na(NaReason::ParseError(_))), "{mhz}");
+            assert!(
+                matches!(clock_section(mhz), Section::Na(NaReason::ParseError(_))),
+                "{mhz}"
+            );
         }
     }
 
@@ -3463,8 +3679,8 @@ mod tests {
         ro.channel_trust = Some(ChannelTrust::VerifiedHardware);
         ro.dimm_count = 2;
 
-        let bytes = bincode::serialize(&ro)
-            .expect("IntelReadout must serialize (no-panic contract)");
+        let bytes =
+            bincode::serialize(&ro).expect("IntelReadout must serialize (no-panic contract)");
         let back: IntelReadout =
             bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
         assert_eq!(ro, back);
@@ -3480,8 +3696,8 @@ mod tests {
             &ChannelRegs::default(),
             false,
         );
-        let bytes = bincode::serialize(&all_na)
-            .expect("IntelReadout must serialize (no-panic contract)");
+        let bytes =
+            bincode::serialize(&all_na).expect("IntelReadout must serialize (no-panic contract)");
         let back: IntelReadout =
             bincode::deserialize(&bytes).expect("IntelReadout must deserialize");
         assert_eq!(all_na, back);
@@ -3740,14 +3956,26 @@ mod tests {
     fn degenerate_word_helpers() {
         assert!(!is_present_word(None), "None is not present");
         assert!(!is_present_word(Some(0)), "zero is not present");
-        assert!(!is_present_word(Some(0xFFFF_FFFF)), "bus-fault is not present");
+        assert!(
+            !is_present_word(Some(0xFFFF_FFFF)),
+            "bus-fault is not present"
+        );
         assert!(is_present_word(Some(1)), "non-zero non-fault is present");
-        assert!(is_present_word(Some(0x1234_5678)), "arbitrary valid word is present");
+        assert!(
+            is_present_word(Some(0x1234_5678)),
+            "arbitrary valid word is present"
+        );
 
         assert!(is_degenerate_word(0), "zero is degenerate");
         assert!(is_degenerate_word(0xFFFF_FFFF), "bus-fault is degenerate");
-        assert!(!is_degenerate_word(1), "non-zero non-fault is not degenerate");
-        assert!(!is_degenerate_word(0x1234_5678), "arbitrary valid word is not degenerate");
+        assert!(
+            !is_degenerate_word(1),
+            "non-zero non-fault is not degenerate"
+        );
+        assert!(
+            !is_degenerate_word(0x1234_5678),
+            "arbitrary valid word is not degenerate"
+        );
     }
 
     /// C-2: OQ-11's DDR5 condition with bus-fault words.

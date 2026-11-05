@@ -86,7 +86,10 @@ fn same_io_error(a: &io::Error, b: &io::Error) -> bool {
 /// set — always the case here, defaults land on connect — a pending
 /// read only unblocks on data, EOF, or the deadline).
 fn map_read_error(error: io::Error) -> ClientError {
-    if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) {
         ClientError::Timeout
     } else {
         ClientError::Io(error)
@@ -260,20 +263,24 @@ impl Client {
 
     /// Override the read timeout (the default is 5 s, set on connect).
     pub fn set_read_timeout(&self, d: Duration) -> Result<(), ClientError> {
-        self.stream.set_read_timeout(Some(d)).map_err(ClientError::Io)
+        self.stream
+            .set_read_timeout(Some(d))
+            .map_err(ClientError::Io)
     }
 
     /// Override the write timeout (the default is 5 s, set on connect).
     pub fn set_write_timeout(&self, d: Duration) -> Result<(), ClientError> {
-        self.stream.set_write_timeout(Some(d)).map_err(ClientError::Io)
+        self.stream
+            .set_write_timeout(Some(d))
+            .map_err(ClientError::Io)
     }
 
     /// Send one request frame (encode + `write_all`; the frame codec is
     /// the P3-11 contract, `FrameError` → [`ClientError::Protocol`],
     /// i/o failure → [`ClientError::Io`]).
     pub fn send(&mut self, req: &Request) -> Result<(), ClientError> {
-        let bytes =
-            encode_frame(&Message::Request(*req)).map_err(|e| ClientError::Protocol(e.to_string()))?;
+        let bytes = encode_frame(&Message::Request(*req))
+            .map_err(|e| ClientError::Protocol(e.to_string()))?;
         self.stream.write_all(&bytes).map_err(ClientError::Io)?;
         Ok(())
     }
@@ -475,9 +482,11 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes =
-                encode_frame(&Message::Response(Response::Telemetry(snapshot))).expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(snapshot)))
+                .expect("must encode");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
         let mut client = Client::connect(sock.path()).expect("must connect");
         let resp = client
@@ -501,9 +510,15 @@ mod tests {
             panic!("expected DaemonDown, got {err:?}");
         };
         let path_str = sock.path().to_string_lossy().into_owned();
-        assert!(msg.contains("cannot connect to"), "friendly message, got: {msg}");
+        assert!(
+            msg.contains("cannot connect to"),
+            "friendly message, got: {msg}"
+        );
         assert!(msg.contains(&path_str), "names the socket path, got: {msg}");
-        assert!(msg.contains("daemon not running"), "actionable hint, got: {msg}");
+        assert!(
+            msg.contains("daemon not running"),
+            "actionable hint, got: {msg}"
+        );
         assert!(
             elapsed >= Duration::from_millis(300),
             "RETRIES={RETRIES} with 100 + 200 ms backoff must be observable, took {elapsed:?}"
@@ -536,7 +551,9 @@ mod tests {
             thread::sleep(Duration::from_millis(500));
         });
         let mut client = Client::connect(sock.path()).expect("must connect");
-        client.set_read_timeout(Duration::from_millis(200)).expect("timeout setter");
+        client
+            .set_read_timeout(Duration::from_millis(200))
+            .expect("timeout setter");
         let err = client
             .request(&Request::GetTelemetry)
             .expect_err("silent daemon: must time out");
@@ -554,11 +571,15 @@ mod tests {
             if let Some(Message::Request(req)) = read_one_message(&mut stream) {
                 // Echo the request frame back (a protocol violation).
                 let bytes = encode_frame(&Message::Request(req)).expect("must encode");
-                stream.write_all(&bytes).expect("stand-in write must not fail");
+                stream
+                    .write_all(&bytes)
+                    .expect("stand-in write must not fail");
             }
         });
         let mut client = Client::connect(sock.path()).expect("must connect");
-        let err = client.request(&Request::GetTelemetry).expect_err("must fail");
+        let err = client
+            .request(&Request::GetTelemetry)
+            .expect_err("must fail");
         let ClientError::Protocol(msg) = err else {
             panic!("expected Protocol, got {err:?}");
         };

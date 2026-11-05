@@ -292,10 +292,7 @@ impl BenchJobManager {
             release(&active, run_id, &busy);
         });
 
-        Ok(JobHandle {
-            run_id,
-            events: rx,
-        })
+        Ok(JobHandle { run_id, events: rx })
     }
 
     /// Start a burn-in run (single-flight, D-1): the same slot
@@ -415,9 +412,7 @@ impl BenchJobManager {
                             break;
                         }
                         let elapsed = (Instant::now() - run_start).as_secs_f64();
-                        let _ = tx.send(JobEvent::BurnInTick(elapsed_update_tick(
-                            elapsed,
-                        )));
+                        let _ = tx.send(JobEvent::BurnInTick(elapsed_update_tick(elapsed)));
                     }
                 }
             });
@@ -445,10 +440,7 @@ impl BenchJobManager {
             release(&active, run_id, &busy);
         });
 
-        Ok(JobHandle {
-            run_id,
-            events: rx,
-        })
+        Ok(JobHandle { run_id, events: rx })
     }
 
     /// Claim the single-flight slot for a new run (the shared claim of
@@ -586,7 +578,11 @@ mod tests {
     async fn start_streams_one_progress_then_terminal_result() {
         let mgr = BenchJobManager::new();
         let handle = mgr
-            .start(StreamTarget::Cell(Tier::L1, BenchOp::Read), BenchMode::Full, 1)
+            .start(
+                StreamTarget::Cell(Tier::L1, BenchOp::Read),
+                BenchMode::Full,
+                1,
+            )
             .await
             .expect("first start on a fresh manager must succeed");
         assert!(handle.run_id > 0);
@@ -626,7 +622,11 @@ mod tests {
             .expect("first start must succeed");
 
         let second = mgr
-            .start(StreamTarget::Cell(Tier::L1, BenchOp::Read), BenchMode::Full, 1)
+            .start(
+                StreamTarget::Cell(Tier::L1, BenchOp::Read),
+                BenchMode::Full,
+                1,
+            )
             .await;
         assert!(
             matches!(second, Err(JobError::Busy)),
@@ -647,7 +647,11 @@ mod tests {
     async fn start_succeeds_again_after_terminal_event() {
         let mgr = BenchJobManager::new();
         let first = mgr
-            .start(StreamTarget::Cell(Tier::L1, BenchOp::Read), BenchMode::Full, 1)
+            .start(
+                StreamTarget::Cell(Tier::L1, BenchOp::Read),
+                BenchMode::Full,
+                1,
+            )
             .await
             .expect("first start must succeed");
         let first_id = first.run_id;
@@ -658,10 +662,18 @@ mod tests {
         );
 
         let second = mgr
-            .start(StreamTarget::Cell(Tier::L1, BenchOp::Write), BenchMode::Full, 1)
+            .start(
+                StreamTarget::Cell(Tier::L1, BenchOp::Write),
+                BenchMode::Full,
+                1,
+            )
             .await
             .expect("start after the terminal event must succeed (busy cleared)");
-        assert_eq!(second.run_id, first_id + 1, "run ids must advance monotonically");
+        assert_eq!(
+            second.run_id,
+            first_id + 1,
+            "run ids must advance monotonically"
+        );
 
         let events = collect(second).await;
         assert_eq!(events.len(), 2, "one progress + one terminal: {events:?}");
@@ -688,8 +700,14 @@ mod tests {
             .await
             .expect("start must succeed");
         let run_id = handle.run_id;
-        assert!(mgr.cancel(run_id), "cancel of the active run_id must return true");
-        assert!(!mgr.cancel(run_id + 1), "cancel of an unknown run_id must return false");
+        assert!(
+            mgr.cancel(run_id),
+            "cancel of the active run_id must return true"
+        );
+        assert!(
+            !mgr.cancel(run_id + 1),
+            "cancel of an unknown run_id must return false"
+        );
 
         let events = collect(handle).await;
         assert!(
@@ -922,13 +940,20 @@ mod tests {
             .expect("the burn-in must start after the bench released the slot");
         let burn_id = burn.run_id;
         let refused = mgr
-            .start(StreamTarget::Cell(Tier::L1, BenchOp::Read), BenchMode::Full, 1)
+            .start(
+                StreamTarget::Cell(Tier::L1, BenchOp::Read),
+                BenchMode::Full,
+                1,
+            )
             .await;
         assert!(
             matches!(refused, Err(JobError::Busy)),
             "a concurrent bench must be refused single-flight"
         );
-        assert!(mgr.cancel(burn_id), "the active burn-in must be cancellable");
+        assert!(
+            mgr.cancel(burn_id),
+            "the active burn-in must be cancellable"
+        );
         let events = collect(burn).await;
         assert!(
             matches!(events.last(), Some(JobEvent::Cancelled)),
@@ -943,7 +968,11 @@ mod tests {
     async fn run_ids_advance_across_run_classes() {
         let mgr = BenchJobManager::new();
         let first = mgr
-            .start(StreamTarget::Cell(Tier::L1, BenchOp::Read), BenchMode::Full, 1)
+            .start(
+                StreamTarget::Cell(Tier::L1, BenchOp::Read),
+                BenchMode::Full,
+                1,
+            )
             .await
             .expect("first start must succeed");
         let first_id = first.run_id;
@@ -983,7 +1012,10 @@ mod tests {
     #[test]
     fn mapped_target_folds_mode_onto_the_memory_tier() {
         // Full scope: the requested target, as-is.
-        assert_eq!(mapped_target(StreamTarget::Full, BenchMode::Full), StreamTarget::Full);
+        assert_eq!(
+            mapped_target(StreamTarget::Full, BenchMode::Full),
+            StreamTarget::Full
+        );
         assert_eq!(
             mapped_target(StreamTarget::Tier(Tier::L2), BenchMode::Full),
             StreamTarget::Tier(Tier::L2)
@@ -1006,7 +1038,10 @@ mod tests {
             StreamTarget::Tier(Tier::Memory)
         );
         assert_eq!(
-            mapped_target(StreamTarget::Cell(Tier::L2, BenchOp::Read), BenchMode::MemoryOnly),
+            mapped_target(
+                StreamTarget::Cell(Tier::L2, BenchOp::Read),
+                BenchMode::MemoryOnly
+            ),
             StreamTarget::Cell(Tier::Memory, BenchOp::Read)
         );
         // Latency (BENCH-G1): the latency-only arm is honored by the

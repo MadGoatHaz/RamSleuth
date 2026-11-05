@@ -77,13 +77,13 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::buffers::{BufferPlan, plan};
+use crate::buffers::{plan, BufferPlan};
 use crate::features::CpuFeatures;
 use crate::orchestrator::{
-    AlignedBuf, BenchmarkGrid, OrchestratorError, Tier, bench_bandwidth, bench_latency,
-    fill_pattern, normalize_size,
+    bench_bandwidth, bench_latency, fill_pattern, normalize_size, AlignedBuf, BenchmarkGrid,
+    OrchestratorError, Tier,
 };
-use crate::topology::{CpuTopology, detect};
+use crate::topology::{detect, CpuTopology};
 use crate::worker::{BenchOp, WorkerError};
 
 /// Grid row order: the [`Tier`] discriminants.
@@ -290,11 +290,7 @@ pub fn run_streamed(
     // a dropped receiver is ignored — the `.ok()` contract); the
     // latency emit is a no-op: the latency pass is a per-tier
     // measurement, never a progress cell.
-    let mut emit_cell = |tier: Tier,
-                        op: BenchOp,
-                        value: f64,
-                        cell_index: u32,
-                        total_cells: u32| {
+    let mut emit_cell = |tier: Tier, op: BenchOp, value: f64, cell_index: u32, total_cells: u32| {
         if let Some(ref tx) = progress_tx {
             let label = format!("{} · {} (GB/s)", tier_name(tier), op_name(op));
             let _ = tx
@@ -412,23 +408,20 @@ fn burn_in(
 
         // One tick per completed bandwidth cell: the iteration, the
         // run elapsed at the emit, and exactly the bandwidth value.
-        let mut emit_cell = |tier: Tier,
-                            op: BenchOp,
-                            value: f64,
-                            _cell_index: u32,
-                            _total_cells: u32| {
-            if let Some(sender) = tx.as_ref() {
-                let _ = sender
-                    .send(BurnInTick {
-                        iteration,
-                        elapsed_secs: start.elapsed().as_secs_f64(),
-                        tier,
-                        bandwidth: Some((op, value)),
-                        latency_ns: None,
-                    })
-                    .ok(); // dropped receiver: ignored, per contract
-            }
-        };
+        let mut emit_cell =
+            |tier: Tier, op: BenchOp, value: f64, _cell_index: u32, _total_cells: u32| {
+                if let Some(sender) = tx.as_ref() {
+                    let _ = sender
+                        .send(BurnInTick {
+                            iteration,
+                            elapsed_secs: start.elapsed().as_secs_f64(),
+                            tier,
+                            bandwidth: Some((op, value)),
+                            latency_ns: None,
+                        })
+                        .ok(); // dropped receiver: ignored, per contract
+                }
+            };
         // One tick per completed per-tier latency pass: exactly the
         // latency value.
         let mut emit_latency = |tier: Tier, ns: f64| {
@@ -561,16 +554,15 @@ fn run_cell_pass(
             for &op in &tier_ops {
                 // Gate: between cells.
                 ensure_not_cancelled(cancel)?;
-                let value =
-                    bench_bandwidth(
-                        &setup.effective,
-                        op,
-                        tier,
-                        src.as_slice(),
-                        dst.as_mut_slice(),
-                        setup.use_avx512,
-                    )
-                    .map_err(map_orchestrator_error)?;
+                let value = bench_bandwidth(
+                    &setup.effective,
+                    op,
+                    tier,
+                    src.as_slice(),
+                    dst.as_mut_slice(),
+                    setup.use_avx512,
+                )
+                .map_err(map_orchestrator_error)?;
                 set_bandwidth_cell(grid, slot, op, value);
                 emit_cell(tier, op, value, cell_index, setup.total_cells);
                 cell_index += 1;
@@ -650,7 +642,9 @@ fn effective_topology(topo: &CpuTopology, threads: usize) -> CpuTopology {
         return topo.clone();
     }
     let mut effective = topo.clone();
-    effective.physical_cores.truncate(threads.min(effective.physical_cores.len()));
+    effective
+        .physical_cores
+        .truncate(threads.min(effective.physical_cores.len()));
     effective
 }
 
@@ -721,15 +715,17 @@ mod tests {
     /// tier's latency pass).
     #[test]
     fn single_cell_run_fills_exactly_its_cell() {
-        let grid =
-            run_streamed(&options(StreamTarget::Cell(Tier::L1, BenchOp::Read)), None)
-                .expect("single-cell run must succeed");
+        let grid = run_streamed(&options(StreamTarget::Cell(Tier::L1, BenchOp::Read)), None)
+            .expect("single-cell run must succeed");
         for &tier in &TIER_ORDER {
             for &metric in &[Metric::Read, Metric::Write, Metric::Copy, Metric::Latency] {
                 let cell = grid.cell(tier, metric);
                 assert!(cell.is_finite(), "{tier:?}/{metric:?} = {cell} not finite");
                 if (tier, metric) == (Tier::L1, Metric::Read) {
-                    assert!(cell > 0.0, "the requested cell must be positive, got {cell}");
+                    assert!(
+                        cell > 0.0,
+                        "the requested cell must be positive, got {cell}"
+                    );
                 } else {
                     assert_eq!(cell, 0.0, "unrequested {tier:?}/{metric:?} must stay 0.0");
                 }
@@ -753,12 +749,19 @@ mod tests {
             assert_eq!(ev.cell_index, i as u32, "ascending cell indices");
             assert_eq!(ev.total_cells, 3, "total_cells = the target's cell count");
             assert_eq!(ev.tier, Tier::L2);
-            assert!(ev.value.is_finite() && ev.value > 0.0, "measured GB/s: {}", ev.value);
+            assert!(
+                ev.value.is_finite() && ev.value > 0.0,
+                "measured GB/s: {}",
+                ev.value
+            );
         }
         let ops: Vec<BenchOp> = events.iter().map(|ev| ev.op).collect();
         assert_eq!(ops, vec![BenchOp::Read, BenchOp::Write, BenchOp::Copy]);
         // Whole tier → the latency pass ran too (in the grid, no event).
-        assert!(grid.cell(Tier::L2, Metric::Latency) > 0.0, "tier latency must be measured");
+        assert!(
+            grid.cell(Tier::L2, Metric::Latency) > 0.0,
+            "tier latency must be measured"
+        );
     }
 
     /// (c) Cancel pre-set before the call: the run halts at gate 0 —
@@ -775,7 +778,11 @@ mod tests {
         let err = run_streamed(&opts, Some(tx)).expect_err("pre-set cancel must fail the run");
         assert!(matches!(err, StreamError::Cancelled), "got {err:?}");
         assert_eq!(err.to_string(), "benchmark run cancelled");
-        assert_eq!(rx.try_iter().count(), 0, "no progress before the first gate");
+        assert_eq!(
+            rx.try_iter().count(),
+            0,
+            "no progress before the first gate"
+        );
     }
 
     /// (d1) `StreamProgress` round-trips through bincode (the wire
@@ -804,8 +811,14 @@ mod tests {
         let errors = vec![
             StreamError::Cancelled,
             StreamError::Worker(WorkerError::LengthMismatch { src: 1, dst: 2 }),
-            StreamError::Worker(WorkerError::Misaligned { buffer: "src", required: 32 }),
-            StreamError::Worker(WorkerError::NotBlockMultiple { len: 120, block: 32 }),
+            StreamError::Worker(WorkerError::Misaligned {
+                buffer: "src",
+                required: 32,
+            }),
+            StreamError::Worker(WorkerError::NotBlockMultiple {
+                len: 120,
+                block: 32,
+            }),
             StreamError::Worker(WorkerError::WorkerPanic { index: 5 }),
             StreamError::Other("topology detection failed".to_string()),
         ];
@@ -821,8 +834,11 @@ mod tests {
     fn dropped_progress_receiver_does_not_fail_the_run() {
         let (tx, rx) = mpsc::channel();
         drop(rx);
-        let grid = run_streamed(&options(StreamTarget::Cell(Tier::L1, BenchOp::Copy)), Some(tx))
-            .expect("a dropped receiver must not fail the run");
+        let grid = run_streamed(
+            &options(StreamTarget::Cell(Tier::L1, BenchOp::Copy)),
+            Some(tx),
+        )
+        .expect("a dropped receiver must not fail the run");
         assert!(grid.cell(Tier::L1, Metric::Copy) > 0.0);
     }
 
@@ -882,7 +898,10 @@ mod tests {
         // Iterations are 1-based and non-decreasing.
         assert_eq!(ticks[0].iteration, 1, "the first tick must be iteration 1");
         for w in ticks.windows(2) {
-            assert!(w[1].iteration >= w[0].iteration, "iterations must not decrease");
+            assert!(
+                w[1].iteration >= w[0].iteration,
+                "iterations must not decrease"
+            );
         }
         // Elapsed: finite, non-negative, non-decreasing.
         for t in &ticks {
@@ -910,11 +929,13 @@ mod tests {
         }
         // Per-iteration pattern: Read, Write, Copy, then the latency pass.
         for iter in 1..=2u32 {
-            let iter_ticks: Vec<&BurnInTick> = ticks
-                .iter()
-                .filter(|t| t.iteration == iter)
-                .collect();
-            assert_eq!(iter_ticks.len(), 4, "iteration {iter} = 3 cells + 1 latency pass");
+            let iter_ticks: Vec<&BurnInTick> =
+                ticks.iter().filter(|t| t.iteration == iter).collect();
+            assert_eq!(
+                iter_ticks.len(),
+                4,
+                "iteration {iter} = 3 cells + 1 latency pass"
+            );
             let ops: Vec<BenchOp> = iter_ticks
                 .iter()
                 .filter_map(|t| t.bandwidth.map(|(op, _)| op))
@@ -929,7 +950,10 @@ mod tests {
                 .filter_map(|t| t.latency_ns)
                 .next()
                 .expect("one latency tick per iteration");
-            assert!(ns > 0.0 && ns.is_finite(), "the latency value must be positive, got {ns}");
+            assert!(
+                ns > 0.0 && ns.is_finite(),
+                "the latency value must be positive, got {ns}"
+            );
         }
     }
 
@@ -951,11 +975,18 @@ mod tests {
         let grid = burn_in(&opts, Some(tx), Some(Duration::from_millis(50)))
             .expect("a deadline burn-in must complete Ok");
         let ticks: Vec<BurnInTick> = rx.iter().collect();
-        assert!(!ticks.is_empty(), "at least one completed pass emits a tick");
+        assert!(
+            !ticks.is_empty(),
+            "at least one completed pass emits a tick"
+        );
         for t in &ticks {
             assert!(t.iteration >= 1, "iterations are 1-based");
             assert!(t.elapsed_secs.is_finite() && t.elapsed_secs >= 0.0);
-            assert_eq!(t.bandwidth.is_some(), t.latency_ns.is_none(), "exactly one Some per tick");
+            assert_eq!(
+                t.bandwidth.is_some(),
+                t.latency_ns.is_none(),
+                "exactly one Some per tick"
+            );
         }
         // The terminal grid: the target cell measured, everything else 0.0.
         for &tier in &TIER_ORDER {
@@ -963,7 +994,10 @@ mod tests {
                 let cell = grid.cell(tier, metric);
                 assert!(cell.is_finite(), "{tier:?}/{metric:?} = {cell} not finite");
                 if (tier, metric) == (Tier::L1, Metric::Read) {
-                    assert!(cell > 0.0, "the requested cell must be positive, got {cell}");
+                    assert!(
+                        cell > 0.0,
+                        "the requested cell must be positive, got {cell}"
+                    );
                 } else {
                     assert_eq!(cell, 0.0, "unrequested {tier:?}/{metric:?} must stay 0.0");
                 }
@@ -1092,10 +1126,12 @@ mod tests {
             "a latency-only target runs no bandwidth cells"
         );
         // The streamed run performs exactly the L3 latency pass.
-        let grid =
-            run_streamed(&options(StreamTarget::Latency(Tier::L3)), None)
-                .expect("a latency-only run must succeed");
-        assert!(grid.cell(Tier::L3, Metric::Latency) > 0.0, "the L3 latency pass ran");
+        let grid = run_streamed(&options(StreamTarget::Latency(Tier::L3)), None)
+            .expect("a latency-only run must succeed");
+        assert!(
+            grid.cell(Tier::L3, Metric::Latency) > 0.0,
+            "the L3 latency pass ran"
+        );
         // No bandwidth cells ran (any tier), and no other tier's latency ran.
         for &tier in &TIER_ORDER {
             for &op in &[Metric::Read, Metric::Write, Metric::Copy] {
@@ -1149,8 +1185,15 @@ mod tests {
             "a cancelled latency burn-in must return Cancelled, got {result:?}"
         );
         for t in &ticks {
-            assert_eq!(t.tier, Tier::Memory, "a Memory latency target only ticks Memory");
-            assert!(t.bandwidth.is_none(), "no bandwidth ticks for a latency-only target");
+            assert_eq!(
+                t.tier,
+                Tier::Memory,
+                "a Memory latency target only ticks Memory"
+            );
+            assert!(
+                t.bandwidth.is_none(),
+                "no bandwidth ticks for a latency-only target"
+            );
             assert!(t.latency_ns.is_some(), "every tick is a latency tick");
             assert!(t.latency_ns.unwrap() > 0.0, "the latency value is positive");
         }

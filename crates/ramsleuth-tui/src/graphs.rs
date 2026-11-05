@@ -340,12 +340,7 @@ pub(crate) fn blank_area(buf: &mut ratatui::buffer::Buffer, area: Rect, bg: Colo
 /// series quantizes to a full bar, not a NaN level), a zero /
 /// too-small `area` renders nothing, and the empty + one-sample
 /// states render without any special-case panic path.
-pub fn render_graphs_panel(
-    frame: &mut Frame,
-    graph: &GraphState,
-    window_min: u32,
-    area: Rect,
-) {
+pub fn render_graphs_panel(frame: &mut Frame, graph: &GraphState, window_min: u32, area: Rect) {
     // A zero / too-small rect cannot host the borders + a row:
     // draw nothing (the no-panic contract).
     if area.is_empty() || area.width < 3 || area.height < 3 {
@@ -534,12 +529,12 @@ fn quantize(value: f64, min: f64, max: f64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::buffer::Buffer;
     use ramsleuth_telemetry::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
     use ramsleuth_telemetry::amd_readout::{map_amd, AmdReadout};
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::{RailConfidence, SystemPlatform, VoltageTelemetry};
+    use ratatui::buffer::Buffer;
 
     /// TC-FE4 (part 1 — the single per-surface idiom clears exactly its
     /// rect): `blank_area` erases every cell of the given [`Rect`] (to
@@ -915,7 +910,10 @@ mod tests {
             text.contains("TUI: compact 5-series sparklines"),
             "the TUI panel must name its compact-sparkline capability: {text}"
         );
-        assert!(text.contains(GRAPH_PARITY_NOTE), "the full note must render: {text}");
+        assert!(
+            text.contains(GRAPH_PARITY_NOTE),
+            "the full note must render: {text}"
+        );
     }
 
     /// (l) The window filter keeps only the samples with
@@ -1007,7 +1005,9 @@ mod tests {
     fn render_full_ring() {
         let mut state = GraphState::default();
         for i in 0..GRAPH_CAPACITY {
-            state.samples.push(sample(i as f64 * 2.0, 1000.0 + i as f64));
+            state
+                .samples
+                .push(sample(i as f64 * 2.0, 1000.0 + i as f64));
         }
         assert!(state.samples.is_full());
         let text = draw_panel(&state, 60, 100, 12);
@@ -1129,7 +1129,10 @@ mod tests {
                     .iter()
                     .map(|c| c.symbol())
                     .collect();
-                assert!(text.contains("GRAPHS"), "the panel title must be present: {text}");
+                assert!(
+                    text.contains("GRAPHS"),
+                    "the panel title must be present: {text}"
+                );
                 assert!(
                     text.contains("CPU FREQ MHz"),
                     "a series label must be present: {text}"

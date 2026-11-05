@@ -46,7 +46,7 @@
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
-    _mm256_set_epi64x, _mm256_store_si256, _mm256_stream_si256, _mm_sfence, __m256i,
+    __m256i, _mm256_set_epi64x, _mm256_store_si256, _mm256_stream_si256, _mm_sfence,
 };
 
 use crate::features::CpuFeatures;
@@ -64,8 +64,14 @@ use crate::features::CpuFeatures;
 /// bytes (asserted in debug builds; undefined behavior in release builds
 /// otherwise). The kernel does not realign internally.
 pub fn avx2_write(dst: &mut [u8], pattern: u64) -> u64 {
-    debug_assert!((dst.as_ptr() as usize) % 32 == 0, "avx2_write: dst must be 32-byte aligned");
-    debug_assert!(dst.len() % 32 == 0, "avx2_write: dst.len() must be a multiple of 32");
+    debug_assert!(
+        (dst.as_ptr() as usize) % 32 == 0,
+        "avx2_write: dst must be 32-byte aligned"
+    );
+    debug_assert!(
+        dst.len() % 32 == 0,
+        "avx2_write: dst.len() must be a multiple of 32"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if CpuFeatures::detect().avx2 {
@@ -286,7 +292,10 @@ mod tests {
         let slice = unsafe { core::slice::from_raw_parts_mut(ptr, LEN) };
         let first = avx2_write(slice, PATTERN);
         let second = avx2_write(slice, PATTERN);
-        assert_ne!(first, 0, "a non-empty buffer must report a non-zero byte count");
+        assert_ne!(
+            first, 0,
+            "a non-empty buffer must report a non-zero byte count"
+        );
         assert_eq!(first, second, "the byte count must be stable across calls");
         assert_eq!(first, LEN as u64);
         dealloc_aligned(ptr, LEN);
@@ -302,7 +311,11 @@ mod tests {
         let slice = unsafe { core::slice::from_raw_parts_mut(ptr, LEN) };
         assert_eq!(avx2_write(slice, PATTERN), LEN as u64);
         let word = PATTERN.to_le_bytes();
-        assert_eq!(&slice[0..8], &word[..], "first 64-bit word must be the LE pattern");
+        assert_eq!(
+            &slice[0..8],
+            &word[..],
+            "first 64-bit word must be the LE pattern"
+        );
         assert_eq!(&*slice, expected(LEN, PATTERN).as_slice());
         dealloc_aligned(ptr, LEN);
     }
@@ -319,14 +332,21 @@ mod tests {
         let slice = unsafe { core::slice::from_raw_parts_mut(ptr, LEN) };
         let want = expected(LEN, PATTERN);
         assert_eq!(avx2_write_resident(slice, PATTERN), LEN as u64);
-        assert_eq!(&*slice, want.as_slice(), "resident stores must fill the same bytes");
+        assert_eq!(
+            &*slice,
+            want.as_slice(),
+            "resident stores must fill the same bytes"
+        );
         // The NT and resident variants agree on contents for the same input.
         slice.fill(0);
         avx2_write(slice, PATTERN);
         let nt = slice.to_vec();
         slice.fill(0);
         avx2_write_resident(slice, PATTERN);
-        assert_eq!(&*slice, &nt, "NT and resident writes must be byte-identical");
+        assert_eq!(
+            &*slice, &nt,
+            "NT and resident writes must be byte-identical"
+        );
         #[cfg(target_arch = "x86_64")]
         if CpuFeatures::detect().avx2 {
             slice.fill(0);

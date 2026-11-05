@@ -155,11 +155,7 @@ fn spd_by_channel<'a>(
 /// cells to N/A while the SMBIOS topology still carries the readout; a
 /// missing / ambiguous SMBIOS topology degrades the channel mode to the
 /// honest terminal state. Never a panic, never an invented value.
-pub fn decode_server(
-    smbios: &SmbiosTopology,
-    spd: &[SpdModule],
-    gen: IntelGen,
-) -> IntelReadout {
+pub fn decode_server(smbios: &SmbiosTopology, spd: &[SpdModule], gen: IntelGen) -> IntelReadout {
     let count = super::channel_count(gen);
 
     // The representative SPD module: the first one carrying usable rated
@@ -492,7 +488,10 @@ mod tests {
         // CAD bus / voltages / RTL: the honest server-uncore reason (not a
         // generic "not applicable" — there is no OS-accessible source).
         assert_eq!(ro.channels[0].cad_bus.proc_odt, Section::Na(na.clone()));
-        assert_eq!(ro.channels[0].voltages.vddio_mem_mv, Section::Na(na.clone()));
+        assert_eq!(
+            ro.channels[0].voltages.vddio_mem_mv,
+            Section::Na(na.clone())
+        );
         assert_eq!(ro.channels[0].rtl, Section::Na(na));
         // The SMBIOS topology is carried (dual-channel, DDR4, 2 DIMMs).
         assert_eq!(ro.channel_mode, Some(ChannelMode::DualSymmetric));

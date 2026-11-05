@@ -382,13 +382,13 @@ mod tests {
             "unbind",
             "uevent",
             "new_device", // driver-dir extras
-            "-0050", // empty bus part
-            "abc-0050", // non-numeric bus
-            "10-00zz", // non-hex address
-            "10-100", // address overflows u8
-            "300-0050", // bus overflows u8
-            "10", // no dash
-            "", // empty name
+            "-0050",      // empty bus part
+            "abc-0050",   // non-numeric bus
+            "10-00zz",    // non-hex address
+            "10-100",     // address overflows u8
+            "300-0050",   // bus overflows u8
+            "10",         // no dash
+            "",           // empty name
         ] {
             assert_eq!(parse_bus_addr(bad), None, "{bad:?} must be dropped");
         }
@@ -480,10 +480,7 @@ mod tests {
     /// file is the fallback.
     #[test]
     fn plan_fallback_unbound_node_uses_bind_file() {
-        assert!(matches!(
-            plan_fallback(true, None),
-            FallbackPlan::BindFile
-        ));
+        assert!(matches!(plan_fallback(true, None), FallbackPlan::BindFile));
     }
 
     /// A refused `new_device` with a node bound to a **foreign**

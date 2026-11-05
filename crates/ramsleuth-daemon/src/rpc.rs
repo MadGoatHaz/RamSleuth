@@ -258,7 +258,11 @@ async fn dispatch(
                 .await
                 .map_err(|e| RpcError::Job(e.to_string()))?;
             let run_id = handle.run_id;
-            write_frame(writer, &Message::Response(Response::BenchStarted { run_id })).await?;
+            write_frame(
+                writer,
+                &Message::Response(Response::BenchStarted { run_id }),
+            )
+            .await?;
 
             // Owner forwarding: the run's std `mpsc` receiver blocks
             // in `recv`, so each pull is one `spawn_blocking`. The
@@ -277,8 +281,11 @@ async fn dispatch(
                 .map_err(|e| RpcError::Join(e.to_string()))?;
                 match event {
                     Ok(JobEvent::Progress(progress)) => {
-                        write_frame(writer, &Message::Response(Response::BenchProgress(progress)))
-                            .await?;
+                        write_frame(
+                            writer,
+                            &Message::Response(Response::BenchProgress(progress)),
+                        )
+                        .await?;
                     }
                     // Defensive: a benchmark run never emits a
                     // burn-in tick (that is the `StartBurnIn` arm's
@@ -293,8 +300,11 @@ async fn dispatch(
                         break;
                     }
                     Ok(JobEvent::Cancelled) => {
-                        write_frame(writer, &Message::Response(Response::BenchCancelled { run_id }))
-                            .await?;
+                        write_frame(
+                            writer,
+                            &Message::Response(Response::BenchCancelled { run_id }),
+                        )
+                        .await?;
                         break;
                     }
                     Ok(JobEvent::Error(msg)) => {
@@ -309,7 +319,10 @@ async fn dispatch(
             }
             Ok(())
         }
-        Message::Request(Request::StartBurnIn { target, duration_minutes }) => {
+        Message::Request(Request::StartBurnIn {
+            target,
+            duration_minutes,
+        }) => {
             // `threads = 0`: auto — one pinned worker per detected
             // physical core (the C7-06 contract). The burn-in shares
             // the single-flight slot with `StartBenchmark` (D-1):
@@ -321,7 +334,11 @@ async fn dispatch(
                 .await
                 .map_err(|e| RpcError::Job(e.to_string()))?;
             let run_id = handle.run_id;
-            write_frame(writer, &Message::Response(Response::BenchStarted { run_id })).await?;
+            write_frame(
+                writer,
+                &Message::Response(Response::BenchStarted { run_id }),
+            )
+            .await?;
 
             // Owner forwarding: the same pattern as the `StartBenchmark`
             // arm (the run's std `mpsc` receiver blocks in `recv`, so
@@ -352,8 +369,11 @@ async fn dispatch(
                         break;
                     }
                     Ok(JobEvent::Cancelled) => {
-                        write_frame(writer, &Message::Response(Response::BenchCancelled { run_id }))
-                            .await?;
+                        write_frame(
+                            writer,
+                            &Message::Response(Response::BenchCancelled { run_id }),
+                        )
+                        .await?;
                         break;
                     }
                     Ok(JobEvent::Error(msg)) => {
@@ -386,9 +406,7 @@ async fn dispatch(
             } else {
                 write_frame(
                     writer,
-                    &Message::Response(Response::Error(format!(
-                        "no active run with id {run_id}"
-                    ))),
+                    &Message::Response(Response::Error(format!("no active run with id {run_id}"))),
                 )
                 .await
             }
@@ -419,15 +437,16 @@ async fn dispatch(
         }
         // A client must never send a `Response` frame: protocol
         // violation, close the connection.
-        Message::Response(_) => {
-            Err(RpcError::Protocol("unexpected response frame".to_owned()))
-        }
+        Message::Response(_) => Err(RpcError::Protocol("unexpected response frame".to_owned())),
     }
 }
 
 /// Encode one message as a P3-11 frame and write it — `write_all` +
 /// `flush` — to the connection's write half.
-async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), message: &Message) -> Result<(), RpcError> {
+async fn write_frame(
+    writer: &mut (impl AsyncWrite + Unpin),
+    message: &Message,
+) -> Result<(), RpcError> {
     let frame = encode_frame(message).map_err(|e| RpcError::Protocol(e.to_string()))?;
     writer.write_all(&frame).await.map_err(RpcError::Io)?;
     writer.flush().await.map_err(RpcError::Io)?;
@@ -891,7 +910,10 @@ mod tests {
 
     impl Conn {
         fn new(stream: tokio::net::UnixStream) -> Self {
-            Self { stream, buf: Vec::new() }
+            Self {
+                stream,
+                buf: Vec::new(),
+            }
         }
 
         /// Encode + write one frame.
@@ -1002,14 +1024,18 @@ mod tests {
         };
         assert_eq!(p.tier, Tier::L1);
         assert_eq!(p.op, BenchOp::Read);
-        assert!(p.value.is_finite() && p.value > 0.0, "the cell must measure > 0: {p:?}");
+        assert!(
+            p.value.is_finite() && p.value > 0.0,
+            "the cell must measure > 0: {p:?}"
+        );
 
         // The uncancelled run terminates with its measured grid.
         let terminal = conn
             .recv_until(|r| {
                 matches!(
                     r,
-                    Response::BenchResult { .. } | Response::BenchCancelled { .. }
+                    Response::BenchResult { .. }
+                        | Response::BenchCancelled { .. }
                         | Response::Error(_)
                 )
             })
@@ -1042,17 +1068,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_from_a_second_connection_acks_and_the_owner_gets_a_terminal() {
         let ctx = mock_ctx();
-        let (client_owner, server_owner) = tokio::net::UnixStream::pair().expect("pair must connect");
-        let (client_other, server_other) = tokio::net::UnixStream::pair().expect("pair must connect");
+        let (client_owner, server_owner) =
+            tokio::net::UnixStream::pair().expect("pair must connect");
+        let (client_other, server_other) =
+            tokio::net::UnixStream::pair().expect("pair must connect");
         let owner_task = tokio::spawn(handle_connection(server_owner, Arc::clone(&ctx)));
         let other_task = tokio::spawn(handle_connection(server_other, Arc::clone(&ctx)));
 
         let mut owner = Conn::new(client_owner);
-        owner.send(&Message::Request(Request::StartBenchmark {
-            target: StreamTarget::Cell(Tier::L1, BenchOp::Read),
-            mode: BenchMode::Full,
-        }))
-        .await;
+        owner
+            .send(&Message::Request(Request::StartBenchmark {
+                target: StreamTarget::Cell(Tier::L1, BenchOp::Read),
+                mode: BenchMode::Full,
+            }))
+            .await;
         let message = owner.recv().await.expect("the started frame");
         let Message::Response(Response::BenchStarted { run_id }) = message else {
             panic!("the first reply must be BenchStarted: {message:?}")
@@ -1060,7 +1089,9 @@ mod tests {
 
         // A second connection cancels the run by its id.
         let mut other = Conn::new(client_other);
-        other.send(&Message::Request(Request::CancelBenchmark { run_id })).await;
+        other
+            .send(&Message::Request(Request::CancelBenchmark { run_id }))
+            .await;
         let message = other.recv().await.expect("the cancel reply frame");
         let Message::Response(ack) = message else {
             panic!("the cancel reply must be a Response: {message:?}")
@@ -1078,13 +1109,17 @@ mod tests {
             .recv_until(|r| {
                 matches!(
                     r,
-                    Response::BenchResult { .. } | Response::BenchCancelled { .. }
+                    Response::BenchResult { .. }
+                        | Response::BenchCancelled { .. }
                         | Response::Error(_)
                 )
             })
             .await;
         assert!(
-            matches!(terminal, Response::BenchResult { .. } | Response::BenchCancelled { .. }),
+            matches!(
+                terminal,
+                Response::BenchResult { .. } | Response::BenchCancelled { .. }
+            ),
             "the owner's terminal must be the run's result or cancellation: {terminal:?}"
         );
 
@@ -1110,17 +1145,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_burn_in_streams_ticks_and_cancels_from_a_second_connection() {
         let ctx = mock_ctx();
-        let (client_owner, server_owner) = tokio::net::UnixStream::pair().expect("pair must connect");
-        let (client_other, server_other) = tokio::net::UnixStream::pair().expect("pair must connect");
+        let (client_owner, server_owner) =
+            tokio::net::UnixStream::pair().expect("pair must connect");
+        let (client_other, server_other) =
+            tokio::net::UnixStream::pair().expect("pair must connect");
         let owner_task = tokio::spawn(handle_connection(server_owner, Arc::clone(&ctx)));
         let other_task = tokio::spawn(handle_connection(server_other, Arc::clone(&ctx)));
 
         let mut owner = Conn::new(client_owner);
-        owner.send(&Message::Request(Request::StartBurnIn {
-            target: StreamTarget::Tier(Tier::L1),
-            duration_minutes: 0,
-        }))
-        .await;
+        owner
+            .send(&Message::Request(Request::StartBurnIn {
+                target: StreamTarget::Tier(Tier::L1),
+                duration_minutes: 0,
+            }))
+            .await;
         let message = owner.recv().await.expect("the started frame");
         let Message::Response(Response::BenchStarted { run_id }) = message else {
             panic!("the first reply must be BenchStarted: {message:?}")
@@ -1132,7 +1170,9 @@ mod tests {
         // connection by its id.
         tokio::time::sleep(Duration::from_millis(1000)).await;
         let mut other = Conn::new(client_other);
-        other.send(&Message::Request(Request::CancelBenchmark { run_id })).await;
+        other
+            .send(&Message::Request(Request::CancelBenchmark { run_id }))
+            .await;
         let message = other.recv().await.expect("the cancel reply frame");
         let Message::Response(ack) = message else {
             panic!("the cancel reply must be a Response: {message:?}")
@@ -1167,7 +1207,8 @@ mod tests {
             .recv_until(|r| {
                 matches!(
                     r,
-                    Response::BenchResult { .. } | Response::BenchCancelled { .. }
+                    Response::BenchResult { .. }
+                        | Response::BenchCancelled { .. }
                         | Response::Error(_)
                 )
             })
@@ -1207,7 +1248,9 @@ mod tests {
         conn.stream.flush().await.expect("test flush must succeed");
 
         let result = task.await.expect("handle_connection must join");
-        let RpcError::Protocol(msg) = result.as_ref().expect_err("the oversized frame must fail the connection")
+        let RpcError::Protocol(msg) = result
+            .as_ref()
+            .expect_err("the oversized frame must fail the connection")
         else {
             panic!("expected a Protocol error, got {result:?}")
         };
@@ -1226,19 +1269,24 @@ mod tests {
         let (client, server) = tokio::net::UnixStream::pair().expect("pair must connect");
         let task = tokio::spawn(handle_connection(server, Arc::clone(&ctx)));
 
-        let mut frame = encode_frame(&Message::Request(Request::GetTelemetry))
-            .expect("the frame must encode");
+        let mut frame =
+            encode_frame(&Message::Request(Request::GetTelemetry)).expect("the frame must encode");
         // The payload begins at the end of the 8-byte header.
         // `Message::Request(GetTelemetry)` serializes to two variant
         // bytes; the first payload byte (offset 8) at 0xFF is not a
         // variant of `Message`, so Bincode rejects the frame.
         frame[8] = 0xFF;
         let mut conn = Conn::new(client);
-        conn.stream.write_all(&frame).await.expect("test write must succeed");
+        conn.stream
+            .write_all(&frame)
+            .await
+            .expect("test write must succeed");
         conn.stream.flush().await.expect("test flush must succeed");
 
         let result = task.await.expect("handle_connection must join");
-        let RpcError::Protocol(msg) = result.as_ref().expect_err("the corrupt frame must fail the connection")
+        let RpcError::Protocol(msg) = result
+            .as_ref()
+            .expect_err("the corrupt frame must fail the connection")
         else {
             panic!("expected a Protocol error, got {result:?}")
         };
@@ -1258,16 +1306,21 @@ mod tests {
         let (client, server) = tokio::net::UnixStream::pair().expect("pair must connect");
         let task = tokio::spawn(handle_connection(server, Arc::clone(&ctx)));
 
-        let mut frame = encode_frame(&Message::Request(Request::GetTelemetry))
-            .expect("the frame must encode");
+        let mut frame =
+            encode_frame(&Message::Request(Request::GetTelemetry)).expect("the frame must encode");
         // Flip the version word (bytes [4..8]) to a foreign generation.
         frame[4..8].copy_from_slice(&0u32.to_le_bytes());
         let mut conn = Conn::new(client);
-        conn.stream.write_all(&frame).await.expect("test write must succeed");
+        conn.stream
+            .write_all(&frame)
+            .await
+            .expect("test write must succeed");
         conn.stream.flush().await.expect("test flush must succeed");
 
         let result = task.await.expect("handle_connection must join");
-        let RpcError::Protocol(msg) = result.as_ref().expect_err("the mismatched frame must fail the connection")
+        let RpcError::Protocol(msg) = result
+            .as_ref()
+            .expect_err("the mismatched frame must fail the connection")
         else {
             panic!("expected a Protocol error, got {result:?}")
         };
@@ -1292,7 +1345,9 @@ mod tests {
         .await;
 
         let result = task.await.expect("handle_connection must join");
-        let RpcError::Protocol(msg) = result.as_ref().expect_err("the response frame must fail the connection")
+        let RpcError::Protocol(msg) = result
+            .as_ref()
+            .expect_err("the response frame must fail the connection")
         else {
             panic!("expected a Protocol error, got {result:?}")
         };
@@ -1329,8 +1384,14 @@ mod tests {
             RpcError::Protocol("a".to_owned())
         );
         assert_ne!(protocol, RpcError::Protocol("other".to_owned()));
-        assert_eq!(RpcError::Job("busy".to_owned()), RpcError::Job("busy".to_owned()));
-        assert_eq!(RpcError::Join("panic".to_owned()), RpcError::Join("panic".to_owned()));
+        assert_eq!(
+            RpcError::Job("busy".to_owned()),
+            RpcError::Job("busy".to_owned())
+        );
+        assert_eq!(
+            RpcError::Join("panic".to_owned()),
+            RpcError::Join("panic".to_owned())
+        );
         assert_ne!(
             RpcError::Job("x".to_owned()),
             RpcError::Join("x".to_owned()),
@@ -1621,10 +1682,8 @@ mod tests {
             RawAcquisition::Amd(mock_amd_source()),
             mock_identity(),
         );
-        let frame = encode_frame(&Message::Response(Response::ProbeReport(
-            report.clone(),
-        )))
-        .expect("the built report frame must encode");
+        let frame = encode_frame(&Message::Response(Response::ProbeReport(report.clone())))
+            .expect("the built report frame must encode");
         let decoded = decode_frame(&frame).expect("the built report frame must decode");
         let Message::Response(Response::ProbeReport(back)) = decoded.message else {
             panic!("the decoded frame must be the ProbeReport response: {decoded:?}")

@@ -63,7 +63,10 @@ pub enum Request {
     /// Start a benchmark run: `target` selects the cells, `mode` the
     /// scope (single-flight — a second start while one is active gets
     /// [`Response::Error`], plan D6).
-    StartBenchmark { target: StreamTarget, mode: BenchMode },
+    StartBenchmark {
+        target: StreamTarget,
+        mode: BenchMode,
+    },
     /// Cancel the active run `run_id`: the in-flight pass finishes, the
     /// run stops at the next gate (clean cancel, plan D6).
     CancelBenchmark { run_id: u64 },
@@ -77,7 +80,10 @@ pub enum Request {
     /// Single-flight with `StartBenchmark` (a second start while any
     /// run is active gets [`Response::Error`], plan D6); its progress
     /// streams on [`Response::BurnInProgress`].
-    StartBurnIn { target: StreamTarget, duration_minutes: u32 },
+    StartBurnIn {
+        target: StreamTarget,
+        duration_minutes: u32,
+    },
     /// Fetch the consent-gated "Submit Probe Report": the full telemetry
     /// snapshot + the Intel raw-register dump (when available) + the
     /// system identity — the [`Response::ProbeReport`] payload (the
@@ -224,8 +230,7 @@ mod tests {
                     duration_minutes,
                 };
                 let bytes = bincode::serialize(&req).expect("Request must serialize");
-                let back: Request =
-                    bincode::deserialize(&bytes).expect("Request must deserialize");
+                let back: Request = bincode::deserialize(&bytes).expect("Request must deserialize");
                 assert_eq!(back, req);
             }
         }
@@ -391,8 +396,16 @@ mod tests {
         let resp_lead = |r: &Response, disc: u32, name: &str| {
             lead(&bincode::serialize(r).unwrap(), disc, name);
         };
-        resp_lead(&Response::Telemetry(fixture_snapshot()), 0, "Response::Telemetry");
-        resp_lead(&Response::BenchStarted { run_id: 1 }, 1, "Response::BenchStarted");
+        resp_lead(
+            &Response::Telemetry(fixture_snapshot()),
+            0,
+            "Response::Telemetry",
+        );
+        resp_lead(
+            &Response::BenchStarted { run_id: 1 },
+            1,
+            "Response::BenchStarted",
+        );
         resp_lead(
             &Response::BenchProgress(StreamProgress {
                 cell_index: 0,
@@ -418,7 +431,11 @@ mod tests {
             3,
             "Response::BenchResult",
         );
-        resp_lead(&Response::BenchCancelled { run_id: 1 }, 4, "Response::BenchCancelled");
+        resp_lead(
+            &Response::BenchCancelled { run_id: 1 },
+            4,
+            "Response::BenchCancelled",
+        );
         resp_lead(&Response::Error(String::new()), 5, "Response::Error");
         resp_lead(
             &Response::BurnInProgress(BurnInTick {
@@ -679,8 +696,7 @@ mod tests {
         ];
         for (name, actual, pinned) in pins {
             assert_eq!(
-                actual,
-                pinned,
+                actual, pinned,
                 "{name} payload layout changed — this is a schema change: bump \
                  PROTOCOL_VERSION (C6 / DAEMON-1) and regenerate the pin"
             );

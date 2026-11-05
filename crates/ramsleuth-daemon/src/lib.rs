@@ -32,12 +32,12 @@
 //!
 //! The binary entry (`src/main.rs`) is rewritten in P3-17.
 
-pub mod caps;
-pub mod socket;
-pub mod cache;
 pub mod bench_job;
+pub mod cache;
+pub mod caps;
 pub mod dram_spike;
 pub mod rpc;
+pub mod socket;
 pub mod spd_bind;
 
 // P3-12: the SOFT privilege probe, re-exported at the root (workspace
@@ -83,7 +83,7 @@ pub use dram_spike::spike;
 // + exactly one terminal) to the owning connection, and acks
 // `CancelBenchmark`; protocol violations close the connection with
 // `RpcError::Protocol`.
-pub use rpc::{DaemonContext, handle_connection, RpcError};
+pub use rpc::{handle_connection, DaemonContext, RpcError};
 // The SPD auto-bind fallback, re-exported at the root (workspace
 // re-export style) — main calls `ensure_spd_eeproms_bound(enabled)` as
 // the first line of the collector closure (before the spike + settle +

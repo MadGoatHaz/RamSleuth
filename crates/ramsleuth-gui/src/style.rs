@@ -88,7 +88,10 @@ pub fn build_style() -> egui::Style {
     visuals.selection.stroke.color = CYAN;
     visuals.hyperlink_color = CYAN;
 
-    egui::Style { visuals, ..Default::default() }
+    egui::Style {
+        visuals,
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -183,8 +186,8 @@ pub fn export_json(
     path: &Path,
 ) -> Result<(), GuiError> {
     let snapshot = ExportSnapshot { telemetry, bench };
-    let json = serde_json::to_string_pretty(&snapshot)
-        .map_err(|err| GuiError::Json(err.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(&snapshot).map_err(|err| GuiError::Json(err.to_string()))?;
     std::fs::write(path, json).map_err(GuiError::Io)?;
     Ok(())
 }
@@ -261,8 +264,12 @@ pub fn snapshot_png(
     // text (never a panic).
     let stamp = wall_clock_string(now_epoch_secs());
     let title = format!("RamSleuth v{}  {}", env!("CARGO_PKG_VERSION"), stamp);
-    let cpu = telemetry.map(snapshot_cpu_line).unwrap_or_else(|| "CPU: N/A".to_owned());
-    let ram = telemetry.map(snapshot_ram_line).unwrap_or_else(|| "RAM: N/A".to_owned());
+    let cpu = telemetry
+        .map(snapshot_cpu_line)
+        .unwrap_or_else(|| "CPU: N/A".to_owned());
+    let ram = telemetry
+        .map(snapshot_ram_line)
+        .unwrap_or_else(|| "RAM: N/A".to_owned());
     draw_text(&mut pixels, MARGIN, TITLE_Y0, &title, CYAN);
     draw_text(&mut pixels, MARGIN, CPU_Y0, &cpu, TEXT);
     draw_text(&mut pixels, MARGIN, RAM_Y0, &ram, TEXT);
@@ -297,8 +304,12 @@ pub fn snapshot_png(
         let mut encoder = png::Encoder::new(&mut out, CARD_W as u32, CARD_H as u32);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().map_err(|err| GuiError::Png(err.to_string()))?;
-        writer.write_image_data(&pixels).map_err(|err| GuiError::Png(err.to_string()))?;
+        let mut writer = encoder
+            .write_header()
+            .map_err(|err| GuiError::Png(err.to_string()))?;
+        writer
+            .write_image_data(&pixels)
+            .map_err(|err| GuiError::Png(err.to_string()))?;
     }
     std::fs::write(path, out).map_err(GuiError::Io)?;
     Ok(())
@@ -335,101 +346,101 @@ fn lerp(a: egui::Color32, b: egui::Color32, t: f64) -> egui::Color32 {
 /// row, bit 0 = the leftmost pixel — a public-domain dot-matrix
 /// pattern set.
 const FONT_5X7: [[u8; 7]; 95] = [
-    [0, 0, 0, 0, 0, 0, 0], // ' '
-    [4, 4, 4, 4, 4, 0, 4], // !
-    [10, 10, 10, 0, 0, 0, 0], // "
+    [0, 0, 0, 0, 0, 0, 0],        // ' '
+    [4, 4, 4, 4, 4, 0, 4],        // !
+    [10, 10, 10, 0, 0, 0, 0],     // "
     [10, 27, 10, 10, 27, 10, 10], // #
-    [14, 9, 10, 6, 21, 9, 14], // $
-    [19, 19, 2, 4, 1, 25, 25], // %
-    [6, 9, 9, 6, 10, 9, 14], // &
-    [4, 4, 0, 0, 0, 0, 0], // '
-    [6, 2, 1, 1, 1, 2, 6], // (
-    [12, 8, 16, 16, 16, 8, 12], // )
-    [0, 10, 14, 31, 14, 10, 0], // *
-    [0, 4, 4, 31, 4, 4, 0], // +
-    [0, 0, 0, 0, 4, 4, 2], // ,
-    [0, 0, 0, 31, 0, 0, 0], // -
-    [0, 0, 0, 0, 0, 4, 4], // .
-    [16, 8, 8, 4, 2, 2, 1], // /
+    [14, 9, 10, 6, 21, 9, 14],    // $
+    [19, 19, 2, 4, 1, 25, 25],    // %
+    [6, 9, 9, 6, 10, 9, 14],      // &
+    [4, 4, 0, 0, 0, 0, 0],        // '
+    [6, 2, 1, 1, 1, 2, 6],        // (
+    [12, 8, 16, 16, 16, 8, 12],   // )
+    [0, 10, 14, 31, 14, 10, 0],   // *
+    [0, 4, 4, 31, 4, 4, 0],       // +
+    [0, 0, 0, 0, 4, 4, 2],        // ,
+    [0, 0, 0, 31, 0, 0, 0],       // -
+    [0, 0, 0, 0, 0, 4, 4],        // .
+    [16, 8, 8, 4, 2, 2, 1],       // /
     [14, 17, 25, 21, 19, 17, 14], // 0
-    [4, 2, 4, 4, 4, 4, 14], // 1
-    [14, 17, 16, 12, 2, 1, 31], // 2
+    [4, 2, 4, 4, 4, 4, 14],       // 1
+    [14, 17, 16, 12, 2, 1, 31],   // 2
     [14, 17, 16, 12, 16, 17, 14], // 3
-    [8, 12, 10, 9, 31, 16, 16], // 4
-    [31, 1, 1, 14, 16, 17, 14], // 5
-    [14, 1, 1, 31, 17, 17, 14], // 6
-    [31, 16, 8, 4, 2, 2, 2], // 7
+    [8, 12, 10, 9, 31, 16, 16],   // 4
+    [31, 1, 1, 14, 16, 17, 14],   // 5
+    [14, 1, 1, 31, 17, 17, 14],   // 6
+    [31, 16, 8, 4, 2, 2, 2],      // 7
     [14, 17, 17, 14, 17, 17, 14], // 8
     [14, 17, 17, 30, 16, 16, 14], // 9
-    [0, 4, 4, 0, 4, 4, 0], // :
-    [0, 4, 4, 0, 4, 2, 0], // ;
-    [16, 8, 4, 2, 4, 8, 16], // <
-    [0, 0, 31, 0, 31, 0, 0], // =
-    [1, 2, 4, 8, 4, 2, 1], // >
-    [14, 17, 16, 12, 0, 0, 4], // ?
-    [14, 17, 21, 13, 1, 1, 14], // @
+    [0, 4, 4, 0, 4, 4, 0],        // :
+    [0, 4, 4, 0, 4, 2, 0],        // ;
+    [16, 8, 4, 2, 4, 8, 16],      // <
+    [0, 0, 31, 0, 31, 0, 0],      // =
+    [1, 2, 4, 8, 4, 2, 1],        // >
+    [14, 17, 16, 12, 0, 0, 4],    // ?
+    [14, 17, 21, 13, 1, 1, 14],   // @
     [14, 17, 17, 31, 17, 17, 17], // A
     [30, 17, 17, 30, 17, 17, 30], // B
-    [14, 17, 1, 1, 1, 17, 14], // C
+    [14, 17, 1, 1, 1, 17, 14],    // C
     [30, 17, 17, 17, 17, 17, 30], // D
-    [31, 1, 1, 30, 1, 1, 31], // E
-    [31, 1, 1, 30, 1, 1, 1], // F
-    [14, 17, 1, 21, 17, 17, 14], // G
+    [31, 1, 1, 30, 1, 1, 31],     // E
+    [31, 1, 1, 30, 1, 1, 1],      // F
+    [14, 17, 1, 21, 17, 17, 14],  // G
     [17, 17, 17, 31, 17, 17, 17], // H
-    [14, 4, 4, 4, 4, 4, 14], // I
-    [28, 16, 16, 16, 16, 17, 6], // J
-    [17, 9, 5, 3, 5, 9, 17], // K
-    [1, 1, 1, 1, 1, 1, 31], // L
+    [14, 4, 4, 4, 4, 4, 14],      // I
+    [28, 16, 16, 16, 16, 17, 6],  // J
+    [17, 9, 5, 3, 5, 9, 17],      // K
+    [1, 1, 1, 1, 1, 1, 31],       // L
     [17, 27, 21, 21, 17, 17, 17], // M
     [17, 19, 21, 25, 17, 17, 17], // N
     [14, 17, 17, 17, 17, 17, 14], // O
-    [30, 17, 17, 30, 1, 1, 1], // P
-    [14, 17, 17, 17, 21, 9, 22], // Q
-    [30, 17, 17, 30, 5, 9, 17], // R
-    [14, 17, 1, 14, 16, 17, 14], // S
-    [31, 4, 4, 4, 4, 4, 4], // T
+    [30, 17, 17, 30, 1, 1, 1],    // P
+    [14, 17, 17, 17, 21, 9, 22],  // Q
+    [30, 17, 17, 30, 5, 9, 17],   // R
+    [14, 17, 1, 14, 16, 17, 14],  // S
+    [31, 4, 4, 4, 4, 4, 4],       // T
     [17, 17, 17, 17, 17, 17, 14], // U
-    [17, 17, 17, 17, 17, 10, 4], // V
+    [17, 17, 17, 17, 17, 10, 4],  // V
     [17, 17, 17, 21, 21, 27, 17], // W
-    [17, 17, 10, 4, 10, 17, 17], // X
-    [17, 17, 10, 4, 4, 4, 4], // Y
-    [31, 16, 8, 4, 2, 1, 31], // Z
-    [30, 2, 2, 2, 2, 2, 30], // [
-    [1, 2, 2, 4, 8, 16, 16], // \
-    [30, 8, 8, 8, 8, 8, 30], // ]
-    [4, 10, 17, 0, 0, 0, 0], // ^
-    [0, 0, 0, 0, 0, 0, 31], // _
-    [4, 2, 1, 0, 0, 0, 0], // `
-    [0, 0, 14, 16, 30, 17, 30], // a
-    [1, 1, 30, 17, 17, 17, 30], // b
-    [0, 0, 14, 1, 1, 17, 14], // c
+    [17, 17, 10, 4, 10, 17, 17],  // X
+    [17, 17, 10, 4, 4, 4, 4],     // Y
+    [31, 16, 8, 4, 2, 1, 31],     // Z
+    [30, 2, 2, 2, 2, 2, 30],      // [
+    [1, 2, 2, 4, 8, 16, 16],      // \
+    [30, 8, 8, 8, 8, 8, 30],      // ]
+    [4, 10, 17, 0, 0, 0, 0],      // ^
+    [0, 0, 0, 0, 0, 0, 31],       // _
+    [4, 2, 1, 0, 0, 0, 0],        // `
+    [0, 0, 14, 16, 30, 17, 30],   // a
+    [1, 1, 30, 17, 17, 17, 30],   // b
+    [0, 0, 14, 1, 1, 17, 14],     // c
     [16, 16, 30, 17, 17, 17, 30], // d
-    [0, 0, 14, 17, 31, 1, 14], // e
-    [12, 2, 30, 2, 2, 2, 2], // f
-    [0, 30, 17, 17, 30, 16, 14], // g
-    [1, 1, 30, 17, 17, 17, 17], // h
-    [4, 0, 6, 4, 4, 4, 14], // i
-    [16, 0, 12, 16, 16, 17, 6], // j
-    [1, 1, 9, 5, 3, 5, 9], // k
-    [6, 4, 4, 4, 4, 4, 14], // l
-    [0, 0, 11, 21, 21, 21, 21], // m
-    [0, 0, 30, 17, 17, 17, 17], // n
-    [0, 0, 14, 17, 17, 17, 14], // o
-    [0, 30, 17, 17, 30, 1, 1], // p
-    [0, 30, 17, 17, 30, 16, 16], // q
-    [0, 0, 21, 19, 1, 1, 1], // r
-    [0, 0, 30, 1, 14, 16, 30], // s
-    [2, 2, 30, 2, 2, 2, 12], // t
-    [0, 0, 17, 17, 17, 17, 30], // u
-    [0, 0, 17, 17, 17, 10, 4], // v
-    [0, 0, 17, 17, 21, 21, 10], // w
-    [0, 0, 17, 10, 4, 10, 17], // x
-    [0, 17, 17, 17, 30, 16, 14], // y
-    [0, 0, 31, 8, 4, 2, 31], // z
-    [8, 4, 4, 2, 4, 4, 8], // {
-    [4, 4, 4, 4, 4, 4, 4], // |
-    [2, 4, 4, 8, 4, 4, 2], // }
-    [0, 0, 18, 9, 0, 0, 0], // ~
+    [0, 0, 14, 17, 31, 1, 14],    // e
+    [12, 2, 30, 2, 2, 2, 2],      // f
+    [0, 30, 17, 17, 30, 16, 14],  // g
+    [1, 1, 30, 17, 17, 17, 17],   // h
+    [4, 0, 6, 4, 4, 4, 14],       // i
+    [16, 0, 12, 16, 16, 17, 6],   // j
+    [1, 1, 9, 5, 3, 5, 9],        // k
+    [6, 4, 4, 4, 4, 4, 14],       // l
+    [0, 0, 11, 21, 21, 21, 21],   // m
+    [0, 0, 30, 17, 17, 17, 17],   // n
+    [0, 0, 14, 17, 17, 17, 14],   // o
+    [0, 30, 17, 17, 30, 1, 1],    // p
+    [0, 30, 17, 17, 30, 16, 16],  // q
+    [0, 0, 21, 19, 1, 1, 1],      // r
+    [0, 0, 30, 1, 14, 16, 30],    // s
+    [2, 2, 30, 2, 2, 2, 12],      // t
+    [0, 0, 17, 17, 17, 17, 30],   // u
+    [0, 0, 17, 17, 17, 10, 4],    // v
+    [0, 0, 17, 17, 21, 21, 10],   // w
+    [0, 0, 17, 10, 4, 10, 17],    // x
+    [0, 17, 17, 17, 30, 16, 14],  // y
+    [0, 0, 31, 8, 4, 2, 31],      // z
+    [8, 4, 4, 2, 4, 4, 8],        // {
+    [4, 4, 4, 4, 4, 4, 4],        // |
+    [2, 4, 4, 8, 4, 4, 2],        // }
+    [0, 0, 18, 9, 0, 0, 0],       // ~
 ];
 
 /// Draw `text` at `(x0, y0)` in the 2×-scaled [`FONT_5X7`] font: one
@@ -650,8 +661,12 @@ mod tests {
             .expect("export_json must not fail for a writable temp path");
 
         let text = std::fs::read_to_string(&path).expect("the exported file must exist");
-        let value: serde_json::Value = serde_json::from_str(&text).expect("export must be valid JSON");
-        assert!(value.is_object(), "a snapshot must serialize to a JSON object");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("export must be valid JSON");
+        assert!(
+            value.is_object(),
+            "a snapshot must serialize to a JSON object"
+        );
         let keys = value
             .as_object()
             .expect("checked is_object")
@@ -659,7 +674,14 @@ mod tests {
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
         let expected: std::collections::BTreeSet<String> = [
-            "amd", "bench", "cpu", "intel", "spd", "platform", "total_capacity", "dimm_sizes",
+            "amd",
+            "bench",
+            "cpu",
+            "intel",
+            "spd",
+            "platform",
+            "total_capacity",
+            "dimm_sizes",
             "vcore",
         ]
         .into_iter()
@@ -668,15 +690,26 @@ mod tests {
         assert_eq!(keys, expected);
 
         // The C6-29 `bench` key carries the grid verbatim.
-        let back_grid: BenchmarkGrid =
-            serde_json::from_value(value["bench"].clone()).expect("bench must re-parse into the grid");
+        let back_grid: BenchmarkGrid = serde_json::from_value(value["bench"].clone())
+            .expect("bench must re-parse into the grid");
         assert_eq!(back_grid, grid);
 
         // The telemetry sub-object is byte-compatible: every one of
         // the seven wire keys matches the pre-C6-29 serialization.
         let base = serde_json::to_value(&telemetry).expect("the wire root must serialize");
-        for key in ["cpu", "amd", "intel", "spd", "platform", "total_capacity", "dimm_sizes"] {
-            assert_eq!(value[key], base[key], "the {key} key must stay byte-compatible");
+        for key in [
+            "cpu",
+            "amd",
+            "intel",
+            "spd",
+            "platform",
+            "total_capacity",
+            "dimm_sizes",
+        ] {
+            assert_eq!(
+                value[key], base[key],
+                "the {key} key must stay byte-compatible"
+            );
         }
 
         // The wire root is serde round-trip safe (P3-06); the extra
@@ -699,7 +732,11 @@ mod tests {
 
         let bytes = std::fs::read(&path).expect("the snapshot file must exist");
         assert!(!bytes.is_empty(), "the snapshot must be non-empty");
-        assert_eq!(&bytes[..8], &PNG_SIG, "the file must start with the PNG signature");
+        assert_eq!(
+            &bytes[..8],
+            &PNG_SIG,
+            "the file must start with the PNG signature"
+        );
 
         let reader = png::Decoder::new(&bytes[..])
             .read_info()
@@ -751,8 +788,12 @@ mod tests {
     fn export_json_maps_write_failure_to_io() {
         let telemetry = ramsleuth_telemetry::collect();
         let path = temp_path("no-such-dir.json");
-        let err = export_json(&telemetry, None, &path.join("missing-dir")).expect_err("a missing parent dir must fail");
-        assert!(matches!(err, GuiError::Io(_)), "a missing parent dir must map to Io, got {err:?}");
+        let err = export_json(&telemetry, None, &path.join("missing-dir"))
+            .expect_err("a missing parent dir must fail");
+        assert!(
+            matches!(err, GuiError::Io(_)),
+            "a missing parent dir must map to Io, got {err:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -768,8 +809,12 @@ mod tests {
             .expect("export_json must not fail for a writable temp path");
 
         let text = std::fs::read_to_string(&path).expect("the exported file must exist");
-        let value: serde_json::Value = serde_json::from_str(&text).expect("export must be valid JSON");
-        assert!(value.is_object(), "a snapshot must serialize to a JSON object");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("export must be valid JSON");
+        assert!(
+            value.is_object(),
+            "a snapshot must serialize to a JSON object"
+        );
         assert!(
             value["bench"].is_null(),
             "no run yet must export `bench: null`, got: {}",
@@ -800,9 +845,10 @@ mod tests {
             .expect("export_json must not fail for a writable temp path");
 
         let text = std::fs::read_to_string(&path).expect("the exported file must exist");
-        let value: serde_json::Value = serde_json::from_str(&text).expect("export must be valid JSON");
-        let back_grid: BenchmarkGrid =
-            serde_json::from_value(value["bench"].clone()).expect("bench must re-parse into the grid");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("export must be valid JSON");
+        let back_grid: BenchmarkGrid = serde_json::from_value(value["bench"].clone())
+            .expect("bench must re-parse into the grid");
         assert_eq!(back_grid, grid, "the all-N/A grid must export as-is");
 
         let _ = std::fs::remove_file(&path);
@@ -816,13 +862,31 @@ mod tests {
         let a = GuiError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
         let b = a.clone();
         assert_eq!(a, b, "clone must preserve kind + message");
-        assert_eq!(a, GuiError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone")));
-        assert_ne!(a, GuiError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "gone")));
+        assert_eq!(
+            a,
+            GuiError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+        );
+        assert_ne!(
+            a,
+            GuiError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "gone"
+            ))
+        );
         assert_ne!(a, GuiError::Png("x".to_owned()));
         assert_eq!(a.to_string(), "export I/O error: gone");
-        assert_eq!(GuiError::Png("bad idat".into()).to_string(), "PNG encode error: bad idat");
-        assert_eq!(GuiError::Json("bad json".into()).to_string(), "JSON serialize error: bad json");
-        assert!(std::error::Error::source(&a).is_some(), "the Io arm must expose its source");
+        assert_eq!(
+            GuiError::Png("bad idat".into()).to_string(),
+            "PNG encode error: bad idat"
+        );
+        assert_eq!(
+            GuiError::Json("bad json".into()).to_string(),
+            "JSON serialize error: bad json"
+        );
+        assert!(
+            std::error::Error::source(&a).is_some(),
+            "the Io arm must expose its source"
+        );
         assert!(std::error::Error::source(&GuiError::Png("x".into())).is_none());
     }
 
@@ -835,7 +899,10 @@ mod tests {
         dimms: Vec<Section<f64>>,
     ) -> SystemMemoryTelemetry {
         SystemMemoryTelemetry {
-            cpu: CpuInfo { vendor: CpuVendor::Amd(AmdZen::Zen3), brand: "Ryzen 9 5950X".to_owned() },
+            cpu: CpuInfo {
+                vendor: CpuVendor::Amd(AmdZen::Zen3),
+                brand: "Ryzen 9 5950X".to_owned(),
+            },
             amd: Section::na(NaReason::NotApplicable),
             intel: Section::na(NaReason::NotApplicable),
             spd: Vec::new(),
@@ -870,8 +937,11 @@ mod tests {
     /// contract): an Na clock, an Na capacity, zero bound DIMMs.
     #[test]
     fn snapshot_lines_degrade_to_na() {
-        let t =
-            fixture_telemetry(Section::na(NaReason::NotApplicable), Section::na(NaReason::NotApplicable), Vec::new());
+        let t = fixture_telemetry(
+            Section::na(NaReason::NotApplicable),
+            Section::na(NaReason::NotApplicable),
+            Vec::new(),
+        );
         assert_eq!(snapshot_cpu_line(&t), "CPU: Ryzen 9 5950X @ N/A");
         assert_eq!(snapshot_ram_line(&t), "RAM: N/A | N/A");
     }
@@ -941,7 +1011,8 @@ mod tests {
             };
             assert_eq!(
                 intel_channel_label(&t),
-                ro.channel_display_label().expect("a resolved mode has a label"),
+                ro.channel_display_label()
+                    .expect("a resolved mode has a label"),
                 "the GUI channel label must equal the shared single-source label"
             );
         }
@@ -963,8 +1034,14 @@ mod tests {
     #[test]
     fn now_epoch_secs_is_plausible() {
         let secs = now_epoch_secs();
-        assert!(secs > 1_577_836_800, "expected a post-2020 count, got: {secs}");
-        assert!(secs < 4_102_444_800, "expected a pre-2100 count, got: {secs}");
+        assert!(
+            secs > 1_577_836_800,
+            "expected a post-2020 count, got: {secs}"
+        );
+        assert!(
+            secs < 4_102_444_800,
+            "expected a pre-2100 count, got: {secs}"
+        );
     }
 
     /// (c2) The card layout (C6-28): a 640×420 RGB8 card with the
@@ -984,13 +1061,16 @@ mod tests {
         let bytes = std::fs::read(&path).expect("the card file must exist");
         assert_eq!(&bytes[..8], &PNG_SIG);
 
-        let mut reader =
-            png::Decoder::new(&bytes[..]).read_info().expect("a valid PNG has a header");
+        let mut reader = png::Decoder::new(&bytes[..])
+            .read_info()
+            .expect("a valid PNG has a header");
         let info = reader.info();
         assert_eq!((info.width, info.height), (CARD_W as u32, CARD_H as u32));
         assert_eq!(info.color_type, png::ColorType::Rgb);
         let mut img = vec![0u8; reader.output_buffer_size()];
-        reader.next_frame(&mut img).expect("the card payload must decode");
+        reader
+            .next_frame(&mut img)
+            .expect("the card payload must decode");
 
         let slate = (SLATE.r(), SLATE.g(), SLATE.b());
         // The title's first glyph (the `R` of `RamSleuth`) sits at the
@@ -1009,14 +1089,22 @@ mod tests {
             "the title glyph must be CYAN"
         );
         // The gap between the separator and the grid stays SLATE...
-        assert_eq!(pixel(&img, 320, 95), slate, "the header/grid gap must be SLATE");
+        assert_eq!(
+            pixel(&img, 320, 95),
+            slate,
+            "the header/grid gap must be SLATE"
+        );
         // ...the separator line renders DIM_CELL...
         assert_eq!(
             pixel(&img, 320, SEPARATOR_Y),
             (DIM_CELL.r(), DIM_CELL.g(), DIM_CELL.b())
         );
         // ...and a measured grid cell is painted (not the background).
-        assert_ne!(pixel(&img, 86, 132), slate, "a measured cell must be painted");
+        assert_ne!(
+            pixel(&img, 86, 132),
+            slate,
+            "a measured cell must be painted"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

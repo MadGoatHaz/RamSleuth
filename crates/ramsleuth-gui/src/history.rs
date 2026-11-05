@@ -106,7 +106,11 @@ impl<T> RingBuffer<T> {
         // `resize_with` (not `vec![None; n]`): no `T: Clone` bound.
         let mut data: Vec<Option<T>> = Vec::with_capacity(capacity);
         data.resize_with(capacity, || None);
-        Self { data, head: 0, len: 0 }
+        Self {
+            data,
+            head: 0,
+            len: 0,
+        }
     }
 
     /// Append `value` as the newest sample. Once the buffer is full
@@ -297,7 +301,11 @@ fn sample_points(samples: &[f64], rect: Rect) -> Vec<Pos2> {
     if rect.width() <= 1.0 || rect.height() <= 1.0 {
         return Vec::new();
     }
-    let finite: Vec<f64> = samples.iter().copied().filter(|value| value.is_finite()).collect();
+    let finite: Vec<f64> = samples
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
     let count = finite.len();
     let span = max - min; // ≥ 0.0; 0.0 = a flat series (the midline).
     finite
@@ -491,7 +499,11 @@ mod tests {
         assert_eq!(buf.len(), 5);
         assert_eq!(buf.last(), Some(&7));
         let order: Vec<u32> = buf.iter().copied().collect();
-        assert_eq!(order, vec![3, 4, 5, 6, 7], "the oldest three (0, 1, 2) must be evicted, in order");
+        assert_eq!(
+            order,
+            vec![3, 4, 5, 6, 7],
+            "the oldest three (0, 1, 2) must be evicted, in order"
+        );
     }
 
     /// (d) The default 300-capacity buffer: push 350 — the first 50
@@ -505,7 +517,11 @@ mod tests {
         assert!(buf.is_full());
         assert_eq!(buf.len(), HISTORY_CAPACITY);
         assert_eq!(buf.last(), Some(&349.0));
-        assert_eq!(buf.iter().next(), Some(&50.0), "the 50 oldest must be evicted");
+        assert_eq!(
+            buf.iter().next(),
+            Some(&50.0),
+            "the 50 oldest must be evicted"
+        );
     }
 
     /// (e) `clear` drops every sample (the head rewinds) and pushes
@@ -573,7 +589,10 @@ mod tests {
     fn finite_min_max_skips_non_finite() {
         assert_eq!(finite_min_max(&[]), None);
         assert_eq!(finite_min_max(&[f64::NAN]), None);
-        assert_eq!(finite_min_max(&[f64::INFINITY, f64::NEG_INFINITY, f64::NAN]), None);
+        assert_eq!(
+            finite_min_max(&[f64::INFINITY, f64::NEG_INFINITY, f64::NAN]),
+            None
+        );
         assert_eq!(finite_min_max(&[3.0, 1.0, 9.0]), Some((1.0, 9.0)));
         assert_eq!(
             finite_min_max(&[f64::INFINITY, 2.0, f64::NEG_INFINITY, 8.0]),
@@ -588,12 +607,15 @@ mod tests {
     #[test]
     fn sample_points_degenerate_inputs_are_empty() {
         assert!(sample_points(&[], plot_rect()).is_empty());
-        assert!(sample_points(&[f64::NAN, f64::INFINITY, f64::NEG_INFINITY], plot_rect()).is_empty());
-        assert!(sample_points(&[1.0, 2.0, 3.0], Rect::NOTHING).is_empty());
         assert!(
-            sample_points(&[1.0, 2.0, 3.0], Rect::from_min_size(Pos2::new(5.0, 5.0), Vec2::ZERO))
-                .is_empty()
+            sample_points(&[f64::NAN, f64::INFINITY, f64::NEG_INFINITY], plot_rect()).is_empty()
         );
+        assert!(sample_points(&[1.0, 2.0, 3.0], Rect::NOTHING).is_empty());
+        assert!(sample_points(
+            &[1.0, 2.0, 3.0],
+            Rect::from_min_size(Pos2::new(5.0, 5.0), Vec2::ZERO)
+        )
+        .is_empty());
     }
 
     /// (j) A single sample is one point at the rect's center (the
@@ -629,7 +651,10 @@ mod tests {
         let points = sample_points(&[7.0, 7.0, 7.0], plot_rect());
         assert_eq!(points.len(), 3);
         for point in &points {
-            assert!(close(point.y, 45.0), "a flat series must sit on the midline");
+            assert!(
+                close(point.y, 45.0),
+                "a flat series must sit on the midline"
+            );
         }
         assert!(close(points[0].x, 10.0));
         assert!(close(points[2].x, 110.0));

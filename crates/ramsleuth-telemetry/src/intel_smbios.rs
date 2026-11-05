@@ -399,31 +399,45 @@ pub fn collect_module_entries() -> (Vec<SmbiosModuleEntry>, SmbiosSourceStatus) 
     collect_module_entries_from(Path::new(DMI_ENTRIES_DIR))
 }
 
-/// The injectable-root [`collect_module_entries`] (the fixture tests pass
-/// a temp directory holding synthetic `17-*` files).
-pub fn collect_module_entries_from(
+/// Single-pass collection of both the SMBIOS topology and the full
+/// module-entry list from the same DMI directory read.
+///
+/// This avoids the double I/O (and the minor inconsistency risk of the
+/// directory changing between reads) of calling [`collect_from`] and then
+/// re-parsing the entries separately. Both [`collect_from`] and
+/// [`collect_module_entries_from`] delegate here so they always agree on
+/// the parsed data.
+///
+/// Returns `(topology, status, module_entries)`.
+fn collect_topology_and_entries_from(
     root: &Path,
-) -> (Vec<SmbiosModuleEntry>, SmbiosSourceStatus) {
-    let (topology, status) = collect_from(root);
-    // If the topology is empty, there are no entries.
-    if topology.populated_count == 0 {
-        return (Vec::new(), status);
-    }
-    // Re-parse the entries to build the full module list. We reuse the
-    // same parsing logic as collect_from but keep all per-DIMM data.
-    let entries = parse_module_entries_from(root);
-    (entries, status)
-}
-
-/// Parse all populated Type 17 entries from `root` into
-/// [`SmbiosModuleEntry`] structs (Chunk 4 internal helper).
-fn parse_module_entries_from(root: &Path) -> Vec<SmbiosModuleEntry> {
+) -> (SmbiosTopology, SmbiosSourceStatus, Vec<SmbiosModuleEntry>) {
+    let mut topology = SmbiosTopology::empty();
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            // M-17: distinguish "absent" (VM / container / non-Intel) from
+            // a permission / I/O failure.
+            let status = if e.kind() == std::io::ErrorKind::NotFound {
+                SmbiosSourceStatus::DirAbsent
+            } else {
+                SmbiosSourceStatus::Unreadable
+            };
+            return (topology, status, Vec::new());
+        }
     };
+    // M-12: the SMBIOS major version selects the Type 17 offset table
+    // (3.x carries the +2 `Error Information Handle` shift; 2.x does not).
     let major = read_bios_major(root);
-    let offsets = if major >= 3 { SMBIOS3_OFFSETS } else { SMBIOS2_OFFSETS };
+    let offsets = if major >= 3 {
+        SMBIOS3_OFFSETS
+    } else {
+        SMBIOS2_OFFSETS
+    };
+    // Collect the Type 17 entries and sort by file name for a deterministic
+    // processing order (the kernel numbers them `17-0`, `17-1`, ...;
+    // `read_dir` order is filesystem-dependent, so sorting keeps the
+    // locator / slot order stable across hosts and tests).
     let mut paths: Vec<std::path::PathBuf> = entries
         .flatten()
         .map(|e| e.path())
@@ -434,18 +448,34 @@ fn parse_module_entries_from(root: &Path) -> Vec<SmbiosModuleEntry> {
         })
         .collect();
     paths.sort();
-
-    let mut out = Vec::new();
+    // M-17: a present-but-corrupt structure (or an unreadable `raw` file)
+    // is a parse failure, distinct from a valid unpopulated DIMM.
+    let mut saw_invalid = false;
+    let mut module_entries = Vec::new();
     for (ordinal, path) in paths.into_iter().enumerate() {
         // The kernel exports each `17-<n>` as a *directory*; the
         // structure bytes live in the payload file `17-<n>/raw`.
         let bytes = match std::fs::read(path.join("raw")) {
             Ok(b) => b,
-            Err(_) => continue, // unreadable -> skip (no panic)
+            Err(_) => {
+                saw_invalid = true;
+                continue; // unreadable -> skip (no panic)
+            }
         };
         match parse_type17_full(&bytes, &offsets) {
             Type17Parse::Populated(parsed) => {
-                out.push(SmbiosModuleEntry {
+                // Topology data (shared with collect_from)
+                topology.populated_count = topology.populated_count.saturating_add(1);
+                topology.dimm_sizes.push(parsed.capacity_mib);
+                if topology.memory_type.is_none() {
+                    topology.memory_type = parsed.memory_type;
+                }
+                if topology.speed_mts.is_none() {
+                    topology.speed_mts = parsed.speed_mts;
+                }
+                topology.locators.push(parsed.locator.clone());
+                // Full module entry (the SPD fallback data)
+                module_entries.push(SmbiosModuleEntry {
                     index: ordinal as u8,
                     capacity_mib: parsed.capacity_mib,
                     memory_type: parsed.memory_type,
@@ -473,10 +503,35 @@ fn parse_module_entries_from(root: &Path) -> Vec<SmbiosModuleEntry> {
                 });
             }
             Type17Parse::Unpopulated => {} // valid structure, empty DIMM
-            Type17Parse::Invalid => {} // corrupt -> skip
+            Type17Parse::Invalid => saw_invalid = true,
         }
     }
-    out
+    // Total capacity = the sum of the per-DIMM sizes (MiB).
+    topology.total_capacity_mib = topology.dimm_sizes.iter().sum::<u64>() as u32;
+    // Channel grammar (M-15): the data-driven [`CHANNEL_PATTERNS`] table is
+    // vendor-neutral, so no DMI board name is needed to resolve channels.
+    topology.derived_mode = derive_mode(&topology.locators);
+    let status = if saw_invalid {
+        SmbiosSourceStatus::ParseError
+    } else {
+        SmbiosSourceStatus::Ok
+    };
+    (topology, status, module_entries)
+}
+
+/// The injectable-root [`collect_module_entries`] (the fixture tests pass
+/// a temp directory holding synthetic `17-*` files).
+///
+/// Delegates to the single-pass [`collect_topology_and_entries_from`] so
+/// the DMI directory is read exactly once (not twice as in the original
+/// implementation that called [`collect_from`] then re-parsed).
+pub fn collect_module_entries_from(root: &Path) -> (Vec<SmbiosModuleEntry>, SmbiosSourceStatus) {
+    let (topology, status, entries) = collect_topology_and_entries_from(root);
+    // If the topology is empty, there are no entries.
+    if topology.populated_count == 0 {
+        return (Vec::new(), status);
+    }
+    (entries, status)
 }
 
 /// Collect the SMBIOS Type 17 topology from the kernel's `dmi` export
@@ -499,79 +554,12 @@ pub fn collect() -> (SmbiosTopology, SmbiosSourceStatus) {
 /// holding synthetic `17-*` files). Any missing / unreadable source
 /// degrades to the empty topology (with the matching
 /// [`SmbiosSourceStatus`], M-17).
+///
+/// Delegates to the single-pass [`collect_topology_and_entries_from`] so
+/// the topology always agrees with the module entries (they are parsed
+/// from the same directory read).
 pub fn collect_from(root: &Path) -> (SmbiosTopology, SmbiosSourceStatus) {
-    let mut topology = SmbiosTopology::empty();
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(e) => {
-            // M-17: distinguish "absent" (VM / container / non-Intel) from
-            // a permission / I/O failure.
-            let status = if e.kind() == std::io::ErrorKind::NotFound {
-                SmbiosSourceStatus::DirAbsent
-            } else {
-                SmbiosSourceStatus::Unreadable
-            };
-            return (topology, status);
-        }
-    };
-    // M-12: the SMBIOS major version selects the Type 17 offset table
-    // (3.x carries the +2 `Error Information Handle` shift; 2.x does not).
-    let major = read_bios_major(root);
-    let offsets = if major >= 3 { SMBIOS3_OFFSETS } else { SMBIOS2_OFFSETS };
-    // Collect the Type 17 entries and sort by file name for a deterministic
-    // processing order (the kernel numbers them `17-0`, `17-1`, ...;
-    // `read_dir` order is filesystem-dependent, so sorting keeps the
-    // locator / slot order stable across hosts and tests).
-    let mut paths: Vec<std::path::PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(TYPE17_PREFIX))
-        })
-        .collect();
-    paths.sort();
-    // M-17: a present-but-corrupt structure (or an unreadable `raw` file)
-    // is a parse failure, distinct from a valid unpopulated DIMM.
-    let mut saw_invalid = false;
-    for path in paths {
-        // The kernel exports each `17-<n>` as a *directory*; the
-        // structure bytes live in the payload file `17-<n>/raw`.
-        let bytes = match std::fs::read(path.join("raw")) {
-            Ok(b) => b,
-            Err(_) => {
-                saw_invalid = true;
-                continue; // unreadable -> skip (no panic)
-            }
-        };
-        match parse_type17(&bytes, &offsets) {
-            Type17Parse::Populated(parsed) => {
-                topology.populated_count = topology.populated_count.saturating_add(1);
-                topology.dimm_sizes.push(parsed.capacity_mib);
-                if topology.memory_type.is_none() {
-                    topology.memory_type = parsed.memory_type;
-                }
-                if topology.speed_mts.is_none() {
-                    topology.speed_mts = parsed.speed_mts;
-                }
-                topology.locators.push(parsed.locator);
-            }
-            Type17Parse::Unpopulated => {} // valid structure, empty DIMM
-            Type17Parse::Invalid => saw_invalid = true,
-        }
-    }
-    // Total capacity = the sum of the per-DIMM sizes (MiB).
-    topology.total_capacity_mib = topology.dimm_sizes.iter().sum::<u64>() as u32;
-    // Channel grammar (M-15): the data-driven [`CHANNEL_PATTERNS`] table is
-    // vendor-neutral (the per-firmware `Controller<digit>` grammar is now in
-    // the table), so no DMI board name is needed to resolve channels.
-    topology.derived_mode = derive_mode(&topology.locators);
-    let status = if saw_invalid {
-        SmbiosSourceStatus::ParseError
-    } else {
-        SmbiosSourceStatus::Ok
-    };
+    let (topology, status, _entries) = collect_topology_and_entries_from(root);
     (topology, status)
 }
 
@@ -608,22 +596,6 @@ enum Type17Parse {
     Unpopulated,
     /// A corrupt / too-short structure (a parse failure).
     Invalid,
-}
-
-/// Parse one raw SMBIOS Type 17 structure using the given version's
-/// [`Type17Offsets`] (M-12), classifying the outcome (M-17): a populated
-/// DIMM, a valid unpopulated DIMM, or a corrupt / too-short structure.
-///
-/// Chunk 4: the populated arm now carries the full [`ParsedModule`]
-/// (capacity, memory type, locator, speed, and the new string-reference
-/// fields: manufacturer, serial number, asset tag, part number).
-///
-/// # No-panic contract
-///
-/// Every field read is bounds-checked; a short / corrupt structure yields
-/// [`Type17Parse::Invalid`] (skipped) rather than a panic.
-fn parse_type17(bytes: &[u8], offsets: &Type17Offsets) -> Type17Parse {
-    parse_type17_full(bytes, offsets)
 }
 
 /// The full Type 17 parser (Chunk 4): extracts every field the
@@ -761,7 +733,8 @@ fn string_at(table: &[u8], ref_idx: u8) -> Option<String> {
     // String ref `N` = the `N`th segment (no leading empty segment in a
     // real table); the trailing null terminator yields an empty segment,
     // which is not a string.
-    parts.get(ref_idx as usize - 1)
+    parts
+        .get(ref_idx as usize - 1)
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .filter(|s| !s.is_empty())
 }
@@ -827,9 +800,7 @@ fn channel_of(locator: &str) -> Option<char> {
     }
     for w in &words {
         let b = w.as_bytes();
-        if b.len() >= 2
-            && matches!(b[0], b'a'..=b'd')
-            && b[1..].iter().all(|c| c.is_ascii_digit())
+        if b.len() >= 2 && matches!(b[0], b'a'..=b'd') && b[1..].iter().all(|c| c.is_ascii_digit())
         {
             return Some(channel_char(b[0] - b'a'));
         }
@@ -881,11 +852,7 @@ mod tests {
     /// (string ref `N` = the `N`th string — **no** leading empty segment,
     /// exactly like the kernel's real tables). Returns the full image the
     /// kernel exports at `17-<n>/raw`.
-    fn type17_file(
-        len: usize,
-        fixed: &mut [u8],
-        strings: &[&str],
-    ) -> Vec<u8> {
+    fn type17_file(len: usize, fixed: &mut [u8], strings: &[&str]) -> Vec<u8> {
         assert!(fixed.len() >= len, "fixed must be at least `len` bytes");
         fixed[OFF_LENGTH] = len as u8;
         let mut out = fixed.to_vec();
@@ -917,8 +884,8 @@ mod tests {
 
     impl TempDmi {
         fn new(test: &str) -> Self {
-            let base = std::env::temp_dir()
-                .join(format!("ramsleuth-dmi-{test}-{}", std::process::id()));
+            let base =
+                std::env::temp_dir().join(format!("ramsleuth-dmi-{test}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(base.join("entries")).expect("dmi entries dir");
             Self {
@@ -930,8 +897,7 @@ mod tests {
         fn write_bios_major(&self, major: u8) {
             let id = self.root.parent().expect("base dir").join("id");
             std::fs::create_dir_all(&id).expect("dmi id dir");
-            std::fs::write(id.join("bios_major"), major.to_string())
-                .expect("bios_major write");
+            std::fs::write(id.join("bios_major"), major.to_string()).expect("bios_major write");
         }
     }
 
@@ -992,37 +958,39 @@ mod tests {
     /// fixed part + the string region). Captured byte-for-byte from the
     /// reference host's `/sys/firmware/dmi/entries` (evidence:
     /// `work/scratch/DeepSeek Report.md:28-41`).
-const REAL_12600KF_17_0: &[u8] = &[
-        0x11, 0x5C, 0x0C, 0x00, 0x0B, 0x00, 0xFE, 0xFF, 0x40, 0x00, 0x40, 0x00, 0x00, 0x40, 0x09, 0x00,
-        0x01, 0x02, 0x1A, 0x80, 0x00, 0x60, 0x09, 0x03, 0x04, 0x05, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x10, 0x0E, 0xB0, 0x04, 0x46, 0x05, 0xB0, 0x04, 0x03, 0x08, 0x00, 0x00, 0x04, 0xEF, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0x6F, 0x6E, 0x74,
-        0x72, 0x6F, 0x6C, 0x6C, 0x65, 0x72, 0x30, 0x2D, 0x43, 0x68, 0x61, 0x6E, 0x6E, 0x65, 0x6C, 0x41,
-        0x2D, 0x44, 0x49, 0x4D, 0x4D, 0x30, 0x00, 0x42, 0x41, 0x4E, 0x4B, 0x20, 0x30, 0x00, 0x54, 0x65,
-        0x61, 0x6D, 0x20, 0x47, 0x72, 0x6F, 0x75, 0x70, 0x20, 0x49, 0x6E, 0x63, 0x00, 0x30, 0x31, 0x30,
-        0x34, 0x44, 0x38, 0x31, 0x37, 0x00, 0x39, 0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x30,
-        0x00, 0x54, 0x45, 0x41, 0x4D, 0x47, 0x52, 0x4F, 0x55, 0x50, 0x2D, 0x55, 0x44, 0x34, 0x2D, 0x33,
-        0x36, 0x30, 0x30, 0x20, 0x20, 0x00, 0x00,
+    const REAL_12600KF_17_0: &[u8] = &[
+        0x11, 0x5C, 0x0C, 0x00, 0x0B, 0x00, 0xFE, 0xFF, 0x40, 0x00, 0x40, 0x00, 0x00, 0x40, 0x09,
+        0x00, 0x01, 0x02, 0x1A, 0x80, 0x00, 0x60, 0x09, 0x03, 0x04, 0x05, 0x06, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x10, 0x0E, 0xB0, 0x04, 0x46, 0x05, 0xB0, 0x04, 0x03, 0x08, 0x00, 0x00, 0x04,
+        0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x43, 0x6F, 0x6E, 0x74, 0x72, 0x6F, 0x6C, 0x6C, 0x65, 0x72, 0x30, 0x2D, 0x43,
+        0x68, 0x61, 0x6E, 0x6E, 0x65, 0x6C, 0x41, 0x2D, 0x44, 0x49, 0x4D, 0x4D, 0x30, 0x00, 0x42,
+        0x41, 0x4E, 0x4B, 0x20, 0x30, 0x00, 0x54, 0x65, 0x61, 0x6D, 0x20, 0x47, 0x72, 0x6F, 0x75,
+        0x70, 0x20, 0x49, 0x6E, 0x63, 0x00, 0x30, 0x31, 0x30, 0x34, 0x44, 0x38, 0x31, 0x37, 0x00,
+        0x39, 0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x30, 0x00, 0x54, 0x45, 0x41, 0x4D,
+        0x47, 0x52, 0x4F, 0x55, 0x50, 0x2D, 0x55, 0x44, 0x34, 0x2D, 0x33, 0x36, 0x30, 0x30, 0x20,
+        0x20, 0x00, 0x00,
     ];
 
     /// The same real table for handle `0x000D` (`17-1/raw`): the
     /// `Controller1` locator + serial `0104D816` (evidence: `work/scratch/
     /// DeepSeek Report.md:43-56`).
-const REAL_12600KF_17_1: &[u8] = &[
-        0x11, 0x5C, 0x0D, 0x00, 0x0B, 0x00, 0xFE, 0xFF, 0x40, 0x00, 0x40, 0x00, 0x00, 0x40, 0x09, 0x00,
-        0x01, 0x02, 0x1A, 0x80, 0x00, 0x60, 0x09, 0x03, 0x04, 0x05, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x10, 0x0E, 0xB0, 0x04, 0x46, 0x05, 0xB0, 0x04, 0x03, 0x08, 0x00, 0x00, 0x04, 0xEF, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0x6F, 0x6E, 0x74,
-        0x72, 0x6F, 0x6C, 0x6C, 0x65, 0x72, 0x31, 0x2D, 0x43, 0x68, 0x61, 0x6E, 0x6E, 0x65, 0x6C, 0x41,
-        0x2D, 0x44, 0x49, 0x4D, 0x4D, 0x30, 0x00, 0x42, 0x41, 0x4E, 0x4B, 0x20, 0x30, 0x00, 0x54, 0x65,
-        0x61, 0x6D, 0x20, 0x47, 0x72, 0x6F, 0x75, 0x70, 0x20, 0x49, 0x6E, 0x63, 0x00, 0x30, 0x31, 0x30,
-        0x34, 0x44, 0x38, 0x31, 0x36, 0x00, 0x39, 0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x30,
-        0x00, 0x54, 0x45, 0x41, 0x4D, 0x47, 0x52, 0x4F, 0x55, 0x50, 0x2D, 0x55, 0x44, 0x34, 0x2D, 0x33,
-        0x36, 0x30, 0x30, 0x20, 0x20, 0x00, 0x00,
+    const REAL_12600KF_17_1: &[u8] = &[
+        0x11, 0x5C, 0x0D, 0x00, 0x0B, 0x00, 0xFE, 0xFF, 0x40, 0x00, 0x40, 0x00, 0x00, 0x40, 0x09,
+        0x00, 0x01, 0x02, 0x1A, 0x80, 0x00, 0x60, 0x09, 0x03, 0x04, 0x05, 0x06, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x10, 0x0E, 0xB0, 0x04, 0x46, 0x05, 0xB0, 0x04, 0x03, 0x08, 0x00, 0x00, 0x04,
+        0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x43, 0x6F, 0x6E, 0x74, 0x72, 0x6F, 0x6C, 0x6C, 0x65, 0x72, 0x31, 0x2D, 0x43,
+        0x68, 0x61, 0x6E, 0x6E, 0x65, 0x6C, 0x41, 0x2D, 0x44, 0x49, 0x4D, 0x4D, 0x30, 0x00, 0x42,
+        0x41, 0x4E, 0x4B, 0x20, 0x30, 0x00, 0x54, 0x65, 0x61, 0x6D, 0x20, 0x47, 0x72, 0x6F, 0x75,
+        0x70, 0x20, 0x49, 0x6E, 0x63, 0x00, 0x30, 0x31, 0x30, 0x34, 0x44, 0x38, 0x31, 0x36, 0x00,
+        0x39, 0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x30, 0x00, 0x54, 0x45, 0x41, 0x4D,
+        0x47, 0x52, 0x4F, 0x55, 0x50, 0x2D, 0x55, 0x44, 0x34, 0x2D, 0x33, 0x36, 0x30, 0x30, 0x20,
+        0x20, 0x00, 0x00,
     ];
 
     /// (a) Two populated DDR4 DIMMs in matched slots `A2` + `B2` → the
@@ -1146,7 +1114,11 @@ const REAL_12600KF_17_1: &[u8] = &[
         write_entry(&dmi.root, 1, &populated_ddr4_speed("B2", 2400));
 
         let (t, _status) = collect_from(&dmi.root);
-        assert_eq!(t.speed_mts, Some(2400), "the configured speed is MT/s directly");
+        assert_eq!(
+            t.speed_mts,
+            Some(2400),
+            "the configured speed is MT/s directly"
+        );
         assert_eq!(t.total_capacity_mib, 32768, "2 x 16384 MiB");
         assert_eq!(t.populated_count, 2);
     }
@@ -1482,8 +1454,7 @@ const REAL_12600KF_17_1: &[u8] = &[
         let o = SMBIOS3_OFFSETS;
         let mut fixed = [0u8; 0x22];
         fixed[OFF_LENGTH] = 0x22;
-        fixed[o.capacity..o.capacity + CAPACITY_LEN]
-            .copy_from_slice(&0x4000u16.to_le_bytes());
+        fixed[o.capacity..o.capacity + CAPACITY_LEN].copy_from_slice(&0x4000u16.to_le_bytes());
         fixed[o.mem_device_locator] = 1;
         fixed[o.bank_locator] = 2;
         fixed[o.memory_type] = 0x1A; // DDR4

@@ -61,7 +61,10 @@ Exit codes:
 /// the version is the crate's `CARGO_PKG_VERSION` (the workspace
 /// release, so it tracks it automatically).
 fn version_line() -> String {
-    format!("ramSleuth ramsleuth-telemetry v{}", env!("CARGO_PKG_VERSION"))
+    format!(
+        "ramSleuth ramsleuth-telemetry v{}",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// The startup short-circuit for a raw argument (checked by `main`
@@ -270,7 +273,10 @@ fn na_line(out: &mut String, reason: &NaReason) {
 fn rows(out: &mut String, indent: &str, pairs: &[(&str, String)]) {
     let key_pad = pairs.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
     for (key, value) in pairs {
-        out.push_str(&format!("{indent}{key:<key_pad$}  {value}\n", key_pad = key_pad));
+        out.push_str(&format!(
+            "{indent}{key:<key_pad$}  {value}\n",
+            key_pad = key_pad
+        ));
     }
 }
 
@@ -380,7 +386,14 @@ fn vendor_text(vendor: &CpuVendor) -> String {
 fn cpu_section_text(cpu: &CpuInfo) -> String {
     let mut out = String::new();
     header(&mut out, "CPU");
-    rows(&mut out, "  ", &[("vendor", vendor_text(&cpu.vendor)), ("brand", cpu.brand.clone())]);
+    rows(
+        &mut out,
+        "  ",
+        &[
+            ("vendor", vendor_text(&cpu.vendor)),
+            ("brand", cpu.brand.clone()),
+        ],
+    );
     out.push('\n');
     out
 }
@@ -415,7 +428,11 @@ fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
 fn vcore_section_text(vcore: &Section<VoltageTelemetry>) -> String {
     let mut out = String::new();
     header(&mut out, "Vcore");
-    rows(&mut out, "  ", &[("CPU Core Voltage", vcore_display(vcore))]);
+    rows(
+        &mut out,
+        "  ",
+        &[("CPU Core Voltage", vcore_display(vcore))],
+    );
     out.push('\n');
     out
 }
@@ -546,13 +563,14 @@ fn intel_channel_text(channel: &IntelChannel, vendor: &CpuVendor) -> String {
     out
 }
 
-/// One `--- Module 0xNN (DDRn) ---` block: the module identity rows plus
-/// one line per factory-rated profile.
+/// One `--- DIMM N (DDRn) ---` block: the module identity rows plus
+/// one line per factory-rated profile. The index is decimal (not hex)
+/// so SMBIOS fallback ordinals are not mistaken for I2C addresses.
 fn spd_module_text(module: &SpdModule) -> String {
     let index = module.index;
     let gen = if module.is_ddr5 { "DDR5" } else { "DDR4" };
     let mut out = String::new();
-    subheader(&mut out, &format!("Module 0x{index:02X} ({gen})"));
+    subheader(&mut out, &format!("DIMM {index} ({gen})"));
     rows(
         &mut out,
         "  ",
@@ -585,12 +603,10 @@ fn spd_profile_text(is_ddr5: bool, profile: &SpdProfile) -> String {
     let trp = cell(&profile.trp);
     let tras = cell(&profile.tras);
     let voltage = volts(&profile.voltage);
-    format!(
-        "  profile {index} ({scheme}): {speed}, {cas}-{trcd}-{trp}-{tras} @ {voltage}\n"
-    )
+    format!("  profile {index} ({scheme}): {speed}, {cas}-{trcd}-{trp}-{tras} @ {voltage}\n")
 }
 
-/// The `=== SPD ===` section: one `--- Module 0xNN ---` block per decoded
+/// The `=== SPD ===` section: one `--- DIMM N ---` block per decoded
 /// module, or a no-modules note when the list is empty.
 fn spd_section_text(modules: &[SpdModule]) -> String {
     let mut out = String::new();
@@ -665,7 +681,10 @@ fn json_escape(s: &str) -> String {
 pub(crate) fn to_json(t: &SystemMemoryTelemetry, smbios: &SmbiosTopology) -> String {
     let amd = match &t.amd {
         Section::Na(_) => "null".to_owned(),
-        _ => format!("\"{}\"", json_escape(&amd_section_text(&t.amd, &t.cpu.vendor))),
+        _ => format!(
+            "\"{}\"",
+            json_escape(&amd_section_text(&t.amd, &t.cpu.vendor))
+        ),
     };
     let intel = match &t.intel {
         Section::Na(_) => "null".to_owned(),
@@ -736,7 +755,7 @@ mod tests {
     use ramsleuth_telemetry::amd_readout::{CommandRate, EccStatus, MemoryChannelMode};
     use ramsleuth_telemetry::cpuid::{AmdZen, IntelGen};
     use ramsleuth_telemetry::intel_readout::{
-        ChannelMode, ChannelRegs, MemoryTech, fixture_channel_regs, fixture_intel_readout,
+        fixture_channel_regs, fixture_intel_readout, ChannelMode, ChannelRegs, MemoryTech,
     };
     use ramsleuth_telemetry::intel_smbios::DerivedMode;
     use ramsleuth_telemetry::{RailConfidence, SystemPlatform};
@@ -900,12 +919,24 @@ mod tests {
     #[test]
     fn tc_cli3_na_renders_the_human_phrase_not_debug() {
         assert_eq!(na_cell(&NaReason::DriverMissing), "N/A (driver missing)");
-        assert_eq!(na_cell(&NaReason::UnsupportedHardware), "N/A (unsupported CPU)");
-        assert_eq!(na_cell(&NaReason::InsufficientPrivilege), "N/A (insufficient privilege)");
-        assert_eq!(na_cell(&NaReason::UnknownPmTableVersion), "N/A (new PM table)");
+        assert_eq!(
+            na_cell(&NaReason::UnsupportedHardware),
+            "N/A (unsupported CPU)"
+        );
+        assert_eq!(
+            na_cell(&NaReason::InsufficientPrivilege),
+            "N/A (insufficient privilege)"
+        );
+        assert_eq!(
+            na_cell(&NaReason::UnknownPmTableVersion),
+            "N/A (new PM table)"
+        );
         // A non-empty `ParseError` detail renders the true reason verbatim;
         // an empty one falls back to the generic "decode failed" phrase.
-        assert_eq!(na_cell(&NaReason::ParseError(String::new())), "N/A (decode failed)");
+        assert_eq!(
+            na_cell(&NaReason::ParseError(String::new())),
+            "N/A (decode failed)"
+        );
         assert_eq!(
             na_cell(&NaReason::ParseError(
                 "server uncore: no OS-accessible timing source".to_owned()
@@ -934,30 +965,68 @@ mod tests {
         let t = representative();
         let dash = render_dashboard(&t, &SmbiosTopology::empty());
         // No Debug walls anywhere in the dashboard.
-        assert!(!dash.contains("SpdModule {"), "no SpdModule Debug wall: {dash}");
-        assert!(!dash.contains("ClockReadout {"), "no ClockReadout Debug wall: {dash}");
-        assert!(!dash.contains("AmdReadout {"), "no AmdReadout Debug wall: {dash}");
-        assert!(!dash.contains("TimingSet {"), "no TimingSet Debug wall: {dash}");
+        assert!(
+            !dash.contains("SpdModule {"),
+            "no SpdModule Debug wall: {dash}"
+        );
+        assert!(
+            !dash.contains("ClockReadout {"),
+            "no ClockReadout Debug wall: {dash}"
+        );
+        assert!(
+            !dash.contains("AmdReadout {"),
+            "no AmdReadout Debug wall: {dash}"
+        );
+        assert!(
+            !dash.contains("TimingSet {"),
+            "no TimingSet Debug wall: {dash}"
+        );
         // The human-readable formatted values appear.
-        for header in ["=== CPU ===", "=== Vcore ===", "=== AMD ===", "=== Intel ===", "=== SPD ==="] {
+        for header in [
+            "=== CPU ===",
+            "=== Vcore ===",
+            "=== AMD ===",
+            "=== Intel ===",
+            "=== SPD ===",
+        ] {
             assert!(dash.contains(header), "missing {header}: {dash}");
         }
         assert!(dash.contains("1600.00 MHz"), "formatted MCLK: {dash}");
         assert!(dash.contains("1.350 V"), "formatted voltage: {dash}");
         assert!(dash.contains("3200 MT/s"), "formatted speed: {dash}");
-        assert!(dash.contains("Module 0x52 (DDR4)"), "SPD module block: {dash}");
-        assert!(dash.contains("profile 1 (EXPO)"), "EXPO profile line: {dash}");
-        assert!(dash.contains("CPU Core Voltage  1.150 V"), "vCore line: {dash}");
+        assert!(dash.contains("DIMM 82 (DDR4)"), "SPD module block: {dash}");
+        assert!(
+            dash.contains("profile 1 (EXPO)"),
+            "EXPO profile line: {dash}"
+        );
+        assert!(
+            dash.contains("CPU Core Voltage  1.150 V"),
+            "vCore line: {dash}"
+        );
         // The JSON carries the same fields, including a vcore field that
         // matches the dashboard's vCore display (dashboard/JSON consistency).
         let json = to_json(&t, &SmbiosTopology::empty());
-        for key in ["\"cpu\"", "\"vendor\"", "\"brand\"", "\"vcore\"", "\"amd\"", "\"intel\"", "\"spd\""] {
+        for key in [
+            "\"cpu\"",
+            "\"vendor\"",
+            "\"brand\"",
+            "\"vcore\"",
+            "\"amd\"",
+            "\"intel\"",
+            "\"spd\"",
+        ] {
             assert!(json.contains(key), "missing {key} in: {json}");
         }
         let expected_vcore = format!("\"vcore\":\"{}\"", json_escape(&vcore_display(&t.vcore)));
-        assert!(json.contains(&expected_vcore), "JSON vcore must match the dashboard's: {json}");
+        assert!(
+            json.contains(&expected_vcore),
+            "JSON vcore must match the dashboard's: {json}"
+        );
         // The degraded Intel branch is `null` in the JSON.
-        assert!(json.contains("\"intel\":null"), "a Na branch is null: {json}");
+        assert!(
+            json.contains("\"intel\":null"),
+            "a Na branch is null: {json}"
+        );
     }
 
     /// (a) `render_dashboard` on an all-Na snapshot: every section prints
@@ -978,13 +1047,13 @@ mod tests {
         assert!(out.contains("(no modules: ee1004 driver absent or no device bound)"));
     }
 
-    /// (b) `render_dashboard` with SPD modules: one `--- Module 0xNN ---`
+    /// (b) `render_dashboard` with SPD modules: one `--- DIMM N ---`
     /// block per module, no no-modules note.
     #[test]
     fn dashboard_renders_spd_modules() {
         let out = render_dashboard(&representative(), &SmbiosTopology::empty());
-        assert!(out.contains("Module 0x52 (DDR4)"));
-        assert!(out.contains("Module 0x53 (DDR5)"));
+        assert!(out.contains("DIMM 82 (DDR4)"));
+        assert!(out.contains("DIMM 83 (DDR5)"));
         assert!(!out.contains("no modules"));
     }
 
@@ -995,8 +1064,9 @@ mod tests {
     #[test]
     fn dashboard_vcore_renders_per_confidence() {
         // Absent → N/A.
-        assert!(render_dashboard(&all_na(), &SmbiosTopology::empty())
-            .contains("CPU Core Voltage  N/A"));
+        assert!(
+            render_dashboard(&all_na(), &SmbiosTopology::empty()).contains("CPU Core Voltage  N/A")
+        );
 
         // Heuristic (no VID) → the value + the `[est]` badge.
         let mut t = all_na();
@@ -1021,8 +1091,14 @@ mod tests {
             confidence: RailConfidence::VerifiedProfile,
         });
         let out = render_dashboard(&t, &SmbiosTopology::empty());
-        assert!(out.contains("CPU Core Voltage  1.216 V (VID: 1.280 V, Δ -64 mV)"), "{out}");
-        assert!(!out.contains("[est]"), "a verified vCore has no badge: {out}");
+        assert!(
+            out.contains("CPU Core Voltage  1.216 V (VID: 1.280 V, Δ -64 mV)"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("[est]"),
+            "a verified vCore has no badge: {out}"
+        );
     }
 
     /// (c) `to_json` is structurally valid — carries all the dashboard's
@@ -1034,13 +1110,24 @@ mod tests {
         let out = to_json(&t, &SmbiosTopology::empty());
         assert!(out.starts_with('{'));
         assert!(out.ends_with('}'));
-        for key in ["\"cpu\"", "\"vendor\"", "\"brand\"", "\"vcore\"", "\"amd\"", "\"intel\"", "\"spd\""] {
+        for key in [
+            "\"cpu\"",
+            "\"vendor\"",
+            "\"brand\"",
+            "\"vcore\"",
+            "\"amd\"",
+            "\"intel\"",
+            "\"spd\"",
+        ] {
             assert!(out.contains(key), "missing key {key} in: {out}");
         }
         // The vcore field carries the same human-readable string the
         // dashboard's Vcore section prints.
         assert!(
-            out.contains(&format!("\"vcore\":\"{}\"", json_escape(&vcore_display(&t.vcore)))),
+            out.contains(&format!(
+                "\"vcore\":\"{}\"",
+                json_escape(&vcore_display(&t.vcore))
+            )),
             "vcore field must match the dashboard: {out}"
         );
     }
@@ -1091,7 +1178,10 @@ mod tests {
     fn version_line_is_the_package_version() {
         assert_eq!(
             version_line(),
-            format!("ramSleuth ramsleuth-telemetry v{}", env!("CARGO_PKG_VERSION"))
+            format!(
+                "ramSleuth ramsleuth-telemetry v{}",
+                env!("CARGO_PKG_VERSION")
+            )
         );
     }
 
@@ -1126,7 +1216,10 @@ mod tests {
     #[test]
     fn vendor_text_is_the_stable_name() {
         assert_eq!(vendor_text(&CpuVendor::Amd(AmdZen::Zen3)), "AMD Zen 3");
-        assert_eq!(vendor_text(&CpuVendor::Intel(IntelGen::AlderLake)), "Intel Alder Lake");
+        assert_eq!(
+            vendor_text(&CpuVendor::Intel(IntelGen::AlderLake)),
+            "Intel Alder Lake"
+        );
         assert_eq!(vendor_text(&CpuVendor::Unknown), "unknown");
     }
 

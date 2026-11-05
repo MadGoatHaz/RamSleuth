@@ -664,7 +664,11 @@ mod tests {
         assert_eq!(r.trust, Some(ChannelTrust::VerifiedFirmware));
 
         // L4: MMIO blocked + SMBIOS ambiguous locators -> Dual heuristic.
-        let r = resolve_channel(None, None, &smbios_topology(2, DerivedMode::Ambiguous, None));
+        let r = resolve_channel(
+            None,
+            None,
+            &smbios_topology(2, DerivedMode::Ambiguous, None),
+        );
         assert_eq!(r.mode, Some(ChannelMode::DualSymmetric));
         assert_eq!(r.trust, Some(ChannelTrust::Heuristic));
         assert!(r.annotation.contains("Heuristic"));
@@ -712,7 +716,11 @@ mod tests {
             Some(MemoryTech::Unknown),
             &smbios,
         );
-        assert_eq!(r.tech, Some(MemoryTech::Ddr4), "SMBIOS Ddr4 wins over MMIO Unknown");
+        assert_eq!(
+            r.tech,
+            Some(MemoryTech::Ddr4),
+            "SMBIOS Ddr4 wins over MMIO Unknown"
+        );
 
         // MMIO tech is valid (Ddr5), SMBIOS has Ddr4 -> MMIO wins.
         let r = resolve_channel(

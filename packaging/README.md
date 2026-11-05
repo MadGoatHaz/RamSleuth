@@ -274,11 +274,53 @@ When the module cannot be loaded (no Secure Boot path available), RamSleuth degr
 
 ## CI
 
-GitHub Actions runs on push and pull requests to `v2-development`:
+GitHub Actions runs on push and pull requests to `v2-development`. All jobs are
+pinned to **`ubuntu-24.04`** (glibc **2.39**) — deliberately not
+`ubuntu-latest` — so that every built binary is compatible with Ubuntu
+24.04+ (fixes the earlier "GLIBC_2.43 not found" failure on 24.04 hosts):
 
-- **test** — matrix `1.75` (MSRV) × `stable` on `ubuntu-latest` (`fail-fast: false`): `cargo test --workspace` (debug), `cargo test --workspace --release`, `cargo clippy --workspace --all-targets -- -D warnings`. The committed `Cargo.lock` is used as-is; the MSRV leg proves the 1.75 claim on a clean runner.
+- **test** — matrix `1.75` (MSRV) × `stable` on `ubuntu-24.04` (`fail-fast: false`): `cargo test --workspace` (debug), `cargo test --workspace --release`, `cargo clippy --workspace --all-targets -- -D warnings`. The committed `Cargo.lock` is used as-is; the MSRV leg proves the 1.75 claim on a clean runner.
 - **build** — `cargo build --release --workspace` on stable, uploading the 6 release binaries as an artifact.
 - **kernel-module** — independent (a kernel failure never breaks the Rust jobs): builds `kernel/ramsleuth-intel` against the runner's `linux-headers-generic`, asserting a `.ko` is produced with **zero compiler warnings** (the job fails on any warning).
+
+## Release artifacts & the `.deb` package
+
+The tag-triggered release workflow (`.github/workflows/release.yml`, also on
+`ubuntu-24.04`) publishes **four** files per release:
+
+- `ramsleuth-<ver>-x86_64.tar.zst` — the deterministic source/binary bundle
+  (the `ramsleuth-bin` AUR package consumes this).
+- `ramsleuth-<ver>-x86_64.tar.zst.sha256` — its checksum.
+- `ramsleuth_<ver>_amd64.deb` — a ready-to-install Debian/Ubuntu/Mint package
+  (see below).
+- `ramsleuth_<ver>_amd64.deb.sha256` — its checksum.
+
+**Building the `.deb` (`packaging/build-deb.sh`).** The script assembles a
+Debian binary package with the same file set as the AUR main packages:
+the 6 Rust binaries → `/usr/bin`, the systemd unit + preset, both DKMS
+helpers (`ramsleuth-install-ryzen-smu-dkms`, `ramsleuth-install-intel-dkms`),
+the one-click `ramsleuth-setup`, `install.sh`, `LICENSE`, the desktop file,
+the polkit policy, the 8-size hicolor icon tree, the Intel DKMS source tree,
+and the AMD `ryzen-smu` vendor tree + `dkms.conf`. `DEBIAN/control` carries
+`Maintainer`, `Depends` (the GUI/systemd/acl runtime libs), and `Recommends`
+(dkms, linux-headers); `preinst`/`postinst`/`postrm` mirror the `.install`
+hooks (group creation, daemon-reload, polkit restart, service enable,
+zero-touch user setup, clean removal).
+
+Usage:
+
+```sh
+# From the repo root (builds from the local checkout; reads the version
+# from Cargo.toml if --version is omitted):
+packaging/build-deb.sh [--version <ver>]
+
+# From a release tarball (what the CI workflow does):
+packaging/build-deb.sh --version <ver> --tarball ramsleuth-<ver>-x86_64.tar.zst
+```
+
+The script uses `dpkg-deb --build` when available (Debian/Ubuntu hosts) and
+falls back to the manual `ar`/`tar` format on other distros (e.g. Arch).
+Output: `ramsleuth_<ver>_amd64.deb` in the current directory.
 
 ## No-panic contract
 

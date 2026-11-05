@@ -65,7 +65,11 @@ impl<T> RingBuffer<T> {
         // `resize_with` (not `vec![None; n]`): no `T: Clone` bound.
         let mut data: Vec<Option<T>> = Vec::with_capacity(capacity);
         data.resize_with(capacity, || None);
-        Self { data, head: 0, len: 0 }
+        Self {
+            data,
+            head: 0,
+            len: 0,
+        }
     }
 
     /// Append `value` as the newest sample. Once the buffer is full
@@ -231,7 +235,11 @@ mod tests {
         assert!(buf.is_full());
         assert_eq!(buf.len(), RING_CAPACITY);
         assert_eq!(buf.last(), Some(&349.0));
-        assert_eq!(buf.iter().next(), Some(&50.0), "the 50 oldest must be evicted");
+        assert_eq!(
+            buf.iter().next(),
+            Some(&50.0),
+            "the 50 oldest must be evicted"
+        );
     }
 
     /// (e) `clear` drops every sample (the head rewinds) and pushes
@@ -256,10 +264,7 @@ mod tests {
         }
         assert!(buf.is_full());
         assert_eq!(buf.last(), Some(&6));
-        assert_eq!(
-            buf.iter().copied().collect::<Vec<u32>>(),
-            vec![8, 7, 6]
-        );
+        assert_eq!(buf.iter().copied().collect::<Vec<u32>>(), vec![8, 7, 6]);
     }
 
     /// (f) A zero capacity is clamped to one (no modulo-by-zero —

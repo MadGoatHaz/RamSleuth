@@ -38,7 +38,7 @@
 //! mouse, resize) maps to `None` and is ignored — the terminal re-reads
 //! the surface size each frame, so resize needs no action of its own.
 
-use crossterm::event::{Event, KeyEvent, KeyCode};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 
 /// The user-facing TUI actions: the P3-22 trio (`Refresh`/`Snapshot`/
 /// `Quit`), the TUI-01 bench-class quartet (`BenchFull`/`BenchMemory`/
@@ -172,15 +172,27 @@ mod tests {
     // (a) 'r' / 'R' -> Refresh
     #[test]
     fn r_key_maps_to_refresh() {
-        assert_eq!(key_to_action(key(KeyCode::Char('r'))), Some(Action::Refresh));
-        assert_eq!(key_to_action(key(KeyCode::Char('R'))), Some(Action::Refresh));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('r'))),
+            Some(Action::Refresh)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('R'))),
+            Some(Action::Refresh)
+        );
     }
 
     // (b) 's' / 'S' -> Snapshot
     #[test]
     fn s_key_maps_to_snapshot() {
-        assert_eq!(key_to_action(key(KeyCode::Char('s'))), Some(Action::Snapshot));
-        assert_eq!(key_to_action(key(KeyCode::Char('S'))), Some(Action::Snapshot));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('s'))),
+            Some(Action::Snapshot)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('S'))),
+            Some(Action::Snapshot)
+        );
     }
 
     // (c) 'q' / 'Q' -> Quit
@@ -194,7 +206,11 @@ mod tests {
     #[test]
     fn other_chars_map_to_none() {
         for code in [KeyCode::Char('0'), KeyCode::Char(' ')] {
-            assert_eq!(key_to_action(key(code)), None, "{code:?} must not be an action");
+            assert_eq!(
+                key_to_action(key(code)),
+                None,
+                "{code:?} must not be an action"
+            );
         }
     }
 
@@ -210,22 +226,38 @@ mod tests {
             KeyCode::Up,
             KeyCode::F(1),
         ] {
-            assert_eq!(key_to_action(key(code)), None, "{code:?} must not be an action");
+            assert_eq!(
+                key_to_action(key(code)),
+                None,
+                "{code:?} must not be an action"
+            );
         }
     }
 
     // (f) 'b' / 'B' -> BenchFull
     #[test]
     fn b_key_maps_to_bench_full() {
-        assert_eq!(key_to_action(key(KeyCode::Char('b'))), Some(Action::BenchFull));
-        assert_eq!(key_to_action(key(KeyCode::Char('B'))), Some(Action::BenchFull));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('b'))),
+            Some(Action::BenchFull)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('B'))),
+            Some(Action::BenchFull)
+        );
     }
 
     // (g) 'm' / 'M' -> BenchMemory
     #[test]
     fn m_key_maps_to_bench_memory() {
-        assert_eq!(key_to_action(key(KeyCode::Char('m'))), Some(Action::BenchMemory));
-        assert_eq!(key_to_action(key(KeyCode::Char('M'))), Some(Action::BenchMemory));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('m'))),
+            Some(Action::BenchMemory)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('M'))),
+            Some(Action::BenchMemory)
+        );
     }
 
     // (h) 'x' / 'X' -> BurnIn
@@ -274,95 +306,210 @@ mod tests {
     // (k) 'g' / 'G' -> ToggleGraphs
     #[test]
     fn g_key_maps_to_toggle_graphs() {
-        assert_eq!(key_to_action(key(KeyCode::Char('g'))), Some(Action::ToggleGraphs));
-        assert_eq!(key_to_action(key(KeyCode::Char('G'))), Some(Action::ToggleGraphs));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('g'))),
+            Some(Action::ToggleGraphs)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('G'))),
+            Some(Action::ToggleGraphs)
+        );
     }
 
     // (l) 't' / 'T' -> ToggleSettings
     #[test]
     fn t_key_maps_to_toggle_settings() {
-        assert_eq!(key_to_action(key(KeyCode::Char('t'))), Some(Action::ToggleSettings));
-        assert_eq!(key_to_action(key(KeyCode::Char('T'))), Some(Action::ToggleSettings));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('t'))),
+            Some(Action::ToggleSettings)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('T'))),
+            Some(Action::ToggleSettings)
+        );
     }
 
     // (m) 'd' / 'D' -> ToggleRequirements
     #[test]
     fn d_key_maps_to_toggle_requirements() {
-        assert_eq!(key_to_action(key(KeyCode::Char('d'))), Some(Action::ToggleRequirements));
-        assert_eq!(key_to_action(key(KeyCode::Char('D'))), Some(Action::ToggleRequirements));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('d'))),
+            Some(Action::ToggleRequirements)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('D'))),
+            Some(Action::ToggleRequirements)
+        );
     }
 
     // (n) 'e' / 'E' -> ExportJson
     #[test]
     fn e_key_maps_to_export_json() {
-        assert_eq!(key_to_action(key(KeyCode::Char('e'))), Some(Action::ExportJson));
-        assert_eq!(key_to_action(key(KeyCode::Char('E'))), Some(Action::ExportJson));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('e'))),
+            Some(Action::ExportJson)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('E'))),
+            Some(Action::ExportJson)
+        );
     }
 
     // (o) 'p' / 'P' -> CyclePoll
     #[test]
     fn p_key_maps_to_cycle_poll() {
-        assert_eq!(key_to_action(key(KeyCode::Char('p'))), Some(Action::CyclePoll));
-        assert_eq!(key_to_action(key(KeyCode::Char('P'))), Some(Action::CyclePoll));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('p'))),
+            Some(Action::CyclePoll)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('P'))),
+            Some(Action::CyclePoll)
+        );
     }
 
     // (p) 'u' / 'U' -> ToggleCapacity
     #[test]
     fn u_key_maps_to_toggle_capacity() {
-        assert_eq!(key_to_action(key(KeyCode::Char('u'))), Some(Action::ToggleCapacity));
-        assert_eq!(key_to_action(key(KeyCode::Char('U'))), Some(Action::ToggleCapacity));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('u'))),
+            Some(Action::ToggleCapacity)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('U'))),
+            Some(Action::ToggleCapacity)
+        );
     }
 
     // (q) 'k' / 'K' -> ToggleClock
     #[test]
     fn k_key_maps_to_toggle_clock() {
-        assert_eq!(key_to_action(key(KeyCode::Char('k'))), Some(Action::ToggleClock));
-        assert_eq!(key_to_action(key(KeyCode::Char('K'))), Some(Action::ToggleClock));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('k'))),
+            Some(Action::ToggleClock)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('K'))),
+            Some(Action::ToggleClock)
+        );
     }
 
     // (r) 'a' / 'A' -> ToggleRefresh
     #[test]
     fn a_key_maps_to_toggle_refresh() {
-        assert_eq!(key_to_action(key(KeyCode::Char('a'))), Some(Action::ToggleRefresh));
-        assert_eq!(key_to_action(key(KeyCode::Char('A'))), Some(Action::ToggleRefresh));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('a'))),
+            Some(Action::ToggleRefresh)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('A'))),
+            Some(Action::ToggleRefresh)
+        );
     }
 
     // (s) 'w' / 'W' -> CycleWindow
     #[test]
     fn w_key_maps_to_cycle_window() {
-        assert_eq!(key_to_action(key(KeyCode::Char('w'))), Some(Action::CycleWindow));
-        assert_eq!(key_to_action(key(KeyCode::Char('W'))), Some(Action::CycleWindow));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('w'))),
+            Some(Action::CycleWindow)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('W'))),
+            Some(Action::CycleWindow)
+        );
     }
 
     // (t) 'f' / 'F' -> ProbeReport (chunk probe-4 — `r`/`R` stays
     // the frozen P3-22 Refresh key; the table is case-insensitive)
     #[test]
     fn f_key_maps_to_probe_report() {
-        assert_eq!(key_to_action(key(KeyCode::Char('f'))), Some(Action::ProbeReport));
-        assert_eq!(key_to_action(key(KeyCode::Char('F'))), Some(Action::ProbeReport));
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('f'))),
+            Some(Action::ProbeReport)
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('F'))),
+            Some(Action::ProbeReport)
+        );
     }
 
     // modifiers are ignored: every action key maps with any modifier set
     #[test]
     fn modifiers_are_ignored() {
-        for mods in [KeyModifiers::CONTROL, KeyModifiers::ALT, KeyModifiers::SHIFT] {
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('r'), mods)), Some(Action::Refresh));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('s'), mods)), Some(Action::Snapshot));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('q'), mods)), Some(Action::Quit));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('b'), mods)), Some(Action::BenchFull));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('m'), mods)), Some(Action::BenchMemory));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('x'), mods)), Some(Action::BurnIn));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('c'), mods)), Some(Action::Cancel));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('g'), mods)), Some(Action::ToggleGraphs));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('t'), mods)), Some(Action::ToggleSettings));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('d'), mods)), Some(Action::ToggleRequirements));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('e'), mods)), Some(Action::ExportJson));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('p'), mods)), Some(Action::CyclePoll));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('u'), mods)), Some(Action::ToggleCapacity));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('k'), mods)), Some(Action::ToggleClock));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('a'), mods)), Some(Action::ToggleRefresh));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('w'), mods)), Some(Action::CycleWindow));
-            assert_eq!(key_to_action(KeyEvent::new(KeyCode::Char('f'), mods)), Some(Action::ProbeReport));
+        for mods in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('r'), mods)),
+                Some(Action::Refresh)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('s'), mods)),
+                Some(Action::Snapshot)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('q'), mods)),
+                Some(Action::Quit)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('b'), mods)),
+                Some(Action::BenchFull)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('m'), mods)),
+                Some(Action::BenchMemory)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('x'), mods)),
+                Some(Action::BurnIn)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('c'), mods)),
+                Some(Action::Cancel)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('g'), mods)),
+                Some(Action::ToggleGraphs)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('t'), mods)),
+                Some(Action::ToggleSettings)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('d'), mods)),
+                Some(Action::ToggleRequirements)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('e'), mods)),
+                Some(Action::ExportJson)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('p'), mods)),
+                Some(Action::CyclePoll)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('u'), mods)),
+                Some(Action::ToggleCapacity)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('k'), mods)),
+                Some(Action::ToggleClock)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('a'), mods)),
+                Some(Action::ToggleRefresh)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('w'), mods)),
+                Some(Action::CycleWindow)
+            );
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('f'), mods)),
+                Some(Action::ProbeReport)
+            );
         }
     }
 }

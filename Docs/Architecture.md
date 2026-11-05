@@ -1693,6 +1693,22 @@ process-lifetime set and made at most once; a daemon restart
 re-attempts), and **never unbinds**: a bound EEPROM is a real DIMM the
 DSDT missed, a persistent desired state.
 
+**SMBIOS Type 17 fallback (when `ee1004` is empty).** On platforms where the
+SPD EEPROMs are not enumerable by `ee1004` — most commonly TRX40 / older
+Threadripper boards, or any system whose I²C buses never expose the SPD
+devices — the facade falls back to the **`intel_smbios`** module's DMI
+`/sys/firmware/dmi/entries/17-<n>` "Memory Device" structures. When
+`spd_eeprom::acquire()` returns an empty list (driver missing or no bound
+devices) and SMBIOS reports populated modules, each SMBIOS entry is mapped to
+a `SpdModule` carrying only the firmware-known basics: **capacity, rated
+speed, part number, serial, rank, and slot locator**. The SPD-only decode
+(die maker, device geometry, XMP/EXPO profiles, fine tCK) remains `Na` —
+**profiles require an actually readable SPD image.** The `dimm_sizes` array
+similarly falls back to the SMBIOS per-device capacities when the SPD-derived
+sizes are all `Na`. The fallback is a pure additive safety net: when `ee1004`
+works normally it is never used, and no wire-format change is required
+(`SpdModule` / `SystemMemoryTelemetry` layouts are unchanged).
+
 ### 10.5 The platform branch
 
 Vendor-neutral identity, unprivileged: **`/sys/class/dmi/id/*`** for

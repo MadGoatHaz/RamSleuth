@@ -165,7 +165,10 @@ enum StatusState {
     /// bench). `burn_in_iteration` is `Some(n)` for a burn-in (the
     /// `Status: Running… (burn-in <m:ss>, iter <n>)` line, C7-18) and
     /// `None` for a normal bench (the `Status: Running… <m:ss>` line).
-    Running { elapsed_secs: f64, burn_in_iteration: Option<u32> },
+    Running {
+        elapsed_secs: f64,
+        burn_in_iteration: Option<u32>,
+    },
     /// A run finished (a terminal grid landed, or streamed progress
     /// is kept): the green `Status: Done` line.
     Done,
@@ -213,7 +216,11 @@ fn status_state(
 /// non-finite / non-positive reading renders `0:00` (a bad elapsed
 /// never panics the line, D5).
 fn format_elapsed(secs: f64) -> String {
-    let total = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
+    let total = if secs.is_finite() && secs > 0.0 {
+        secs as u64
+    } else {
+        0
+    };
     format!("{}:{:02}", total / 60, total % 60)
 }
 
@@ -536,7 +543,9 @@ fn render_grid_table(ui: &mut egui::Ui, data: &TelemetryData) {
             for metric in &METRICS {
                 header.col(|ui| {
                     ui.label(
-                        egui::RichText::new(metric_name(*metric)).strong().color(CYAN),
+                        egui::RichText::new(metric_name(*metric))
+                            .strong()
+                            .color(CYAN),
                     );
                 });
             }
@@ -576,7 +585,9 @@ static NORMAL_RUN_START: Mutex<Option<Instant>> = Mutex::new(None);
 /// it): a poisoned lock is recovered in place (the render thread is
 /// the sole user; the no-panic contract, D5).
 fn track_run_start(running: bool) -> Option<Instant> {
-    let mut guard = NORMAL_RUN_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = NORMAL_RUN_START
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if running {
         Some(*guard.get_or_insert_with(Instant::now))
     } else {
@@ -804,7 +815,11 @@ mod tests {
         assert_eq!(format_elapsed(125.0), "2:05");
         assert_eq!(format_elapsed(3661.0), "61:01");
         assert_eq!(format_elapsed(f64::NAN), "0:00", "NaN never panics");
-        assert_eq!(format_elapsed(-4.0), "0:00", "a negative elapsed renders zero");
+        assert_eq!(
+            format_elapsed(-4.0),
+            "0:00",
+            "a negative elapsed renders zero"
+        );
         assert_eq!(format_elapsed(f64::INFINITY), "0:00", "+inf never panics");
     }
 
@@ -992,7 +1007,11 @@ mod tests {
             progress_event(Tier::Memory, BenchOp::Read, 27.5), // latest wins
         ];
         let grid = live_grid(&events);
-        assert_eq!(grid.cell(Tier::Memory, Metric::Read), 27.5, "latest per cell wins");
+        assert_eq!(
+            grid.cell(Tier::Memory, Metric::Read),
+            27.5,
+            "latest per cell wins"
+        );
         assert_eq!(grid.cell(Tier::Memory, Metric::Write), 43.0);
         assert_eq!(grid.cell(Tier::L1, Metric::Read), 35.0);
         // Unmeasured cells — and the whole latency column (no
@@ -1020,8 +1039,16 @@ mod tests {
         ];
         let grid = live_grid(&broken);
         assert_eq!(grid.cell(Tier::L1, Metric::Read), 0.0, "NaN never renders");
-        assert_eq!(grid.cell(Tier::L2, Metric::Write), 0.0, "+inf never renders");
-        assert_eq!(grid.cell(Tier::L3, Metric::Copy), 0.0, "negative never renders");
+        assert_eq!(
+            grid.cell(Tier::L2, Metric::Write),
+            0.0,
+            "+inf never renders"
+        );
+        assert_eq!(
+            grid.cell(Tier::L3, Metric::Copy),
+            0.0,
+            "negative never renders"
+        );
     }
 
     /// (k) `cell_phase`: not in flight → `Terminal` for every cell
@@ -1079,23 +1106,46 @@ mod tests {
         let live = live_grid(&[progress_event(Tier::Memory, BenchOp::Read, 26.0)]);
 
         // Terminal: the existing semantics.
-        let text = phase_cell_text(CellPhase::Terminal, &grid, &live, Tier::Memory, Metric::Read);
+        let text = phase_cell_text(
+            CellPhase::Terminal,
+            &grid,
+            &live,
+            Tier::Memory,
+            Metric::Read,
+        );
         assert_eq!(text, "26.35 GB/s");
-        assert_eq!(phase_cell_color(CellPhase::Terminal, Metric::Read, &text), CYAN);
-        let text =
-            phase_cell_text(CellPhase::Terminal, &grid, &live, Tier::Memory, Metric::Latency);
+        assert_eq!(
+            phase_cell_color(CellPhase::Terminal, Metric::Read, &text),
+            CYAN
+        );
+        let text = phase_cell_text(
+            CellPhase::Terminal,
+            &grid,
+            &live,
+            Tier::Memory,
+            Metric::Latency,
+        );
         assert_eq!(text, "86.84 ns");
-        assert_eq!(phase_cell_color(CellPhase::Terminal, Metric::Latency, &text), AMBER);
+        assert_eq!(
+            phase_cell_color(CellPhase::Terminal, Metric::Latency, &text),
+            AMBER
+        );
         let text = phase_cell_text(CellPhase::Terminal, &grid, &live, Tier::L2, Metric::Write);
         assert_eq!(text, "N/A");
-        assert_eq!(phase_cell_color(CellPhase::Terminal, Metric::Write, &text), NA_GRAY);
+        assert_eq!(
+            phase_cell_color(CellPhase::Terminal, Metric::Write, &text),
+            NA_GRAY
+        );
 
         // Live: the in-flight value + the `…` suffix, dimmed.
         let text = phase_cell_text(CellPhase::Live, &grid, &live, Tier::Memory, Metric::Read);
         assert_eq!(text, "26.00 GB/s…");
         let color = phase_cell_color(CellPhase::Live, Metric::Read, &text);
         assert_eq!(color, CYAN.gamma_multiply(0.6), "the live fill is dimmed");
-        assert_ne!(color, CYAN, "the live fill is distinct from the final value");
+        assert_ne!(
+            color, CYAN,
+            "the live fill is distinct from the final value"
+        );
 
         // A burn-in's `latest` also carries per-tier latency ticks →
         // the Live latency cell shows `ns…` (not `GB/s…`).
@@ -1106,7 +1156,13 @@ mod tests {
             latency_ns: [86.84, 0.0, 0.0, 0.0],
         };
         assert_eq!(
-            phase_cell_text(CellPhase::Live, &grid, &live_lat, Tier::Memory, Metric::Latency),
+            phase_cell_text(
+                CellPhase::Live,
+                &grid,
+                &live_lat,
+                Tier::Memory,
+                Metric::Latency
+            ),
             "86.84 ns…"
         );
 
@@ -1115,7 +1171,10 @@ mod tests {
             phase_cell_text(CellPhase::NotStarted, &grid, &live, Tier::L3, Metric::Read),
             "N/A"
         );
-        assert_eq!(phase_cell_color(CellPhase::NotStarted, Metric::Read, "N/A"), NA_GRAY);
+        assert_eq!(
+            phase_cell_color(CellPhase::NotStarted, Metric::Read, "N/A"),
+            NA_GRAY
+        );
     }
 
     /// (m) `burn_in_cmd`: the `Run Burn-In` trigger's [`BenchCmd`] —
@@ -1143,7 +1202,10 @@ mod tests {
         assert_eq!(burn_in_minutes_clamped(0), 0);
         assert_eq!(burn_in_minutes_clamped(1440), 1440);
         assert_eq!(burn_in_minutes_clamped(9999), BURN_IN_MINUTES_MAX);
-        assert_eq!(burn_in_cmd(9999).duration_minutes, Some(BURN_IN_MINUTES_MAX));
+        assert_eq!(
+            burn_in_cmd(9999).duration_minutes,
+            Some(BURN_IN_MINUTES_MAX)
+        );
         assert_eq!(burn_in_cmd(0).duration_minutes, Some(0));
     }
 
@@ -1242,7 +1304,11 @@ mod tests {
         };
         let live = table_live_grid(&bench);
         assert_eq!(live.cell(Tier::Memory, Metric::Read), 26.0);
-        assert_eq!(live.cell(Tier::L1, Metric::Read), 0.0, "unmeasured cells stay 0.0");
+        assert_eq!(
+            live.cell(Tier::L1, Metric::Read),
+            0.0,
+            "unmeasured cells stay 0.0"
+        );
 
         // Neither in flight: the progress accumulation (harmless — the
         // terminal grid renders).

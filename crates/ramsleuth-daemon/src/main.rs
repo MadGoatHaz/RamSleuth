@@ -209,9 +209,11 @@ where
                 // seconds value whose nanosecond product would
                 // overflow is rejected before the conversion
                 // (no-panic contract).
-                let seconds: u64 = value
-                    .parse()
-                    .map_err(|_| format!("--max-age must be a non-negative integer number of seconds, got `{value}`"))?;
+                let seconds: u64 = value.parse().map_err(|_| {
+                    format!(
+                        "--max-age must be a non-negative integer number of seconds, got `{value}`"
+                    )
+                })?;
                 if seconds > u64::MAX / 1_000_000_000 {
                     return Err(format!(
                         "--max-age {seconds} s is too large to represent as a duration"
@@ -322,7 +324,10 @@ async fn main() {
         }
     };
 
-    println!("ramsleuth-daemon listening on {}", args.socket_path.display());
+    println!(
+        "ramsleuth-daemon listening on {}",
+        args.socket_path.display()
+    );
 
     // Shutdown handlers (plan D5: graceful stop, never a panic).
     // Handler installation is part of startup: a failure is fatal.
@@ -450,12 +455,14 @@ mod tests {
     /// the flag (checked for both value-taking flags).
     #[test]
     fn missing_flag_values_are_rejected() {
-        let err = parse_args(["--socket"]).expect_err("`--socket` without a value must be rejected");
+        let err =
+            parse_args(["--socket"]).expect_err("`--socket` without a value must be rejected");
         assert!(
             err.contains("--socket"),
             "the error must name the flag: {err}"
         );
-        let err = parse_args(["--max-age"]).expect_err("`--max-age` without a value must be rejected");
+        let err =
+            parse_args(["--max-age"]).expect_err("`--max-age` without a value must be rejected");
         assert!(
             err.contains("--max-age"),
             "the error must name the flag: {err}"

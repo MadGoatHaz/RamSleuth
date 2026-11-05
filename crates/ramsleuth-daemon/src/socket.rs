@@ -442,7 +442,10 @@ mod tests {
 
         let listener = setup_listener(&socket_path).expect("a fresh path must set up cleanly");
 
-        assert!(socket_path.exists(), "the socket file must exist after setup");
+        assert!(
+            socket_path.exists(),
+            "the socket file must exist after setup"
+        );
         let mode = fs::metadata(&socket_path)
             .expect("the socket file must be stat-able")
             .permissions()
@@ -450,8 +453,7 @@ mod tests {
         assert_eq!(mode & 0o777, 0o660, "the socket mode must be 0660");
         // The listener must be live: the kernel accepts a `connect` to
         // the bound path (it lands in the accept backlog).
-        let _probe =
-            UnixStream::connect(&socket_path).expect("the returned listener must be live");
+        let _probe = UnixStream::connect(&socket_path).expect("the returned listener must be live");
 
         drop(listener);
         cleanup(&dir);
@@ -469,8 +471,8 @@ mod tests {
             "precondition: the planted file is not a socket"
         );
 
-        let listener = setup_listener(&socket_path)
-            .expect("a stale file must be removed and rebound");
+        let listener =
+            setup_listener(&socket_path).expect("a stale file must be removed and rebound");
         assert!(
             fs::metadata(&socket_path).unwrap().file_type().is_socket(),
             "the rebound path must hold a real socket"

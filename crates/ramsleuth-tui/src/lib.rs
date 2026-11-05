@@ -98,11 +98,7 @@ pub use ring::RingBuffer;
 // plan D6); the render path is a pure reader (the `window_samples`
 // filter + the `[g]` `render_graphs_panel` overlay).
 pub use graphs::{
-    GraphSample,
-    GraphState,
-    record_graph_sample,
-    window_samples,
-    render_graphs_panel,
+    record_graph_sample, render_graphs_panel, window_samples, GraphSample, GraphState,
     GRAPH_CAPACITY,
 };
 // FE-7: the CPU-temperature source scan is the shared
@@ -117,7 +113,7 @@ pub use ramsleuth_display::read_cpu_temp_c;
 // `[d]` toggle drive; `render_about_block` is the screen's
 // always-present informational companion (the 17-key grid).
 pub use requirements::{
-    Requirement, about_block_height, diagnose, render_about_block, render_requirements_strip,
+    about_block_height, diagnose, render_about_block, render_requirements_strip, Requirement,
 };
 
 // chunk probe-4: the consent-gated probe-report overlay,
@@ -126,11 +122,6 @@ pub use requirements::{
 // the preview keys) and performs the I/O (the file write, the
 // clipboard spawn); `ui` draws the overlay topmost.
 pub use probe::{
-    ClipboardUtil,
-    NoticeTone,
-    ProbeOverlayState,
-    copy_to_clipboard,
-    find_clipboard_utility,
-    probe_report_default_path,
-    write_probe_report,
+    copy_to_clipboard, find_clipboard_utility, probe_report_default_path, write_probe_report,
+    ClipboardUtil, NoticeTone, ProbeOverlayState,
 };

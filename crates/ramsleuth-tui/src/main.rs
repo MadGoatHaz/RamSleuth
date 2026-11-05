@@ -197,23 +197,19 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
-use ratatui::Terminal;
-use ramsleuth_bench::{BenchmarkGrid, BenchOp, BurnInTick, StreamTarget, Tier};
+use ramsleuth_bench::{BenchOp, BenchmarkGrid, BurnInTick, StreamTarget, Tier};
 use ramsleuth_client::Client;
 use ramsleuth_protocol::{BenchMode, Request, Response, DEFAULT_SOCKET_PATH};
 use ramsleuth_telemetry::probe::render_probe_report_md;
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 use ramsleuth_tui::events;
 use ramsleuth_tui::probe::{
-    NoticeTone,
-    ProbeOverlayState,
-    copy_to_clipboard,
-    probe_report_default_path,
-    write_probe_report,
+    copy_to_clipboard, probe_report_default_path, write_probe_report, NoticeTone, ProbeOverlayState,
 };
 use ramsleuth_tui::{key_to_action, render, Action, AppState, BenchState};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui::Terminal;
 // ---------------------------------------------------------------------------
 // Poison-tolerant shared-state guard acquisition (FE-3).
 //
@@ -410,12 +406,9 @@ where
     while let Some(raw) = iter.next() {
         let arg = raw.as_ref();
         if arg == "--socket" {
-            let value = iter
-                .next()
-                .map(|v| v.as_ref().to_owned())
-                .ok_or_else(|| {
-                    "--socket requires a value (the daemon's Unix socket path)".to_owned()
-                })?;
+            let value = iter.next().map(|v| v.as_ref().to_owned()).ok_or_else(|| {
+                "--socket requires a value (the daemon's Unix socket path)".to_owned()
+            })?;
             parsed.socket = PathBuf::from(value);
         } else if arg.starts_with("--") {
             return Err(format!("unknown flag `{arg}` (expected `--socket <path>`)"));
@@ -575,12 +568,9 @@ fn record_graph_sample(state: &mut AppState) {
 /// would be a lie, D-4: 0 ≠ N/A). Non-finite / non-positive values
 /// never count as a figure (the bench zone's live-cell rule).
 fn latest_memory_read_bw(bench: &BenchState) -> f64 {
-    if let Some(event) = bench
-        .progress
-        .iter()
-        .rev()
-        .find(|e| e.tier == Tier::Memory && e.op == BenchOp::Read && e.value.is_finite() && e.value > 0.0)
-    {
+    if let Some(event) = bench.progress.iter().rev().find(|e| {
+        e.tier == Tier::Memory && e.op == BenchOp::Read && e.value.is_finite() && e.value > 0.0
+    }) {
         return event.value;
     }
     if let Some(grid) = &bench.grid {
@@ -864,8 +854,7 @@ fn run_burn_in(
     let Some(duration_minutes) = cmd.duration_minutes else {
         let mut s = state_write(state);
         s.bench.burn_in.running = false;
-        s.error =
-            Some("burn-in command without a duration_minutes discriminator".to_owned());
+        s.error = Some("burn-in command without a duration_minutes discriminator".to_owned());
         return Ok(());
     };
     if let Err(error) = client.send(&Request::StartBurnIn {
@@ -1064,7 +1053,9 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(format!("failed to clear the terminal: {e}"));
         }
-        Ok(Self { terminal: Some(terminal) })
+        Ok(Self {
+            terminal: Some(terminal),
+        })
     }
 }
 
@@ -1317,7 +1308,8 @@ fn unix_timestamp() -> u64 {
 /// destination; an unset `HOME` degrades to the CWD (`.`) — never a
 /// panic.
 fn out_dir_from_home(home: Option<&OsStr>) -> PathBuf {
-    home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    home.map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// The export destination dir (the GUI F2/F3 rule): `$HOME`, falling
@@ -1447,10 +1439,7 @@ fn probe_report_fetch(socket: &Path, state: &Arc<RwLock<AppState>>) {
             // Any other frame in reply to `GetProbeReport` violates
             // the wire contract (probe reports reply only to
             // `GetProbeReport`, chunk probe-1a): record it (D5).
-            state
-                .write()
-                .unwrap()
-                .error = Some("unexpected response to GetProbeReport".to_owned());
+            state.write().unwrap().error = Some("unexpected response to GetProbeReport".to_owned());
         }
         Err(error) => {
             state_write(state).error = Some(error.to_string());
@@ -1490,9 +1479,12 @@ fn scroll_probe_preview(state: &Arc<RwLock<AppState>>, area: Rect, delta: i32) {
     let (current, max) = {
         let app = state_read(state);
         match &app.probe {
-            ProbeOverlayState::Preview { markdown, scroll, .. } => {
-                (*scroll, ramsleuth_tui::probe::preview_max_scroll(markdown, area))
-            }
+            ProbeOverlayState::Preview {
+                markdown, scroll, ..
+            } => (
+                *scroll,
+                ramsleuth_tui::probe::preview_max_scroll(markdown, area),
+            ),
             _ => return,
         }
     };
@@ -1530,7 +1522,11 @@ fn handle_probe_overlay_key(
             if let ProbeOverlayState::Consent { markdown } =
                 std::mem::replace(&mut app.probe, ProbeOverlayState::None)
             {
-                app.probe = ProbeOverlayState::Preview { markdown, notice: None, scroll: 0 };
+                app.probe = ProbeOverlayState::Preview {
+                    markdown,
+                    notice: None,
+                    scroll: 0,
+                };
             }
         }
         // `[q]` / `[n]` / `Esc` (both phases): close the overlay —
@@ -1552,7 +1548,10 @@ fn handle_probe_overlay_key(
                 return;
             };
             let (tone, text) = match write_probe_report(write_path, &markdown) {
-                Ok(path) => (NoticeTone::Ok, format!("Report written to {}", path.display())),
+                Ok(path) => (
+                    NoticeTone::Ok,
+                    format!("Report written to {}", path.display()),
+                ),
                 Err(error) => (NoticeTone::Error, format!("write failed: {error}")),
             };
             set_preview_notice(state, tone, text);
@@ -1827,7 +1826,8 @@ fn apply_requirements_auto_open(state: &RwLock<AppState>, dismissed: bool) {
 fn strip_visibility(state: &AppState) -> (bool, bool, bool) {
     (
         state.settings.requirements_open,
-        !ramsleuth_tui::requirements::diagnose(state).is_empty() && state.settings.requirements_open,
+        !ramsleuth_tui::requirements::diagnose(state).is_empty()
+            && state.settings.requirements_open,
         state.settings.settings_open,
     )
 }
@@ -1945,7 +1945,13 @@ fn run(args: TuiArgs) -> ExitCode {
                     // break) is performed with the lock released.
                     let side = {
                         let mut s = state_write(&state);
-                        dispatch_action(action, &mut s, &mut requirements_dismissed, &bench_tx, &cancel)
+                        dispatch_action(
+                            action,
+                            &mut s,
+                            &mut requirements_dismissed,
+                            &bench_tx,
+                            &cancel,
+                        )
                     };
                     match side {
                         // The state-only actions (the toggles, the
@@ -2047,8 +2053,8 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::process;
-    use std::thread;
     use std::sync::atomic::AtomicUsize;
+    use std::thread;
 
     use ramsleuth_bench::{BenchmarkGrid, StreamProgress};
     use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message};
@@ -2081,11 +2087,18 @@ mod tests {
             guard.error = Some("panic-while-holding".to_owned());
             panic!("poison the lock");
         }));
-        assert!(state.is_poisoned(), "the lock must be poisoned after the panic");
+        assert!(
+            state.is_poisoned(),
+            "the lock must be poisoned after the panic"
+        );
         // A read through the helper recovers the guard (no cascade panic) and
         // sees the value the panicking writer set.
         let app = state_read(&state);
-        assert_eq!(app.error.as_deref(), Some("panic-while-holding"), "read recovers the last-good value");
+        assert_eq!(
+            app.error.as_deref(),
+            Some("panic-while-holding"),
+            "read recovers the last-good value"
+        );
         drop(app);
         // A write through the helper also recovers (no cascade panic).
         let mut app = state_write(&state);
@@ -2104,10 +2117,7 @@ mod tests {
 
     impl TempSocket {
         fn new(name: &str) -> Self {
-            let path = PathBuf::from(format!(
-                "/tmp/ramsleuth-tui-{name}-{}.sock",
-                process::id()
-            ));
+            let path = PathBuf::from(format!("/tmp/ramsleuth-tui-{name}-{}.sock", process::id()));
             let _ = std::fs::remove_file(&path); // stale file from a crashed earlier run
             Self { path }
         }
@@ -2332,7 +2342,10 @@ mod tests {
     #[test]
     fn unknown_flag_is_rejected() {
         let err = parse_args(["--bogus"]).expect_err("an unknown flag must be rejected");
-        assert!(err.contains("--bogus"), "the error must name the flag: {err}");
+        assert!(
+            err.contains("--bogus"),
+            "the error must name the flag: {err}"
+        );
     }
 
     /// (d) A positional argument is rejected with its name (the TUI
@@ -2340,7 +2353,10 @@ mod tests {
     #[test]
     fn positional_is_rejected() {
         let err = parse_args(["dump"]).expect_err("a positional must be rejected");
-        assert!(err.contains("dump"), "the error must name the argument: {err}");
+        assert!(
+            err.contains("dump"),
+            "the error must name the argument: {err}"
+        );
     }
 
     /// (e) `--socket` with a missing value is rejected with a message
@@ -2349,7 +2365,10 @@ mod tests {
     fn missing_socket_value_is_rejected() {
         let err =
             parse_args(["--socket"]).expect_err("`--socket` without a value must be rejected");
-        assert!(err.contains("--socket"), "the error must name the flag: {err}");
+        assert!(
+            err.contains("--socket"),
+            "the error must name the flag: {err}"
+        );
     }
 
     /// (f) A repeated `--socket` — the last value wins.
@@ -2364,7 +2383,11 @@ mod tests {
     /// yields — the ramsleuth-client P3-21 test precedent).
     #[test]
     fn owned_string_args_parse() {
-        let args: Vec<String> = ["--socket", "/tmp/y.sock"].iter().copied().map(str::to_owned).collect();
+        let args: Vec<String> = ["--socket", "/tmp/y.sock"]
+            .iter()
+            .copied()
+            .map(str::to_owned)
+            .collect();
         let parsed = parse_args(args).expect("owned String args must parse");
         assert_eq!(parsed.socket, PathBuf::from("/tmp/y.sock"));
     }
@@ -2384,16 +2407,19 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes =
-                encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
-                    .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                .expect("must encode");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
 
         // A pre-existing error (initialized here, not reassigned after)
         // must be cleared by a successful poll.
-        let mut state =
-            AppState { error: Some("stale error".to_owned()), ..Default::default() };
+        let mut state = AppState {
+            error: Some("stale error".to_owned()),
+            ..Default::default()
+        };
         poll_once(sock.path(), &mut state).expect("poll_once must not error");
 
         assert_eq!(
@@ -2401,13 +2427,19 @@ mod tests {
             Some("TUI Test CPU"),
             "the stand-in's canned snapshot must land in the state"
         );
-        assert!(state.error.is_none(), "a successful poll must clear the error");
+        assert!(
+            state.error.is_none(),
+            "a successful poll must clear the error"
+        );
         let status = &state.daemon_status;
         assert!(
             status.contains("connected"),
             "the status must report the connection, got: {status}"
         );
-        assert!(state.last_update.is_some(), "a successful poll must stamp last_update");
+        assert!(
+            state.last_update.is_some(),
+            "a successful poll must stamp last_update"
+        );
         stand_in.join();
     }
 
@@ -2483,10 +2515,11 @@ mod tests {
                     Some(other) => panic!("stand-in expected GetTelemetry, got {other:?}"),
                     None => continue, // a no-fetch probe connect (EOF)
                 }
-                let bytes =
-                    encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
-                        .expect("must encode");
-                stream.write_all(&bytes).expect("stand-in write must not fail");
+                let bytes = encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                    .expect("must encode");
+                stream
+                    .write_all(&bytes)
+                    .expect("stand-in write must not fail");
             }
         })
     }
@@ -2506,8 +2539,11 @@ mod tests {
     fn wait_for_status(state: &Arc<RwLock<AppState>>, needle: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let status =
-                state.read().expect("the updater must not poison the lock").daemon_status.clone();
+            let status = state
+                .read()
+                .expect("the updater must not poison the lock")
+                .daemon_status
+                .clone();
             if status.contains(needle) {
                 return;
             }
@@ -2675,10 +2711,13 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes =
-                encode_frame(&Message::Response(Response::Telemetry(populated_snapshot())))
-                    .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            let bytes = encode_frame(&Message::Response(
+                Response::Telemetry(populated_snapshot()),
+            ))
+            .expect("must encode");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
 
         let mut state = AppState::default();
@@ -2705,13 +2744,11 @@ mod tests {
                 "the sample is stamped with unix seconds"
             );
             assert_eq!(
-                sample.vddcr_soc_mv,
-                1050.0,
+                sample.vddcr_soc_mv, 1050.0,
                 "the fixture's SOC rail lands in mV on every sample"
             );
             assert_eq!(
-                sample.vddcr_cpu_mv,
-                1150.0,
+                sample.vddcr_cpu_mv, 1150.0,
                 "the fixture's vcore rail lands in mV on every sample"
             );
             assert!(
@@ -2719,8 +2756,7 @@ mod tests {
                 "the all-Na platform keeps the freq series no-source (D-4)"
             );
             assert_eq!(
-                sample.bandwidth_gbps,
-                26.35,
+                sample.bandwidth_gbps, 26.35,
                 "the bandwidth is the terminal grid's memory-read cell (D-5)"
             );
         }
@@ -2741,10 +2777,11 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes =
-                encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
-                    .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                .expect("must encode");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
         let mut state = AppState::default();
         poll_once(sock.path(), &mut state).expect("poll_once must not error");
@@ -2802,10 +2839,13 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes =
-                encode_frame(&Message::Response(Response::Telemetry(populated_snapshot())))
-                    .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            let bytes = encode_frame(&Message::Response(
+                Response::Telemetry(populated_snapshot()),
+            ))
+            .expect("must encode");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
         let mut state = AppState::default();
         poll_once(sock.path(), &mut state).expect("first poll must not error");
@@ -2837,10 +2877,13 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes =
-                encode_frame(&Message::Response(Response::Telemetry(populated_snapshot())))
-                    .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            let bytes = encode_frame(&Message::Response(
+                Response::Telemetry(populated_snapshot()),
+            ))
+            .expect("must encode");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
         poll_once(back_sock.path(), &mut state).expect("the reconnect poll must not error");
         stand_in.join();
@@ -2876,11 +2919,22 @@ mod tests {
         };
         // (1) Neither: no progress, no grid → the no-figure sentinel.
         let idle = BenchState::default();
-        assert_eq!(latest_memory_read_bw(&idle), 0.0, "no bench data at all → 0.0");
+        assert_eq!(
+            latest_memory_read_bw(&idle),
+            0.0,
+            "no bench data at all → 0.0"
+        );
 
         // (2) Terminal grid only (row 0 = the Memory read cell).
-        let grid_only = BenchState { grid: Some(grid.clone()), ..Default::default() };
-        assert_eq!(latest_memory_read_bw(&grid_only), 26.35, "the terminal grid cell");
+        let grid_only = BenchState {
+            grid: Some(grid.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            latest_memory_read_bw(&grid_only),
+            26.35,
+            "the terminal grid cell"
+        );
 
         // (3) A live `Memory · Read` event beats the (older) terminal
         // grid; a newer non-Memory / non-Read event is ignored.
@@ -3001,7 +3055,9 @@ mod tests {
                 Response::BenchResult { run_id: 1, grid },
             ] {
                 let bytes = encode_frame(&Message::Response(response)).expect("must encode");
-                stream.write_all(&bytes).expect("stand-in write must not fail");
+                stream
+                    .write_all(&bytes)
+                    .expect("stand-in write must not fail");
             }
         });
 
@@ -3032,8 +3088,15 @@ mod tests {
         run_bench(sock.path(), cmd, &state, &cancel).expect("run_bench must not error");
 
         let state = state.read().expect("the updater must not poison the lock");
-        assert!(!state.bench.running, "the terminal result must clear running");
-        assert_eq!(state.bench.run_id, Some(1), "the ack's run_id must be recorded");
+        assert!(
+            !state.bench.running,
+            "the terminal result must clear running"
+        );
+        assert_eq!(
+            state.bench.run_id,
+            Some(1),
+            "the ack's run_id must be recorded"
+        );
         assert_eq!(
             state.bench.progress, expected_progress,
             "exactly the streamed events; the stale entry is cleared"
@@ -3043,7 +3106,10 @@ mod tests {
             Some(expected_grid),
             "the terminal grid must land in the state"
         );
-        assert!(state.error.is_none(), "a clean run must not record an error");
+        assert!(
+            state.error.is_none(),
+            "a clean run must not record an error"
+        );
         stand_in.join();
     }
 
@@ -3062,10 +3128,11 @@ mod tests {
                 Some(Message::Request(Request::StartBenchmark { .. })) => {}
                 other => panic!("stand-in expected StartBenchmark, got {other:?}"),
             }
-            let started =
-                encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
-                    .expect("must encode");
-            stream.write_all(&started).expect("stand-in write must not fail");
+            let started = encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
+                .expect("must encode");
+            stream
+                .write_all(&started)
+                .expect("stand-in write must not fail");
             // Mimic the daemon: end the run after a beat — the worker
             // either sees the cancel flag before the terminal frame
             // (sends a `CancelBenchmark` and breaks) or receives the
@@ -3092,8 +3159,7 @@ mod tests {
                 };
                 // The function locks the shared state only per
                 // mutation — never across the stream drain (C14-03).
-                run_bench(&socket, cmd, &state, &cancel)
-                    .expect("run_bench must not error");
+                run_bench(&socket, cmd, &state, &cancel).expect("run_bench must not error");
             })
         };
 
@@ -3101,7 +3167,13 @@ mod tests {
         // state), then set the shared cancel flag.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if state.read().expect("the updater must not poison the lock").bench.run_id.is_some() {
+            if state
+                .read()
+                .expect("the updater must not poison the lock")
+                .bench
+                .run_id
+                .is_some()
+            {
                 break;
             }
             assert!(
@@ -3111,12 +3183,21 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         cancel.store(true, Ordering::Relaxed);
-        worker.join().expect("run_bench must return on cancel (no hang)");
+        worker
+            .join()
+            .expect("run_bench must return on cancel (no hang)");
 
         let state = state.read().expect("the updater must not poison the lock");
         assert!(!state.bench.running, "the cancel must clear running");
-        assert_eq!(state.bench.run_id, Some(42), "the run id must stay recorded");
-        assert!(state.error.is_none(), "a clean cancel must not record an error");
+        assert_eq!(
+            state.bench.run_id,
+            Some(42),
+            "the run id must stay recorded"
+        );
+        assert!(
+            state.error.is_none(),
+            "a clean cancel must not record an error"
+        );
         stand_in.join();
     }
 
@@ -3139,7 +3220,9 @@ mod tests {
                 "a benchmark is already running".to_owned(),
             )))
             .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
 
         let cmd = TuiBenchCmd {
@@ -3158,7 +3241,10 @@ mod tests {
             Some("a benchmark is already running"),
             "the daemon's structured message must be recorded"
         );
-        assert!(state.bench.grid.is_none(), "an errored run lands no terminal grid");
+        assert!(
+            state.bench.grid.is_none(),
+            "an errored run lands no terminal grid"
+        );
         stand_in.join();
     }
 
@@ -3179,9 +3265,15 @@ mod tests {
         run_bench(sock.path(), cmd, &state, &cancel).expect("run_bench must not error");
 
         let state = state.read().expect("the updater must not poison the lock");
-        assert!(!state.bench.running, "a failed connect must not leave a run in flight");
+        assert!(
+            !state.bench.running,
+            "a failed connect must not leave a run in flight"
+        );
         assert!(state.bench.progress.is_empty(), "no progress without a run");
-        let error = state.error.clone().expect("a friendly error must be recorded");
+        let error = state
+            .error
+            .clone()
+            .expect("a friendly error must be recorded");
         assert!(
             error.contains("daemon not running"),
             "the error must carry the DaemonDown hint, got: {error}"
@@ -3226,10 +3318,11 @@ mod tests {
                 Some(Message::Request(Request::StartBenchmark { .. })) => {}
                 other => panic!("stand-in expected StartBenchmark, got {other:?}"),
             }
-            let started =
-                encode_frame(&Message::Response(Response::BenchStarted { run_id: 7 }))
-                    .expect("must encode");
-            stream.write_all(&started).expect("stand-in write must not fail");
+            let started = encode_frame(&Message::Response(Response::BenchStarted { run_id: 7 }))
+                .expect("must encode");
+            stream
+                .write_all(&started)
+                .expect("stand-in write must not fail");
             for cell_index in 0u32..15 {
                 let tick = encode_frame(&Message::Response(Response::BenchProgress(
                     StreamProgress {
@@ -3242,7 +3335,9 @@ mod tests {
                     },
                 )))
                 .expect("must encode");
-                stream.write_all(&tick).expect("stand-in write must not fail");
+                stream
+                    .write_all(&tick)
+                    .expect("stand-in write must not fail");
                 thread::sleep(Duration::from_millis(100));
             }
             let result = encode_frame(&Message::Response(Response::BenchResult {
@@ -3250,7 +3345,9 @@ mod tests {
                 grid,
             }))
             .expect("must encode");
-            stream.write_all(&result).expect("stand-in write must not fail");
+            stream
+                .write_all(&result)
+                .expect("stand-in write must not fail");
         });
 
         let state = Arc::new(RwLock::new(AppState::default()));
@@ -3265,8 +3362,7 @@ mod tests {
                     mode: BenchMode::Full,
                     duration_minutes: None,
                 };
-                run_bench(&socket, cmd, &state, &cancel)
-                    .expect("run_bench must not error");
+                run_bench(&socket, cmd, &state, &cancel).expect("run_bench must not error");
             })
         };
 
@@ -3304,7 +3400,9 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        worker.join().expect("run_bench must return at its terminal (no hang)");
+        worker
+            .join()
+            .expect("run_bench must return at its terminal (no hang)");
         stand_in.join();
 
         // The terminal assertions take one brief, fully-scoped read
@@ -3359,7 +3457,10 @@ mod tests {
         let expected_grid = grid.clone();
         let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
             match read_one_message(&mut stream) {
-                Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
+                Some(Message::Request(Request::StartBurnIn {
+                    target,
+                    duration_minutes,
+                })) => {
                     assert_eq!(
                         target,
                         StreamTarget::Full,
@@ -3407,7 +3508,9 @@ mod tests {
                 Response::BenchResult { run_id: 9, grid },
             ] {
                 let bytes = encode_frame(&Message::Response(response)).expect("must encode");
-                stream.write_all(&bytes).expect("stand-in write must not fail");
+                stream
+                    .write_all(&bytes)
+                    .expect("stand-in write must not fail");
             }
         });
 
@@ -3441,7 +3544,10 @@ mod tests {
         run_burn_in(sock.path(), cmd, &state, &cancel).expect("run_burn_in must not error");
 
         let state = state.read().expect("the updater must not poison the lock");
-        assert!(!state.bench.burn_in.running, "the terminal must clear burn_in.running");
+        assert!(
+            !state.bench.burn_in.running,
+            "the terminal must clear burn_in.running"
+        );
         assert!(
             state.bench.running,
             "a burn-in run must not touch the normal-bench running flag"
@@ -3458,27 +3564,33 @@ mod tests {
             }],
             "a burn-in run must not touch the normal-bench progress"
         );
-        assert_eq!(state.bench.run_id, Some(9), "the ack's run_id must be recorded");
-        assert_eq!(state.bench.burn_in.iteration, 2, "the newest tick's iteration");
-        assert_eq!(state.bench.burn_in.elapsed_secs, 3.5, "the newest tick's elapsed");
         assert_eq!(
-            state.bench.burn_in.latest.read_gbps[0],
-            52.5,
+            state.bench.run_id,
+            Some(9),
+            "the ack's run_id must be recorded"
+        );
+        assert_eq!(
+            state.bench.burn_in.iteration, 2,
+            "the newest tick's iteration"
+        );
+        assert_eq!(
+            state.bench.burn_in.elapsed_secs, 3.5,
+            "the newest tick's elapsed"
+        );
+        assert_eq!(
+            state.bench.burn_in.latest.read_gbps[0], 52.5,
             "the newest value per cell wins (the stale 7.0 is reset)"
         );
         assert_eq!(
-            state.bench.burn_in.latest.latency_ns[1],
-            1.2,
+            state.bench.burn_in.latest.latency_ns[1], 1.2,
             "the latency tick lands in the tier's latency cell (L1 = slot 1)"
         );
         assert_eq!(
-            state.bench.burn_in.latest.write_gbps,
-            [0.0; 4],
+            state.bench.burn_in.latest.write_gbps, [0.0; 4],
             "an unticked column stays zero"
         );
         assert_eq!(
-            state.bench.burn_in.latest.copy_gbps,
-            [0.0; 4],
+            state.bench.burn_in.latest.copy_gbps, [0.0; 4],
             "an unticked column stays zero"
         );
         assert_eq!(
@@ -3486,7 +3598,10 @@ mod tests {
             Some(expected_grid),
             "the terminal grid must land in the state"
         );
-        assert!(state.error.is_none(), "a clean run must not record an error");
+        assert!(
+            state.error.is_none(),
+            "a clean run must not record an error"
+        );
         stand_in.join();
     }
 
@@ -3502,20 +3617,27 @@ mod tests {
         let sock = TempSocket::new("burnin-cancel");
         let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
             match read_one_message(&mut stream) {
-                Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
-                    assert_eq!(target, StreamTarget::Full, "the cmd's target must ride the wire");
+                Some(Message::Request(Request::StartBurnIn {
+                    target,
+                    duration_minutes,
+                })) => {
                     assert_eq!(
-                        duration_minutes,
-                        0,
+                        target,
+                        StreamTarget::Full,
+                        "the cmd's target must ride the wire"
+                    );
+                    assert_eq!(
+                        duration_minutes, 0,
                         "the infinite (0) duration must ride the wire"
                     );
                 }
                 other => panic!("stand-in expected StartBurnIn, got {other:?}"),
             }
-            let started =
-                encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
-                    .expect("must encode");
-            stream.write_all(&started).expect("stand-in write must not fail");
+            let started = encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
+                .expect("must encode");
+            stream
+                .write_all(&started)
+                .expect("stand-in write must not fail");
             // Mimic the daemon: end the run after a beat — the worker
             // either sees the cancel flag before the terminal frame
             // (sends a `CancelBenchmark` and breaks) or receives the
@@ -3542,8 +3664,7 @@ mod tests {
                 };
                 // The function locks the shared state only per
                 // mutation — never across the stream drain (C14-03).
-                run_burn_in(&socket, cmd, &state, &cancel)
-                    .expect("run_burn_in must not error");
+                run_burn_in(&socket, cmd, &state, &cancel).expect("run_burn_in must not error");
             })
         };
 
@@ -3551,7 +3672,13 @@ mod tests {
         // state), then set the shared cancel flag.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if state.read().expect("the updater must not poison the lock").bench.run_id.is_some() {
+            if state
+                .read()
+                .expect("the updater must not poison the lock")
+                .bench
+                .run_id
+                .is_some()
+            {
                 break;
             }
             assert!(
@@ -3561,12 +3688,24 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         cancel.store(true, Ordering::Relaxed);
-        worker.join().expect("run_burn_in must return on cancel (no hang)");
+        worker
+            .join()
+            .expect("run_burn_in must return on cancel (no hang)");
 
         let state = state.read().expect("the updater must not poison the lock");
-        assert!(!state.bench.burn_in.running, "the cancel must clear burn_in.running");
-        assert_eq!(state.bench.run_id, Some(42), "the run id must stay recorded");
-        assert!(state.error.is_none(), "a clean cancel must not record an error");
+        assert!(
+            !state.bench.burn_in.running,
+            "the cancel must clear burn_in.running"
+        );
+        assert_eq!(
+            state.bench.run_id,
+            Some(42),
+            "the run id must stay recorded"
+        );
+        assert!(
+            state.error.is_none(),
+            "a clean cancel must not record an error"
+        );
         stand_in.join();
     }
 
@@ -3601,10 +3740,7 @@ mod tests {
                 // sees the EOF either way.
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !cancel.load(Ordering::Relaxed) {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the cancel flag was never set"
-                    );
+                    assert!(Instant::now() < deadline, "the cancel flag was never set");
                     thread::sleep(Duration::from_millis(10));
                 }
                 let tick = encode_frame(&Message::Response(Response::BurnInProgress(BurnInTick {
@@ -3642,8 +3778,7 @@ mod tests {
                     mode: BenchMode::Full,
                     duration_minutes: Some(0),
                 };
-                run_burn_in(&socket, cmd, &state, &cancel)
-                    .expect("run_burn_in must not error");
+                run_burn_in(&socket, cmd, &state, &cancel).expect("run_burn_in must not error");
             })
         };
 
@@ -3668,7 +3803,9 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         cancel.store(true, Ordering::Relaxed);
-        worker.join().expect("run_burn_in must return on the pre-ack cancel (no hang)");
+        worker
+            .join()
+            .expect("run_burn_in must return on the pre-ack cancel (no hang)");
         stand_in.join();
 
         assert!(
@@ -3676,9 +3813,15 @@ mod tests {
             "a pre-ack cancel must send no CancelBenchmark (no run id yet)"
         );
         let state = state.read().expect("the updater must not poison the lock");
-        assert!(!state.bench.burn_in.running, "the cancel must clear burn_in.running");
+        assert!(
+            !state.bench.burn_in.running,
+            "the cancel must clear burn_in.running"
+        );
         assert_eq!(state.bench.run_id, None, "the ack never landed — no run id");
-        assert!(state.error.is_none(), "a clean cancel must not record an error");
+        assert!(
+            state.error.is_none(),
+            "a clean cancel must not record an error"
+        );
     }
 
     /// (x) A `BenchProgress` frame in a burn-in stream violates the
@@ -3695,10 +3838,11 @@ mod tests {
                 Some(Message::Request(Request::StartBurnIn { .. })) => {}
                 other => panic!("stand-in expected StartBurnIn, got {other:?}"),
             }
-            let started =
-                encode_frame(&Message::Response(Response::BenchStarted { run_id: 3 }))
-                    .expect("must encode");
-            stream.write_all(&started).expect("stand-in write must not fail");
+            let started = encode_frame(&Message::Response(Response::BenchStarted { run_id: 3 }))
+                .expect("must encode");
+            stream
+                .write_all(&started)
+                .expect("stand-in write must not fail");
             let progress = encode_frame(&Message::Response(Response::BenchProgress(
                 StreamProgress {
                     cell_index: 0,
@@ -3710,7 +3854,9 @@ mod tests {
                 },
             )))
             .expect("must encode");
-            stream.write_all(&progress).expect("stand-in write must not fail");
+            stream
+                .write_all(&progress)
+                .expect("stand-in write must not fail");
         });
 
         let cmd = TuiBenchCmd {
@@ -3723,8 +3869,14 @@ mod tests {
         run_burn_in(sock.path(), cmd, &state, &cancel).expect("run_burn_in must not error");
 
         let state = state.read().expect("the updater must not poison the lock");
-        assert!(!state.bench.burn_in.running, "the violation must clear burn_in.running");
-        let error = state.error.as_ref().expect("the violation must record a structured error");
+        assert!(
+            !state.bench.burn_in.running,
+            "the violation must clear burn_in.running"
+        );
+        let error = state
+            .error
+            .as_ref()
+            .expect("the violation must record a structured error");
         assert!(
             error.contains("unexpected benchmark frame during burn-in"),
             "the error must name the violation, got: {error}"
@@ -3750,7 +3902,10 @@ mod tests {
         run_burn_in(sock.path(), cmd, &state, &cancel).expect("run_burn_in must not error");
 
         let state = state.read().expect("the updater must not poison the lock");
-        assert!(!state.bench.burn_in.running, "a failed connect must not leave a burn-in in flight");
+        assert!(
+            !state.bench.burn_in.running,
+            "a failed connect must not leave a burn-in in flight"
+        );
         assert_eq!(
             state.bench.burn_in.latest,
             BenchmarkGrid {
@@ -3761,7 +3916,10 @@ mod tests {
             },
             "no tick landed — the latest grid stays zero"
         );
-        let error = state.error.clone().expect("a friendly error must be recorded");
+        let error = state
+            .error
+            .clone()
+            .expect("a friendly error must be recorded");
         assert!(
             error.contains("daemon not running"),
             "the error must carry the DaemonDown hint, got: {error}"
@@ -3775,17 +3933,29 @@ mod tests {
     /// they never touch each other's flag).
     #[test]
     fn run_in_flight_tracks_both_run_classes() {
-        assert!(!run_in_flight(&BenchState::default()), "idle: no run in flight");
-        let bench = BenchState { running: true, ..Default::default() };
+        assert!(
+            !run_in_flight(&BenchState::default()),
+            "idle: no run in flight"
+        );
+        let bench = BenchState {
+            running: true,
+            ..Default::default()
+        };
         assert!(run_in_flight(&bench), "a normal bench in flight");
         let burn = BenchState {
-            burn_in: ramsleuth_tui::ui::BurnInState { running: true, ..Default::default() },
+            burn_in: ramsleuth_tui::ui::BurnInState {
+                running: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(run_in_flight(&burn), "a burn-in in flight");
         let both = BenchState {
             running: true,
-            burn_in: ramsleuth_tui::ui::BurnInState { running: true, ..Default::default() },
+            burn_in: ramsleuth_tui::ui::BurnInState {
+                running: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(run_in_flight(&both), "both classes in flight");
@@ -3825,11 +3995,14 @@ mod tests {
                     match read_one_message(&mut stream) {
                         Some(Message::Request(Request::StartBenchmark { .. })) => {
                             seen.fetch_or(1, Ordering::Relaxed);
-                            let started = encode_frame(&Message::Response(
-                                Response::BenchStarted { run_id: 1 },
-                            ))
-                            .expect("must encode");
-                            stream.write_all(&started).expect("stand-in write must not fail");
+                            let started =
+                                encode_frame(&Message::Response(Response::BenchStarted {
+                                    run_id: 1,
+                                }))
+                                .expect("must encode");
+                            stream
+                                .write_all(&started)
+                                .expect("stand-in write must not fail");
                             let result = encode_frame(&Message::Response(Response::BenchResult {
                                 run_id: 1,
                                 grid: BenchmarkGrid {
@@ -3840,37 +4013,49 @@ mod tests {
                                 },
                             }))
                             .expect("must encode");
-                            stream.write_all(&result).expect("stand-in write must not fail");
+                            stream
+                                .write_all(&result)
+                                .expect("stand-in write must not fail");
                         }
-                        Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
+                        Some(Message::Request(Request::StartBurnIn {
+                            target,
+                            duration_minutes,
+                        })) => {
                             assert_eq!(
                                 target,
                                 StreamTarget::Full,
                                 "the burn-in cmd's target must ride the wire"
                             );
                             assert_eq!(
-                                duration_minutes,
-                                7,
+                                duration_minutes, 7,
                                 "the burn-in cmd's duration must ride the wire"
                             );
                             seen.fetch_or(2, Ordering::Relaxed);
-                            let started = encode_frame(&Message::Response(
-                                Response::BenchStarted { run_id: 2 },
-                            ))
-                            .expect("must encode");
-                            stream.write_all(&started).expect("stand-in write must not fail");
-                            let cancelled = encode_frame(&Message::Response(
-                                Response::BenchCancelled { run_id: 2 },
-                            ))
-                            .expect("must encode");
-                            stream.write_all(&cancelled).expect("stand-in write must not fail");
+                            let started =
+                                encode_frame(&Message::Response(Response::BenchStarted {
+                                    run_id: 2,
+                                }))
+                                .expect("must encode");
+                            stream
+                                .write_all(&started)
+                                .expect("stand-in write must not fail");
+                            let cancelled =
+                                encode_frame(&Message::Response(Response::BenchCancelled {
+                                    run_id: 2,
+                                }))
+                                .expect("must encode");
+                            stream
+                                .write_all(&cancelled)
+                                .expect("stand-in write must not fail");
                         }
                         Some(Message::Request(Request::GetTelemetry)) => {
                             let bytes = encode_frame(&Message::Response(Response::Telemetry(
                                 mock_snapshot(),
                             )))
                             .expect("must encode");
-                            stream.write_all(&bytes).expect("stand-in write must not fail");
+                            stream
+                                .write_all(&bytes)
+                                .expect("stand-in write must not fail");
                         }
                         Some(other) => {
                             panic!("stand-in saw an unexpected frame: {other:?}")
@@ -3948,8 +4133,14 @@ mod tests {
         // Both runs ended cleanly: nothing left in flight (either
         // class), no error recorded.
         let state = state.read().expect("the updater must not poison the lock");
-        assert!(!state.bench.running, "the normal run must end at its terminal");
-        assert!(!state.bench.burn_in.running, "the burn-in must end at its terminal");
+        assert!(
+            !state.bench.running,
+            "the normal run must end at its terminal"
+        );
+        assert!(
+            !state.bench.burn_in.running,
+            "the burn-in must end at its terminal"
+        );
         assert!(state.error.is_none(), "clean runs must not record an error");
     }
 
@@ -3968,8 +4159,7 @@ mod tests {
 
     impl TempOutDir {
         fn new(name: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("ramsleuth-tui-{name}-{}", process::id()));
+            let path = std::env::temp_dir().join(format!("ramsleuth-tui-{name}-{}", process::id()));
             std::fs::create_dir_all(&path).expect("the test out dir must be created");
             Self { path }
         }
@@ -4019,7 +4209,10 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("the exported file must exist");
         let value: serde_json::Value =
             serde_json::from_str(&text).expect("export must be valid JSON");
-        assert!(value.is_object(), "a snapshot must serialize to a JSON object");
+        assert!(
+            value.is_object(),
+            "a snapshot must serialize to a JSON object"
+        );
         let keys = value
             .as_object()
             .expect("checked is_object")
@@ -4027,7 +4220,14 @@ mod tests {
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
         let expected: std::collections::BTreeSet<String> = [
-            "amd", "bench", "cpu", "intel", "spd", "platform", "total_capacity", "dimm_sizes",
+            "amd",
+            "bench",
+            "cpu",
+            "intel",
+            "spd",
+            "platform",
+            "total_capacity",
+            "dimm_sizes",
             "vcore",
         ]
         .into_iter()
@@ -4047,8 +4247,19 @@ mod tests {
         // every one of the seven wire keys matches the plain wire
         // root serialization.
         let base = serde_json::to_value(&telemetry).expect("the wire root must serialize");
-        for key in ["cpu", "amd", "intel", "spd", "platform", "total_capacity", "dimm_sizes"] {
-            assert_eq!(value[key], base[key], "the {key} key must stay byte-compatible");
+        for key in [
+            "cpu",
+            "amd",
+            "intel",
+            "spd",
+            "platform",
+            "total_capacity",
+            "dimm_sizes",
+        ] {
+            assert_eq!(
+                value[key], base[key],
+                "the {key} key must stay byte-compatible"
+            );
         }
 
         // The wire root is serde round-trip safe (P3-06); the extra
@@ -4073,11 +4284,28 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("the exported file must exist");
         let value: serde_json::Value =
             serde_json::from_str(&text).expect("export must be valid JSON");
-        assert!(value.is_object(), "a snapshot must serialize to a JSON object");
-        assert!(value["bench"].is_null(), "no run yet: the bench key is the JSON null");
+        assert!(
+            value.is_object(),
+            "a snapshot must serialize to a JSON object"
+        );
+        assert!(
+            value["bench"].is_null(),
+            "no run yet: the bench key is the JSON null"
+        );
         let base = serde_json::to_value(&telemetry).expect("the wire root must serialize");
-        for key in ["cpu", "amd", "intel", "spd", "platform", "total_capacity", "dimm_sizes"] {
-            assert_eq!(value[key], base[key], "the {key} key must stay byte-compatible");
+        for key in [
+            "cpu",
+            "amd",
+            "intel",
+            "spd",
+            "platform",
+            "total_capacity",
+            "dimm_sizes",
+        ] {
+            assert_eq!(
+                value[key], base[key],
+                "the {key} key must stay byte-compatible"
+            );
         }
     }
 
@@ -4118,8 +4346,7 @@ mod tests {
         // A nested path whose parent dir does not exist: `fs::write`
         // fails with a missing-dir I/O error.
         let path = dir.path().join("no-such-dir").join("missing-dir.json");
-        let err =
-            export_json(&telemetry, None, &path).expect_err("a missing parent dir must fail");
+        let err = export_json(&telemetry, None, &path).expect_err("a missing parent dir must fail");
         assert!(
             err.starts_with("export file write failed:"),
             "the write failure must carry the I/O class, got: {err}"
@@ -4137,7 +4364,10 @@ mod tests {
         let grid = fixture_grid();
         let state = AppState {
             telemetry: Some(mock_snapshot()),
-            bench: BenchState { grid: Some(grid.clone()), ..Default::default() },
+            bench: BenchState {
+                grid: Some(grid.clone()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -4148,7 +4378,10 @@ mod tests {
             path.starts_with(dir.path()),
             "the file must land in the out dir: {path:?}"
         );
-        let name = path.file_name().and_then(|s| s.to_str()).expect("the file must be named");
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("the file must be named");
         assert!(
             name.starts_with("ramsleuth-export-"),
             "the file must carry the export name prefix, got: {name}"
@@ -4162,7 +4395,10 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("the exported file must be readable");
         let value: serde_json::Value =
             serde_json::from_str(&text).expect("the export must be valid JSON");
-        assert!(value.is_object(), "a snapshot must serialize to a JSON object");
+        assert!(
+            value.is_object(),
+            "a snapshot must serialize to a JSON object"
+        );
         let back_grid: BenchmarkGrid = serde_json::from_value(value["bench"].clone())
             .expect("bench must re-parse into the grid");
         assert_eq!(back_grid, grid, "the terminal grid is exported");
@@ -4175,10 +4411,11 @@ mod tests {
         let dir = TempOutDir::new("perform-export-none");
         let state = AppState::default(); // no snapshot yet
 
-        let result =
-            perform_export(&state, dir.path()).expect("no telemetry must not fail");
+        let result = perform_export(&state, dir.path()).expect("no telemetry must not fail");
         assert!(result.is_none(), "no telemetry: no file (the GUI rule)");
-        let count = std::fs::read_dir(dir.path()).expect("the dir must be readable").count();
+        let count = std::fs::read_dir(dir.path())
+            .expect("the dir must be readable")
+            .count();
         assert_eq!(count, 0, "no telemetry: nothing was written to the out dir");
     }
 
@@ -4188,12 +4425,14 @@ mod tests {
     #[test]
     fn perform_export_maps_write_failure_to_a_string() {
         let dir = TempOutDir::new("perform-export-fail");
-        let state = AppState { telemetry: Some(mock_snapshot()), ..Default::default() };
+        let state = AppState {
+            telemetry: Some(mock_snapshot()),
+            ..Default::default()
+        };
         // Nest the out dir one level below the temp dir: the missing
         // parent makes the write fail.
         let nested = dir.path().join("no-such-dir");
-        let err =
-            perform_export(&state, &nested).expect_err("a missing parent dir must fail");
+        let err = perform_export(&state, &nested).expect_err("a missing parent dir must fail");
         assert!(
             err.starts_with("export file write failed:"),
             "the write failure must carry the I/O class, got: {err}"
@@ -4229,16 +4468,17 @@ mod tests {
         let path = PathBuf::from("/tmp/ramsleuth-export-1.json");
         record_export_result(&mut state, Ok(Some(path)));
         assert_eq!(
-            state.daemon_status,
-            "export: /tmp/ramsleuth-export-1.json",
+            state.daemon_status, "export: /tmp/ramsleuth-export-1.json",
             "the written path lands in daemon_status (transient)"
         );
-        assert!(state.error.is_none(), "a written export must not record an error");
+        assert!(
+            state.error.is_none(),
+            "a written export must not record an error"
+        );
 
         record_export_result(&mut state, Ok(None));
         assert_eq!(
-            state.daemon_status,
-            "nothing to export yet (no telemetry)",
+            state.daemon_status, "nothing to export yet (no telemetry)",
             "the no-telemetry hint lands in daemon_status"
         );
         assert!(state.error.is_none(), "a hint must not record an error");
@@ -4282,8 +4522,16 @@ mod tests {
         // Off-preset values advance to the next preset above them.
         assert_eq!(cycle_poll(200), 500, "a sub-500 ms value lands on 500 ms");
         assert_eq!(cycle_poll(400), 500, "a sub-500 ms value lands on 500 ms");
-        assert_eq!(cycle_poll(1_500), 2_000, "between 1 s and 2 s it lands on 2 s");
-        assert_eq!(cycle_poll(59_000), 60_000, "between 30 s and 60 s it lands on 60 s");
+        assert_eq!(
+            cycle_poll(1_500),
+            2_000,
+            "between 1 s and 2 s it lands on 2 s"
+        );
+        assert_eq!(
+            cycle_poll(59_000),
+            60_000,
+            "between 30 s and 60 s it lands on 60 s"
+        );
         assert_eq!(cycle_poll(61_000), 100, "past the last preset it wraps");
     }
 
@@ -4297,7 +4545,11 @@ mod tests {
         assert_eq!(cycle_window(5), 15);
         assert_eq!(cycle_window(15), 60);
         assert_eq!(cycle_window(60), 1, "past the last preset the cycle wraps");
-        assert_eq!(cycle_window(2), 5, "an off-preset value lands on the next preset above");
+        assert_eq!(
+            cycle_window(2),
+            5,
+            "an off-preset value lands on the next preset above"
+        );
         assert_eq!(cycle_window(7), 15);
         assert_eq!(cycle_window(20), 60);
         assert_eq!(cycle_window(90), 1, "past the last preset it wraps");
@@ -4316,36 +4568,75 @@ mod tests {
 
         assert!(state.settings.capacity_gib, "the GiB default");
         assert_eq!(
-            dispatch_action(Action::ToggleCapacity, &mut state, &mut dismissed, &tx, &cancel),
+            dispatch_action(
+                Action::ToggleCapacity,
+                &mut state,
+                &mut dismissed,
+                &tx,
+                &cancel
+            ),
             SideEffect::None
         );
         assert!(!state.settings.capacity_gib, "GiB → GB");
         assert_eq!(
-            dispatch_action(Action::ToggleCapacity, &mut state, &mut dismissed, &tx, &cancel),
+            dispatch_action(
+                Action::ToggleCapacity,
+                &mut state,
+                &mut dismissed,
+                &tx,
+                &cancel
+            ),
             SideEffect::None
         );
         assert!(state.settings.capacity_gib, "GB → GiB (round-trip)");
 
         assert!(state.settings.clock_mhz, "the MHz default");
         assert_eq!(
-            dispatch_action(Action::ToggleClock, &mut state, &mut dismissed, &tx, &cancel),
+            dispatch_action(
+                Action::ToggleClock,
+                &mut state,
+                &mut dismissed,
+                &tx,
+                &cancel
+            ),
             SideEffect::None
         );
         assert!(!state.settings.clock_mhz, "MHz → GHz");
         assert_eq!(
-            dispatch_action(Action::ToggleClock, &mut state, &mut dismissed, &tx, &cancel),
+            dispatch_action(
+                Action::ToggleClock,
+                &mut state,
+                &mut dismissed,
+                &tx,
+                &cancel
+            ),
             SideEffect::None
         );
         assert!(state.settings.clock_mhz, "GHz → MHz (round-trip)");
 
         assert!(state.settings.refresh, "the TUI's refresh-on default");
         assert_eq!(
-            dispatch_action(Action::ToggleRefresh, &mut state, &mut dismissed, &tx, &cancel),
+            dispatch_action(
+                Action::ToggleRefresh,
+                &mut state,
+                &mut dismissed,
+                &tx,
+                &cancel
+            ),
             SideEffect::None
         );
-        assert!(!state.settings.refresh, "refresh on → off (the poller freezes the cadence)");
+        assert!(
+            !state.settings.refresh,
+            "refresh on → off (the poller freezes the cadence)"
+        );
         assert_eq!(
-            dispatch_action(Action::ToggleRefresh, &mut state, &mut dismissed, &tx, &cancel),
+            dispatch_action(
+                Action::ToggleRefresh,
+                &mut state,
+                &mut dismissed,
+                &tx,
+                &cancel
+            ),
             SideEffect::None
         );
         assert!(state.settings.refresh, "off → on (round-trip)");
@@ -4378,12 +4669,21 @@ mod tests {
         {
             let mut s = state_write(&state);
             assert_eq!(
-                dispatch_action(Action::ToggleRequirements, &mut s, &mut dismissed, &tx, &cancel),
+                dispatch_action(
+                    Action::ToggleRequirements,
+                    &mut s,
+                    &mut dismissed,
+                    &tx,
+                    &cancel
+                ),
                 SideEffect::None
             );
         }
         assert!(dismissed, "closing dismisses the auto-open (the latch)");
-        assert!(!state_read(&state).settings.requirements_open, "the strip is closed");
+        assert!(
+            !state_read(&state).settings.requirements_open,
+            "the strip is closed"
+        );
         apply_requirements_auto_open(&state, dismissed);
         assert!(
             !state_read(&state).settings.requirements_open,
@@ -4395,12 +4695,21 @@ mod tests {
         {
             let mut s = state_write(&state);
             assert_eq!(
-                dispatch_action(Action::ToggleRequirements, &mut s, &mut dismissed, &tx, &cancel),
+                dispatch_action(
+                    Action::ToggleRequirements,
+                    &mut s,
+                    &mut dismissed,
+                    &tx,
+                    &cancel
+                ),
                 SideEffect::None
             );
         }
         assert!(!dismissed, "reopening clears the dismissal");
-        assert!(state_read(&state).settings.requirements_open, "the strip is open again");
+        assert!(
+            state_read(&state).settings.requirements_open,
+            "the strip is open again"
+        );
         apply_requirements_auto_open(&state, dismissed);
         assert!(
             state_read(&state).settings.requirements_open,
@@ -4435,7 +4744,10 @@ mod tests {
         // A normal bench in flight: all three run keys skip + the
         // note lands in `daemon_status`.
         let mut state = AppState {
-            bench: BenchState { running: true, ..Default::default() },
+            bench: BenchState {
+                running: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         for action in [Action::BenchFull, Action::BenchMemory, Action::BurnIn] {
@@ -4448,13 +4760,19 @@ mod tests {
             state.daemon_status, RUN_IN_FLIGHT_NOTE,
             "a skipped send records the dim status note (the GUI single-flight UX)"
         );
-        assert!(rx.try_recv().is_err(), "no command was queued while a run is in flight");
+        assert!(
+            rx.try_recv().is_err(),
+            "no command was queued while a run is in flight"
+        );
 
         // A burn-in in flight (the compound guard's other class):
         // the same skip.
         let mut state = AppState {
             bench: BenchState {
-                burn_in: ramsleuth_tui::ui::BurnInState { running: true, ..Default::default() },
+                burn_in: ramsleuth_tui::ui::BurnInState {
+                    running: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -4484,7 +4802,9 @@ mod tests {
             (StreamTarget::Full, BenchMode::Full, None),
             "`[b]` = a full run (no burn-in duration)"
         );
-        let memory = rx.try_recv().expect("the `[m]` memory-bench cmd was queued");
+        let memory = rx
+            .try_recv()
+            .expect("the `[m]` memory-bench cmd was queued");
         assert_eq!(
             (memory.target, memory.mode, memory.duration_minutes),
             (StreamTarget::Full, BenchMode::MemoryOnly, None),
@@ -4532,8 +4852,7 @@ mod tests {
             tx: &mpsc::Sender<TuiBenchCmd>,
             cancel: &AtomicBool,
         ) -> Option<SideEffect> {
-            let action =
-                key_to_action(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))?;
+            let action = key_to_action(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))?;
             apply_requirements_auto_open(state, *dismissed);
             Some({
                 let mut s = state_write(state);
@@ -4541,7 +4860,9 @@ mod tests {
             })
         }
 
-        let keys = ['g', 'p', 'u', 'k', 'a', 'w', 't', 'd', 'b', 'm', 'x', 'c', 'e', 's', 'r', 'z', 'q'];
+        let keys = [
+            'g', 'p', 'u', 'k', 'a', 'w', 't', 'd', 'b', 'm', 'x', 'c', 'e', 's', 'r', 'z', 'q',
+        ];
         let mut sides = Vec::new();
         for key in keys {
             sides.push(step(&state, key, &mut dismissed, &tx, &cancel));
@@ -4551,10 +4872,17 @@ mod tests {
             vec![
                 // g p u k a w t d b m x c: the state-only keys
                 // (`Some(SideEffect::None)` — they dispatched, no I/O)
-                Some(SideEffect::None), Some(SideEffect::None), Some(SideEffect::None),
-                Some(SideEffect::None), Some(SideEffect::None), Some(SideEffect::None),
-                Some(SideEffect::None), Some(SideEffect::None),
-                Some(SideEffect::None), Some(SideEffect::None), Some(SideEffect::None),
+                Some(SideEffect::None),
+                Some(SideEffect::None),
+                Some(SideEffect::None),
+                Some(SideEffect::None),
+                Some(SideEffect::None),
+                Some(SideEffect::None),
+                Some(SideEffect::None),
+                Some(SideEffect::None),
+                Some(SideEffect::None),
+                Some(SideEffect::None),
+                Some(SideEffect::None),
                 Some(SideEffect::None),
                 // e s r: the I/O keys report their effect
                 Some(SideEffect::Export),
@@ -4570,17 +4898,29 @@ mod tests {
 
         let s = state_read(&state);
         assert!(s.settings.graphs_open, "one `[g]` opens the graphs overlay");
-        assert_eq!(s.settings.poll_interval_ms, 5_000, "one `[p]` advances 2 s → 5 s");
+        assert_eq!(
+            s.settings.poll_interval_ms, 5_000,
+            "one `[p]` advances 2 s → 5 s"
+        );
         assert!(!s.settings.capacity_gib, "one `[u]` flips GiB → GB");
         assert!(!s.settings.clock_mhz, "one `[k]` flips MHz → GHz");
         assert!(!s.settings.refresh, "one `[a]` freezes the periodic poll");
-        assert_eq!(s.settings.graph_window_min, 15, "one `[w]` advances 5 → 15 min");
-        assert!(s.settings.settings_open, "one `[t]` opens the settings strip");
+        assert_eq!(
+            s.settings.graph_window_min, 15,
+            "one `[w]` advances 5 → 15 min"
+        );
+        assert!(
+            s.settings.settings_open,
+            "one `[t]` opens the settings strip"
+        );
         assert!(
             !s.settings.requirements_open,
             "the `[d]` closed the strip the auto-open had opened"
         );
-        assert!(dismissed, "the `[d]` close dismissed the auto-open (the latch)");
+        assert!(
+            dismissed,
+            "the `[d]` close dismissed the auto-open (the latch)"
+        );
 
         // The three run keys queued exactly their commands (in
         // order) — the state stayed idle, so none was skipped.
@@ -4589,7 +4929,9 @@ mod tests {
             (full.target, full.mode, full.duration_minutes),
             (StreamTarget::Full, BenchMode::Full, None)
         );
-        let memory = rx.try_recv().expect("the `[m]` memory-bench cmd was queued");
+        let memory = rx
+            .try_recv()
+            .expect("the `[m]` memory-bench cmd was queued");
         assert_eq!(
             (memory.target, memory.mode, memory.duration_minutes),
             (StreamTarget::Full, BenchMode::MemoryOnly, None)
@@ -4600,7 +4942,10 @@ mod tests {
             (StreamTarget::Full, BenchMode::Full, Some(5))
         );
         assert!(rx.try_recv().is_err(), "exactly three commands were queued");
-        assert!(cancel.load(Ordering::Relaxed), "the `[c]` key set the shared cancel flag");
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the `[c]` key set the shared cancel flag"
+        );
     }
 
     /// (bq) Every one of the 17 actions dispatches a defined effect
@@ -4642,7 +4987,10 @@ mod tests {
         );
         for (action, side_effect) in expected {
             let side = dispatch_action(action, &mut state, &mut dismissed, &tx, &cancel);
-            assert_eq!(side, side_effect, "{action:?} must dispatch its defined effect");
+            assert_eq!(
+                side, side_effect,
+                "{action:?} must dispatch its defined effect"
+            );
         }
     }
 
@@ -4757,8 +5105,8 @@ mod tests {
 
     impl TempDir {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("ramsleuth-tui-probe-{name}-{}", process::id()));
+            let path =
+                std::env::temp_dir().join(format!("ramsleuth-tui-probe-{name}-{}", process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("test dir must create");
             Self { path }
@@ -4788,10 +5136,11 @@ mod tests {
                 Some(Message::Request(Request::GetProbeReport)) => {}
                 other => panic!("stand-in expected GetProbeReport, got {other:?}"),
             }
-            let bytes =
-                encode_frame(&Message::Response(Response::ProbeReport(probe_fixture())))
-                    .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            let bytes = encode_frame(&Message::Response(Response::ProbeReport(probe_fixture())))
+                .expect("must encode");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
 
         let state = Arc::new(RwLock::new(AppState::default()));
@@ -4800,12 +5149,18 @@ mod tests {
         let app = state_read(&state);
         match &app.probe {
             ProbeOverlayState::Consent { markdown } => {
-                assert!(markdown.starts_with("# RamSleuth Probe Report"), "{markdown}");
+                assert!(
+                    markdown.starts_with("# RamSleuth Probe Report"),
+                    "{markdown}"
+                );
                 assert!(markdown.contains("TUI Test CPU"), "{markdown}");
             }
             other => panic!("the consent overlay must open, got {other:?}"),
         }
-        assert!(app.error.is_none(), "a successful fetch must not record an error");
+        assert!(
+            app.error.is_none(),
+            "a successful fetch must not record an error"
+        );
         stand_in.join();
     }
 
@@ -4818,8 +5173,15 @@ mod tests {
         let state = Arc::new(RwLock::new(AppState::default()));
         probe_report_fetch(sock.path(), &state);
         let app = state_read(&state);
-        assert_eq!(app.probe, ProbeOverlayState::None, "no overlay on a failed fetch");
-        let error = app.error.clone().expect("a friendly error must be recorded");
+        assert_eq!(
+            app.probe,
+            ProbeOverlayState::None,
+            "no overlay on a failed fetch"
+        );
+        let error = app
+            .error
+            .clone()
+            .expect("a friendly error must be recorded");
         assert!(error.contains("daemon not running"), "{error}");
     }
 
@@ -4834,16 +5196,24 @@ mod tests {
                 Some(Message::Request(Request::GetProbeReport)) => {}
                 other => panic!("stand-in expected GetProbeReport, got {other:?}"),
             }
-            let bytes =
-                encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
-                    .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                .expect("must encode");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
         let state = Arc::new(RwLock::new(AppState::default()));
         probe_report_fetch(sock.path(), &state);
         let app = state_read(&state);
-        assert_eq!(app.probe, ProbeOverlayState::None, "no overlay on a contract violation");
-        assert_eq!(app.error.as_deref(), Some("unexpected response to GetProbeReport"));
+        assert_eq!(
+            app.probe,
+            ProbeOverlayState::None,
+            "no overlay on a contract violation"
+        );
+        assert_eq!(
+            app.error.as_deref(),
+            Some("unexpected response to GetProbeReport")
+        );
         stand_in.join();
     }
 
@@ -4857,7 +5227,9 @@ mod tests {
         let no_clip = |_: &str| Ok("copied".to_owned());
 
         let state = Arc::new(RwLock::new(AppState {
-            probe: ProbeOverlayState::Consent { markdown: "# the report".to_owned() },
+            probe: ProbeOverlayState::Consent {
+                markdown: "# the report".to_owned(),
+            },
             ..Default::default()
         }));
         handle_probe_overlay_key(
@@ -4904,7 +5276,9 @@ mod tests {
         let dir = TempDir::new("overlay-yes");
         let area = Rect::new(0, 0, 80, 24);
         let state = Arc::new(RwLock::new(AppState {
-            probe: ProbeOverlayState::Consent { markdown: "# the report".to_owned() },
+            probe: ProbeOverlayState::Consent {
+                markdown: "# the report".to_owned(),
+            },
             ..Default::default()
         }));
         handle_probe_overlay_key(
@@ -4916,8 +5290,15 @@ mod tests {
         );
         let app = state_read(&state);
         match &app.probe {
-            ProbeOverlayState::Preview { markdown, notice, scroll } => {
-                assert_eq!(markdown, "# the report", "the carried markdown must move over");
+            ProbeOverlayState::Preview {
+                markdown,
+                notice,
+                scroll,
+            } => {
+                assert_eq!(
+                    markdown, "# the report",
+                    "the carried markdown must move over"
+                );
                 assert!(notice.is_none(), "the preview opens with no notice");
                 assert_eq!(*scroll, 0, "the preview opens at the top");
             }
@@ -4994,7 +5375,10 @@ mod tests {
         );
         let app = state_read(&state);
         match &app.probe {
-            ProbeOverlayState::Preview { notice: Some((tone, text)), .. } => {
+            ProbeOverlayState::Preview {
+                notice: Some((tone, text)),
+                ..
+            } => {
                 assert_eq!(*tone, NoticeTone::Ok);
                 assert_eq!(text, "Copied to clipboard (wl-copy)");
             }
@@ -5018,9 +5402,19 @@ mod tests {
         );
         let app = state_read(&state);
         match &app.probe {
-            ProbeOverlayState::Preview { notice: Some((tone, text)), .. } => {
-                assert_eq!(*tone, NoticeTone::Warn, "no utility is a warning, not a failure");
-                assert_eq!(text, "No clipboard utility found — use [w] to write to file");
+            ProbeOverlayState::Preview {
+                notice: Some((tone, text)),
+                ..
+            } => {
+                assert_eq!(
+                    *tone,
+                    NoticeTone::Warn,
+                    "no utility is a warning, not a failure"
+                );
+                assert_eq!(
+                    text,
+                    "No clipboard utility found — use [w] to write to file"
+                );
             }
             other => panic!("the preview must stay open after [c], got {other:?}"),
         }
@@ -5039,7 +5433,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let state = Arc::new(RwLock::new(AppState {
-            probe: ProbeOverlayState::Preview { markdown, notice: None, scroll: 0 },
+            probe: ProbeOverlayState::Preview {
+                markdown,
+                notice: None,
+                scroll: 0,
+            },
             ..Default::default()
         }));
         let no_clip = |_: &str| Ok("copied".to_owned());
@@ -5053,7 +5451,11 @@ mod tests {
                 &no_clip,
             );
         }
-        assert_eq!(scroll_of(&state), 10, "the scroll must clamp at max (20 − 10)");
+        assert_eq!(
+            scroll_of(&state),
+            10,
+            "the scroll must clamp at max (20 − 10)"
+        );
         handle_probe_overlay_key(
             overlay_key(KeyCode::Down),
             &state,

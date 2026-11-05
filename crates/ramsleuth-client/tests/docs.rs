@@ -11,8 +11,7 @@ use std::path::Path;
 /// The repo-root `Docs/User_Guide.md` (the client crate is at
 /// `crates/ramsleuth-client`, so two levels up).
 fn user_guide_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../Docs/User_Guide.md")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Docs/User_Guide.md")
 }
 
 /// The §6 section body: from the `## 6.` heading to the next `## ` heading
@@ -24,10 +23,7 @@ fn section_6() -> String {
         .find("## 6.")
         .expect("the User_Guide must have a §6 (Running the CLI)");
     let rest = &text[start..];
-    let end = rest[8..]
-        .find("\n## ")
-        .map(|i| i + 8)
-        .unwrap_or(rest.len());
+    let end = rest[8..].find("\n## ").map(|i| i + 8).unwrap_or(rest.len());
     rest[..end].to_owned()
 }
 

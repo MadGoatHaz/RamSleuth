@@ -144,8 +144,7 @@ pub const CONSENT_QUESTION: &str = "Submit probe report?";
 /// The consent prompt's detail line (the no-PII note — the renderer
 /// footer's mirror: no username, hostname, IP, MAC, or serial
 /// numbers).
-pub const CONSENT_DETAIL: &str =
-    "This gathers CPU/system/telemetry data (no personal info).";
+pub const CONSENT_DETAIL: &str = "This gathers CPU/system/telemetry data (no personal info).";
 
 // ---------------------------------------------------------------------------
 // The overlay paint (drawn last + topmost by `ui::render`).
@@ -172,7 +171,11 @@ pub fn render_probe_overlay(frame: &mut Frame, overlay: &ProbeOverlayState, area
             crate::graphs::blank_area(frame.buffer_mut(), box_area, SLATE);
             render_consent(frame, box_area)
         }
-        ProbeOverlayState::Preview { markdown, notice, scroll } => {
+        ProbeOverlayState::Preview {
+            markdown,
+            notice,
+            scroll,
+        } => {
             // The preview's region IS the whole frame; blanking it to the
             // terminal's default surface keeps both open phases a clean
             // modal surface (FE-4 — the same single `blank_area` idiom).
@@ -225,7 +228,10 @@ fn render_consent(frame: &mut Frame, area: Rect) {
         CONSENT_QUESTION,
         Style::default().fg(LIGHT_GREY).add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from(Span::styled(CONSENT_DETAIL, Style::default().fg(DIM))));
+    lines.push(Line::from(Span::styled(
+        CONSENT_DETAIL,
+        Style::default().fg(DIM),
+    )));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled("[y]", Style::default().fg(CYAN)),
@@ -333,8 +339,9 @@ pub fn write_probe_report(path: &Path, markdown: &str) -> Result<PathBuf, String
 /// (`$HOME`; the GUI F2/F3 rule's CWD fallback when `HOME` is unset
 /// — never a panic).
 pub fn probe_report_default_path() -> PathBuf {
-    let home =
-        std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join(".ramsleuth").join("probe-report.md")
 }
 
@@ -373,7 +380,11 @@ pub fn find_clipboard_utility(path_env: &str) -> Option<ClipboardUtil> {
         .filter(|dir| !dir.is_empty())
         .map(Path::new)
         .collect();
-    for util in [ClipboardUtil::WlCopy, ClipboardUtil::Xclip, ClipboardUtil::Xsel] {
+    for util in [
+        ClipboardUtil::WlCopy,
+        ClipboardUtil::Xclip,
+        ClipboardUtil::Xsel,
+    ] {
         for dir in &dirs {
             if is_executable(&dir.join(util.bin())) {
                 return Some(util);
@@ -444,11 +455,11 @@ pub fn copy_to_clipboard(markdown: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::process;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
 
     /// Draw the overlay into an in-memory terminal of the given size
     /// and return the buffer as text (one line per row, trailing
@@ -515,7 +526,9 @@ mod tests {
     #[test]
     fn open_phases_carry_markdown() {
         let md = fixture_markdown();
-        let consent = ProbeOverlayState::Consent { markdown: md.clone() };
+        let consent = ProbeOverlayState::Consent {
+            markdown: md.clone(),
+        };
         assert!(consent.is_open());
         assert_eq!(consent.markdown(), Some(md.as_str()));
         let preview = ProbeOverlayState::Preview {
@@ -524,14 +537,20 @@ mod tests {
             scroll: 0,
         };
         assert!(preview.is_open());
-        assert_eq!(preview.markdown().unwrap(), md, "the preview carries the markdown");
+        assert_eq!(
+            preview.markdown().unwrap(),
+            md,
+            "the preview carries the markdown"
+        );
     }
 
     /// (c) The consent prompt renders: the title, the question, the
     /// no-PII detail, and the `[y]es / [n]o` answer line.
     #[test]
     fn render_consent_prompt() {
-        let overlay = ProbeOverlayState::Consent { markdown: fixture_markdown() };
+        let overlay = ProbeOverlayState::Consent {
+            markdown: fixture_markdown(),
+        };
         let text = draw_overlay(&overlay, 100, 24);
         assert!(text.contains("PROBE REPORT — consent"), "{text}");
         assert!(text.contains("Submit probe report?"), "{text}");
@@ -568,7 +587,10 @@ mod tests {
     /// and `line 1` are out of view.
     #[test]
     fn render_preview_scrolls() {
-        let markdown: String = (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let markdown: String = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let open = ProbeOverlayState::Preview {
             markdown: markdown.clone(),
             notice: None,
@@ -577,14 +599,30 @@ mod tests {
         let text = draw_overlay(&open, 100, 14);
         // 10 lines visible (14 rows − 2 borders − 2 footer lines).
         assert!(text.contains("│line 0"), "scroll 0 shows the top: {text}");
-        assert!(text.contains("│line 9"), "scroll 0 shows the 10th line: {text}");
-        assert!(!text.contains("│line 10"), "the 11th line is clipped: {text}");
-        let scrolled = ProbeOverlayState::Preview { markdown, notice: None, scroll: 5 };
+        assert!(
+            text.contains("│line 9"),
+            "scroll 0 shows the 10th line: {text}"
+        );
+        assert!(
+            !text.contains("│line 10"),
+            "the 11th line is clipped: {text}"
+        );
+        let scrolled = ProbeOverlayState::Preview {
+            markdown,
+            notice: None,
+            scroll: 5,
+        };
         let text = draw_overlay(&scrolled, 100, 14);
         assert!(text.contains("│line 5"), "{text}");
         assert!(text.contains("│line 14"), "{text}");
-        assert!(!text.contains("│line 0"), "line 0 must be scrolled out: {text}");
-        assert!(!text.contains("│line 4"), "line 4 must be scrolled out: {text}");
+        assert!(
+            !text.contains("│line 0"),
+            "line 0 must be scrolled out: {text}"
+        );
+        assert!(
+            !text.contains("│line 4"),
+            "line 4 must be scrolled out: {text}"
+        );
     }
 
     /// (f) Every phase renders at a zero / tiny area without
@@ -593,7 +631,9 @@ mod tests {
     fn render_all_phases_zero_area_never_panics() {
         let backend = TestBackend::new(1, 1);
         let mut terminal = Terminal::new(backend).expect("test terminal must init");
-        let consent = ProbeOverlayState::Consent { markdown: fixture_markdown() };
+        let consent = ProbeOverlayState::Consent {
+            markdown: fixture_markdown(),
+        };
         let preview = ProbeOverlayState::Preview {
             markdown: fixture_markdown(),
             notice: None,
@@ -625,7 +665,9 @@ mod tests {
     fn tc_fe4_consent_clears_only_its_box_not_the_frame() {
         let width = 100u16;
         let height = 30u16;
-        let overlay = ProbeOverlayState::Consent { markdown: fixture_markdown() };
+        let overlay = ProbeOverlayState::Consent {
+            markdown: fixture_markdown(),
+        };
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal must init");
         terminal
@@ -707,7 +749,10 @@ mod tests {
     fn preview_max_scroll_clamps() {
         let short = "a\nb\nc";
         assert_eq!(preview_max_scroll(short, Rect::new(0, 0, 80, 24)), 0);
-        let long: String = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let long: String = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         // 24 rows: inner 22, text 20 → max 30.
         assert_eq!(preview_max_scroll(&long, Rect::new(0, 0, 80, 24)), 30);
         // A 1-row area: inner 0 → text 0 → max = all 50 lines.
@@ -741,7 +786,10 @@ mod tests {
         std::fs::write(&blocker, "x").expect("blocker must write");
         let path = blocker.join("probe-report.md"); // the parent is a file
         let err = write_probe_report(&path, "md").expect_err("a file parent must fail");
-        assert!(err.contains("blocker"), "the error must name the path: {err}");
+        assert!(
+            err.contains("blocker"),
+            "the error must name the path: {err}"
+        );
         assert!(!path.exists(), "nothing may be written");
     }
 
@@ -799,12 +847,19 @@ mod tests {
         let path_env = a.display().to_string();
         touch_exec(&a, "xsel");
         touch_exec(&a, "xclip");
-        assert_eq!(find_clipboard_utility(&path_env), Some(ClipboardUtil::Xclip));
+        assert_eq!(
+            find_clipboard_utility(&path_env),
+            Some(ClipboardUtil::Xclip)
+        );
         std::fs::remove_file(a.join("xclip")).unwrap();
         assert_eq!(find_clipboard_utility(&path_env), Some(ClipboardUtil::Xsel));
         std::fs::remove_file(a.join("xsel")).unwrap();
         assert_eq!(find_clipboard_utility(&path_env), None);
-        assert_eq!(find_clipboard_utility(""), None, "an empty PATH: no utility");
+        assert_eq!(
+            find_clipboard_utility(""),
+            None,
+            "an empty PATH: no utility"
+        );
     }
 
     /// (l) A present but **non-executable** utility is not found

@@ -125,10 +125,8 @@ use crate::error::{TelemetryError, TelemetryResult};
 /// kernel_kobj)`), so the canonical path is
 /// `/sys/kernel/ryzen_smu_drv/smn`; the legacy `ryzen_smu` directory name
 /// is kept as a fallback for older or renamed builds.
-const SYSFS_SMN_CANDIDATES: [&str; 2] = [
-    "/sys/kernel/ryzen_smu_drv/smn",
-    "/sys/kernel/ryzen_smu/smn",
-];
+const SYSFS_SMN_CANDIDATES: [&str; 2] =
+    ["/sys/kernel/ryzen_smu_drv/smn", "/sys/kernel/ryzen_smu/smn"];
 
 /// Driver name carried by [`TelemetryError::DriverMissing`].
 const DRIVER: &str = "ryzen_smu";
@@ -181,19 +179,19 @@ const SMN_UMC_CAP_HI: u32 = 0xDF4;
 /// bases are read unconditionally (the `+0x100000` offset rule does NOT
 /// apply; each channel's own CsEn flags decide activity).
 pub const SMN_CHANNEL_REGISTER_SET: [u32; 14] = [
-    SMN_CH0_BASE, // UMCCH::BaseAddr0 (CS0; bit 0 = CsEn)
-    SMN_CH0_BASE + 0x04, // UMCCH::BaseAddr1 (CS1; bit 0 = CsEn)
-    SMN_CH0_BASE + 0x08, // UMCCH::BaseAddr2 (CS2; bit 0 = CsEn)
-    SMN_CH0_BASE + 0x0C, // UMCCH::BaseAddr3 (CS3; bit 0 = CsEn)
-    SMN_CH0_BASE + 0x20, // UMCCH::AddrMask0 (DIMM 0 rank size)
-    SMN_CH0_BASE + 0x24, // UMCCH::AddrMask1 (DIMM 1 rank size)
+    SMN_CH0_BASE,                  // UMCCH::BaseAddr0 (CS0; bit 0 = CsEn)
+    SMN_CH0_BASE + 0x04,           // UMCCH::BaseAddr1 (CS1; bit 0 = CsEn)
+    SMN_CH0_BASE + 0x08,           // UMCCH::BaseAddr2 (CS2; bit 0 = CsEn)
+    SMN_CH0_BASE + 0x0C,           // UMCCH::BaseAddr3 (CS3; bit 0 = CsEn)
+    SMN_CH0_BASE + 0x20,           // UMCCH::AddrMask0 (DIMM 0 rank size)
+    SMN_CH0_BASE + 0x24,           // UMCCH::AddrMask1 (DIMM 1 rank size)
     SMN_CH0_BASE + SMN_UMC_CAP_HI, // UMCCH::UmcCapHi (bit 30 EccEn, bit 31 ChipKillCap)
-    SMN_CH1_BASE, // UMCCH::BaseAddr0 (CS0; bit 0 = CsEn)
-    SMN_CH1_BASE + 0x04, // UMCCH::BaseAddr1 (CS1; bit 0 = CsEn)
-    SMN_CH1_BASE + 0x08, // UMCCH::BaseAddr2 (CS2; bit 0 = CsEn)
-    SMN_CH1_BASE + 0x0C, // UMCCH::BaseAddr3 (CS3; bit 0 = CsEn)
-    SMN_CH1_BASE + 0x20, // UMCCH::AddrMask0 (DIMM 0 rank size)
-    SMN_CH1_BASE + 0x24, // UMCCH::AddrMask1 (DIMM 1 rank size)
+    SMN_CH1_BASE,                  // UMCCH::BaseAddr0 (CS0; bit 0 = CsEn)
+    SMN_CH1_BASE + 0x04,           // UMCCH::BaseAddr1 (CS1; bit 0 = CsEn)
+    SMN_CH1_BASE + 0x08,           // UMCCH::BaseAddr2 (CS2; bit 0 = CsEn)
+    SMN_CH1_BASE + 0x0C,           // UMCCH::BaseAddr3 (CS3; bit 0 = CsEn)
+    SMN_CH1_BASE + 0x20,           // UMCCH::AddrMask0 (DIMM 0 rank size)
+    SMN_CH1_BASE + 0x24,           // UMCCH::AddrMask1 (DIMM 1 rank size)
     SMN_CH1_BASE + SMN_UMC_CAP_HI, // UMCCH::UmcCapHi (bit 30 EccEn, bit 31 ChipKillCap)
 ];
 
@@ -202,8 +200,19 @@ pub const SMN_CHANNEL_REGISTER_SET: [u32; 14] = [
 /// Exposed (`pub`) as the single source of truth for the probe report's AMD
 /// SMN table (the `probe` renderer names each row from these addresses).
 pub const SMN_REGISTER_SET: [u32; 13] = [
-    SMN_MCLK, SMN_CMD0, SMN_CMD1, SMN_CMD2, SMN_CMD3, SMN_CMD4, SMN_CMD5,
-    SMN_RDRD, SMN_WRWR, SMN_TURN, SMN_CKE, SMN_RFC, SMN_RFC_MIRROR,
+    SMN_MCLK,
+    SMN_CMD0,
+    SMN_CMD1,
+    SMN_CMD2,
+    SMN_CMD3,
+    SMN_CMD4,
+    SMN_CMD5,
+    SMN_RDRD,
+    SMN_WRWR,
+    SMN_TURN,
+    SMN_CKE,
+    SMN_RFC,
+    SMN_RFC_MIRROR,
 ];
 
 /// Offset-rule marker (reference line 220): a raw `0x50200` read of exactly
@@ -409,14 +418,11 @@ pub struct SmnFields {
 /// sentinel never decodes as data, P6-10). Unknown addresses are
 /// ignored.
 fn word_opt(regs: &[(u32, Option<u32>)], addr: u32) -> Option<u32> {
-    regs.iter()
-        .find(|(a, _)| *a == addr)
-        .and_then(|(_, word)| {
-            word
-                .as_ref()
-                .filter(|w| **w != SMN_READ_FAILURE_SENTINEL)
-                .copied()
-        })
+    regs.iter().find(|(a, _)| *a == addr).and_then(|(_, word)| {
+        word.as_ref()
+            .filter(|w| **w != SMN_READ_FAILURE_SENTINEL)
+            .copied()
+    })
 }
 
 /// The raw word for `addr` in a register list: the **first** occurrence's
@@ -457,8 +463,15 @@ pub fn decode_smn(regs: &[(u32, Option<u32>)]) -> SmnFields {
     // unusual-but-nonzero one) trips the gate, and an absent / failed
     // word (`None`) is not unverified (the P6-10 parse-value behavior
     // is preserved).
-    let setpoint_unverified =
-        word_opt(regs, SMN_MCLK).map(|w| mclk_setpoint_mhz(w) == 0).unwrap_or(false);
+    //
+    // Assumption: the ryzen_smu driver returns `Some(0)` only for a real
+    // zero value — a failed or unimplemented read always returns `None`
+    // (or the `0xFFFF_FFFF` sentinel handled above). If the driver ever
+    // changed this contract (returning `Some(0)` on failure), the gate
+    // could fire incorrectly on healthy platforms.
+    let setpoint_unverified = word_opt(regs, SMN_MCLK)
+        .map(|w| mclk_setpoint_mhz(w) == 0)
+        .unwrap_or(false);
 
     SmnFields {
         gdm: gdm_flag(word_at(regs, SMN_MCLK)),
@@ -553,8 +566,7 @@ struct ChannelPop {
 /// evidence); an enabled CS with an unreadable mask makes the channel's
 /// capacity `None`.
 fn decode_channel(base: u32, regs: &[(u32, Option<u32>)]) -> ChannelPop {
-    let cs = [0u32, 4, 8, 0xC]
-        .map(|off| (word_opt(regs, base + off).unwrap_or(0) & 1) != 0);
+    let cs = [0u32, 4, 8, 0xC].map(|off| (word_opt(regs, base + off).unwrap_or(0) & 1) != 0);
 
     let mut active = false;
     let mut capacity: Option<u64> = Some(0);
@@ -833,8 +845,7 @@ pub fn read_all_channel_registers() -> Vec<(u32, Option<u32>)> {
 fn read_all_channel_registers_with<R: FnMut(u32) -> TelemetryResult<u32>>(
     mut reader: R,
 ) -> Vec<(u32, Option<u32>)> {
-    let mut regs: Vec<(u32, Option<u32>)> =
-        Vec::with_capacity(SMN_CHANNEL_REGISTER_SET.len());
+    let mut regs: Vec<(u32, Option<u32>)> = Vec::with_capacity(SMN_CHANNEL_REGISTER_SET.len());
     for &addr in SMN_CHANNEL_REGISTER_SET.iter() {
         let word = match reader(addr) {
             Err(TelemetryError::DriverMissing { .. }) if regs.is_empty() => {
@@ -861,7 +872,11 @@ fn read_all_channel_registers_with<R: FnMut(u32) -> TelemetryResult<u32>>(
 /// All candidates absent → [`TelemetryError::DriverMissing`].
 fn open_smn_attr(candidates: &[&str]) -> TelemetryResult<std::fs::File> {
     for &path in candidates {
-        match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
             Ok(file) => return Ok(file),
             Err(e) => match classify_io_error(&e) {
                 TelemetryError::DriverMissing { .. } => continue,
@@ -876,9 +891,7 @@ fn open_smn_attr(candidates: &[&str]) -> TelemetryResult<std::fs::File> {
 fn check_smn_write(written: usize) -> TelemetryResult<()> {
     if written < SMN_WORD {
         return Err(TelemetryError::Parse {
-            detail: format!(
-                "truncated smn address write: {written} of {SMN_WORD} byte(s)"
-            ),
+            detail: format!("truncated smn address write: {written} of {SMN_WORD} byte(s)"),
         });
     }
     Ok(())
@@ -1004,10 +1017,7 @@ fn read_word(res: TelemetryResult<u32>) -> Option<u32> {
 /// `0`). The offset rule is decided by the first read only (monitor_cpu
 /// semantics): a sentinel on the relocated re-read keeps the relocated
 /// base with no set-point.
-fn apply_smn_with<R: FnMut(u32) -> TelemetryResult<u32>>(
-    mut reader: R,
-    snap: &mut AmdPmSnapshot,
-) {
+fn apply_smn_with<R: FnMut(u32) -> TelemetryResult<u32>>(mut reader: R, snap: &mut AmdPmSnapshot) {
     let (setpoint, base) = match reader(SMN_MCLK) {
         // Offset rule: a raw `0x50200` word of exactly the marker relocates
         // the UMC block; the set-point word is re-read at the relocated
@@ -1082,15 +1092,43 @@ mod tests {
             pdm: 0,
             command_rate: 0,
             timings: AmdPmTimings {
-                cl: 0, rcwdwr: 0, rcdrd: 0, rp: 0, ras: 0, rc: 0, rrds: 0, rrld: 0,
-                faw: 0, wtrs: 0, wtrl: 0, wr: 0, rfc1: 0, rfc2: 0, rfcsb: 0,
-                cwl: 0, rtp: 0, rdwr: 0, wrrd: 0, rdrd_sd: 0, rdrd_dd: 0,
-                rdrd_scl: 0, rdrd_sc: 0, wrwr_sd: 0, wrwr_dd: 0, wrwr_scl: 0,
+                cl: 0,
+                rcwdwr: 0,
+                rcdrd: 0,
+                rp: 0,
+                ras: 0,
+                rc: 0,
+                rrds: 0,
+                rrld: 0,
+                faw: 0,
+                wtrs: 0,
+                wtrl: 0,
+                wr: 0,
+                rfc1: 0,
+                rfc2: 0,
+                rfcsb: 0,
+                cwl: 0,
+                rtp: 0,
+                rdwr: 0,
+                wrrd: 0,
+                rdrd_sd: 0,
+                rdrd_dd: 0,
+                rdrd_scl: 0,
+                rdrd_sc: 0,
+                wrwr_sd: 0,
+                wrwr_dd: 0,
+                wrwr_scl: 0,
                 wrwr_sc: 0,
             },
             cad_bus: AmdPmCadBus {
-                proc_odt: 0, rtt_nom: 0, rtt_wr: 0, rtt_park: 0, clk_drv: 0,
-                addr_cmd_drv: 0, cs_odt_drv: 0, cke_drv: 0,
+                proc_odt: 0,
+                rtt_nom: 0,
+                rtt_wr: 0,
+                rtt_park: 0,
+                clk_drv: 0,
+                addr_cmd_drv: 0,
+                cs_odt_drv: 0,
+                cke_drv: 0,
             },
             voltages: AmdPmVoltages {
                 vddcr_soc_mv: 1128,
@@ -1106,18 +1144,18 @@ mod tests {
     /// per field (the decode expectations are pinned below).
     fn fixture_regs() -> Vec<(u32, Option<u32>)> {
         vec![
-            (SMN_MCLK, Some(0x0000_1539)),     // README live example: 1900 MHz, GDM off, 2T
-            (SMN_CMD0, Some(0x1010_2410)),     // tCL=16 tRAS=36 tRCDRD=16 tRCDWR=16
-            (SMN_CMD1, Some(0x0010_0030)),     // tRC=48 tRP=16
-            (SMN_CMD2, Some(0x0400_0404)),     // tRRDS=4 tRRDL=4 tRTP=4
-            (SMN_CMD3, Some(0x0000_0010)),     // tFAW=16
-            (SMN_CMD4, Some(0x0008_0410)),     // tCWL=16 tWTRS=4 tWTRL=8
-            (SMN_CMD5, Some(0x0000_0010)),     // tWR=16
-            (SMN_RDRD, Some(0x0504_0302)),     // dd=2 sd=3 sc=4 scl=5
-            (SMN_WRWR, Some(0x0908_0706)),     // dd=6 sd=7 sc=8 scl=9
-            (SMN_TURN, Some(0x0000_0602)),     // tWRRD=2 tRDWR=6
-            (SMN_CKE, Some(0x0400_0000)),      // tCKE=4 (decoded, not stored)
-            (SMN_RFC, Some(0x7E08_20A0)),      // tRFC=160 tRFC2=260 tRFC4=504
+            (SMN_MCLK, Some(0x0000_1539)), // README live example: 1900 MHz, GDM off, 2T
+            (SMN_CMD0, Some(0x1010_2410)), // tCL=16 tRAS=36 tRCDRD=16 tRCDWR=16
+            (SMN_CMD1, Some(0x0010_0030)), // tRC=48 tRP=16
+            (SMN_CMD2, Some(0x0400_0404)), // tRRDS=4 tRRDL=4 tRTP=4
+            (SMN_CMD3, Some(0x0000_0010)), // tFAW=16
+            (SMN_CMD4, Some(0x0008_0410)), // tCWL=16 tWTRS=4 tWTRL=8
+            (SMN_CMD5, Some(0x0000_0010)), // tWR=16
+            (SMN_RDRD, Some(0x0504_0302)), // dd=2 sd=3 sc=4 scl=5
+            (SMN_WRWR, Some(0x0908_0706)), // dd=6 sd=7 sc=8 scl=9
+            (SMN_TURN, Some(0x0000_0602)), // tWRRD=2 tRDWR=6
+            (SMN_CKE, Some(0x0400_0000)),  // tCKE=4 (decoded, not stored)
+            (SMN_RFC, Some(0x7E08_20A0)),  // tRFC=160 tRFC2=260 tRFC4=504
             (SMN_RFC_MIRROR, Some(0x1111_2222)), // mirror (ignored: no sentinel)
         ]
     }
@@ -1142,8 +1180,8 @@ mod tests {
         assert_eq!(
             SMN_REGISTER_SET,
             [
-                0x50200, 0x50204, 0x50208, 0x5020C, 0x50210, 0x50214, 0x50218,
-                0x50220, 0x50224, 0x50228, 0x50254, 0x50260, 0x50264,
+                0x50200, 0x50204, 0x50208, 0x5020C, 0x50210, 0x50214, 0x50218, 0x50220, 0x50224,
+                0x50228, 0x50254, 0x50260, 0x50264,
             ]
         );
     }
@@ -1231,8 +1269,10 @@ mod tests {
     /// driver's failed-read sentinel and decodes to no data (P6-10).
     #[test]
     fn max_mask_words_pin_every_mask_width() {
-        let regs: Vec<(u32, Option<u32>)> =
-            SMN_REGISTER_SET.iter().map(|a| (*a, Some(max_mask_word(*a)))).collect();
+        let regs: Vec<(u32, Option<u32>)> = SMN_REGISTER_SET
+            .iter()
+            .map(|a| (*a, Some(max_mask_word(*a))))
+            .collect();
         let f = decode_smn(&regs);
         assert_eq!(f.gdm, 1);
         assert_eq!(f.command_rate, 1); // bit 10 set in the max mask word
@@ -1280,11 +1320,33 @@ mod tests {
         assert_eq!(
             f.timings,
             AmdPmTimings {
-                cl: 16, rcwdwr: 16, rcdrd: 16, rp: 16, ras: 36, rc: 48, rrds: 4,
-                rrld: 4, faw: 16, wtrs: 4, wtrl: 8, wr: 16, rfc1: 160, rfc2: 260,
-                rfcsb: 504, cwl: 16, rtp: 4, rdwr: 6, wrrd: 2, rdrd_sd: 3,
-                rdrd_dd: 2, rdrd_scl: 5, rdrd_sc: 4, wrwr_sd: 7, wrwr_dd: 6,
-                wrwr_scl: 9, wrwr_sc: 8,
+                cl: 16,
+                rcwdwr: 16,
+                rcdrd: 16,
+                rp: 16,
+                ras: 36,
+                rc: 48,
+                rrds: 4,
+                rrld: 4,
+                faw: 16,
+                wtrs: 4,
+                wtrl: 8,
+                wr: 16,
+                rfc1: 160,
+                rfc2: 260,
+                rfcsb: 504,
+                cwl: 16,
+                rtp: 4,
+                rdwr: 6,
+                wrrd: 2,
+                rdrd_sd: 3,
+                rdrd_dd: 2,
+                rdrd_scl: 5,
+                rdrd_sc: 4,
+                wrwr_sd: 7,
+                wrwr_dd: 6,
+                wrwr_scl: 9,
+                wrwr_sc: 8,
             }
         );
     }
@@ -1297,7 +1359,10 @@ mod tests {
     fn gdm_is_bit_11_of_50200() {
         assert_eq!(decode_smn(&[(SMN_MCLK, Some(0x0000_0800u32))]).gdm, 1);
         assert_eq!(decode_smn(&[(SMN_MCLK, Some(0x0000_07FFu32))]).gdm, 0);
-        assert_eq!(decode_smn(&[(SMN_MCLK, Some(SMN_READ_FAILURE_SENTINEL))]).gdm, 0);
+        assert_eq!(
+            decode_smn(&[(SMN_MCLK, Some(SMN_READ_FAILURE_SENTINEL))]).gdm,
+            0
+        );
     }
 
     /// (b) Command rate is exactly bit 10 of `0x50200` (all other bits
@@ -1306,9 +1371,18 @@ mod tests {
     /// a read failure, not `2T` (P6-10).
     #[test]
     fn command_rate_is_bit_10_of_50200() {
-        assert_eq!(decode_smn(&[(SMN_MCLK, Some(0x0000_0400u32))]).command_rate, 1);
-        assert_eq!(decode_smn(&[(SMN_MCLK, Some(0x0000_0BFFu32))]).command_rate, 0);
-        assert_eq!(decode_smn(&[(SMN_MCLK, Some(SMN_READ_FAILURE_SENTINEL))]).command_rate, 0);
+        assert_eq!(
+            decode_smn(&[(SMN_MCLK, Some(0x0000_0400u32))]).command_rate,
+            1
+        );
+        assert_eq!(
+            decode_smn(&[(SMN_MCLK, Some(0x0000_0BFFu32))]).command_rate,
+            0
+        );
+        assert_eq!(
+            decode_smn(&[(SMN_MCLK, Some(SMN_READ_FAILURE_SENTINEL))]).command_rate,
+            0
+        );
     }
 
     /// (b) The `0x50200` gate (Castle Peak / Threadripper 3990X): a word
@@ -1441,11 +1515,7 @@ mod tests {
         assert_eq!(t.rfc2, 260);
         assert_eq!(t.rfcsb, 504);
 
-        let t = decode_smn(&[
-            (SMN_RFC, Some(0x2106_0138)),
-            (SMN_RFC_MIRROR, None),
-        ])
-        .timings;
+        let t = decode_smn(&[(SMN_RFC, Some(0x2106_0138)), (SMN_RFC_MIRROR, None)]).timings;
         assert_eq!(t.rfc1, 0);
         assert_eq!(t.rfc2, 0);
         assert_eq!(t.rfcsb, 0);
@@ -1461,19 +1531,38 @@ mod tests {
             command_rate: 0,
             setpoint_unverified: false,
             timings: AmdPmTimings {
-                cl: 0, rcwdwr: 0, rcdrd: 0, rp: 0, ras: 0, rc: 0, rrds: 0, rrld: 0,
-                faw: 0, wtrs: 0, wtrl: 0, wr: 0, rfc1: 0, rfc2: 0, rfcsb: 0,
-                cwl: 0, rtp: 0, rdwr: 0, wrrd: 0, rdrd_sd: 0, rdrd_dd: 0,
-                rdrd_scl: 0, rdrd_sc: 0, wrwr_sd: 0, wrwr_dd: 0, wrwr_scl: 0,
+                cl: 0,
+                rcwdwr: 0,
+                rcdrd: 0,
+                rp: 0,
+                ras: 0,
+                rc: 0,
+                rrds: 0,
+                rrld: 0,
+                faw: 0,
+                wtrs: 0,
+                wtrl: 0,
+                wr: 0,
+                rfc1: 0,
+                rfc2: 0,
+                rfcsb: 0,
+                cwl: 0,
+                rtp: 0,
+                rdwr: 0,
+                wrrd: 0,
+                rdrd_sd: 0,
+                rdrd_dd: 0,
+                rdrd_scl: 0,
+                rdrd_sc: 0,
+                wrwr_sd: 0,
+                wrwr_dd: 0,
+                wrwr_scl: 0,
                 wrwr_sc: 0,
             },
         };
         assert_eq!(decode_smn(&[]), zero);
 
-        let dup = vec![
-            (SMN_CMD0, Some(0x1010_2410)),
-            (SMN_CMD0, Some(0xFFFF_FFFF)),
-        ];
+        let dup = vec![(SMN_CMD0, Some(0x1010_2410)), (SMN_CMD0, Some(0xFFFF_FFFF))];
         assert_eq!(decode_smn(&dup).timings.cl, 16); // first occurrence wins
 
         let unknown = vec![
@@ -1572,12 +1661,18 @@ mod tests {
         // The short-read classification itself (no I/O): any count below 4
         // is Parse, 4 is Ok.
         for n in 0..SMN_WORD {
-            assert!(matches!(check_smn_read(n), Err(TelemetryError::Parse { .. })), "{n}");
+            assert!(
+                matches!(check_smn_read(n), Err(TelemetryError::Parse { .. })),
+                "{n}"
+            );
         }
         assert_eq!(check_smn_read(SMN_WORD), Ok(()));
         // The short-write classification mirrors it.
         for n in 0..SMN_WORD {
-            assert!(matches!(check_smn_write(n), Err(TelemetryError::Parse { .. })), "{n}");
+            assert!(
+                matches!(check_smn_write(n), Err(TelemetryError::Parse { .. })),
+                "{n}"
+            );
         }
         assert_eq!(check_smn_write(SMN_WORD), Ok(()));
         // (The write-failure branch is the same `classify_io_error` mapping
@@ -1594,7 +1689,8 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let (a, b) = UnixStream::pair().expect("unix socket pair");
-        b.shutdown(std::net::Shutdown::Write).expect("close the send direction");
+        b.shutdown(std::net::Shutdown::Write)
+            .expect("close the send direction");
 
         let res = smn_protocol_read(&a, 0x50200);
         assert!(
@@ -1688,7 +1784,11 @@ mod tests {
     fn apply_smn_with_privilege_failure_contains_per_register() {
         let mut snap = base_snapshot();
         apply_smn_with(
-            |_| Err(TelemetryError::InsufficientPrivilege { hint: "run as root" }),
+            |_| {
+                Err(TelemetryError::InsufficientPrivilege {
+                    hint: "run as root",
+                })
+            },
             &mut snap,
         );
         assert_eq!(snap.gdm, 0);
@@ -1762,8 +1862,7 @@ mod tests {
                     Ok(0x1010_2410) // relocated tCL/tRAS/...
                 } else {
                     assert!(
-                        (SMN_CMD1 + SMN_HIGH_BASE..=SMN_RFC_MIRROR + SMN_HIGH_BASE)
-                            .contains(&addr),
+                        (SMN_CMD1 + SMN_HIGH_BASE..=SMN_RFC_MIRROR + SMN_HIGH_BASE).contains(&addr),
                         "unexpected relocated address: {addr:#x}"
                     );
                     Ok(0)
@@ -1776,7 +1875,10 @@ mod tests {
         assert_eq!(seen[0], SMN_MCLK);
         assert_eq!(seen[1], SMN_MCLK + SMN_HIGH_BASE);
         for a in &seen[2..] {
-            assert!(*a >= SMN_CMD0 + SMN_HIGH_BASE, "low address after relocation: {a:#x}");
+            assert!(
+                *a >= SMN_CMD0 + SMN_HIGH_BASE,
+                "low address after relocation: {a:#x}"
+            );
         }
         assert_eq!(snap.timings.cl, 16); // from the relocated 0x50204 word
         assert_eq!(snap.gdm, 0);
@@ -1788,14 +1890,21 @@ mod tests {
     #[test]
     fn read_word_maps_errors_and_sentinel_to_none() {
         assert_eq!(read_word(Ok(0x1539)), Some(0x1539));
-        assert_eq!(read_word(Ok(SMN_HIGH_BASE_MARKER)), Some(SMN_HIGH_BASE_MARKER));
+        assert_eq!(
+            read_word(Ok(SMN_HIGH_BASE_MARKER)),
+            Some(SMN_HIGH_BASE_MARKER)
+        );
         assert_eq!(read_word(Ok(SMN_READ_FAILURE_SENTINEL)), None);
         assert_eq!(
-            read_word(Err(TelemetryError::InsufficientPrivilege { hint: "run as root" })),
+            read_word(Err(TelemetryError::InsufficientPrivilege {
+                hint: "run as root"
+            })),
             None
         );
         assert_eq!(
-            read_word(Err(TelemetryError::Parse { detail: "x".to_owned() })),
+            read_word(Err(TelemetryError::Parse {
+                detail: "x".to_owned()
+            })),
             None
         );
     }
@@ -1828,11 +1937,14 @@ mod tests {
         assert_eq!(seen.len(), 13);
         assert_eq!(seen[0], SMN_MCLK);
         for a in &seen[1..] {
-            assert!(*a < SMN_HIGH_BASE, "relocated address on a sentinel probe: {a:#x}");
+            assert!(
+                *a < SMN_HIGH_BASE,
+                "relocated address on a sentinel probe: {a:#x}"
+            );
         }
         assert_eq!(snap.gdm, 0); // sentinel -> no set-point -> parse value
         assert_eq!(snap.command_rate, 0); // sentinel -> no set-point -> parse value
-        // The bare-address words still decode (per-register containment).
+                                          // The bare-address words still decode (per-register containment).
         assert_eq!(snap.timings.cl, 16);
         assert_eq!(snap.timings.rfc1, 160);
         assert_eq!(snap.timings.wrwr_scl, 9);
@@ -1943,10 +2055,13 @@ mod tests {
         );
         assert_eq!(pm_before, pm_after, "PM-table fields must never be touched");
         assert!(snap.gdm <= 1, "gdm decodes from a single bit");
-        assert!(snap.command_rate <= 1, "command rate decodes from a single bit");
+        assert!(
+            snap.command_rate <= 1,
+            "command rate decodes from a single bit"
+        );
         assert_eq!(snap.pdm, 0); // unconfirmed: never written
         assert_eq!(snap.cad_bus, base_snapshot().cad_bus); // unconfirmed: never written
-        // Every timing is within its reference mask width (0 or decoded).
+                                                           // Every timing is within its reference mask width (0 or decoded).
         let t = &snap.timings;
         assert!(t.cl <= 63 && t.ras <= 127 && t.rcdrd <= 63 && t.rcwdwr <= 63);
         assert!(t.rc <= 255 && t.rp <= 63 && t.rrds <= 31 && t.rrld <= 31 && t.rtp <= 31);
@@ -2021,9 +2136,8 @@ mod tests {
         assert_eq!(regs[2], Some(0x1111_0000));
 
         // DriverMissing on the probe -> the whole read is a no-op (empty).
-        let regs = read_all_dram_registers_with(|_| {
-            Err(TelemetryError::DriverMissing { driver: DRIVER })
-        });
+        let regs =
+            read_all_dram_registers_with(|_| Err(TelemetryError::DriverMissing { driver: DRIVER }));
         assert!(regs.is_empty());
     }
 
@@ -2079,7 +2193,15 @@ mod tests {
     /// 0 = 1), the rank mask, everything else disabled; `cap` the
     /// `UmcCapHi` word.
     fn one_rank(mask: u32, cap: u32) -> ChannelWords {
-        (Some(0x0000_0001), None, None, None, Some(mask), None, Some(cap))
+        (
+            Some(0x0000_0001),
+            None,
+            None,
+            None,
+            Some(mask),
+            None,
+            Some(cap),
+        )
     }
 
     /// An unpopulated channel: every CS disabled, no data words.
@@ -2233,17 +2355,21 @@ mod tests {
         );
         // no active channel → Unknown
         assert_eq!(
-            decode_channel_registers(&channel_regs_fixture(
-                empty_channel(),
-                empty_channel()
-            ))
-            .ecc,
+            decode_channel_registers(&channel_regs_fixture(empty_channel(), empty_channel())).ecc,
             EccStatus::Unknown
         );
         // an active channel with an unreadable `UmcCapHi` → Unknown
         assert_eq!(
             decode_channel_registers(&channel_regs_fixture(
-                (Some(0x0000_0001), None, None, None, Some(0xFE00_0000), None, None),
+                (
+                    Some(0x0000_0001),
+                    None,
+                    None,
+                    None,
+                    Some(0xFE00_0000),
+                    None,
+                    None
+                ),
                 empty_channel()
             ))
             .ecc,

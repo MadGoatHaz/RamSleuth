@@ -158,7 +158,9 @@ fn read_dmi(name: &str) -> Option<String> {
 /// The `ryzen_smu` driver `version` attribute (the first candidate that
 /// exists), or `None` when the driver publishes none (or is absent).
 fn read_smu_version() -> Option<String> {
-    SMU_VERSION_CANDIDATES.iter().find_map(|path| read_file(path))
+    SMU_VERSION_CANDIDATES
+        .iter()
+        .find_map(|path| read_file(path))
 }
 
 /// `cpu_clock_mhz` source: the first `cpu MHz` line of `/proc/cpuinfo`.
@@ -356,7 +358,10 @@ fn is_agesa_version(token: &str) -> bool {
     }
     // First group: 1–2 digits, optionally prefixed by one `P`/`C` letter
     // (the documented project-code prefixes).
-    let g0 = match groups[0].strip_prefix('P').or_else(|| groups[0].strip_prefix('C')) {
+    let g0 = match groups[0]
+        .strip_prefix('P')
+        .or_else(|| groups[0].strip_prefix('C'))
+    {
         Some(digits) => digits,
         None => groups[0],
     };
@@ -401,7 +406,10 @@ mod tests {
     #[test]
     fn parse_cpu_mhz_degrades_to_none() {
         // No `cpu MHz` line at all.
-        assert_eq!(parse_cpu_mhz("processor\t: 0\nvendor_id\t: GenuineIntel\n"), None);
+        assert_eq!(
+            parse_cpu_mhz("processor\t: 0\nvendor_id\t: GenuineIntel\n"),
+            None
+        );
         // Malformed value.
         assert_eq!(parse_cpu_mhz("cpu MHz\t\t: abc\n"), None);
         // Non-positive (a kernel sleeping at 0.000 carries no usable data).
@@ -417,11 +425,15 @@ mod tests {
     /// (a3) `MemTotal` kB → GiB (1024-based), the unit word skipped.
     #[test]
     fn parse_mem_total_gib_happy_path() {
-        let meminfo = "MemTotal:       32768000 kB\nMemFree:         1024 kB\nMemAvailable:   30000000 kB\n";
+        let meminfo =
+            "MemTotal:       32768000 kB\nMemFree:         1024 kB\nMemAvailable:   30000000 kB\n";
         let gib = parse_mem_total_gib(meminfo).expect("MemTotal present");
         assert!((gib - 31.25).abs() < 1e-9, "expected 31.25 GiB, got {gib}");
         // Exactly 1 GiB.
-        assert_eq!(parse_mem_total_gib("MemTotal:       1048576 kB\n"), Some(1.0));
+        assert_eq!(
+            parse_mem_total_gib("MemTotal:       1048576 kB\n"),
+            Some(1.0)
+        );
     }
 
     /// (a4) Absent / malformed `MemTotal` degrades to `None`.
@@ -478,13 +490,22 @@ mod tests {
     /// the bare 4-group form, and the project-code-prefixed 3-group form.
     #[test]
     fn parse_agesa_recognized_shapes() {
-        assert_eq!(parse_agesa("AGESA 12.0.6557.0"), Some("12.0.6557.0".to_owned()));
+        assert_eq!(
+            parse_agesa("AGESA 12.0.6557.0"),
+            Some("12.0.6557.0".to_owned())
+        );
         // A token following ordinary prose is still picked up.
-        assert_eq!(parse_agesa("BIOS ver 12.0.6557.0"), Some("12.0.6557.0".to_owned()));
+        assert_eq!(
+            parse_agesa("BIOS ver 12.0.6557.0"),
+            Some("12.0.6557.0".to_owned())
+        );
         assert_eq!(parse_agesa("P3.20.0017"), Some("P3.20.0017".to_owned()));
         assert_eq!(parse_agesa("C2.61.1000"), Some("C2.61.1000".to_owned()));
         // Case-insensitive keyword.
-        assert_eq!(parse_agesa("agesa 12.0.6557.0"), Some("12.0.6557.0".to_owned()));
+        assert_eq!(
+            parse_agesa("agesa 12.0.6557.0"),
+            Some("12.0.6557.0".to_owned())
+        );
         // The host's `ryzen_smu` `version` attribute (D-6): a one-digit
         // third group now validates.
         assert_eq!(parse_agesa("56.78.0"), Some("56.78.0".to_owned()));
@@ -557,7 +578,10 @@ mod tests {
             Section::na(NaReason::NotApplicable)
         );
         // No BIOS string at all → honest N/A.
-        assert_eq!(agesa_from_sources(None), Section::na(NaReason::NotApplicable));
+        assert_eq!(
+            agesa_from_sources(None),
+            Section::na(NaReason::NotApplicable)
+        );
     }
 
     /// (b6) D-1: the SMU firmware section — the driver payload is
@@ -587,7 +611,10 @@ mod tests {
     /// `Value`, or `Na(NotApplicable)` — the only two states this branch
     /// can produce for any field (the frozen fallback column).
     fn is_value_or_na(section: &Section<impl std::fmt::Debug>) -> bool {
-        matches!(section, Section::Value(_) | Section::Na(NaReason::NotApplicable))
+        matches!(
+            section,
+            Section::Value(_) | Section::Na(NaReason::NotApplicable)
+        )
     }
 
     /// (c1) `collect_platform()` on this host never panics and every field
@@ -625,7 +652,10 @@ mod tests {
 
         // A carried clock is in-band (never garbage, never a sentinel).
         if let Section::Value(mhz) = &p.cpu_clock_mhz {
-            assert!(mhz.is_finite() && *mhz > 0.0, "clock must be finite positive MHz: {mhz}");
+            assert!(
+                mhz.is_finite() && *mhz > 0.0,
+                "clock must be finite positive MHz: {mhz}"
+            );
         }
     }
 
@@ -637,7 +667,10 @@ mod tests {
     fn dmi_vendor_helpers_are_value_or_none() {
         for vendor in [dmi_board_vendor(), dmi_sys_vendor()] {
             if let Some(text) = &vendor {
-                assert!(!text.trim().is_empty(), "a carried vendor is non-empty: {text:?}");
+                assert!(
+                    !text.trim().is_empty(),
+                    "a carried vendor is non-empty: {text:?}"
+                );
             }
         }
     }
@@ -674,8 +707,8 @@ mod tests {
             agesa: Section::na(NaReason::NotApplicable),
             smu_version: Section::Value("56.78.0".to_owned()),
         };
-        let bytes = bincode::serialize(&p)
-            .expect("SystemPlatform must serialize (no-panic contract)");
+        let bytes =
+            bincode::serialize(&p).expect("SystemPlatform must serialize (no-panic contract)");
         let back: SystemPlatform =
             bincode::deserialize(&bytes).expect("SystemPlatform must deserialize");
         assert_eq!(p, back);
@@ -687,8 +720,8 @@ mod tests {
             agesa: Section::na(NaReason::NotApplicable),
             smu_version: Section::na(NaReason::NotApplicable),
         };
-        let bytes = bincode::serialize(&all_na)
-            .expect("SystemPlatform must serialize (no-panic contract)");
+        let bytes =
+            bincode::serialize(&all_na).expect("SystemPlatform must serialize (no-panic contract)");
         let back: SystemPlatform =
             bincode::deserialize(&bytes).expect("SystemPlatform must deserialize");
         assert_eq!(all_na, back);
@@ -699,8 +732,8 @@ mod tests {
     #[test]
     fn collect_platform_on_this_host_bincode_round_trip() {
         let p = collect_platform();
-        let bytes = bincode::serialize(&p)
-            .expect("SystemPlatform must serialize (no-panic contract)");
+        let bytes =
+            bincode::serialize(&p).expect("SystemPlatform must serialize (no-panic contract)");
         let back: SystemPlatform =
             bincode::deserialize(&bytes).expect("SystemPlatform must deserialize");
         assert_eq!(p, back);

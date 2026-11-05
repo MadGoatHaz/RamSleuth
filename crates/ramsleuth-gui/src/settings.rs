@@ -308,7 +308,10 @@ mod tests {
         assert_eq!(settings.poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
         assert_eq!(
             settings.units,
-            Units { capacity: CapacityUnit::GiB, clock: ClockUnit::MHz }
+            Units {
+                capacity: CapacityUnit::GiB,
+                clock: ClockUnit::MHz
+            }
         );
         assert_eq!(settings.theme, Theme::DarkSlate);
         assert!(!settings.refresh_enabled, "refresh must default off");
@@ -325,7 +328,10 @@ mod tests {
         let settings = GuiSettings {
             socket: "/tmp/ramsleuth-dev.sock".to_owned(),
             poll_interval_ms: 5000,
-            units: Units { capacity: CapacityUnit::GB, clock: ClockUnit::GHz },
+            units: Units {
+                capacity: CapacityUnit::GB,
+                clock: ClockUnit::GHz,
+            },
             theme: Theme::DarkSlate,
             refresh_enabled: false,
         };
@@ -359,7 +365,13 @@ mod tests {
         );
         let units: Units = serde_json::from_str(r#"{"capacity":"GB","clock":"GHz"}"#)
             .expect("units must deserialize");
-        assert_eq!(units, Units { capacity: CapacityUnit::GB, clock: ClockUnit::GHz });
+        assert_eq!(
+            units,
+            Units {
+                capacity: CapacityUnit::GB,
+                clock: ClockUnit::GHz
+            }
+        );
     }
 
     /// (e) `format_clock`: the MHz arm keeps the carried value, the
@@ -367,8 +379,14 @@ mod tests {
     /// finite inputs degrade to the honest `N/A` (never a panic).
     #[test]
     fn format_clock_arms() {
-        let mhz = Units { capacity: CapacityUnit::GiB, clock: ClockUnit::MHz };
-        let ghz = Units { capacity: CapacityUnit::GiB, clock: ClockUnit::GHz };
+        let mhz = Units {
+            capacity: CapacityUnit::GiB,
+            clock: ClockUnit::MHz,
+        };
+        let ghz = Units {
+            capacity: CapacityUnit::GiB,
+            clock: ClockUnit::GHz,
+        };
         assert_eq!(format_clock(3600.0, &mhz), "3600 MHz");
         assert_eq!(format_clock(1800.0, &mhz), "1800 MHz");
         assert_eq!(format_clock(3600.0, &ghz), "3.6 GHz");
@@ -382,8 +400,14 @@ mod tests {
     /// when non-whole); non-finite → `N/A`.
     #[test]
     fn format_capacity_arms() {
-        let gib = Units { capacity: CapacityUnit::GiB, clock: ClockUnit::MHz };
-        let gb = Units { capacity: CapacityUnit::GB, clock: ClockUnit::MHz };
+        let gib = Units {
+            capacity: CapacityUnit::GiB,
+            clock: ClockUnit::MHz,
+        };
+        let gb = Units {
+            capacity: CapacityUnit::GB,
+            clock: ClockUnit::MHz,
+        };
         assert_eq!(format_capacity(64.0, &gib), "64 GiB");
         assert_eq!(format_capacity(4.5, &gib), "4.5 GiB");
         assert_eq!(format_capacity(64.0, &gb), "68.7 GB");
@@ -394,8 +418,14 @@ mod tests {
     /// arm converts (one decimal when non-whole); non-finite → `N/A`.
     #[test]
     fn format_bw_arms() {
-        let gib = Units { capacity: CapacityUnit::GiB, clock: ClockUnit::MHz };
-        let gb = Units { capacity: CapacityUnit::GB, clock: ClockUnit::MHz };
+        let gib = Units {
+            capacity: CapacityUnit::GiB,
+            clock: ClockUnit::MHz,
+        };
+        let gb = Units {
+            capacity: CapacityUnit::GB,
+            clock: ClockUnit::MHz,
+        };
         assert_eq!(format_bw(12.0, &gib), "12 GiB/s");
         assert_eq!(format_bw(12.0, &gb), "12.9 GB/s");
         assert_eq!(format_bw(f64::NEG_INFINITY, &gb), "N/A");
@@ -424,16 +454,17 @@ mod tests {
         let mut settings = GuiSettings::default();
         let mut panel_id = egui::Id::NULL;
         let frame_input = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                screen_size,
-            )),
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), screen_size)),
             ..Default::default()
         };
         // Warm-up frame: the grid records its state, so the second
         // frame renders (and paints) the content.
-        let _ = ctx.run(frame_input(), |ctx| show_panel(ctx, &mut settings, &mut panel_id));
-        let out = ctx.run(frame_input(), |ctx| show_panel(ctx, &mut settings, &mut panel_id));
+        let _ = ctx.run(frame_input(), |ctx| {
+            show_panel(ctx, &mut settings, &mut panel_id)
+        });
+        let out = ctx.run(frame_input(), |ctx| {
+            show_panel(ctx, &mut settings, &mut panel_id)
+        });
         (ctx, out.shapes, panel_id)
     }
 

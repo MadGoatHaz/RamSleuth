@@ -216,12 +216,18 @@ pub fn collect() -> SystemMemoryTelemetry {
     //     profiles, no JEP106 die makers) — for boards without ee1004
     //     (common on TRX40 / older AMD platforms).
     if spd.is_empty()
-        && matches!(spd_status, SpdAcquireStatus::NoDevices | SpdAcquireStatus::DriverMissing)
+        && matches!(
+            spd_status,
+            SpdAcquireStatus::NoDevices | SpdAcquireStatus::DriverMissing
+        )
         && smbios.populated_count > 0
     {
         let (smbios_entries, _entry_status) = crate::intel_smbios::collect_module_entries();
         if !smbios_entries.is_empty() {
-            spd = smbios_entries.iter().map(smbios_entry_to_spd_module).collect();
+            spd = smbios_entries
+                .iter()
+                .map(smbios_entry_to_spd_module)
+                .collect();
             eprintln!(
                 "warning: no bound SPD EEPROM (ee1004) devices; using SMBIOS fallback ({} DIMM(s), limited data: no XMP/EXPO profiles, no JEP106 die makers)",
                 spd.len()
@@ -245,8 +251,10 @@ pub fn collect() -> SystemMemoryTelemetry {
     //    Na(NotApplicable) on an unknown board / absent device, §9).
     //    Chunk 3: the DMI `board_vendor` feeds the vendor-aware vCore
     //    fallback (the in0 → Vcore resolution).
-    let board_vrm =
-        board_vrm::read_board_vrm(&platform.motherboard, platform::dmi_board_vendor().as_deref());
+    let board_vrm = board_vrm::read_board_vrm(
+        &platform.motherboard,
+        platform::dmi_board_vendor().as_deref(),
+    );
     // 7. Per-DIMM capacities (D-C3/D-C9): parallel to the SPD modules, with
     //    the SMBIOS Type 17 fallback when the SPD is incomplete (fewer bound
     //    `ee1004` modules than populated DIMMs).
@@ -417,8 +425,7 @@ fn intel_branch(
             // decode input; the /dev/mem fallback has none -> Unknown).
             ro.ecc_status = intel_readout::decode_ecc_status(sysfs.capid0a);
             // M-17: thread the SMBIOS source status into the annotation.
-            ro.channel_annotation =
-                annotate_smbios_status(&ro.channel_annotation, smbios_status);
+            ro.channel_annotation = annotate_smbios_status(&ro.channel_annotation, smbios_status);
             Ok(ro)
         }
         // The frozen fallthrough rule: the `/dev/mem` fallback is taken
@@ -429,8 +436,7 @@ fn intel_branch(
             let bar = intel_mchbar::acquire_for(cpu.vendor)?;
             let mut ro = intel_readout::read_intel_with(&bar, smbios, gen)?;
             // M-17: thread the SMBIOS source status into the annotation.
-            ro.channel_annotation =
-                annotate_smbios_status(&ro.channel_annotation, smbios_status);
+            ro.channel_annotation = annotate_smbios_status(&ro.channel_annotation, smbios_status);
             Ok(ro)
         }
         Err(err) => Err(err),
@@ -470,7 +476,10 @@ fn spd_branch() -> (Vec<SpdModule>, SpdAcquireStatus) {
 /// [`annotate_intel_with_spd`] / the `dimm_sizes` fallback) marks the
 /// data source.
 fn smbios_entry_to_spd_module(entry: &SmbiosModuleEntry) -> SpdModule {
-    let is_ddr5 = matches!(entry.memory_type, Some(crate::intel_readout::MemoryTech::Ddr5));
+    let is_ddr5 = matches!(
+        entry.memory_type,
+        Some(crate::intel_readout::MemoryTech::Ddr5)
+    );
     SpdModule {
         index: entry.index,
         is_ddr5,
@@ -665,9 +674,7 @@ fn assemble(
     // reading fills it; a carried `Value` always stands (a hypothetical
     // future PM-sourced value can never be clobbered).
     match (&mut telemetry.amd, &board_vrm.vddio_mem_mv) {
-        (Section::Value(readout), Section::Value(mv))
-            if readout.voltages.vddio_mem_mv.is_na() =>
-        {
+        (Section::Value(readout), Section::Value(mv)) if readout.voltages.vddio_mem_mv.is_na() => {
             readout.voltages.vddio_mem_mv = Section::Value(*mv);
         }
         _ => {}
@@ -773,11 +780,11 @@ fn annotate_intel_with_spd(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
     use crate::amd_readout::{
         CadBus, ClockReadout, CommandRate, DivMode, EccStatus, MemoryChannelMode, RttValue,
         TimingSet, VoltageSet,
     };
-    use crate::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
     use crate::cpuid::{AmdZen, IntelGen};
 
     /// (a) `reason_from` maps each of the six frozen `TelemetryError`
@@ -791,15 +798,21 @@ mod tests {
             NaReason::UnsupportedHardware
         );
         assert_eq!(
-            reason_from(&TelemetryError::DriverMissing { driver: "ryzen_smu" }),
+            reason_from(&TelemetryError::DriverMissing {
+                driver: "ryzen_smu"
+            }),
             NaReason::DriverMissing
         );
         assert_eq!(
-            reason_from(&TelemetryError::InsufficientPrivilege { hint: "run as root" }),
+            reason_from(&TelemetryError::InsufficientPrivilege {
+                hint: "run as root"
+            }),
             NaReason::InsufficientPrivilege
         );
         assert_eq!(
-            reason_from(&TelemetryError::UnknownPmTableVersion { version: 0x0711_0300 }),
+            reason_from(&TelemetryError::UnknownPmTableVersion {
+                version: 0x0711_0300
+            }),
             NaReason::UnknownPmTableVersion
         );
         // Io → ParseError carrying the inner error's display text.
@@ -922,7 +935,10 @@ mod tests {
         // `Na(NotApplicable)` — never any other reason.
         match &t.total_capacity {
             Section::Value(gib) => {
-                assert!(gib.is_finite() && *gib > 0.0, "total_capacity must be positive, got {gib}")
+                assert!(
+                    gib.is_finite() && *gib > 0.0,
+                    "total_capacity must be positive, got {gib}"
+                )
             }
             Section::Na(reason) => assert!(
                 matches!(reason, NaReason::NotApplicable),
@@ -940,8 +956,9 @@ mod tests {
             vendor: CpuVendor::Amd(AmdZen::Zen3),
             brand: "Ryzen 9 5950X".to_owned(),
         };
-        let amd: TelemetryResult<AmdReadout> =
-            Err(TelemetryError::DriverMissing { driver: "ryzen_smu" });
+        let amd: TelemetryResult<AmdReadout> = Err(TelemetryError::DriverMissing {
+            driver: "ryzen_smu",
+        });
         let intel: TelemetryResult<IntelReadout> = Err(TelemetryError::UnsupportedHardware {
             vendor: "AMD (Intel IMC decode requires an Intel CPU)".to_owned(),
         });
@@ -993,8 +1010,9 @@ mod tests {
         let amd: TelemetryResult<AmdReadout> = Err(TelemetryError::UnsupportedHardware {
             vendor: "Intel (AMD SMU telemetry requires AMD silicon)".to_owned(),
         });
-        let intel: TelemetryResult<IntelReadout> =
-            Err(TelemetryError::InsufficientPrivilege { hint: "run as root" });
+        let intel: TelemetryResult<IntelReadout> = Err(TelemetryError::InsufficientPrivilege {
+            hint: "run as root",
+        });
         let spd = vec![fixture_module(0x50)];
         // The C6-06 fields carry through independently of the vendor
         // branches (same shape as the AMD-failure arm above).
@@ -1058,9 +1076,13 @@ mod tests {
         let ok: TelemetryResult<u32> = Ok(42);
         assert_eq!(section_from(ok), Section::Value(42));
 
-        let err: TelemetryResult<u32> =
-            Err(TelemetryError::InsufficientPrivilege { hint: "run as root" });
-        assert_eq!(section_from(err), Section::Na(NaReason::InsufficientPrivilege));
+        let err: TelemetryResult<u32> = Err(TelemetryError::InsufficientPrivilege {
+            hint: "run as root",
+        });
+        assert_eq!(
+            section_from(err),
+            Section::Na(NaReason::InsufficientPrivilege)
+        );
     }
 
     /// A minimal `SpdModule` fixture for the containment tests (fields
@@ -1192,10 +1214,7 @@ mod tests {
             // `Value` total exercises both arms of the new cells on the
             // wire.
             total_capacity: Section::Value(16.0),
-            dimm_sizes: vec![
-                Section::Value(16.0),
-                Section::na(NaReason::NotApplicable),
-            ],
+            dimm_sizes: vec![Section::Value(16.0), Section::na(NaReason::NotApplicable)],
             // The Chunk 3 vCore (the AMD branch's SMU vCore, 1150 mV,
             // wrapped as a VerifiedProfile — exercises the `Value` arm
             // of the new trailing field on the wire).
@@ -1270,15 +1289,43 @@ mod tests {
             pdm: 0,
             command_rate: 0,
             timings: AmdPmTimings {
-                cl: 0, rcwdwr: 0, rcdrd: 0, rp: 0, ras: 0, rc: 0, rrds: 0, rrld: 0,
-                faw: 0, wtrs: 0, wtrl: 0, wr: 0, rfc1: 0, rfc2: 0, rfcsb: 0,
-                cwl: 0, rtp: 0, rdwr: 0, wrrd: 0, rdrd_sd: 0, rdrd_dd: 0,
-                rdrd_scl: 0, rdrd_sc: 0, wrwr_sd: 0, wrwr_dd: 0, wrwr_scl: 0,
+                cl: 0,
+                rcwdwr: 0,
+                rcdrd: 0,
+                rp: 0,
+                ras: 0,
+                rc: 0,
+                rrds: 0,
+                rrld: 0,
+                faw: 0,
+                wtrs: 0,
+                wtrl: 0,
+                wr: 0,
+                rfc1: 0,
+                rfc2: 0,
+                rfcsb: 0,
+                cwl: 0,
+                rtp: 0,
+                rdwr: 0,
+                wrrd: 0,
+                rdrd_sd: 0,
+                rdrd_dd: 0,
+                rdrd_scl: 0,
+                rdrd_sc: 0,
+                wrwr_sd: 0,
+                wrwr_dd: 0,
+                wrwr_scl: 0,
                 wrwr_sc: 0,
             },
             cad_bus: AmdPmCadBus {
-                proc_odt: 0, rtt_nom: 0, rtt_wr: 0, rtt_park: 0, clk_drv: 0,
-                addr_cmd_drv: 0, cs_odt_drv: 0, cke_drv: 0,
+                proc_odt: 0,
+                rtt_nom: 0,
+                rtt_wr: 0,
+                rtt_park: 0,
+                clk_drv: 0,
+                addr_cmd_drv: 0,
+                cs_odt_drv: 0,
+                cke_drv: 0,
             },
             voltages: AmdPmVoltages {
                 vddcr_soc_mv: 1128,
@@ -1372,11 +1419,33 @@ mod tests {
         let mut snap = pm_only_snapshot();
         snap.gdm = 1;
         snap.timings = AmdPmTimings {
-            cl: 63, rcwdwr: 63, rcdrd: 63, rp: 63, ras: 127, rc: 255, rrds: 31,
-            rrld: 31, faw: 255, wtrs: 31, wtrl: 63, wr: 255, rfc1: 1023,
-            rfc2: 1023, rfcsb: 1023, cwl: 63, rtp: 31, rdwr: 31, wrrd: 15,
-            rdrd_sd: 15, rdrd_dd: 15, rdrd_scl: 63, rdrd_sc: 15, wrwr_sd: 15,
-            wrwr_dd: 15, wrwr_scl: 63, wrwr_sc: 15,
+            cl: 63,
+            rcwdwr: 63,
+            rcdrd: 63,
+            rp: 63,
+            ras: 127,
+            rc: 255,
+            rrds: 31,
+            rrld: 31,
+            faw: 255,
+            wtrs: 31,
+            wtrl: 63,
+            wr: 255,
+            rfc1: 1023,
+            rfc2: 1023,
+            rfcsb: 1023,
+            cwl: 63,
+            rtp: 31,
+            rdwr: 31,
+            wrrd: 15,
+            rdrd_sd: 15,
+            rdrd_dd: 15,
+            rdrd_scl: 63,
+            rdrd_sc: 15,
+            wrwr_sd: 15,
+            wrwr_dd: 15,
+            wrwr_scl: 63,
+            wrwr_sc: 15,
         };
 
         // The frozen public entry point the wiring calls (the host-state
@@ -1524,11 +1593,33 @@ mod tests {
                     other => panic!("unexpected timing cell: {other:?}"),
                 };
                 let all = [
-                    &t.cl, &t.rcwdwr, &t.rcdrd, &t.rp, &t.ras, &t.rc, &t.rrds,
-                    &t.rrld, &t.faw, &t.wtrs, &t.wtrl, &t.wr, &t.rfc1, &t.rfc2,
-                    &t.rfcsb, &t.cwl, &t.rtp, &t.rdwr, &t.wrrd, &t.rdrd_sd,
-                    &t.rdrd_dd, &t.rdrd_scl, &t.rdrd_sc, &t.wrwr_sd,
-                    &t.wrwr_dd, &t.wrwr_scl, &t.wrwr_sc,
+                    &t.cl,
+                    &t.rcwdwr,
+                    &t.rcdrd,
+                    &t.rp,
+                    &t.ras,
+                    &t.rc,
+                    &t.rrds,
+                    &t.rrld,
+                    &t.faw,
+                    &t.wtrs,
+                    &t.wtrl,
+                    &t.wr,
+                    &t.rfc1,
+                    &t.rfc2,
+                    &t.rfcsb,
+                    &t.cwl,
+                    &t.rtp,
+                    &t.rdwr,
+                    &t.wrrd,
+                    &t.rdrd_sd,
+                    &t.rdrd_dd,
+                    &t.rdrd_scl,
+                    &t.rdrd_sc,
+                    &t.wrwr_sd,
+                    &t.wrwr_dd,
+                    &t.wrwr_scl,
+                    &t.wrwr_sc,
                 ];
                 for cell in &all {
                     check_timing(cell);
@@ -1591,9 +1682,15 @@ mod tests {
 
         let sizes = dimm_sizes(&[density_na, ok, devices_na], &SmbiosTopology::empty());
 
-        assert_eq!(sizes[0], Section::na(NaReason::ParseError("fixture".to_owned())));
+        assert_eq!(
+            sizes[0],
+            Section::na(NaReason::ParseError("fixture".to_owned()))
+        );
         assert_eq!(sizes[1], Section::Value(16.0));
-        assert_eq!(sizes[2], Section::na(NaReason::ParseError("invalid rank config".to_owned())));
+        assert_eq!(
+            sizes[2],
+            Section::na(NaReason::ParseError("invalid rank config".to_owned()))
+        );
     }
 
     /// (f4) SPD-incomplete fallback: when the bound SPD module count is
@@ -1671,7 +1768,10 @@ mod tests {
         assert_eq!(sum_dimm_sizes(&sizes), Section::Value(24.0));
 
         // A single value module sums to itself.
-        assert_eq!(sum_dimm_sizes(&[Section::Value(16.0)]), Section::Value(16.0));
+        assert_eq!(
+            sum_dimm_sizes(&[Section::Value(16.0)]),
+            Section::Value(16.0)
+        );
 
         // All-`Na` (no DIMM carries a value) → the honest
         // Na(NotApplicable); an empty list degrades the same.
@@ -1679,12 +1779,18 @@ mod tests {
             Section::na(NaReason::NotApplicable),
             Section::na(NaReason::ParseError("invalid rank config".to_owned())),
         ];
-        assert_eq!(sum_dimm_sizes(&all_na), Section::na(NaReason::NotApplicable));
+        assert_eq!(
+            sum_dimm_sizes(&all_na),
+            Section::na(NaReason::NotApplicable)
+        );
         assert_eq!(sum_dimm_sizes(&[]), Section::na(NaReason::NotApplicable));
 
         // The host shape (two 16 GiB DIMMs) through the full
         // spd → dimm_sizes → sum_dimm_sizes chain.
-        let spd = vec![capacity_module(0x52, 16384, 8), capacity_module(0x53, 16384, 8)];
+        let spd = vec![
+            capacity_module(0x52, 16384, 8),
+            capacity_module(0x53, 16384, 8),
+        ];
         assert_eq!(
             sum_dimm_sizes(&dimm_sizes(&spd, &SmbiosTopology::empty())),
             Section::Value(32.0)
@@ -1736,7 +1842,10 @@ mod tests {
     fn total_capacity_falls_back_to_meminfo() {
         // No DIMM values (the fixture modules carry Na density/devices)
         // → the meminfo fallback, whatever this host reports.
-        let sizes = dimm_sizes(&[fixture_module(0x52), fixture_module(0x53)], &SmbiosTopology::empty());
+        let sizes = dimm_sizes(
+            &[fixture_module(0x52), fixture_module(0x53)],
+            &SmbiosTopology::empty(),
+        );
         assert!(
             sizes.iter().all(Section::is_na),
             "fixture modules carry no capacity value"
@@ -1750,7 +1859,10 @@ mod tests {
         // honest `Na(NotApplicable)`.
         match platform::mem_total_gib() {
             Section::Value(gib) => {
-                assert!(gib.is_finite() && gib > 0.0, "meminfo total must be positive: {gib}")
+                assert!(
+                    gib.is_finite() && gib > 0.0,
+                    "meminfo total must be positive: {gib}"
+                )
             }
             Section::Na(reason) => assert!(
                 matches!(reason, NaReason::NotApplicable),
@@ -1767,7 +1879,10 @@ mod tests {
     /// produces (the C6-01 fallback column).
     fn assert_value_or_na<T: std::fmt::Debug>(name: &str, cell: &Section<T>) {
         assert!(
-            matches!(cell, Section::Value(_) | Section::Na(NaReason::NotApplicable)),
+            matches!(
+                cell,
+                Section::Value(_) | Section::Na(NaReason::NotApplicable)
+            ),
             "platform.{name} must be Value or Na(NotApplicable), got {cell:?}"
         );
     }
@@ -2010,13 +2125,21 @@ mod tests {
             brand: "i5-12600KF".to_owned(),
         };
         assert_eq!(
-            vcore_section(&intel, &Section::na(NaReason::UnsupportedHardware), &board_vrm),
+            vcore_section(
+                &intel,
+                &Section::na(NaReason::UnsupportedHardware),
+                &board_vrm
+            ),
             Section::Value(verified)
         );
         // Intel with an all-Na board readout (enterprise / out-of-bounds)
         // → Na.
         assert_eq!(
-            vcore_section(&intel, &Section::na(NaReason::UnsupportedHardware), &BoardVrmReadout::all_na()),
+            vcore_section(
+                &intel,
+                &Section::na(NaReason::UnsupportedHardware),
+                &BoardVrmReadout::all_na()
+            ),
             Section::na(NaReason::NotApplicable)
         );
         // AMD with a `Na` vCore slot → Na.

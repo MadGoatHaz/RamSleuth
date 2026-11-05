@@ -230,9 +230,8 @@ impl Drop for MchBar {
             // bytes created in `mmap_devmem`; this `MchBar` is the sole
             // owner (no `Clone`/`Copy`) and `Drop` runs exactly once, so
             // this is the single `munmap` for the range.
-            let _ = unsafe {
-                nix::sys::mman::munmap(self.region.cast::<std::ffi::c_void>(), self.len)
-            };
+            let _ =
+                unsafe { nix::sys::mman::munmap(self.region.cast::<std::ffi::c_void>(), self.len) };
         }
     }
 }
@@ -443,9 +442,7 @@ fn check_read_bounds(offset: usize, len: usize) -> Result<(), TelemetryError> {
     };
     if end > len {
         return Err(TelemetryError::Parse {
-            detail: format!(
-                "read_u32 offset {offset:#x} out of bounds (window is {len:#x} bytes)"
-            ),
+            detail: format!("read_u32 offset {offset:#x} out of bounds (window is {len:#x} bytes)"),
         });
     }
     Ok(())
@@ -633,9 +630,9 @@ fn read_host_bridge_config() -> TelemetryResult<Vec<u8>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(bytes),
         // Host-bridge device absent from the PCI bus.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(TelemetryError::DriverMissing { driver: HOST_BRIDGE_BDF })
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(TelemetryError::DriverMissing {
+            driver: HOST_BRIDGE_BDF,
+        }),
         Err(e) => Err(TelemetryError::Io(reconstruct_io(&e))),
     }
 }
@@ -701,7 +698,14 @@ fn mmap_devmem(fd: RawFd, base: u64, length: usize) -> TelemetryResult<NonNull<u
     // (checked above). On success the kernel returns a live, page-aligned
     // mapping of exactly `length` bytes.
     let ptr = unsafe {
-        mmap(None, length, ProtFlags::PROT_READ, MapFlags::MAP_PRIVATE, borrowed, offset)
+        mmap(
+            None,
+            length,
+            ProtFlags::PROT_READ,
+            MapFlags::MAP_PRIVATE,
+            borrowed,
+            offset,
+        )
     };
     match ptr {
         Ok(p) => Ok(p.cast::<u8>()),
@@ -815,10 +819,7 @@ mod tests {
     fn decode_bar5_high_dword_combination() {
         let cfg = config_with_bar5(0xFED1_0001, 0x0000_0001);
         assert_eq!(decode_bar5(&cfg), Ok(0x0000_0001_FED1_0001));
-        assert_eq!(
-            mchbar_base(0x0000_0001_FED1_0001),
-            0x0000_0001_FED1_0000
-        );
+        assert_eq!(mchbar_base(0x0000_0001_FED1_0001), 0x0000_0001_FED1_0000);
     }
 
     /// (a) A disabled MCHBAR (MCHBAR_EN=0) with no address bits is the
@@ -844,9 +845,9 @@ mod tests {
     #[test]
     fn decode_bar5_disabled_with_address_is_parse_error() {
         for (low, high) in [
-            (0xFED1_0000u32, 0u32),       // typical base, EN clear
-            (0x0000_1000, 0),             // bit 16 (lowest address bit) only
-            (0x0000_0000, 0x0000_0001),   // bit 32 in the high dword
+            (0xFED1_0000u32, 0u32),     // typical base, EN clear
+            (0x0000_1000, 0),           // bit 16 (lowest address bit) only
+            (0x0000_0000, 0x0000_0001), // bit 32 in the high dword
         ] {
             assert!(
                 matches!(
@@ -881,10 +882,7 @@ mod tests {
     fn mchbar_base_keeps_only_address_bits() {
         assert_eq!(mchbar_base(0x0000_0000_FED1_0001), 0x0000_0000_FED1_0000);
         assert_eq!(mchbar_base(0x0000_0000_FED1_FFFF), 0x0000_0000_FED1_F000);
-        assert_eq!(
-            mchbar_base(MCHBAR_BASE_MASK),
-            MCHBAR_BASE_MASK
-        );
+        assert_eq!(mchbar_base(MCHBAR_BASE_MASK), MCHBAR_BASE_MASK);
         assert_eq!(mchbar_base(0x0000_0080_0000_0000), 0);
         assert_eq!(mchbar_base(0x0000_0001_FED1_0000), 0x0000_0001_FED1_0000);
         assert_eq!(mchbar_base(0x0000_0000_0000_F000), 0x0000_0000_0000_F000);
@@ -925,10 +923,7 @@ mod tests {
     #[test]
     fn mchbar_base_from_config_valid_and_invalid() {
         let cfg = config_with_bar5(0xFED1_0001, 0x0000_0000); // valid Skylake
-        assert_eq!(
-            mchbar_base_from_config(&cfg),
-            Some(0x0000_0000_FED1_0000)
-        );
+        assert_eq!(mchbar_base_from_config(&cfg), Some(0x0000_0000_FED1_0000));
 
         let cfg = config_with_bar5(0x0000_0000, 0x0000_0000); // unpopulated
         assert_eq!(mchbar_base_from_config(&cfg), None);
@@ -958,7 +953,10 @@ mod tests {
                 detail.contains("virtualized host"),
                 "{vendor:?} should be detected as virtualized: {detail}"
             );
-            assert!(detail.contains(vendor), "the vendor should be named: {detail}");
+            assert!(
+                detail.contains(vendor),
+                "the vendor should be named: {detail}"
+            );
         }
         // A non-hypervisor vendor -> the generic unsupported-platform message.
         let detail = mchbar_zero_detail(Some("Intel"));
@@ -1118,7 +1116,10 @@ mod tests {
                 "{gen:?}"
             );
         }
-        assert_eq!(window_size_for(CpuVendor::Amd(AmdZen::Zen3)), MCHBAR_WINDOW_SIZE);
+        assert_eq!(
+            window_size_for(CpuVendor::Amd(AmdZen::Zen3)),
+            MCHBAR_WINDOW_SIZE
+        );
         assert_eq!(window_size_for(CpuVendor::Unknown), MCHBAR_WINDOW_SIZE);
     }
 }

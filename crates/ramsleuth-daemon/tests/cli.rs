@@ -30,10 +30,18 @@ fn run(args: &[&str]) -> std::process::Output {
 fn version_prints_the_package_version_and_exits_zero() {
     for flag in ["--version", "-V"] {
         let out = run(&[flag]);
-        assert!(out.status.success(), "{flag} must exit 0, got {:?}", out.status);
+        assert!(
+            out.status.success(),
+            "{flag} must exit 0, got {:?}",
+            out.status
+        );
         let expected = format!("ramSleuth ramsleuth-daemon v{}", env!("CARGO_PKG_VERSION"));
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert_eq!(stdout, expected + "\n", "{flag} must print the version line");
+        assert_eq!(
+            stdout,
+            expected + "\n",
+            "{flag} must print the version line"
+        );
     }
 }
 
@@ -42,7 +50,11 @@ fn version_prints_the_package_version_and_exits_zero() {
 fn help_prints_the_usage_and_exits_zero() {
     for flag in ["--help", "-h"] {
         let out = run(&[flag]);
-        assert!(out.status.success(), "{flag} must exit 0, got {:?}", out.status);
+        assert!(
+            out.status.success(),
+            "{flag} must exit 0, got {:?}",
+            out.status
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             stdout.contains("Usage: ramsleuth-daemon ["),

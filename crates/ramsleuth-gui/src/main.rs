@@ -366,7 +366,9 @@ pub struct GuiArgs {
 
 impl Default for GuiArgs {
     fn default() -> Self {
-        Self { socket: PathBuf::from(DEFAULT_SOCKET_PATH) }
+        Self {
+            socket: PathBuf::from(DEFAULT_SOCKET_PATH),
+        }
     }
 }
 
@@ -390,12 +392,9 @@ where
     while let Some(raw) = iter.next() {
         let arg = raw.as_ref();
         if arg == "--socket" {
-            let value = iter
-                .next()
-                .map(|v| v.as_ref().to_owned())
-                .ok_or_else(|| {
-                    "--socket requires a value (the daemon's Unix socket path)".to_owned()
-                })?;
+            let value = iter.next().map(|v| v.as_ref().to_owned()).ok_or_else(|| {
+                "--socket requires a value (the daemon's Unix socket path)".to_owned()
+            })?;
             parsed.socket = PathBuf::from(value);
         } else if arg.starts_with("--") {
             return Err(format!("unknown flag `{arg}` (expected `--socket <path>`)"));
@@ -552,7 +551,8 @@ fn about_body() -> Vec<(&'static str, String)> {
             "Live RAM telemetry + a Memory & Latency Benchmark \
              for AMD and Intel desktops. Watch your memory in real \
              time — clocks, timings, voltages, channel mode, ECC — \
-             and measure how fast your memory subsystem really is.".to_owned(),
+             and measure how fast your memory subsystem really is."
+                .to_owned(),
         ),
         (
             "How it works",
@@ -561,7 +561,8 @@ fn about_body() -> Vec<(&'static str, String)> {
              PM tables, the Intel MCHBAR IMC registers, and the SPD \
              EEPROMs on each DIMM — and serves them to this GUI over \
              a local Unix socket. This GUI is unprivileged: it only \
-             talks to the daemon.".to_owned(),
+             talks to the daemon."
+                .to_owned(),
         ),
         (
             "What it can do",
@@ -574,14 +575,16 @@ fn about_body() -> Vec<(&'static str, String)> {
              copy / latency\n\
              \u{2022} Benchmark burn-in for stress testing\n\
              \u{2022} Probe report: a consent-gated snapshot for bug \
-             reports (the header's Probe button)".to_owned(),
+             reports (the header's Probe button)"
+                .to_owned(),
         ),
         (
             "Intel vs AMD",
             "Intel: per-channel IMC subtimings decoded from the \
              MCHBAR registers (Tier 1–3, Skylake → Arrow \
              Lake).\nAMD: SMU PM clocks, voltages, and the UCLK / MCLK \
-             CAD bus mode via the ryzen-smu driver.".to_owned(),
+             CAD bus mode via the ryzen-smu driver."
+                .to_owned(),
         ),
         (
             "This build",
@@ -866,8 +869,10 @@ impl eframe::App for RamSleuthApp {
         // the worker's `reconnect_requested` edge forces the
         // poller's immediate poll, and the strip unmounts on its own
         // once the daemon serves.)
-        let probe_open =
-            matches!(self.probe_state, ProbeState::Consent | ProbeState::Preview(_));
+        let probe_open = matches!(
+            self.probe_state,
+            ProbeState::Consent | ProbeState::Preview(_)
+        );
         let modal_open = probe_open || self.about_open;
         // The keyboard (C6-30, the spec's key legend): a fresh
         // key-down — egui marks OS key-repeats `repeat: true`, so a
@@ -884,9 +889,12 @@ impl eframe::App for RamSleuthApp {
                 i.events
                     .iter()
                     .filter_map(|event| match event {
-                        egui::Event::Key { key, pressed: true, repeat: false, .. } => {
-                            key_action(*key)
-                        }
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            repeat: false,
+                            ..
+                        } => key_action(*key),
                         _ => None,
                     })
                     .next()
@@ -975,19 +983,17 @@ impl eframe::App for RamSleuthApp {
         // to the dashboard. Every closing path resets (the buttons
         // are re-openable); the modals block the key legend above.
         let esc_down = ctx.input(|i| {
-            i.events
-                .iter()
-                .any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: egui::Key::Escape,
-                            pressed: true,
-                            repeat: false,
-                            ..
-                        }
-                    )
-                })
+            i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    }
+                )
+            })
         });
         if probe_open && esc_down {
             self.handle_probe_esc();
@@ -1118,7 +1124,10 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
         Some(gib) => format_capacity(*gib, units),
         None => "N/A".to_owned(),
     };
-    let mut line = format!("RAM: {total} ({})", dimm_summary(&t.dimm_sizes, &t.spd, units));
+    let mut line = format!(
+        "RAM: {total} ({})",
+        dimm_summary(&t.dimm_sizes, &t.spd, units)
+    );
     // The max SPD speed; the platform MCLK×2 fallback when no bound
     // module carries one (omitted only when neither is available).
     let speed = t
@@ -1162,10 +1171,7 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
 /// `Asynchronous 1:2`, and `None` (the default text color) for the
 /// honest `N/A`.
 fn sync_mode_from_clocks(clocks: &ClockReadout, units: &Units) -> (String, Option<egui::Color32>) {
-    let text = ramsleuth_display::sync_mode_from_clocks(
-        clocks,
-        units.clock == ClockUnit::MHz,
-    );
+    let text = ramsleuth_display::sync_mode_from_clocks(clocks, units.clock == ClockUnit::MHz);
     let color = match clocks.div_mode.value() {
         Some(DivMode::OneToOne) => Some(AMBER),
         Some(DivMode::OneToTwo) => Some(CRIMSON),
@@ -1256,9 +1262,19 @@ impl RamSleuthApp {
             Some(t) => {
                 let units = &data.settings.units;
                 let (mode, color) = intel_mode(t).unwrap_or_else(|| sync_mode(t, units));
-                (cpu_line_text(t, units), ram_line_prefix(t, units), mode, color)
+                (
+                    cpu_line_text(t, units),
+                    ram_line_prefix(t, units),
+                    mode,
+                    color,
+                )
             }
-            None => ("CPU: —".to_owned(), "RAM: —".to_owned(), String::new(), None),
+            None => (
+                "CPU: —".to_owned(),
+                "RAM: —".to_owned(),
+                String::new(),
+                None,
+            ),
         };
         // Line 1's left anchor: the badge is the CPU vendor's short
         // word (`Unknown` when no poll has landed yet); the daemon
@@ -1314,7 +1330,8 @@ impl RamSleuthApp {
                     // the hover tooltip.
                     let (dot_rect, _) =
                         ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                    ui.painter().circle(dot_rect.center(), 6.0, dot, egui::Stroke::NONE);
+                    ui.painter()
+                        .circle(dot_rect.center(), 6.0, dot, egui::Stroke::NONE);
                     ui.label(daemon_label)
                         .on_hover_text(format!("IPC: {}", data.settings.socket));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1432,7 +1449,11 @@ impl RamSleuthApp {
             // splits the margin-reduced width into the two zone
             // columns. A pathological window collapses the content to
             // zero (never a negative allocation, never a panic).
-            .frame(egui::Frame::default().fill(SLATE).inner_margin(OUTER_MARGIN))
+            .frame(
+                egui::Frame::default()
+                    .fill(SLATE)
+                    .inner_margin(OUTER_MARGIN),
+            )
             .show(ctx, |ui| {
                 // The style's item_spacing, captured before the column
                 // gap is set below; each column's content restores it —
@@ -1444,8 +1465,7 @@ impl RamSleuthApp {
                 // is gone. The gap between the columns is `COLUMN_GAP`
                 // (the style's `item_spacing.x`, restored inside each
                 // column so the zones keep their inner gaps).
-                ui.style_mut().spacing.item_spacing =
-                    egui::vec2(COLUMN_GAP, item_spacing.y);
+                ui.style_mut().spacing.item_spacing = egui::vec2(COLUMN_GAP, item_spacing.y);
                 // `ui.columns` hands the closure a `&mut [Ui]` — one
                 // column per element (egui 0.27), so `columns[0]` is the
                 // left (telemetry) zone and `columns[1]` the right
@@ -1763,8 +1783,8 @@ impl RamSleuthApp {
                             // The in-flight indicator (the poller is
                             // fetching): a spinner + the disabled
                             // buttons.
-                            let in_flight = state_read(&self.state).probe_result
-                                == ProbeResult::Pending;
+                            let in_flight =
+                                state_read(&self.state).probe_result == ProbeResult::Pending;
                             ui.horizontal(|ui| {
                                 if in_flight {
                                     ui.add(egui::Spinner::new());
@@ -1793,9 +1813,7 @@ impl RamSleuthApp {
                                 }
                                 // Secondary (the `Got it` precedent):
                                 // plain — return to `Idle`.
-                                if !in_flight
-                                    && ui.add(egui::Button::new("Cancel")).clicked()
-                                {
+                                if !in_flight && ui.add(egui::Button::new("Cancel")).clicked() {
                                     self.probe_state.apply(ProbeEvent::CancelConsent);
                                 }
                             });
@@ -1905,14 +1923,12 @@ impl RamSleuthApp {
                                     // place before the browser
                                     // takes focus.
                                     ctx.copy_text(md.clone());
-                                    self.notice = Some((
-                                        PROBE_ISSUE_COPY_NOTICE.to_owned(),
-                                        Instant::now(),
-                                    ));
+                                    self.notice =
+                                        Some((PROBE_ISSUE_COPY_NOTICE.to_owned(), Instant::now()));
                                     if let Some(title) = self.probe_title.clone() {
-                                        ctx.open_url(egui::OpenUrl::same_tab(
-                                            probe_issue_url(&title),
-                                        ));
+                                        ctx.open_url(egui::OpenUrl::same_tab(probe_issue_url(
+                                            &title,
+                                        )));
                                     }
                                     self.probe_state.apply(ProbeEvent::Submit);
                                 }
@@ -1974,11 +1990,7 @@ impl RamSleuthApp {
                             .stroke(egui::Stroke::new(1.0_f32, CYAN))
                             .inner_margin(egui::Margin::symmetric(12.0, 10.0));
                         frame.show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new("About RamSleuth")
-                                    .strong()
-                                    .color(CYAN),
-                            );
+                            ui.label(egui::RichText::new("About RamSleuth").strong().color(CYAN));
                             ui.add_space(4.0);
                             // The body: the section headings + the
                             // wrapped text in a bounded scroll
@@ -2494,10 +2506,10 @@ mod tests {
     use ramsleuth_bench::BenchmarkGrid;
     use ramsleuth_gui::{BenchState, CapacityUnit, ClockUnit, DEFAULT_POLL_INTERVAL_MS};
     use ramsleuth_telemetry::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
-    use ramsleuth_telemetry::amd_readout::{
-        AmdReadout, CadBus, ClockReadout, DivMode, GearMode, TimingSet, VoltageSet, map_amd,
-    };
     use ramsleuth_telemetry::amd_readout::EccStatus;
+    use ramsleuth_telemetry::amd_readout::{
+        map_amd, AmdReadout, CadBus, ClockReadout, DivMode, GearMode, TimingSet, VoltageSet,
+    };
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::intel_readout::{ChannelMode, IntelChannel, IntelReadout};
@@ -2509,8 +2521,7 @@ mod tests {
     /// A unique temp out dir per test (pid-scoped — the style / client
     /// temp-path precedent); created now, removed by the test.
     fn temp_out_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("ramsleuth-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ramsleuth-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("the test out dir must be created");
         dir
     }
@@ -2550,7 +2561,10 @@ mod tests {
     #[test]
     fn parse_args_unknown_flag_errors() {
         let err = parse_args(["--bogus"]).expect_err("an unknown flag must error");
-        assert!(err.contains("--bogus"), "the error must name the flag, got: {err}");
+        assert!(
+            err.contains("--bogus"),
+            "the error must name the flag, got: {err}"
+        );
     }
 
     /// (a) A positional argument / a missing `--socket` value → an
@@ -2608,22 +2622,34 @@ mod tests {
         let dir = temp_out_dir("export");
         let data = TelemetryData {
             telemetry: Some(ramsleuth_telemetry::collect()),
-            bench: BenchState { grid: Some(fixture_grid()), ..Default::default() },
+            bench: BenchState {
+                grid: Some(fixture_grid()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
         let path = perform_export(GuiAction::ExportJson, &data, &dir)
             .expect("the export must not fail")
             .expect("telemetry set must produce a file");
-        assert!(path.starts_with(&dir), "the file must land in the out dir: {path:?}");
-        let name = path.file_name().and_then(|s| s.to_str()).expect("the file must be named");
+        assert!(
+            path.starts_with(&dir),
+            "the file must land in the out dir: {path:?}"
+        );
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("the file must be named");
         assert!(name.starts_with("ramsleuth-export-"), "got: {name}");
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("json"));
 
         let text = fs::read_to_string(&path).expect("the exported file must be readable");
         let value: serde_json::Value =
             serde_json::from_str(&text).expect("the export must be valid JSON");
-        assert!(value.is_object(), "a snapshot must serialize to a JSON object");
+        assert!(
+            value.is_object(),
+            "a snapshot must serialize to a JSON object"
+        );
         assert!(
             value["bench"].is_object(),
             "a completed run must export the bench grid object, got: {}",
@@ -2640,21 +2666,34 @@ mod tests {
     fn perform_export_png_writes_valid_png() {
         let dir = temp_out_dir("snapshot");
         let data = TelemetryData {
-            bench: BenchState { grid: Some(fixture_grid()), ..Default::default() },
+            bench: BenchState {
+                grid: Some(fixture_grid()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
         let path = perform_export(GuiAction::SnapshotPng, &data, &dir)
             .expect("the snapshot must not fail")
             .expect("a grid set must produce a file");
-        assert!(path.starts_with(&dir), "the file must land in the out dir: {path:?}");
-        let name = path.file_name().and_then(|s| s.to_str()).expect("the file must be named");
+        assert!(
+            path.starts_with(&dir),
+            "the file must land in the out dir: {path:?}"
+        );
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("the file must be named");
         assert!(name.starts_with("ramsleuth-snapshot-"), "got: {name}");
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
 
         const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         let bytes = fs::read(&path).expect("the snapshot file must be readable");
-        assert_eq!(&bytes[..8], &PNG_SIG, "the file must start with the PNG signature");
+        assert_eq!(
+            &bytes[..8],
+            &PNG_SIG,
+            "the file must start with the PNG signature"
+        );
 
         fs::remove_dir_all(&dir).expect("cleanup");
     }
@@ -2702,13 +2741,15 @@ mod tests {
         let dir = temp_out_dir("noop");
         let data = TelemetryData {
             telemetry: Some(ramsleuth_telemetry::collect()),
-            bench: BenchState { grid: Some(fixture_grid()), ..Default::default() },
+            bench: BenchState {
+                grid: Some(fixture_grid()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
         for action in [GuiAction::Quit, GuiAction::None] {
-            let result =
-                perform_export(action, &data, &dir).expect("a noop action must not fail");
+            let result = perform_export(action, &data, &dir).expect("a noop action must not fail");
             assert_eq!(result, None, "{action:?} must yield Ok(None)");
         }
         assert!(
@@ -2764,8 +2805,10 @@ mod tests {
             (DAEMON_DOWN_RED, "Daemon")
         );
 
-        let disconnected =
-            TelemetryData { daemon_status: "disconnected".to_owned(), ..Default::default() };
+        let disconnected = TelemetryData {
+            daemon_status: "disconnected".to_owned(),
+            ..Default::default()
+        };
         assert_eq!(
             daemon_status_indicator(&disconnected),
             (DAEMON_DOWN_RED, "Daemon")
@@ -2791,8 +2834,14 @@ mod tests {
     #[test]
     fn unix_timestamp_is_plausible() {
         let ts = unix_timestamp();
-        assert!(ts > 1_577_836_800, "expected a post-2020 timestamp, got: {ts}");
-        assert!(ts < 4_102_444_800, "expected a pre-2100 timestamp, got: {ts}");
+        assert!(
+            ts > 1_577_836_800,
+            "expected a post-2020 timestamp, got: {ts}"
+        );
+        assert!(
+            ts < 4_102_444_800,
+            "expected a pre-2100 timestamp, got: {ts}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2967,10 +3016,7 @@ mod tests {
             dimm_sizes: vec![Section::Value(16.0), Section::Value(16.0)],
             vcore: na(),
         };
-        assert_eq!(
-            super::mclk_derived_speed(&t),
-            Some("3600 MT/s".to_owned())
-        );
+        assert_eq!(super::mclk_derived_speed(&t), Some("3600 MT/s".to_owned()));
     }
 
     /// (h1) `platform_badge`: the vendor's short word — any AMD Zen
@@ -2978,7 +3024,13 @@ mod tests {
     /// `Unknown`.
     #[test]
     fn platform_badge_maps_every_vendor() {
-        for zen in [AmdZen::Zen1, AmdZen::Zen2, AmdZen::Zen3, AmdZen::Zen4, AmdZen::Zen5] {
+        for zen in [
+            AmdZen::Zen1,
+            AmdZen::Zen2,
+            AmdZen::Zen3,
+            AmdZen::Zen4,
+            AmdZen::Zen5,
+        ] {
             assert_eq!(platform_badge(&CpuVendor::Amd(zen)), "AMD");
         }
         assert_eq!(
@@ -3008,7 +3060,10 @@ mod tests {
 
         // The GHz knob (C7-11): the same carried clock renders ÷1000
         // (3600 MHz → 3.6 GHz).
-        let ghz = Units { clock: ClockUnit::GHz, ..Units::default() };
+        let ghz = Units {
+            clock: ClockUnit::GHz,
+            ..Units::default()
+        };
         assert_eq!(
             cpu_line_text(&t, &ghz),
             "CPU: Ryzen 9 5950X @ 3.6 GHz | Motherboard: ProArt X570-CREATOR (BIOS: F60 + 09/15/2024, AGESA N/A)"
@@ -3111,7 +3166,11 @@ mod tests {
     fn dimm_summary_groups_and_degrades() {
         let default_units = Units::default();
         assert_eq!(
-            dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &[], &default_units),
+            dimm_summary(
+                &[Section::Value(16.0), Section::Value(16.0)],
+                &[],
+                &default_units
+            ),
             "2x16 GiB"
         );
         assert_eq!(
@@ -3137,7 +3196,10 @@ mod tests {
         );
 
         // The GB knob (C7-11): 16 GiB → 17.2 GB per group.
-        let gb = Units { capacity: CapacityUnit::GB, ..Units::default() };
+        let gb = Units {
+            capacity: CapacityUnit::GB,
+            ..Units::default()
+        };
         assert_eq!(
             dimm_summary(&[Section::Value(16.0), Section::Value(16.0)], &[], &gb),
             "2x17.2 GB"
@@ -3228,40 +3290,61 @@ mod tests {
         // The live host shape: 4×16 GiB installed (62.68 GiB OS
         // total), 2 bound to the SPD bus (32 GiB sum).
         assert_eq!(
-            slot_note(&Section::Value(62.68), &[Section::Value(16.0), Section::Value(16.0)]),
+            slot_note(
+                &Section::Value(62.68),
+                &[Section::Value(16.0), Section::Value(16.0)]
+            ),
             Some("2 of 4 slots SPD-visible".to_owned())
         );
         // An exact multiple (no reserved fraction): 3 slots, 2
         // visible.
         assert_eq!(
-            slot_note(&Section::Value(48.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            slot_note(
+                &Section::Value(48.0),
+                &[Section::Value(16.0), Section::Value(16.0)]
+            ),
             Some("2 of 3 slots SPD-visible".to_owned())
         );
         // A non-integer quotient (50/16 = 3.125, more than a tenth
         // of a module off) → the generic note.
         assert_eq!(
-            slot_note(&Section::Value(50.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            slot_note(
+                &Section::Value(50.0),
+                &[Section::Value(16.0), Section::Value(16.0)]
+            ),
             Some("SPD sees 2 of the installed capacity".to_owned())
         );
         // total ≤ sum → no note (the breakdown accounts for the
         // whole total).
         assert_eq!(
-            slot_note(&Section::Value(32.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            slot_note(
+                &Section::Value(32.0),
+                &[Section::Value(16.0), Section::Value(16.0)]
+            ),
             None
         );
         assert_eq!(
-            slot_note(&Section::Value(16.0), &[Section::Value(16.0), Section::Value(16.0)]),
+            slot_note(
+                &Section::Value(16.0),
+                &[Section::Value(16.0), Section::Value(16.0)]
+            ),
             None
         );
         // A `Na` total → no note.
         assert_eq!(
-            slot_note(&Section::na(NaReason::NotApplicable), &[Section::Value(16.0)]),
+            slot_note(
+                &Section::na(NaReason::NotApplicable),
+                &[Section::Value(16.0)]
+            ),
             None
         );
         // No visible modules (all-Na sizes) → no note, even with a
         // `Value` total.
         assert_eq!(
-            slot_note(&Section::Value(62.68), &[Section::na(NaReason::NotApplicable)]),
+            slot_note(
+                &Section::Value(62.68),
+                &[Section::na(NaReason::NotApplicable)]
+            ),
             None
         );
     }
@@ -3468,19 +3551,50 @@ mod tests {
                 pdm: 0,
                 command_rate: 0,
                 timings: AmdPmTimings {
-                    cl: 16, rcwdwr: 16, rcdrd: 16, rp: 16, ras: 32, rc: 48, rrds: 4,
-                    rrld: 4, faw: 16, wtrs: 8, wtrl: 8, wr: 8, rfc1: 160, rfc2: 160,
-                    rfcsb: 160, cwl: 16, rtp: 8, rdwr: 8, wrrd: 4, rdrd_sd: 100,
-                    rdrd_dd: 101, rdrd_scl: 102, rdrd_sc: 103, wrwr_sd: 104,
-                    wrwr_dd: 105, wrwr_scl: 106, wrwr_sc: 107,
+                    cl: 16,
+                    rcwdwr: 16,
+                    rcdrd: 16,
+                    rp: 16,
+                    ras: 32,
+                    rc: 48,
+                    rrds: 4,
+                    rrld: 4,
+                    faw: 16,
+                    wtrs: 8,
+                    wtrl: 8,
+                    wr: 8,
+                    rfc1: 160,
+                    rfc2: 160,
+                    rfcsb: 160,
+                    cwl: 16,
+                    rtp: 8,
+                    rdwr: 8,
+                    wrrd: 4,
+                    rdrd_sd: 100,
+                    rdrd_dd: 101,
+                    rdrd_scl: 102,
+                    rdrd_sc: 103,
+                    wrwr_sd: 104,
+                    wrwr_dd: 105,
+                    wrwr_scl: 106,
+                    wrwr_sc: 107,
                 },
                 cad_bus: AmdPmCadBus {
-                    proc_odt: 5, rtt_nom: 2, rtt_wr: 0, rtt_park: 4, clk_drv: 6,
-                    addr_cmd_drv: 8, cs_odt_drv: 10, cke_drv: 12,
+                    proc_odt: 5,
+                    rtt_nom: 2,
+                    rtt_wr: 0,
+                    rtt_park: 4,
+                    clk_drv: 6,
+                    addr_cmd_drv: 8,
+                    cs_odt_drv: 10,
+                    cke_drv: 12,
                 },
                 voltages: AmdPmVoltages {
-                    vddcr_soc_mv: 1150, vddio_mem_mv: 1350, vdd_misc_mv: 1000,
-                    vpp_mv: 1800, vcore_mv: 1150,
+                    vddcr_soc_mv: 1150,
+                    vddio_mem_mv: 1350,
+                    vdd_misc_mv: 1000,
+                    vpp_mv: 1800,
+                    vcore_mv: 1150,
                 },
             });
             readout.channel_mode = mode;
@@ -3514,7 +3628,10 @@ mod tests {
         // The hardware mode beats the one-bound-DIMM SPD count.
         assert_eq!(
             ram_line_prefix(
-                &amd_t(MemoryChannelMode::DualSymmetric, EccStatus::CapableButDisabled),
+                &amd_t(
+                    MemoryChannelMode::DualSymmetric,
+                    EccStatus::CapableButDisabled
+                ),
                 &Units::default(),
             ),
             "RAM: 16 GiB (1x16 GiB) | Dual-Channel (Symmetric) | ECC: Capable (disabled) | Mode: "
@@ -3575,11 +3692,7 @@ mod tests {
         );
 
         // No bound modules at all: every segment degrades to N/A.
-        let empty = fixture_telemetry(
-            Section::na(NaReason::NotApplicable),
-            Vec::new(),
-            Vec::new(),
-        );
+        let empty = fixture_telemetry(Section::na(NaReason::NotApplicable), Vec::new(), Vec::new());
         assert_eq!(
             ram_line_prefix(&empty, &Units::default()),
             "RAM: N/A (N/A) | N/A | N/A | Mode: "
@@ -3587,7 +3700,10 @@ mod tests {
 
         // The GB knob (C7-11): 32 GiB → 34.4 GB total, 16 GiB →
         // 17.2 GB per group.
-        let gb = Units { capacity: CapacityUnit::GB, ..Units::default() };
+        let gb = Units {
+            capacity: CapacityUnit::GB,
+            ..Units::default()
+        };
         assert_eq!(
             ram_line_prefix(&t, &gb),
             "RAM: 34.4 GB (2x17.2 GB) 3200 MT/s | Dual-Channel | N/A | Mode: "
@@ -3729,10 +3845,16 @@ mod tests {
                 &fixture_clocks(Some(DivMode::OneToOne), Some(1800.0)),
                 &default_units,
             ),
-            ("Synchronous 1:1 (UCLK = MCLK = 1800 MHz)".to_owned(), Some(AMBER))
+            (
+                "Synchronous 1:1 (UCLK = MCLK = 1800 MHz)".to_owned(),
+                Some(AMBER)
+            )
         );
         assert_eq!(
-            sync_mode_from_clocks(&fixture_clocks(Some(DivMode::OneToOne), None), &default_units),
+            sync_mode_from_clocks(
+                &fixture_clocks(Some(DivMode::OneToOne), None),
+                &default_units
+            ),
             ("Synchronous 1:1".to_owned(), Some(AMBER))
         );
         assert_eq!(
@@ -3748,10 +3870,16 @@ mod tests {
         );
 
         // The GHz knob (C7-11): 1800 MHz → 1.8 GHz.
-        let ghz = Units { clock: ClockUnit::GHz, ..Units::default() };
+        let ghz = Units {
+            clock: ClockUnit::GHz,
+            ..Units::default()
+        };
         assert_eq!(
             sync_mode_from_clocks(&fixture_clocks(Some(DivMode::OneToOne), Some(1800.0)), &ghz),
-            ("Synchronous 1:1 (UCLK = MCLK = 1.8 GHz)".to_owned(), Some(AMBER))
+            (
+                "Synchronous 1:1 (UCLK = MCLK = 1.8 GHz)".to_owned(),
+                Some(AMBER)
+            )
         );
     }
 
@@ -3763,7 +3891,10 @@ mod tests {
     fn sync_mode_degrades_on_na_amd_branch() {
         let t = fixture_telemetry(Section::Value(32.0), Vec::new(), Vec::new());
         assert_eq!(sync_mode(&t, &Units::default()), ("N/A".to_owned(), None));
-        let ghz = Units { clock: ClockUnit::GHz, ..Units::default() };
+        let ghz = Units {
+            clock: ClockUnit::GHz,
+            ..Units::default()
+        };
         assert_eq!(sync_mode(&t, &ghz), ("N/A".to_owned(), None));
     }
 
@@ -3804,7 +3935,9 @@ mod tests {
     /// seeds the protocol's default socket.
     #[test]
     fn seed_settings_from_the_cli_socket() {
-        let args = GuiArgs { socket: PathBuf::from("/tmp/ramsleuth-dev.sock") };
+        let args = GuiArgs {
+            socket: PathBuf::from("/tmp/ramsleuth-dev.sock"),
+        };
         let settings = seed_settings(&args);
         assert_eq!(settings.socket, "/tmp/ramsleuth-dev.sock");
         assert_eq!(settings.poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
@@ -3901,12 +4034,21 @@ mod tests {
 
         // No click: stays closed; the button is laid out.
         let rect = frame(Vec::new());
-        assert!(!flag.load(Ordering::Relaxed), "no click must not open the window");
-        assert!(rect.area() > 0.0, "the button must be laid out, got {rect:?}");
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "no click must not open the window"
+        );
+        assert!(
+            rect.area() > 0.0,
+            "the button must be laid out, got {rect:?}"
+        );
 
         // A click at the button's center: opens.
         frame(click_events(rect.center()));
-        assert!(flag.load(Ordering::Relaxed), "a click on the button must open the window");
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a click on the button must open the window"
+        );
 
         // A click while open: closes.
         let rect = frame(Vec::new());
@@ -3939,7 +4081,11 @@ mod tests {
                 &None,
             );
             let _ = ctx.end_frame();
-            assert_eq!(flag.load(Ordering::Relaxed), open, "a render must not toggle the flag");
+            assert_eq!(
+                flag.load(Ordering::Relaxed),
+                open,
+                "a render must not toggle the flag"
+            );
         }
     }
 
@@ -3968,7 +4114,10 @@ mod tests {
         show_graphs_viewport(&ctx, &state, &flag, &None);
         let out = ctx.end_frame();
         let registered = out.viewport_output.get(&child).cloned();
-        assert!(registered.is_some(), "the deferred child must be registered on spawn");
+        assert!(
+            registered.is_some(),
+            "the deferred child must be registered on spawn"
+        );
         assert!(
             registered.expect("registered").class == egui::ViewportClass::Deferred,
             "the child must be a deferred (independent-window) viewport"
@@ -3977,7 +4126,10 @@ mod tests {
         // The child's own frame: renders the window over the shared
         // state (a pure reader, D6) on its own cadence, without
         // closing it.
-        let mut child_input = egui::RawInput { viewport_id: child, ..Default::default() };
+        let mut child_input = egui::RawInput {
+            viewport_id: child,
+            ..Default::default()
+        };
         child_input.viewports.insert(
             child,
             egui::ViewportInfo {
@@ -3988,8 +4140,14 @@ mod tests {
         ctx.begin_frame(child_input);
         run_graphs_child_frame(&ctx, &state, &flag);
         let child_out = ctx.end_frame();
-        assert!(!child_out.shapes.is_empty(), "the child frame must paint the graph window");
-        assert!(flag.load(Ordering::Relaxed), "a plain child frame must not close the window");
+        assert!(
+            !child_out.shapes.is_empty(),
+            "the child frame must paint the graph window"
+        );
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a plain child frame must not close the window"
+        );
 
         // Root frame 2 (flag still open): the re-registration keeps
         // the child alive (the keep-alive).
@@ -4034,10 +4192,15 @@ mod tests {
         // The WM close: the child's frame carries `ViewportEvent::
         // Close` (eframe's glow runtime pushes it on the window's
         // CloseRequested event).
-        let mut info =
-            egui::ViewportInfo { parent: Some(egui::ViewportId::ROOT), ..Default::default() };
+        let mut info = egui::ViewportInfo {
+            parent: Some(egui::ViewportId::ROOT),
+            ..Default::default()
+        };
         info.events.push(egui::ViewportEvent::Close);
-        let mut child_input = egui::RawInput { viewport_id: child, ..Default::default() };
+        let mut child_input = egui::RawInput {
+            viewport_id: child,
+            ..Default::default()
+        };
         child_input.viewports.insert(child, info);
         ctx.begin_frame(child_input);
         run_graphs_child_frame(&ctx, &state, &flag);
@@ -4070,7 +4233,10 @@ mod tests {
         assert!(last, "the edge memory must now read open");
 
         // A held-open frame is a no-edge: no write.
-        assert_eq!(apply_refresh_transition(&mut saved, &mut last, true, true), None);
+        assert_eq!(
+            apply_refresh_transition(&mut saved, &mut last, true, true),
+            None
+        );
         assert_eq!(saved, Some(false));
 
         // Closing (either path — both clear the same flag, D-C7):
@@ -4084,12 +4250,18 @@ mod tests {
         assert!(!last, "the edge memory must now read closed");
 
         // A held-closed frame is a no-edge: no write.
-        assert_eq!(apply_refresh_transition(&mut saved, &mut last, false, false), None);
+        assert_eq!(
+            apply_refresh_transition(&mut saved, &mut last, false, false),
+            None
+        );
         assert_eq!(saved, None);
 
         // Opening with the gate already ON: the detector saves the
         // `true` original and re-asserts on.
-        assert_eq!(apply_refresh_transition(&mut saved, &mut last, true, true), Some(true));
+        assert_eq!(
+            apply_refresh_transition(&mut saved, &mut last, true, true),
+            Some(true)
+        );
         assert_eq!(saved, Some(true));
 
         // Closing: a pre-enabled original stays enabled.
@@ -4105,7 +4277,10 @@ mod tests {
         // seen the opening edge, but the detector must stay no-op
         // safe).
         let mut last = true;
-        assert_eq!(apply_refresh_transition(&mut saved, &mut last, false, false), None);
+        assert_eq!(
+            apply_refresh_transition(&mut saved, &mut last, false, false),
+            None
+        );
         assert!(!last);
     }
 
@@ -4153,7 +4328,10 @@ mod tests {
             // `true`, g1): the detector force-enables the gate.
             app.graphs_open.store(true, Ordering::Relaxed);
             app.apply_graphs_lifecycle();
-            assert!(gate(&app), "open must force the gate on (original: {original})");
+            assert!(
+                gate(&app),
+                "open must force the gate on (original: {original})"
+            );
             assert_eq!(
                 app.saved_refresh,
                 Some(original),
@@ -4169,12 +4347,23 @@ mod tests {
             // reverts to the saved original.
             app.graphs_open.store(false, Ordering::Relaxed);
             app.apply_graphs_lifecycle();
-            assert_eq!(gate(&app), original, "close must restore the saved original (original: {original})");
-            assert_eq!(app.saved_refresh, None, "the save must be consumed on the close edge");
+            assert_eq!(
+                gate(&app),
+                original,
+                "close must restore the saved original (original: {original})"
+            );
+            assert_eq!(
+                app.saved_refresh, None,
+                "the save must be consumed on the close edge"
+            );
 
             // A held-closed frame: no edge, the original stands.
             app.apply_graphs_lifecycle();
-            assert_eq!(gate(&app), original, "a held-closed frame must not touch the gate");
+            assert_eq!(
+                gate(&app),
+                original,
+                "a held-closed frame must not touch the gate"
+            );
         }
         fs::remove_dir_all(&out_dir).expect("cleanup");
     }
@@ -4229,7 +4418,11 @@ mod tests {
             let action = app.render_zones(&ctx, &data);
             let out = ctx.end_frame();
 
-            assert_eq!(action, GuiAction::None, "a no-click frame must report no action");
+            assert_eq!(
+                action,
+                GuiAction::None,
+                "a no-click frame must report no action"
+            );
 
             // The zone frames: the CYAN-stroked rects of frame size
             // (the header / settings strips use `HEADER_STROKE`, not
@@ -4256,8 +4449,10 @@ mod tests {
             let left_x = frames.iter().fold(f32::INFINITY, |mn, r| mn.min(r.min.x));
             let right_x = frames.iter().fold(0.0_f32, |mx, r| mx.max(r.min.x));
             let rightmost_x = frames.iter().fold(0.0_f32, |mx, r| mx.max(r.max.x));
-            let mut right: Vec<egui::Rect> =
-                frames.into_iter().filter(|r| (r.min.x - right_x).abs() < 2.0).collect();
+            let mut right: Vec<egui::Rect> = frames
+                .into_iter()
+                .filter(|r| (r.min.x - right_x).abs() < 2.0)
+                .collect();
             if case == 0 {
                 // Default window: all three frames are visible —
                 // one per zone (the placeholder status draws no SPD
@@ -4269,9 +4464,15 @@ mod tests {
                 );
                 right.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
                 let (bench, status) = (right[0], right[1]);
-                assert!(bench.max.y < status.min.y, "the bench slice must sit above the status slice");
+                assert!(
+                    bench.max.y < status.min.y,
+                    "the bench slice must sit above the status slice"
+                );
                 let gap = status.min.y - bench.max.y;
-                assert!(gap >= 7.9, "the preserved 8 pt gap must separate the slices (got {gap})");
+                assert!(
+                    gap >= 7.9,
+                    "the preserved 8 pt gap must separate the slices (got {gap})"
+                );
                 assert!(
                     gap <= 25.0,
                     "the gap is 8 pt + one item spacing, not a layout blow-up (got {gap})"
@@ -4382,7 +4583,11 @@ mod tests {
             });
             let action = app.render_zones(&ctx, &data);
             let out = ctx.end_frame();
-            assert_eq!(action, GuiAction::None, "a no-click frame reports no action");
+            assert_eq!(
+                action,
+                GuiAction::None,
+                "a no-click frame reports no action"
+            );
             out.shapes
                 .iter()
                 .filter_map(|clipped| match &clipped.shape {
@@ -4400,7 +4605,10 @@ mod tests {
         // sits above the status, which fills the constrained remainder
         // (down to the column's bottom).
         let frames = frame_rects(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1]);
-        assert!(frames.len() >= 2, "the bench + status frames must render ({frames:?})");
+        assert!(
+            frames.len() >= 2,
+            "the bench + status frames must render ({frames:?})"
+        );
         let right_x = frames.iter().fold(0.0_f32, |mx, r| mx.max(r.min.x));
         let mut right: Vec<egui::Rect> = frames
             .into_iter()
@@ -4418,7 +4626,10 @@ mod tests {
         // The status fills the constrained remainder: below the bench,
         // reaching the column's bottom (no gap left unfilled at the
         // default size).
-        assert!(bench.max.y < status.min.y, "the bench must sit above the status");
+        assert!(
+            bench.max.y < status.min.y,
+            "the bench must sit above the status"
+        );
         assert!(
             status.max.y > DEFAULT_WINDOW_SIZE[1] - 60.0,
             "the status must fill down toward the column bottom (bottom {} of {})",
@@ -4492,9 +4703,7 @@ mod tests {
         let outcome = map_setup_exit(1, "info\n[intel-dkms] ERROR: modprobe failed\n");
         assert_eq!(
             outcome.failure.as_deref(),
-            Some(
-                with_setup_log_pointer("[intel-dkms] ERROR: modprobe failed (exit 1)").as_str()
-            ),
+            Some(with_setup_log_pointer("[intel-dkms] ERROR: modprobe failed (exit 1)").as_str()),
         );
 
         // Exit 1 without the marker: the last non-empty line + the
@@ -4515,10 +4724,7 @@ mod tests {
         // exit code.
         assert_eq!(
             map_setup_exit(1, "").failure.as_deref(),
-            Some(
-                with_setup_log_pointer(&format!("{GENERIC_FAILURE_POINTER} (exit 1)"))
-                    .as_str()
-            ),
+            Some(with_setup_log_pointer(&format!("{GENERIC_FAILURE_POINTER} (exit 1)")).as_str()),
             "a marker-less empty stderr must point at the manual floor + the log"
         );
 
@@ -4745,10 +4951,7 @@ mod tests {
 
         // The poller lands the report: Consent → Preview (the
         // markdown is rendered, the title is set, the slot consumed).
-        app.state
-            .write()
-            .unwrap()
-            .probe_result = ProbeResult::Ok(fixture_probe_report());
+        app.state.write().unwrap().probe_result = ProbeResult::Ok(fixture_probe_report());
         app.advance_probe();
         match &app.probe_state {
             ProbeState::Preview(md) => {
@@ -4802,14 +5005,13 @@ mod tests {
         let mut app = probe_test_app("probe-err");
         let out_dir = app.out_dir.clone();
         app.probe_state = ProbeState::Consent;
-        app.state
-            .write()
-            .unwrap()
-            .probe_result = ProbeResult::Err("daemon down".to_owned());
+        app.state.write().unwrap().probe_result = ProbeResult::Err("daemon down".to_owned());
         app.advance_probe();
         assert_eq!(app.probe_state, ProbeState::Idle);
         assert!(
-            app.notice.as_ref().is_some_and(|(text, _)| text.contains("daemon down")),
+            app.notice
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("daemon down")),
             "the failure must flash a notice"
         );
         assert_eq!(
@@ -4954,7 +5156,10 @@ mod tests {
             texts.contains(&PROBE_CONSENT_BODY),
             "the body must paint: {texts:?}"
         );
-        assert!(texts.contains(&"Allow"), "the Allow button must paint: {texts:?}");
+        assert!(
+            texts.contains(&"Allow"),
+            "the Allow button must paint: {texts:?}"
+        );
         assert!(
             texts.contains(&"Cancel"),
             "the Cancel button must paint: {texts:?}"
@@ -4969,12 +5174,10 @@ mod tests {
             .shapes
             .iter()
             .find_map(|clipped| match &clipped.shape {
-                egui::Shape::Text(text) if text.galley.text() == "Allow" => {
-                    Some(egui::pos2(
-                        text.pos.x + text.galley.size().x / 2.0,
-                        text.pos.y + text.galley.size().y / 2.0,
-                    ))
-                }
+                egui::Shape::Text(text) if text.galley.text() == "Allow" => Some(egui::pos2(
+                    text.pos.x + text.galley.size().x / 2.0,
+                    text.pos.y + text.galley.size().y / 2.0,
+                )),
                 _ => None,
             })
             .expect("the Allow button's label must be painted");
@@ -5028,12 +5231,10 @@ mod tests {
             .shapes
             .iter()
             .find_map(|clipped| match &clipped.shape {
-                egui::Shape::Text(text) if text.galley.text() == "Cancel" => {
-                    Some(egui::pos2(
-                        text.pos.x + text.galley.size().x / 2.0,
-                        text.pos.y + text.galley.size().y / 2.0,
-                    ))
-                }
+                egui::Shape::Text(text) if text.galley.text() == "Cancel" => Some(egui::pos2(
+                    text.pos.x + text.galley.size().x / 2.0,
+                    text.pos.y + text.galley.size().y / 2.0,
+                )),
                 _ => None,
             })
             .expect("the Cancel button's label must be painted");
@@ -5120,12 +5321,10 @@ mod tests {
             .shapes
             .iter()
             .find_map(|clipped| match &clipped.shape {
-                egui::Shape::Text(text) if text.galley.text() == "Cancel" => {
-                    Some(egui::pos2(
-                        text.pos.x + text.galley.size().x / 2.0,
-                        text.pos.y + text.galley.size().y / 2.0,
-                    ))
-                }
+                egui::Shape::Text(text) if text.galley.text() == "Cancel" => Some(egui::pos2(
+                    text.pos.x + text.galley.size().x / 2.0,
+                    text.pos.y + text.galley.size().y / 2.0,
+                )),
                 _ => None,
             })
             .expect("the Cancel button's label must be painted");
@@ -5317,8 +5516,7 @@ mod tests {
     #[test]
     fn about_body_carries_the_version_and_capabilities() {
         let sections = about_body();
-        let bodies: Vec<&str> =
-            sections.iter().map(|(_, body)| body.as_str()).collect();
+        let bodies: Vec<&str> = sections.iter().map(|(_, body)| body.as_str()).collect();
         let full = bodies.join("\n");
         assert!(
             full.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
@@ -5408,12 +5606,10 @@ mod tests {
             .shapes
             .iter()
             .find_map(|clipped| match &clipped.shape {
-                egui::Shape::Text(text) if text.galley.text() == "Close" => {
-                    Some(egui::pos2(
-                        text.pos.x + text.galley.size().x / 2.0,
-                        text.pos.y + text.galley.size().y / 2.0,
-                    ))
-                }
+                egui::Shape::Text(text) if text.galley.text() == "Close" => Some(egui::pos2(
+                    text.pos.x + text.galley.size().x / 2.0,
+                    text.pos.y + text.galley.size().y / 2.0,
+                )),
                 _ => None,
             })
             .expect("the Close button's label must be painted");
@@ -5494,12 +5690,10 @@ mod tests {
             .shapes
             .iter()
             .find_map(|clipped| match &clipped.shape {
-                egui::Shape::Text(text) if text.galley.text() == "About" => {
-                    Some(egui::pos2(
-                        text.pos.x + text.galley.size().x / 2.0,
-                        text.pos.y + text.galley.size().y / 2.0,
-                    ))
-                }
+                egui::Shape::Text(text) if text.galley.text() == "About" => Some(egui::pos2(
+                    text.pos.x + text.galley.size().x / 2.0,
+                    text.pos.y + text.galley.size().y / 2.0,
+                )),
                 _ => None,
             })
             .expect("the About button's label must be painted");

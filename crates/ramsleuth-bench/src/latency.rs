@@ -192,7 +192,10 @@ mod tests {
             cur = ring[cur];
         }
         assert!(cur == 0, "chase from 0 must return to 0 after {n} steps");
-        assert!(visited.iter().all(|&v| v), "every slot must be visited once");
+        assert!(
+            visited.iter().all(|&v| v),
+            "every slot must be visited once"
+        );
     }
 
     /// Sub-line sizes yield an empty ring; a 64-byte ring yields one slot
@@ -204,5 +207,4 @@ mod tests {
         let one = build_chase_ring(64, 0);
         assert_eq!(one, vec![0]);
     }
-
 }

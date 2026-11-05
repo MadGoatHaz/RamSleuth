@@ -12,9 +12,7 @@ use super::types::*;
 use crate::amd_readout::TimingSet;
 use crate::cpuid::IntelGen;
 use crate::error::{NaReason, Section};
-use crate::intel_gen::{
-    AlderDdr4Fields, ALDER_DDR4_CHANNELS, ALDER_DDR4_FIELDS,
-};
+use crate::intel_gen::{AlderDdr4Fields, ALDER_DDR4_CHANNELS, ALDER_DDR4_FIELDS};
 
 // ---------------------------------------------------------------------------
 // Phase 1 (Intel MC fix): the Alder Lake **DDR4** bitfield decoders — the
@@ -35,18 +33,30 @@ use crate::intel_gen::{
 
 /// tRCD — `TC_PRE` 64-bit [58:51] = high word [26:19].
 pub(super) fn alk_d4_pre_trcd(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.trcd.0 - TC_PRE_HI_WORD_SHIFT, f.trcd.1 - TC_PRE_HI_WORD_SHIFT)
+    field16(
+        reg,
+        f.trcd.0 - TC_PRE_HI_WORD_SHIFT,
+        f.trcd.1 - TC_PRE_HI_WORD_SHIFT,
+    )
 }
 
 /// tRAS — `TC_PRE` 64-bit [50:42] = high word [18:10].
 pub(super) fn alk_d4_pre_tras(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.tras.0 - TC_PRE_HI_WORD_SHIFT, f.tras.1 - TC_PRE_HI_WORD_SHIFT)
+    field16(
+        reg,
+        f.tras.0 - TC_PRE_HI_WORD_SHIFT,
+        f.tras.1 - TC_PRE_HI_WORD_SHIFT,
+    )
 }
 
 /// tWRPRE — `TC_PRE` 64-bit [41:32] = high word [9:0] (decoded — no
 /// frozen display slot).
 pub fn alk_d4_pre_wrpre(reg: u32, f: &AlderDdr4Fields) -> u16 {
-    field16(reg, f.twrpre.0 - TC_PRE_HI_WORD_SHIFT, f.twrpre.1 - TC_PRE_HI_WORD_SHIFT)
+    field16(
+        reg,
+        f.twrpre.0 - TC_PRE_HI_WORD_SHIFT,
+        f.twrpre.1 - TC_PRE_HI_WORD_SHIFT,
+    )
 }
 
 /// tPPD — `TC_PRE` 64-bit [23:20] (low word; decoded — no display slot).
@@ -304,8 +314,7 @@ pub(super) fn decode_alder_ddr4(
         } else {
             &regs.alk_d4_tc1
         };
-        let mut channel =
-            decode_alder_ddr4_channel(i as u8, mclk.clone(), tc, &ALDER_DDR4_FIELDS);
+        let mut channel = decode_alder_ddr4_channel(i as u8, mclk.clone(), tc, &ALDER_DDR4_FIELDS);
         channel.clocks.gear_mode = gear_mode.clone();
         channel.clocks.uclk_mhz = uclk.clone();
         channels.push(channel);
@@ -319,11 +328,11 @@ pub(super) fn decode_alder_ddr4(
 
 #[cfg(test)]
 mod tests {
+    use super::super::MemoryTech;
     use super::*;
     use crate::cpuid::IntelGen;
     use crate::intel_gen::ALDER_DDR4_FIELDS;
     use crate::intel_smbios::SmbiosTopology;
-    use super::super::MemoryTech;
 
     /// N-03: an Alder Lake DDR4 channel whose every TC register is the
     /// bus-fault word `0xFFFF_FFFF` produces all-`Na` timing cells — the
@@ -346,8 +355,7 @@ mod tests {
             tc_rfp: Some(fault),
             tc_rftp: Some(fault),
         };
-        let ch =
-            decode_alder_ddr4_channel(0, Section::Value(1600.0), &regs, &ALDER_DDR4_FIELDS);
+        let ch = decode_alder_ddr4_channel(0, Section::Value(1600.0), &regs, &ALDER_DDR4_FIELDS);
         // Every timing cell must be Na (no fabricated values).
         let cells: [&Section<u16>; 27] = [
             &ch.timings.cl,
@@ -398,18 +406,18 @@ mod tests {
         let d4_tc = AlderDdr4TcRegs {
             tc_pre_lo: Some(0x0051_0011), // tRP 17 / tRDPRE 8 / tPPD 5
             tc_pre_hi: Some(0x0088_A019), // tRCD 17 / tRAS 40 / tWRPRE 25
-            tc_act: Some(0x0005_0C10), // tFAW 16 / tRRD_SG 6 / tRRD_DG 10
-            tc_rdrd: Some(0x140C_0806), // dd 20 / dr 12 / dg 8 / sg 6
-            tc_rdwr: Some(0x140C_0807), // dd 20 / dr 12 / dg 8 / sg 7
-            tc_wrrd: Some(0x2838_1404), // dd 20 / dr 14 / dg 10 / sg 4
-            tc_wrwr: Some(0x140C_0805), // dd 20 / dr 12 / dg 8 / sg 5
-            tc_odt: Some(0x1516_0000), // tCWL 21 / tCL 22
-            tc_rfp: Some(0x0200_0003), // tREFI9 2 / OREF_RI 3
-            tc_rftp: Some(0x02D0_1004), // tRFC 180 / tREFI 4100
+            tc_act: Some(0x0005_0C10),    // tFAW 16 / tRRD_SG 6 / tRRD_DG 10
+            tc_rdrd: Some(0x140C_0806),   // dd 20 / dr 12 / dg 8 / sg 6
+            tc_rdwr: Some(0x140C_0807),   // dd 20 / dr 12 / dg 8 / sg 7
+            tc_wrrd: Some(0x2838_1404),   // dd 20 / dr 14 / dg 10 / sg 4
+            tc_wrwr: Some(0x140C_0805),   // dd 20 / dr 12 / dg 8 / sg 5
+            tc_odt: Some(0x1516_0000),    // tCWL 21 / tCL 22
+            tc_rfp: Some(0x0200_0003),    // tREFI9 2 / OREF_RI 3
+            tc_rftp: Some(0x02D0_1004),   // tRFC 180 / tREFI 4100
         };
         let regs = IntelImcRegs {
             mcbios_req: Some(0x0000_0120), // ratio 32 @ 100 MHz / 2 = 1600 MHz
-            mad_inter_channel: Some(0), // [2:0] == 0 -> DDR4 (the dispatch key)
+            mad_inter_channel: Some(0),    // [2:0] == 0 -> DDR4 (the dispatch key)
             alk_d4_tc0: d4_tc.clone(),
             alk_d4_tc1: d4_tc,
             ..IntelImcRegs::default()

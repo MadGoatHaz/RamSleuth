@@ -45,7 +45,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ramsleuth_bench::{BenchmarkGrid, BenchOp, Metric, StreamProgress, StreamTarget, Tier};
+use ramsleuth_bench::{BenchOp, BenchmarkGrid, Metric, StreamProgress, StreamTarget, Tier};
 use ramsleuth_protocol::{BenchMode, Request, Response};
 use ramsleuth_telemetry::error::Section;
 use ramsleuth_telemetry::probe::render_probe_report_md;
@@ -234,7 +234,7 @@ pub fn bench(
                 // subcommand is the separate `StartBurnIn` path.
                 return Err(ClientError::Protocol(
                     "unexpected burn-in frame during benchmark".to_owned(),
-                ))
+                ));
             }
             Response::ProbeReport(_) => {
                 // A probe-report frame in a normal-bench stream
@@ -243,7 +243,7 @@ pub fn bench(
                 // subcommand only ever starts a `StartBenchmark`.
                 return Err(ClientError::Protocol(
                     "unexpected probe report during benchmark".to_owned(),
-                ))
+                ));
             }
         }
     }
@@ -334,8 +334,9 @@ fn section_state<T>(section: &Section<T>) -> String {
 /// CWD fallback when `HOME` is unset — the GUI F2/F3 rule; never a
 /// panic).
 pub fn default_probe_report_path() -> PathBuf {
-    let home =
-        std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join(".ramsleuth").join("probe-report.md")
 }
 
@@ -459,7 +460,11 @@ pub fn burn(client: &mut Client, duration_minutes: u32) -> Result<String, Client
     let duration = if duration_minutes == 0 {
         "infinite (0 — the run stops only when cancelled)".to_owned()
     } else {
-        let unit = if duration_minutes == 1 { "minute" } else { "minutes" };
+        let unit = if duration_minutes == 1 {
+            "minute"
+        } else {
+            "minutes"
+        };
         format!("{duration_minutes} {unit} (the daemon stops it at the deadline)")
     };
     let text = format!(
@@ -490,7 +495,7 @@ mod tests {
     use ramsleuth_telemetry::cpuid::{CpuInfo, CpuVendor, IntelGen};
     use ramsleuth_telemetry::error::{NaReason, Section};
     use ramsleuth_telemetry::intel_readout::{
-        ChannelRegs, fixture_channel_regs, fixture_intel_readout,
+        fixture_channel_regs, fixture_intel_readout, ChannelRegs,
     };
     use ramsleuth_telemetry::spd_decode::SpdModule;
     use ramsleuth_telemetry::{ProbeReport, ProbeSystem, SystemMemoryTelemetry, SystemPlatform};
@@ -563,9 +568,10 @@ mod tests {
                     other => panic!("stand-in expected a request frame, got {other:?}"),
                 }
                 for reply in replies {
-                    let bytes =
-                        encode_frame(&Message::Response(reply)).expect("reply must encode");
-                    stream.write_all(&bytes).expect("stand-in write must not fail");
+                    let bytes = encode_frame(&Message::Response(reply)).expect("reply must encode");
+                    stream
+                        .write_all(&bytes)
+                        .expect("stand-in write must not fail");
                 }
             }
         })
@@ -698,7 +704,10 @@ mod tests {
             .expect("bench must succeed on a result terminal");
         handle.join().expect("stand-in thread must not panic");
 
-        assert!(text.contains("benchmark started (run 1)"), "started line, got: {text}");
+        assert!(
+            text.contains("benchmark started (run 1)"),
+            "started line, got: {text}"
+        );
         assert!(
             text.contains("  [0/12] Memory/Read: 512.00 GB/s"),
             "progress line, got: {text}"
@@ -706,9 +715,18 @@ mod tests {
         // the terminal grid (header + units + a few cells)
         assert!(text.contains("Read"), "grid header, got: {text}");
         assert!(text.contains("Latency"), "grid header, got: {text}");
-        assert!(text.contains("512.00 GB/s"), "grid bandwidth cell, got: {text}");
-        assert!(text.contains("88.00 ns/hop"), "grid latency cell, got: {text}");
-        assert!(!text.contains("N/A"), "a full grid has no N/A cells, got: {text}");
+        assert!(
+            text.contains("512.00 GB/s"),
+            "grid bandwidth cell, got: {text}"
+        );
+        assert!(
+            text.contains("88.00 ns/hop"),
+            "grid latency cell, got: {text}"
+        );
+        assert!(
+            !text.contains("N/A"),
+            "a full grid has no N/A cells, got: {text}"
+        );
     }
 
     /// (b) `bench` on a cancelled run: the stand-in answers
@@ -730,8 +748,12 @@ mod tests {
             ],
         );
         let mut client = Client::connect(sock.path()).expect("must connect");
-        let text = bench(&mut client, StreamTarget::Tier(Tier::L1), BenchMode::MemoryOnly)
-            .expect("a cancelled run is a clean terminal");
+        let text = bench(
+            &mut client,
+            StreamTarget::Tier(Tier::L1),
+            BenchMode::MemoryOnly,
+        )
+        .expect("a cancelled run is a clean terminal");
         handle.join().expect("stand-in thread must not panic");
 
         assert!(text.contains("benchmark started (run 7)"), "got: {text}");
@@ -818,7 +840,10 @@ mod tests {
         assert!(text.contains("Intel: ok"), "got: {text}");
         assert!(text.contains("SPD: ok (1 module)"), "got: {text}");
         let path = sock.path().to_string_lossy().into_owned();
-        assert!(text.contains(&format!("daemon: {path}")), "socket line, got: {text}");
+        assert!(
+            text.contains(&format!("daemon: {path}")),
+            "socket line, got: {text}"
+        );
     }
 
     /// (e) `status` on a fully degraded snapshot: every vendor section
@@ -838,7 +863,10 @@ mod tests {
 
         assert!(text.contains("CPU: ok"), "got: {text}");
         assert!(text.contains("AMD: N/A (driver missing)"), "got: {text}");
-        assert!(text.contains("Intel: N/A (insufficient privilege)"), "got: {text}");
+        assert!(
+            text.contains("Intel: N/A (insufficient privilege)"),
+            "got: {text}"
+        );
         assert!(text.contains("SPD: N/A (no modules)"), "got: {text}");
     }
 
@@ -883,7 +911,10 @@ mod tests {
         assert!(lines[1].contains("512.00 GB/s"), "got: {text}");
         assert!(lines[1].contains("88.00 ns/hop"), "got: {text}");
         assert!(lines[2].contains("12.70 ns/hop"), "got: {text}");
-        assert!(!text.contains("N/A"), "a full grid has no N/A cells, got: {text}");
+        assert!(
+            !text.contains("N/A"),
+            "a full grid has no N/A cells, got: {text}"
+        );
     }
 
     /// TC-CLI6 (the tier-order confirming test): the client `render_grid`
@@ -929,8 +960,14 @@ mod tests {
             15,
             "15 unmeasured cells, got: {text}"
         );
-        assert!(lines[1].contains("512.00 GB/s"), "the measured cell, got: {text}");
-        assert!(lines[1].contains("N/A"), "unmeasured Memory cells, got: {text}");
+        assert!(
+            lines[1].contains("512.00 GB/s"),
+            "the measured cell, got: {text}"
+        );
+        assert!(
+            lines[1].contains("N/A"),
+            "unmeasured Memory cells, got: {text}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -967,7 +1004,11 @@ mod tests {
     #[test]
     fn probe_writes_the_markdown_to_the_given_path() {
         let sock = TempSocket::new("probe-write");
-        let handle = spawn_standin(&sock, Request::GetProbeReport, vec![Response::ProbeReport(fixture_report())]);
+        let handle = spawn_standin(
+            &sock,
+            Request::GetProbeReport,
+            vec![Response::ProbeReport(fixture_report())],
+        );
         let dir = std::env::temp_dir().join(format!(
             "ramsleuth-client-probe-{}-{}",
             process::id(),
@@ -1000,7 +1041,11 @@ mod tests {
     #[test]
     fn probe_stdout_returns_the_markdown() {
         let sock = TempSocket::new("probe-stdout");
-        let handle = spawn_standin(&sock, Request::GetProbeReport, vec![Response::ProbeReport(fixture_report())]);
+        let handle = spawn_standin(
+            &sock,
+            Request::GetProbeReport,
+            vec![Response::ProbeReport(fixture_report())],
+        );
         let mut client = Client::connect(sock.path()).expect("must connect");
         let path = std::env::temp_dir().join(format!(
             "ramsleuth-client-probe-{}-{}",
@@ -1025,7 +1070,11 @@ mod tests {
     #[test]
     fn probe_json_returns_the_raw_report_json() {
         let sock = TempSocket::new("probe-json");
-        let handle = spawn_standin(&sock, Request::GetProbeReport, vec![Response::ProbeReport(fixture_report())]);
+        let handle = spawn_standin(
+            &sock,
+            Request::GetProbeReport,
+            vec![Response::ProbeReport(fixture_report())],
+        );
         let mut client = Client::connect(sock.path()).expect("must connect");
         let path = std::env::temp_dir().join(format!(
             "ramsleuth-client-probe-{}-{}",
@@ -1047,7 +1096,11 @@ mod tests {
     #[test]
     fn probe_structured_error_reply_is_protocol() {
         let sock = TempSocket::new("probe-err");
-        let handle = spawn_standin(&sock, Request::GetProbeReport, vec![Response::Error("nope".to_owned())]);
+        let handle = spawn_standin(
+            &sock,
+            Request::GetProbeReport,
+            vec![Response::Error("nope".to_owned())],
+        );
         let mut client = Client::connect(sock.path()).expect("must connect");
         let err = probe_to(&mut client, false, false, Path::new("/tmp/never"))
             .expect_err("an Error reply must fail probe");
@@ -1062,8 +1115,11 @@ mod tests {
     #[test]
     fn probe_unexpected_reply_is_protocol() {
         let sock = TempSocket::new("probe-badreply");
-        let handle =
-            spawn_standin(&sock, Request::GetProbeReport, vec![Response::Telemetry(mixed_snapshot())]);
+        let handle = spawn_standin(
+            &sock,
+            Request::GetProbeReport,
+            vec![Response::Telemetry(mixed_snapshot())],
+        );
         let mut client = Client::connect(sock.path()).expect("must connect");
         let err = probe_to(&mut client, false, false, Path::new("/tmp/never"))
             .expect_err("a non-ProbeReport reply must fail probe");
@@ -1100,8 +1156,14 @@ mod tests {
         let text = burn(&mut client, 5).expect("burn must succeed on a BenchStarted ack");
         handle.join().expect("stand-in thread must not panic");
 
-        assert!(text.contains("burn-in started (run 3)"), "the run id, got: {text}");
-        assert!(text.contains("5 minutes"), "the finite duration, got: {text}");
+        assert!(
+            text.contains("burn-in started (run 3)"),
+            "the run id, got: {text}"
+        );
+        assert!(
+            text.contains("5 minutes"),
+            "the finite duration, got: {text}"
+        );
         assert!(
             text.contains("cancel run 3"),
             "the stop guidance names the run, got: {text}"
@@ -1131,7 +1193,10 @@ mod tests {
         handle.join().expect("stand-in thread must not panic");
 
         assert!(text.contains("burn-in started (run 7)"), "got: {text}");
-        assert!(text.contains("infinite"), "the infinite duration, got: {text}");
+        assert!(
+            text.contains("infinite"),
+            "the infinite duration, got: {text}"
+        );
         assert!(
             text.contains("cancel run 7"),
             "an infinite run stops only via the cancel, got: {text}"
@@ -1192,11 +1257,14 @@ mod tests {
     #[test]
     fn burn_unexpected_reply_is_protocol() {
         let sock = TempSocket::new("burn-badreply");
-        let handle =
-            spawn_standin(&sock, Request::StartBurnIn {
+        let handle = spawn_standin(
+            &sock,
+            Request::StartBurnIn {
                 target: StreamTarget::Full,
                 duration_minutes: 5,
-            }, vec![Response::Telemetry(mixed_snapshot())]);
+            },
+            vec![Response::Telemetry(mixed_snapshot())],
+        );
         let mut client = Client::connect(sock.path()).expect("must connect");
         let err = burn(&mut client, 5).expect_err("a non-BenchStarted reply must fail burn");
         handle.join().expect("stand-in thread must not panic");

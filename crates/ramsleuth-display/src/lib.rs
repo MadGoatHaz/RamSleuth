@@ -89,7 +89,11 @@ pub fn format_clock(mhz: f64, clock_mhz: bool) -> String {
 /// non-positive reading renders `0:00` (a bad elapsed never panics the
 /// line, D5).
 pub fn format_elapsed(secs: f64) -> String {
-    let total = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
+    let total = if secs.is_finite() && secs > 0.0 {
+        secs as u64
+    } else {
+        0
+    };
     format!("{}:{:02}", total / 60, total % 60)
 }
 
@@ -167,7 +171,10 @@ pub fn channel_mode(dimm_count: usize) -> String {
 /// Unit-agnostic: counts, not GiB.
 pub fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String> {
     let total = total.value().copied().filter(|value| value.is_finite())?;
-    let visible: Vec<f64> = sizes.iter().filter_map(|cell| cell.value().copied()).collect();
+    let visible: Vec<f64> = sizes
+        .iter()
+        .filter_map(|cell| cell.value().copied())
+        .collect();
     if visible.is_empty() {
         return None;
     }
@@ -175,7 +182,9 @@ pub fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String>
     if total <= sum {
         return None;
     }
-    let uniform = visible.iter().all(|value| (value - visible[0]).abs() < 0.05);
+    let uniform = visible
+        .iter()
+        .all(|value| (value - visible[0]).abs() < 0.05);
     if uniform {
         let unit = visible[0];
         if unit > 0.0 {
@@ -186,7 +195,10 @@ pub fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String>
             }
         }
     }
-    Some(format!("SPD sees {} of the installed capacity", visible.len()))
+    Some(format!(
+        "SPD sees {} of the installed capacity",
+        visible.len()
+    ))
 }
 
 /// The summary-line speed fallback when no bound SPD module carries a
@@ -197,16 +209,13 @@ pub fn slot_note(total: &Section<f64>, sizes: &[Section<f64>]) -> Option<String>
 pub fn mclk_derived_speed(t: &SystemMemoryTelemetry) -> Option<String> {
     let mclk = match t.amd.value() {
         Some(readout) => readout.clocks.mclk_mhz.value().copied(),
-        None => t
-            .intel
-            .value()
-            .and_then(|readout| {
-                readout
-                    .channels
-                    .iter()
-                    .filter_map(|c| c.clocks.mclk_mhz.value().copied())
-                    .reduce(|a, b| if b > a { b } else { a })
-            }),
+        None => t.intel.value().and_then(|readout| {
+            readout
+                .channels
+                .iter()
+                .filter_map(|c| c.clocks.mclk_mhz.value().copied())
+                .reduce(|a, b| if b > a { b } else { a })
+        }),
     }?;
     Some(format!("{:.0} MT/s", mclk * 2.0))
 }
@@ -236,7 +245,10 @@ pub fn sync_mode_from_clocks(clocks: &ClockReadout, clock_mhz: bool) -> String {
     match clocks.div_mode.value() {
         Some(DivMode::OneToOne) => match clocks.mclk_mhz.value() {
             Some(mhz) => {
-                format!("Synchronous 1:1 (UCLK = MCLK = {})", format_clock(*mhz, clock_mhz))
+                format!(
+                    "Synchronous 1:1 (UCLK = MCLK = {})",
+                    format_clock(*mhz, clock_mhz)
+                )
             }
             None => "Synchronous 1:1".to_owned(),
         },
@@ -494,7 +506,10 @@ fn read_hwmon_temp_c() -> f64 {
     let Some(selected) = select_hwmon_dir(&name_refs) else {
         return f64::NAN; // no CPU-temp hwmon device.
     };
-    let Some(dir) = names.iter().position(|name| name == selected).and_then(|i| dirs.get(i))
+    let Some(dir) = names
+        .iter()
+        .position(|name| name == selected)
+        .and_then(|i| dirs.get(i))
     else {
         // `selected` came from `names`: not expected, still degrades.
         return f64::NAN;
@@ -653,10 +668,7 @@ mod tests {
     fn dimm_summary_pins_the_group_form() {
         let sizes = vec![section(16.0), section(16.0)];
         let modules = vec![spd(1), spd(1)];
-        assert_eq!(
-            dimm_summary(&sizes, &modules, true),
-            "2x16 GiB Single-Rank"
-        );
+        assert_eq!(dimm_summary(&sizes, &modules, true), "2x16 GiB Single-Rank");
         // A Na size contributes nothing; an all-Na list degrades to N/A.
         let na_sizes = vec![Section::na(NaReason::NotApplicable)];
         assert_eq!(dimm_summary(&na_sizes, &[], true), "N/A");
@@ -665,9 +677,15 @@ mod tests {
     #[test]
     fn slot_note_pins_the_excess_form() {
         // total == sum → no note (no excess to explain).
-        assert_eq!(slot_note(&section(32.0), &[section(16.0), section(16.0)]), None);
+        assert_eq!(
+            slot_note(&section(32.0), &[section(16.0), section(16.0)]),
+            None
+        );
         // total ≤ sum → no note (no false alarm).
-        assert_eq!(slot_note(&section(16.0), &[section(16.0), section(16.0)]), None);
+        assert_eq!(
+            slot_note(&section(16.0), &[section(16.0), section(16.0)]),
+            None
+        );
         // Non-uniform sizes that exceed the sum → the generic note.
         assert_eq!(
             slot_note(&section(48.0), &[section(16.0), section(8.0)]),
@@ -683,7 +701,10 @@ mod tests {
 
     #[test]
     fn rank_word_pins_the_arms() {
-        assert_eq!(rank_word(&Section::Value(1)), Some("Single-Rank".to_owned()));
+        assert_eq!(
+            rank_word(&Section::Value(1)),
+            Some("Single-Rank".to_owned())
+        );
         assert_eq!(rank_word(&Section::Value(2)), Some("Dual-Rank".to_owned()));
         assert_eq!(rank_word(&Section::Value(3)), Some("3-Rank".to_owned()));
         assert_eq!(rank_word(&Section::Value(0)), None);
@@ -700,15 +721,24 @@ mod tests {
             smu_version: smu,
         };
         assert_eq!(
-            age_fragment(&platform(Section::Value("PI 1.2.0.12".to_owned()), Section::na(NaReason::NotApplicable))),
+            age_fragment(&platform(
+                Section::Value("PI 1.2.0.12".to_owned()),
+                Section::na(NaReason::NotApplicable)
+            )),
             "AGESA PI 1.2.0.12"
         );
         assert_eq!(
-            age_fragment(&platform(Section::na(NaReason::NotApplicable), Section::Value("1.0.0".to_owned()))),
+            age_fragment(&platform(
+                Section::na(NaReason::NotApplicable),
+                Section::Value("1.0.0".to_owned())
+            )),
             "SMU 1.0.0"
         );
         assert_eq!(
-            age_fragment(&platform(Section::na(NaReason::NotApplicable), Section::na(NaReason::NotApplicable))),
+            age_fragment(&platform(
+                Section::na(NaReason::NotApplicable),
+                Section::na(NaReason::NotApplicable)
+            )),
             "AGESA N/A"
         );
     }
@@ -718,7 +748,10 @@ mod tests {
     #[test]
     fn na_cell_text_pins_the_compact_form() {
         assert_eq!(na_cell_text(&NaReason::NotApplicable), "N/A");
-        assert_eq!(na_cell_text(&NaReason::DriverMissing), "N/A (driver missing)");
+        assert_eq!(
+            na_cell_text(&NaReason::DriverMissing),
+            "N/A (driver missing)"
+        );
         assert_eq!(
             na_cell_text(&NaReason::UnsupportedHardware),
             "N/A (unsupported CPU)"
@@ -732,7 +765,10 @@ mod tests {
             "N/A (new PM table)"
         );
         // A non-empty `ParseError` detail is surfaced verbatim (the fix).
-        assert_eq!(na_cell_text(&NaReason::ParseError("x".to_owned())), "N/A (x)");
+        assert_eq!(
+            na_cell_text(&NaReason::ParseError("x".to_owned())),
+            "N/A (x)"
+        );
         // An empty detail falls back to the terse "decode failed" tag.
         assert_eq!(
             na_cell_text(&NaReason::ParseError(String::new())),
@@ -772,7 +808,15 @@ mod tests {
         ] {
             let text = na_section_text(&reason);
             assert!(text.starts_with("No data —"), "{reason:?}: {text}");
-            assert!(text.contains("not an error") || text.contains("daemon") || text.contains("platform") || text.contains("driver") || text.contains("privilege") || text.contains("decoded"), "{reason:?}: {text}");
+            assert!(
+                text.contains("not an error")
+                    || text.contains("daemon")
+                    || text.contains("platform")
+                    || text.contains("driver")
+                    || text.contains("privilege")
+                    || text.contains("decoded"),
+                "{reason:?}: {text}"
+            );
         }
         // A non-empty `ParseError` detail is surfaced verbatim (the fix);
         // an empty one falls back to the generic decode-failure note.
@@ -786,7 +830,10 @@ mod tests {
             "No data — the register values couldn't be decoded on this platform."
         );
         // The section form is the verbose one (distinct from the compact).
-        assert_ne!(na_section_text(&NaReason::DriverMissing), na_cell_text(&NaReason::DriverMissing));
+        assert_ne!(
+            na_section_text(&NaReason::DriverMissing),
+            na_cell_text(&NaReason::DriverMissing)
+        );
     }
 
     #[test]
@@ -820,7 +867,10 @@ mod tests {
             copy_gbps: [12.11, 36.40, 31.80, 11.05],
             latency_ns: [86.84, 1.12, 4.20, 13.90],
         };
-        assert_eq!(bench_cell_text(&grid, Tier::Memory, Metric::Read), "26.35 GB/s");
+        assert_eq!(
+            bench_cell_text(&grid, Tier::Memory, Metric::Read),
+            "26.35 GB/s"
+        );
         assert_eq!(bench_cell_text(&grid, Tier::L1, Metric::Latency), "1.12 ns");
         assert_eq!(bench_cell_text(&grid, Tier::L2, Metric::Write), "N/A");
     }

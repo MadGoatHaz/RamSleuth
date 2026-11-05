@@ -91,7 +91,7 @@ use ramsleuth_telemetry::{ProbeReport, SystemMemoryTelemetry};
 
 use crate::graph::GraphState;
 use crate::history::HistoryState;
-use crate::settings::{DEFAULT_POLL_INTERVAL_MS, GuiSettings};
+use crate::settings::{GuiSettings, DEFAULT_POLL_INTERVAL_MS};
 // ---------------------------------------------------------------------------
 // Poison-tolerant shared-state guard acquisition (FE-3).
 //
@@ -445,10 +445,7 @@ pub fn request_probe_report(socket: &Path, state: &RwLock<TelemetryData>) -> Res
     let mut client = match Client::connect(socket) {
         Ok(client) => client,
         Err(error) => {
-            state
-                .write()
-                .unwrap()
-                .probe_result = ProbeResult::Err(error.to_string());
+            state.write().unwrap().probe_result = ProbeResult::Err(error.to_string());
             return Ok(());
         }
     };
@@ -500,9 +497,11 @@ fn record_history_sample(state: &mut TelemetryData) {
     let Some(vddcr_soc_mv) = readout.voltages.vddcr_soc_mv.value().copied() else {
         return; // VDDCR_SOC absent: skip the whole sample.
     };
-    state
-        .history
-        .push(mclk_mhz, f64::from(vddcr_soc_mv), latest_memory_read_bw(state));
+    state.history.push(
+        mclk_mhz,
+        f64::from(vddcr_soc_mv),
+        latest_memory_read_bw(state),
+    );
 }
 
 /// Append one graphs-window sample (C7-20) for the just-landed
@@ -544,13 +543,9 @@ fn record_graph_sample(state: &mut TelemetryData) {
 /// zero rather than a hole). Non-finite / non-positive values never
 /// count as a figure (the bench zone's live-cell rule).
 fn latest_memory_read_bw(state: &TelemetryData) -> f64 {
-    if let Some(event) = state
-        .bench
-        .progress
-        .iter()
-        .rev()
-        .find(|e| e.tier == Tier::Memory && e.op == BenchOp::Read && e.value.is_finite() && e.value > 0.0)
-    {
+    if let Some(event) = state.bench.progress.iter().rev().find(|e| {
+        e.tier == Tier::Memory && e.op == BenchOp::Read && e.value.is_finite() && e.value > 0.0
+    }) {
         return event.value;
     }
     if let Some(grid) = &state.bench.grid {
@@ -695,8 +690,7 @@ pub fn run_bench(
                 // `run_burn_in`'s `BenchProgress` contract guard
                 // (C7-16 landed the real burn-in consumption).
                 let mut s = state_write(state);
-                s.error =
-                    Some("unexpected burn-in frame during benchmark".to_owned());
+                s.error = Some("unexpected burn-in frame during benchmark".to_owned());
                 s.bench.running = false;
                 break;
             }
@@ -805,8 +799,7 @@ pub fn run_burn_in(
     let Some(duration_minutes) = cmd.duration_minutes else {
         let mut s = state_write(state);
         s.bench.burn_in.running = false;
-        s.error =
-            Some("burn-in command without a duration_minutes discriminator".to_owned());
+        s.error = Some("burn-in command without a duration_minutes discriminator".to_owned());
         return Ok(());
     };
     if let Err(error) = client.send(&Request::StartBurnIn {
@@ -1016,8 +1009,7 @@ pub fn spawn_poller(
         // with it off the stamp only matters after a later
         // refresh-enable (the baseline fetch is due-gate-independent
         // — D-8).
-        let mut last_poll =
-            Instant::now() - Duration::from_millis(DEFAULT_POLL_INTERVAL_MS);
+        let mut last_poll = Instant::now() - Duration::from_millis(DEFAULT_POLL_INTERVAL_MS);
         // Baseline-once (D-8): the last `settings.socket` value a
         // one-shot baseline fetch ran against (`None` before the
         // first tick). A distinct value triggers exactly one
@@ -1142,7 +1134,7 @@ mod tests {
     use std::sync::mpsc;
 
     use ramsleuth_bench::{BenchOp, Tier};
-    use ramsleuth_protocol::{FrameError, Message, decode_frame, encode_frame};
+    use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message};
     use ramsleuth_telemetry::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
     use ramsleuth_telemetry::amd_readout::map_amd;
     use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
@@ -1171,11 +1163,18 @@ mod tests {
             guard.error = Some("panic-while-holding".to_owned());
             panic!("poison the lock");
         }));
-        assert!(state.is_poisoned(), "the lock must be poisoned after the panic");
+        assert!(
+            state.is_poisoned(),
+            "the lock must be poisoned after the panic"
+        );
         // A read through the helper recovers the guard (no cascade panic) and
         // sees the value the panicking writer set.
         let data = state_read(&state);
-        assert_eq!(data.error.as_deref(), Some("panic-while-holding"), "read recovers the last-good value");
+        assert_eq!(
+            data.error.as_deref(),
+            Some("panic-while-holding"),
+            "read recovers the last-good value"
+        );
         drop(data);
         // A write through the helper also recovers (no cascade panic).
         let mut data = state_write(&state);
@@ -1193,10 +1192,8 @@ mod tests {
 
     impl TempSocket {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "ramsleuth-{name}-{}.sock",
-                process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("ramsleuth-{name}-{}.sock", process::id()));
             let _ = std::fs::remove_file(&path); // stale file from a crashed earlier run
             Self { path }
         }
@@ -1294,6 +1291,49 @@ mod tests {
             Self { handle }
         }
 
+        /// A loop variant: accepts connections until `stop` is set,
+        /// handing each its 1-based index + stream to `handler`. The
+        /// handler must not panic on EOF (a client timeout closes the
+        /// connection — `read_one_message` returns `None`); it is the
+        /// handler's responsibility to treat that as a benign close.
+        /// The caller stops the loop by setting `stop` and then wakes
+        /// the blocking `accept` with a throwaway connect (immediate
+        /// EOF; the accept returns, sees `stop`, and exits).
+        fn spawn_until_stopped(
+            sock: &TempSocket,
+            stop: &Arc<AtomicBool>,
+            mut handler: impl FnMut(usize, UnixStream) + Send + 'static,
+        ) -> Self {
+            let listener = UnixListener::bind(sock.path()).expect("test socket must bind");
+            let stop = Arc::clone(stop);
+            let handle = thread::spawn(move || {
+                let mut index = 0usize;
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if stop.load(Ordering::Relaxed) {
+                                // The stop-waker: close without
+                                // handing to the handler.
+                                drop(stream);
+                                break;
+                            }
+                            index += 1;
+                            handler(index, stream);
+                        }
+                        Err(_) => {
+                            // A transient accept error (the listener
+                            // was closed): exit.
+                            break;
+                        }
+                    }
+                }
+            });
+            Self { handle }
+        }
+
         fn join(self) {
             self.handle.join().expect("stand-in thread must not panic");
         }
@@ -1313,7 +1353,10 @@ mod tests {
         assert!(state.last_update.is_none());
         assert!(state.error.is_none());
         assert!(state.graph.is_empty(), "a fresh state has no graph samples");
-        assert!(!state.reconnect_requested, "a fresh state has no reconnect edge");
+        assert!(
+            !state.reconnect_requested,
+            "a fresh state has no reconnect edge"
+        );
     }
 
     /// (a) `poll_telemetry` against a live stand-in (a `GetTelemetry`
@@ -1329,17 +1372,19 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes = encode_frame(&Message::Response(Response::Telemetry(
-                mock_snapshot(),
-            )))
-            .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                .expect("must encode");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
 
         // A pre-existing error (initialized here, not reassigned after)
         // must be cleared by a successful poll.
-        let mut state =
-            TelemetryData { error: Some("stale error".to_owned()), ..Default::default() };
+        let mut state = TelemetryData {
+            error: Some("stale error".to_owned()),
+            ..Default::default()
+        };
         poll_telemetry(sock.path(), &mut state).expect("poll_telemetry must not error");
 
         assert_eq!(
@@ -1347,7 +1392,10 @@ mod tests {
             Some("GUI Test CPU"),
             "the stand-in's canned snapshot must land in the state"
         );
-        assert!(state.error.is_none(), "a successful poll must clear the error");
+        assert!(
+            state.error.is_none(),
+            "a successful poll must clear the error"
+        );
         let status = &state.daemon_status;
         assert!(
             status.contains("connected"),
@@ -1357,7 +1405,10 @@ mod tests {
             status.contains(&sock.path().display().to_string()),
             "the status must name the socket, got: {status}"
         );
-        assert!(state.last_update.is_some(), "a successful poll must stamp last_update");
+        assert!(
+            state.last_update.is_some(),
+            "a successful poll must stamp last_update"
+        );
         // The stand-in snapshot is all-Na AMD (a driver-missing
         // host): the Na guard appends no history sample — no panic
         // (the no-panic contract, D5).
@@ -1403,8 +1454,7 @@ mod tests {
         // The daemon-down state (a missing socket): the prompt shows.
         let down = TempSocket::new("liveness-down");
         let mut state_down = TelemetryData::default();
-        poll_telemetry(down.path(), &mut state_down)
-            .expect("poll_telemetry must not error");
+        poll_telemetry(down.path(), &mut state_down).expect("poll_telemetry must not error");
         assert_eq!(state_down.daemon_status, "disconnected");
         assert!(
             requirements_strip_visible(true, &state_down),
@@ -1419,11 +1469,11 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes = encode_frame(&Message::Response(Response::Telemetry(
-                mock_snapshot(),
-            )))
-            .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                .expect("must encode");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
         let mut state_up = TelemetryData::default();
         poll_telemetry(up.path(), &mut state_up).expect("poll_telemetry must not error");
@@ -1482,7 +1532,9 @@ mod tests {
                 Response::BenchResult { run_id: 1, grid },
             ] {
                 let bytes = encode_frame(&Message::Response(response)).expect("must encode");
-                stream.write_all(&bytes).expect("stand-in write must not fail");
+                stream
+                    .write_all(&bytes)
+                    .expect("stand-in write must not fail");
             }
         });
 
@@ -1513,16 +1565,22 @@ mod tests {
         run_bench(sock.path(), cmd, &state, &cancel).expect("run_bench must not error");
 
         let state = state.read().expect("the poller must not poison the lock");
-        assert!(!state.bench.running, "the terminal result must clear running");
-        assert_eq!(state.bench.run_id, Some(1), "the ack's run_id must be recorded");
+        assert!(
+            !state.bench.running,
+            "the terminal result must clear running"
+        );
+        assert_eq!(
+            state.bench.run_id,
+            Some(1),
+            "the ack's run_id must be recorded"
+        );
         assert_eq!(
             state.bench.progress.len(),
             1,
             "exactly the streamed event; the stale entry is cleared"
         );
         assert_eq!(
-            state.bench.progress[0],
-            expected_progress,
+            state.bench.progress[0], expected_progress,
             "the streamed event must land verbatim"
         );
         assert_eq!(
@@ -1530,7 +1588,10 @@ mod tests {
             Some(expected_grid),
             "the terminal grid must land in the state"
         );
-        assert!(state.error.is_none(), "a clean run must not record an error");
+        assert!(
+            state.error.is_none(),
+            "a clean run must not record an error"
+        );
         stand_in.join();
     }
 
@@ -1577,21 +1638,27 @@ mod tests {
     #[test]
     fn reconnect_edge_forces_an_immediate_poll_with_refresh_off() {
         let sock = TempSocket::new("reconnect-edge");
-        let stand_in = DaemonStandIn::spawn_multi(&sock, 2, |_, mut stream| {
+        let stop = Arc::new(AtomicBool::new(false));
+        // A loop stand-in (accepts until stopped) so the poller can
+        // retry through client-timeout closes: under heavy parallel
+        // test load the accept thread can be descheduled for many
+        // seconds, the client's 5 s read deadline fires, and the
+        // closed connection would otherwise kill a fixed-count
+        // stand-in (the handler panicking on EOF). `None` = benign
+        // client close; any other non-`GetTelemetry` frame is still a
+        // protocol violation.
+        let stand_in = DaemonStandIn::spawn_until_stopped(&sock, &stop, |_, mut stream| {
             match read_one_message(&mut stream) {
                 Some(Message::Request(Request::GetTelemetry)) => {}
+                None => return, // the client timed out / closed
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes = encode_frame(&Message::Response(Response::Telemetry(
-                mock_snapshot(),
-            )))
-            .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                .expect("must encode");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
-        // `stand_in` is intentionally NOT joined (the leak rationale
-        // in the test doc): the thread is done in the edge-first
-        // interleaving and blocked in the stop-first one.
-        let _ = stand_in;
 
         // The setup worker's edge: a successful run, refresh off,
         // the live socket seeded at the stand-in.
@@ -1605,15 +1672,18 @@ mod tests {
             ..Default::default()
         }));
         let (_tx, rx) = mpsc::channel::<BenchCmd>();
-        let stop = Arc::new(AtomicBool::new(false));
+        let poller_stop = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
 
-        let handle = spawn_poller(state.clone(), rx, stop.clone(), cancel);
-        // Wait for the edge's immediate poll to land (bounded — the
-        // 30 s deadline is generous under full-machine test load:
-        // the poller's tick is 200 ms, so a sane build lands the
-        // edge's poll in well under a second).
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let handle = spawn_poller(state.clone(), rx, poller_stop.clone(), cancel);
+        // Wait for the edge's immediate poll to land. The 60 s deadline
+        // is generous: under heavy CI / full-machine test load the
+        // stand-in's accept thread can be descheduled for many seconds
+        // (observed up to ~15 s) before it services the poller's
+        // connection, and the client's 5 s read timeout then retries
+        // on subsequent poller ticks. A sane idle build lands the
+        // edge's poll in well under a second.
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let s = state.read().expect("the poller must not poison the lock");
             if s.daemon_status.starts_with("connected") {
@@ -1626,8 +1696,14 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        stop.store(true, Ordering::Relaxed);
+        poller_stop.store(true, Ordering::Relaxed);
         handle.join().expect("the poller thread must not panic");
+
+        // Stop the stand-in: set the flag, then wake its blocking
+        // `accept` with a throwaway connect (immediate EOF).
+        stop.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(sock.path());
+        stand_in.join();
 
         let s = state.read().expect("the poller must not poison the lock");
         assert!(
@@ -1644,7 +1720,10 @@ mod tests {
             s.telemetry.is_some(),
             "the edge's poll must land the stand-in's snapshot"
         );
-        assert!(!s.reconnect_requested, "the edge must be consumed exactly once");
+        assert!(
+            !s.reconnect_requested,
+            "the edge must be consumed exactly once"
+        );
     }
 
     /// (f) CANCEL (P3-28): after the `BenchStarted` ack lands in the
@@ -1661,10 +1740,11 @@ mod tests {
                 Some(Message::Request(Request::StartBenchmark { .. })) => {}
                 other => panic!("stand-in expected StartBenchmark, got {other:?}"),
             }
-            let started =
-                encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
-                    .expect("must encode");
-            stream.write_all(&started).expect("stand-in write must not fail");
+            let started = encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
+                .expect("must encode");
+            stream
+                .write_all(&started)
+                .expect("stand-in write must not fail");
             // Mimic the daemon: end the run after a beat — the worker
             // either sees the cancel flag before the terminal frame
             // (sends a `CancelBenchmark` and breaks) or receives the
@@ -1691,8 +1771,7 @@ mod tests {
                 };
                 // The function locks the shared state only per
                 // mutation — never across the stream drain (C14-03).
-                run_bench(&socket, cmd, &state, &cancel)
-                    .expect("run_bench must not error");
+                run_bench(&socket, cmd, &state, &cancel).expect("run_bench must not error");
             })
         };
 
@@ -1700,7 +1779,13 @@ mod tests {
         // state), then set the shared cancel flag.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if state.read().expect("the poller must not poison the lock").bench.run_id.is_some() {
+            if state
+                .read()
+                .expect("the poller must not poison the lock")
+                .bench
+                .run_id
+                .is_some()
+            {
                 break;
             }
             assert!(
@@ -1710,12 +1795,21 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         cancel.store(true, Ordering::Relaxed);
-        worker.join().expect("run_bench must return on cancel (no hang)");
+        worker
+            .join()
+            .expect("run_bench must return on cancel (no hang)");
 
         let state = state.read().expect("the poller must not poison the lock");
         assert!(!state.bench.running, "the cancel must clear running");
-        assert_eq!(state.bench.run_id, Some(42), "the run id must stay recorded");
-        assert!(state.error.is_none(), "a clean cancel must not record an error");
+        assert_eq!(
+            state.bench.run_id,
+            Some(42),
+            "the run id must stay recorded"
+        );
+        assert!(
+            state.error.is_none(),
+            "a clean cancel must not record an error"
+        );
         stand_in.join();
     }
 
@@ -1823,11 +1917,13 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes = encode_frame(&Message::Response(Response::Telemetry(
-                populated_snapshot(1800),
-            )))
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(populated_snapshot(
+                1800,
+            ))))
             .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
 
         let mut state = TelemetryData::default();
@@ -1843,19 +1939,32 @@ mod tests {
         poll_telemetry(sock.path(), &mut state).expect("poll_telemetry must not error");
         stand_in.join();
 
-        assert_eq!(state.history.len(), 1, "one successful poll appends exactly one sample");
         assert_eq!(
-            *state.history.mclk.last().expect("the mclk series has the sample"),
+            state.history.len(),
+            1,
+            "one successful poll appends exactly one sample"
+        );
+        assert_eq!(
+            *state
+                .history
+                .mclk
+                .last()
+                .expect("the mclk series has the sample"),
             1800.0,
             "MCLK lands in MHz"
         );
         assert_eq!(
-            *state.history.vddcr_soc.last().expect("the vddcr_soc series has the sample"),
+            *state
+                .history
+                .vddcr_soc
+                .last()
+                .expect("the vddcr_soc series has the sample"),
             1050.0,
             "VDDCR_SOC lands in mV"
         );
         assert_eq!(
-            *state.history
+            *state
+                .history
                 .bandwidth
                 .last()
                 .expect("the bandwidth series has the sample"),
@@ -1872,7 +1981,11 @@ mod tests {
     fn latest_memory_read_bw_source_priority() {
         // Neither: no progress, no grid → 0.0.
         let idle = TelemetryData::default();
-        assert_eq!(latest_memory_read_bw(&idle), 0.0, "no bench data at all → 0.0");
+        assert_eq!(
+            latest_memory_read_bw(&idle),
+            0.0,
+            "no bench data at all → 0.0"
+        );
 
         // Terminal grid only (row 0 = the Memory read cell).
         let grid_only = TelemetryData {
@@ -1887,7 +2000,11 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(latest_memory_read_bw(&grid_only), 26.35, "the terminal grid cell");
+        assert_eq!(
+            latest_memory_read_bw(&grid_only),
+            26.35,
+            "the terminal grid cell"
+        );
 
         // A live `Memory · Read` event beats the (older) terminal
         // grid; a newer non-Memory / non-Read event is ignored.
@@ -1983,11 +2100,13 @@ mod tests {
             }
             // One sample per connection: MCLK = the 1-based index (so
             // the eviction is observable); VDDCR_SOC is constant.
-            let bytes = encode_frame(&Message::Response(Response::Telemetry(
-                populated_snapshot(index as u16),
-            )))
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(populated_snapshot(
+                index as u16,
+            ))))
             .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
 
         let mut state = TelemetryData::default();
@@ -2007,7 +2126,11 @@ mod tests {
             Some(6.0),
             "the five oldest samples (MCLK 1..=5) are evicted"
         );
-        assert_eq!(mclk.last().copied(), Some(total as f64), "the newest sample is last");
+        assert_eq!(
+            mclk.last().copied(),
+            Some(total as f64),
+            "the newest sample is last"
+        );
         assert!(
             mclk.windows(2).all(|w| w[1] > w[0]),
             "the samples stay in poll order (oldest → newest)"
@@ -2033,17 +2156,23 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes = encode_frame(&Message::Response(Response::Telemetry(
-                populated_snapshot(1800),
-            )))
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(populated_snapshot(
+                1800,
+            ))))
             .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
         let mut state = TelemetryData::default();
         poll_telemetry(sock.path(), &mut state).expect("first poll must not error");
         poll_telemetry(sock.path(), &mut state).expect("second poll must not error");
         stand_in.join();
-        assert_eq!(state.history.len(), 2, "two continuous polls append two samples");
+        assert_eq!(
+            state.history.len(),
+            2,
+            "two continuous polls append two samples"
+        );
 
         // Phase 2: the daemon drops (a missing socket records
         // `disconnected`), then comes back → the stale series is
@@ -2059,16 +2188,25 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes = encode_frame(&Message::Response(Response::Telemetry(
-                populated_snapshot(1800),
-            )))
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(populated_snapshot(
+                1800,
+            ))))
             .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
         poll_telemetry(back_sock.path(), &mut state).expect("the reconnect poll must not error");
         stand_in.join();
-        assert_eq!(state.history.len(), 1, "the reconnect clears the stale series");
-        assert_eq!(*state.history.mclk.last().expect("the fresh sample"), 1800.0);
+        assert_eq!(
+            state.history.len(),
+            1,
+            "the reconnect clears the stale series"
+        );
+        assert_eq!(
+            *state.history.mclk.last().expect("the fresh sample"),
+            1800.0
+        );
     }
 
     /// (g5) C7-20: five successful polls append five graphs-window
@@ -2086,11 +2224,13 @@ mod tests {
                 Some(Message::Request(Request::GetTelemetry)) => {}
                 other => panic!("stand-in expected GetTelemetry, got {other:?}"),
             }
-            let bytes = encode_frame(&Message::Response(Response::Telemetry(
-                populated_snapshot(index as u16),
-            )))
+            let bytes = encode_frame(&Message::Response(Response::Telemetry(populated_snapshot(
+                index as u16,
+            ))))
             .expect("must encode");
-            stream.write_all(&bytes).expect("stand-in write must not fail");
+            stream
+                .write_all(&bytes)
+                .expect("stand-in write must not fail");
         });
 
         let mut state = TelemetryData::default();
@@ -2108,9 +2248,16 @@ mod tests {
         }
         stand_in.join();
 
-        assert_eq!(state.graph.len(), 5, "five successful polls append five graph samples");
+        assert_eq!(
+            state.graph.len(),
+            5,
+            "five successful polls append five graph samples"
+        );
         for sample in state.graph.samples.iter() {
-            assert!(sample.t.is_finite() && sample.t > 0.0, "the sample is stamped with unix seconds");
+            assert!(
+                sample.t.is_finite() && sample.t > 0.0,
+                "the sample is stamped with unix seconds"
+            );
             assert_eq!(sample.vddcr_soc_mv, 1050.0, "VDDCR_SOC lands in mV");
             assert_eq!(
                 sample.bandwidth_gbps, 26.35,
@@ -2186,7 +2333,9 @@ mod tests {
                         populated_snapshot(1800),
                     )))
                     .expect("must encode");
-                    stream.write_all(&bytes).expect("stand-in write must not fail");
+                    stream
+                        .write_all(&bytes)
+                        .expect("stand-in write must not fail");
                 }
             })
         };
@@ -2214,8 +2363,15 @@ mod tests {
         // window (one per poll; a 100 ms knob polls nearly every
         // 200 ms tick).
         thread::sleep(Duration::from_millis(1_500));
-        let a = state.read().expect("the poller must not poison the lock").history.len();
-        assert!(a >= 2, "the short interval must produce several samples, got {a}");
+        let a = state
+            .read()
+            .expect("the poller must not poison the lock")
+            .history
+            .len();
+        assert!(
+            a >= 2,
+            "the short interval must produce several samples, got {a}"
+        );
 
         // Phase B: change the knob live (no restart) to the clamp
         // ceiling — the cadence freezes (60 s cannot elapse in the
@@ -2225,8 +2381,15 @@ mod tests {
             guard.settings.poll_interval_ms = MAX_POLL_INTERVAL_MS;
         }
         thread::sleep(Duration::from_millis(1_200));
-        let b = state.read().expect("the poller must not poison the lock").history.len();
-        assert_eq!(b, a, "a live interval change to 60 s must freeze the cadence");
+        let b = state
+            .read()
+            .expect("the poller must not poison the lock")
+            .history
+            .len();
+        assert_eq!(
+            b, a,
+            "a live interval change to 60 s must freeze the cadence"
+        );
 
         // Phase C: the refresh gate — a short interval again, but
         // refresh disabled: polling stays paused (the gate wins over
@@ -2237,10 +2400,13 @@ mod tests {
             guard.settings.refresh_enabled = false;
         }
         thread::sleep(Duration::from_millis(1_200));
-        let c = state.read().expect("the poller must not poison the lock").history.len();
+        let c = state
+            .read()
+            .expect("the poller must not poison the lock")
+            .history
+            .len();
         assert_eq!(
-            c,
-            a,
+            c, a,
             "a disabled refresh must pause polling even with a short interval"
         );
 
@@ -2253,7 +2419,11 @@ mod tests {
             .settings
             .refresh_enabled = true;
         thread::sleep(Duration::from_millis(1_000));
-        let d = state.read().expect("the poller must not poison the lock").history.len();
+        let d = state
+            .read()
+            .expect("the poller must not poison the lock")
+            .history
+            .len();
         assert!(d > a, "re-enabling the refresh must resume polling");
 
         // Stop: drop the bench sender (the poller's channel
@@ -2343,11 +2513,11 @@ mod tests {
                         None => break, // the waker (an EOF before a frame)
                     }
                     let bytes =
-                        encode_frame(&Message::Response(Response::Telemetry(
-                            mock_snapshot(),
-                        )))
-                        .expect("must encode");
-                    stream.write_all(&bytes).expect("stand-in write must not fail");
+                        encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                            .expect("must encode");
+                    stream
+                        .write_all(&bytes)
+                        .expect("stand-in write must not fail");
                 }
             })
         };
@@ -2439,11 +2609,11 @@ mod tests {
                     }
                     None => break, // an unexpected EOF before a frame
                 }
-                let bytes = encode_frame(&Message::Response(Response::Telemetry(
-                    mock_snapshot(),
-                )))
-                .expect("must encode");
-                stream.write_all(&bytes).expect("stand-in write must not fail");
+                let bytes = encode_frame(&Message::Response(Response::Telemetry(mock_snapshot())))
+                    .expect("must encode");
+                stream
+                    .write_all(&bytes)
+                    .expect("stand-in write must not fail");
             }
         })
     }
@@ -2610,7 +2780,10 @@ mod tests {
         wait_for_status(&state, "disconnected");
         {
             let s = state.read().expect("the poller must not poison the lock");
-            assert!(s.error.is_some(), "the failed baseline must record a structured error");
+            assert!(
+                s.error.is_some(),
+                "the failed baseline must record a structured error"
+            );
         }
         // No retry storm: several ticks pass with the gate off — the
         // failed baseline is never re-attempted on its own.
@@ -2770,7 +2943,10 @@ mod tests {
         let expected_grid = grid.clone();
         let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
             match read_one_message(&mut stream) {
-                Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
+                Some(Message::Request(Request::StartBurnIn {
+                    target,
+                    duration_minutes,
+                })) => {
                     assert_eq!(
                         target,
                         StreamTarget::Full,
@@ -2818,7 +2994,9 @@ mod tests {
                 Response::BenchResult { run_id: 9, grid },
             ] {
                 let bytes = encode_frame(&Message::Response(response)).expect("must encode");
-                stream.write_all(&bytes).expect("stand-in write must not fail");
+                stream
+                    .write_all(&bytes)
+                    .expect("stand-in write must not fail");
             }
         });
 
@@ -2841,32 +3019,52 @@ mod tests {
         run_burn_in(sock.path(), cmd, &state, &cancel).expect("run_burn_in must not error");
 
         let state = state.read().expect("the poller must not poison the lock");
-        assert!(!state.bench.burn_in.running, "the terminal must clear burn_in.running");
+        assert!(
+            !state.bench.burn_in.running,
+            "the terminal must clear burn_in.running"
+        );
         assert!(
             !state.bench.running,
             "a burn-in run must not touch the normal-bench running flag"
         );
-        assert_eq!(state.bench.run_id, Some(9), "the ack's run_id must be recorded");
-        assert_eq!(state.bench.burn_in.iteration, 2, "the newest tick's iteration");
-        assert_eq!(state.bench.burn_in.elapsed_secs, 3.5, "the newest tick's elapsed");
         assert_eq!(
-            state.bench.burn_in.latest.read_gbps[0],
-            52.5,
+            state.bench.run_id,
+            Some(9),
+            "the ack's run_id must be recorded"
+        );
+        assert_eq!(
+            state.bench.burn_in.iteration, 2,
+            "the newest tick's iteration"
+        );
+        assert_eq!(
+            state.bench.burn_in.elapsed_secs, 3.5,
+            "the newest tick's elapsed"
+        );
+        assert_eq!(
+            state.bench.burn_in.latest.read_gbps[0], 52.5,
             "the newest value per cell wins (the stale 7.0 is reset)"
         );
         assert_eq!(
-            state.bench.burn_in.latest.latency_ns[1],
-            1.2,
+            state.bench.burn_in.latest.latency_ns[1], 1.2,
             "the latency tick lands in the tier's latency cell (L1 = slot 1)"
         );
-        assert_eq!(state.bench.burn_in.latest.write_gbps, [0.0; 4], "an unticked column stays zero");
-        assert_eq!(state.bench.burn_in.latest.copy_gbps, [0.0; 4], "an unticked column stays zero");
+        assert_eq!(
+            state.bench.burn_in.latest.write_gbps, [0.0; 4],
+            "an unticked column stays zero"
+        );
+        assert_eq!(
+            state.bench.burn_in.latest.copy_gbps, [0.0; 4],
+            "an unticked column stays zero"
+        );
         assert_eq!(
             state.bench.grid,
             Some(expected_grid),
             "the terminal grid must land in the state"
         );
-        assert!(state.error.is_none(), "a clean run must not record an error");
+        assert!(
+            state.error.is_none(),
+            "a clean run must not record an error"
+        );
         stand_in.join();
     }
 
@@ -2882,20 +3080,27 @@ mod tests {
         let sock = TempSocket::new("burnin-cancel");
         let stand_in = DaemonStandIn::spawn(&sock, move |mut stream| {
             match read_one_message(&mut stream) {
-                Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
-                    assert_eq!(target, StreamTarget::Full, "the cmd's target must ride the wire");
+                Some(Message::Request(Request::StartBurnIn {
+                    target,
+                    duration_minutes,
+                })) => {
                     assert_eq!(
-                        duration_minutes,
-                        0,
+                        target,
+                        StreamTarget::Full,
+                        "the cmd's target must ride the wire"
+                    );
+                    assert_eq!(
+                        duration_minutes, 0,
                         "the infinite (0) duration must ride the wire"
                     );
                 }
                 other => panic!("stand-in expected StartBurnIn, got {other:?}"),
             }
-            let started =
-                encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
-                    .expect("must encode");
-            stream.write_all(&started).expect("stand-in write must not fail");
+            let started = encode_frame(&Message::Response(Response::BenchStarted { run_id: 42 }))
+                .expect("must encode");
+            stream
+                .write_all(&started)
+                .expect("stand-in write must not fail");
             // Mimic the daemon: end the run after a beat — the worker
             // either sees the cancel flag before the terminal frame
             // (sends a `CancelBenchmark` and breaks) or receives the
@@ -2922,8 +3127,7 @@ mod tests {
                 };
                 // The function locks the shared state only per
                 // mutation — never across the stream drain (C14-03).
-                run_burn_in(&socket, cmd, &state, &cancel)
-                    .expect("run_burn_in must not error");
+                run_burn_in(&socket, cmd, &state, &cancel).expect("run_burn_in must not error");
             })
         };
 
@@ -2931,7 +3135,13 @@ mod tests {
         // state), then set the shared cancel flag.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if state.read().expect("the poller must not poison the lock").bench.run_id.is_some() {
+            if state
+                .read()
+                .expect("the poller must not poison the lock")
+                .bench
+                .run_id
+                .is_some()
+            {
                 break;
             }
             assert!(
@@ -2941,12 +3151,24 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         cancel.store(true, Ordering::Relaxed);
-        worker.join().expect("run_burn_in must return on cancel (no hang)");
+        worker
+            .join()
+            .expect("run_burn_in must return on cancel (no hang)");
 
         let state = state.read().expect("the poller must not poison the lock");
-        assert!(!state.bench.burn_in.running, "the cancel must clear burn_in.running");
-        assert_eq!(state.bench.run_id, Some(42), "the run id must stay recorded");
-        assert!(state.error.is_none(), "a clean cancel must not record an error");
+        assert!(
+            !state.bench.burn_in.running,
+            "the cancel must clear burn_in.running"
+        );
+        assert_eq!(
+            state.bench.run_id,
+            Some(42),
+            "the run id must stay recorded"
+        );
+        assert!(
+            state.error.is_none(),
+            "a clean cancel must not record an error"
+        );
         stand_in.join();
     }
 
@@ -2964,10 +3186,11 @@ mod tests {
                 Some(Message::Request(Request::StartBurnIn { .. })) => {}
                 other => panic!("stand-in expected StartBurnIn, got {other:?}"),
             }
-            let started =
-                encode_frame(&Message::Response(Response::BenchStarted { run_id: 3 }))
-                    .expect("must encode");
-            stream.write_all(&started).expect("stand-in write must not fail");
+            let started = encode_frame(&Message::Response(Response::BenchStarted { run_id: 3 }))
+                .expect("must encode");
+            stream
+                .write_all(&started)
+                .expect("stand-in write must not fail");
             let progress = encode_frame(&Message::Response(Response::BenchProgress(
                 StreamProgress {
                     cell_index: 0,
@@ -2979,7 +3202,9 @@ mod tests {
                 },
             )))
             .expect("must encode");
-            stream.write_all(&progress).expect("stand-in write must not fail");
+            stream
+                .write_all(&progress)
+                .expect("stand-in write must not fail");
         });
 
         let cmd = BenchCmd {
@@ -2992,8 +3217,14 @@ mod tests {
         run_burn_in(sock.path(), cmd, &state, &cancel).expect("run_burn_in must not error");
 
         let state = state.read().expect("the poller must not poison the lock");
-        assert!(!state.bench.burn_in.running, "the violation must clear burn_in.running");
-        let error = state.error.as_ref().expect("the violation must record a structured error");
+        assert!(
+            !state.bench.burn_in.running,
+            "the violation must clear burn_in.running"
+        );
+        let error = state
+            .error
+            .as_ref()
+            .expect("the violation must record a structured error");
         assert!(
             error.contains("unexpected benchmark frame during burn-in"),
             "the error must name the violation, got: {error}"
@@ -3034,9 +3265,13 @@ mod tests {
                         Some(Message::Request(Request::StartBenchmark { .. })) => {
                             seen.fetch_or(1, Ordering::Relaxed);
                             let started =
-                                encode_frame(&Message::Response(Response::BenchStarted { run_id: 1 }))
-                                    .expect("must encode");
-                            stream.write_all(&started).expect("stand-in write must not fail");
+                                encode_frame(&Message::Response(Response::BenchStarted {
+                                    run_id: 1,
+                                }))
+                                .expect("must encode");
+                            stream
+                                .write_all(&started)
+                                .expect("stand-in write must not fail");
                             let result = encode_frame(&Message::Response(Response::BenchResult {
                                 run_id: 1,
                                 grid: BenchmarkGrid {
@@ -3047,35 +3282,49 @@ mod tests {
                                 },
                             }))
                             .expect("must encode");
-                            stream.write_all(&result).expect("stand-in write must not fail");
+                            stream
+                                .write_all(&result)
+                                .expect("stand-in write must not fail");
                         }
-                        Some(Message::Request(Request::StartBurnIn { target, duration_minutes })) => {
+                        Some(Message::Request(Request::StartBurnIn {
+                            target,
+                            duration_minutes,
+                        })) => {
                             assert_eq!(
                                 target,
                                 StreamTarget::Full,
                                 "the burn-in cmd's target must ride the wire"
                             );
                             assert_eq!(
-                                duration_minutes,
-                                7,
+                                duration_minutes, 7,
                                 "the burn-in cmd's duration must ride the wire"
                             );
                             seen.fetch_or(2, Ordering::Relaxed);
                             let started =
-                                encode_frame(&Message::Response(Response::BenchStarted { run_id: 2 }))
-                                    .expect("must encode");
-                            stream.write_all(&started).expect("stand-in write must not fail");
+                                encode_frame(&Message::Response(Response::BenchStarted {
+                                    run_id: 2,
+                                }))
+                                .expect("must encode");
+                            stream
+                                .write_all(&started)
+                                .expect("stand-in write must not fail");
                             let cancelled =
-                                encode_frame(&Message::Response(Response::BenchCancelled { run_id: 2 }))
-                                    .expect("must encode");
-                            stream.write_all(&cancelled).expect("stand-in write must not fail");
+                                encode_frame(&Message::Response(Response::BenchCancelled {
+                                    run_id: 2,
+                                }))
+                                .expect("must encode");
+                            stream
+                                .write_all(&cancelled)
+                                .expect("stand-in write must not fail");
                         }
                         Some(Message::Request(Request::GetTelemetry)) => {
                             let bytes = encode_frame(&Message::Response(Response::Telemetry(
                                 mock_snapshot(),
                             )))
                             .expect("must encode");
-                            stream.write_all(&bytes).expect("stand-in write must not fail");
+                            stream
+                                .write_all(&bytes)
+                                .expect("stand-in write must not fail");
                         }
                         Some(other) => {
                             panic!("stand-in saw an unexpected frame: {other:?}")
@@ -3137,7 +3386,11 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(seen.load(Ordering::Relaxed), 3, "exactly one StartBenchmark + one StartBurnIn");
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            3,
+            "exactly one StartBenchmark + one StartBurnIn"
+        );
 
         // Stop: drop the bench sender (the poller's channel
         // disconnects), set the shared flag, and wake the stand-in's
@@ -3152,8 +3405,14 @@ mod tests {
         // Both runs ended cleanly: nothing left in flight (either
         // class), no error recorded.
         let state = state.read().expect("the poller must not poison the lock");
-        assert!(!state.bench.running, "the normal run must end at its terminal");
-        assert!(!state.bench.burn_in.running, "the burn-in must end at its terminal");
+        assert!(
+            !state.bench.running,
+            "the normal run must end at its terminal"
+        );
+        assert!(
+            !state.bench.burn_in.running,
+            "the burn-in must end at its terminal"
+        );
         assert!(state.error.is_none(), "clean runs must not record an error");
     }
 
@@ -3195,22 +3454,23 @@ mod tests {
                 Some(Message::Request(Request::StartBurnIn { .. })) => {}
                 other => panic!("stand-in expected StartBurnIn, got {other:?}"),
             }
-            let started =
-                encode_frame(&Message::Response(Response::BenchStarted { run_id: 7 }))
-                    .expect("must encode");
-            stream.write_all(&started).expect("stand-in write must not fail");
-            for iteration in 1u32..=15 {
-                let tick = encode_frame(&Message::Response(Response::BurnInProgress(
-                    BurnInTick {
-                        iteration,
-                        elapsed_secs: f64::from(iteration) * 0.1,
-                        tier: Tier::Memory,
-                        bandwidth: Some((BenchOp::Read, f64::from(iteration))),
-                        latency_ns: None,
-                    },
-                )))
+            let started = encode_frame(&Message::Response(Response::BenchStarted { run_id: 7 }))
                 .expect("must encode");
-                stream.write_all(&tick).expect("stand-in write must not fail");
+            stream
+                .write_all(&started)
+                .expect("stand-in write must not fail");
+            for iteration in 1u32..=15 {
+                let tick = encode_frame(&Message::Response(Response::BurnInProgress(BurnInTick {
+                    iteration,
+                    elapsed_secs: f64::from(iteration) * 0.1,
+                    tier: Tier::Memory,
+                    bandwidth: Some((BenchOp::Read, f64::from(iteration))),
+                    latency_ns: None,
+                })))
+                .expect("must encode");
+                stream
+                    .write_all(&tick)
+                    .expect("stand-in write must not fail");
                 thread::sleep(Duration::from_millis(100));
             }
             let result = encode_frame(&Message::Response(Response::BenchResult {
@@ -3218,7 +3478,9 @@ mod tests {
                 grid,
             }))
             .expect("must encode");
-            stream.write_all(&result).expect("stand-in write must not fail");
+            stream
+                .write_all(&result)
+                .expect("stand-in write must not fail");
         });
 
         let state = Arc::new(RwLock::new(TelemetryData::default()));
@@ -3233,8 +3495,7 @@ mod tests {
                     mode: BenchMode::Full,
                     duration_minutes: Some(0),
                 };
-                run_burn_in(&socket, cmd, &state, &cancel)
-                    .expect("run_burn_in must not error");
+                run_burn_in(&socket, cmd, &state, &cancel).expect("run_burn_in must not error");
             })
         };
 
@@ -3280,7 +3541,9 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        worker.join().expect("run_burn_in must return at its terminal (no hang)");
+        worker
+            .join()
+            .expect("run_burn_in must return at its terminal (no hang)");
         stand_in.join();
 
         // The phase-1 assertions take one brief, fully-scoped read
@@ -3292,7 +3555,10 @@ mod tests {
         );
         {
             let s = state.read().expect("the poller must not poison the lock");
-            assert!(!s.bench.burn_in.running, "the terminal must clear burn_in.running");
+            assert!(
+                !s.bench.burn_in.running,
+                "the terminal must clear burn_in.running"
+            );
             assert_eq!(
                 s.bench.grid,
                 Some(expected_grid),
@@ -3310,20 +3576,19 @@ mod tests {
                 Some(Message::Request(Request::StartBurnIn { .. })) => {}
                 other => panic!("stand-in expected StartBurnIn, got {other:?}"),
             }
-            let started =
-                encode_frame(&Message::Response(Response::BenchStarted { run_id: 11 }))
-                    .expect("must encode");
-            stream.write_all(&started).expect("stand-in write must not fail");
+            let started = encode_frame(&Message::Response(Response::BenchStarted { run_id: 11 }))
+                .expect("must encode");
+            stream
+                .write_all(&started)
+                .expect("stand-in write must not fail");
             for iteration in 1u32..=60 {
-                let tick = encode_frame(&Message::Response(Response::BurnInProgress(
-                    BurnInTick {
-                        iteration,
-                        elapsed_secs: f64::from(iteration) * 0.1,
-                        tier: Tier::Memory,
-                        bandwidth: Some((BenchOp::Read, f64::from(iteration))),
-                        latency_ns: None,
-                    },
-                )))
+                let tick = encode_frame(&Message::Response(Response::BurnInProgress(BurnInTick {
+                    iteration,
+                    elapsed_secs: f64::from(iteration) * 0.1,
+                    tier: Tier::Memory,
+                    bandwidth: Some((BenchOp::Read, f64::from(iteration))),
+                    latency_ns: None,
+                })))
                 .expect("must encode");
                 if stream.write_all(&tick).is_err() {
                     break; // the client dropped (the run ended)
@@ -3342,8 +3607,7 @@ mod tests {
                     mode: BenchMode::Full,
                     duration_minutes: Some(0),
                 };
-                run_burn_in(&socket2, cmd, &state, &cancel)
-                    .expect("run_burn_in must not error");
+                run_burn_in(&socket2, cmd, &state, &cancel).expect("run_burn_in must not error");
             })
         };
 
@@ -3368,11 +3632,16 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         cancel.store(true, Ordering::Relaxed);
-        worker.join().expect("run_burn_in must return on cancel (no hang)");
+        worker
+            .join()
+            .expect("run_burn_in must return on cancel (no hang)");
         stand_in2.join();
 
         let s = state.read().expect("the poller must not poison the lock");
-        assert!(!s.bench.burn_in.running, "the cancel must clear burn_in.running");
+        assert!(
+            !s.bench.burn_in.running,
+            "the cancel must clear burn_in.running"
+        );
         assert!(s.error.is_none(), "a clean cancel must not record an error");
     }
 

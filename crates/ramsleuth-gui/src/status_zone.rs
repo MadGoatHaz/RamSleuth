@@ -2,7 +2,7 @@
 //! line + the F2 / F3 / Q actions row (P3-29).
 //!
 //! Grand Design §3.1 bottom-right panel: one small framed "card" per
-//! bound SPD slot (a `slot 0xNN (DDR4|DDR5)` header over the
+//! bound SPD slot (a `DIMM N (DDR4|DDR5)` header over the
 //! [`spd_cards`] rows — a product line, a DRAM-die line, a human rank
 //! label, the raw maker / part / rank / density / speed cells, each
 //! its [`Section`] value in CYAN or a bare `N/A` in muted `NA_GRAY`, plus
@@ -87,12 +87,24 @@ pub fn spd_cards(telemetry: &SystemMemoryTelemetry) -> Vec<Vec<(String, String)>
 /// rows.
 fn card_rows(module: &SpdModule) -> Vec<(String, String)> {
     let mut rows = vec![
-        ("product".to_owned(), product_line(&module.maker, &module.part)),
+        (
+            "product".to_owned(),
+            product_line(&module.maker, &module.part),
+        ),
         ("dram die".to_owned(), dram_die_line(module)),
         ("rank label".to_owned(), rank_label(&module.rank)),
-        ("maker".to_owned(), display(&module.maker, |value: &String| value.clone())),
-        ("part".to_owned(), display(&module.part, |value: &String| value.clone())),
-        ("rank".to_owned(), display(&module.rank, |value: &u8| value.to_string())),
+        (
+            "maker".to_owned(),
+            display(&module.maker, |value: &String| value.clone()),
+        ),
+        (
+            "part".to_owned(),
+            display(&module.part, |value: &String| value.clone()),
+        ),
+        (
+            "rank".to_owned(),
+            display(&module.rank, |value: &u8| value.to_string()),
+        ),
         (
             "density".to_owned(),
             display(&module.density_mbit, |value: &u16| format!("{value} Mbit")),
@@ -187,8 +199,9 @@ fn profile_row(is_ddr5: bool, profile: &SpdProfile) -> (String, String) {
     let scheme = if is_ddr5 { "EXPO" } else { "XMP" };
     let speed = display(&profile.speed_mts, |value: &u16| format!("{value} MT/s"));
     let tick = |section: &Section<u8>| display(section, |value: &u8| value.to_string());
-    let voltage =
-        display(&profile.voltage, |value: &u16| format!("{:.3} V", f64::from(*value) / 1000.0));
+    let voltage = display(&profile.voltage, |value: &u16| {
+        format!("{:.3} V", f64::from(*value) / 1000.0)
+    });
     (
         format!("{scheme} {}", profile.index),
         format!(
@@ -255,8 +268,7 @@ fn daemon_status_color(data: &TelemetryData) -> egui::Color32 {
 /// the daemon serves no `ee1004` device): the self-explanatory form
 /// — the `ee1004` driver is unavailable on this system, the daemon
 /// is up (muted `NA_GRAY`, never an error color).
-pub const NO_SPD_TEXT: &str =
-    "No SPD — the SPD EEPROM driver isn't available on this system.";
+pub const NO_SPD_TEXT: &str = "No SPD — the SPD EEPROM driver isn't available on this system.";
 
 /// The semantic color of one card row's display: CYAN for a decoded
 /// value, muted `NA_GRAY` for an absent one (the bare / terse-tag
@@ -310,7 +322,7 @@ pub fn render_status_zone(ui: &mut egui::Ui, data: &TelemetryData) -> GuiAction 
 }
 
 /// The per-slot SPD module cards as a 2-column flow grid (R1):
-/// one framed card per bound module (the `slot 0xNN (DDR4|DDR5)`
+/// one framed card per bound module (the `DIMM N (DDR4|DDR5)`
 /// header + the [`spd_cards`] rows), the DIMM cards side-by-side in
 /// row pairs — 1 DIMM → `1×1` (left cell), 2 → `1×2`,
 /// 3 → `2+1`, 4 → `2×2` balanced — each card allocated
@@ -374,7 +386,9 @@ fn render_spd_cards(ui: &mut egui::Ui, data: &TelemetryData) {
 /// default text, the display in its semantic color).
 fn render_spd_card(ui: &mut egui::Ui, module: &SpdModule, card: &[(String, String)]) {
     let generation = if module.is_ddr5 { "DDR5" } else { "DDR4" };
-    let header = format!("slot 0x{:02X} ({generation})", module.index);
+    // Decimal index (not hex) so SMBIOS fallback ordinals are not
+    // mistaken for I2C addresses.
+    let header = format!("DIMM {} ({generation})", module.index);
     let frame = egui::Frame::default()
         .fill(SLATE)
         .stroke(egui::Stroke::new(1.0_f32, CYAN))
@@ -522,7 +536,10 @@ mod tests {
             // Parallel to spd (C6-06): module 0 is 16384 Mbit x 8 devices = 16 GiB;
             // module 1 density is Na, so its entry carries the offending source reason.
             total_capacity: Section::Value(16.0),
-            dimm_sizes: vec![Section::Value(16.0), Section::na(NaReason::UnknownPmTableVersion)],
+            dimm_sizes: vec![
+                Section::Value(16.0),
+                Section::na(NaReason::UnknownPmTableVersion),
+            ],
             vcore: Section::na(NaReason::NotApplicable),
         }
     }
@@ -591,7 +608,10 @@ mod tests {
             card[0],
             ("product".to_owned(), "Samsung (M391A2K40DB)".to_owned())
         );
-        assert_eq!(card[1], ("dram die".to_owned(), "SK hynix (16Gb)".to_owned()));
+        assert_eq!(
+            card[1],
+            ("dram die".to_owned(), "SK hynix (16Gb)".to_owned())
+        );
         assert_eq!(card[2], ("rank label".to_owned(), "Dual-Rank".to_owned()));
         assert_eq!(card[3], ("maker".to_owned(), "Samsung".to_owned()));
         assert_eq!(card[4], ("part".to_owned(), "M391A2K40DB".to_owned()));
@@ -618,14 +638,15 @@ mod tests {
     /// gray, no panic.
     #[test]
     fn spd_cards_handles_no_spd_and_all_na_without_panic() {
-        assert!(spd_cards(&no_spd()).is_empty(), "no SPD modules -> no cards");
+        assert!(
+            spd_cards(&no_spd()).is_empty(),
+            "no SPD modules -> no cards"
+        );
 
         let cards = spd_cards(&all_na_snapshot());
         assert_eq!(cards.len(), 1, "one card per module");
         assert!(
-            cards[0]
-                .iter()
-                .all(|(_, display)| display.contains("N/A")),
+            cards[0].iter().all(|(_, display)| display.contains("N/A")),
             "every all-Na row must carry an N/A display: {cards:?}"
         );
         // The both-Na product line degrades to the maker's terse tag.
@@ -634,13 +655,13 @@ mod tests {
             ("product".to_owned(), "N/A (driver missing)".to_owned())
         );
         // The structurally not-applicable die maker keeps the bare N/A.
-        assert_eq!(
-            cards[0][1],
-            ("dram die".to_owned(), "N/A".to_owned())
-        );
+        assert_eq!(cards[0][1], ("dram die".to_owned(), "N/A".to_owned()));
         assert_eq!(
             cards[0][2],
-            ("rank label".to_owned(), "N/A (insufficient privilege)".to_owned())
+            (
+                "rank label".to_owned(),
+                "N/A (insufficient privilege)".to_owned()
+            )
         );
         assert_eq!(
             cards[0][3],
@@ -648,7 +669,10 @@ mod tests {
         );
         assert_eq!(
             cards[0][4],
-            ("part".to_owned(), "N/A (part number: byte 0x149 outside image bounds)".to_owned())
+            (
+                "part".to_owned(),
+                "N/A (part number: byte 0x149 outside image bounds)".to_owned()
+            )
         );
         assert_eq!(
             cards[0][5],
@@ -660,15 +684,15 @@ mod tests {
         );
         assert_eq!(
             cards[0][7],
-            ("speed".to_owned(), "N/A (base speed byte 0x20 is 0 (no minimum data rate recorded))".to_owned())
+            (
+                "speed".to_owned(),
+                "N/A (base speed byte 0x20 is 0 (no minimum data rate recorded))".to_owned()
+            )
         );
         // The all-Na EXPO profile line: every field degrades to bare N/A
         // (the structurally not-applicable form).
         assert_eq!(cards[0][8].0, "EXPO 0");
-        assert_eq!(
-            cards[0][8].1,
-            "N/A N/A-N/A-N/A-N/A @ N/A"
-        );
+        assert_eq!(cards[0][8].1, "N/A N/A-N/A-N/A-N/A @ N/A");
     }
 
     /// (b′) The new card rows in isolation: the rank label maps
@@ -789,7 +813,10 @@ mod tests {
             line.starts_with("daemon: connected: /tmp/ramsleuth.sock · "),
             "the status must be printed verbatim: {line}"
         );
-        assert!(line.ends_with("s ago"), "a landed stamp must end in 's ago': {line}");
+        assert!(
+            line.ends_with("s ago"),
+            "a landed stamp must end in 's ago': {line}"
+        );
 
         // A transport failure: the status is kept, the stamp never.
         let down = TelemetryData {
@@ -867,7 +894,10 @@ mod tests {
         const W: f32 = 420.0;
         const H: f32 = 640.0;
         for telemetry in [Some(representative()), Some(no_spd()), None] {
-            let data = TelemetryData { telemetry, ..Default::default() };
+            let data = TelemetryData {
+                telemetry,
+                ..Default::default()
+            };
             let ctx = egui::Context::default();
             ctx.begin_frame(egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_max(

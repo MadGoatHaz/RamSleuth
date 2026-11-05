@@ -343,9 +343,9 @@ pub fn read_pm_key_values(pm_blob: &[u8]) -> [Option<u32>; 5] {
 pub fn classify_io_error(e: &std::io::Error) -> TelemetryError {
     match e.kind() {
         std::io::ErrorKind::NotFound => TelemetryError::DriverMissing { driver: DRIVER },
-        std::io::ErrorKind::PermissionDenied => TelemetryError::InsufficientPrivilege {
-            hint: PRIV_HINT,
-        },
+        std::io::ErrorKind::PermissionDenied => {
+            TelemetryError::InsufficientPrivilege { hint: PRIV_HINT }
+        }
         _ => TelemetryError::Io(match e.raw_os_error() {
             Some(code) => std::io::Error::from_raw_os_error(code),
             None => std::io::Error::new(e.kind(), e.to_string()),
@@ -531,7 +531,10 @@ fn context_from_blob(blob: Vec<u8>) -> TelemetryResult<SmuContext> {
         let expected = parse_table_size(&size_attr)?;
         check_size_matches(expected, blob.len())?;
     }
-    Ok(SmuContext { version, pm: Some(blob) })
+    Ok(SmuContext {
+        version,
+        pm: Some(blob),
+    })
 }
 
 /// Read the first existing sibling sysfs attribute in `candidates`.
@@ -607,7 +610,10 @@ mod tests {
     /// bytes (e.g. a newline) are ignored.
     #[test]
     fn parse_version_word_le() {
-        assert_eq!(parse_version_word(&[0x05, 0x08, 0x38, 0x00]), Ok(0x0038_0805));
+        assert_eq!(
+            parse_version_word(&[0x05, 0x08, 0x38, 0x00]),
+            Ok(0x0038_0805)
+        );
         assert_eq!(
             parse_version_word(&[0x03, 0x08, 0x2D, 0x00, 0x0A]),
             Ok(0x002D_0803)
@@ -693,7 +699,9 @@ mod tests {
         let e = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file or directory");
         assert_eq!(
             classify_io_error(&e),
-            TelemetryError::DriverMissing { driver: "ryzen_smu" }
+            TelemetryError::DriverMissing {
+                driver: "ryzen_smu"
+            }
         );
 
         let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
@@ -712,7 +720,9 @@ mod tests {
     fn classify_io_error_raw_os_codes() {
         assert_eq!(
             classify_io_error(&std::io::Error::from_raw_os_error(2)),
-            TelemetryError::DriverMissing { driver: "ryzen_smu" }
+            TelemetryError::DriverMissing {
+                driver: "ryzen_smu"
+            }
         );
         assert_eq!(
             classify_io_error(&std::io::Error::from_raw_os_error(13)),
@@ -859,8 +869,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn read_pm_version_attr_parses_sibling_or_zero_sentinel() {
-        let dir = std::env::temp_dir()
-            .join(format!("ramsleuth_amd_smu_test_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ramsleuth_amd_smu_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("test: create temp dir");
         // Absent attribute -> the `0` sentinel.
@@ -881,7 +891,10 @@ mod tests {
     #[test]
     fn pm_state_dir_exists_no_pm() {
         assert!(matches!(
-            classify_pm_state(true, Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            classify_pm_state(
+                true,
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            ),
             PmAcquireState::DriverPresentNoPm
         ));
     }
@@ -890,7 +903,10 @@ mod tests {
     #[test]
     fn pm_state_dir_absent_no_pm() {
         assert!(matches!(
-            classify_pm_state(false, Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            classify_pm_state(
+                false,
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            ),
             PmAcquireState::DriverMissing
         ));
     }

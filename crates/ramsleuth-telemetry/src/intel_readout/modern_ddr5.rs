@@ -144,9 +144,7 @@ pub fn mirror_or_mcl(mirror: Option<u32>, mcl: Option<u32>) -> Option<u32> {
         // H-3: A degenerate mirror word (0x0 / 0xFFFF_FFFF) falls back
         // to the MCL register, which is *also* screened for degenerates
         // (a bus-faulted MCL word is not a valid fallback source).
-        Some(w) if is_degenerate_word(w) => {
-            mcl.filter(|&w| !is_degenerate_word(w))
-        }
+        Some(w) if is_degenerate_word(w) => mcl.filter(|&w| !is_degenerate_word(w)),
         // A populated, non-degenerate mirror wins.
         Some(v) => Some(v),
     }
@@ -377,33 +375,27 @@ impl IntelImcRegs {
         // [`is_present_word`].
         let degenerate = |v: &Option<u32>| !is_present_word(*v);
         let channel_all = |c: &ChannelRegs| {
-            [&c.tc_dbp,
-                &c.tc_rap,
-                &c.tc_rfp,
-                &c.tc_rap2,
-                &c.tc_rdrd,
-                &c.tc_rdwr,
-                &c.tc_wrrd,
-                &c.tc_wrwr]
-                .iter()
-                .all(|v| degenerate(v))
+            [
+                &c.tc_dbp, &c.tc_rap, &c.tc_rfp, &c.tc_rap2, &c.tc_rdrd, &c.tc_rdwr, &c.tc_wrrd,
+                &c.tc_wrwr,
+            ]
+            .iter()
+            .all(|v| degenerate(v))
         };
         let mcl_all = |m: &MclRegs| {
-            [&m.tc_pre,
-                &m.tc_act,
-                &m.tc_act2,
-                &m.tc_wtr,
-                &m.tc_rfp,
-                &m.tc_rfp2,
-                &m.tc_rdrd,
-                &m.tc_wrwr]
-                .iter()
-                .all(|v| degenerate(v))
+            [
+                &m.tc_pre, &m.tc_act, &m.tc_act2, &m.tc_wtr, &m.tc_rfp, &m.tc_rfp2, &m.tc_rdrd,
+                &m.tc_wrwr,
+            ]
+            .iter()
+            .all(|v| degenerate(v))
         };
         [&self.mcbios_req, &self.mad_dimm_ch2, &self.mad_dimm_ch3]
             .iter()
             .all(|v| degenerate(v))
-            && [&self.ch0, &self.ch1, &self.ch2, &self.ch3].iter().all(|c| channel_all(c))
+            && [&self.ch0, &self.ch1, &self.ch2, &self.ch3]
+                .iter()
+                .all(|c| channel_all(c))
             && [&self.mcl0, &self.mcl1].iter().all(|m| mcl_all(m))
     }
 }
@@ -538,7 +530,11 @@ mod tests {
         ] {
             assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
         }
-        for s in [&ch.cad_bus.rtt_nom, &ch.cad_bus.rtt_wr, &ch.cad_bus.rtt_park] {
+        for s in [
+            &ch.cad_bus.rtt_nom,
+            &ch.cad_bus.rtt_wr,
+            &ch.cad_bus.rtt_park,
+        ] {
             assert!(matches!(s, Section::Na(NaReason::NotApplicable)), "{s:?}");
         }
         for s in [
@@ -806,7 +802,11 @@ mod tests {
             ..IntelImcRegs::default()
         };
         let mcl2 = tier3_mcl_for(2, &ALDER_CHANNELS[2], &regs);
-        assert_eq!(mcl2.tc_act, Some(0x0018_0410), "0x4804 valid -> mirror wins");
+        assert_eq!(
+            mcl2.tc_act,
+            Some(0x0018_0410),
+            "0x4804 valid -> mirror wins"
+        );
         let ch = decode_tier3_channel(
             2,
             super::super::decode_mclk(Some(0x0000_0024), IntelGen::AlderLake),
@@ -860,11 +860,11 @@ mod tests {
     fn mirror_only_subchannels_take_the_mirror_as_is() {
         let regs = IntelImcRegs {
             ch1: ChannelRegs {
-                tc_dbp: Some(0x284D_2828), // +0x00
-                tc_rap: Some(0x0028_8410), // +0x04
-                tc_rfp: Some(0x4),         // +0x08
+                tc_dbp: Some(0x284D_2828),  // +0x00
+                tc_rap: Some(0x0028_8410),  // +0x04
+                tc_rfp: Some(0x4),          // +0x08
                 tc_rdrd: Some(0x0048_C286), // +0x20
-                tc_wrrd: Some(0x286),      // +0x28
+                tc_wrrd: Some(0x286),       // +0x28
                 ..ChannelRegs::default()
             },
             ..IntelImcRegs::default()
@@ -917,12 +917,7 @@ mod tests {
             tc_rfp: Some(0x0000_0BB8), // tRFC1 [11:0] = 3000
             ..MclRegs::default()
         };
-        let ch = decode_tier3_channel(
-            0,
-            Section::Value(2400.0),
-            &mcl,
-            &ALDER_CHANNELS[0],
-        );
+        let ch = decode_tier3_channel(0, Section::Value(2400.0), &mcl, &ALDER_CHANNELS[0]);
         assert_eq!(
             ch.timings.rfc1,
             Section::Value(3000),
@@ -934,12 +929,7 @@ mod tests {
             tc_rfp: Some(0x0000_0FFF), // tRFC1 [11:0] = 4095
             ..MclRegs::default()
         };
-        let ch = decode_tier3_channel(
-            0,
-            Section::Value(2400.0),
-            &mcl,
-            &ALDER_CHANNELS[0],
-        );
+        let ch = decode_tier3_channel(0, Section::Value(2400.0), &mcl, &ALDER_CHANNELS[0]);
         assert_eq!(
             ch.timings.rfc1,
             Section::Value(4095),
@@ -957,10 +947,14 @@ mod tests {
         // offset the same), so any gen keys the reader; use Alder Lake.
         let gen = IntelGen::AlderLake;
         let imc_base = super::super::imc_base_for(gen);
-        assert!(IntelImcRegs::default().primary_window_degenerate(), "all-None");
+        assert!(
+            IntelImcRegs::default().primary_window_degenerate(),
+            "all-None"
+        );
         let all_zero = IntelImcRegs::from_wide_reader(imc_base, |_off: usize| Some(0u32));
         assert!(all_zero.primary_window_degenerate(), "all-zero");
-        let all_fault = IntelImcRegs::from_wide_reader(imc_base, |_off: usize| Some(0xFFFF_FFFFu32));
+        let all_fault =
+            IntelImcRegs::from_wide_reader(imc_base, |_off: usize| Some(0xFFFF_FFFFu32));
         assert!(all_fault.primary_window_degenerate(), "all-bus-fault");
         let mixed = IntelImcRegs::from_wide_reader(imc_base, |off: usize| {
             if off & 1 == 0 {

@@ -324,10 +324,7 @@ fn detect_x86() -> CpuInfo {
         VendorKind::Unknown => CpuVendor::Unknown,
     };
 
-    CpuInfo {
-        vendor,
-        brand,
-    }
+    CpuInfo { vendor, brand }
 }
 
 /// Read the 48-byte CPUID brand string (leaves `0x80000002`–`0x80000004`).
@@ -397,9 +394,12 @@ fn vendor_kind_from_words(bx: u32, cx: u32, dx: u32) -> VendorKind {
 /// telemetry limitations (PM-table absence, `0x50200` layout divergence)
 /// are keyed on this helper.
 ///
-/// Pure, never panics.
+/// Pure, never panics. The `starts_with("AMD")` guard excludes any
+/// hypothetical non-AMD product whose brand string contains
+/// "Threadripper" (the string is AMD-specific, but the guard is cheap
+/// and makes the intent explicit).
 pub fn is_threadripper(brand: &str) -> bool {
-    brand.contains("Threadripper")
+    brand.starts_with("AMD") && brand.contains("Threadripper")
 }
 
 /// Map an AMD CPUID family to an [`AmdZen`] generation.
@@ -411,7 +411,11 @@ pub fn is_threadripper(brand: &str) -> bool {
 /// Family map: `0x15`→Zen 1, `0x17`→Zen 2, `0x19`→Zen 3 (5950X),
 /// `0x1A`→Zen 4, `0x1C`→Zen 5; anything else is `None`.
 fn amd_zen_from_family(family: u32, ext_family: u32) -> Option<AmdZen> {
-    let full = if family < 0xF { family } else { family + (ext_family & 0xFF) };
+    let full = if family < 0xF {
+        family
+    } else {
+        family + (ext_family & 0xFF)
+    };
     match full {
         0x15 => Some(AmdZen::Zen1),
         0x17 => Some(AmdZen::Zen2),
@@ -571,7 +575,11 @@ fn parse_core_ultra(toks: &[&str]) -> Option<BrandToken> {
         .filter(|c| c.is_ascii_alphabetic())
         .map(|b| *b as char)
         .collect();
-    Some(BrandToken { gen, tier: BrandTier::CoreUltra, suffix })
+    Some(BrandToken {
+        gen,
+        tier: BrandTier::CoreUltra,
+        suffix,
+    })
 }
 
 /// 2. Non-Ultra Core Series 1 `N processor NNN[SFX]` — e.g.
@@ -598,7 +606,11 @@ fn parse_core_series1(toks: &[&str]) -> Option<BrandToken> {
         .filter(|c| c.is_ascii_alphabetic())
         .map(|b| *b as char)
         .collect();
-    Some(BrandToken { gen, tier: BrandTier::CoreSeries1, suffix })
+    Some(BrandToken {
+        gen,
+        tier: BrandTier::CoreSeries1,
+        suffix,
+    })
 }
 
 /// 3. Legacy Core `iN-NNxxx` — e.g. `i7-11700K`, `i7-8700`, `i7-1165G7`.
@@ -627,7 +639,11 @@ fn parse_legacy_core(toks: &[&str]) -> Option<BrandToken> {
             .filter(|c| c.is_ascii_alphabetic())
             .map(|b| *b as char)
             .collect();
-        return Some(BrandToken { gen, tier: BrandTier::LegacyCore, suffix });
+        return Some(BrandToken {
+            gen,
+            tier: BrandTier::LegacyCore,
+            suffix,
+        });
     }
     None
 }
@@ -653,7 +669,11 @@ fn parse_xeon_w(toks: &[&str]) -> Option<BrandToken> {
             .filter(|c| c.is_ascii_alphabetic())
             .map(|b| *b as char)
             .collect();
-        return Some(BrandToken { gen, tier: BrandTier::XeonW, suffix });
+        return Some(BrandToken {
+            gen,
+            tier: BrandTier::XeonW,
+            suffix,
+        });
     }
     None
 }
@@ -679,7 +699,11 @@ fn parse_xeon_scalable(toks: &[&str]) -> Option<BrandToken> {
         .filter(|c| c.is_ascii_alphabetic() || *c == b'+')
         .map(char::from)
         .collect();
-    Some(BrandToken { gen, tier: BrandTier::XeonScalable, suffix })
+    Some(BrandToken {
+        gen,
+        tier: BrandTier::XeonScalable,
+        suffix,
+    })
 }
 
 /// 6. Entry N-series `N100` / `N200` — no generation number.
@@ -857,7 +881,13 @@ pub fn intel_gen_from_brand(brand: &str, model: u32) -> Option<IntelGen> {
             _ => from_model, // 12th default: Alder Lake [THE i5-12600KF FIX]
         },
         0x9A => {
-            if matches!(tok, Some(BrandToken { tier: BrandTier::CoreSeries1, .. })) {
+            if matches!(
+                tok,
+                Some(BrandToken {
+                    tier: BrandTier::CoreSeries1,
+                    ..
+                })
+            ) {
                 Some(IntelGen::CoreSeries1Mobile)
             } else {
                 match tok.as_ref().map(|t| t.gen) {
@@ -867,7 +897,13 @@ pub fn intel_gen_from_brand(brand: &str, model: u32) -> Option<IntelGen> {
             }
         }
         0xBA => {
-            if matches!(tok, Some(BrandToken { tier: BrandTier::CoreSeries1, .. })) {
+            if matches!(
+                tok,
+                Some(BrandToken {
+                    tier: BrandTier::CoreSeries1,
+                    ..
+                })
+            ) {
                 Some(IntelGen::CoreSeries1Mobile)
             } else {
                 from_model // 13th default: Raptor Lake
@@ -919,7 +955,10 @@ mod tests {
         let info = CpuInfo::detect();
         match info.vendor {
             CpuVendor::Amd(_) | CpuVendor::Intel(_) => {
-                assert!(!info.brand.is_empty(), "brand should be populated: {info:?}");
+                assert!(
+                    !info.brand.is_empty(),
+                    "brand should be populated: {info:?}"
+                );
             }
             CpuVendor::Unknown => {
                 // An unrecognized vendor: no brand claim to verify.
@@ -988,10 +1027,8 @@ mod tests {
     #[test]
     fn cpu_info_bincode_round_trip() {
         let info = CpuInfo::detect();
-        let bytes = bincode::serialize(&info)
-            .expect("CpuInfo must serialize (no-panic contract)");
-        let back: CpuInfo =
-            bincode::deserialize(&bytes).expect("CpuInfo must deserialize");
+        let bytes = bincode::serialize(&info).expect("CpuInfo must serialize (no-panic contract)");
+        let back: CpuInfo = bincode::deserialize(&bytes).expect("CpuInfo must deserialize");
         assert_eq!(info, back);
     }
 
@@ -1021,8 +1058,7 @@ mod tests {
             (IntelGen::RocketLake, 11),
         ];
         for (gen, expected) in pre_existing {
-            let bytes =
-                bincode::serialize(&gen).expect("IntelGen must serialize (OQ-10 pin)");
+            let bytes = bincode::serialize(&gen).expect("IntelGen must serialize (OQ-10 pin)");
             assert_eq!(
                 bytes,
                 expected.to_le_bytes().to_vec(),
@@ -1038,8 +1074,7 @@ mod tests {
             (IntelGen::CoreSeries1Mobile, 15),
         ];
         for (gen, expected) in appended {
-            let bytes =
-                bincode::serialize(&gen).expect("IntelGen must serialize (OQ-10 pin)");
+            let bytes = bincode::serialize(&gen).expect("IntelGen must serialize (OQ-10 pin)");
             assert_eq!(
                 bytes,
                 expected.to_le_bytes().to_vec(),
@@ -1217,8 +1252,14 @@ mod tests {
             Some(IntelGen::TigerLake)
         );
         // 0xA5: 11th-gen → Rocket Lake; 10th-gen / absent → Comet Lake.
-        assert_eq!(intel_gen_from_brand("i7-11700K", 0xA5), Some(IntelGen::RocketLake));
-        assert_eq!(intel_gen_from_brand("i7-10700", 0xA5), Some(IntelGen::CometLake));
+        assert_eq!(
+            intel_gen_from_brand("i7-11700K", 0xA5),
+            Some(IntelGen::RocketLake)
+        );
+        assert_eq!(
+            intel_gen_from_brand("i7-10700", 0xA5),
+            Some(IntelGen::CometLake)
+        );
         assert_eq!(intel_gen_from_brand("", 0xA5), Some(IntelGen::CometLake));
         // 0xB7: 13th and 14th gen both → Raptor Lake (the coarse enum has
         // no distinct refresh variant).
@@ -1301,7 +1342,10 @@ mod tests {
             intel_gen_from_brand("i7-11700K", 0xBD),
             Some(IntelGen::LunarLake)
         );
-        assert_eq!(intel_gen_from_brand("i7-11700K", 0xBE), Some(IntelGen::AlderLake));
+        assert_eq!(
+            intel_gen_from_brand("i7-11700K", 0xBE),
+            Some(IntelGen::AlderLake)
+        );
         // ES / prototype → Unrecognized.
         assert_eq!(
             intel_gen_from_brand("Intel(R) Genuine Processor", 0x9B),
@@ -1329,28 +1373,52 @@ mod tests {
     fn brand_parse_five_alternatives() {
         // Core Ultra Series 1 (Meteor Lake): gen 1.
         let t = brand_parse("Intel(R) Core(TM) Ultra 7 155H").unwrap();
-        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::CoreUltra, 1, "H"));
+        assert_eq!(
+            (t.tier, t.gen, t.suffix.as_str()),
+            (BrandTier::CoreUltra, 1, "H")
+        );
         // Core Ultra Series 2 (Arrow Lake): gen 2, K suffix.
         let t = brand_parse("Intel(R) Core(TM) Ultra 9 285K").unwrap();
-        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::CoreUltra, 2, "K"));
+        assert_eq!(
+            (t.tier, t.gen, t.suffix.as_str()),
+            (BrandTier::CoreUltra, 2, "K")
+        );
         // Core Ultra Series 2 (Lunar Lake): gen 2, V suffix (MoP).
         let t = brand_parse("Intel(R) Core(TM) Ultra 7 258V").unwrap();
-        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::CoreUltra, 2, "V"));
+        assert_eq!(
+            (t.tier, t.gen, t.suffix.as_str()),
+            (BrandTier::CoreUltra, 2, "V")
+        );
         // Non-Ultra Core Series 1: gen 1.
         let t = brand_parse("Intel(R) Core(TM) 7 processor 150U").unwrap();
-        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::CoreSeries1, 1, "U"));
+        assert_eq!(
+            (t.tier, t.gen, t.suffix.as_str()),
+            (BrandTier::CoreSeries1, 1, "U")
+        );
         // Legacy Core iN-NNxxx: 5-digit → two-digit gen.
         let t = brand_parse("Intel(R) Core(TM) i7-11700K CPU @ 3.60GHz").unwrap();
-        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::LegacyCore, 11, "K"));
+        assert_eq!(
+            (t.tier, t.gen, t.suffix.as_str()),
+            (BrandTier::LegacyCore, 11, "K")
+        );
         // Legacy 4-digit desktop → single-digit gen.
         let t = brand_parse("Intel(R) Core(TM) i7-8700").unwrap();
-        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::LegacyCore, 8, ""));
+        assert_eq!(
+            (t.tier, t.gen, t.suffix.as_str()),
+            (BrandTier::LegacyCore, 8, "")
+        );
         // Legacy 4-digit mobile (starts with 1) → two-digit gen.
         let t = brand_parse("Intel(R) Core(TM) i5-1335U").unwrap();
-        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::LegacyCore, 13, "U"));
+        assert_eq!(
+            (t.tier, t.gen, t.suffix.as_str()),
+            (BrandTier::LegacyCore, 13, "U")
+        );
         // Xeon W workstation (gen = first two digits).
         let t = brand_parse("Intel(R) Xeon(R) W-1290P CPU @ 3.70GHz").unwrap();
-        assert_eq!((t.tier, t.gen, t.suffix.as_str()), (BrandTier::XeonW, 12, "P"));
+        assert_eq!(
+            (t.tier, t.gen, t.suffix.as_str()),
+            (BrandTier::XeonW, 12, "P")
+        );
         // Xeon Scalable server (gen = 2nd digit).
         let t = brand_parse("Intel(R) Xeon(R) Platinum 8480+ CPU").unwrap();
         assert_eq!((t.tier, t.gen), (BrandTier::XeonScalable, 4));
@@ -1381,7 +1449,10 @@ mod tests {
         assert_eq!(intel_gen_from_brand("", 0x8C), Some(IntelGen::TigerLake));
         assert_eq!(intel_gen_from_brand("", 0x8D), Some(IntelGen::TigerLake));
         assert_eq!(intel_gen_from_brand("", 0xBE), Some(IntelGen::AlderLake));
-        assert_eq!(intel_gen_from_brand("", 0x8F), Some(IntelGen::SapphireRapids));
+        assert_eq!(
+            intel_gen_from_brand("", 0x8F),
+            Some(IntelGen::SapphireRapids)
+        );
         assert_eq!(intel_gen_from_brand("", 0x9C), Some(IntelGen::JasperLake));
         assert_eq!(intel_gen_from_brand("", 0xBD), Some(IntelGen::LunarLake));
         assert_eq!(intel_gen_from_brand("", 0x9B), Some(IntelGen::Unrecognized));
@@ -1483,10 +1554,22 @@ mod tests {
         );
         // Non-server brands → None (an unrecognized vN, a Xeon W, a client
         // Core, and the empty string all keep the client fallback).
-        assert_eq!(server_gen_from_brand("Intel(R) Xeon(R) E3-1505M v6 @ 2.80GHz"), None);
-        assert_eq!(server_gen_from_brand("Intel(R) Xeon(R) W-2123 CPU @ 3.30GHz"), None);
-        assert_eq!(server_gen_from_brand("Intel(R) Core(TM) i5-6600K CPU @ 3.50GHz"), None);
-        assert_eq!(server_gen_from_brand("Intel(R) Core(TM) i7-7700 CPU @ 4.20GHz"), None);
+        assert_eq!(
+            server_gen_from_brand("Intel(R) Xeon(R) E3-1505M v6 @ 2.80GHz"),
+            None
+        );
+        assert_eq!(
+            server_gen_from_brand("Intel(R) Xeon(R) W-2123 CPU @ 3.30GHz"),
+            None
+        );
+        assert_eq!(
+            server_gen_from_brand("Intel(R) Core(TM) i5-6600K CPU @ 3.50GHz"),
+            None
+        );
+        assert_eq!(
+            server_gen_from_brand("Intel(R) Core(TM) i7-7700 CPU @ 4.20GHz"),
+            None
+        );
         assert_eq!(server_gen_from_brand(""), None);
     }
 

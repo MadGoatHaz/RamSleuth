@@ -76,10 +76,10 @@
 // this chunk's file scope).
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 use core::arch::x86_64::{
-    _mm512_add_epi64, _mm512_castsi512_si256, _mm512_extracti64x4_epi64, _mm512_load_si512,
-    _mm512_set_epi64, _mm512_setzero_si512, _mm512_store_si512, _mm512_stream_si512, _mm_add_epi64,
-    _mm256_castsi256_si128, _mm_cvtsi128_si64, _mm256_extracti128_si256, _mm_sfence,
-    _mm_unpackhi_epi64, __m512i,
+    __m512i, _mm256_castsi256_si128, _mm256_extracti128_si256, _mm512_add_epi64,
+    _mm512_castsi512_si256, _mm512_extracti64x4_epi64, _mm512_load_si512, _mm512_set_epi64,
+    _mm512_setzero_si512, _mm512_store_si512, _mm512_stream_si512, _mm_add_epi64,
+    _mm_cvtsi128_si64, _mm_sfence, _mm_unpackhi_epi64,
 };
 
 #[cfg(feature = "avx512")]
@@ -216,7 +216,10 @@ pub fn avx512_write_resident(dst: &mut [u8], pattern: u64) -> u64 {
 /// debug builds; undefined behavior in release builds otherwise). The
 /// kernel does not realign internally.
 pub fn avx512_copy(src: &[u8], dst: &mut [u8]) -> u64 {
-    debug_assert!(src.len() == dst.len(), "avx512_copy: src.len() must equal dst.len()");
+    debug_assert!(
+        src.len() == dst.len(),
+        "avx512_copy: src.len() must equal dst.len()"
+    );
     debug_assert!(
         (src.as_ptr() as usize) % 64 == 0,
         "avx512_copy: src must be 64-byte aligned",
@@ -270,7 +273,10 @@ pub fn avx512_copy(src: &[u8], dst: &mut [u8]) -> u64 {
 /// debug builds; undefined behavior in release builds otherwise). The
 /// kernel does not realign internally.
 pub fn avx512_copy_resident(src: &[u8], dst: &mut [u8]) -> u64 {
-    debug_assert!(src.len() == dst.len(), "avx512_copy_resident: src.len() must equal dst.len()");
+    debug_assert!(
+        src.len() == dst.len(),
+        "avx512_copy_resident: src.len() must equal dst.len()"
+    );
     debug_assert!(
         (src.as_ptr() as usize) % 64 == 0,
         "avx512_copy_resident: src must be 64-byte aligned",
@@ -610,7 +616,11 @@ mod tests {
             avx2_read(slice),
             "the 512 dispatch must preserve the P1-04 checksum",
         );
-        assert_eq!(avx512_read(slice), word_sum(slice), "must equal the word-sum reference");
+        assert_eq!(
+            avx512_read(slice),
+            word_sum(slice),
+            "must equal the word-sum reference"
+        );
         dealloc_aligned(ptr, LEN);
     }
 
@@ -661,7 +671,11 @@ mod tests {
         dst.fill(0);
         dst.copy_from_slice(src);
         assert_eq!(dst, src, "destination must match a direct copy_from_slice");
-        assert_eq!(avx2_read(dst), checksum, "checksum must match a direct copy_from_slice result");
+        assert_eq!(
+            avx2_read(dst),
+            checksum,
+            "checksum must match a direct copy_from_slice result"
+        );
         // The checksum also equals `avx2_copy`'s on the same inputs.
         dst.fill(0);
         assert_eq!(
@@ -725,7 +739,11 @@ mod tests {
         assert_eq!(&*dst, expected(LEN, PATTERN).as_slice());
         dst.fill(0);
         avx512_write(dst, PATTERN);
-        assert_eq!(&*dst, expected(LEN, PATTERN).as_slice(), "NT and resident 512 writes agree");
+        assert_eq!(
+            &*dst,
+            expected(LEN, PATTERN).as_slice(),
+            "NT and resident 512 writes agree"
+        );
 
         // Resident copy is byte-identical to the source and checksums the
         // same as the NT copy.
@@ -734,14 +752,20 @@ mod tests {
         assert_eq!(dst, src, "resident 512 copy must be byte-identical");
         dst.fill(0);
         let nt_checksum = avx512_copy(src, dst);
-        assert_eq!(resident_checksum, nt_checksum, "resident and NT 512 copy checksums agree");
+        assert_eq!(
+            resident_checksum, nt_checksum,
+            "resident and NT 512 copy checksums agree"
+        );
 
         // Off-AVX-512F the resident 512 dispatches fall back to the AVX2
         // resident kernels (verified on a host without AVX-512F).
         #[cfg(feature = "avx512")]
         if !CpuFeatures::detect().avx512f {
             dst.fill(0);
-            assert_eq!(avx512_write_resident(dst, PATTERN), avx2_write_resident(dst, PATTERN));
+            assert_eq!(
+                avx512_write_resident(dst, PATTERN),
+                avx2_write_resident(dst, PATTERN)
+            );
             dst.fill(0);
             assert_eq!(avx512_copy_resident(src, dst), avx2_copy_resident(src, dst));
         }
@@ -769,7 +793,10 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         if CpuFeatures::detect().avx512f {
             // SAFETY: all preconditions hold by construction of `src`/`dst`.
-            assert_eq!(unsafe { avx512_read_simd(src.as_ptr(), LEN) }, word_sum(src));
+            assert_eq!(
+                unsafe { avx512_read_simd(src.as_ptr(), LEN) },
+                word_sum(src)
+            );
             // SAFETY: all preconditions hold by construction of `dst`.
             let n = unsafe { avx512_write_simd(dst.as_mut_ptr(), LEN, PATTERN) };
             assert_eq!(n, LEN as u64);

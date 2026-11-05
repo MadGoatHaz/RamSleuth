@@ -697,8 +697,14 @@ mod tests {
             .unwrap_or_else(|| panic!("SapphireRapids must resolve to the Server profile (H-9)"));
         assert_eq!(p, &SERVER_8CH, "Sapphire Rapids");
         assert_eq!(p.map, GenMap::Server, "Sapphire Rapids");
-        assert_eq!(p.channel_count, 8, "Sapphire Rapids is 8-channel DDR5 (H-9)");
-        assert_eq!(p.mchbar_mask, 0, "Sapphire Rapids (no OS-accessible MCHBAR)");
+        assert_eq!(
+            p.channel_count, 8,
+            "Sapphire Rapids is 8-channel DDR5 (H-9)"
+        );
+        assert_eq!(
+            p.mchbar_mask, 0,
+            "Sapphire Rapids (no OS-accessible MCHBAR)"
+        );
         assert_eq!(p.gear, GearCap::None, "Sapphire Rapids (no gear register)");
     }
 
@@ -728,8 +734,9 @@ mod tests {
     #[test]
     fn tier3_ddr5_dual_channel_generations_resolve_to_alder_profile() {
         for gen in [IntelGen::MeteorLake, IntelGen::ArrowLake] {
-            let p = profile_for(gen)
-                .unwrap_or_else(|| panic!("{gen:?} must resolve to the 2-channel DDR5 Alder profile"));
+            let p = profile_for(gen).unwrap_or_else(|| {
+                panic!("{gen:?} must resolve to the 2-channel DDR5 Alder profile")
+            });
             assert_eq!(p, &ALDER_DDR5, "{gen:?}");
             assert_eq!(p.window_size, 0x40000, "{gen:?}");
             assert_eq!(p.mchbar_mask, 0x0000_007F_FFFC_0000, "{gen:?}");
@@ -762,15 +769,24 @@ mod tests {
         // OQ-4: each documented per-controller MCL base appears exactly
         // once; subchannels 1 and 3 carry none.
         assert_eq!(
-            ALDER_CHANNELS.iter().filter(|c| c.mcl_base == Some(0xD000)).count(),
+            ALDER_CHANNELS
+                .iter()
+                .filter(|c| c.mcl_base == Some(0xD000))
+                .count(),
             1,
         );
         assert_eq!(
-            ALDER_CHANNELS.iter().filter(|c| c.mcl_base == Some(0xD800)).count(),
+            ALDER_CHANNELS
+                .iter()
+                .filter(|c| c.mcl_base == Some(0xD800))
+                .count(),
             1,
         );
         assert_eq!(
-            ALDER_CHANNELS.iter().filter(|c| c.mcl_base.is_none()).count(),
+            ALDER_CHANNELS
+                .iter()
+                .filter(|c| c.mcl_base.is_none())
+                .count(),
             2,
         );
     }
@@ -813,10 +829,9 @@ mod tests {
         assert_eq!(f.twrwr_dg, (11, 6));
         // Every documented range is well-formed: 0 <= lo <= hi <= 31.
         let ranges = [
-            f.trcd, f.trp, f.tras, f.tcwl, f.tcl, f.tfaw, f.trrd_s,
-            f.trrd_l, f.tppd, f.twtr_s, f.twtr_l, f.twr, f.trtp, f.trfc1,
-            f.trefi, f.trfcsb, f.trdrd_sg, f.trdrd_dg, f.trdrd_dr,
-            f.trdrd_dd, f.twrwr_sg, f.twrwr_dg,
+            f.trcd, f.trp, f.tras, f.tcwl, f.tcl, f.tfaw, f.trrd_s, f.trrd_l, f.tppd, f.twtr_s,
+            f.twtr_l, f.twr, f.trtp, f.trfc1, f.trefi, f.trfcsb, f.trdrd_sg, f.trdrd_dg,
+            f.trdrd_dr, f.trdrd_dd, f.twrwr_sg, f.twrwr_dg,
         ];
         assert_eq!(ranges.len(), 22);
         for (hi, lo) in ranges {
@@ -832,7 +847,7 @@ mod tests {
     fn alder_ddr4_channels_pin_mc_bases() {
         assert_eq!(ALDER_DDR4_CHANNELS.len(), 2, "DDR4 Alder Lake = 2 MCs");
         let expected: [(u32, u32); 2] = [
-            (0xE000, 0xD000), // MC0
+            (0xE000, 0xD000),  // MC0
             (0x1E000, 0xD800), // MC1 (0xE000 + 0x10000)
         ];
         for (i, ch) in ALDER_DDR4_CHANNELS.iter().enumerate() {
@@ -898,12 +913,10 @@ mod tests {
         // Every range is well-formed: lo <= hi. The 64-bit TC_PRE fields
         // may reach bit 63; the 32-bit register fields stay <= 31.
         let all = [
-            f.trcd, f.tras, f.twrpre, f.tppd, f.trdpre, f.trp, f.trrd_dg,
-            f.trrd_sg, f.tfaw, f.rdrd_dd, f.rdrd_dr, f.rdrd_dg, f.rdrd_sg,
-            f.rdwr_dd, f.rdwr_dr, f.rdwr_dg, f.rdwr_sg, f.wrrd_dd,
-            f.wrrd_dr, f.wrrd_dg, f.wrrd_sg, f.wrwr_dd, f.wrwr_dr,
-            f.wrwr_dg, f.wrwr_sg, f.tcwl, f.tcl, f.trefi9, f.oref_ri,
-            f.trfc, f.trefi,
+            f.trcd, f.tras, f.twrpre, f.tppd, f.trdpre, f.trp, f.trrd_dg, f.trrd_sg, f.tfaw,
+            f.rdrd_dd, f.rdrd_dr, f.rdrd_dg, f.rdrd_sg, f.rdwr_dd, f.rdwr_dr, f.rdwr_dg, f.rdwr_sg,
+            f.wrrd_dd, f.wrrd_dr, f.wrrd_dg, f.wrrd_sg, f.wrwr_dd, f.wrwr_dr, f.wrwr_dg, f.wrwr_sg,
+            f.tcwl, f.tcl, f.trefi9, f.oref_ri, f.trfc, f.trefi,
         ];
         assert_eq!(all.len(), 31);
         for (hi, lo) in all {
@@ -912,10 +925,9 @@ mod tests {
         }
         // The 32-bit registers never exceed bit 31.
         let thirty_two_bit = [
-            f.tppd, f.trdpre, f.trp, f.trrd_dg, f.trrd_sg, f.tfaw, f.rdrd_dd,
-            f.rdrd_dr, f.rdrd_dg, f.rdrd_sg, f.rdwr_dd, f.rdwr_dr, f.rdwr_dg,
-            f.rdwr_sg, f.wrrd_dd, f.wrrd_dr, f.wrrd_dg, f.wrrd_sg, f.wrwr_dd,
-            f.wrwr_dr, f.wrwr_dg, f.wrwr_sg, f.tcwl, f.tcl, f.trefi9,
+            f.tppd, f.trdpre, f.trp, f.trrd_dg, f.trrd_sg, f.tfaw, f.rdrd_dd, f.rdrd_dr, f.rdrd_dg,
+            f.rdrd_sg, f.rdwr_dd, f.rdwr_dr, f.rdwr_dg, f.rdwr_sg, f.wrrd_dd, f.wrrd_dr, f.wrrd_dg,
+            f.wrrd_sg, f.wrwr_dd, f.wrwr_dr, f.wrwr_dg, f.wrwr_sg, f.tcwl, f.tcl, f.trefi9,
             f.oref_ri, f.trfc, f.trefi,
         ];
         for (hi, lo) in thirty_two_bit {

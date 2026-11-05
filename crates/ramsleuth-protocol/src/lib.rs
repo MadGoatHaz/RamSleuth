@@ -29,7 +29,5 @@
 pub mod frame;
 pub mod messages;
 
-pub use frame::{
-    decode_frame, encode_frame, Frame, FrameError, MAX_FRAME_SIZE, PROTOCOL_VERSION,
-};
-pub use messages::{BenchMode, DEFAULT_SOCKET_PATH, Message, Request, Response};
+pub use frame::{decode_frame, encode_frame, Frame, FrameError, MAX_FRAME_SIZE, PROTOCOL_VERSION};
+pub use messages::{BenchMode, Message, Request, Response, DEFAULT_SOCKET_PATH};

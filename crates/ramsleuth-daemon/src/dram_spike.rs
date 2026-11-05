@@ -182,8 +182,14 @@ mod tests {
     fn enter_is_single_flight() {
         let gate = AtomicBool::new(false);
         let first = enter(&gate).expect("first enter acquires the free gate");
-        assert!(gate.load(Ordering::SeqCst), "gate is true while the guard is held");
-        assert!(enter(&gate).is_none(), "a second enter while the first is held -> None");
+        assert!(
+            gate.load(Ordering::SeqCst),
+            "gate is true while the guard is held"
+        );
+        assert!(
+            enter(&gate).is_none(),
+            "a second enter while the first is held -> None"
+        );
         drop(first);
     }
 
@@ -196,7 +202,10 @@ mod tests {
             let _g = enter(&gate).expect("enter acquires the free gate");
             assert!(gate.load(Ordering::SeqCst), "gate true while held");
         } // `_g` drops here.
-        assert!(!gate.load(Ordering::SeqCst), "gate false after the guard drops");
+        assert!(
+            !gate.load(Ordering::SeqCst),
+            "gate false after the guard drops"
+        );
     }
 
     /// (c) `spike_run` on a 4096-byte zeroed buffer for 10 ms: the buffer
@@ -208,9 +217,18 @@ mod tests {
         let sink = spike_run(&mut buf, Duration::from_millis(10));
         let elapsed = start.elapsed();
         std::hint::black_box(sink);
-        assert!(!buf.iter().all(|&b| b == 0), "write-back must modify the buffer");
-        assert!(elapsed >= Duration::from_millis(10), "ran at least the target: {elapsed:?}");
-        assert!(elapsed < Duration::from_secs(10), "time-bounded (not stuck): {elapsed:?}");
+        assert!(
+            !buf.iter().all(|&b| b == 0),
+            "write-back must modify the buffer"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(10),
+            "ran at least the target: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "time-bounded (not stuck): {elapsed:?}"
+        );
     }
 
     /// (d) `spike_run` on a 4-byte buffer returns 0 without panicking
@@ -227,12 +245,24 @@ mod tests {
     /// leaves `SPIKE_RUNNING` released, and is bounded well under 3 s.
     #[test]
     fn spike_global_path_releases_gate_and_is_bounded() {
-        assert!(!SPIKE_RUNNING.load(Ordering::SeqCst), "gate free before the spike");
+        assert!(
+            !SPIKE_RUNNING.load(Ordering::SeqCst),
+            "gate free before the spike"
+        );
         let start = Instant::now();
-        assert!(spike(), "the 256 MiB reservation succeeds on a healthy host");
+        assert!(
+            spike(),
+            "the 256 MiB reservation succeeds on a healthy host"
+        );
         let elapsed = start.elapsed();
-        assert!(!SPIKE_RUNNING.load(Ordering::SeqCst), "gate released after spike() returns");
-        assert!(elapsed < Duration::from_secs(3), "spike() is bounded: {elapsed:?}");
+        assert!(
+            !SPIKE_RUNNING.load(Ordering::SeqCst),
+            "gate released after spike() returns"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "spike() is bounded: {elapsed:?}"
+        );
     }
 
     /// (f) `spike_with_gate` on a local gate + a 4096-byte buffer runs

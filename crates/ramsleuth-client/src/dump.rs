@@ -219,7 +219,10 @@ fn na_line(out: &mut String, reason: &NaReason) {
 fn rows(out: &mut String, indent: &str, pairs: &[(&str, String)]) {
     let key_pad = pairs.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
     for (key, value) in pairs {
-        out.push_str(&format!("{indent}{key:<key_pad$}  {value}\n", key_pad = key_pad));
+        out.push_str(&format!(
+            "{indent}{key:<key_pad$}  {value}\n",
+            key_pad = key_pad
+        ));
     }
 }
 
@@ -332,7 +335,14 @@ fn vendor_text(vendor: &CpuVendor) -> String {
 /// snapshot root carries the detected CPU).
 fn cpu_section(out: &mut String, cpu: &CpuInfo) {
     header(out, "CPU");
-    rows(out, "  ", &[("vendor", vendor_text(&cpu.vendor)), ("brand", cpu.brand.clone())]);
+    rows(
+        out,
+        "  ",
+        &[
+            ("vendor", vendor_text(&cpu.vendor)),
+            ("brand", cpu.brand.clone()),
+        ],
+    );
     out.push('\n');
 }
 
@@ -419,7 +429,7 @@ fn intel_channel(out: &mut String, channel: &IntelChannel, vendor: &CpuVendor) {
     rows(out, "  ", &[("RTL (ticks)", cell(&channel.rtl))]);
 }
 
-/// The `=== SPD ===` section: one `--- Module 0xNN ---` block per decoded
+/// The `=== SPD ===` section: one `--- DIMM N ---` block per decoded
 /// module (maker / part / serial / rank / density / speed + the XMP / EXPO
 /// profile lines), or a no-modules note when the list is empty.
 fn spd_section(out: &mut String, modules: &[SpdModule]) {
@@ -434,12 +444,14 @@ fn spd_section(out: &mut String, modules: &[SpdModule]) {
     out.push('\n');
 }
 
-/// One `--- Module 0xNN (DDRn) ---` block: the module identity rows plus
-/// one line per factory-rated profile.
+/// One `--- DIMM N (DDRn) ---` block: the module identity rows plus
+/// one line per factory-rated profile. The index is shown as a plain
+/// decimal (not hex) so SMBIOS fallback modules (ordinal index) are not
+/// mistaken for I2C addresses.
 fn spd_module(out: &mut String, module: &SpdModule) {
     let index = module.index;
     let gen = if module.is_ddr5 { "DDR5" } else { "DDR4" };
-    subheader(out, &format!("Module 0x{index:02X} ({gen})"));
+    subheader(out, &format!("DIMM {index} ({gen})"));
     rows(
         out,
         "  ",
@@ -537,7 +549,7 @@ mod tests {
     use ramsleuth_telemetry::amd_readout::{CommandRate, EccStatus, MemoryChannelMode};
     use ramsleuth_telemetry::cpuid::{AmdZen, IntelGen};
     use ramsleuth_telemetry::intel_readout::{
-        ChannelMode, ChannelRegs, fixture_channel_regs, fixture_intel_readout,
+        fixture_channel_regs, fixture_intel_readout, ChannelMode, ChannelRegs,
     };
     use ramsleuth_telemetry::{RailConfidence, SystemPlatform};
 
@@ -781,8 +793,8 @@ mod tests {
         // Intel branch degraded on this AMD host (C3: `unsupported CPU`)
         assert!(text.contains("N/A (unsupported CPU)"));
         // SPD modules (one DDR4 + one DDR5) with their profile lines
-        assert!(text.contains("Module 0x52 (DDR4)"));
-        assert!(text.contains("Module 0x53 (DDR5)"));
+        assert!(text.contains("DIMM 82 (DDR4)"));
+        assert!(text.contains("DIMM 83 (DDR5)"));
         assert!(text.contains("profile 1 (XMP): 3600 MT/s, 18-18-18-36 @ 1.350 V"));
         assert!(text.contains("profile 1 (EXPO): 3600 MT/s, 18-18-18-36 @ 1.350 V"));
     }
@@ -802,7 +814,10 @@ mod tests {
         assert!(text.contains("N/A (insufficient privilege)"));
         assert!(text.contains("(no modules: ee1004 driver absent or no device bound)"));
         // a fully degraded snapshot must not print any formatted reading
-        assert!(!text.contains("MHz"), "all-Na snapshot prints no clock values: {text}");
+        assert!(
+            !text.contains("MHz"),
+            "all-Na snapshot prints no clock values: {text}"
+        );
     }
 
     /// (c) `render` is deterministic: the same snapshot always yields the
@@ -844,8 +859,8 @@ mod tests {
         // channel 0: decoded clocks (1600 MHz MCLK) + gear 1×
         assert!(text.contains("1600.00 MHz"));
         assert!(text.contains("1x")); // gear 1 (MC_BIOS_REQ gear bits 00b)
-        // The SPD module's `ParseError("fixture")` cells now surface their
-        // detail (the fix).
+                                      // The SPD module's `ParseError("fixture")` cells now surface their
+                                      // detail (the fix).
         assert!(text.contains("N/A (fixture)"));
         // channel 0 RTL: the live map has no RTL register (the
         // `NotApplicable` cell keeps the one bare `N/A`, D-4).
@@ -856,13 +871,34 @@ mod tests {
         // names — the AMD names would be a mislabel.
         // (`rows` pads to the longest key — `Memory I/O` — then two
         // spaces.)
-        assert!(text.contains("SoC         N/A"), "generic Intel SoC rail: {text}");
-        assert!(text.contains("Memory I/O  N/A"), "generic Intel memory rail: {text}");
-        assert!(text.contains("Misc        N/A"), "generic Intel misc rail: {text}");
-        assert!(text.contains("VPP         N/A"), "generic Intel VPP rail: {text}");
-        assert!(!text.contains("VDDCR_SOC"), "no AMD rail names in the Intel dump: {text}");
-        assert!(!text.contains("VDDIO_MEM"), "no AMD rail names in the Intel dump: {text}");
-        assert!(!text.contains("VDD_MISC"), "no AMD rail names in the Intel dump: {text}");
+        assert!(
+            text.contains("SoC         N/A"),
+            "generic Intel SoC rail: {text}"
+        );
+        assert!(
+            text.contains("Memory I/O  N/A"),
+            "generic Intel memory rail: {text}"
+        );
+        assert!(
+            text.contains("Misc        N/A"),
+            "generic Intel misc rail: {text}"
+        );
+        assert!(
+            text.contains("VPP         N/A"),
+            "generic Intel VPP rail: {text}"
+        );
+        assert!(
+            !text.contains("VDDCR_SOC"),
+            "no AMD rail names in the Intel dump: {text}"
+        );
+        assert!(
+            !text.contains("VDDIO_MEM"),
+            "no AMD rail names in the Intel dump: {text}"
+        );
+        assert!(
+            !text.contains("VDD_MISC"),
+            "no AMD rail names in the Intel dump: {text}"
+        );
     }
 
     /// (f) `dump` over a live in-process daemon stand-in: a `Telemetry`
@@ -875,10 +911,7 @@ mod tests {
 
     impl TempSocket {
         fn new(name: &str) -> Self {
-            let path = PathBuf::from(format!(
-                "/tmp/ramsleuth-dump-{name}-{}.sock",
-                process::id()
-            ));
+            let path = PathBuf::from(format!("/tmp/ramsleuth-dump-{name}-{}.sock", process::id()));
             let _ = std::fs::remove_file(&path); // stale file from a crashed earlier run
             Self { path }
         }
@@ -974,7 +1007,10 @@ mod tests {
             confidence: RailConfidence::VerifiedProfile,
         }));
         assert!(out.contains("CPU Core Voltage: 1.216 V"), "{out}");
-        assert!(!out.contains("[est]"), "a verified vCore has no badge: {out}");
+        assert!(
+            !out.contains("[est]"),
+            "a verified vCore has no badge: {out}"
+        );
 
         // Heuristic (vendor-fallback) → the `[est]` badge.
         let out = render_vcore(Section::Value(VoltageTelemetry {

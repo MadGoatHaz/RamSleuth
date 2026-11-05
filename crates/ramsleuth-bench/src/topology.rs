@@ -75,7 +75,10 @@ impl fmt::Display for TopologyError {
             ),
             Self::NoCpus => write!(f, "no cpuN directories found under {SYSFS_CPU_ROOT}"),
             Self::NoL3Cache => {
-                write!(f, "no level-3 cache found under {SYSFS_CPU_ROOT}/cpu*/cache")
+                write!(
+                    f,
+                    "no level-3 cache found under {SYSFS_CPU_ROOT}/cpu*/cache"
+                )
             }
         }
     }
@@ -134,11 +137,10 @@ struct CpuRecord {
 
 /// List logical CPUs (`cpuN` directories) under `root`, ascending.
 fn list_logical_cpus(root: &Path) -> Result<Vec<usize>, TopologyError> {
-    let entries = fs::read_dir(root)
-        .map_err(|source| TopologyError::Io {
-            path: root.to_path_buf(),
-            source,
-        })?;
+    let entries = fs::read_dir(root).map_err(|source| TopologyError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
     let mut cpus = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
@@ -391,10 +393,7 @@ mod tests {
         assert_eq!(parse_size("32768K"), Some(32768 * 1024));
         assert_eq!(parse_size("16M"), Some(16 * 1024 * 1024));
         assert_eq!(parse_size("1G"), Some(1024 * 1024 * 1024));
-        assert_eq!(
-            parse_size("2T"),
-            Some(2 * 1024 * 1024 * 1024 * 1024)
-        );
+        assert_eq!(parse_size("2T"), Some(2 * 1024 * 1024 * 1024 * 1024));
         assert_eq!(parse_size("4096"), Some(4096));
         assert_eq!(parse_size("16m"), Some(16 * 1024 * 1024));
     }
@@ -458,7 +457,10 @@ mod tests {
 
         // every physical-core entry is a valid logical CPU index.
         for &rep in &topo.physical_cores {
-            assert!(rep < topo.logical_cpus.len(), "representative {rep} out of range");
+            assert!(
+                rep < topo.logical_cpus.len(),
+                "representative {rep} out of range"
+            );
             assert!(
                 topo.logical_cpus.contains(&rep),
                 "representative {rep} missing from logical_cpus"

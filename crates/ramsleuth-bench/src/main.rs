@@ -14,8 +14,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use ramsleuth_bench::{
-    detect, run_all, run_streamed, BenchmarkGrid, CpuFeatures, Metric, StreamOptions,
-    StreamTarget, Tier,
+    detect, run_all, run_streamed, BenchmarkGrid, CpuFeatures, Metric, StreamOptions, StreamTarget,
+    Tier,
 };
 
 /// Parsed CLI options (std-only parsing — no arg-parsing dependency).
@@ -292,7 +292,10 @@ mod tests {
              \"copy_gbps\":[9, 10, 11, 12],\"latency_ns\":[13, 14, 15, 16]}"
         );
         for key in ["read_gbps", "write_gbps", "copy_gbps", "latency_ns"] {
-            assert!(json.contains(&format!("\"{key}\":")), "missing key {key} in {json}");
+            assert!(
+                json.contains(&format!("\"{key}\":")),
+                "missing key {key} in {json}"
+            );
         }
     }
 
@@ -308,8 +311,14 @@ mod tests {
         for header in ["Read (GB/s)", "Write (GB/s)", "Copy (GB/s)", "Latency (ns)"] {
             assert!(table.contains(header), "header {header} missing:\n{table}");
         }
-        assert!(table.contains("2.50"), "L1 read cell should be 2.50:\n{table}");
-        assert!(table.contains("13.0"), "Memory latency cell should be 13.0:\n{table}");
+        assert!(
+            table.contains("2.50"),
+            "L1 read cell should be 2.50:\n{table}"
+        );
+        assert!(
+            table.contains("13.0"),
+            "Memory latency cell should be 13.0:\n{table}"
+        );
     }
 
     /// (c) `parse_opts` accepts `--avx512`/`--json`, recognizes
@@ -320,8 +329,7 @@ mod tests {
         let none = parse_opts(&[]).expect("no args is valid");
         assert!(!none.avx512 && !none.json);
 
-        let both =
-            parse_opts(&["--avx512".into(), "--json".into()]).expect("known flags parse");
+        let both = parse_opts(&["--avx512".into(), "--json".into()]).expect("known flags parse");
         assert!(both.avx512 && both.json);
 
         for help in ["--help", "-h", "--version", "-V"] {

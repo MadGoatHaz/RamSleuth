@@ -260,21 +260,36 @@ pub fn render_probe_report_md(report: &ProbeReport) -> String {
     out.push_str("# RamSleuth Probe Report\n\n");
     out.push_str(&format!(
         "> **{}** — {} on {} (kernel {}), RamSleuth v{}\n\n",
-        report.system.cpu_brand, report.system.cpu_gen, report.system.os,
-        report.system.kernel, report.system.ramsleuth_version,
+        report.system.cpu_brand,
+        report.system.cpu_gen,
+        report.system.os,
+        report.system.kernel,
+        report.system.ramsleuth_version,
     ));
     // 2. The System table (the issue template's nine fields).
     out.push_str("## System\n\n");
     out.push_str("| Field | Value |\n|---|---|\n");
     for (field, value) in system_rows(&report.system) {
-        out.push_str(&format!("| {} | {} |\n", md_escape(field), md_escape(&value)));
+        out.push_str(&format!(
+            "| {} | {} |\n",
+            md_escape(field),
+            md_escape(&value)
+        ));
     }
     out.push('\n');
     // 3. The decoded telemetry in the dashboard display form.
     out.push_str("## Decoded Telemetry\n\n");
     render_cpu(&mut out, &report.telemetry.cpu, &report.telemetry.vcore);
-    render_amd(&mut out, &report.telemetry.cpu.vendor, &report.telemetry.amd);
-    render_intel(&mut out, &report.telemetry.cpu.vendor, &report.telemetry.intel);
+    render_amd(
+        &mut out,
+        &report.telemetry.cpu.vendor,
+        &report.telemetry.amd,
+    );
+    render_intel(
+        &mut out,
+        &report.telemetry.cpu.vendor,
+        &report.telemetry.intel,
+    );
     render_spd(&mut out, &report.telemetry.spd);
     render_platform(&mut out, &report.telemetry);
     // 4. The raw registers: the Intel IMC table when Intel raw is the
@@ -316,7 +331,10 @@ fn system_rows(system: &ProbeSystem) -> Vec<(&str, String)> {
         ("Generation", system.cpu_gen.clone()),
         (
             "PCI Host Bridge",
-            system.pci_host_bridge.clone().unwrap_or_else(|| "N/A".to_owned()),
+            system
+                .pci_host_bridge
+                .clone()
+                .unwrap_or_else(|| "N/A".to_owned()),
         ),
         ("Kernel", system.kernel.clone()),
         ("OS", system.os.clone()),
@@ -722,9 +740,11 @@ fn render_intel(out: &mut String, vendor: &CpuVendor, section: &Section<IntelRea
     }
 }
 
-/// The `### SPD` subsection: one `#### Module 0xNN (DDRn)` block per
+/// The `### SPD` subsection: one `#### DIMM N (DDRn)` block per
 /// decoded module (the module identity + the factory-rated profiles),
-/// or a no-modules note when the list is empty.
+/// or a no-modules note when the list is empty. The index is decimal
+/// (not hex) so SMBIOS fallback ordinals are not mistaken for I2C
+/// addresses.
 fn render_spd(out: &mut String, modules: &[SpdModule]) {
     out.push_str("### SPD\n\n");
     if modules.is_empty() {
@@ -733,7 +753,7 @@ fn render_spd(out: &mut String, modules: &[SpdModule]) {
     }
     for module in modules {
         let gen = if module.is_ddr5 { "DDR5" } else { "DDR4" };
-        out.push_str(&format!("#### Module 0x{:02X} ({gen})\n\n", module.index));
+        out.push_str(&format!("#### DIMM {} ({gen})\n\n", module.index));
         md_table(
             out,
             "Field",
@@ -901,7 +921,11 @@ fn render_raw_table(out: &mut String, raw: &ProbeRaw) {
             ("MCHBAR_BASE", hex64(raw.mchbar_base)),
             (
                 "MCHBAR_ENABLED",
-                if raw.mchbar_enabled { "true".to_owned() } else { "false".to_owned() },
+                if raw.mchbar_enabled {
+                    "true".to_owned()
+                } else {
+                    "false".to_owned()
+                },
             ),
         ],
     );
@@ -1057,7 +1081,11 @@ fn push_display_na(
     push_na(out, &format!("{prefix}.clocks.uclk"), &clocks.uclk_mhz);
     push_na(out, &format!("{prefix}.clocks.fclk"), &clocks.fclk_mhz);
     push_na(out, &format!("{prefix}.clocks.div_mode"), &clocks.div_mode);
-    push_na(out, &format!("{prefix}.clocks.gear_mode"), &clocks.gear_mode);
+    push_na(
+        out,
+        &format!("{prefix}.clocks.gear_mode"),
+        &clocks.gear_mode,
+    );
     push_na(out, &format!("{prefix}.clocks.gdm"), &clocks.gdm);
     push_na(out, &format!("{prefix}.clocks.pdm"), &clocks.pdm);
     push_na(
@@ -1073,8 +1101,16 @@ fn push_display_na(
     push_na(out, &format!("{prefix}.cad_bus.rtt_wr"), &cad.rtt_wr);
     push_na(out, &format!("{prefix}.cad_bus.rtt_park"), &cad.rtt_park);
     push_na(out, &format!("{prefix}.cad_bus.clk_drv"), &cad.clk_drv);
-    push_na(out, &format!("{prefix}.cad_bus.addr_cmd_drv"), &cad.addr_cmd_drv);
-    push_na(out, &format!("{prefix}.cad_bus.cs_odt_drv"), &cad.cs_odt_drv);
+    push_na(
+        out,
+        &format!("{prefix}.cad_bus.addr_cmd_drv"),
+        &cad.addr_cmd_drv,
+    );
+    push_na(
+        out,
+        &format!("{prefix}.cad_bus.cs_odt_drv"),
+        &cad.cs_odt_drv,
+    );
     push_na(out, &format!("{prefix}.cad_bus.cke_drv"), &cad.cke_drv);
     for (name, section) in voltages_sections(voltages) {
         push_na(out, &format!("{prefix}.voltages.{name}"), section);
@@ -1150,10 +1186,7 @@ fn raw_u32_sections(raw: &ProbeRaw) -> [(&str, Option<u32>); 56] {
 fn collect_na_reasons(report: &ProbeReport, out: &mut Vec<(String, String)>) {
     let telemetry = &report.telemetry;
     match &telemetry.amd {
-        Section::Na(reason) => out.push((
-            "amd (whole branch)".to_owned(),
-            na_cell(reason),
-        )),
+        Section::Na(reason) => out.push(("amd (whole branch)".to_owned(), na_cell(reason))),
         Section::Value(readout) => push_display_na(
             "amd",
             out,
@@ -1164,10 +1197,7 @@ fn collect_na_reasons(report: &ProbeReport, out: &mut Vec<(String, String)>) {
         ),
     }
     match &telemetry.intel {
-        Section::Na(reason) => out.push((
-            "intel (whole branch)".to_owned(),
-            na_cell(reason),
-        )),
+        Section::Na(reason) => out.push(("intel (whole branch)".to_owned(), na_cell(reason))),
         Section::Value(readout) => {
             if readout.channel_mode.is_none() {
                 out.push((
@@ -1201,11 +1231,7 @@ fn collect_na_reasons(report: &ProbeReport, out: &mut Vec<(String, String)>) {
         push_na(out, &format!("{prefix}.part"), &module.part);
         push_na(out, &format!("{prefix}.serial"), &module.serial);
         push_na(out, &format!("{prefix}.rank"), &module.rank);
-        push_na(
-            out,
-            &format!("{prefix}.density_mbit"),
-            &module.density_mbit,
-        );
+        push_na(out, &format!("{prefix}.density_mbit"), &module.density_mbit);
         push_na(out, &format!("{prefix}.speed_mts"), &module.speed_mts);
         for (profile_index, profile) in module.profiles.iter().enumerate() {
             let pp = format!("{prefix}.profiles[{profile_index}]");
@@ -1218,11 +1244,7 @@ fn collect_na_reasons(report: &ProbeReport, out: &mut Vec<(String, String)>) {
         }
     }
     let platform = &telemetry.platform;
-    push_na(
-        out,
-        "platform.cpu_clock_mhz",
-        &platform.cpu_clock_mhz,
-    );
+    push_na(out, "platform.cpu_clock_mhz", &platform.cpu_clock_mhz);
     push_na(out, "platform.motherboard", &platform.motherboard);
     push_na(out, "platform.bios", &platform.bios);
     push_na(out, "platform.agesa", &platform.agesa);
@@ -1459,8 +1481,7 @@ mod tests {
         };
         let bytes =
             bincode::serialize(&report).expect("ProbeReport must serialize (no-panic contract)");
-        let back: ProbeReport =
-            bincode::deserialize(&bytes).expect("ProbeReport must deserialize");
+        let back: ProbeReport = bincode::deserialize(&bytes).expect("ProbeReport must deserialize");
         assert_eq!(report, back);
     }
 
@@ -1504,8 +1525,7 @@ mod tests {
         };
         let bytes =
             bincode::serialize(&report).expect("ProbeReport must serialize (no-panic contract)");
-        let back: ProbeReport =
-            bincode::deserialize(&bytes).expect("ProbeReport must deserialize");
+        let back: ProbeReport = bincode::deserialize(&bytes).expect("ProbeReport must deserialize");
         assert_eq!(report, back);
     }
 
@@ -1532,8 +1552,7 @@ mod tests {
         };
         let bytes =
             bincode::serialize(&report).expect("ProbeReport must serialize (no-panic contract)");
-        let back: ProbeReport =
-            bincode::deserialize(&bytes).expect("ProbeReport must deserialize");
+        let back: ProbeReport = bincode::deserialize(&bytes).expect("ProbeReport must deserialize");
         assert_eq!(report, back);
     }
 
@@ -1576,7 +1595,10 @@ mod tests {
         );
 
         // The System table (the template's nine fields).
-        assert!(md.contains("| CPU | Intel(R) Core(TM) i7-11700K CPU @ 3.60GHz |"), "{md}");
+        assert!(
+            md.contains("| CPU | Intel(R) Core(TM) i7-11700K CPU @ 3.60GHz |"),
+            "{md}"
+        );
         assert!(md.contains("| Vendor | Intel |"), "{md}");
         assert!(md.contains("| Generation | RocketLake |"), "{md}");
         assert!(md.contains("| PCI Host Bridge | 8086:4250 |"), "{md}");
@@ -1584,13 +1606,16 @@ mod tests {
         assert!(md.contains("| OS | Linux / Arch |"), "{md}");
         assert!(md.contains("| Arch | x86_64 |"), "{md}");
         assert!(md.contains("| RamSleuth Version | 2.4.13 |"), "{md}");
-        assert!(md.contains("| Telemetry Source | ramsleuth_intel |"), "{md}");
+        assert!(
+            md.contains("| Telemetry Source | ramsleuth_intel |"),
+            "{md}"
+        );
 
         // Decoded Telemetry: the branch N/A cells, the SPD module, the
         // platform identity + derived capacities.
         assert!(md.contains("N/A (unsupported hardware)"), "{md}");
         assert!(md.contains("N/A (driver missing)"), "{md}");
-        assert!(md.contains("#### Module 0x52 (DDR4)"), "{md}");
+        assert!(md.contains("#### DIMM 82 (DDR4)"), "{md}");
         assert!(md.contains("| maker | 0xC1 |"), "{md}");
         assert!(md.contains("| rank | 1 |"), "{md}");
         assert!(md.contains("| density | 16384 Mbit |"), "{md}");
@@ -1612,14 +1637,26 @@ mod tests {
 
         // N/A Reasons: the branch reasons, the SPD module N/A fields,
         // the absent ch3 raws, and the platform N/A fields.
-        assert!(md.contains("`amd (whole branch)` — N/A (unsupported hardware)"), "{md}");
-        assert!(md.contains("`intel (whole branch)` — N/A (driver missing)"), "{md}");
-        assert!(md.contains("`spd[0x52].die_maker` — N/A (not applicable)"), "{md}");
+        assert!(
+            md.contains("`amd (whole branch)` — N/A (unsupported hardware)"),
+            "{md}"
+        );
+        assert!(
+            md.contains("`intel (whole branch)` — N/A (driver missing)"),
+            "{md}"
+        );
+        assert!(
+            md.contains("`spd[0x52].die_maker` — N/A (not applicable)"),
+            "{md}"
+        );
         assert!(
             md.contains("`raw.tc_ch3_dbp` — N/A (register absent / read failed)"),
             "{md}"
         );
-        assert!(md.contains("`platform.agesa` — N/A (not applicable)"), "{md}");
+        assert!(
+            md.contains("`platform.agesa` — N/A (not applicable)"),
+            "{md}"
+        );
 
         // The footer: the generating version + the no-personal-info note.
         assert!(
@@ -1747,7 +1784,10 @@ mod tests {
         let md = render_probe_report_md(&report);
 
         // The readout-level channel mode leads the Intel section.
-        assert!(md.contains("| channel mode | Dual-Channel (Symmetric) |"), "{md}");
+        assert!(
+            md.contains("| channel mode | Dual-Channel (Symmetric) |"),
+            "{md}"
+        );
         // Both channels render their own blocks.
         assert!(md.contains("#### Channel 0"), "{md}");
         assert!(md.contains("#### Channel 1"), "{md}");
@@ -1758,10 +1798,33 @@ mod tests {
         assert!(md.contains("| gear mode | 2x |"), "{md}");
         // All 27 timings per channel (the canonical display names).
         for name in [
-            "tCL", "tRCDWR", "tRCDRD", "tRP", "tRAS", "tRC", "tRRDS", "tRRLD", "tFAW",
-            "tWTRS", "tWTRL", "tWR", "tRFC1", "tRFC2", "tRFCsb", "tCWL", "tRTP", "tRDWR",
-            "tWRRD", "tRDRD(SD)", "tRDRD(CCD)", "tRDRD(SCL)", "tRDRD(SC)", "tWRWR(SD)",
-            "tWRWR(CCD)", "tWRWR(SCL)", "tWRWR(SC)",
+            "tCL",
+            "tRCDWR",
+            "tRCDRD",
+            "tRP",
+            "tRAS",
+            "tRC",
+            "tRRDS",
+            "tRRLD",
+            "tFAW",
+            "tWTRS",
+            "tWTRL",
+            "tWR",
+            "tRFC1",
+            "tRFC2",
+            "tRFCsb",
+            "tCWL",
+            "tRTP",
+            "tRDWR",
+            "tWRRD",
+            "tRDRD(SD)",
+            "tRDRD(CCD)",
+            "tRDRD(SCL)",
+            "tRDRD(SC)",
+            "tWRWR(SD)",
+            "tWRWR(CCD)",
+            "tWRWR(SCL)",
+            "tWRWR(SC)",
         ] {
             assert!(md.contains(&format!("| {name} |")), "{md}");
         }
@@ -1770,9 +1833,18 @@ mod tests {
         assert!(md.contains("| tRC | 52 |"), "{md}");
         assert!(md.contains("N/A (not applicable)"), "{md}");
         // The N/A-reason paths for one channel's degraded cells.
-        assert!(md.contains("`intel.ch0.clocks.fclk` — N/A (not applicable)"), "{md}");
-        assert!(md.contains("`intel.ch0.timings.rfc2` — N/A (not applicable)"), "{md}");
-        assert!(md.contains("`intel.ch1.rtl` — N/A (not applicable)"), "{md}");
+        assert!(
+            md.contains("`intel.ch0.clocks.fclk` — N/A (not applicable)"),
+            "{md}"
+        );
+        assert!(
+            md.contains("`intel.ch0.timings.rfc2` — N/A (not applicable)"),
+            "{md}"
+        );
+        assert!(
+            md.contains("`intel.ch1.rtl` — N/A (not applicable)"),
+            "{md}"
+        );
         // The Intel rail labels are the generic descriptions (the AMD
         // SMU names would be a mislabel on Intel — Issue 3): each
         // structurally-Na rail renders with its generic label.
@@ -1780,8 +1852,14 @@ mod tests {
         assert!(md.contains("| Memory I/O | N/A (not applicable) |"), "{md}");
         assert!(md.contains("| Misc | N/A (not applicable) |"), "{md}");
         assert!(md.contains("| VPP | N/A (not applicable) |"), "{md}");
-        assert!(!md.contains("| VDDCR_SOC |"), "no AMD rail names in the Intel section: {md}");
-        assert!(!md.contains("| VDDIO_MEM |"), "no AMD rail names in the Intel section: {md}");
+        assert!(
+            !md.contains("| VDDCR_SOC |"),
+            "no AMD rail names in the Intel section: {md}"
+        );
+        assert!(
+            !md.contains("| VDDIO_MEM |"),
+            "no AMD rail names in the Intel section: {md}"
+        );
         // raw: None renders the not-captured note + the raw N/A reason.
         assert!(md.contains("not captured"), "{md}");
         assert!(md.contains("`raw (whole dump)` — not captured"), "{md}");
@@ -1809,9 +1887,14 @@ mod tests {
         // The 3990X state: no PM table (the `pm: None` short-circuit) +
         // the unverified `0x50200` word (the SMN overlay's gate) + the
         // Threadripper flag (the brand string identifies a 3990X).
-        let mut snap =
-            pm_parse(&SmuContext { version: 0, pm: None }, AmdZen::Zen2)
-                .expect("pm: None short-circuits to the all-zero snapshot");
+        let mut snap = pm_parse(
+            &SmuContext {
+                version: 0,
+                pm: None,
+            },
+            AmdZen::Zen2,
+        )
+        .expect("pm: None short-circuits to the all-zero snapshot");
         snap.smn_setpoint_unverified = true;
         snap.threadripper = true;
         let readout = map_amd(&snap);
@@ -1988,7 +2071,10 @@ mod tests {
             ChannelTrust::VerifiedHardware,
             "",
         )));
-        assert!(md.contains("| channel mode | Dual-Channel (Symmetric) |"), "{md}");
+        assert!(
+            md.contains("| channel mode | Dual-Channel (Symmetric) |"),
+            "{md}"
+        );
         assert!(!md.contains("channel annotation"), "{md}");
     }
 
@@ -2216,8 +2302,7 @@ mod tests {
         let report = amd_fixture_report();
         let bytes =
             bincode::serialize(&report).expect("ProbeReport must serialize (no-panic contract)");
-        let back: ProbeReport =
-            bincode::deserialize(&bytes).expect("ProbeReport must deserialize");
+        let back: ProbeReport = bincode::deserialize(&bytes).expect("ProbeReport must deserialize");
         assert_eq!(report, back);
     }
 

@@ -168,7 +168,10 @@ mod tests {
             "000000000020000000000000",
             "-1",
         ] {
-            assert!(!cap_sys_rawio_from_cappeff(bad), "expected false for {bad:?}");
+            assert!(
+                !cap_sys_rawio_from_cappeff(bad),
+                "expected false for {bad:?}"
+            );
         }
     }
 

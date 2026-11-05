@@ -54,7 +54,7 @@
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
-    _mm256_load_si256, _mm256_store_si256, _mm256_stream_si256, _mm_sfence, __m256i,
+    __m256i, _mm256_load_si256, _mm256_store_si256, _mm256_stream_si256, _mm_sfence,
 };
 
 use crate::features::CpuFeatures;
@@ -76,10 +76,22 @@ use crate::kernel_read::avx2_read;
 /// debug builds; undefined behavior in release builds otherwise). The
 /// kernel does not realign internally.
 pub fn avx2_copy(src: &[u8], dst: &mut [u8]) -> u64 {
-    debug_assert!(src.len() == dst.len(), "avx2_copy: src.len() must equal dst.len()");
-    debug_assert!((src.as_ptr() as usize) % 32 == 0, "avx2_copy: src must be 32-byte aligned");
-    debug_assert!((dst.as_ptr() as usize) % 32 == 0, "avx2_copy: dst must be 32-byte aligned");
-    debug_assert!(src.len() % 32 == 0, "avx2_copy: src.len() must be a multiple of 32");
+    debug_assert!(
+        src.len() == dst.len(),
+        "avx2_copy: src.len() must equal dst.len()"
+    );
+    debug_assert!(
+        (src.as_ptr() as usize) % 32 == 0,
+        "avx2_copy: src must be 32-byte aligned"
+    );
+    debug_assert!(
+        (dst.as_ptr() as usize) % 32 == 0,
+        "avx2_copy: dst must be 32-byte aligned"
+    );
+    debug_assert!(
+        src.len() % 32 == 0,
+        "avx2_copy: src.len() must be a multiple of 32"
+    );
     debug_assert!(
         src.as_ptr() as usize + src.len() <= dst.as_ptr() as usize
             || dst.as_ptr() as usize + dst.len() <= src.as_ptr() as usize,
@@ -121,7 +133,10 @@ pub fn avx2_copy(src: &[u8], dst: &mut [u8]) -> u64 {
 /// debug builds; undefined behavior in release builds otherwise). The
 /// kernel does not realign internally.
 pub fn avx2_copy_resident(src: &[u8], dst: &mut [u8]) -> u64 {
-    debug_assert!(src.len() == dst.len(), "avx2_copy_resident: src.len() must equal dst.len()");
+    debug_assert!(
+        src.len() == dst.len(),
+        "avx2_copy_resident: src.len() must equal dst.len()"
+    );
     debug_assert!(
         (src.as_ptr() as usize) % 32 == 0,
         "avx2_copy_resident: src must be 32-byte aligned",
@@ -314,12 +329,20 @@ mod tests {
         let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, LEN) };
         let checksum = avx2_copy(src, dst);
         assert_eq!(dst, src, "destination must be byte-identical to the source");
-        assert_eq!(checksum, word_sum(src), "checksum must match the P1-04 word sum");
+        assert_eq!(
+            checksum,
+            word_sum(src),
+            "checksum must match the P1-04 word sum"
+        );
         // A direct `copy_from_slice` over the same pair yields the
         // same contents and therefore the same checksum.
         dst.fill(0);
         dst.copy_from_slice(src);
-        assert_eq!(avx2_read(dst), checksum, "checksum must match a direct copy_from_slice result");
+        assert_eq!(
+            avx2_read(dst),
+            checksum,
+            "checksum must match a direct copy_from_slice result"
+        );
         #[cfg(target_arch = "x86_64")]
         if CpuFeatures::detect().avx2 {
             dst.fill(0);
@@ -353,7 +376,10 @@ mod tests {
         assert_ne!(first, 0, "a non-zero pattern must not checksum to 0");
         src[0] = src[0].wrapping_add(1); // mutate the source (byte 0 was 0)
         let third = avx2_copy(src, dst);
-        assert_ne!(third, first, "different source data must change the checksum");
+        assert_ne!(
+            third, first,
+            "different source data must change the checksum"
+        );
         dealloc_aligned(src_ptr, LEN);
         dealloc_aligned(dst_ptr, LEN);
     }
@@ -397,12 +423,22 @@ mod tests {
         let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, LEN) };
         dst.fill(0);
         let resident_checksum = avx2_copy_resident(src, dst);
-        assert_eq!(dst, src, "resident copy must be byte-identical to the source");
-        assert_eq!(resident_checksum, word_sum(src), "resident copy checksum = P1-04 word sum");
+        assert_eq!(
+            dst, src,
+            "resident copy must be byte-identical to the source"
+        );
+        assert_eq!(
+            resident_checksum,
+            word_sum(src),
+            "resident copy checksum = P1-04 word sum"
+        );
         // The NT and resident copies agree on contents and checksum.
         dst.fill(0);
         let nt_checksum = avx2_copy(src, dst);
-        assert_eq!(resident_checksum, nt_checksum, "resident and NT copy checksums must agree");
+        assert_eq!(
+            resident_checksum, nt_checksum,
+            "resident and NT copy checksums must agree"
+        );
         assert_eq!(dst, src);
         #[cfg(target_arch = "x86_64")]
         if CpuFeatures::detect().avx2 {

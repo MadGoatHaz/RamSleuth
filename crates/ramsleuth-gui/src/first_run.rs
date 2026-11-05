@@ -1135,9 +1135,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut open = true;
         let mut setup = SetupOutcome {
-            secure_boot_pending: Some(
-                "reboot, enroll the MOK key, then re-click Setup".to_owned(),
-            ),
+            secure_boot_pending: Some("reboot, enroll the MOK key, then re-click Setup".to_owned()),
             ..Default::default()
         };
         let frame_input = |events: Vec<egui::Event>| egui::RawInput {
@@ -1188,10 +1186,7 @@ mod tests {
             !setup.done,
             "a pending outcome is not done — no auto-reconnect edge may fire",
         );
-        assert!(
-            open,
-            "no click must not close the strip",
-        );
+        assert!(open, "no click must not close the strip",);
     }
 
     /// (l) The liveness trigger — the SETUP strip's visibility
@@ -1203,8 +1198,7 @@ mod tests {
         let data = TelemetryData {
             daemon_status: "disconnected".to_owned(),
             error: Some(
-                "cannot connect to /run/ramsleuth/ramsleuth.sock: daemon not running?"
-                    .to_owned(),
+                "cannot connect to /run/ramsleuth/ramsleuth.sock: daemon not running?".to_owned(),
             ),
             ..Default::default()
         };

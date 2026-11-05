@@ -45,8 +45,8 @@ use std::time::Instant;
 
 use crate::buffers::plan;
 use crate::latency::{build_chase_ring, STRIDE_BYTES};
-use crate::topology::{CpuTopology, TopologyError, detect};
-use crate::worker::{BenchOp, WorkerError, run_pinned};
+use crate::topology::{detect, CpuTopology, TopologyError};
+use crate::worker::{run_pinned, BenchOp, WorkerError};
 
 /// Iterations per pass: bandwidth takes the best (min), latency the median.
 const BENCH_ITERATIONS: usize = 3;
@@ -190,8 +190,14 @@ pub(crate) fn run_all_sized(
         let mut dst = AlignedBuf::new(size);
         fill_pattern(src.as_mut_slice());
 
-        grid.read_gbps[slot] =
-            bench_bandwidth(topo, BenchOp::Read, tier, src.as_slice(), dst.as_mut_slice(), use_avx512)?;
+        grid.read_gbps[slot] = bench_bandwidth(
+            topo,
+            BenchOp::Read,
+            tier,
+            src.as_slice(),
+            dst.as_mut_slice(),
+            use_avx512,
+        )?;
         grid.write_gbps[slot] = bench_bandwidth(
             topo,
             BenchOp::Write,
@@ -200,8 +206,14 @@ pub(crate) fn run_all_sized(
             dst.as_mut_slice(),
             use_avx512,
         )?;
-        grid.copy_gbps[slot] =
-            bench_bandwidth(topo, BenchOp::Copy, tier, src.as_slice(), dst.as_mut_slice(), use_avx512)?;
+        grid.copy_gbps[slot] = bench_bandwidth(
+            topo,
+            BenchOp::Copy,
+            tier,
+            src.as_slice(),
+            dst.as_mut_slice(),
+            use_avx512,
+        )?;
 
         // The latency pass needs a single buffer: release `dst` before
         // allocating the chase buffer to keep the per-tier peak at
@@ -219,7 +231,11 @@ pub(crate) fn run_all_sized(
 /// sizes per-tier windows with it.
 pub(crate) fn normalize_size(size: usize) -> usize {
     let rem = size % STRIDE_BYTES;
-    let aligned = if rem == 0 { size } else { size + STRIDE_BYTES - rem };
+    let aligned = if rem == 0 {
+        size
+    } else {
+        size + STRIDE_BYTES - rem
+    };
     aligned.max(STRIDE_BYTES)
 }
 
@@ -245,10 +261,18 @@ impl AlignedBuf {
     /// Allocate a zeroed `size`-byte window with a guaranteed 64-byte
     /// aligned base (see the struct docs for the padding strategy).
     pub(crate) fn new(size: usize) -> Self {
-        let owner = vec![0u8; size.checked_add(STRIDE_BYTES).expect("aligned buffer size overflow")];
+        let owner = vec![
+            0u8;
+            size.checked_add(STRIDE_BYTES)
+                .expect("aligned buffer size overflow")
+        ];
         let offset = (STRIDE_BYTES - (owner.as_ptr() as usize % STRIDE_BYTES)) % STRIDE_BYTES;
         debug_assert!(offset + size <= owner.len());
-        Self { owner, offset, size }
+        Self {
+            owner,
+            offset,
+            size,
+        }
     }
 
     /// The aligned window as a shared slice.
@@ -265,7 +289,9 @@ impl AlignedBuf {
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as in [`AlignedBuf::as_slice`]; the exclusive
         // `&mut self` guarantees no other view of the window is live.
-        unsafe { std::slice::from_raw_parts_mut(self.owner.as_mut_ptr().add(self.offset), self.size) }
+        unsafe {
+            std::slice::from_raw_parts_mut(self.owner.as_mut_ptr().add(self.offset), self.size)
+        }
     }
 }
 
@@ -361,7 +387,11 @@ fn materialize_chase(ring: &[usize], size: usize) -> AlignedBuf {
     let slots = size / STRIDE_BYTES;
     debug_assert_eq!(ring.len(), slots, "ring must have one entry per slot");
     let mut buf = AlignedBuf::new(size);
-    for (i, chunk) in buf.as_mut_slice().chunks_exact_mut(STRIDE_BYTES).enumerate() {
+    for (i, chunk) in buf
+        .as_mut_slice()
+        .chunks_exact_mut(STRIDE_BYTES)
+        .enumerate()
+    {
         debug_assert!(ring[i] < slots);
         chunk[..8].copy_from_slice(&ring[i].to_le_bytes());
     }
@@ -392,9 +422,7 @@ fn chase_loop(buf: &[u8], hops: usize) -> Option<usize> {
     // storage with a length that is a multiple of 64, so reinterpreting
     // its bytes as `buf.len() / 8` `u64` words is a valid, 8-aligned,
     // in-bounds view of the same storage (no other live references).
-    let words = unsafe {
-        std::slice::from_raw_parts(buf.as_ptr().cast::<u64>(), buf.len() / 8)
-    };
+    let words = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u64>(), buf.len() / 8) };
     let mut idx = 0usize;
     for _ in 0..hops {
         // Release-path bound check (BENCH-6): a corrupted ring entry
@@ -471,7 +499,14 @@ fn chase_materialized(buf: &[u8], hops: usize) -> (f64, usize) {
         };
         let w1 = Instant::now();
         let wall_ns = w1.duration_since(w0).as_secs_f64() * 1e9;
-        (if wall_ns <= 0.0 { 0.0 } else { wall_ns / hops as f64 }, final_idx)
+        (
+            if wall_ns <= 0.0 {
+                0.0
+            } else {
+                wall_ns / hops as f64
+            },
+            final_idx,
+        )
     }
 }
 
@@ -549,7 +584,9 @@ mod tests {
         for i in [0usize, 1, 5, slots - 1] {
             let start = STRIDE_BYTES * i;
             let word = u64::from_le_bytes(
-                bytes[start..start + 8].try_into().expect("8-byte slot prefix"),
+                bytes[start..start + 8]
+                    .try_into()
+                    .expect("8-byte slot prefix"),
             );
             assert_eq!(word as usize, ring[i], "slot {i} must hold ring[{i}]");
         }
@@ -659,8 +696,16 @@ mod tests {
             "a DRAM-sized ring must chase the fixed 1M hops, not a full traversal"
         );
         // A small cache ring (< 1M) is also the fixed 1M.
-        assert_eq!(chase_hops(1024), CHASE_HOPS, "a small cache ring is floored to 1M");
-        assert_eq!(chase_hops(0), CHASE_HOPS, "the hop count is independent of ring length");
+        assert_eq!(
+            chase_hops(1024),
+            CHASE_HOPS,
+            "a small cache ring is floored to 1M"
+        );
+        assert_eq!(
+            chase_hops(0),
+            CHASE_HOPS,
+            "the hop count is independent of ring length"
+        );
     }
 
     /// TC-BENCH6 (BENCH-6): a corrupted ring (one slot index `>= slots`)
@@ -678,12 +723,16 @@ mod tests {
         // to `slots` (out of bounds).
         let ring = build_chase_ring(size, 42);
         let mut buf = AlignedBuf::new(size);
-        for (i, chunk) in buf.as_mut_slice().chunks_exact_mut(STRIDE_BYTES).enumerate() {
+        for (i, chunk) in buf
+            .as_mut_slice()
+            .chunks_exact_mut(STRIDE_BYTES)
+            .enumerate()
+        {
             chunk[..8].copy_from_slice(&ring[i].to_le_bytes());
         }
         let bytes = buf.as_mut_slice();
         bytes[..8].copy_from_slice(&slots.to_le_bytes()); // slot 0 → OOB index
-        // The chase must degrade to a non-counted 0.0, not panic/UB.
+                                                          // The chase must degrade to a non-counted 0.0, not panic/UB.
         let (ns, _) = chase_materialized(bytes, CHASE_HOPS);
         assert_eq!(ns, 0.0, "a corrupted ring degrades to a non-counted 0.0");
     }

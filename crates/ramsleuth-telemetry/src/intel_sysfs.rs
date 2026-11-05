@@ -200,9 +200,9 @@ pub struct SysfsRegs {
 /// 2. the kobject gate ([`kobject_gate`]) — absent →
 ///    [`TelemetryError::DriverMissing`];
 /// 3. the per-attribute reads with per-register containment
-    ///    ([`read_from`]) — the 25 core, the 36 `alk_d4` attributes
-    ///    (graceful `None` on a build that does not expose them), and the
-    ///    18 Tier-3
+///    ([`read_from`]) — the 25 core, the 36 `alk_d4` attributes
+///    (graceful `None` on a build that does not expose them), and the
+///    18 Tier-3
 ///    `ch2/ch3` / `mcl0/mcl1` / `mad_dimm_ch2/3` attributes
 ///    (graceful `None` on a 64 KiB module build).
 ///
@@ -474,9 +474,9 @@ fn kobject_gate(root: &Path) -> TelemetryResult<()> {
 fn classify_io(e: &std::io::Error) -> TelemetryError {
     match e.kind() {
         std::io::ErrorKind::NotFound => TelemetryError::DriverMissing { driver: DRIVER },
-        std::io::ErrorKind::PermissionDenied => TelemetryError::InsufficientPrivilege {
-            hint: PRIV_HINT,
-        },
+        std::io::ErrorKind::PermissionDenied => {
+            TelemetryError::InsufficientPrivilege { hint: PRIV_HINT }
+        }
         _ => TelemetryError::Io(match e.raw_os_error() {
             Some(code) => std::io::Error::from_raw_os_error(code),
             None => std::io::Error::new(e.kind(), e.to_string()),
@@ -584,7 +584,10 @@ mod tests {
     impl TempKobject {
         fn new(test: &str) -> Self {
             let mut root = std::env::temp_dir();
-            root.push(format!("ramsleuth-intel-sysfs-{test}-{}", std::process::id()));
+            root.push(format!(
+                "ramsleuth-intel-sysfs-{test}-{}",
+                std::process::id()
+            ));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).expect("temp kobject dir");
             Self { root }
@@ -1230,8 +1233,11 @@ mod tests {
         }
         let k = TempKobject::new("unreadable");
         write_acceptance_kobject(&k);
-        std::fs::set_permissions(k.root.join("mcbios_req"), std::fs::Permissions::from_mode(0o0))
-            .expect("chmod");
+        std::fs::set_permissions(
+            k.root.join("mcbios_req"),
+            std::fs::Permissions::from_mode(0o0),
+        )
+        .expect("chmod");
         let err = read_from(&k.root).unwrap_err();
         assert_eq!(
             err,

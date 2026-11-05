@@ -39,8 +39,8 @@
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
-    _mm256_add_epi64, _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_load_si256,
-    _mm256_setzero_si256, _mm_add_epi64, _mm_cvtsi128_si64, _mm_unpackhi_epi64, __m256i,
+    __m256i, _mm256_add_epi64, _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_load_si256,
+    _mm256_setzero_si256, _mm_add_epi64, _mm_cvtsi128_si64, _mm_unpackhi_epi64,
 };
 
 use crate::features::CpuFeatures;
@@ -57,8 +57,14 @@ use crate::features::CpuFeatures;
 /// bytes (asserted in debug builds; undefined behavior in release builds
 /// otherwise). The kernel does not realign internally.
 pub fn avx2_read(src: &[u8]) -> u64 {
-    debug_assert!((src.as_ptr() as usize) % 32 == 0, "avx2_read: src must be 32-byte aligned");
-    debug_assert!(src.len() % 32 == 0, "avx2_read: src.len() must be a multiple of 32");
+    debug_assert!(
+        (src.as_ptr() as usize) % 32 == 0,
+        "avx2_read: src must be 32-byte aligned"
+    );
+    debug_assert!(
+        src.len() % 32 == 0,
+        "avx2_read: src.len() must be a multiple of 32"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if CpuFeatures::detect().avx2 {
@@ -207,7 +213,11 @@ mod tests {
             *b = (i % 251) as u8;
         }
         let expected = word_sum(slice);
-        assert_eq!(avx2_read(slice), expected, "must equal the word-sum reference");
+        assert_eq!(
+            avx2_read(slice),
+            expected,
+            "must equal the word-sum reference"
+        );
         assert_eq!(avx2_read(slice), expected, "two calls must agree");
         slice[0] = 250; // original byte 0 was `0`
         assert_ne!(avx2_read(slice), expected, "different data must differ");

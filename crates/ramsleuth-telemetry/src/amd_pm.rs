@@ -90,15 +90,14 @@ const MIN_LEN: usize = 0x518;
 /// 5950X silicon against the amkillam/ryzen_smu driver model — the live
 /// driver reports 0x380805).
 pub const VERMEER_TABLE_VERSIONS: [u32; 10] = [
-    0x2D_08_03, 0x2D_09_03, 0x38_00_05, 0x38_05_05, 0x38_06_05, 0x38_07_05,
-    0x38_08_04, 0x38_08_05, 0x38_09_04, 0x38_09_05,
+    0x2D_08_03, 0x2D_09_03, 0x38_00_05, 0x38_05_05, 0x38_06_05, 0x38_07_05, 0x38_08_04, 0x38_08_05,
+    0x38_09_04, 0x38_09_05,
 ];
 
 /// Matisse / Zen 2 accepted `TableVersionId`s (shares Vermeer's f32
 /// layout).
 pub const MATISSE_TABLE_VERSIONS: [u32; 8] = [
-    0x24_00_03, 0x24_05_03, 0x24_06_03, 0x24_07_03,
-    0x24_08_02, 0x24_08_03, 0x24_09_02, 0x24_09_03,
+    0x24_00_03, 0x24_05_03, 0x24_06_03, 0x24_07_03, 0x24_08_02, 0x24_08_03, 0x24_09_02, 0x24_09_03,
 ];
 
 /// One PM-table layout, keyed by AMD Zen generation (generation-first —
@@ -898,10 +897,19 @@ mod tests {
     fn non_finite_fields_degrade_to_zero() {
         let ctx = SmuContext {
             version: V_VERMEER,
-            pm: Some(synthetic_blob(f32::NAN, f32::INFINITY, f32::INFINITY, f32::NAN, f32::NAN)),
+            pm: Some(synthetic_blob(
+                f32::NAN,
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NAN,
+                f32::NAN,
+            )),
         };
         // uclk == mclk (both +inf) -> derived 1:1; everything else 0.
-        assert_eq!(parse(&ctx, AmdZen::Zen3), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 0, 0, 0)));
+        assert_eq!(
+            parse(&ctx, AmdZen::Zen3),
+            Ok(known_snapshot(V_VERMEER, 0, 0, 0, 0, 0, 0))
+        );
     }
 
     /// (e) Negative (but finite) floats degrade to the zero value.
@@ -912,7 +920,10 @@ mod tests {
             pm: Some(synthetic_blob(-1.0, -2.0, -4.0, -0.5, -1.5)),
         };
         // -2.0 != -4.0 -> derived 1:2.
-        assert_eq!(parse(&ctx, AmdZen::Zen3), Ok(known_snapshot(V_VERMEER, 0, 0, 0, 1, 0, 0)));
+        assert_eq!(
+            parse(&ctx, AmdZen::Zen3),
+            Ok(known_snapshot(V_VERMEER, 0, 0, 0, 1, 0, 0))
+        );
     }
 
     /// (b) Truncated blobs — every length from 0 up to one byte short of
@@ -962,12 +973,18 @@ mod tests {
     fn parse_pm_none_yields_all_zero_snapshot() {
         // A `0` version sentinel (no version attribute published) must NOT
         // be rejected — the short-circuit returns before the version gate.
-        let ctx = SmuContext { version: 0, pm: None };
+        let ctx = SmuContext {
+            version: 0,
+            pm: None,
+        };
         assert_eq!(parse(&ctx, AmdZen::Zen2), Ok(all_zero_snapshot(0)));
 
         // A non-zero version (a readable `pm_table_version` attribute) is
         // carried into the all-zero snapshot.
-        let ctx = SmuContext { version: 0x38_08_05, pm: None };
+        let ctx = SmuContext {
+            version: 0x38_08_05,
+            pm: None,
+        };
         assert_eq!(parse(&ctx, AmdZen::Zen3), Ok(all_zero_snapshot(0x38_08_05)));
 
         // Every field is zero (the honest-Na basis under the P2-05 gates).
@@ -1003,7 +1020,10 @@ mod tests {
             pm: Some(synthetic_blob(1600.0, 1600.0, 1600.0, 1.0, 0.0)),
         };
         assert_eq!(
-            parse(&ctx, AmdZen::Zen3).expect("synthetic blob must parse").voltages.vcore_mv,
+            parse(&ctx, AmdZen::Zen3)
+                .expect("synthetic blob must parse")
+                .voltages
+                .vcore_mv,
             0
         );
     }
