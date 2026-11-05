@@ -118,12 +118,26 @@ const VOLTAGE_MAX_MV: u16 = 4000;
 const PM_NOT_EXPOSED_REASON: &str =
     "PM table not exposed by driver (AGESA version may be unsupported by ryzen-smu)";
 
+/// The specific N/A reason for PM-derived fields on a Threadripper
+/// (Castle Peak / TRX40) platform when the `ryzen-smu` driver does not
+/// expose the `pm_table` attribute — a known driver limitation on
+/// Threadripper 3000 / WRX80, not a decode failure.
+const PM_NOT_EXPOSED_TRX40_REASON: &str =
+    "PM table not exposed by ryzen-smu driver on this platform (known limitation for Threadripper 3000/WRX80)";
+
 /// The specific N/A reason for the `0x50200`-derived fields (GDM,
 /// command rate) when the word was read but its decoded MCLK set-point
 /// is `0` MHz — impossible for a running system, so the word's field
 /// layout is unverified on this platform (Castle Peak reads
 /// `0x00000100`; the Vermeer / Renoir layout does not apply).
 const SMN_50200_UNVERIFIED_REASON: &str = "0x50200 layout unverified on this platform";
+
+/// The specific N/A reason for the `0x50200`-derived fields (GDM,
+/// command rate) on a Threadripper (Castle Peak / TRX40) platform:
+/// the register layout is known to differ from desktop Matisse /
+/// Vermeer, so the fields are unvalidated and reported unavailable.
+const SMN_50200_UNVERIFIED_TRX40_REASON: &str =
+    "0x50200 layout not validated for Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable";
 
 // ---------------------------------------------------------------------------
 // Vendor-neutral display types (frozen here; P2-07 + P2-10 consume them).
@@ -539,33 +553,52 @@ fn map_voltage(mv: u16) -> Section<u16> {
 /// A PM-derived clock: the specific "PM table not exposed by driver" N/A
 /// when `pm_exposed` is `false` (the driver is loaded but the `pm_table`
 /// attribute is absent — e.g. Castle Peak / Threadripper 3990X), else the
-/// usual sanity gate.
-fn pm_clock(mhz: u16, pm_exposed: bool) -> Section<f64> {
+/// usual sanity gate. `threadripper` selects the platform-specific
+/// wording.
+fn pm_clock(mhz: u16, pm_exposed: bool, threadripper: bool) -> Section<f64> {
     if !pm_exposed {
-        return Section::na(pm_not_exposed_na());
+        return Section::na(pm_not_exposed_na(threadripper));
     }
     map_clock(mhz)
 }
 
 /// A PM-derived voltage: the same gate as [`pm_clock`].
-fn pm_voltage(mv: u16, pm_exposed: bool) -> Section<u16> {
+fn pm_voltage(mv: u16, pm_exposed: bool, threadripper: bool) -> Section<u16> {
     if !pm_exposed {
-        return Section::na(pm_not_exposed_na());
+        return Section::na(pm_not_exposed_na(threadripper));
     }
     map_voltage(mv)
 }
 
 /// The N/A cell for a PM-derived field whose data source is absent
 /// (names the driver / AGESA cause — not a decode failure).
-fn pm_not_exposed_na() -> NaReason {
-    NaReason::ParseError(PM_NOT_EXPOSED_REASON.to_owned())
+///
+/// `threadripper` selects the platform-specific wording: a Threadripper
+/// (Castle Peak / TRX40) host gets the "known limitation" message; all
+/// other platforms keep the original text unchanged.
+fn pm_not_exposed_na(threadripper: bool) -> NaReason {
+    let reason = if threadripper {
+        PM_NOT_EXPOSED_TRX40_REASON
+    } else {
+        PM_NOT_EXPOSED_REASON
+    };
+    NaReason::ParseError(reason.to_owned())
 }
 
 /// The N/A cell for a `0x50200`-derived field (GDM / command rate) whose
 /// word proved unverified on this platform (a `0` MHz set-point is
 /// impossible for a running system).
-fn smn_50200_na() -> NaReason {
-    NaReason::ParseError(SMN_50200_UNVERIFIED_REASON.to_owned())
+///
+/// `threadripper` selects the platform-specific wording: a Threadripper
+/// (Castle Peak / TRX40) host gets the "layout not validated" message;
+/// all other platforms keep the original text unchanged.
+fn smn_50200_na(threadripper: bool) -> NaReason {
+    let reason = if threadripper {
+        SMN_50200_UNVERIFIED_TRX40_REASON
+    } else {
+        SMN_50200_UNVERIFIED_REASON
+    };
+    NaReason::ParseError(reason.to_owned())
 }
 
 /// Maps the frozen [`AmdPmSnapshot`] (P2-04) to the vendor-neutral
@@ -599,20 +632,22 @@ fn build_readout(snap: &AmdPmSnapshot, ch: &ChannelSmnFields) -> AmdReadout {
     let t = &snap.timings;
     let c = &snap.cad_bus;
     let v = &snap.voltages;
+    let tr = snap.threadripper;
 
     AmdReadout {
         clocks: ClockReadout {
             // PM-derived: the specific "not exposed by driver" N/A when
             // `pm_exposed` is false (the Castle Peak / Threadripper
             // 3990X case — a missing data source, not a decode failure),
-            // else the usual sanity gate.
-            mclk_mhz: pm_clock(snap.mclk_mhz, snap.pm_exposed),
-            uclk_mhz: pm_clock(snap.uclk_mhz, snap.pm_exposed),
-            fclk_mhz: pm_clock(snap.fclk_mhz, snap.pm_exposed),
+            // else the usual sanity gate. The Threadripper flag selects
+            // the platform-specific wording.
+            mclk_mhz: pm_clock(snap.mclk_mhz, snap.pm_exposed, tr),
+            uclk_mhz: pm_clock(snap.uclk_mhz, snap.pm_exposed, tr),
+            fclk_mhz: pm_clock(snap.fclk_mhz, snap.pm_exposed, tr),
             div_mode: if snap.pm_exposed {
                 map_div_mode(snap.div_mode)
             } else {
-                Section::na(pm_not_exposed_na())
+                Section::na(pm_not_exposed_na(tr))
             },
             // AMD PM tables report the UCLK:MCLK divide mode, not an
             // Intel-style SA:MEM gear multiplier → not applicable.
@@ -620,15 +655,16 @@ fn build_readout(snap: &AmdPmSnapshot, ch: &ChannelSmnFields) -> AmdReadout {
             // The `0x50200` gate: a present word whose set-point
             // decodes to `0` MHz is unverified on this platform —
             // GDM / command rate render N/A with the specific reason
-            // instead of the coincidental bits ("off" / "1T").
+            // instead of the coincidental bits ("off" / "1T"). The
+            // Threadripper flag selects the platform-specific wording.
             gdm: if snap.smn_setpoint_unverified {
-                Section::na(smn_50200_na())
+                Section::na(smn_50200_na(tr))
             } else {
                 map_mode_flag(snap.gdm)
             },
             pdm: map_mode_flag(snap.pdm),
             command_rate: if snap.smn_setpoint_unverified {
-                Section::na(smn_50200_na())
+                Section::na(smn_50200_na(tr))
             } else {
                 map_command_rate(snap.command_rate)
             },
@@ -673,13 +709,14 @@ fn build_readout(snap: &AmdPmSnapshot, ch: &ChannelSmnFields) -> AmdReadout {
             cke_drv: map_code_to_ohms(c.cke_drv),
         },
         // PM-derived rails: the specific "not exposed by driver" N/A
-        // when `pm_exposed` is false, else the usual sanity gate.
+        // when `pm_exposed` is false (the Threadripper flag selects the
+        // platform-specific wording), else the usual sanity gate.
         voltages: VoltageSet {
-            vddcr_soc_mv: pm_voltage(v.vddcr_soc_mv, snap.pm_exposed),
-            vddio_mem_mv: pm_voltage(v.vddio_mem_mv, snap.pm_exposed),
-            vdd_misc_mv: pm_voltage(v.vdd_misc_mv, snap.pm_exposed),
-            vpp_mv: pm_voltage(v.vpp_mv, snap.pm_exposed),
-            vcore_mv: pm_voltage(v.vcore_mv, snap.pm_exposed),
+            vddcr_soc_mv: pm_voltage(v.vddcr_soc_mv, snap.pm_exposed, tr),
+            vddio_mem_mv: pm_voltage(v.vddio_mem_mv, snap.pm_exposed, tr),
+            vdd_misc_mv: pm_voltage(v.vdd_misc_mv, snap.pm_exposed, tr),
+            vpp_mv: pm_voltage(v.vpp_mv, snap.pm_exposed, tr),
+            vcore_mv: pm_voltage(v.vcore_mv, snap.pm_exposed, tr),
         },
         channel_mode: ch.mode,
         ecc_status: ch.ecc,
@@ -697,6 +734,7 @@ mod tests {
             version: 0x0007_0B02, // 7.11.2 — the test-host family
             pm_exposed: true,
             smn_setpoint_unverified: false,
+            threadripper: false,
             mclk_mhz: 1600,
             uclk_mhz: 1600,
             fclk_mhz: 1600,
@@ -1138,6 +1176,96 @@ mod tests {
         let ro = map_amd(&good_snapshot());
         assert_eq!(ro.clocks.gdm, Section::Value(true));
         assert_eq!(ro.clocks.command_rate, Section::Value(CommandRate::OneT));
+    }
+
+    /// (i″) Threadripper / Castle Peak: PM table not exposed → the
+    /// platform-specific "known limitation for Threadripper 3000/WRX80"
+    /// reason instead of the generic desktop text. Non-TRX40 platforms
+    /// keep the original message (regression check above).
+    #[test]
+    fn pm_table_not_exposed_threadripper_carries_specific_reason() {
+        let mut s = good_snapshot();
+        s.pm_exposed = false;
+        s.threadripper = true;
+        s.mclk_mhz = 0;
+        s.uclk_mhz = 0;
+        s.fclk_mhz = 0;
+        s.div_mode = 0;
+        s.voltages = AmdPmVoltages {
+            vddcr_soc_mv: 0,
+            vddio_mem_mv: 0,
+            vdd_misc_mv: 0,
+            vpp_mv: 0,
+            vcore_mv: 0,
+        };
+        let ro = map_amd(&s);
+
+        for cell in [&ro.clocks.mclk_mhz, &ro.clocks.uclk_mhz, &ro.clocks.fclk_mhz] {
+            let detail = parse_error_detail(cell)
+                .expect("a PM clock with no table must be Na(ParseError)");
+            assert!(
+                detail.contains("PM table not exposed by ryzen-smu driver"),
+                "the TRX40 reason names the driver: {detail}"
+            );
+            assert!(
+                detail.contains("known limitation for Threadripper 3000/WRX80"),
+                "the TRX40 reason names the platform: {detail}"
+            );
+        }
+        // The divide mode: the same TRX40-specific reason.
+        let detail = parse_error_detail(&ro.clocks.div_mode)
+            .expect("the divide mode with no table must be Na(ParseError)");
+        assert!(
+            detail.contains("known limitation for Threadripper 3000/WRX80"),
+            "{detail}"
+        );
+
+        for cell in [
+            &ro.voltages.vddcr_soc_mv,
+            &ro.voltages.vddio_mem_mv,
+            &ro.voltages.vdd_misc_mv,
+            &ro.voltages.vpp_mv,
+            &ro.voltages.vcore_mv,
+        ] {
+            let detail = parse_error_detail(cell)
+                .expect("a PM rail with no table must be Na(ParseError)");
+            assert!(
+                detail.contains("known limitation for Threadripper 3000/WRX80"),
+                "{detail}"
+            );
+        }
+    }
+
+    /// (i‴) Threadripper / Castle Peak: the `0x50200` unverified gate →
+    /// the platform-specific "layout not validated for Threadripper/TRX40
+    /// (Castle Peak)" reason instead of the generic desktop text.
+    #[test]
+    fn unverified_50200_threadripper_carries_specific_reason() {
+        let mut s = good_snapshot();
+        s.smn_setpoint_unverified = true;
+        s.threadripper = true;
+        let ro = map_amd(&s);
+
+        let detail = parse_error_detail(&ro.clocks.gdm)
+            .expect("an unverified 0x50200 word must Na the GDM");
+        assert!(
+            detail.contains("0x50200 layout not validated for Threadripper/TRX40"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("Castle Peak"),
+            "the TRX40 reason names the platform: {detail}"
+        );
+        let detail = parse_error_detail(&ro.clocks.command_rate)
+            .expect("an unverified 0x50200 word must Na the command rate");
+        assert!(
+            detail.contains("0x50200 layout not validated for Threadripper/TRX40"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("GDM and command rate unavailable"),
+            "{detail}"
+        );
     }
 
     /// The RZQ code table resolves known divisors to `240/N` ohms and rejects

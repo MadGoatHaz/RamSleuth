@@ -327,6 +327,15 @@ pub struct AmdPmSnapshot {
     /// `gdm` / `command_rate` as N/A with the unverified-layout reason
     /// instead of the coincidental bits.
     pub smn_setpoint_unverified: bool,
+    /// `true` when the CPU brand identifies a Threadripper
+    /// (Castle Peak / TRX40 / Threadripper PRO). Set by the facade
+    /// ([`crate::facade::amd_branch`]) from
+    /// [`crate::cpuid::is_threadripper`] after the snapshot is parsed;
+    /// `parse` initializes it to `false`. The P2-05 mapping uses this
+    /// flag to emit platform-specific N/A reasons (the PM-table and
+    /// `0x50200` limitations are known Threadripper behaviors, not
+    /// decode failures).
+    pub threadripper: bool,
     /// Memory clock (MCLK) in MHz.
     pub mclk_mhz: u16,
     /// Memory controller clock (UCLK) in MHz.
@@ -454,9 +463,11 @@ pub fn parse(ctx: &SmuContext, zen: AmdZen) -> TelemetryResult<AmdPmSnapshot> {
         version: ctx.version,
         // A present blob is an exposed table; the set-point flag starts
         // `false` — the SMN overlay sets it when `0x50200` proves
-        // unverified.
+        // unverified. The threadripper flag is `false` here — the
+        // facade sets it from the CPU brand after `parse`.
         pm_exposed: true,
         smn_setpoint_unverified: false,
+        threadripper: false,
         mclk_mhz: to_u16(mclk),
         uclk_mhz: to_u16(uclk),
         fclk_mhz: to_u16(fclk),
@@ -540,9 +551,12 @@ fn all_zero_snapshot(version: u32) -> AmdPmSnapshot {
         version,
         // No table: the PM-derived fields are N/A with the specific
         // "not exposed by driver" reason (the mapping keys on this flag),
-        // never the generic "0 outside plausible range" parse error.
+        // never the generic "0 outside plausible range" parse error. The
+        // threadripper flag is `false` here — the facade sets it from
+        // the CPU brand.
         pm_exposed: false,
         smn_setpoint_unverified: false,
+        threadripper: false,
         mclk_mhz: 0,
         uclk_mhz: 0,
         fclk_mhz: 0,
@@ -640,6 +654,7 @@ mod tests {
             version,
             pm_exposed: true,
             smn_setpoint_unverified: false,
+            threadripper: false,
             mclk_mhz,
             uclk_mhz,
             fclk_mhz,

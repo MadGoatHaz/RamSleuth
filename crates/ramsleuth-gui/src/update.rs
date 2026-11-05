@@ -1735,6 +1735,7 @@ mod tests {
             version: 0x0007_0B02,
             pm_exposed: true,
             smn_setpoint_unverified: false,
+            threadripper: false,
             mclk_mhz,
             uclk_mhz: 1600,
             fclk_mhz: 1600,

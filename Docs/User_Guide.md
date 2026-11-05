@@ -1507,6 +1507,37 @@ against your *current* kernel and staged (inspectable) under
 module itself** — loading is the helper's job, kept separate so the daemon
 stays sandboxed and the driver stays an explicit, audited opt-in.
 
+### 10.1 Threadripper / TRX40 / WRX80 known limitations
+
+On AMD Threadripper (Castle Peak / TRX40, Threadripper PRO / WRX80, and
+future Threadripper platforms) two fields may show `N/A` even when the
+`ryzen_smu` module is installed and working correctly. **These are known
+platform limitations, not bugs:**
+
+- **PM table (MCLK / UCLK / FCLK / divide mode / voltages)** — the
+  `ryzen_smu` driver does not expose the `pm_table` sysfs attribute on
+  some Threadripper AGESA versions. When this happens, every PM-derived
+  field reads:
+  `N/A (PM table not exposed by ryzen-smu driver on this platform (known limitation for Threadripper 3000/WRX80))`
+  This is a limitation of the driver's AGESA support matrix, not of
+  RamSleuth. The SMN-overlay fields (DRAM subtimings, command rate, GDM)
+  are read through a separate interface and are **not affected** by this.
+
+- **GDM / command rate (`0x50200` layout)** — the `0x50200` UMC register
+  that carries the MCLK set-point, Gear Down Mode, and DRAM command rate
+  uses a different bit layout on Threadripper (Castle Peak) than on
+  desktop Matisse / Vermeer. When RamSleuth detects that the decoded
+  set-point is implausible (0 MHz — impossible on a running system), it
+  conservatively reports:
+  `N/A (0x50200 layout not validated for Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)`
+  The remaining 27 DRAM subtimings are read from separate registers and
+  are **not affected**.
+
+All other telemetry (SPD, platform info, benchmarks, CPU temperature)
+works normally on Threadripper. If your Threadripper system *does*
+expose the PM table (some AGESA versions do), all fields will populate
+as on desktop Ryzen.
+
 ---
 
 ## 10.5 Intel live subtimings: the `ramsleuth_intel` module (optional)
@@ -1772,6 +1803,14 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   **board-delivered** from the Super-I/O `in0` (not the MCHBAR window), with
   the confidence badge from Section 8.3 — it reads `N/A` only on enterprise
   / out-of-bounds / no-Super-I/O boards.
+- **Threadripper / TRX40 / WRX80** — two known platform limitations
+  (Section 10.1): the `ryzen_smu` driver may not expose the PM table on
+  some Threadripper AGESA versions (MCLK / UCLK / FCLK / voltages read
+  `N/A` with a platform-specific reason), and the `0x50200` UMC register
+  layout differs from desktop Ryzen (GDM / command rate read `N/A` with a
+  "layout not validated" reason). The 27 DRAM subtimings, SPD, benchmarks,
+  and all other telemetry work normally — these are driver / silicon
+  limitations, not RamSleuth faults.
 - **Some Vermeer (Zen 3) boards read the PM-table subtiming block as 0** —
   the 27 subtimings come back zeroed (the firmware leaves the block
   unpopulated) while the clocks, voltages, and SPD all read normally — a
