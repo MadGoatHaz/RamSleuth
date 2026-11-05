@@ -422,7 +422,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     dpkg-deb --info "$OUTPUT"
     echo ""
     echo "=== dpkg-deb -c (file list) ==="
-    dpkg-deb -c "$OUTPUT" | head -50
+    dpkg-deb -c "$OUTPUT"
 else
     echo ""
     echo "=== Package structure (no dpkg-deb) ==="
