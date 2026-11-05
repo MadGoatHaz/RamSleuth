@@ -1,4 +1,5 @@
-//! SMBIOS Type 17 cross-check (Intel memory-channel detection, Chunk 2).
+//! SMBIOS Type 17 cross-check (Intel memory-channel detection, Chunk 2) and
+//! vendor-neutral SPD fallback (Chunk 4).
 //!
 //! The hardware MMIO decode ([`crate::intel_readout::decode`]) can misreport
 //! a populated dual-channel kit as single-channel when the IMC registers are
@@ -11,6 +12,16 @@
 //! from the board-locator strings — whether the populated DIMMs sit in
 //! matched channel slots (dual), a single channel, or carry ambiguous
 //! (non-standard) labels.
+//!
+//! **Chunk 4 (vendor-neutral SPD fallback):** the same SMBIOS Type 17
+//! parsing is also used as a fallback when the `ee1004` EEPROM driver has no
+//! bound devices (common on TRX40 / older AMD platforms). The
+//! [`collect_module_entries`] function returns a [`SmbiosModuleEntry`] per
+//! populated DIMM with basic module identity (size, speed, part number,
+//! manufacturer, serial, locator). SMBIOS does **not** carry XMP/EXPO
+//! profiles or JEP106 die-maker codes — those are SPD-EEPROM-only — so the
+//! fallback is marked "limited" by the consumer (the facade threads the
+//! source annotation into the readout).
 //!
 //! # Source (unprivileged, `std::fs`-only)
 //!
@@ -104,6 +115,12 @@ const SPEED_LEN: usize = 2;
 /// the 3.5 layout). SMBIOS 3.0+ inserted the 2-byte `Memory Error
 /// Information Handle` at `0x06-0x07`, shifting the fields that follow by
 /// +2 relative to the 2.x classic table.
+///
+/// Chunk 4: the string-reference fields (manufacturer, serial number,
+/// asset tag, part number) are now version-keyed too — the same +2 shift
+/// applies (verified against the real 12600KF/Z690M-ITX/ax 3.5 fixture
+/// whose strings decode to "Team Group Inc" / "0104D817" /
+/// "9876543210" / "TEAMGROUP-UD4-3600").
 #[derive(Debug, Clone, Copy)]
 struct Type17Offsets {
     /// The 16-bit "Memory Device Capacity" word.
@@ -117,6 +134,14 @@ struct Type17Offsets {
     mem_device_locator: usize,
     /// The "Bank Locator" string reference.
     bank_locator: usize,
+    /// The "Manufacturer" string reference (Chunk 4).
+    manufacturer: usize,
+    /// The "Serial Number" string reference (Chunk 4).
+    serial_number: usize,
+    /// The "Asset Tag" string reference (Chunk 4).
+    asset_tag: usize,
+    /// The "Part Number" string reference (Chunk 4).
+    part_number: usize,
 }
 
 /// The SMBIOS 2.x (2.4 / 2.6) Type 17 offsets — the classic DMTF table
@@ -139,6 +164,12 @@ const SMBIOS2_OFFSETS: Type17Offsets = Type17Offsets {
     memory_type: 0x10,
     mem_device_locator: 0x08,
     bank_locator: 0x09,
+    // Chunk 4: the 2.x string refs are the 3.x values shifted -2 (the
+    // same uniform shift as the other fields).
+    manufacturer: 0x15,
+    serial_number: 0x16,
+    asset_tag: 0x17,
+    part_number: 0x18,
 };
 
 /// The SMBIOS 3.x (3.0–3.8, incl. the verified 3.5 reference) Type 17
@@ -153,6 +184,13 @@ const SMBIOS3_OFFSETS: Type17Offsets = Type17Offsets {
     memory_type: 0x12,
     mem_device_locator: 0x10,
     bank_locator: 0x11,
+    // Chunk 4: verified against the real 12600KF/Z690M-ITX/ax 3.5 fixture
+    // (strings 3-6 = "Team Group Inc" / "0104D817" / "9876543210" /
+    // "TEAMGROUP-UD4-3600").
+    manufacturer: 0x17,
+    serial_number: 0x18,
+    asset_tag: 0x19,
+    part_number: 0x1A,
 };
 
 /// The source status of the SMBIOS Type 17 collection (M-17): *why* the
@@ -299,6 +337,148 @@ impl SmbiosTopology {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Chunk 4: SMBIOS SPD fallback (basic module identity for hosts without ee1004)
+// ---------------------------------------------------------------------------
+
+/// A basic SPD-like module entry derived from SMBIOS Type 17 — the
+/// fallback when the `ee1004` EEPROM driver has no bound devices (common
+/// on TRX40 / older AMD platforms).
+///
+/// Vendor-neutral: SMBIOS Type 17 is exported by the kernel for all
+/// platforms (AMD, Intel, ARM), regardless of CPU vendor.
+///
+/// **Limitations (Chunk 4 contract):** SMBIOS does **not** carry XMP/EXPO
+/// profiles, JEP106 die-maker codes, or detailed SPD timing parameters —
+/// those are SPD-EEPROM-only. This entry provides basic module identity:
+/// size, speed, part number, manufacturer, serial, and locator. The
+/// consumer (the facade) marks the data source so the display layer can
+/// render it with the "limited" annotation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SmbiosModuleEntry {
+    /// Module index: the DMI handle ordinal (0, 1, 2, …) in the order the
+    /// entries were enumerated (sorted by file name).
+    pub index: u8,
+    /// Capacity in MiB.
+    pub capacity_mib: u64,
+    /// Active memory technology (DDR4/DDR5/etc.), if recognized.
+    pub memory_type: Option<MemoryTech>,
+    /// Configured memory speed in MT/s, if reported.
+    pub speed_mts: Option<u16>,
+    /// Device locator string (e.g. "A2", "DIMM A",
+    /// "Controller0-ChannelA-DIMM0").
+    pub locator: String,
+    /// Manufacturer string (e.g. "Team Group Inc"), if present and not
+    /// "Unknown".
+    pub manufacturer: Option<String>,
+    /// Serial number string, if present.
+    pub serial_number: Option<String>,
+    /// Asset tag string, if present.
+    pub asset_tag: Option<String>,
+    /// Part number string (e.g. "TEAMGROUP-UD4-3600"), if present.
+    pub part_number: Option<String>,
+}
+
+/// Collect basic SPD-like module entries from SMBIOS Type 17 for all
+/// populated DIMMs — the [`acquire`](crate::spd_eeprom::acquire) fallback
+/// when the `ee1004` driver has no bound devices.
+///
+/// Returns the `(entries, status)` pair:
+/// - the entries: `vec![]` when the DMI source is absent (VM/container),
+///   no populated DIMM is found, or every structure is corrupt — the
+///   caller renders this as "no SPD data";
+/// - the [`SmbiosSourceStatus`]: *why* the list is empty (absent /
+///   unreadable / corrupt), so the facade can annotate the readout.
+///
+/// # No-panic contract
+///
+/// Mirrors [`collect_from`]: a missing directory (VM / container) or any
+/// read failure yields `vec![]` with the matching [`SmbiosSourceStatus`]
+/// — never a panic, never an invented DIMM.
+pub fn collect_module_entries() -> (Vec<SmbiosModuleEntry>, SmbiosSourceStatus) {
+    collect_module_entries_from(Path::new(DMI_ENTRIES_DIR))
+}
+
+/// The injectable-root [`collect_module_entries`] (the fixture tests pass
+/// a temp directory holding synthetic `17-*` files).
+pub fn collect_module_entries_from(
+    root: &Path,
+) -> (Vec<SmbiosModuleEntry>, SmbiosSourceStatus) {
+    let (topology, status) = collect_from(root);
+    // If the topology is empty, there are no entries.
+    if topology.populated_count == 0 {
+        return (Vec::new(), status);
+    }
+    // Re-parse the entries to build the full module list. We reuse the
+    // same parsing logic as collect_from but keep all per-DIMM data.
+    let entries = parse_module_entries_from(root);
+    (entries, status)
+}
+
+/// Parse all populated Type 17 entries from `root` into
+/// [`SmbiosModuleEntry`] structs (Chunk 4 internal helper).
+fn parse_module_entries_from(root: &Path) -> Vec<SmbiosModuleEntry> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let major = read_bios_major(root);
+    let offsets = if major >= 3 { SMBIOS3_OFFSETS } else { SMBIOS2_OFFSETS };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(TYPE17_PREFIX))
+        })
+        .collect();
+    paths.sort();
+
+    let mut out = Vec::new();
+    for (ordinal, path) in paths.into_iter().enumerate() {
+        // The kernel exports each `17-<n>` as a *directory*; the
+        // structure bytes live in the payload file `17-<n>/raw`.
+        let bytes = match std::fs::read(path.join("raw")) {
+            Ok(b) => b,
+            Err(_) => continue, // unreadable -> skip (no panic)
+        };
+        match parse_type17_full(&bytes, &offsets) {
+            Type17Parse::Populated(parsed) => {
+                out.push(SmbiosModuleEntry {
+                    index: ordinal as u8,
+                    capacity_mib: parsed.capacity_mib,
+                    memory_type: parsed.memory_type,
+                    speed_mts: parsed.speed_mts,
+                    locator: parsed.locator,
+                    // Trim whitespace and filter "Unknown" / empty strings:
+                    // SMBIOS often carries "Unknown" as a placeholder for
+                    // manufacturer, which we treat as absent.
+                    manufacturer: parsed
+                        .manufacturer
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty() && s.to_ascii_lowercase() != "unknown"),
+                    serial_number: parsed
+                        .serial_number
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty()),
+                    asset_tag: parsed
+                        .asset_tag
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty()),
+                    part_number: parsed
+                        .part_number
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty()),
+                });
+            }
+            Type17Parse::Unpopulated => {} // valid structure, empty DIMM
+            Type17Parse::Invalid => {} // corrupt -> skip
+        }
+    }
+    out
+}
+
 /// Collect the SMBIOS Type 17 topology from the kernel's `dmi` export
 /// (the frozen [`DMI_ENTRIES_DIR`]).
 ///
@@ -366,16 +546,16 @@ pub fn collect_from(root: &Path) -> (SmbiosTopology, SmbiosSourceStatus) {
             }
         };
         match parse_type17(&bytes, &offsets) {
-            Type17Parse::Populated(capacity, mem_type, locator, speed) => {
+            Type17Parse::Populated(parsed) => {
                 topology.populated_count = topology.populated_count.saturating_add(1);
-                topology.dimm_sizes.push(capacity);
+                topology.dimm_sizes.push(parsed.capacity_mib);
                 if topology.memory_type.is_none() {
-                    topology.memory_type = mem_type;
+                    topology.memory_type = parsed.memory_type;
                 }
                 if topology.speed_mts.is_none() {
-                    topology.speed_mts = speed;
+                    topology.speed_mts = parsed.speed_mts;
                 }
-                topology.locators.push(locator);
+                topology.locators.push(parsed.locator);
             }
             Type17Parse::Unpopulated => {} // valid structure, empty DIMM
             Type17Parse::Invalid => saw_invalid = true,
@@ -395,12 +575,35 @@ pub fn collect_from(root: &Path) -> (SmbiosTopology, SmbiosSourceStatus) {
     (topology, status)
 }
 
+/// All fields parsed from one populated SMBIOS Type 17 structure
+/// (Chunk 4: the full field set the topology and the module-entry list
+/// share).
+struct ParsedModule {
+    /// Capacity in MiB.
+    capacity_mib: u64,
+    /// Memory technology, if recognized.
+    memory_type: Option<MemoryTech>,
+    /// Device locator string.
+    locator: String,
+    /// Configured memory speed in MT/s, if reported.
+    speed_mts: Option<u16>,
+    /// Manufacturer string, if present.
+    manufacturer: Option<String>,
+    /// Serial number string, if present.
+    serial_number: Option<String>,
+    /// Asset tag string, if present.
+    asset_tag: Option<String>,
+    /// Part number string, if present.
+    part_number: Option<String>,
+}
+
 /// The outcome of parsing one raw Type 17 structure (M-17): a populated
 /// DIMM, a valid-but-unpopulated DIMM (capacity `0` — **not** an error),
 /// or a corrupt / too-short structure (a parse failure).
 enum Type17Parse {
-    /// A populated DIMM: (capacity MiB, memory type, locator, speed MT/s).
-    Populated(u64, Option<MemoryTech>, String, Option<u16>),
+    /// A populated DIMM with all parsed fields (Chunk 4: the full
+    /// [`ParsedModule`] instead of the old 4-tuple).
+    Populated(ParsedModule),
     /// A valid structure whose DIMM is unpopulated (capacity `0`).
     Unpopulated,
     /// A corrupt / too-short structure (a parse failure).
@@ -411,11 +614,26 @@ enum Type17Parse {
 /// [`Type17Offsets`] (M-12), classifying the outcome (M-17): a populated
 /// DIMM, a valid unpopulated DIMM, or a corrupt / too-short structure.
 ///
+/// Chunk 4: the populated arm now carries the full [`ParsedModule`]
+/// (capacity, memory type, locator, speed, and the new string-reference
+/// fields: manufacturer, serial number, asset tag, part number).
+///
 /// # No-panic contract
 ///
 /// Every field read is bounds-checked; a short / corrupt structure yields
 /// [`Type17Parse::Invalid`] (skipped) rather than a panic.
 fn parse_type17(bytes: &[u8], offsets: &Type17Offsets) -> Type17Parse {
+    parse_type17_full(bytes, offsets)
+}
+
+/// The full Type 17 parser (Chunk 4): extracts every field the
+/// [`SmbiosModuleEntry`] needs in addition to the topology data.
+///
+/// # No-panic contract
+///
+/// Every field read is bounds-checked; a short / corrupt structure yields
+/// [`Type17Parse::Invalid`] (skipped) rather than a panic.
+fn parse_type17_full(bytes: &[u8], offsets: &Type17Offsets) -> Type17Parse {
     if bytes.len() < 2 {
         return Type17Parse::Invalid;
     }
@@ -499,7 +717,31 @@ fn parse_type17(bytes: &[u8], offsets: &Type17Offsets) -> Type17Parse {
         None
     };
 
-    Type17Parse::Populated(capacity, mem_type, locator, speed)
+    // Chunk 4: the new string-reference fields (manufacturer, serial
+    // number, asset tag, part number). Each is bounds-checked; an absent
+    // field yields None (never a panic, never an invented value).
+    let str_at = |off: usize| -> Option<String> {
+        if fixed.len() > off {
+            string_at(table, fixed[off])
+        } else {
+            None
+        }
+    };
+    let manufacturer = str_at(offsets.manufacturer);
+    let serial_number = str_at(offsets.serial_number);
+    let asset_tag = str_at(offsets.asset_tag);
+    let part_number = str_at(offsets.part_number);
+
+    Type17Parse::Populated(ParsedModule {
+        capacity_mib: capacity,
+        memory_type: mem_type,
+        locator,
+        speed_mts: speed,
+        manufacturer,
+        serial_number,
+        asset_tag,
+        part_number,
+    })
 }
 
 /// Extract the `ref_idx`-th string from a raw SMBIOS string table
@@ -1163,5 +1405,145 @@ const REAL_12600KF_17_1: &[u8] = &[
         // A `D` that only starts a longer word is not a channel.
         assert_eq!(channel_of("DIMM"), None);
         assert_eq!(channel_of("Decade 1"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Chunk 4: SMBIOS SPD fallback — collect_module_entries tests
+    // ------------------------------------------------------------------
+
+    /// (Chunk 4) The real 12600KF/Z690M-ITX/ax table (SMBIOS 3.5, 92-byte
+    /// fixed part): `collect_module_entries_from` returns 2 populated
+    /// entries with all the new string-reference fields decoded correctly
+    /// from the fixture's string table:
+    /// - String 3: "Team Group Inc" (Manufacturer)
+    /// - String 4: "0104D817" / "0104D816" (Serial Number)
+    /// - String 5: "9876543210" (Asset Tag)
+    /// - String 6: "TEAMGROUP-UD4-3600  " (Part Number)
+    #[test]
+    fn chunk4_real_12600kf_entries_decode_string_fields() {
+        let dmi = TempDmi::new("chunk4-real");
+        write_entry(&dmi.root, 0, REAL_12600KF_17_0);
+        write_entry(&dmi.root, 1, REAL_12600KF_17_1);
+
+        let (entries, status) = collect_module_entries_from(&dmi.root);
+        assert_eq!(status, SmbiosSourceStatus::Ok);
+        assert_eq!(entries.len(), 2, "both populated DIMMs must be entries");
+
+        // Entry 0 (handle 0x000C): the first DIMM.
+        let e0 = &entries[0];
+        assert_eq!(e0.index, 0);
+        assert_eq!(e0.capacity_mib, 16384, "0x4000 MB = 16 GiB");
+        assert_eq!(e0.memory_type, Some(MemoryTech::Ddr4));
+        assert_eq!(e0.speed_mts, Some(3600), "0x0E10 = 3600 MT/s");
+        assert_eq!(e0.locator, "Controller0-ChannelA-DIMM0");
+        assert_eq!(
+            e0.manufacturer.as_deref(),
+            Some("Team Group Inc"),
+            "string ref 3 = Manufacturer"
+        );
+        assert_eq!(
+            e0.serial_number.as_deref(),
+            Some("0104D817"),
+            "string ref 4 = Serial Number (DIMM 0)"
+        );
+        assert_eq!(
+            e0.asset_tag.as_deref(),
+            Some("9876543210"),
+            "string ref 5 = Asset Tag"
+        );
+        assert_eq!(
+            e0.part_number.as_deref(),
+            Some("TEAMGROUP-UD4-3600"),
+            "string ref 6 = Part Number (trimmed)"
+        );
+
+        // Entry 1 (handle 0x000D): the second DIMM (different serial).
+        let e1 = &entries[1];
+        assert_eq!(e1.index, 1);
+        assert_eq!(e1.capacity_mib, 16384);
+        assert_eq!(e1.locator, "Controller1-ChannelA-DIMM0");
+        assert_eq!(e1.manufacturer.as_deref(), Some("Team Group Inc"));
+        assert_eq!(
+            e1.serial_number.as_deref(),
+            Some("0104D816"),
+            "string ref 4 = Serial Number (DIMM 1)"
+        );
+        assert_eq!(e1.asset_tag.as_deref(), Some("9876543210"));
+        assert_eq!(e1.part_number.as_deref(), Some("TEAMGROUP-UD4-3600"));
+    }
+
+    /// (Chunk 4) "Unknown" / empty manufacturer strings are filtered out
+    /// (the SMBIOS spec allows "Unknown" as a placeholder — we treat it as
+    /// absent rather than displaying it). Part number is trimmed.
+    #[test]
+    fn chunk4_unknown_manufacturer_is_filtered() {
+        // Build a synthetic 3.x-layout entry with "Unknown" manufacturer
+        // (string 3) and a part number with trailing spaces (string 4).
+        let o = SMBIOS3_OFFSETS;
+        let mut fixed = [0u8; 0x22];
+        fixed[OFF_LENGTH] = 0x22;
+        fixed[o.capacity..o.capacity + CAPACITY_LEN]
+            .copy_from_slice(&0x4000u16.to_le_bytes());
+        fixed[o.mem_device_locator] = 1;
+        fixed[o.bank_locator] = 2;
+        fixed[o.memory_type] = 0x1A; // DDR4
+        fixed[o.manufacturer] = 3; // string ref -> "Unknown"
+        fixed[o.serial_number] = 0; // no serial
+        fixed[o.asset_tag] = 0; // no asset tag
+        fixed[o.part_number] = 4; // string ref -> "PART-001  "
+        fixed[OFF_SPEED..OFF_SPEED + SPEED_LEN].copy_from_slice(&3200u16.to_le_bytes());
+        let bytes = type17_file(0x22, &mut fixed, &["A2", "A2", "Unknown", "PART-001  "]);
+
+        let dmi = TempDmi::new("chunk4-unknown-mfr");
+        write_entry(&dmi.root, 0, &bytes);
+
+        let (entries, status) = collect_module_entries_from(&dmi.root);
+        assert_eq!(status, SmbiosSourceStatus::Ok);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.manufacturer, None, "\"Unknown\" is filtered out");
+        assert_eq!(e.serial_number, None, "string ref 0 is absent");
+        assert_eq!(e.part_number.as_deref(), Some("PART-001"), "trimmed");
+        assert_eq!(e.speed_mts, Some(3200));
+    }
+
+    /// (Chunk 4) A missing DMI directory yields empty entries with
+    /// `DirAbsent` status (the VM / container case) — never a panic.
+    #[test]
+    fn chunk4_missing_dir_is_empty_entries() {
+        let (entries, status) =
+            collect_module_entries_from(Path::new("/nonexistent/dmi/entries-chunk4"));
+        assert!(entries.is_empty());
+        assert_eq!(status, SmbiosSourceStatus::DirAbsent);
+    }
+
+    /// (Chunk 4) A corrupt structure yields empty entries with
+    /// `ParseError` status.
+    #[test]
+    fn chunk4_corrupt_structure_is_parse_error() {
+        let dmi = TempDmi::new("chunk4-corrupt");
+        write_entry(&dmi.root, 0, &[0x11]); // one byte (no length)
+        let (entries, status) = collect_module_entries_from(&dmi.root);
+        assert!(entries.is_empty());
+        assert_eq!(status, SmbiosSourceStatus::ParseError);
+    }
+
+    /// (Chunk 4) `SmbiosModuleEntry` derives the expected traits.
+    #[test]
+    fn chunk4_module_entry_derives() {
+        let e = SmbiosModuleEntry {
+            index: 0,
+            capacity_mib: 16384,
+            memory_type: Some(MemoryTech::Ddr4),
+            speed_mts: Some(3200),
+            locator: "A2".to_owned(),
+            manufacturer: Some("Test".to_owned()),
+            serial_number: Some("S1".to_owned()),
+            asset_tag: None,
+            part_number: Some("P1".to_owned()),
+        };
+        let e2 = e.clone();
+        assert_eq!(e, e2);
+        assert!(format!("{e:?}").contains("SmbiosModuleEntry"));
     }
 }
