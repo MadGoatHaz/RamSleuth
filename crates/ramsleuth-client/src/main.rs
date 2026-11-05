@@ -100,6 +100,23 @@ const BENCH_READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// a wedged daemon.
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Suggest a related RamSleuth binary when the user types a flag or
+/// positional that looks like they meant to invoke a different tool.
+fn suggest_for_unknown(arg: &str) -> Option<&'static str> {
+    let normalized = arg.trim_start_matches('-');
+    match normalized {
+        "tui" => Some("Did you mean `ramsleuth-tui`? (run `ramsleuth-tui --help`)"),
+        "client" => Some("Did you mean `ramsleuth-client`? (run `ramsleuth-client --help`)"),
+        "bench" => None, // ramsleuth-client has a `bench` subcommand
+        "telemetry" => {
+            Some("Did you mean `ramsleuth-telemetry`? (run `ramsleuth-telemetry --help`)")
+        }
+        "daemon" => Some("Did you mean `ramsleuth-daemon`? (run `ramsleuth-daemon --help`)"),
+        "gui" => Some("Did you mean `ramsleuth` (the GUI)? (run `ramsleuth --help`)"),
+        _ => None,
+    }
+}
+
 /// The client's parsed command line (P3-21).
 ///
 /// Pure data — produced by [`parse_cli`] (no env access, no I/O,
@@ -125,6 +142,9 @@ pub struct CliArgs {
     /// `probe` `--json`: emit the raw `ProbeReport` as JSON instead of
     /// the markdown (to stdout).
     pub probe_json: bool,
+    /// `bench` `--json`: also emit the terminal grid as a JSON object
+    /// (matching the standalone `ramsleuth-bench` `--json`).
+    pub bench_json: bool,
     /// `burn` `--duration <minutes>`: the burn-in soak duration in
     /// minutes (`0` = infinite — the daemon's wire
     /// `duration_minutes`); defaults to [`DEFAULT_BURN_MINUTES`] (the
@@ -145,6 +165,7 @@ impl Default for CliArgs {
             mode: BenchMode::Full,
             probe_stdout: false,
             probe_json: false,
+            bench_json: false,
             burn_duration: DEFAULT_BURN_MINUTES,
         }
     }
@@ -190,7 +211,8 @@ const USAGE: &str = concat!(
     "           CPU, the AMD / Intel sections, and the SPD modules with\n",
     "           XMP/EXPO profiles\n",
     "  bench    Run a streamed Memory & Latency Benchmark\n",
-    "           (progress lines + the 4x4 grid)\n",
+    "           (progress lines + the 4x4 grid; --json also emits the\n",
+    "           grid as JSON)\n",
     "  status   Print the per-section health summary\n",
     "  probe    Fetch the probe report from the daemon and write it as\n",
     "           markdown to ~/.ramsleuth/probe-report.md (--stdout\n",
@@ -208,13 +230,22 @@ const USAGE: &str = concat!(
     "  --stdout                         probe: print the report to stdout\n",
     "                                   instead of the default file\n",
     "  --json                           probe: emit the raw ProbeReport as\n",
-    "                                   JSON instead of the markdown\n",
+    "                                   JSON instead of the markdown;\n",
+    "                                   bench: also emit the grid as JSON\n",
     "  --duration <minutes>             burn: the soak duration in minutes\n",
     "                                   (default: 5; 0 = infinite)\n",
     "  -h, --help                       Print this help and exit\n",
     "  -V, --version                    Print the version and exit\n",
     "\n",
     "Exit codes: 0 success, 1 daemon/client error, 2 usage error\n",
+    "\n",
+    "Related tools:\n",
+    "  ramsleuth              Desktop GUI (egui)\n",
+    "  ramsleuth-tui          Terminal dashboard (ratatui)\n",
+    "  ramsleuth-client       CLI client (probe, dump, status, bench, burn)\n",
+    "  ramsleuth-bench        Standalone memory & latency benchmark\n",
+    "  ramsleuth-telemetry    Standalone telemetry snapshot (no daemon)\n",
+    "  ramsleuth-daemon       Privileged root daemon (CAP_SYS_RAWIO)\n",
 );
 
 /// The `--version`/`-V` output line: `ramSleuth <bin> v<version>` —
@@ -367,6 +398,7 @@ where
                 }
                 "--json" => {
                     parsed.probe_json = true;
+                    parsed.bench_json = true;
                 }
                 "--duration" => {
                     let value = iter.next().map(|v| v.as_ref().to_owned()).ok_or_else(|| {
@@ -375,11 +407,15 @@ where
                     parsed.burn_duration = parse_duration(&value)?;
                 }
                 other => {
-                    return Err(format!(
+                    let mut msg = format!(
                         "unknown flag `{other}` (expected `--socket <path>`, \
                          `--tier <memory|l1|l2|l3|full>`, `--mode <full|memory-only>`, \
                          `--stdout`, `--json`, or `--duration <minutes>`)"
-                    ));
+                    );
+                    if let Some(sug) = suggest_for_unknown(other) {
+                        msg.push_str(&format!("\n  {sug}"));
+                    }
+                    return Err(msg);
                 }
             }
         } else {
@@ -471,7 +507,7 @@ fn main() {
     // through to exit 0; any client/daemon error exits 1.
     let result: Result<(), ClientError> = match args.subcommand {
         Subcommand::Dump => dump(&mut client),
-        Subcommand::Bench => bench(&mut client, args.target, args.mode).map(drop),
+        Subcommand::Bench => bench(&mut client, args.target, args.mode, args.bench_json).map(drop),
         Subcommand::Status => status(&mut client).map(drop),
         Subcommand::Probe => probe(&mut client, args.probe_stdout, args.probe_json).map(drop),
         Subcommand::Burn => burn(&mut client, args.burn_duration).map(drop),

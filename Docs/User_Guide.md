@@ -968,7 +968,8 @@ Options:
   --tier <memory|l1|l2|l3|full>    bench: tier scope (default: full)
   --mode <full|memory-only>        bench: run scope (default: full)
   --stdout                         probe: print the report to stdout
-  --json                           probe: emit the raw ProbeReport as JSON
+  --json                           probe: emit the raw ProbeReport as JSON;
+                                    bench: also emit the grid as JSON
   --duration <minutes>             burn: the soak duration (default: 5;
                                    0 = infinite)
 
@@ -992,9 +993,10 @@ Exit codes: 0 success, 1 daemon/client error, 2 usage error
   bandwidth in GB/s, latency in ns/hop, unmeasured cells `N/A`). `--tier`
   scopes which tier rows run (`memory` / `l1` / `l2` / `l3` / `full`,
   default `full`); `--mode` scopes the run (`full` = all 12 bandwidth cells
-  plus the four latency passes, or `memory-only`; default `full`). A run in
-  flight elsewhere (single-flight daemon) answers with a structured
-  "benchmark already running" error.
+  plus the four latency passes, or `memory-only`; default `full`); `--json`
+  also emits the terminal grid as a JSON object (matching the standalone
+  `ramsleuth-bench` `--json`). A run in flight elsewhere (single-flight
+  daemon) answers with a structured "benchmark already running" error.
 - **`status`** — the one-line-per-section health summary: `CPU: ok` (the
   snapshot root always carries the detected vendor + brand), `AMD: ok` /
   `AMD: N/A (<reason>)`, `Intel: ok` / `Intel: N/A (<reason>)`,

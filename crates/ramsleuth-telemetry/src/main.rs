@@ -55,6 +55,14 @@ Options:
 Exit codes:
   0  snapshot rendered (even if every section is N/A)
   2  unknown flag
+
+Related tools:
+  ramsleuth              Desktop GUI (egui)
+  ramsleuth-tui          Terminal dashboard (ratatui)
+  ramsleuth-client       CLI client (probe, dump, status, bench, burn)
+  ramsleuth-bench        Standalone memory & latency benchmark
+  ramsleuth-telemetry    Standalone telemetry snapshot (no daemon)
+  ramsleuth-daemon       Privileged root daemon (CAP_SYS_RAWIO)
 ";
 
 /// The `--version`/`-V` output line: `ramSleuth <bin> v<version>` —
@@ -101,6 +109,23 @@ where
     ShortCircuit::None
 }
 
+/// Suggest a related RamSleuth binary when the user types a flag or
+/// positional that looks like they meant to invoke a different tool.
+fn suggest_for_unknown(arg: &str) -> Option<&'static str> {
+    let normalized = arg.trim_start_matches('-');
+    match normalized {
+        "tui" => Some("Did you mean `ramsleuth-tui`? (run `ramsleuth-tui --help`)"),
+        "client" => Some("Did you mean `ramsleuth-client`? (run `ramsleuth-client --help`)"),
+        "bench" => Some("Did you mean `ramsleuth-bench`? (run `ramsleuth-bench --help`)"),
+        "telemetry" => {
+            Some("Did you mean `ramsleuth-telemetry`? (run `ramsleuth-telemetry --help`)")
+        }
+        "daemon" => Some("Did you mean `ramsleuth-daemon`? (run `ramsleuth-daemon --help`)"),
+        "gui" => Some("Did you mean `ramsleuth` (the GUI)? (run `ramsleuth --help`)"),
+        _ => None,
+    }
+}
+
 /// Parse argv (index 0 is the program name). `--json` sets `json`;
 /// `-h`/`--help` / `-V`/`--version` are recognized (not an error —
 /// `main` short-circuits them before parsing); any other argument is
@@ -112,7 +137,13 @@ pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--json" => opts.json = true,
             // recognized; help / version are handled in `main`
             "-h" | "--help" | "-V" | "--version" => {}
-            bad => return Err(bad.to_owned()),
+            bad => {
+                let mut msg = bad.to_owned();
+                if let Some(sug) = suggest_for_unknown(bad) {
+                    msg.push_str(&format!("\n  {sug}"));
+                }
+                return Err(msg);
+            }
         }
     }
     Ok(opts)
@@ -728,7 +759,8 @@ fn main() {
     }
     match parse_opts(&args) {
         Err(bad) => {
-            eprintln!("unknown flag: {bad}");
+            eprintln!("ramsleuth-telemetry: unknown flag {bad}");
+            eprint!("{USAGE}");
             std::process::exit(2);
         }
         Ok(opts) => {
