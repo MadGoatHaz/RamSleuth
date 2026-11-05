@@ -56,7 +56,7 @@ use crate::cpuid::{CpuInfo, CpuVendor};
 use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
 use crate::intel_mchbar;
 use crate::intel_readout::{self, IntelReadout};
-use crate::intel_smbios::{SmbiosSourceStatus, SmbiosTopology};
+use crate::intel_smbios::{SmbiosModuleEntry, SmbiosSourceStatus, SmbiosTopology};
 use crate::intel_sysfs;
 use crate::platform::{self, SystemPlatform};
 use crate::spd_decode::{self, SpdModule};
@@ -199,7 +199,7 @@ pub fn collect() -> SystemMemoryTelemetry {
     //    Collected before the Intel branch because the server-uncore decode
     //    sources the SPD modules (real EEPROM data) alongside the SMBIOS
     //    topology.
-    let (spd, spd_status) = spd_branch();
+    let (mut spd, spd_status) = spd_branch();
     // 2b. The SMBIOS Type 17 topology (vendor-neutral: the kernel `dmi`
     //     export exists on every x86 host, Intel and AMD alike). Collected
     //     once here and supplied both to the Intel branch (the 4-tier trust
@@ -208,6 +208,26 @@ pub fn collect() -> SystemMemoryTelemetry {
     //     buses to an OS-visible I2C adapter still reports the full
     //     population from the firmware ground truth).
     let (smbios, smbios_status) = crate::intel_smbios::collect();
+    // 2c. Chunk 4: SMBIOS SPD fallback. When the ee1004 driver has no
+    //     bound devices (or is missing) but SMBIOS Type 17 reports
+    //     populated DIMMs, create SpdModule structs from the SMBIOS data.
+    //     This provides basic module identity (size, speed, part number,
+    //     manufacturer, serial, locator) — limited data (no XMP/EXPO
+    //     profiles, no JEP106 die makers) — for boards without ee1004
+    //     (common on TRX40 / older AMD platforms).
+    if spd.is_empty()
+        && matches!(spd_status, SpdAcquireStatus::NoDevices | SpdAcquireStatus::DriverMissing)
+        && smbios.populated_count > 0
+    {
+        let (smbios_entries, _entry_status) = crate::intel_smbios::collect_module_entries();
+        if !smbios_entries.is_empty() {
+            spd = smbios_entries.iter().map(smbios_entry_to_spd_module).collect();
+            eprintln!(
+                "warning: no bound SPD EEPROM (ee1004) devices; using SMBIOS fallback ({} DIMM(s), limited data: no XMP/EXPO profiles, no JEP106 die makers)",
+                spd.len()
+            );
+        }
+    }
     // 3. AMD branch (gated on vendor before any provider I/O).
     let amd = amd_branch(&cpu);
     // 4. Intel branch (gated on vendor before any provider I/O; the server
@@ -433,6 +453,56 @@ fn spd_branch() -> (Vec<SpdModule>, SpdAcquireStatus) {
     }
 }
 
+/// Chunk 4: convert a [`SmbiosModuleEntry`] into a [`SpdModule`] for the
+/// SMBIOS fallback.
+///
+/// The fields not available from SMBIOS (die maker, die type, devices,
+/// density, rank, profiles) are marked `Na(NotApplicable)`. The fields
+/// that are available (maker, part, serial, speed, memory type) are
+/// populated from the SMBIOS data. The display layer renders these the
+/// same as SPD-derived modules but the annotation (threaded via
+/// [`annotate_intel_with_spd`] / the `dimm_sizes` fallback) marks the
+/// data source.
+fn smbios_entry_to_spd_module(entry: &SmbiosModuleEntry) -> SpdModule {
+    let is_ddr5 = matches!(entry.memory_type, Some(crate::intel_readout::MemoryTech::Ddr5));
+    SpdModule {
+        index: entry.index,
+        is_ddr5,
+        maker: entry
+            .manufacturer
+            .as_ref()
+            .map(|s| Section::Value(s.clone()))
+            .unwrap_or_else(|| Section::na(NaReason::NotApplicable)),
+        // Not available from SMBIOS:
+        die_maker: Section::na(NaReason::NotApplicable),
+        die_type: Section::na(NaReason::NotApplicable),
+        devices: Section::na(NaReason::NotApplicable),
+        part: entry
+            .part_number
+            .as_ref()
+            .map(|s| Section::Value(s.clone()))
+            .unwrap_or_else(|| Section::na(NaReason::NotApplicable)),
+        serial: entry
+            .serial_number
+            .as_ref()
+            .map(|s| Section::Value(s.clone()))
+            .unwrap_or_else(|| Section::na(NaReason::NotApplicable)),
+        // Rank is not a standard SMBIOS Type 17 field (the "Configured
+        // Memory Speed" is, but rank is not reliably exposed); mark Na.
+        rank: Section::na(NaReason::NotApplicable),
+        // Density is not in SMBIOS Type 17 (only total capacity); mark Na.
+        // The per-DIMM capacity still comes through the `dimm_sizes`
+        // SMBIOS fallback (MiB → GiB).
+        density_mbit: Section::na(NaReason::NotApplicable),
+        speed_mts: entry
+            .speed_mts
+            .map(Section::Value)
+            .unwrap_or_else(|| Section::na(NaReason::NotApplicable)),
+        // XMP/EXPO profiles are SPD-EEPROM-only; not in SMBIOS.
+        profiles: Vec::new(),
+    }
+}
+
 /// Platform branch (C6-01): `platform::collect_platform()`.
 ///
 /// Vendor-independent, like the SPD branch: it runs on every vendor and
@@ -463,6 +533,12 @@ fn platform_branch() -> SystemPlatform {
 /// IS visible (maker / part / speed / profiles) is carried separately in
 /// the snapshot's `spd` list and stays intact.
 ///
+/// **Chunk 4 SMBIOS fallback:** when the `ee1004` driver has no bound
+/// devices and the `spd` list is populated from SMBIOS Type 17 instead,
+/// the SPD-derived sizes are all `Na` (density/devices are not in
+/// SMBIOS). In that case the per-DIMM sizes also come from the SMBIOS
+/// per-device capacities (the same source as the modules themselves).
+///
 /// Pure: never a panic, never an invented value.
 fn dimm_sizes(spd: &[SpdModule], smbios: &SmbiosTopology) -> Vec<Section<f64>> {
     // SPD incomplete: fall back to the SMBIOS per-device sizes (MiB → GiB).
@@ -474,7 +550,7 @@ fn dimm_sizes(spd: &[SpdModule], smbios: &SmbiosTopology) -> Vec<Section<f64>> {
             .collect();
     }
     // SPD complete (or the SMBIOS source is empty): the SPD-derived sizes.
-    spd
+    let spd_sizes: Vec<Section<f64>> = spd
         .iter()
         .map(|module| match (&module.density_mbit, &module.devices) {
             (Section::Na(reason), _) => Section::na(reason.clone()),
@@ -483,7 +559,19 @@ fn dimm_sizes(spd: &[SpdModule], smbios: &SmbiosTopology) -> Vec<Section<f64>> {
                 Section::Value((*density_mbit as f64) * (*devices as f64) / 8192.0)
             }
         })
-        .collect()
+        .collect();
+    // Chunk 4: when the SMBIOS fallback is active, the SPD-derived sizes
+    // are all Na (density/devices are not in SMBIOS). In that case, use
+    // the SMBIOS per-device sizes instead (the same firmware ground truth
+    // as the SPD-incomplete fallback).
+    if !smbios.dimm_sizes.is_empty() && spd_sizes.iter().all(Section::is_na) {
+        return smbios
+            .dimm_sizes
+            .iter()
+            .map(|mib| Section::Value((*mib as f64) / 1024.0))
+            .collect();
+    }
+    spd_sizes
 }
 
 /// Sum the per-DIMM capacities that carry a value (an `Na` entry
