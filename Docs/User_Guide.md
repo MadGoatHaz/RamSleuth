@@ -1553,15 +1553,20 @@ platform limitations, not bugs:**
   RamSleuth. The SMN-overlay fields (DRAM subtimings, command rate, GDM)
   are read through a separate interface and are **not affected** by this.
 
-- **GDM / command rate (`0x50200` layout)** — the `0x50200` UMC register
-  that carries the MCLK set-point, Gear Down Mode, and DRAM command rate
-  uses a different bit layout on Threadripper (Castle Peak) than on
-  desktop Matisse / Vermeer. When RamSleuth detects that the decoded
-  set-point is implausible (0 MHz — impossible on a running system), it
-  conservatively reports:
-  `N/A (0x50200 layout not validated for Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)`
-  The remaining 27 DRAM subtimings are read from separate registers and
-  are **not affected**.
+- **GDM / command rate (channel topology)** — the `0x50200` UMC register
+  layout (MCLK set-point, Gear Down Mode, DRAM command rate) is
+  **identical** on Threadripper (Castle Peak) to desktop Matisse /
+  Vermeer. The earlier confusion came from reading channel 0, which is
+  electrically dormant on TRX40 boards (they route DIMMs to the
+  odd-indexed channels 1/3/5/7) and holds JEDEC fallback data with a
+  zero clock multiplier. RamSleuth now scans all eight UMC channel
+  instances and decodes from the first active one. When an active
+  channel is present, GDM and command rate populate normally. Only when
+  **every** channel is dormant (no active memory detected) does
+  RamSleuth report:
+  `N/A (No active memory channel detected on Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)`
+  The remaining 27 DRAM subtimings are read from the same active channel
+  and are **not affected** by this gate.
 
 All other telemetry (SPD, platform info, benchmarks, CPU temperature)
 works normally on Threadripper. If your Threadripper system *does*

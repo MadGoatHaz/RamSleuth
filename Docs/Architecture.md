@@ -1310,22 +1310,32 @@ and a failed SMU read leaves the `0xFFFFFFFF` failed-read sentinel — the
 overlay treats that word as a failed read (per-register containment: its
 fields decode to `0`, never as data).
 
-**Threadripper / Castle Peak note.** The `0x50200` bit layout above is
-verified on desktop Matisse (Zen 2) and Vermeer (Zen 3). On Threadripper
-(Castle Peak, TRX40 / WRX80) the same address can read a word whose decoded
-set-point is `0` MHz (e.g. `0x00000100`) — impossible on a running system —
-indicating a different field layout. When the decode yields a `0` MHz
-set-point, the overlay flags the word unverified and GDM / command rate
-render `N/A` with the reason "0x50200 layout not validated for
-Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable"
-(only the two fields in that word are affected; the 27 subtimings in the
-other registers decode normally). Similarly, the `ryzen_smu` driver does
-not expose the `pm_table` attribute on some Threadripper AGESA versions;
-the `pm_exposed` flag then carries the specific "PM table not exposed by
-ryzen-smu driver on this platform (known limitation for Threadripper
-3000/WRX80)" reason on every PM-derived field. Both are detected via the
-CPUID brand string ("Threadripper") and are platform limitations, not
-decode failures.
+**Threadripper / Castle Peak note.** The `0x50200` bit layout is
+**identical** on Threadripper (Castle Peak, TRX40 / WRX80) to desktop
+Matisse (Zen 2) and Vermeer (Zen 3): multiplier [6:0], power-gate [8],
+command rate [10], GDM [11]. The earlier observation that channel 0
+reads `0x00000100` (zero multiplier, power-gated) is a channel-topology
+artifact, not a layout difference: TRX40 boards route DIMMs to the
+odd-indexed UMC instances (1, 3, 5, 7) and leave channel 0 electrically
+dormant with JEDEC DDR4-2400 fallback data. The overlay now scans all
+eight channel bases (1 MiB stride from `0x0005_0000`) and decodes from
+the first active channel (non-zero multiplier, power-gate clear). The
+27 DRAM subtimings additionally apply Castle Peak per-field arithmetic
+offsets (verified against the known DDR4-3200 data point: tCL −4, tRAS
+−1, tRC −1, tFAW +13, tCWL +6, tWR +6) to map the raw register values
+onto the BIOS-visible timings. When every channel is dormant, the
+decode falls back to channel 0 and the zero multiplier trips the
+`setpoint_unverified` gate — GDM / command rate then render `N/A` with
+the reason "No active memory channel detected on Threadripper/TRX40
+(Castle Peak); GDM and command rate unavailable" (only the two fields
+in that word are affected; the 27 subtimings in the other registers
+still decode from the dormant channel's JEDEC fallback values).
+Similarly, the `ryzen_smu` driver does not expose the `pm_table`
+attribute on some Threadripper AGESA versions; the `pm_exposed` flag
+then carries the specific "PM table not exposed by ryzen-smu driver on
+this platform (known limitation for Threadripper 3000/WRX80)" reason on
+every PM-derived field. Both are detected via the CPUID brand string
+("Threadripper") and are platform limitations, not decode failures.
 
 **Channel mode + ECC (the 14-register channel set).** Complementary to the
 timing block: per UMC channel (base `0x00050000` / `0x00150000` — the fixed
