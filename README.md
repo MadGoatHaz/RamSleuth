@@ -1,4 +1,4 @@
-# RamSleuth v2.4.19
+# RamSleuth v2.4.20
 
 Live memory-controller telemetry and a native Memory & Latency Benchmark for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
 
@@ -10,12 +10,10 @@ RamSleuth is a 9-crate Rust workspace (8 product crates + the `tools/gen-icon` d
 
 Every privileged read flows through a single root daemon that holds only `CAP_SYS_RAWIO` — all clients (the CLI, the TUI, the GUI) run fully unprivileged — and the no-panic contract means a missing driver, privilege, or piece of hardware never crashes anything: the affected fields render as a structured `N/A (<reason>)` and the process exits 0.
 
-## What's new in v2.4.19
+## What's new in v2.4.20
 
-- **Official `.deb` package** — a ready-to-install Debian/Ubuntu/Mint package built by the release workflow (`build-deb.sh`), shipping all helper scripts, the systemd unit, the polkit policy, and proper metadata — one `dpkg -i` and you're running.
-- **SMBIOS fallback for SPD data** — on platforms where the `ee1004` driver cannot enumerate the SPD EEPROMs (most commonly TRX40 / older Threadripper boards), RamSleuth now falls back to the unprivileged SMBIOS Type 17 DMI records for per-DIMM size, technology, speed, and manufacturer data.
-- **Improved Threadripper / TRX40 platform detection** — platform-specific N/A messaging distinguishes the two known TRX40 limitations (PM table not exposed by certain AGESA versions, unvalidated `0x50200` bit layout) from a missing driver, so a supported Threadripper never reads as "driver missing".
-- **GLIBC 2.39 compatibility** — the release workflow now builds on `ubuntu-24.04` (GLIBC 2.39), so the published binaries work on Ubuntu 24.04+ and any modern distro (fixes the earlier "GLIBC_2.43 not found" failure on 24.04 hosts).
+- **Threadripper 3000 (Castle Peak / TRX40) DRAM timing decode** — tCL, tCWL, tWR, tFAW, tRAS, tRC now read correctly using platform-specific SMN register layout (8-channel UMC scan with per-field offsets; fixes "JEDEC defaults instead of XMP timings" on TRX40 boards).
+- **CLI/TUI discovery improvements** — related tools now appear in all help outputs, smart flag suggestions for common typos, and parity fixes across the CLI and TUI interfaces.
 
 ## Why RamSleuth
 
@@ -64,8 +62,8 @@ yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest i
 **Debian/Ubuntu/Mint — `.deb` package:**
 
 ```sh
-wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.19/ramsleuth_2.4.19_amd64.deb
-sudo dpkg -i ramsleuth_2.4.19_amd64.deb
+wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.20/ramsleuth_2.4.20_amd64.deb
+sudo dpkg -i ramsleuth_2.4.20_amd64.deb
 sudo usermod -aG ramsleuth $USER
 newgrp ramsleuth        # or log out and back in
 ramsleuth-tui
@@ -106,10 +104,10 @@ The full walkthrough — every zone, key, flag, N/A reason, and day-2 troublesho
 - [Packaging & AUR](packaging/README.md) — the two-package AUR model, the unified version-bump flow, the `ryzen-smu-dkms` extra, and the CI/release artifact contracts.
 - [Changelog](CHANGELOG.md) — release history.
 
-**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.19**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
+**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.20**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
 
 ## License
 
 MIT — the workspace `Cargo.toml` declares `license = "MIT"`. Repository: <https://github.com/MadGoatHaz/RamSleuth>.
 
-RamSleuth v2.4.19 · branch `v2-development`
+RamSleuth v2.4.20 · branch `v2-development`

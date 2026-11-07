@@ -1,6 +1,6 @@
 # RamSleuth — User Guide
 
-**Version:** 2.4.19 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
+**Version:** 2.4.20 · **Platform:** Arch Linux (x86_64) · **License:** MIT · **Repository:** [github.com/MadGoatHaz/RamSleuth](https://github.com/MadGoatHaz/RamSleuth)
 
 RamSleuth v2 is a live RAM telemetry suite and a Memory & Latency Benchmark for
 AMD and Intel desktops. It watches your memory system in real time — clocks, the
@@ -248,12 +248,12 @@ yay -S ramsleuth-intel-dkms  # Intel — live Intel subtimings (Section 10.5)
 The two **core** packages are deliberately distinct:
 
 - **`ramsleuth` — STABLE source.** Builds the workspace from the official
-  git tag `v$pkgver` (currently `v2.4.19`). A tag is a reproducible,
+  git tag `v$pkgver` (currently `v2.4.20`). A tag is a reproducible,
   auditable snapshot — this is the **default recommendation for production
   installs**. It compiles only the pinned repository (`--locked`), with no
   third-party code in the build.
 - **`ramsleuth-bin` — PRECOMPILED.** Downloads the release binary tarball
-  `ramsleuth-2.4.19-x86_64.tar.zst` from the official GitHub Release (pinned
+  `ramsleuth-2.4.20-x86_64.tar.zst` from the official GitHub Release (pinned
   by its `sha256sums`) and installs it as-is — **no build, no makedepends**.
   This is the **fastest install path**.
 
@@ -303,7 +303,7 @@ can build and install either package directly from the `packaging/`
 directories:
 
 ```sh
-cd packaging/ramsleuth      # STABLE source (builds from the v2.4.19 tag)
+cd packaging/ramsleuth      # STABLE source (builds from the v2.4.20 tag)
 # cd packaging/ramsleuth-bin   # PRECOMPILED (downloads the release tarball)
 makepkg -si
 ```
@@ -407,8 +407,8 @@ building from source, and you can force that path with `--build`.)
 
 **Debian/Ubuntu/Mint — `.deb` package (simplest, no clone):**
 ```sh
-wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.19/ramsleuth_2.4.19_amd64.deb
-sudo dpkg -i ramsleuth_2.4.19_amd64.deb
+wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.20/ramsleuth_2.4.20_amd64.deb
+sudo dpkg -i ramsleuth_2.4.20_amd64.deb
 sudo usermod -aG ramsleuth $USER
 newgrp ramsleuth
 ramsleuth-tui
@@ -443,7 +443,7 @@ ramsleuth probe      # one-shot report
 
 ```sh
 ./install.sh --build             # build from source instead of downloading
-./install.sh --version 2.4.19    # install a specific version
+./install.sh --version 2.4.20    # install a specific version
 ```
 
 **Manual install (if you prefer full control):**
@@ -647,7 +647,7 @@ shows `Disconnected` with a hint, and the dashboard stays responsive.
 
 ### 4.1 The 3-line header
 
-**Line 1** — the title **`RamSleuth v2.4.19`**, a **platform tag**
+**Line 1** — the title **`RamSleuth v2.4.20`**, a **platform tag**
 (`[AMD AM4 Platform]` for Zen 1–3, `[AMD AM5 Platform]` for Zen 4/5,
 `[Intel LGA Platform]`, or a bare `[Platform]` when the vendor is unknown),
 the **daemon status** (`Daemon: Connected (IPC: /run/ramsleuth/ramsleuth.sock)`
@@ -1997,6 +1997,6 @@ group, no socket, no driver.
 
 ---
 
-*This guide describes RamSleuth v2.4.19. For the technical design, see
+*This guide describes RamSleuth v2.4.20. For the technical design, see
 `Docs/Architecture.md`; for the packaging operator guide, see
 `packaging/README.md`.*

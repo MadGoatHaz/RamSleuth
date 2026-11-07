@@ -7,7 +7,7 @@
 # Usage:
 #   packaging/build-deb.sh --version <ver> [--tarball <path>]
 #
-#   --version   Required. The package version (e.g. 2.4.19).
+#   --version   Required. The package version (e.g. 2.4.20).
 #   --tarball   Optional. Path to the release tarball. Defaults to
 #               ramsleuth-<ver>-x86_64.tar.zst in the current directory.
 #               If the tarball does not exist, the script builds from
@@ -27,7 +27,7 @@ TARBALL=""
 usage() {
     echo "Usage: $0 --version <ver> [--tarball <path>]" >&2
     echo "" >&2
-    echo "  --version   Package version (required), e.g. 2.4.19" >&2
+    echo "  --version   Package version (required), e.g. 2.4.20" >&2
     echo "  --tarball   Release tarball path (optional)." >&2
     echo "              Defaults to ramsleuth-<ver>-x86_64.tar.zst." >&2
     echo "              If absent, builds from the current repo checkout." >&2

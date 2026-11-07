@@ -1,7 +1,7 @@
 # RamSleuth — Architecture
 
 **Document:** `Docs/Architecture.md` (part of the RamSleuth v2 repository-facing documentation)
-**Applies to:** workspace v2.4.19 (branch `v2-development`)
+**Applies to:** workspace v2.4.20 (branch `v2-development`)
 **Audience:** expert readers — kernel-aware systems programmers, packagers, and maintainers who need the full design rationale behind RamSleuth.
 
 Companion documents: [`README.md`](../README.md) (entry point), [`Docs/User_Guide.md`](User_Guide.md) (operational guide), [`packaging/README.md`](../packaging/README.md) (packaging and operator guide).
@@ -281,7 +281,7 @@ one development tool — all inheriting a single version:
 
 | Workspace fact | Value |
 |----------------|-------|
-| Version | **2.4.19** (`[workspace.package].version`) |
+| Version | **2.4.20** (`[workspace.package].version`) |
 | Edition | 2021 |
 | MSRV | **1.75** (`rust-version`) |
 | Resolver | 2 |
