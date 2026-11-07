@@ -2422,7 +2422,7 @@ mod tests {
             |addr| {
                 seen.push(addr);
                 let offset = addr & 0xFFFF; // offset within the channel block
-                // Channel 0 MCLK probe: dormant.
+                                            // Channel 0 MCLK probe: dormant.
                 if addr == 0x50200 {
                     return Ok(0x0000_0100);
                 }
@@ -2467,7 +2467,7 @@ mod tests {
         assert!(!snap.smn_setpoint_unverified);
         assert_eq!(snap.gdm, 1); // GDM bit 11 set in 0x0830
         assert_eq!(snap.command_rate, 0); // bit 10 clear
-        // The Castle Peak field offsets map the raw words to BIOS values.
+                                          // The Castle Peak field offsets map the raw words to BIOS values.
         assert_eq!(snap.timings.cl, 14);
         assert_eq!(snap.timings.ras, 38);
         assert_eq!(snap.timings.rc, 56);
@@ -2552,7 +2552,10 @@ mod tests {
             },
             &mut snap_non_tr,
         );
-        assert_eq!(seen_non_tr[0], SMN_MCLK, "Matisse path probes 0x50200 first");
+        assert_eq!(
+            seen_non_tr[0], SMN_MCLK,
+            "Matisse path probes 0x50200 first"
+        );
 
         // Threadripper: the Castle Peak path probes channel bases.
         let mut seen_tr: Vec<u32> = Vec::new();
