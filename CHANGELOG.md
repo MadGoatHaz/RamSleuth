@@ -6,6 +6,10 @@ All notable per-release changes to RamSleuth. Newest first.
 
 ## [Unreleased]
 
+### New
+
+- **Threadripper 3000 / TRX40 live DRAM subtiming decode (Castle Peak)** — the AMD SMN overlay now scans all eight UMC channel instances on the Castle Peak server I/O die (1 MiB stride) and decodes from the first active channel, fixing the long-standing "JEDEC defaults instead of XMP timings" symptom on TRX40 boards (channel 0 is electrically dormant; TRX40 routes DIMMs to channels 1/3/5/7). The 27 DRAM subtimings apply the verified per-field arithmetic offsets that map raw register values to BIOS-visible timings (validated against the known DDR4-3200 data point: CL14-18-18-38, tRC=56, tFAW=39, tCWL=18, tWR=24, tRFC=312/192/132). GDM and command rate now populate normally when an active channel is present; the previous conservative "layout not validated" N/A is replaced with an accurate "no active memory channel detected" reason that only fires when all eight channels are dormant.
+
 ## [2.4.19] - 2026-11-05
 
 ### New

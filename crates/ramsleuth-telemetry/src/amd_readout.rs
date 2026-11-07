@@ -131,11 +131,15 @@ const PM_NOT_EXPOSED_TRX40_REASON: &str =
 const SMN_50200_UNVERIFIED_REASON: &str = "0x50200 layout unverified on this platform";
 
 /// The specific N/A reason for the `0x50200`-derived fields (GDM,
-/// command rate) on a Threadripper (Castle Peak / TRX40) platform:
-/// the register layout is known to differ from desktop Matisse /
-/// Vermeer, so the fields are unvalidated and reported unavailable.
+/// command rate) on a Threadripper (Castle Peak / TRX40) platform when
+/// no active memory channel was detected during the eight-UMC scan.
+/// The `0x50200` layout itself is verified identical to Matisse (same
+/// bit positions: multiplier [6:0], power-gate [8], command rate [10],
+/// GDM [11]); the unavailability stems from every UMC instance being
+/// dormant / power-gated (all eight channel probes returned a zero
+/// clock multiplier), so no valid GDM / command-rate bits exist.
 const SMN_50200_UNVERIFIED_TRX40_REASON: &str =
-    "0x50200 layout not validated for Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable";
+    "No active memory channel detected on Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable";
 
 // ---------------------------------------------------------------------------
 // Vendor-neutral display types (frozen here; P2-07 + P2-10 consume them).
@@ -1285,8 +1289,9 @@ mod tests {
     }
 
     /// (i‴) Threadripper / Castle Peak: the `0x50200` unverified gate →
-    /// the platform-specific "layout not validated for Threadripper/TRX40
-    /// (Castle Peak)" reason instead of the generic desktop text.
+    /// the platform-specific "No active memory channel detected on
+    /// Threadripper/TRX40 (Castle Peak)" reason instead of the generic
+    /// desktop text.
     #[test]
     fn unverified_50200_threadripper_carries_specific_reason() {
         let mut s = good_snapshot();
@@ -1297,7 +1302,7 @@ mod tests {
         let detail =
             parse_error_detail(&ro.clocks.gdm).expect("an unverified 0x50200 word must Na the GDM");
         assert!(
-            detail.contains("0x50200 layout not validated for Threadripper/TRX40"),
+            detail.contains("No active memory channel detected on Threadripper/TRX40"),
             "{detail}"
         );
         assert!(
@@ -1307,7 +1312,7 @@ mod tests {
         let detail = parse_error_detail(&ro.clocks.command_rate)
             .expect("an unverified 0x50200 word must Na the command rate");
         assert!(
-            detail.contains("0x50200 layout not validated for Threadripper/TRX40"),
+            detail.contains("No active memory channel detected on Threadripper/TRX40"),
             "{detail}"
         );
         assert!(

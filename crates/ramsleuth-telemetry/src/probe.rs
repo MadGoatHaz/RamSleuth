@@ -1971,7 +1971,7 @@ mod tests {
         // platform-specific unvalidated-layout reason (never the
         // coincidental "off" / "1T").
         let unverified =
-            "N/A (parse error: 0x50200 layout not validated for Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)";
+            "N/A (parse error: No active memory channel detected on Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)";
         assert!(md.contains(&format!("| GDM | {unverified} |")), "{md}");
         assert!(
             md.contains(&format!("| command rate | {unverified} |")),
@@ -1986,7 +1986,7 @@ mod tests {
             "{md}"
         );
         assert!(
-            md.contains("`amd.clocks.gdm` — N/A (parse error: 0x50200 layout not validated for Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)"),
+            md.contains("`amd.clocks.gdm` — N/A (parse error: No active memory channel detected on Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)"),
             "{md}"
         );
     }

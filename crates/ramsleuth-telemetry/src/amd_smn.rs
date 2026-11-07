@@ -231,6 +231,18 @@ const SMN_RFC_SENTINEL: u32 = 0x2106_0138;
 const SMN_READ_FAILURE_SENTINEL: u32 = 0xFFFF_FFFF;
 
 // ---------------------------------------------------------------------------
+// Castle Peak (Threadripper 3000 / TRX40) channel topology (research:
+// "Castle Peak DRAM SMN Registers" — the server I/O die carries eight UMC
+// instances at a fixed 1 MiB stride; TRX40 routes DIMMs to the odd-indexed
+// channels only, leaving channel 0 dormant with JEDEC fallback data).
+// ---------------------------------------------------------------------------
+
+/// Number of UMC channel instances on the Castle Peak server I/O die.
+const CP_NUM_CHANNELS: u32 = 8;
+/// Stride between consecutive UMC channel bases (1 MiB = 0x0010_0000).
+const CP_CHANNEL_STRIDE: u32 = 0x0010_0000;
+
+// ---------------------------------------------------------------------------
 // Pure decoders (fixture-testable without I/O; the `intel_readout::decode_*`
 // pattern). Every extractor masks the reference's exact bit range, so the
 // result is bounded by construction (max `0x3FF`) — no overflow, no panic.
@@ -423,6 +435,122 @@ fn word_opt(regs: &[(u32, Option<u32>)], addr: u32) -> Option<u32> {
             .filter(|w| **w != SMN_READ_FAILURE_SENTINEL)
             .copied()
     })
+}
+
+// ---------------------------------------------------------------------------
+// Castle Peak (Threadripper 3000 / TRX40) decode path.
+//
+// The server I/O die carries eight UMC instances at a 1 MiB stride
+// (channel i base = 0x0005_0000 + i × 0x0010_0000). TRX40 boards route
+// DIMMs to the odd-indexed channels (1, 3, 5, 7); channel 0 is dormant
+// and holds JEDEC DDR4-2400 fallback data. The register offsets and
+// bit widths are identical to Matisse, but the timing values are stored
+// with a per-field arithmetic offset relative to the user-visible
+// (BIOS-reported) timings (research: "Castle Peak DRAM SMN Registers",
+// verified against the known DDR4-3200 data point). The decode below
+// extracts the raw bit fields and then applies those offsets.
+// ---------------------------------------------------------------------------
+
+/// A Castle Peak channel is active when its `Base + 0x0200` word has a
+/// non-zero clock multiplier (bits [6:0]) AND the power-gate flag (bit
+/// 8) is clear. A dormant channel reads multiplier `0` with bit 8 set
+/// (e.g. `0x00000100` on TRX40 channel 0).
+fn cp_is_active_channel(mclk_word: u32) -> bool {
+    let multiplier = mclk_word & 0x7F;
+    let power_gated = (mclk_word & 0x100) != 0;
+    multiplier != 0 && !power_gated
+}
+
+/// Castle Peak field offsets (raw register value → user-visible timing).
+///
+/// Derived from the known DDR4-3200 data point (research §"Active Channel
+/// Register Bit-Packing Model"): the raw bit-field extraction yields the
+/// values listed in the "Decoded Value" column, while the BIOS-visible
+/// timings are in the "Target DDR4-3200 Timing" column. The per-field
+/// delta is applied after the raw extraction. Fields with no delta use
+/// the raw value unchanged.
+#[inline]
+fn cp_tcl(raw: u16) -> u16 {
+    raw.saturating_sub(4)
+}
+#[inline]
+fn cp_tras(raw: u16) -> u16 {
+    raw.saturating_sub(1)
+}
+#[inline]
+fn cp_trc(raw: u16) -> u16 {
+    raw.saturating_sub(1)
+}
+#[inline]
+fn cp_tfaw(raw: u16) -> u16 {
+    raw.saturating_add(13)
+}
+#[inline]
+fn cp_tcwl(raw: u16) -> u16 {
+    raw.saturating_add(6)
+}
+#[inline]
+fn cp_twr(raw: u16) -> u16 {
+    raw.saturating_add(6)
+}
+
+/// Castle Peak-specific SMN decode: same register addresses and bit
+/// fields as [`decode_smn`] (Matisse), but with the per-field arithmetic
+/// offsets that map the raw register values onto the BIOS-visible
+/// timings. The GDM / command-rate bits and the `setpoint_unverified`
+/// gate work identically: an active channel has a non-zero multiplier
+/// so the gate stays clear; a dormant channel (e.g. TRX40 channel 0
+/// reading `0x00000100`) trips the gate and those two fields render
+/// N/A downstream.
+pub fn decode_smn_castle_peak(regs: &[(u32, Option<u32>)]) -> SmnFields {
+    // tRFC mirror rule (identical to Matisse).
+    let (w_rfc, w_mirror) = (word_at(regs, SMN_RFC), word_at(regs, SMN_RFC_MIRROR));
+    let rfc_word = if w_rfc == SMN_RFC_SENTINEL && w_rfc != w_mirror {
+        w_mirror
+    } else {
+        w_rfc
+    };
+
+    // Same 0x50200 gate as Matisse: a present word whose set-point
+    // decodes to 0 MHz is impossible on a running channel — unverified.
+    let setpoint_unverified = word_opt(regs, SMN_MCLK)
+        .map(|w| mclk_setpoint_mhz(w) == 0)
+        .unwrap_or(false);
+
+    SmnFields {
+        gdm: gdm_flag(word_at(regs, SMN_MCLK)),
+        command_rate: command_rate(word_at(regs, SMN_MCLK)),
+        setpoint_unverified,
+        timings: AmdPmTimings {
+            cl: cp_tcl(tcl(word_at(regs, SMN_CMD0))),
+            rcwdwr: trcdwr(word_at(regs, SMN_CMD0)),
+            rcdrd: trcdrd(word_at(regs, SMN_CMD0)),
+            rp: trp(word_at(regs, SMN_CMD1)),
+            ras: cp_tras(tras(word_at(regs, SMN_CMD0))),
+            rc: cp_trc(trc(word_at(regs, SMN_CMD1))),
+            rrds: trrds(word_at(regs, SMN_CMD2)),
+            rrld: trrdl(word_at(regs, SMN_CMD2)),
+            faw: cp_tfaw(tfaw(word_at(regs, SMN_CMD3))),
+            wtrs: twtrs(word_at(regs, SMN_CMD4)),
+            wtrl: twtrl(word_at(regs, SMN_CMD4)),
+            wr: cp_twr(twr(word_at(regs, SMN_CMD5))),
+            rfc1: trfc(rfc_word),
+            rfc2: trfc2(rfc_word),
+            rfcsb: trfc4(rfc_word),
+            cwl: cp_tcwl(tcwl(word_at(regs, SMN_CMD4))),
+            rtp: trtp(word_at(regs, SMN_CMD2)),
+            rdwr: trdwr(word_at(regs, SMN_TURN)),
+            wrrd: twrrd(word_at(regs, SMN_TURN)),
+            rdrd_sd: trdrd_sd(word_at(regs, SMN_RDRD)),
+            rdrd_dd: trdrd_dd(word_at(regs, SMN_RDRD)),
+            rdrd_scl: trdrd_scl(word_at(regs, SMN_RDRD)),
+            rdrd_sc: trdrd_sc(word_at(regs, SMN_RDRD)),
+            wrwr_sd: twrwr_sd(word_at(regs, SMN_WRWR)),
+            wrwr_dd: twrwr_dd(word_at(regs, SMN_WRWR)),
+            wrwr_scl: twrwr_scl(word_at(regs, SMN_WRWR)),
+            wrwr_sc: twrwr_sc(word_at(regs, SMN_WRWR)),
+        },
+    }
 }
 
 /// The raw word for `addr` in a register list: the **first** occurrence's
@@ -1002,6 +1130,77 @@ fn read_word(res: TelemetryResult<u32>) -> Option<u32> {
     res.ok().filter(|w| *w != SMN_READ_FAILURE_SENTINEL)
 }
 
+/// The Castle Peak / Threadripper overlay core with an **injectable
+/// register reader** (the hermetic test seam, mirroring
+/// [`apply_smn_with`]). No vendor gate here — that belongs to the public
+/// [`apply_smn`] contract.
+///
+/// Channel topology (research: "Castle Peak DRAM SMN Registers"): the
+/// server I/O die carries eight UMC instances at a fixed 1 MiB stride —
+/// channel `i` base = `0x0005_0000 + i × 0x0010_0000`. TRX40 boards route
+/// DIMMs to the odd-indexed channels (1, 3, 5, 7); channel 0 is dormant
+/// and populated with JEDEC DDR4-2400 fallback data. The overlay scans
+/// all eight bases and uses the first **active** channel (its `+0x0200`
+/// word has a non-zero clock multiplier and the power-gate flag clear).
+/// When no channel is active it falls back to channel 0 — the dormant
+/// base — so the decode still runs (its `0x50200` word trips the
+/// `setpoint_unverified` gate, rendering GDM / command rate N/A
+/// downstream, while the dormant channel's JEDEC values are at least
+/// structurally present).
+///
+/// `DriverMissing` on any channel-scan read is a whole-overlay no-op
+/// (the attribute's presence cannot change mid-scan). Every other read
+/// failure is contained per register by [`read_word`]. The register
+/// offsets within the active channel are identical to Matisse, but the
+/// timing values decode through [`decode_smn_castle_peak`] (the
+/// per-field arithmetic offsets that map the raw register values onto
+/// the BIOS-visible timings).
+fn apply_smn_castle_peak_with<R: FnMut(u32) -> TelemetryResult<u32>>(
+    mut reader: R,
+    snap: &mut AmdPmSnapshot,
+) {
+    // Scan all eight UMC channel bases for the first active one.
+    let mut active_base: Option<u32> = None;
+    for i in 0..CP_NUM_CHANNELS {
+        let base = SMN_CH0_BASE + i * CP_CHANNEL_STRIDE;
+        match reader(base + 0x0200) {
+            // The `smn` attribute is gone (or was never there): whole-overlay
+            // no-op — the snapshot keeps exactly what the PM table provided.
+            Err(TelemetryError::DriverMissing { .. }) => return,
+            Ok(word) if cp_is_active_channel(word) => {
+                active_base = Some(base);
+                break;
+            }
+            // Inactive channel (dormant / power-gated) or a per-register
+            // read failure: keep scanning.
+            _ => continue,
+        }
+    }
+
+    // No active channel: fall back to channel 0 (the dormant base). The
+    // decode still runs; the `0x50200` word's zero multiplier trips the
+    // `setpoint_unverified` gate downstream.
+    let base = active_base.unwrap_or(SMN_CH0_BASE);
+    let stride = base - SMN_CH0_BASE;
+
+    // Read the 13-register timing set from the resolved base. Each entry
+    // is stored with its channel-0 absolute address (the decode functions
+    // key on those); the `stride` selects the physical channel.
+    let mut regs: Vec<(u32, Option<u32>)> = Vec::with_capacity(SMN_REGISTER_SET.len());
+    for &addr in SMN_REGISTER_SET.iter() {
+        regs.push((addr, read_word(reader(addr + stride))));
+    }
+
+    let fields = decode_smn_castle_peak(&regs);
+    // Only the SMN fields are written (same write surface as the Matisse
+    // path). `pdm` and the `cad_bus` codes stay zeroed (unconfirmed
+    // bitfields, plan D3).
+    snap.gdm = fields.gdm;
+    snap.command_rate = fields.command_rate;
+    snap.timings = fields.timings;
+    snap.smn_setpoint_unverified = fields.setpoint_unverified;
+}
+
 /// The overlay core with an **injectable register reader** (the hermetic
 /// test seam: tests feed synthetic words or synthetic errors; production
 /// injects [`read_smn_register`]). No vendor gate here — that belongs to
@@ -1017,7 +1216,24 @@ fn read_word(res: TelemetryResult<u32>) -> Option<u32> {
 /// `0`). The offset rule is decided by the first read only (monitor_cpu
 /// semantics): a sentinel on the relocated re-read keeps the relocated
 /// base with no set-point.
+///
+/// **Castle Peak / Threadripper dispatch:** when
+/// [`AmdPmSnapshot::threadripper`] is set (the CPUID brand identifies a
+/// Threadripper — TRX40 / WRX80 / Threadripper PRO), the overlay routes
+/// through [`apply_smn_castle_peak_with`] instead: it scans all eight
+/// server-I/O-die UMC bases (1 MiB stride) for the first active channel
+/// (TRX40 routes DIMMs to the odd-indexed channels; channel 0 is dormant
+/// with JEDEC fallback data) and decodes with the Castle Peak field
+/// offsets ([`decode_smn_castle_peak`]). The Matisse / desktop path above
+/// is unchanged for non-Threadripper platforms.
 fn apply_smn_with<R: FnMut(u32) -> TelemetryResult<u32>>(mut reader: R, snap: &mut AmdPmSnapshot) {
+    // Castle Peak / Threadripper: scan the eight UMC channel bases for an
+    // active channel and decode with the platform-specific field offsets.
+    if snap.threadripper {
+        apply_smn_castle_peak_with(&mut reader, snap);
+        return;
+    }
+
     let (setpoint, base) = match reader(SMN_MCLK) {
         // Offset rule: a raw `0x50200` word of exactly the marker relocates
         // the UMC block; the set-point word is re-read at the relocated
@@ -2070,6 +2286,290 @@ mod tests {
         assert!(t.wrwr_dd <= 15 && t.wrwr_sd <= 15 && t.wrwr_sc <= 15 && t.wrwr_scl <= 63);
         assert!(t.wrrd <= 15 && t.rdwr <= 31);
         assert!(t.rfc1 <= 1023 && t.rfc2 <= 1023 && t.rfcsb <= 1023);
+    }
+
+    // ---- Castle Peak / Threadripper decode path --------------------------
+
+    /// (CP) The `cp_is_active_channel` gate (research §"Active Channel
+    /// Verification"): an active channel has a non-zero clock multiplier
+    /// (bits [6:0]) AND the power-gate flag (bit 8) clear; a dormant
+    /// channel has multiplier 0 with bit 8 set.
+    #[test]
+    fn cp_is_active_channel_pins_the_gate() {
+        // Active DDR4-3200 (1T, GDM): multiplier 0x30, bit 8 clear.
+        assert!(cp_is_active_channel(0x0000_0830));
+        // Active DDR4-3200 (1T, Manual): multiplier 0x30, bit 8 clear.
+        assert!(cp_is_active_channel(0x0000_0030));
+        // Active DDR4-3200 (2T, Manual): multiplier 0x30, bit 8 clear.
+        assert!(cp_is_active_channel(0x0000_0430));
+        // Inactive channel (TRX40 channel 0): multiplier 0, bit 8 set.
+        assert!(!cp_is_active_channel(0x0000_0100));
+        // Multiplier 0, bit 8 clear: still inactive (no clock).
+        assert!(!cp_is_active_channel(0x0000_0000));
+        // Multiplier non-zero, bit 8 set: power-gated → inactive.
+        assert!(!cp_is_active_channel(0x0000_0130));
+    }
+
+    /// (CP) The known DDR4-3200 data point (research §"Active Channel
+    /// Register Bit-Packing Model"): the raw register words decode to the
+    /// BIOS-visible timings through the Castle Peak per-field offsets.
+    /// Input: the 13 register words at the channel-0 absolute addresses;
+    /// the `0x50200` word is the dormant-channel marker (multiplier 0,
+    /// bit 8 set) so `setpoint_unverified` trips and GDM / command rate
+    /// render N/A downstream.
+    #[test]
+    fn decode_smn_castle_peak_pins_the_known_data_point() {
+        let regs: Vec<(u32, Option<u32>)> = vec![
+            (0x50200, Some(0x0000_0100)),
+            (0x50204, Some(0x1212_2712)),
+            (0x50208, Some(0x0012_0039)),
+            (0x5020C, Some(0x0900_0604)),
+            (0x50210, Some(0x0000_001A)),
+            (0x50214, Some(0x0009_030C)),
+            (0x50218, Some(0x0000_0012)),
+            (0x50220, Some(0x0301_0303)),
+            (0x50224, Some(0x0301_0303)),
+            (0x50228, Some(0x0000_0501)),
+            (0x50254, Some(0x0604_0008)),
+            (0x50260, Some(0x2106_0138)),
+            (0x50264, Some(0x2106_0138)),
+        ];
+        let f = decode_smn_castle_peak(&regs);
+        // Primary timings (the BIOS-visible values).
+        assert_eq!(f.timings.cl, 14, "tCL");
+        assert_eq!(f.timings.rcdrd, 18, "tRCDRD");
+        assert_eq!(f.timings.rcwdwr, 18, "tRCDWR");
+        assert_eq!(f.timings.rp, 18, "tRP");
+        assert_eq!(f.timings.ras, 38, "tRAS");
+        assert_eq!(f.timings.rc, 56, "tRC = tRAS + tRP");
+        // Secondary timings.
+        assert_eq!(f.timings.wr, 24, "tWR");
+        assert_eq!(f.timings.cwl, 18, "tCWL");
+        assert_eq!(f.timings.faw, 39, "tFAW");
+        // Refresh.
+        assert_eq!(f.timings.rfc1, 312, "tRFC");
+        assert_eq!(f.timings.rfc2, 192, "tRFC2");
+        assert_eq!(f.timings.rfcsb, 132, "tRFCsb");
+        // Turnaround / RRD.
+        assert_eq!(f.timings.rtp, 9, "tRTP");
+        assert_eq!(f.timings.rdwr, 5, "tRDWR");
+        assert_eq!(f.timings.wtrs, 3, "tWTR_S");
+        assert_eq!(f.timings.wtrl, 9, "tWTR_L");
+        assert_eq!(f.timings.rrds, 4, "tRRD_S");
+        // The dormant channel's 0x50200 word (multiplier 0) trips the
+        // setpoint_unverified gate — GDM / command rate render N/A
+        // downstream (the coincidental bits would read "GDM off" / "1T").
+        assert!(
+            f.setpoint_unverified,
+            "dormant channel 0x50200 must trip the unverified gate"
+        );
+    }
+
+    /// (CP) An **active** Castle Peak channel (non-zero multiplier, bit 8
+    /// clear): the `setpoint_unverified` gate stays clear and GDM /
+    /// command rate decode normally from the same word.
+    #[test]
+    fn decode_smn_castle_peak_active_channel_gate_clear() {
+        // Active DDR4-3200 (1T, GDM): multiplier 0x30, bit 8 clear,
+        // GDM bit 11 set.
+        let regs: Vec<(u32, Option<u32>)> = vec![
+            (0x50200, Some(0x0000_0830)),
+            (0x50204, Some(0x1212_2712)),
+            (0x50208, Some(0x0012_0039)),
+            (0x5020C, Some(0x0900_0604)),
+            (0x50210, Some(0x0000_001A)),
+            (0x50214, Some(0x0009_030C)),
+            (0x50218, Some(0x0000_0012)),
+            (0x50220, Some(0x0301_0303)),
+            (0x50224, Some(0x0301_0303)),
+            (0x50228, Some(0x0000_0501)),
+            (0x50254, Some(0x0604_0008)),
+            (0x50260, Some(0x2106_0138)),
+            (0x50264, Some(0x2106_0138)),
+        ];
+        let f = decode_smn_castle_peak(&regs);
+        assert!(
+            !f.setpoint_unverified,
+            "active channel multiplier 0x30 must NOT trip the gate"
+        );
+        assert_eq!(f.gdm, 1, "GDM bit 11 set");
+        assert_eq!(f.command_rate, 0, "command rate bit 10 clear (1T)");
+        // Timings decode identically to the dormant-channel case.
+        assert_eq!(f.timings.cl, 14);
+        assert_eq!(f.timings.ras, 38);
+        assert_eq!(f.timings.rc, 56);
+        assert_eq!(f.timings.faw, 39);
+        assert_eq!(f.timings.cwl, 18);
+        assert_eq!(f.timings.wr, 24);
+    }
+
+    /// (CP) The `apply_smn_castle_peak_with` channel scan: the reader is
+    /// driven with a TRX40 topology — channel 0 dormant (`0x00000100`),
+    /// channel 1 active (multiplier 0x30) — and the overlay must read the
+    /// timing registers from channel 1's base (`0x15xxxx`), not channel
+    /// 0's (`0x5xxxxx`). The decoded timings land in the snapshot; the
+    /// active channel's non-zero multiplier keeps `setpoint_unverified`
+    /// clear.
+    #[test]
+    fn apply_smn_castle_peak_with_scans_to_the_active_channel() {
+        let mut seen: Vec<u32> = Vec::new();
+        let mut snap = base_snapshot();
+        snap.threadripper = true;
+
+        // A synthetic TRX40 reader: channel 0 (0x5xxxxx) is dormant;
+        // channel 1 (0x15xxxx) is active with the known DDR4-3200 words.
+        apply_smn_with(
+            |addr| {
+                seen.push(addr);
+                let offset = addr & 0xFFFF; // offset within the channel block
+                // Channel 0 MCLK probe: dormant.
+                if addr == 0x50200 {
+                    return Ok(0x0000_0100);
+                }
+                // Channel 1 MCLK probe: active (multiplier 0x30, GDM).
+                if addr == 0x150200 {
+                    return Ok(0x0000_0830);
+                }
+                // Channel 1 timing words: the known DDR4-3200 data point,
+                // addressed relative to channel 1's base.
+                let ch1_word = match offset {
+                    0x0204 => Some(0x1212_2712),
+                    0x0208 => Some(0x0012_0039),
+                    0x020C => Some(0x0900_0604),
+                    0x0210 => Some(0x0000_001A),
+                    0x0214 => Some(0x0009_030C),
+                    0x0218 => Some(0x0000_0012),
+                    0x0220 => Some(0x0301_0303),
+                    0x0224 => Some(0x0301_0303),
+                    0x0228 => Some(0x0000_0501),
+                    0x0254 => Some(0x0604_0008),
+                    0x0260 => Some(0x2106_0138),
+                    0x0264 => Some(0x2106_0138),
+                    _ => None,
+                };
+                if addr >= 0x150000 && addr < 0x250000 {
+                    if let Some(w) = ch1_word {
+                        return Ok(w);
+                    }
+                }
+                Ok(0) // any other read: zero (honest Na downstream)
+            },
+            &mut snap,
+        );
+
+        // The scan probed channel 0 (dormant) then channel 1 (active).
+        assert!(seen.contains(&0x50200), "channel 0 MCLK probed");
+        assert!(seen.contains(&0x150200), "channel 1 MCLK probed");
+        // Timing registers were read from channel 1's base.
+        assert!(seen.contains(&0x150204), "channel 1 CMD0 read");
+        assert!(seen.contains(&0x150260), "channel 1 RFC read");
+        // The active channel's non-zero multiplier clears the gate.
+        assert!(!snap.smn_setpoint_unverified);
+        assert_eq!(snap.gdm, 1); // GDM bit 11 set in 0x0830
+        assert_eq!(snap.command_rate, 0); // bit 10 clear
+        // The Castle Peak field offsets map the raw words to BIOS values.
+        assert_eq!(snap.timings.cl, 14);
+        assert_eq!(snap.timings.ras, 38);
+        assert_eq!(snap.timings.rc, 56);
+        assert_eq!(snap.timings.faw, 39);
+        assert_eq!(snap.timings.cwl, 18);
+        assert_eq!(snap.timings.wr, 24);
+        assert_eq!(snap.timings.rfc1, 312);
+        assert_eq!(snap.timings.rfc2, 192);
+        assert_eq!(snap.timings.rfcsb, 132);
+    }
+
+    /// (CP) The `apply_smn_castle_peak_with` fallback: every channel
+    /// dormant (all eight MCLK probes return `0x00000100`) → the overlay
+    /// falls back to channel 0, the decode still runs (JEDEC-fallback
+    /// values), and the zero multiplier trips `setpoint_unverified`.
+    #[test]
+    fn apply_smn_castle_peak_with_all_dormant_falls_back_to_channel0() {
+        let mut seen: Vec<u32> = Vec::new();
+        let mut snap = base_snapshot();
+        snap.threadripper = true;
+
+        apply_smn_with(
+            |addr| {
+                seen.push(addr);
+                // Every MCLK probe (channels 0–7) is dormant.
+                if (addr & 0xFFFF) == 0x0200 {
+                    return Ok(0x0000_0100);
+                }
+                // Channel 0 timing words: the known JEDEC-fallback data.
+                let ch0_word = match addr {
+                    0x50204 => Some(0x1212_2712),
+                    0x50208 => Some(0x0012_0039),
+                    0x5020C => Some(0x0900_0604),
+                    0x50210 => Some(0x0000_001A),
+                    0x50214 => Some(0x0009_030C),
+                    0x50218 => Some(0x0000_0012),
+                    0x50220 => Some(0x0301_0303),
+                    0x50224 => Some(0x0301_0303),
+                    0x50228 => Some(0x0000_0501),
+                    0x50254 => Some(0x0604_0008),
+                    0x50260 => Some(0x2106_0138),
+                    0x50264 => Some(0x2106_0138),
+                    _ => None,
+                };
+                if let Some(w) = ch0_word {
+                    return Ok(w);
+                }
+                Ok(0)
+            },
+            &mut snap,
+        );
+
+        // All eight MCLK probes ran.
+        assert_eq!(seen.len(), 8 + 13); // 8 probes + 13 fallback reads
+        for i in 0..CP_NUM_CHANNELS {
+            let probe = SMN_CH0_BASE + i * CP_CHANNEL_STRIDE + 0x0200;
+            assert!(seen.contains(&probe), "channel {i} MCLK probed: {probe:#x}");
+        }
+        // Fallback to channel 0: the zero multiplier trips the gate.
+        assert!(snap.smn_setpoint_unverified);
+        // The decode still ran (JEDEC-fallback values through the offsets).
+        assert_eq!(snap.timings.cl, 14);
+        assert_eq!(snap.timings.ras, 38);
+        assert_eq!(snap.timings.rc, 56);
+    }
+
+    /// (CP) The Threadripper dispatch: when `snap.threadripper` is true,
+    /// `apply_smn_with` routes through the Castle Peak scan (the reader
+    /// sees channel-base probes, not the Matisse offset-rule probe); when
+    /// false, the Matisse path runs unchanged (the first read is
+    /// `SMN_MCLK`).
+    #[test]
+    fn apply_smn_with_dispatches_on_threadripper_flag() {
+        // Non-Threadripper: the Matisse path reads SMN_MCLK first.
+        let mut seen_non_tr: Vec<u32> = Vec::new();
+        let mut snap_non_tr = base_snapshot();
+        snap_non_tr.threadripper = false;
+        apply_smn_with(
+            |addr| {
+                seen_non_tr.push(addr);
+                Ok(0x1539) // a valid Matisse set-point word
+            },
+            &mut snap_non_tr,
+        );
+        assert_eq!(seen_non_tr[0], SMN_MCLK, "Matisse path probes 0x50200 first");
+
+        // Threadripper: the Castle Peak path probes channel bases.
+        let mut seen_tr: Vec<u32> = Vec::new();
+        let mut snap_tr = base_snapshot();
+        snap_tr.threadripper = true;
+        apply_smn_with(
+            |addr| {
+                seen_tr.push(addr);
+                Ok(0x0000_0100) // every channel dormant → fallback
+            },
+            &mut snap_tr,
+        );
+        assert_eq!(
+            seen_tr[0],
+            SMN_CH0_BASE + 0x0200,
+            "Castle Peak path probes channel 0 first"
+        );
     }
 
     /// (g) The bulk-read core: the full 13-entry list in address order, the
