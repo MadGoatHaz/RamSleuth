@@ -4,11 +4,11 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing four artifacts: the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`, and the Debian/Ubuntu/Mint package `ramsleuth_<ver>_amd64.deb` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project — with one deliberate exception: the `ryzen-smu-dkms` extra keeps its own `1.0` pkgver line (re-pinned per release wave via the commit pin + `pkgrel`, not version-bumped) and does not track the workspace version.
 
-## [Unreleased]
+## [2.4.20] - (unreleased)
 
-### New
+### Fixed
 
-- **Threadripper 3000 / TRX40 live DRAM subtiming decode (Castle Peak)** — the AMD SMN overlay now scans all eight UMC channel instances on the Castle Peak server I/O die (1 MiB stride) and decodes from the first active channel, fixing the long-standing "JEDEC defaults instead of XMP timings" symptom on TRX40 boards (channel 0 is electrically dormant; TRX40 routes DIMMs to channels 1/3/5/7). The 27 DRAM subtimings apply the verified per-field arithmetic offsets that map raw register values to BIOS-visible timings (validated against the known DDR4-3200 data point: CL14-18-18-38, tRC=56, tFAW=39, tCWL=18, tWR=24, tRFC=312/192/132). GDM and command rate now populate normally when an active channel is present; the previous conservative "layout not validated" N/A is replaced with an accurate "no active memory channel detected" reason that only fires when all eight channels are dormant.
+- **Threadripper 3000 (Castle Peak / TRX40) DRAM timing decode** — tCL, tCWL, tWR, tFAW, tRAS, tRC now read correctly using platform-specific SMN register layout (8-channel UMC scan with per-field offsets; fixes "JEDEC defaults instead of XMP timings" on TRX40 boards).
 
 ## [2.4.19] - 2026-11-05
 
