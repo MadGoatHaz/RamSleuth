@@ -145,9 +145,18 @@ journalctl -u ramsleuth
 
 The unit never loads the `ryzen_smu` or `ramsleuth_intel` module.
 
-## Optional: `ryzen_smu` DKMS extra (live AMD subtimings)
+## Optional: `ryzen_smu` DKMS extra (live AMD subtimings + APOB)
 
-**Not a hard dependency.** Without the module, RamSleuth degrades gracefully: the AMD subtiming fields read `N/A (DriverMissing)`, exit 0, no panic.
+**Not a hard dependency** on desktop Ryzen (AM4 / AM5), where the built-in
+`/dev/mem` MCHBAR decode covers the live subtimings. **Required for
+Threadripper / TRX40 / WRX80 (sIOD) timing readout:** on those platforms the
+DRAM subtimings come from the **APOB** (AGESA Pre-Output Buffer) firmware
+structure, which the `ryzen_smu` module discovers in physical RAM and exposes
+via sysfs (`/sys/kernel/ryzen_smu_drv/apob`). Without the module, Threadripper
+DRAM subtimings read `N/A (DriverMissing)` — the SMN timing registers on sIOD
+silicon hold frozen JEDEC boot straps and do not reflect the trained timings.
+On desktop Ryzen without the module, the other AMD fields (clocks, voltages,
+SPD) still degrade gracefully to `N/A (DriverMissing)`, exit 0, no panic.
 
 ### Source: offline vendor, pinned git as fallback
 
@@ -192,7 +201,9 @@ The distinct names are deliberate: they keep the **helper binary itself** out of
 `AUTOINSTALL=yes` in the bundled `dkms.conf` auto-rebuilds the module on kernel updates. Verify:
 
 ```sh
-ls /sys/kernel/ryzen_smu_drv/pm_table
+ls /sys/kernel/ryzen_smu_drv/pm_table       # the PM table (clocks, voltages)
+ls /sys/kernel/ryzen_smu_drv/apob_available # 1 = APOB discovered (Threadripper / sIOD timings)
+ls /sys/kernel/ryzen_smu_drv/apob_size      # APOB table size in bytes
 ```
 
 Operational notes: the `monitor_cpu` ground-truth CLI is built only when the source includes a `userspace/` dir — the vendored tree omits it, so a vendor-path build prints the pre-existing `monitor_cpu unavailable` warning (the module itself is unaffected; a git-path build includes it). And on a box that registered an old git-path DKMS version (`<revcount>.d298366`) before the vendor landed, the vendor path registers `1.d298366` **alongside** it — harmless (AUTOINSTALL rebuilds both); tidy up with `sudo dkms remove ryzen_smu/<old>`; and, since v2.4.8, both DKMS helpers run `dkms install … --force` and remove a stale `/usr/lib/depmod.d/<module>.conf` left by an older helper, so a re-run over a residual (already-registered/loaded) module is idempotent — the residual is overwritten cleanly, never a build failure.

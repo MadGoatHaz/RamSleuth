@@ -583,13 +583,14 @@ do_install() {
   else
     warn "/usr/share/ryzen-smu-dkms/dkms.conf skipped — not present in this source; the helper falls back to the vendored dkms.conf"
   fi
-  # The vendored ryzen_smu source tree (the 6 module files frozen at upstream
-  # d298366 + SUMS.sha256 + NOTICE.md) → /usr/share/ryzen-smu-dkms/vendor/ —
-  # the exact path the AMD helper resolves as its OFFLINE vendored source
-  # (C21-08/09: SUMS-verified, zero network). GUARDED like the AUR does.
+  # The vendored ryzen_smu source tree (the 8 module files: 6 frozen at
+  # upstream d298366 + 2 APOB additions, all SUMS-verified + NOTICE.md) →
+  # /usr/share/ryzen-smu-dkms/vendor/ — the exact path the AMD helper
+  # resolves as its OFFLINE vendored source (C21-08/09: SUMS-verified,
+  # zero network). GUARDED like the AUR does.
   if [[ -d "$VENDOR_DIR/ryzen-smu" ]]; then
     local f
-    for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
+    for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h apob.c apob.h; do
       if [[ -f "$VENDOR_DIR/ryzen-smu/$f" ]]; then
         install -Dm644 "$VENDOR_DIR/ryzen-smu/$f" "/usr/share/ryzen-smu-dkms/vendor/ryzen-smu/$f"
       fi

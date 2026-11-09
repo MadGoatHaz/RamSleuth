@@ -1190,7 +1190,10 @@ list), so a failure in one branch can never affect the others. `collect()`
 whole crate.
 
 ```text
-CpuInfo::detect() ──┬─ AMD:      amd_smu::acquire() → amd_pm::parse() → amd_smn::apply_smn (overlay) → amd_readout::map_amd()
+CpuInfo::detect() ──┬─ AMD:      amd_smu::acquire() → amd_pm::parse()
+                    │           ├─ cIOD: amd_smn::apply_smn (overlay) → amd_readout::map_amd()
+                    │           └─ sIOD: amd_apob::read_apob_from_sysfs() → amd_apob::parse_apob() → timings
+                    │                     └─ on APOB failure: amd_smn::apply_smn (fallback) → amd_readout::map_amd()
                     ├─ Intel:    intel_sysfs::acquire() (primary: ramsleuth_intel kobject) → intel_readout::decode
                     │           └─ on DriverMissing only: intel_mchbar::acquire() → intel_readout::read_intel (/dev/mem fallback)
                     ├─ SPD:      spd_eeprom::acquire() → spd_decode::decode() (per image)
@@ -1319,25 +1322,183 @@ artifact, not a layout difference: TRX40 boards route DIMMs to the
 odd-indexed UMC instances (1, 3, 5, 7) and leave channel 0 electrically
 dormant with JEDEC DDR4-2400 fallback data. The overlay now scans all
 eight channel bases (1 MiB stride from `0x0005_0000`) and decodes from
-the first active channel (non-zero multiplier, power-gate clear). The
-27 DRAM subtimings additionally apply Castle Peak per-field arithmetic
-offsets (verified against the known DDR4-3200 data point: tCL −4, tRAS
-−1, tRC −1, tFAW +13, tCWL +6, tWR +6) to map the raw register values
-onto the BIOS-visible timings. When every channel is dormant, the
-decode falls back to channel 0 and the zero multiplier trips the
-`setpoint_unverified` gate — GDM / command rate then render `N/A` with
-the reason "No active memory channel detected on Threadripper/TRX40
-(Castle Peak); GDM and command rate unavailable" (only the two fields
-in that word are affected; the 27 subtimings in the other registers
-still decode from the dormant channel's JEDEC fallback values).
-Similarly, the `ryzen_smu` driver does not expose the `pm_table`
-attribute on some Threadripper AGESA versions; the `pm_exposed` flag
-then carries the specific "PM table not exposed by ryzen-smu driver on
-this platform (known limitation for Threadripper 3000/WRX80)" reason on
-every PM-derived field. Both are detected via the CPUID brand string
-("Threadripper") and are platform limitations, not decode failures.
+the first active channel (non-zero multiplier, power-gate clear). When
+every channel is dormant, the decode falls back to channel 0 and the
+zero multiplier trips the `setpoint_unverified` gate — GDM / command
+rate then render `N/A` with the reason "No active memory channel
+detected on Threadripper/TRX40 (Castle Peak); GDM and command rate
+unavailable". Similarly, the `ryzen_smu` driver does not expose the
+`pm_table` attribute on some Threadripper AGESA versions; the
+`pm_exposed` flag then carries the specific "PM table not exposed by
+ryzen-smu driver on this platform (known limitation for Threadripper
+3000/WRX80)" reason on every PM-derived field.
 
-**Channel mode + ECC (the 14-register channel set).** Complementary to the
+**The 27 DRAM subtimings on sIOD: the APOB path.** The live SMN timing
+registers (0x50204–0x50264) on server-I/O-die (sIOD) silicon — Castle
+Peak (Threadripper 3000 / TRX40), Chagall (Threadripper PRO 5000 /
+WRX80), and the EPYC line — hold frozen JEDEC bootstrap straps written
+at early boot and **do not receive post-training updates** (the
+sIOD AGESA path programs the DDR PHY directly and bypasses the shadow
+register writeback that client-I/O-die (cIOD) performs). Empirically,
+two TRX40 systems with different CAS latencies (tCL=14 vs tCL=16)
+produce identical SMN register dumps across the entire 0x50000–0x50600
+range. A previous attempt to decode sIOD timings from the SMN
+registers using per-field arithmetic offsets (the v2.4.20 "fix") was a
+curve-fit to a single data point and produced wrong values elsewhere;
+it was reverted in v2.4.21, leaving all 27 subtimings as honest `N/A`.
+
+The correct source is the **APOB (AGESA Pre-Output Buffer)**: a
+firmware data structure written to physical DRAM during early boot
+(AGESA Phase 1 on the PSP) containing the complete trained platform
+state — memory timings, fabric topology, core mapping, power limits.
+The APOB is not exposed through any standard OS interface (no ACPI,
+SMBIOS, or MMIO BAR); it resides in a reserved physical allocation and
+must be discovered by scanning known candidate addresses. On Castle
+Peak the APOB Group 1 Type 3 entry contains the trained DDR4 timings in
+plaintext (8 channel structures × 108 bytes each), while on production
+EPYC (Rome/Milan) the equivalent entries are encrypted or sanitized
+under Platform Secure Boot. See §10.2a for the full APOB acquisition
+and parse design.
+
+Platform routing is by **CPUID package type** (leaf 0x80000001
+EBX[31:28]): PkgType 0x02 (sIOD — TR4/sTRX4/sWRX8/SP3/SP5) routes to
+the APOB path first with the SMN overlay as fallback; PkgType 0x01
+(cIOD — AM4/AM5) continues to use the SMN register path as primary
+with APOB as a secondary source when available. Both are detected via
+the CPUID brand string ("Threadripper", "EPYC") and package type and
+are platform routing decisions, not decode failures.
+
+#### 10.2a The APOB (AGESA Pre-Output Buffer) path — sIOD timing source
+
+**What it is.** The APOB is a firmware data structure written to physical DRAM
+during early boot (AGESA Phase 1, executed on the PSP) containing the complete
+trained platform state: memory timings, fabric topology, CPU core mapping,
+power limits, and board configuration. It is a contiguous binary blob:
+
+- **16-byte header:** signature (`0x424F5041` = "APOB" little-endian), format
+  version (`0x0001` legacy / `0x0002` modern Zen), table size (bytes, including
+  header and all entries), flags.
+- **Variable-length entry array:** each entry has a 12-byte header (Group ID
+  `u16`, Type ID `u16`, payload size `u32`, instance ID `u8`, flags `u8`
+  — bit 7 = encrypted — header size `u16`) followed by the payload.
+
+The APOB is **not** exposed through any standard OS interface (no ACPI table,
+no SMBIOS type, no MMIO BAR). It resides in a reserved physical RAM allocation
+(64 KB-aligned, in the first 16 MB) and must be discovered by scanning known
+candidate addresses. The format is reverse-engineered from AMD AGESA firmware
+and the open-source [ZenStates-Core](https://github.com/irusanov/ZenStates-Core)
+project; the authoritative field layouts are documented in
+`work/docs/research/ZenStates-Core Telemetry Integration Audit.md` (Part 1) and
+`work/docs/research/Castle Peak Linux DRAM Timings.md`.
+
+**Why it is needed (the sIOD timing gap).** On server-I/O-die (sIOD) platforms
+— Castle Peak (Threadripper 3000 / TRX40), Chagall (Threadripper PRO 5000 /
+WRX80), and the EPYC line — the SMN UMC shadow registers that desktop (cIOD)
+timing decode reads from hold frozen JEDEC bootstrap straps and do not
+receive post-training updates. The sIOD AGESA path programs the DDR PHY
+directly and writes the trained state only into the APOB. The APOB is therefore
+the **only** OS-accessible source of the actual trained DRAM timings on sIOD
+silicon. On production EPYC (Rome/Milan) the timing entries are encrypted or
+sanitized under Platform Secure Boot (PSB), so the APOB path is currently
+useful only on unencrypted platforms (Threadripper / WRX80); on desktop cIOD
+(Am4/AM5) the SMN path remains primary and the APOB is a secondary cross-check
+when available.
+
+**Discovery (kernel module).** The `ryzen_smu` kernel module (extended with
+the APOB subsystem in v2.4.22) discovers the APOB at probe time:
+
+1. Scan three candidate physical addresses in priority order:
+   `0x0A200000`, `0x09F00000`, `0x04000000` (64 KB-aligned, first 16 MB).
+2. At each candidate, `ioremap_cache` the first page and check the signature
+   word at offset 0 for `0x424F5041`.
+3. On a signature match, read the table size (offset 8, `u32`) and validate
+   it (0 < size ≤ 1 MiB); if the table spans multiple pages, re-map the full
+   size.
+4. On the first valid APOB, store the physical address, virtual mapping,
+   size, and version; stop scanning.
+
+The kernel module does **no parsing** — it exposes the raw blob and metadata
+via four read-only sysfs attributes:
+
+- `/sys/kernel/ryzen_smu_drv/apob` — the raw APOB blob (up to one page per
+  read; the userspace reader handles multi-page tables)
+- `/sys/kernel/ryzen_smu_drv/apob_available` — `1` if discovered, `0` otherwise
+- `/sys/kernel/ryzen_smu_drv/apob_size` — table size in bytes
+- `/sys/kernel/ryzen_smu_drv/apob_version` — format version (hex)
+
+Discovery is non-fatal: if the APOB is not found at any candidate, the module
+still loads and the attributes report unavailable (`0` / `0` bytes); the
+userspace parser treats this as "APOB not available" and falls back to the
+SMN path.
+
+**Parsing (userspace, `ramsleuth-telemetry`).** The Rust parser
+(`amd_apob.rs`) reads the raw blob from sysfs and:
+
+1. Validates the 16-byte header (signature, version, table size within
+   bounds, table size ≥ header size).
+2. Iterates the entry array: for each entry, reads the 12-byte header,
+   validates the payload size against the remaining table bytes (a
+   boundary overrun stops iteration cleanly — no panic, no wraparound).
+3. Skips encrypted entries (Group ID `0xFFFF` or flags bit 7 set)
+   gracefully — they are noted but not parsed.
+4. Targets **Group 1 (Memory), Type 3 (Timings)**: on Castle Peak this is a
+   block of 8 × 108-byte per-channel timing structures. Each 108-byte
+   structure decodes to the standard timing fields (tCL, tRCDW/R, tRP,
+   tRAS, tRC, tFAW, tWTR_S/L, tWR, tRFC_S/F/PB, tCWL, command rate) using
+   the offsets documented in the research audit (Part 1, "Architectural
+   Timing Profiles").
+5. Produces a structured `ApobData` (header, parsed entries, per-channel
+   timings) that feeds the `AmdReadout` via the facade, with the timing
+   source annotated as `"APOB"` for display.
+
+All parsing is bounds-checked, never panics, and produces typed errors
+(`ApobError`: `NotFound`, `BadSignature`, `Truncated`, `UnsupportedVersion`,
+`EntryOverrun`, `TimingsNotFound`, `TimingsEncrypted`, `TimingsTooShort`,
+`Io`).
+
+**Platform routing (the facade).** `CpuInfo::detect()` now extracts the
+**package type** from CPUID leaf `0x80000001` EBX[31:28]:
+
+| PkgType | Platform | Timing source priority |
+|---------|----------|----------------------|
+| `0x00`  | Mobile (FP4–FP8 BGA) | APOB (if available) → SMN fallback |
+| `0x01`  | Client (AM4 / AM5) | SMN (primary) → APOB (secondary) |
+| `0x02`  | Server / HEDT (TR4 / sTRX4 / sWRX8 / SP3 / SP5) | APOB (primary) → SMN fallback |
+| `0x04`  | Client (AM5, some Zen 4+) | SMN (primary) → APOB (secondary) |
+| `0x07`  | Server (SP5) | APOB (primary) → SMN fallback |
+
+The facade routes sIOD (PkgType 0x02) to the APOB path first: if the APOB
+is available and the Group 1 Type 3 timing entry parses successfully, those
+timings populate the `AmdReadout`; if the APOB is unavailable or the timing
+entry is encrypted/missing, the SMN overlay runs as a fallback (producing
+`N/A` on sIOD where the registers hold frozen straps — an honest
+degradation). Client (PkgType 0x01 / 0x04) continues to use the SMN path
+as primary; the APOB is read as a secondary source only when available.
+
+**Display and probe reports.** The timing source is annotated on the wire
+and in the display: the TUI / GUI / CLI show "APOB" (vs "SMN") next to the
+timing block header on Threadripper, and the probe report (`probe.rs`)
+carries the source annotation so bug reports identify which path produced
+the values. The `amd_readout.rs` mapping layer is unchanged — it consumes
+the same `TimingSet` struct regardless of source.
+
+**Limitations and future scope.** The current APOB parser targets the
+Castle Peak (Zen 2 sIOD) DDR4 layout (Group 1 Type 3, 8 × 108 bytes).
+Future extensions (out of scope for v2.4.22):
+
+- **DDR5 subchannel timings** (Group 1 Type 4) for Zen 4/5 sIOD (Storm
+  Peak / Threadripper 7000) — a different payload layout with two
+  32-bit subchannels per physical channel.
+- **EPYC (Rome/Milan)** — timing entries are encrypted/sanitized under
+  PSB on production firmware; not currently readable.
+- **Additional APOB groups** — core map (Group 3), fabric topology
+  (Group 2), impedance configuration (Group 1 Type 8) — the entry
+  iteration infrastructure is in place; decoding the payloads is
+  future work.
+
+#### 10.2b Channel mode + ECC (the 14-register channel set)
+
+Complementary to the
 timing block: per UMC channel (base `0x00050000` / `0x00150000` — the fixed
 `+0x00100000` stride, so the `+0x100000` offset rule does *not* apply) the
 four CS base words (bit 0 = CsEn), the two `AddrMask` rank-size words, and

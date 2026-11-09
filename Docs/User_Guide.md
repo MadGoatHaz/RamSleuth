@@ -57,8 +57,11 @@ memory controller's own state and shows it in a dense dashboard:
   FCLK (the Infinity Fabric clock on AMD), the UCLK:MCLK sync ratio (1:1
   synchronous or 1:2 asynchronous), the DRAM command rate (1T/2T), and the
   CPU's live core frequency.
-- **Live DRAM subtimings** — on AMD, all 27 (tCL, tRCD, tRP, tRAS, tRFC, …)
-  straight from the SMU PM table; on Intel client silicon, the subset its
+- **Live DRAM subtimings** — on AMD desktop (cIOD), all 27 (tCL, tRCD, tRP,
+  tRAS, tRFC, …) from the SMN register space via the `ryzen_smu` driver; on
+  AMD Threadripper (TRX40 / sIOD), from the **APOB** (AGESA Pre-Output Buffer)
+  firmware structure exposed by the same driver; on Intel client silicon, the
+  subset its
   MCHBAR registers expose, decoded from the memory controller (Section 8.2) —
   per-channel on the Tier 1 / Tier 2 generations (Haswell / Broadwell through
   Rocket Lake, the 64 KiB register window) and per-subchannel on the Tier 3
@@ -1192,11 +1195,16 @@ language tour.
 
 The live timings are the controller's *actual* timing state, in **ticks**
 (clock cycles of the DRAM clock domain — a tick at 3000 MHz is ~0.33 ns).
-AMD: all 27, from the SMU PM table. Intel: the subset its MCHBAR registers
-expose (tCL/tRCD/tRP, tCCD_S/L, the RDRD/RDWR/WRWR/WRRD set, RTL); tRAS —
-and tWTRS/tWTRL — may read `N/A` on some SKUs because the firmware leaves
-those TC fields unprogrammed, a platform/firmware condition rather than a
-bug (Section 9).
+AMD desktop (AM4 / AM5): all 27, from the SMN register space via the
+`ryzen_smu` driver. AMD Threadripper (TRX40 / WRX80): all 27, from the
+**APOB** (AGESA Pre-Output Buffer) — a firmware boot snapshot the driver
+exposes, because the live SMN timing registers on server-I/O-die (sIOD)
+silicon hold frozen JEDEC boot straps and do not reflect the trained
+timings (Section 10). The display annotates the source as "SMN" or
+"APOB". Intel: the subset its MCHBAR registers expose (tCL/tRCD/tRP,
+tCCD_S/L, the RDRD/RDWR/WRWR/WRRD set, RTL); tRAS — and tWTRS/tWTRL — may
+read `N/A` on some SKUs because the firmware leaves those TC fields
+unprogrammed, a platform/firmware condition rather than a bug (Section 9).
 
 | # | Timing | Meaning |
 |---|---|---|
@@ -1516,6 +1524,20 @@ the mainline kernel.
   process exits 0. RamSleuth is fully useful on an AMD machine without the
   module; the module only unlocks the live-subtiming depth.
 
+**Threadripper / TRX40 note:** On Threadripper (Castle Peak / TRX40,
+Threadripper PRO / WRX80) and other server-I/O-die (sIOD) platforms, the
+DRAM subtimings are **not** read from the live SMN memory-controller
+registers — on those chips the registers hold frozen JEDEC boot straps that
+never reflect the trained timings. Instead, RamSleuth reads them from the
+**APOB** (AGESA Pre-Output Buffer), a firmware data structure written to
+physical RAM during boot that contains the trained memory configuration.
+The `ryzen_smu` kernel module discovers and exposes the APOB, so **on
+Threadripper the module is required for timing readout** — without it, all
+27 DRAM subtimings show `N/A (DriverMissing)`. The APOB is a boot-time
+snapshot: on DDR4 the trained timings do not change after boot, so the
+values are accurate; the display annotates the source as "APOB" to
+distinguish it from the live SMN source used on desktop Ryzen.
+
 Three ways to get it (all build the same **pinned** upstream source —
 `amkillam/ryzen_smu @ d2983668300dd2a598e5a7dc40e71ce0678cc270`, verified
 2026-08-15 — never a branch HEAD):
@@ -1579,24 +1601,24 @@ known platform limitations, not bugs:**
   RamSleuth report:
   `N/A (No active memory channel detected on Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)`
 
-- **DRAM subtimings (tCL, tRCD, tRP, tRAS, tRC, … all 27)** — the bit-field
-  layout of the SMN timing registers (0x50204–0x50264) has not been
-  verified against AMD-published UMC maps for Threadripper / TRX40. A
-  previous per-field arithmetic offset (reverse-engineered from a single
-  DDR4-3200 data point) was removed because it produced wrong values on
-  systems with different timings. All 27 SMN-derived timing fields now
-  render as honest N/A:
-  `N/A (SMN timing layout not verified on Threadripper/TRX40 (Castle Peak). Raw registers available via `ramsleuth-telemetry --raw-smn` for manual analysis.)`
-  If you need the raw register values (for manual decode or before/after
-  BIOS comparisons), use `ramsleuth-telemetry --raw-smn` — it dumps every
-  readable word in the 0x50000–0x50400 range with no decode applied.
+- **DRAM subtimings (tCL, tRCD, tRP, tRAS, tRC, … all 27)** — available
+  via the **APOB** (AGESA Pre-Output Buffer) when the `ryzen_smu` kernel
+  module is loaded. On sIOD platforms the live SMN timing registers hold
+  frozen JEDEC boot straps and do not reflect the trained timings, so
+  RamSleuth reads the APOB firmware structure instead (Section 10). The
+  APOB source is annotated as "APOB" in the display and probe reports
+  to distinguish it from the live SMN source used on desktop Ryzen.
+  Without the `ryzen_smu` module the subtimings show
+  `N/A (DriverMissing)`. The SMN registers are still readable via
+  `ramsleuth-telemetry --raw-smn` for before/after BIOS comparisons, but
+  on TRX40 they hold the JEDEC bootstrap values, not the trained timings.
 
 All other telemetry (SPD, platform info, benchmarks, CPU temperature)
 works normally on Threadripper. If your Threadripper system *does*
 expose the PM table (some AGESA versions do), the PM-derived fields
-(MCLK / UCLK / FCLK / voltages) will populate as on desktop Ryzen,
-though the SMN-derived subtimings remain N/A until the layout is
-verified.
+(MCLK / UCLK / FCLK / voltages) will populate as on desktop Ryzen.
+The DRAM subtimings come from the APOB (not the SMN registers) when the
+`ryzen_smu` module is loaded — see the APOB note in Section 10.
 
 ---
 
@@ -1863,15 +1885,16 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   **board-delivered** from the Super-I/O `in0` (not the MCHBAR window), with
   the confidence badge from Section 8.3 — it reads `N/A` only on enterprise
   / out-of-bounds / no-Super-I/O boards.
-- **Threadripper / TRX40 / WRX80** — three known platform limitations
+- **Threadripper / TRX40 / WRX80** — two remaining platform limitations
   (Section 10.1): the `ryzen_smu` driver may not expose the PM table on
   some Threadripper AGESA versions (MCLK / UCLK / FCLK / voltages read
-  `N/A` with a platform-specific reason); GDM / command rate read `N/A`
-  when every UMC channel is dormant; and the 27 DRAM subtimings read
-  `N/A` because the SMN timing-register layout is not yet verified on
-  Threadripper / TRX40 (use `ramsleuth-telemetry --raw-smn` for the raw
-  registers). SPD, benchmarks, and all other telemetry work normally —
-  these are driver / silicon limitations, not RamSleuth faults.
+  `N/A` with a platform-specific reason); and GDM / command rate read
+  `N/A` when every UMC channel is dormant. The 27 DRAM subtimings are
+  **now available** via the APOB (AGESA Pre-Output Buffer) when the
+  `ryzen_smu` module is loaded — without the module they read
+  `N/A (DriverMissing)`. SPD, benchmarks, and all other telemetry work
+  normally — the remaining items are driver / silicon limitations, not
+  RamSleuth faults.
 - **Some Vermeer (Zen 3) boards read the PM-table subtiming block as 0** —
   the 27 subtimings come back zeroed (the firmware leaves the block
   unpopulated) while the clocks, voltages, and SPD all read normally — a
