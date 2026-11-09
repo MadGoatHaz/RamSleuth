@@ -16,7 +16,7 @@ endif
 endif
 
 obj-m				:= $(MOD).o
-$(MOD)-objs		 	:= drv.o smu.o
+$(MOD)-objs		 	:= drv.o smu.o apob.o
 
 .PHONY: all modules clean dkms-install dkms-uninstall insmod checkmod
 

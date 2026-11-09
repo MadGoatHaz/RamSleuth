@@ -14,6 +14,7 @@
 #include <linux/version.h>
 
 #include "smu.h"
+#include "apob.h"
 
 #ifndef KBUILD_MODNAME
     #define KBUILD_MODNAME "ryzen_smu"
@@ -44,7 +45,30 @@ MODULE_LICENSE("GPL");
 #define PCI_DEVICE_ID_AMD_MI200_ROOT        0x14bb
 #define PCI_DEVICE_ID_AMD_MI300_ROOT        0x14f8
 
-#define MAX_ATTRS_LEN                      13
+/*
+ * drv_attrs[] layout:
+ *   [0..7]   Fixed attributes (drv_version, version, mp1_if_version, codename,
+ *            smu_args, mp1_smu_cmd, hsmp_smu_cmd, smn)
+ *   [8..10]  APOB attributes (apob_available, apob_size, apob_version)
+ *   [11]     RSMU optional pointer
+ *   [12]     PM table size optional pointer
+ *   [13]     PM table optional pointer
+ *   [14]     PM table version optional pointer
+ *   [15]     Spare
+ *   [16]     Termination pointer (NULL)
+ *
+ * The APOB binary attribute ("apob") is NOT in this array — it is added
+ * separately via sysfs_add_bin_file() after the kobject is created.
+ */
+#define MAX_ATTRS_LEN                      17
+
+/* Reserved slot indices in drv_attrs[] (see layout above) */
+#define DRV_ATTR_RSMU                      11
+#define DRV_ATTR_PM_SIZE                   12
+#define DRV_ATTR_PM_TABLE                  13
+#define DRV_ATTR_PM_VERSION                14
+#define DRV_ATTR_SPARE                     15
+#define DRV_ATTR_TERMINATION               16
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
     #error "Unsupported kernel version. Minimum: v4.19"
@@ -68,6 +92,10 @@ static struct ryzen_smu_data {
 
     u32                     smn_result;
 
+    /* APOB (AGESA Pre-Output Buffer) state — raw blob from physical DRAM.
+     * Discovered independently of the SMU mailbox; not fatal if absent. */
+    struct apob_data        apob;
+
     u8*                     pm_table;
     u32                     pm_table_version;
     size_t                  pm_table_read_size;
@@ -81,6 +109,14 @@ static struct ryzen_smu_data {
     .smu_rsp              = SMU_Return_OK,
 
     .smn_result           = 0,
+
+    .apob                 = {
+        .vaddr            = NULL,
+        .paddr            = 0,
+        .size             = 0,
+        .version          = 0,
+        .found            = false,
+    },
 
     .pm_table             = NULL,
     .pm_table_version     = 0,
@@ -266,6 +302,65 @@ size_t count) {
     return count;
 }
 
+/* ---------------------------------------------------------------------------
+ * APOB (AGESA Pre-Output Buffer) sysfs attributes
+ * ---------------------------------------------------------------------------
+ *
+ * The APOB is a boot-time firmware structure in reserved physical RAM.
+ * The kernel exposes the RAW blob via a binary sysfs attribute — no parsing
+ * is done here. All format knowledge lives in the userspace Rust parser.
+ *
+ * Thread safety: The APOB is read-only and static after boot. The bin_read
+ * and show functions perform memcpy_fromio from ioremap'd memory, which is
+ * safe without locking because the data never changes at runtime and the
+ * ioremap region is coherent.
+ */
+
+static ssize_t apob_available_show(struct kobject *kobj,
+                                   struct kobj_attribute *attr, char *buff)
+{
+    return sprintf(buff, "%d\n", g_driver.apob.found ? 1 : 0);
+}
+
+static ssize_t apob_size_show(struct kobject *kobj,
+                              struct kobj_attribute *attr, char *buff)
+{
+    return sprintf(buff, "%zu\n", g_driver.apob.size);
+}
+
+static ssize_t apob_version_show(struct kobject *kobj,
+                                 struct kobj_attribute *attr, char *buff)
+{
+    return sprintf(buff, "0x%08x\n", g_driver.apob.version);
+}
+
+/*
+ * Binary read for the raw APOB blob.
+ *
+ * This is called by sysfs_add_bin_file when userspace reads the "apob"
+ * attribute. The offset/count parameters allow reading the blob in chunks
+ * (userspace may need to read more than one PAGE_SIZE if the APOB is large).
+ *
+ * Thread safety: see comment above. The APOB is static and read-only.
+ */
+static ssize_t apob_bin_read(struct file *filp, struct kobject *kobj,
+                             const struct bin_attribute *attr, char *buf,
+                             loff_t offset, size_t count)
+{
+    struct apob_data *apob = &g_driver.apob;
+    size_t to_copy;
+
+    if (!apob->found || !apob->vaddr)
+        return 0;
+
+    if (offset >= apob->size)
+        return 0;
+
+    to_copy = min(count, apob->size - offset);
+    memcpy_fromio(buf, apob->vaddr + offset, to_copy);
+    return to_copy;
+}
+
 __RO_ATTR (drv_version);
 __RO_ATTR (version);
 __RO_ATTR (mp1_if_version);
@@ -275,6 +370,11 @@ __RO_ATTR (pm_table);
 __RO_ATTR (pm_table_size);
 __RO_ATTR (pm_table_version);
 
+/* APOB regular attributes (the raw blob is exposed via bin_attribute below) */
+__RO_ATTR (apob_available);
+__RO_ATTR (apob_size);
+__RO_ATTR (apob_version);
+
 __RW_ATTR (rsmu_cmd);
 __RW_ATTR (mp1_smu_cmd);
 __RW_ATTR (hsmp_smu_cmd);
@@ -282,7 +382,24 @@ __RW_ATTR (smu_args);
 
 __RW_ATTR (smn);
 
+/*
+ * Binary sysfs attribute for the raw APOB blob.
+ *
+ * The size is set dynamically in ryzen_smu_probe() after APOB discovery.
+ * The max_size caps the read to APOB_MAX_TABLE_SIZE (1 MiB) to prevent
+ * userspace from requesting an unreasonably large buffer.
+ */
+static struct bin_attribute apob_bin_attr = {
+    .attr = {
+        .name = "apob",
+        .mode = 0444,
+    },
+    .read = apob_bin_read,
+    .size = 0,
+};
+
 static struct attribute *drv_attrs[MAX_ATTRS_LEN] = {
+    /* Fixed attributes [0..7] */
     &dev_attr_drv_version.attr,
     &dev_attr_version.attr,
     &dev_attr_mp1_if_version.attr,
@@ -294,17 +411,25 @@ static struct attribute *drv_attrs[MAX_ATTRS_LEN] = {
 
     &dev_attr_smn.attr,
 
+    /* APOB attributes [8..10] */
+    &dev_attr_apob_available.attr,
+    &dev_attr_apob_size.attr,
+    &dev_attr_apob_version.attr,
+
     // -- NOTE: Do not edit below here. --
 
-    // RSMU Optional Pointer
+    // RSMU Optional Pointer [11]
     NULL,
 
-    // PM Table Optional Pointers
+    // PM Table Optional Pointers [12..14]
     NULL,
     NULL,
     NULL,
 
-    // Termination Pointer
+    // Spare [15]
+    NULL,
+
+    // Termination Pointer [16]
     NULL,
 };
 
@@ -361,14 +486,19 @@ static int ryzen_smu_probe(struct pci_dev *dev, const struct pci_device_id *id) 
         return -EINVAL;
     }
 
+    // Discover the APOB (AGESA Pre-Output Buffer) in physical DRAM.
+    // Non-fatal: if the APOB is not found, the module still loads and the
+    // APOB sysfs attributes report unavailable (apob_available = 0).
+    apob_init(&g_driver.apob);
+
     // Check if RSMU is valid to determine if to skip PM table setup.
     if (ryzen_smu_get_version(MAILBOX_TYPE_RSMU, 0) == 0) {
-        // We do something absolutely stupid here and use relative offsets to overwrite offsets
-        //  in the drv_attrs[] array.
+        // We use explicit slot indices (defined above) to overwrite the
+        // reserved NULL slots in the drv_attrs[] array.
         //
-        // This shouldn't *typically* cause errors unless the array structure is messed with.
-        // So, we left a warning above to not touch it.
-        drv_attrs[MAX_ATTRS_LEN - 5] = &dev_attr_rsmu_cmd.attr;
+        // This shouldn't *typically* cause errors unless the array structure
+        // is messed with. So, we left a warning above to not touch it.
+        drv_attrs[DRV_ATTR_RSMU] = &dev_attr_rsmu_cmd.attr;
     }
     else {
         pr_info("RSMU Mailbox: Disabled or not responding to commands.");
@@ -398,11 +528,11 @@ static int ryzen_smu_probe(struct pci_dev *dev, const struct pci_device_id *id) 
         if (ret == SMU_Return_OK) {
             pr_debug("Probe succeeded: read %ld bytes", g_driver.pm_table_read_size);
 
-            drv_attrs[MAX_ATTRS_LEN - 4] = &dev_attr_pm_table_size.attr;
-            drv_attrs[MAX_ATTRS_LEN - 3] = &dev_attr_pm_table.attr;
+            drv_attrs[DRV_ATTR_PM_SIZE] = &dev_attr_pm_table_size.attr;
+            drv_attrs[DRV_ATTR_PM_TABLE] = &dev_attr_pm_table.attr;
 
             if (g_driver.pm_table_version)
-                drv_attrs[MAX_ATTRS_LEN - 2] = &dev_attr_pm_table_version.attr;
+                drv_attrs[DRV_ATTR_PM_VERSION] = &dev_attr_pm_table_version.attr;
         }
         else
             pr_err("Failed to probe the PM table -- disabling feature (%d)", ret);
@@ -411,18 +541,33 @@ static int ryzen_smu_probe(struct pci_dev *dev, const struct pci_device_id *id) 
         pr_debug("Notice: PM tables are not supported for the current platform (%d)", ret);
     }
 
-_CONTINUE_SETUP:
+    _CONTINUE_SETUP:
     // Allocate the sysfs attr group with the parameters for use
     g_driver.drv_kobj = kobject_create_and_add("ryzen_smu_drv", kernel_kobj);
     if (!g_driver.drv_kobj) {
         pr_err("Unable to create sysfs interface");
-        return -ENOMEM;
+        goto fail_apob;
     }
 
-    if (sysfs_create_group(g_driver.drv_kobj, &drv_attr_group))
+    if (sysfs_create_group(g_driver.drv_kobj, &drv_attr_group)) {
+        pr_err("Failed to create sysfs attribute group");
         kobject_put(g_driver.drv_kobj);
+        g_driver.drv_kobj = NULL;
+        goto fail_apob;
+    }
+
+    /* Add the APOB binary attribute (only if APOB was found) */
+    if (g_driver.apob.found) {
+        apob_bin_attr.size = g_driver.apob.size;
+        if (sysfs_create_bin_file(g_driver.drv_kobj, &apob_bin_attr))
+            pr_warn("APOB: failed to add binary sysfs attribute\n");
+    }
 
     return 0;
+
+fail_apob:
+    apob_exit(&g_driver.apob);
+    return -ENOMEM;
 }
 
 static void ryzen_smu_remove(struct pci_dev *dev) {
@@ -432,6 +577,9 @@ static void ryzen_smu_remove(struct pci_dev *dev) {
 
     if (g_driver.drv_kobj)
         kobject_put(g_driver.drv_kobj);
+
+    // Release the APOB ioremap (no-op if APOB was not found)
+    apob_exit(&g_driver.apob);
 
     smu_cleanup();
 }
