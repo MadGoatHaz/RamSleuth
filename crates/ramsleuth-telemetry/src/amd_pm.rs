@@ -335,6 +335,17 @@ pub struct AmdPmSnapshot {
     /// `0x50200` limitations are known Threadripper behaviors, not
     /// decode failures).
     pub threadripper: bool,
+    /// `true` when the platform is a server / workstation I/O Die
+    /// (sIOD) — Threadripper (TRX40 / WRX80 / sTRX Pro) or EPYC
+    /// (SP3 / SP5). Set by the facade
+    /// ([`crate::facade::amd_branch`]) from
+    /// [`crate::cpuid::detect_amd_package_type`] after the snapshot is
+    /// parsed; `parse` initializes it to `false`. The P2-05 mapping uses
+    /// this flag to emit the sIOD timing N/A reason (SMN shadow
+    /// registers are not updated post-training on sIOD, and APOB was
+    /// not available) — covers both Threadripper and EPYC, where the
+    /// `threadripper` brand flag alone does not.
+    pub siod: bool,
     /// Memory clock (MCLK) in MHz.
     pub mclk_mhz: u16,
     /// Memory controller clock (UCLK) in MHz.
@@ -462,11 +473,13 @@ pub fn parse(ctx: &SmuContext, zen: AmdZen) -> TelemetryResult<AmdPmSnapshot> {
         version: ctx.version,
         // A present blob is an exposed table; the set-point flag starts
         // `false` — the SMN overlay sets it when `0x50200` proves
-        // unverified. The threadripper flag is `false` here — the
-        // facade sets it from the CPU brand after `parse`.
+        // unverified. The threadripper and siod flags are `false` here —
+        // the facade sets them from the CPU brand / platform type after
+        // `parse`.
         pm_exposed: true,
         smn_setpoint_unverified: false,
         threadripper: false,
+        siod: false,
         mclk_mhz: to_u16(mclk),
         uclk_mhz: to_u16(uclk),
         fclk_mhz: to_u16(fclk),
@@ -551,11 +564,12 @@ fn all_zero_snapshot(version: u32) -> AmdPmSnapshot {
         // No table: the PM-derived fields are N/A with the specific
         // "not exposed by driver" reason (the mapping keys on this flag),
         // never the generic "0 outside plausible range" parse error. The
-        // threadripper flag is `false` here — the facade sets it from
-        // the CPU brand.
+        // threadripper and siod flags are `false` here — the facade sets
+        // them from the CPU brand / platform type.
         pm_exposed: false,
         smn_setpoint_unverified: false,
         threadripper: false,
+        siod: false,
         mclk_mhz: 0,
         uclk_mhz: 0,
         fclk_mhz: 0,
@@ -654,6 +668,7 @@ mod tests {
             pm_exposed: true,
             smn_setpoint_unverified: false,
             threadripper: false,
+            siod: false,
             mclk_mhz,
             uclk_mhz,
             fclk_mhz,

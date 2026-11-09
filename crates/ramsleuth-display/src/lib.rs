@@ -30,7 +30,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ramsleuth_bench::{BenchmarkGrid, Metric, Tier};
-use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode, EccStatus};
+use ramsleuth_telemetry::amd_readout::{ClockReadout, DivMode, EccStatus, TimingSource};
 use ramsleuth_telemetry::cpuid::CpuVendor;
 use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::intel_readout::ChannelTrust;
@@ -234,6 +234,31 @@ pub fn ecc_label(t: &SystemMemoryTelemetry) -> String {
     {
         EccStatus::Unknown => "N/A".to_owned(),
         s => s.label().to_owned(),
+    }
+}
+
+/// The AMD DRAM timing source: derived from the platform type (sIOD vs
+/// cIOD, via the CPU brand string) and whether any timing cell carries
+/// a value.
+///
+/// - **sIOD** (Threadripper / EPYC) with any timing value →
+///   [`TimingSource::Apob`] (the Phase 3 APOB overlay succeeded; the
+///   SMN shadow registers are not updated post-training on sIOD, so any
+///   live timing must be from the APOB).
+/// - **cIOD** (desktop Ryzen) with any timing value →
+///   [`TimingSource::Smn`] (the SMN shadow registers are the live
+///   source on cIOD).
+/// - No timing value (all cells `Na`) → [`TimingSource::Unavailable`]
+///   (APOB not found on sIOD, or SMN unreadable on cIOD).
+///
+/// This is a pure derivation — no wire-protocol change is needed, and
+/// the function never panics (a degraded / non-AMD snapshot yields
+/// [`TimingSource::Unavailable`]). The frontends and the probe report
+/// use this to annotate where the displayed timings came from (Phase 4).
+pub fn timing_source(t: &SystemMemoryTelemetry) -> TimingSource {
+    match t.amd.value() {
+        Some(readout) => ramsleuth_telemetry::amd_readout::timing_source(&t.cpu.brand, readout),
+        None => TimingSource::Unavailable,
     }
 }
 
