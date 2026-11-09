@@ -1,4 +1,4 @@
-# RamSleuth v2.4.21
+# RamSleuth v2.4.22
 
 Live memory-controller telemetry and a native Memory & Latency Benchmark for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
 
@@ -10,15 +10,11 @@ RamSleuth is a 9-crate Rust workspace (8 product crates + the `tools/gen-icon` d
 
 Every privileged read flows through a single root daemon that holds only `CAP_SYS_RAWIO` — all clients (the CLI, the TUI, the GUI) run fully unprivileged — and the no-panic contract means a missing driver, privilege, or piece of hardware never crashes anything: the affected fields render as a structured `N/A (<reason>)` and the process exits 0.
 
-## What's new in v2.4.21
+## What's new in v2.4.22
 
-- **Reverted unverified Threadripper/TRX40 (Castle Peak) timing decode** — the v2.4.20 per-field arithmetic offsets were a curve-fit to a single data point and produced wrong values on other systems; tCL and other SMN-derived timings now correctly report N/A with an explanation until a proper register mapping is completed.
-- **`ramsleuth-telemetry --raw-smn`** — new diagnostic flag that dumps all readable SMN registers (0x50000–0x50400) for hardware analysis, with `--smn-range <start> <end>` to customize the range.
-- **Expanded raw register section in probe reports** — the 0x50000–0x50400 SMN range is now included to enable before/after comparison for register-level debugging.
-
-## What's coming in v2.4.22
-
-- **APOB (AGESA Pre-Output Buffer) timing support for Threadripper / TRX40** — DRAM timings (tCL, tRCD, tRP, tRAS, and the full 27-subtiming set) are now readable on Threadripper 3000 / TRX40 via the APOB firmware structure exposed by the `ryzen_smu` kernel module, closing the timing gap left by the v2.4.21 SMN revert. The module is required for Threadripper timing readout; see the [User Guide](Docs/User_Guide.md) for details.
+- **APOB (AGESA Pre-Output Buffer) timing support for Threadripper / TRX40 and EPYC sIOD** — DRAM timings (tCL, tRCD, tRP, tRAS, and the full subtiming set) are now readable on Threadripper 3000 / TRX40, WRX80, and EPYC sIOD platforms via the APOB firmware structure discovered in physical RAM and exposed by the `ryzen_smu` kernel module, closing the timing gap left by the v2.4.21 SMN revert. The module is required for sIOD timing readout; see the [User Guide](Docs/User_Guide.md) for details.
+- **Timing source annotation** — probe reports and displays now show whether timings came from SMN registers (desktop Ryzen) or the APOB structure (Threadripper / sIOD).
+- **CPUID package type detection** — accurate sIOD vs cIOD platform routing for correct timing source selection.
 
 ## Why RamSleuth
 
@@ -67,8 +63,8 @@ yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest i
 **Debian/Ubuntu/Mint — `.deb` package:**
 
 ```sh
-wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.21/ramsleuth_2.4.21_amd64.deb
-sudo dpkg -i ramsleuth_2.4.21_amd64.deb
+wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.22/ramsleuth_2.4.22_amd64.deb
+sudo dpkg -i ramsleuth_2.4.22_amd64.deb
 sudo usermod -aG ramsleuth $USER
 newgrp ramsleuth        # or log out and back in
 ramsleuth-tui
@@ -109,10 +105,10 @@ The full walkthrough — every zone, key, flag, N/A reason, and day-2 troublesho
 - [Packaging & AUR](packaging/README.md) — the two-package AUR model, the unified version-bump flow, the `ryzen-smu-dkms` extra, and the CI/release artifact contracts.
 - [Changelog](CHANGELOG.md) — release history.
 
-**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.21**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
+**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.22**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
 
 ## License
 
 MIT — the workspace `Cargo.toml` declares `license = "MIT"`. Repository: <https://github.com/MadGoatHaz/RamSleuth>.
 
-RamSleuth v2.4.21 · branch `v2-development`
+RamSleuth v2.4.22 · branch `v2-development`
