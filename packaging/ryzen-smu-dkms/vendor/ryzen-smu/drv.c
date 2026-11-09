@@ -21,8 +21,8 @@
 #endif
 
 MODULE_AUTHOR("Leonardo Gates <leogatesx9r@protonmail.com>");
-MODULE_DESCRIPTION("AMD Ryzen SMU Command Driver");
-MODULE_VERSION("0.1.7");
+MODULE_DESCRIPTION("AMD Ryzen SMU Command Driver (APOB timing support for sIOD platforms)");
+MODULE_VERSION("0.1.8");
 MODULE_LICENSE("GPL");
 
 #define MSEC_TO_NSEC(x)                    (x * 1000000)

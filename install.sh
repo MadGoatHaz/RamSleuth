@@ -146,6 +146,21 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# --- C1: Auto-detect development branch → source build mode -------------------
+# When run from a git checkout that is not on a published release tag, the
+# default "auto" mode would download the latest release binary (not this
+# checkout's code). Switch to source build mode with a clear message so
+# the user's dev-branch code actually gets installed.
+if [[ "${RAMSLEUTH_SUDO_REEXEC:-0}" != "1" && "$MODE" == "auto" && -z "$WANT_VERSION" && -n "$REPO_ROOT" ]]; then
+  local_head="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)" || local_head="HEAD"
+  if [[ "$local_head" != "HEAD" ]] && ! git -C "$REPO_ROOT" describe --tags --exact-match HEAD >/dev/null 2>&1; then
+    latest_tag="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 HEAD 2>/dev/null)" || latest_tag="no release"
+    warn "You appear to be on a development branch ('${local_head}') ahead of the latest release (${latest_tag})."
+    warn "Running in source build mode. To install a published release instead, pass --version <ver>."
+    MODE="build"
+  fi
+fi
+
 # --- HTTP helpers (curl preferred, wget fallback) ------------------------------
 http_get() { # $1=url $2=dest-file
   # No `--` before -o: after `--` curl/wget treat -o/-O as a second URL.

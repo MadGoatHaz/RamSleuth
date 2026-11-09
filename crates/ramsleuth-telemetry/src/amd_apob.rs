@@ -204,14 +204,15 @@ pub struct ApobEntry {
 
 /// Per-channel DRAM timings extracted from the APOB Group 1 Type 3 entry.
 ///
-/// The field layout is specific to the Castle Peak (Zen 2 sIOD) DDR4
-/// timing structure: 108 bytes per channel.
+/// The field layout is the sIOD DDR4 timing structure: 108 bytes per
+/// channel. This covers Castle Peak (TRX40, 8 channels), Chagall
+/// (WRX80), and EPYC DDR4 platforms (Rome/Milan 8 or 12 channels).
 ///
 /// Source: architecture doc §A.3; ZenStates-Core ApobLayout.cs
 /// (Castle Peak profile).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApobChannelTimings {
-    /// Channel index (0–7 for Castle Peak's 8 UMC instances).
+    /// Channel index (0–15; EPYC Milan/Genoa have 12 channels, TRX40 has 8).
     pub channel: u8,
     /// CAS latency (cycles).
     pub tcl: u8,
@@ -225,6 +226,10 @@ pub struct ApobChannelTimings {
     pub tras: u16,
     /// Row cycle time (tRAS + tRP) (cycles).
     pub trc: u16,
+    /// Row to row delay (short, same bank group) (cycles). @ 0x08
+    pub trrd_s: u8,
+    /// Row to row delay (long, different bank group) (cycles). @ 0x09
+    pub trrd_l: u8,
     /// Four-activate window (cycles).
     pub tfaw: u16,
     /// Write to read delay (short) (cycles).
@@ -243,6 +248,10 @@ pub struct ApobChannelTimings {
     pub tcwl: u8,
     /// Read to precharge time (cycles).
     pub trtp: u8,
+    /// Read to write turnaround (cycles). @ 0x18
+    pub trdwr: u8,
+    /// Write to read turnaround (cycles). @ 0x19
+    pub twrtr: u8,
     /// Command rate: 0 = 1T, 1 = 2T, 2 = Gear Down Mode.
     pub cmd_rate: u8,
 }
@@ -251,7 +260,9 @@ pub struct ApobChannelTimings {
 #[derive(Debug, Clone)]
 pub struct ApobTimings {
     /// One entry per channel found in the APOB Group 1 Type 3 payload.
-    /// For Castle Peak: 8 channels × 108 bytes.
+    /// The channel count is derived from the payload size: TRX40 has 8
+    /// channels (864 bytes), EPYC Milan/Genoa DDR4 have 12 channels
+    /// (1296 bytes). Each channel block is 108 bytes.
     pub channels: Vec<ApobChannelTimings>,
 }
 
@@ -280,6 +291,9 @@ pub enum ApobError {
     /// The timing entry payload is too short to contain the expected
     /// number of channels.
     TimingsTooShort { expected: usize, actual: usize },
+    /// The timing payload is malformed (not a multiple of the channel
+    /// block size, or an unrealistic channel count).
+    InvalidTimingData(String),
     /// I/O error reading from sysfs.
     Io(String),
 }
@@ -314,12 +328,33 @@ impl std::fmt::Display for ApobError {
                 "APOB timings payload too short: expected {} bytes, got {}",
                 expected, actual
             ),
+            Self::InvalidTimingData(msg) => write!(f, "APOB invalid timing data: {}", msg),
             Self::Io(msg) => write!(f, "APOB I/O error: {}", msg),
         }
     }
 }
 
 impl std::error::Error for ApobError {}
+
+/// Check if the APOB is available from the `ryzen_smu` sysfs interface.
+///
+/// This is a lightweight probe (reads only the `apob_available` flag) that
+/// lets the facade distinguish between three failure modes on a sIOD
+/// platform:
+///
+/// - `Ok(true)` — the module is loaded, has APOB support, and the APOB
+///   was found at a candidate address (`apob_available` = 1).
+/// - `Ok(false)` — the module is loaded and has APOB support, but the APOB
+///   was not found at any candidate address (`apob_available` = 0).
+/// - `Err(ApobError::NotFound)` — the `apob_available` sysfs attribute
+///   does not exist (the module is not loaded, or is an old version
+///   without APOB support).
+/// - `Err(ApobError::Io(..))` — an I/O error reading the attribute.
+///
+/// Source: the `ryzen_smu` kernel module's `apob_available` sysfs attribute.
+pub fn apob_is_available() -> Result<bool, ApobError> {
+    read_apob_available()
+}
 
 /// Read the raw APOB blob from the `ryzen_smu` sysfs interface.
 ///
@@ -546,15 +581,18 @@ pub fn parse_apob(blob: &[u8]) -> Result<ApobData, ApobError> {
     })
 }
 
-/// Extract the Castle Peak (Zen 2 sIOD) DDR4 timings from an [`ApobData`].
+/// Extract the sIOD DDR4 timings from an [`ApobData`].
 ///
 /// Searches for the Group 1 (Mem) Type 3 (Timings) entry and decodes the
-/// per-channel timing structure.
+/// per-channel timing structure. The channel count is derived from the
+/// payload size: each channel block is 108 bytes. This covers:
 ///
-/// # Castle Peak timing layout
+/// - TRX40 (Castle Peak, 8 channels → 864 bytes)
+/// - WRX80 (Chagall, 8 channels → 864 bytes)
+/// - EPYC Rome (SP3, 8 channels → 864 bytes)
+/// - EPYC Milan / Genoa DDR4 (SP3/SP5, 12 channels → 1296 bytes)
 ///
-/// The payload is 8 channels × 108 bytes each (for the sIOD 8-UMC topology).
-/// Each 108-byte channel block has the following fields (little-endian):
+/// # sIOD DDR4 timing layout (per 108-byte channel block, little-endian)
 ///
 /// | Offset | Field    | Type  | Description                          |
 /// |--------|----------|-------|--------------------------------------|
@@ -589,8 +627,10 @@ pub fn parse_apob(blob: &[u8]) -> Result<ApobData, ApobError> {
 ///
 /// - `ApobError::TimingsNotFound` — no Group 1 Type 3 entry.
 /// - `ApobError::TimingsEncrypted` — the entry is encrypted.
-/// - `ApobError::TimingsTooShort` — the payload is too short for 8 channels.
-pub fn extract_castle_peak_timings(apob: &ApobData) -> Result<ApobTimings, ApobError> {
+/// - `ApobError::InvalidTimingData` — the payload is not a multiple of the
+///   108-byte channel block size, or the channel count is unrealistic
+///   (0 or > 16).
+pub fn extract_siod_ddr4_timings(apob: &ApobData) -> Result<ApobTimings, ApobError> {
     // Find the Group 1 Type 3 (APOB_MEM_TIMINGS) entry.
     // Source: architecture doc §A.2, type 0x0003.
     const TIMINGS_TYPE_ID: u16 = 0x0003;
@@ -609,21 +649,29 @@ pub fn extract_castle_peak_timings(apob: &ApobData) -> Result<ApobTimings, ApobE
         return Err(ApobError::TimingsEncrypted);
     }
 
-    // Castle Peak: 8 channels × 108 bytes = 864 bytes minimum.
+    // Derive the channel count from the payload size. Each channel block
+    // is 108 bytes (the sIOD DDR4 layout). TRX40 has 8 channels (864
+    // bytes), EPYC Milan/Genoa DDR4 have 12 channels (1296 bytes).
     const CHANNEL_SIZE: usize = 108;
-    const NUM_CHANNELS: usize = 8;
-    const MIN_PAYLOAD: usize = CHANNEL_SIZE * NUM_CHANNELS;
+    const MAX_CHANNELS: usize = 16; // sanity cap — more than 16 is not realistic
 
-    if timings_entry.data.len() < MIN_PAYLOAD {
-        return Err(ApobError::TimingsTooShort {
-            expected: MIN_PAYLOAD,
-            actual: timings_entry.data.len(),
-        });
+    let num_channels = timings_entry.data.len() / CHANNEL_SIZE;
+
+    if num_channels == 0 {
+        return Err(ApobError::InvalidTimingData(
+            "no complete channel blocks in the timing payload".into(),
+        ));
+    }
+    if num_channels > MAX_CHANNELS {
+        return Err(ApobError::InvalidTimingData(format!(
+            "unrealistic channel count: {} (max {})",
+            num_channels, MAX_CHANNELS
+        )));
     }
 
-    let mut channels = Vec::with_capacity(NUM_CHANNELS);
+    let mut channels = Vec::with_capacity(num_channels);
 
-    for ch in 0..NUM_CHANNELS {
+    for ch in 0..num_channels {
         let base = ch * CHANNEL_SIZE;
         let d = &timings_entry.data;
 
@@ -635,6 +683,8 @@ pub fn extract_castle_peak_timings(apob: &ApobData) -> Result<ApobTimings, ApobE
             trp: d[base + 0x03],
             tras: u16::from_le_bytes([d[base + 0x04], d[base + 0x05]]),
             trc: u16::from_le_bytes([d[base + 0x06], d[base + 0x07]]),
+            trrd_s: d[base + 0x08],
+            trrd_l: d[base + 0x09],
             tfaw: u16::from_le_bytes([d[base + 0x0A], d[base + 0x0B]]),
             twtr_s: d[base + 0x0C],
             twtr_l: d[base + 0x0D],
@@ -644,6 +694,8 @@ pub fn extract_castle_peak_timings(apob: &ApobData) -> Result<ApobTimings, ApobE
             trfc_pb: u16::from_le_bytes([d[base + 0x14], d[base + 0x15]]),
             tcwl: d[base + 0x16],
             trtp: d[base + 0x17],
+            trdwr: d[base + 0x18],
+            twrtr: d[base + 0x19],
             cmd_rate: d[base + 0x1C],
         });
     }
@@ -659,7 +711,7 @@ pub fn extract_castle_peak_timings(apob: &ApobData) -> Result<ApobTimings, ApobE
 mod tests {
     use super::*;
 
-    /// Construct a synthetic Castle Peak APOB blob for testing.
+    /// Construct a synthetic sIOD DDR4 APOB blob for testing.
     ///
     /// Header: APOB signature, version 0x0002, table_size = 16 + 12 + 864,
     /// flags 0.
@@ -668,8 +720,9 @@ mod tests {
     ///
     /// Channel 0 uses Sea_Monkey's known-good DDR4-3200 CL14 values:
     /// tCL=14, tRCDW=18, tRCDR=18, tRP=18, tRAS=38, tRC=56,
-    /// tFAW=39, tWTR_S=4, tWTR_L=12, tWR=24, tRFC_S=312,
-    /// tRFC_F=192, tRFC_PB=132, tCWL=18, CmdRate=0 (1T).
+    /// tRRDS=4, tRRDL=8, tFAW=39, tWTR_S=4, tWTR_L=12, tWR=24,
+    /// tRFC_S=312, tRFC_F=192, tRFC_PB=132, tCWL=18, tRTP=14,
+    /// tRDWR=8, tWRTR=8, CmdRate=0 (1T).
     /// Channels 1–7 are zero-filled (dormant on TRX40).
     fn synthetic_castle_peak_apob() -> Vec<u8> {
         let mut blob = Vec::new();
@@ -702,6 +755,8 @@ mod tests {
                 ch_data[0x05] = 0; // tRAS (high byte)
                 ch_data[0x06] = 56; // tRC (low byte)
                 ch_data[0x07] = 0; // tRC (high byte)
+                ch_data[0x08] = 4; // tRRDS
+                ch_data[0x09] = 8; // tRRDL
                 ch_data[0x0A] = 39; // tFAW (low byte)
                 ch_data[0x0B] = 0; // tFAW (high byte)
                 ch_data[0x0C] = 4; // tWTR_S
@@ -716,6 +771,8 @@ mod tests {
                 ch_data[0x15] = 0; // tRFC_PB (high byte)
                 ch_data[0x16] = 18; // tCWL
                 ch_data[0x17] = 14; // tRTP
+                ch_data[0x18] = 8; // tRDWR
+                ch_data[0x19] = 8; // tWRTR
                 ch_data[0x1C] = 0; // CmdRate: 1T
                 blob.extend_from_slice(&ch_data);
             } else {
@@ -737,7 +794,7 @@ mod tests {
         assert_eq!(apob.entries[0].header.group, ApobGroup::Mem);
         assert_eq!(apob.entries[0].header.type_id, 3);
 
-        let timings = extract_castle_peak_timings(&apob).expect("Castle Peak timings must extract");
+        let timings = extract_siod_ddr4_timings(&apob).expect("sIOD DDR4 timings must extract");
         assert_eq!(timings.channels.len(), 8);
 
         let ch0 = &timings.channels[0];
@@ -747,6 +804,8 @@ mod tests {
         assert_eq!(ch0.trp, 18);
         assert_eq!(ch0.tras, 38);
         assert_eq!(ch0.trc, 56);
+        assert_eq!(ch0.trrd_s, 4);
+        assert_eq!(ch0.trrd_l, 8);
         assert_eq!(ch0.tfaw, 39);
         assert_eq!(ch0.twtr_s, 4);
         assert_eq!(ch0.twtr_l, 12);
@@ -756,6 +815,8 @@ mod tests {
         assert_eq!(ch0.trfc_pb, 132);
         assert_eq!(ch0.tcwl, 18);
         assert_eq!(ch0.trtp, 14);
+        assert_eq!(ch0.trdwr, 8);
+        assert_eq!(ch0.twrtr, 8);
         assert_eq!(ch0.cmd_rate, 0);
 
         // Dormant channels are all zeros.
@@ -841,7 +902,7 @@ mod tests {
         // Change the type to something else.
         blob[APOB_HEADER_SIZE + 2..APOB_HEADER_SIZE + 4].copy_from_slice(&0x99u16.to_le_bytes());
         let apob = parse_apob(&blob).expect("APOB must parse");
-        let err = extract_castle_peak_timings(&apob).unwrap_err();
+        let err = extract_siod_ddr4_timings(&apob).unwrap_err();
         assert!(matches!(err, ApobError::TimingsNotFound));
     }
 
@@ -855,13 +916,32 @@ mod tests {
         // Set flags bit 7 (encrypted) in the entry header.
         blob[APOB_HEADER_SIZE + 9] = 0x80;
         let apob = parse_apob(&blob).expect("APOB must parse");
-        let err = extract_castle_peak_timings(&apob).unwrap_err();
+        let err = extract_siod_ddr4_timings(&apob).unwrap_err();
         assert!(matches!(err, ApobError::TimingsEncrypted));
     }
 
-    /// Timing extraction: payload too short for 8 channels.
+    /// Timing extraction: payload not a multiple of the channel block size
+    /// (50 bytes < 108 → no complete channel blocks).
     #[test]
-    fn test_extract_timings_too_short() {
+    fn test_extract_timings_no_complete_blocks() {
+        let mut blob = synthetic_castle_peak_apob();
+        // Set type_size to 50 (less than one 108-byte channel block).
+        blob[APOB_HEADER_SIZE + 4..APOB_HEADER_SIZE + 8].copy_from_slice(&50u32.to_le_bytes());
+        // Also adjust the table_size in the header to match.
+        let new_table_size = (APOB_HEADER_SIZE + APOB_ENTRY_HEADER_SIZE + 50) as u32;
+        blob[8..12].copy_from_slice(&new_table_size.to_le_bytes());
+        let apob = parse_apob(&blob).expect("APOB must parse");
+        let err = extract_siod_ddr4_timings(&apob).unwrap_err();
+        assert!(
+            matches!(err, ApobError::InvalidTimingData(_)),
+            "expected InvalidTimingData, got {err:?}"
+        );
+    }
+
+    /// Timing extraction: a 4-channel payload (432 bytes) is valid with
+    /// dynamic channel count (4 complete 108-byte blocks).
+    #[test]
+    fn test_extract_timings_four_channels() {
         let mut blob = synthetic_castle_peak_apob();
         // Set type_size to 432 (4 channels × 108).
         blob[APOB_HEADER_SIZE + 4..APOB_HEADER_SIZE + 8].copy_from_slice(&432u32.to_le_bytes());
@@ -869,14 +949,36 @@ mod tests {
         let new_table_size = (APOB_HEADER_SIZE + APOB_ENTRY_HEADER_SIZE + 432) as u32;
         blob[8..12].copy_from_slice(&new_table_size.to_le_bytes());
         let apob = parse_apob(&blob).expect("APOB must parse");
-        let err = extract_castle_peak_timings(&apob).unwrap_err();
-        assert!(matches!(
-            err,
-            ApobError::TimingsTooShort {
-                expected: 864,
-                actual: 432
-            }
-        ));
+        let timings = extract_siod_ddr4_timings(&apob).expect("4-channel payload must extract");
+        assert_eq!(timings.channels.len(), 4);
+        // Channel 0 still has the known-good values.
+        assert_eq!(timings.channels[0].tcl, 14);
+    }
+
+    /// Timing extraction: a 12-channel payload (1296 bytes, EPYC
+    /// Milan/Genoa DDR4) is valid with dynamic channel count.
+    #[test]
+    fn test_extract_timings_twelve_channels_epyc() {
+        let mut blob = synthetic_castle_peak_apob();
+        // The synthetic blob currently has 8 channels (864 bytes).
+        // Extend it to 12 channels (1296 bytes) by appending 4 more
+        // zero-filled channel blocks.
+        for _ in 0..4 {
+            blob.extend_from_slice(&[0u8; 108]);
+        }
+        // Update the type_size to 1296 (12 channels × 108).
+        blob[APOB_HEADER_SIZE + 4..APOB_HEADER_SIZE + 8].copy_from_slice(&1296u32.to_le_bytes());
+        // Update the table_size in the header to match.
+        let new_table_size = (APOB_HEADER_SIZE + APOB_ENTRY_HEADER_SIZE + 1296) as u32;
+        blob[8..12].copy_from_slice(&new_table_size.to_le_bytes());
+        let apob = parse_apob(&blob).expect("APOB must parse");
+        let timings = extract_siod_ddr4_timings(&apob).expect("12-channel payload must extract");
+        assert_eq!(timings.channels.len(), 12);
+        // Channel 0 still has the known-good values.
+        assert_eq!(timings.channels[0].tcl, 14);
+        // Channels 8-11 are zero-filled (appended).
+        assert_eq!(timings.channels[8].tcl, 0);
+        assert_eq!(timings.channels[11].tcl, 0);
     }
 
     /// Multiple entries: the parser handles more than one entry.
@@ -942,6 +1044,7 @@ mod tests {
                 expected: 864,
                 actual: 432,
             },
+            ApobError::InvalidTimingData("test".to_string()),
             ApobError::Io("test".to_string()),
         ];
         for e in errors {

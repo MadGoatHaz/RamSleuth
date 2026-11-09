@@ -361,42 +361,151 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
     // trained-timing snapshot in physical RAM) is the primary source
     // for DRAM timings. Try APOB first; if it succeeds, overlay its
     // trained values onto the readout (replacing the Na from the
-    // unverified SMN layout). If APOB fails (driver not loaded, APOB
-    // not found, encrypted entry, etc.), the SMN-derived readout
-    // stands as-is (the existing path — honest Na on sIOD).
+    // unverified SMN layout). If APOB fails, set a specific N/A reason
+    // on the timing fields so the user knows exactly what to do (M2).
     //
     // On cIOD platforms (desktop Ryzen AM4/AM5), the SMN registers are
     // the live source — APOB is not consulted (no behavior change).
     if matches!(platform, cpuid::AmdPackageType::Server(_)) {
-        if let Some(apob_ch) = try_apob_timings() {
-            overlay_apob_timings(&mut readout, &apob_ch);
+        match try_apob_timings() {
+            Ok(Some(apob_ch)) => {
+                overlay_apob_timings(&mut readout, &apob_ch);
+            }
+            Ok(None) => {
+                // APOB was read and parsed successfully, but no channel
+                // is active (all tCL values are zero). The default
+                // unverified reason already names the APOB, so it stays.
+            }
+            Err(ApobProbeOutcome::ModuleNotReady) => {
+                // The ryzen_smu module is not loaded, or is an old
+                // version without APOB support.
+                set_all_timings_na(
+                    &mut readout,
+                    NaReason::ParseError(
+                        "APOB not accessible — ensure ryzen-smu kernel module v0.1.8+ is loaded (`sudo modprobe ryzen_smu`)"
+                            .to_owned(),
+                    ),
+                );
+            }
+            Err(ApobProbeOutcome::ApobNotFound) => {
+                // The module is loaded and has APOB support, but the
+                // APOB was not found at any candidate physical address.
+                set_all_timings_na(
+                    &mut readout,
+                    NaReason::ParseError(
+                        "APOB not found in system memory — this platform may not support APOB timing readout"
+                            .to_owned(),
+                    ),
+                );
+            }
+            Err(ApobProbeOutcome::TimingsUnavailable) => {
+                // The APOB was found but the timing entry is missing,
+                // encrypted, or has an invalid layout. The default
+                // unverified reason already names the APOB, so it stays.
+            }
         }
     }
     Ok(readout)
 }
 
+/// The outcome of a failed APOB probe attempt on a sIOD platform.
+///
+/// Used to set specific N/A reasons on the timing fields when the APOB
+/// is not available (M2):
+///
+/// - [`ApobProbeOutcome::ModuleNotReady`] — the `ryzen_smu` module is not
+///   loaded, or is an old version without APOB support (the
+///   `apob_available` sysfs attribute is absent).
+/// - [`ApobProbeOutcome::ApobNotFound`] — the module is loaded and has
+///   APOB support, but the APOB was not found at any candidate physical
+///   address (`apob_available` = 0).
+/// - [`ApobProbeOutcome::TimingsUnavailable`] — the APOB was found but
+///   the timing entry is missing, encrypted, has an invalid layout, or
+///   no channel is active.
+///
+/// A successful probe returns `Ok(Some(ch))` or `Ok(None)` (no active
+/// channel) and does not use this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApobProbeOutcome {
+    /// The ryzen_smu module is not loaded, or is an old version without
+    /// APOB support.
+    ModuleNotReady,
+    /// The module has APOB support but the APOB was not found at any
+    /// candidate physical address.
+    ApobNotFound,
+    /// The APOB was found but the timing entry is missing, encrypted,
+    /// has an invalid layout, or no channel is active.
+    TimingsUnavailable,
+}
+
+/// Map an [`amd_apob::ApobError`] to the corresponding
+/// [`ApobProbeOutcome`] for specific N/A messaging (M2).
+fn apob_error_to_outcome(e: &amd_apob::ApobError) -> ApobProbeOutcome {
+    match e {
+        // The `read_apob_from_sysfs()` call returns NotFound when
+        // `apob_available` is 0 (module loaded, APOB not found).
+        amd_apob::ApobError::NotFound => ApobProbeOutcome::ApobNotFound,
+        // All other errors (parse, encrypted, invalid layout, etc.)
+        // mean the APOB was found but the timings could not be extracted.
+        _ => ApobProbeOutcome::TimingsUnavailable,
+    }
+}
+
 /// Try to read and parse APOB timings from the `ryzen_smu` sysfs
 /// interface.
 ///
-/// Returns the first *active* channel's timings, or `None` if any step
-/// fails: the driver is not loaded, the APOB is not found at any
-/// candidate address, the blob fails validation, the timing entry is
-/// missing/encrypted/truncated, or no channel is active (a trained
-/// channel has a non-zero tCL; dormant channels on TRX40's 8-UMC
-/// topology are all zeros).
+/// Returns:
+/// - `Ok(Some(ch))` — the first *active* channel's timings (a trained
+///   channel has a non-zero tCL; dormant channels on TRX40's 8-UMC
+///   topology are all zeros).
+/// - `Ok(None)` — the APOB was read and parsed successfully, but no
+///   channel is active (all tCL values are zero).
+/// - `Err(outcome)` — the APOB probe failed with a specific outcome
+///   (module not ready, APOB not found, or timings unavailable) that
+///   drives the N/A reason on the timing fields (M2).
 ///
 /// All errors are contained: a failure here never propagates past this
 /// function — the facade degrades to the SMN path (the existing
 /// behavior). Never panics.
-fn try_apob_timings() -> Option<amd_apob::ApobChannelTimings> {
-    let blob = amd_apob::read_apob_from_sysfs().ok()?;
-    let apob = amd_apob::parse_apob(&blob).ok()?;
-    let timings = amd_apob::extract_castle_peak_timings(&apob).ok()?;
-    // The first active (non-dormant) channel. TRX40 routes DIMMs to
-    // odd-indexed UMC instances and leaves channel 0 dormant with
-    // JEDEC bootstrap straps, so scan for the first channel with a
-    // non-zero tCL.
-    timings.channels.iter().find(|ch| ch.tcl != 0).copied()
+fn try_apob_timings() -> Result<Option<amd_apob::ApobChannelTimings>, ApobProbeOutcome> {
+    // First, check if the APOB is available (lightweight probe).
+    match amd_apob::apob_is_available() {
+        Ok(true) => {
+            // The module is loaded, has APOB support, and the APOB was
+            // found. Read and parse it.
+            let blob = amd_apob::read_apob_from_sysfs().map_err(|e| apob_error_to_outcome(&e))?;
+            let apob = amd_apob::parse_apob(&blob).map_err(|e| apob_error_to_outcome(&e))?;
+            let timings = amd_apob::extract_siod_ddr4_timings(&apob)
+                .map_err(|e| apob_error_to_outcome(&e))?;
+            // The first active (non-dormant) channel.
+            Ok(timings.channels.iter().find(|ch| ch.tcl != 0).copied())
+        }
+        Ok(false) => {
+            // The module is loaded and has APOB support, but the APOB
+            // was not found at any candidate address.
+            Err(ApobProbeOutcome::ApobNotFound)
+        }
+        Err(amd_apob::ApobError::NotFound) => {
+            // The `apob_available` sysfs attribute does not exist — the
+            // module is not loaded, or is an old version without APOB
+            // support.
+            Err(ApobProbeOutcome::ModuleNotReady)
+        }
+        Err(_) => {
+            // An I/O error reading the availability flag — treat as
+            // module not ready.
+            Err(ApobProbeOutcome::ModuleNotReady)
+        }
+    }
+}
+
+/// Set the N/A reason on all 27 timing fields of a readout (M2).
+///
+/// Used when the APOB probe fails on a sIOD platform to provide a
+/// specific, actionable message instead of the generic unverified
+/// reason.
+fn set_all_timings_na(readout: &mut AmdReadout, reason: NaReason) {
+    readout.timings = amd_readout::timing_set_with_reason(reason);
 }
 
 /// Overlay APOB-sourced timing values onto the readout's timing fields.
@@ -430,6 +539,9 @@ fn overlay_apob_timings(readout: &mut AmdReadout, ch: &amd_apob::ApobChannelTimi
     overlay(&mut t.rp, u16::from(ch.trp));
     overlay(&mut t.ras, ch.tras);
     overlay(&mut t.rc, ch.trc);
+    // tRRDS / tRRDL (offsets 0x08 / 0x09).
+    overlay(&mut t.rrds, u16::from(ch.trrd_s));
+    overlay(&mut t.rrld, u16::from(ch.trrd_l));
     overlay(&mut t.faw, ch.tfaw);
     overlay(&mut t.wtrs, u16::from(ch.twtr_s));
     overlay(&mut t.wtrl, u16::from(ch.twtr_l));
@@ -440,6 +552,9 @@ fn overlay_apob_timings(readout: &mut AmdReadout, ch: &amd_apob::ApobChannelTimi
     overlay(&mut t.cwl, u16::from(ch.tcwl));
     // tRTP is provided by the APOB (offset 0x17).
     overlay(&mut t.rtp, u16::from(ch.trtp));
+    // tRDWR / tWRTR (offsets 0x18 / 0x19).
+    overlay(&mut t.rdwr, u16::from(ch.trdwr));
+    overlay(&mut t.wrrd, u16::from(ch.twrtr));
     // Command rate from the APOB (overrides the Na from the unverified
     // 0x50200 layout on sIOD). Only the two defined encodings are
     // overlaid; reserved values leave the existing state.
@@ -2362,6 +2477,8 @@ mod tests {
             trp: 18,
             tras: 38,
             trc: 56,
+            trrd_s: 4,
+            trrd_l: 8,
             tfaw: 39,
             twtr_s: 4,
             twtr_l: 12,
@@ -2371,6 +2488,8 @@ mod tests {
             trfc_pb: 132,
             tcwl: 18,
             trtp: 14,
+            trdwr: 8,
+            twrtr: 8,
             cmd_rate: 0, // 1T
         };
 
@@ -2398,11 +2517,12 @@ mod tests {
             Section::Value(CommandRate::OneT)
         );
 
+        // APOB-provided rrds/rrld/rdwr/wrrd are now Values (M1).
+        assert_eq!(readout.timings.rrds, Section::Value(4));
+        assert_eq!(readout.timings.rrld, Section::Value(8));
+        assert_eq!(readout.timings.rdwr, Section::Value(8));
+        assert_eq!(readout.timings.wrrd, Section::Value(8));
         // Non-APOB fields remain Na (the sIOD unverified state).
-        assert!(readout.timings.rrds.is_na());
-        assert!(readout.timings.rrld.is_na());
-        assert!(readout.timings.rdwr.is_na());
-        assert!(readout.timings.wrrd.is_na());
         assert!(readout.timings.rdrd_sd.is_na());
         assert!(readout.timings.rdrd_dd.is_na());
         assert!(readout.timings.rdrd_scl.is_na());
@@ -2495,6 +2615,8 @@ mod tests {
             trp: 18,
             tras: 5000, // >2048 → skip
             trc: 56,
+            trrd_s: 4,
+            trrd_l: 8,
             tfaw: 39,
             twtr_s: 4,
             twtr_l: 12,
@@ -2504,6 +2626,8 @@ mod tests {
             trfc_pb: 132,
             tcwl: 18,
             trtp: 14,
+            trdwr: 8,
+            twrtr: 8,
             cmd_rate: 3, // reserved → skip
         };
 

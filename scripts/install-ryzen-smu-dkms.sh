@@ -227,9 +227,22 @@ resolve_vendor_src() {
 # --- Idempotent fast path ------------------------------------------------------
 # Already loaded (re-run, or AUTOINSTALL=yes rebuilt after a kernel update).
 # Canonical ryzen_smu_drv path first, legacy ryzen_smu path as fallback.
+#
+# C2: the fast path must also check for APOB support. An old module
+# (pre-v0.1.8) has pm_table but no apob_available — if we exited here
+# the APOB-enabled version would never be built. Fall through to
+# rebuild + reload when the loaded module lacks APOB support.
+APOB_AVAILABLE="/sys/kernel/ryzen_smu_drv/apob_available"
+APOB_AVAILABLE_LEGACY="/sys/kernel/${MODULE}/apob_available"
+
 if [[ -e "${PM_TABLE}" || -e "${PM_TABLE_LEGACY}" ]]; then
-  log "${MODULE} already loaded (pm_table present) — nothing to do."
-  exit 0
+  if [[ -e "${APOB_AVAILABLE}" || -e "${APOB_AVAILABLE_LEGACY}" ]]; then
+    log "${MODULE} already loaded with APOB support — nothing to do."
+    exit 0
+  else
+    log "${MODULE} loaded but lacks APOB support — rebuilding the APOB-enabled version..."
+    # fall through to rebuild
+  fi
 fi
 
 # --- Privilege: re-exec under sudo if not root (operator prompt appears here) ---
@@ -509,8 +522,23 @@ if [[ "${SB_STATE}" == "enabled" ]]; then
     log "Secure Boot: mokutil is not installed — automatic MOK enrollment is skipped (disable Secure Boot in UEFI; see the guidance below)"
   fi
 fi
+# C3: If the module was already loaded (the fast path detected pm_table
+# but no apob_available), a bare modprobe is a no-op — the stale module
+# (without APOB support) stays loaded. Unload it first, then load the
+# freshly built APOB-enabled version.
+if lsmod | grep -q "^${MODULE}"; then
+  log "${MODULE} is loaded — reloading to pick up changes..."
+  if rmmod "${MODULE}" 2>/dev/null; then
+    log "${MODULE} unloaded."
+  else
+    log "WARNING: could not unload ${MODULE} (in use?). Reboot to load new version."
+    log "  Or manually: sudo rmmod ${MODULE} && sudo modprobe ${MODULE}"
+  fi
+fi
+
 if modprobe "${MODULE}"; then
   printf '%s\n' "${MODULE}" > "/etc/modules-load.d/${MODULE}.conf"   # idempotent overwrite
+  log "${MODULE} loaded."
 else
   # The load is pending the one-time MOK step (or a detection-missed SB
   # rejection): build + install succeeded — actionable guidance + the

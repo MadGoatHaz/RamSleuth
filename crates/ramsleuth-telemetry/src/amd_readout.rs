@@ -642,14 +642,13 @@ fn map_timing(ticks: u16) -> Section<u16> {
     }
 }
 
-/// A [`TimingSet`] with all 27 fields as N/A carrying the unverified
-/// SMN-layout reason for Threadripper / Castle Peak (the previous
-/// per-field arithmetic offsets were removed as fabricated values; the
-/// raw registers remain available via `--raw-smn`).
-fn timing_set_unverified() -> TimingSet {
-    let na = Section::na(NaReason::ParseError(
-        SMN_TIMINGS_UNVERIFIED_TRX40_REASON.to_owned(),
-    ));
+/// A [`TimingSet`] with all 27 fields as N/A carrying the given reason.
+///
+/// Used by the sIOD APOB path to set specific N/A reasons when the APOB
+/// is not available (module not ready, APOB not found, etc.) or to
+/// apply the default unverified reason on sIOD platforms.
+pub fn timing_set_with_reason(reason: NaReason) -> TimingSet {
+    let na = Section::na(reason);
     TimingSet {
         cl: na.clone(),
         rcwdwr: na.clone(),
@@ -679,6 +678,16 @@ fn timing_set_unverified() -> TimingSet {
         wrwr_scl: na.clone(),
         wrwr_sc: na,
     }
+}
+
+/// A [`TimingSet`] with all 27 fields as N/A carrying the unverified
+/// SMN-layout reason for Threadripper / Castle Peak (the previous
+/// per-field arithmetic offsets were removed as fabricated values; the
+/// raw registers remain available via `--raw-smn`).
+fn timing_set_unverified() -> TimingSet {
+    timing_set_with_reason(NaReason::ParseError(
+        SMN_TIMINGS_UNVERIFIED_TRX40_REASON.to_owned(),
+    ))
 }
 
 /// Maps a raw CAD ODT/driver code to a sanity-gated [`Section<f64>`] (ohms).
