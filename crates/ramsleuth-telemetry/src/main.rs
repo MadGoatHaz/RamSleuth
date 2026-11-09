@@ -1310,8 +1310,8 @@ mod tests {
         let range_dec_args = [
             prog.clone(),
             "--smn-range".to_owned(),
-            "327680".to_owned(), // 0x50200
-            "328192".to_owned(), // 0x50400
+            "328192".to_owned(), // 0x50200
+            "328704".to_owned(), // 0x50400
         ];
         assert_eq!(
             parse_opts(&range_dec_args),
