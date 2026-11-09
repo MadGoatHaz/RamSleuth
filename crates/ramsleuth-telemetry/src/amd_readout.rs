@@ -141,6 +141,17 @@ const SMN_50200_UNVERIFIED_REASON: &str = "0x50200 layout unverified on this pla
 const SMN_50200_UNVERIFIED_TRX40_REASON: &str =
     "No active memory channel detected on Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable";
 
+/// The specific N/A reason for all 27 SMN-derived DRAM timing fields on
+/// a Threadripper (Castle Peak / TRX40) platform. The bit-field layout
+/// of the timing registers (0x50204–0x50264) has not been verified
+/// against AMD-published UMC maps for this platform; a previous
+/// per-field arithmetic offset (reverse-engineered from one DDR4-3200
+/// data point) was removed because it fabricated wrong values on other
+/// systems. Raw registers remain available via
+/// `ramsleuth-telemetry --raw-smn` for manual analysis.
+pub const SMN_TIMINGS_UNVERIFIED_TRX40_REASON: &str =
+    "SMN timing layout not verified on Threadripper/TRX40 (Castle Peak). Raw registers available via `ramsleuth-telemetry --raw-smn` for manual analysis.";
+
 // ---------------------------------------------------------------------------
 // Vendor-neutral display types (frozen here; P2-07 + P2-10 consume them).
 // ---------------------------------------------------------------------------
@@ -518,6 +529,45 @@ fn map_timing(ticks: u16) -> Section<u16> {
     }
 }
 
+/// A [`TimingSet`] with all 27 fields as N/A carrying the unverified
+/// SMN-layout reason for Threadripper / Castle Peak (the previous
+/// per-field arithmetic offsets were removed as fabricated values; the
+/// raw registers remain available via `--raw-smn`).
+fn timing_set_unverified() -> TimingSet {
+    let na = Section::na(NaReason::ParseError(
+        SMN_TIMINGS_UNVERIFIED_TRX40_REASON.to_owned(),
+    ));
+    TimingSet {
+        cl: na.clone(),
+        rcwdwr: na.clone(),
+        rcdrd: na.clone(),
+        rp: na.clone(),
+        ras: na.clone(),
+        rc: na.clone(),
+        rrds: na.clone(),
+        rrld: na.clone(),
+        faw: na.clone(),
+        wtrs: na.clone(),
+        wtrl: na.clone(),
+        wr: na.clone(),
+        rfc1: na.clone(),
+        rfc2: na.clone(),
+        rfcsb: na.clone(),
+        cwl: na.clone(),
+        rtp: na.clone(),
+        rdwr: na.clone(),
+        wrrd: na.clone(),
+        rdrd_sd: na.clone(),
+        rdrd_dd: na.clone(),
+        rdrd_scl: na.clone(),
+        rdrd_sc: na.clone(),
+        wrwr_sd: na.clone(),
+        wrwr_dd: na.clone(),
+        wrwr_scl: na.clone(),
+        wrwr_sc: na,
+    }
+}
+
 /// Maps a raw CAD ODT/driver code to a sanity-gated [`Section<f64>`] (ohms).
 /// Code `0` or an unrecognized code → `Na(NotApplicable)`.
 fn map_code_to_ohms(code: u16) -> Section<f64> {
@@ -671,34 +721,42 @@ fn build_readout(snap: &AmdPmSnapshot, ch: &ChannelSmnFields) -> AmdReadout {
                 map_command_rate(snap.command_rate)
             },
         },
-        timings: TimingSet {
-            cl: map_timing(t.cl),
-            rcwdwr: map_timing(t.rcwdwr),
-            rcdrd: map_timing(t.rcdrd),
-            rp: map_timing(t.rp),
-            ras: map_timing(t.ras),
-            rc: map_timing(t.rc),
-            rrds: map_timing(t.rrds),
-            rrld: map_timing(t.rrld),
-            faw: map_timing(t.faw),
-            wtrs: map_timing(t.wtrs),
-            wtrl: map_timing(t.wtrl),
-            wr: map_timing(t.wr),
-            rfc1: map_timing(t.rfc1),
-            rfc2: map_timing(t.rfc2),
-            rfcsb: map_timing(t.rfcsb),
-            cwl: map_timing(t.cwl),
-            rtp: map_timing(t.rtp),
-            rdwr: map_timing(t.rdwr),
-            wrrd: map_timing(t.wrrd),
-            rdrd_sd: map_timing(t.rdrd_sd),
-            rdrd_dd: map_timing(t.rdrd_dd),
-            rdrd_scl: map_timing(t.rdrd_scl),
-            rdrd_sc: map_timing(t.rdrd_sc),
-            wrwr_sd: map_timing(t.wrwr_sd),
-            wrwr_dd: map_timing(t.wrwr_dd),
-            wrwr_scl: map_timing(t.wrwr_scl),
-            wrwr_sc: map_timing(t.wrwr_sc),
+        timings: if tr {
+            // Threadripper / Castle Peak: the SMN timing-register layout
+            // is unverified on this platform (see
+            // `SMN_TIMINGS_UNVERIFIED_TRX40_REASON`), so all 27 fields
+            // render as honest N/A rather than fabricated values.
+            timing_set_unverified()
+        } else {
+            TimingSet {
+                cl: map_timing(t.cl),
+                rcwdwr: map_timing(t.rcwdwr),
+                rcdrd: map_timing(t.rcdrd),
+                rp: map_timing(t.rp),
+                ras: map_timing(t.ras),
+                rc: map_timing(t.rc),
+                rrds: map_timing(t.rrds),
+                rrld: map_timing(t.rrld),
+                faw: map_timing(t.faw),
+                wtrs: map_timing(t.wtrs),
+                wtrl: map_timing(t.wtrl),
+                wr: map_timing(t.wr),
+                rfc1: map_timing(t.rfc1),
+                rfc2: map_timing(t.rfc2),
+                rfcsb: map_timing(t.rfcsb),
+                cwl: map_timing(t.cwl),
+                rtp: map_timing(t.rtp),
+                rdwr: map_timing(t.rdwr),
+                wrrd: map_timing(t.wrrd),
+                rdrd_sd: map_timing(t.rdrd_sd),
+                rdrd_dd: map_timing(t.rdrd_dd),
+                rdrd_scl: map_timing(t.rdrd_scl),
+                rdrd_sc: map_timing(t.rdrd_sc),
+                wrwr_sd: map_timing(t.wrwr_sd),
+                wrwr_dd: map_timing(t.wrwr_dd),
+                wrwr_scl: map_timing(t.wrwr_scl),
+                wrwr_sc: map_timing(t.wrwr_sc),
+            }
         },
         cad_bus: CadBus {
             proc_odt: map_code_to_ohms(c.proc_odt),
@@ -1286,6 +1344,71 @@ mod tests {
                 "{detail}"
             );
         }
+    }
+
+    /// (i″′) Threadripper / Castle Peak: all 27 timing fields render N/A
+    /// with the unverified-SMN-layout reason — the previous per-field
+    /// arithmetic offsets (reverse-engineered from one data point) were
+    /// removed as fabricated values. The reason names the platform and
+    /// points to `--raw-smn` for the raw registers. Non-Threadripper
+    /// platforms keep the normal timing mapping (regression check).
+    #[test]
+    fn threadripper_timings_render_unverified_na() {
+        let mut s = good_snapshot();
+        s.threadripper = true;
+        let ro = map_amd(&s);
+
+        // Every one of the 27 timing fields is N/A with the specific reason.
+        let timing_cells: [&Section<u16>; 27] = [
+            &ro.timings.cl,
+            &ro.timings.rcwdwr,
+            &ro.timings.rcdrd,
+            &ro.timings.rp,
+            &ro.timings.ras,
+            &ro.timings.rc,
+            &ro.timings.rrds,
+            &ro.timings.rrld,
+            &ro.timings.faw,
+            &ro.timings.wtrs,
+            &ro.timings.wtrl,
+            &ro.timings.wr,
+            &ro.timings.rfc1,
+            &ro.timings.rfc2,
+            &ro.timings.rfcsb,
+            &ro.timings.cwl,
+            &ro.timings.rtp,
+            &ro.timings.rdwr,
+            &ro.timings.wrrd,
+            &ro.timings.rdrd_sd,
+            &ro.timings.rdrd_dd,
+            &ro.timings.rdrd_scl,
+            &ro.timings.rdrd_sc,
+            &ro.timings.wrwr_sd,
+            &ro.timings.wrwr_dd,
+            &ro.timings.wrwr_scl,
+            &ro.timings.wrwr_sc,
+        ];
+        for cell in timing_cells {
+            let detail =
+                parse_error_detail(cell).expect("a Threadripper timing must be Na(ParseError)");
+            assert!(
+                detail.contains("SMN timing layout not verified on Threadripper/TRX40"),
+                "the reason names the platform: {detail}"
+            );
+            assert!(
+                detail.contains("Castle Peak"),
+                "the reason names the codename: {detail}"
+            );
+            assert!(
+                detail.contains("--raw-smn"),
+                "the reason points to the raw-register dump: {detail}"
+            );
+        }
+
+        // Non-Threadripper: the normal mapping (timings are values).
+        let ro = map_amd(&good_snapshot());
+        assert_eq!(ro.timings.cl, Section::Value(16));
+        assert_eq!(ro.timings.ras, Section::Value(32));
     }
 
     /// (i‴) Threadripper / Castle Peak: the `0x50200` unverified gate →

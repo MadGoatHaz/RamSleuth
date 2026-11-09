@@ -34,6 +34,14 @@ use ramsleuth_telemetry::{collect, SystemMemoryTelemetry, VoltageTelemetry};
 struct Opts {
     /// Emit the snapshot as JSON instead of the dashboard text.
     json: bool,
+    /// Dump all readable SMN registers in the given range and exit
+    /// (the `--raw-smn` diagnostic; implies a raw-register dump instead
+    /// of the telemetry dashboard).
+    raw_smn: bool,
+    /// The SMN address range for `--raw-smn` (inclusive, step 4).
+    /// Default: 0x50000–0x50400 (the UMC timing + channel aperture).
+    smn_start: u32,
+    smn_end: u32,
 }
 
 /// Usage text (printed for `--help` / `-h`).
@@ -49,12 +57,21 @@ Usage: ramsleuth-telemetry [OPTIONS]
 
 Options:
   --json       Print the snapshot as a hand-rolled JSON block
+  --raw-smn    Dump all readable AMD SMN registers in the given range
+               (one per line: SMN_0xADDR = 0xVALUE) and exit — the
+               diagnostic for before/after BIOS comparisons; no decode
+               is applied, only raw 32-bit words
+  --smn-range START END
+               Set the SMN address range for --raw-smn (hex or decimal,
+               inclusive, step 4). Default: 0x50000 0x50400 (covers the
+               UMC timing + channel registers)
   -h, --help   Print this help and exit
   -V, --version Print the version and exit
 
 Exit codes:
-  0  snapshot rendered (even if every section is N/A)
-  2  unknown flag
+  0  snapshot rendered (even if every section is N/A), or raw SMN dump
+     completed (possibly zero registers if the driver is absent)
+  2  unknown flag or malformed --smn-range argument
 
 Related tools:
   ramsleuth              Desktop GUI (egui)
@@ -127,14 +144,43 @@ fn suggest_for_unknown(arg: &str) -> Option<&'static str> {
 }
 
 /// Parse argv (index 0 is the program name). `--json` sets `json`;
-/// `-h`/`--help` / `-V`/`--version` are recognized (not an error —
-/// `main` short-circuits them before parsing); any other argument is
-/// an error naming that argument.
+/// `--raw-smn` sets `raw_smn`; `--smn-range START END` sets the SMN
+/// address range; `-h`/`--help` / `-V`/`--version` are recognized (not
+/// an error — `main` short-circuits them before parsing); any other
+/// argument is an error naming that argument.
 pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
-    let mut opts = Opts { json: false };
-    for arg in args.iter().skip(1) {
-        match arg.as_str() {
+    let mut opts = Opts {
+        json: false,
+        raw_smn: false,
+        smn_start: 0x50000,
+        smn_end: 0x50400,
+    };
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
             "--json" => opts.json = true,
+            "--raw-smn" => opts.raw_smn = true,
+            "--smn-range" => {
+                // Consume the next two arguments: START and END.
+                let start = if i + 1 < args.len() {
+                    parse_address(&args[i + 1], "--smn-range START")?
+                } else {
+                    return Err("--smn-range requires START and END".to_owned());
+                };
+                let end = if i + 2 < args.len() {
+                    parse_address(&args[i + 2], "--smn-range END")?
+                } else {
+                    return Err("--smn-range requires START and END".to_owned());
+                };
+                if start > end {
+                    return Err(format!(
+                        "--smn-range START ({start:#x}) must be ≤ END ({end:#x})"
+                    ));
+                }
+                opts.smn_start = start;
+                opts.smn_end = end;
+                i += 2; // consume START and END
+            }
             // recognized; help / version are handled in `main`
             "-h" | "--help" | "-V" | "--version" => {}
             bad => {
@@ -145,8 +191,20 @@ pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 return Err(msg);
             }
         }
+        i += 1;
     }
     Ok(opts)
+}
+
+/// Parse an address argument (hex with `0x` prefix or decimal) into a
+/// `u32`. Used by `--smn-range START END`.
+fn parse_address(arg: &str, label: &str) -> Result<u32, String> {
+    let value = if let Some(hex) = arg.strip_prefix("0x").or_else(|| arg.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16)
+    } else {
+        arg.parse::<u32>()
+    };
+    value.map_err(|_| format!("{label} `{arg}` is not a valid 32-bit address (hex or decimal)"))
 }
 
 // ---------------------------------------------------------------------------
@@ -759,11 +817,37 @@ fn main() {
     }
     match parse_opts(&args) {
         Err(bad) => {
-            eprintln!("ramsleuth-telemetry: unknown flag {bad}");
+            eprintln!("ramsleuth-telemetry: {bad}");
             eprint!("{USAGE}");
             std::process::exit(2);
         }
         Ok(opts) => {
+            if opts.raw_smn {
+                // The --raw-smn diagnostic: dump all readable SMN
+                // registers in the given range and exit. No decode is
+                // applied — only raw 32-bit words. This is the tool for
+                // before/after BIOS comparisons (the register layout
+                // may be unverified on this platform, but the raw words
+                // are always true).
+                let regs = ramsleuth_telemetry::amd_smn::dump_smn_range(
+                    opts.smn_start,
+                    opts.smn_end,
+                );
+                if regs.is_empty() {
+                    eprintln!(
+                        "ramsleuth-telemetry: no SMN registers read in \
+                         {:#06x}–{:#06x} (ryzen_smu driver absent, not AMD, \
+                         or insufficient privilege)",
+                        opts.smn_start, opts.smn_end
+                    );
+                }
+                for (addr, word) in regs {
+                    println!("SMN_{addr:#08x} = {word:#010x}");
+                }
+                // Exit 0: a zero-register dump (driver absent) is a valid,
+                // structured outcome, not a failure (no-panic contract).
+                std::process::exit(0);
+            }
             let t = collect();
             // The SMBIOS Type 17 topology (unprivileged dmi read) feeds the
             // Intel section's capacity line and the server-uncore speed
@@ -1174,19 +1258,72 @@ mod tests {
         assert_eq!(json_escape("Ryzen 9 5950X — ok"), "Ryzen 9 5950X — ok");
     }
 
-    /// (d) `parse_opts`: `--json` sets the flag; `-h`/`--help` are
-    /// recognized (no error — `main` short-circuits them); any other
-    /// argument is an error naming that argument verbatim.
+    /// (d) `parse_opts`: `--json` sets the flag; `--raw-smn` sets the raw
+    /// dump flag; `--smn-range START END` sets the address range;
+    /// `-h`/`--help` are recognized (no error — `main` short-circuits
+    /// them); any other argument is an error naming that argument
+    /// verbatim.
     #[test]
     fn parse_opts_flags() {
         let prog = "ramsleuth-telemetry".to_owned();
-        let text = Opts { json: false };
-        let json = Opts { json: true };
+        let text = Opts {
+            json: false,
+            raw_smn: false,
+            smn_start: 0x50000,
+            smn_end: 0x50400,
+        };
+        let json = Opts {
+            json: true,
+            raw_smn: false,
+            smn_start: 0x50000,
+            smn_end: 0x50400,
+        };
+        let raw = Opts {
+            json: false,
+            raw_smn: true,
+            smn_start: 0x50000,
+            smn_end: 0x50400,
+        };
+        let custom_range = Opts {
+            json: false,
+            raw_smn: true,
+            smn_start: 0x50200,
+            smn_end: 0x50300,
+        };
 
         assert_eq!(parse_opts(std::slice::from_ref(&prog)), Ok(text));
 
         let json_args = [prog.clone(), "--json".to_owned()];
         assert_eq!(parse_opts(&json_args), Ok(json));
+
+        let raw_args = [prog.clone(), "--raw-smn".to_owned()];
+        assert_eq!(parse_opts(&raw_args), Ok(raw));
+
+        let range_args = [
+            prog.clone(),
+            "--raw-smn".to_owned(),
+            "--smn-range".to_owned(),
+            "0x50200".to_owned(),
+            "0x50300".to_owned(),
+        ];
+        assert_eq!(parse_opts(&range_args), Ok(custom_range));
+
+        // Decimal addresses work too.
+        let range_dec_args = [
+            prog.clone(),
+            "--smn-range".to_owned(),
+            "327680".to_owned(), // 0x50200
+            "328192".to_owned(), // 0x50400
+        ];
+        assert_eq!(
+            parse_opts(&range_dec_args),
+            Ok(Opts {
+                json: false,
+                raw_smn: false,
+                smn_start: 0x50200,
+                smn_end: 0x50400,
+            })
+        );
 
         let h_args = [prog.clone(), "-h".to_owned()];
         assert_eq!(parse_opts(&h_args), Ok(text));
@@ -1202,6 +1339,38 @@ mod tests {
 
         let bogus_args = [prog.clone(), "--bogus".to_owned()];
         assert_eq!(parse_opts(&bogus_args), Err("--bogus".to_owned()));
+
+        // Malformed range: START > END.
+        let bad_range = [
+            prog.clone(),
+            "--smn-range".to_owned(),
+            "0x50400".to_owned(),
+            "0x50200".to_owned(),
+        ];
+        assert!(
+            parse_opts(&bad_range).is_err(),
+            "START > END must be rejected"
+        );
+
+        // Malformed range: non-numeric.
+        let bad_addr = [
+            prog.clone(),
+            "--smn-range".to_owned(),
+            "not-a-number".to_owned(),
+            "0x50400".to_owned(),
+        ];
+        assert!(parse_opts(&bad_addr).is_err(), "non-numeric address must be rejected");
+
+        // Missing END.
+        let missing_end = [
+            prog.clone(),
+            "--smn-range".to_owned(),
+            "0x50200".to_owned(),
+        ];
+        assert!(
+            parse_opts(&missing_end).is_err(),
+            "missing END must be rejected"
+        );
     }
 
     /// (e) The `--version`/`-V` line is the package version, exactly
