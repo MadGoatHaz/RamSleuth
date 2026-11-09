@@ -336,6 +336,12 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
     // signal for ambiguous brands.
     let pkg_type = cpuid::read_pkg_type();
     let platform = cpuid::detect_amd_package_type(&cpu.brand, pkg_type, zen);
+    // Phase 4: the sIOD flag — covers both Threadripper and EPYC
+    // (the `threadripper` brand flag alone does not). Used by the
+    // P2-05 mapping to emit the sIOD timing N/A reason (SMN shadow
+    // registers are not updated post-training on sIOD, and APOB was
+    // not available).
+    snap.siod = matches!(platform, cpuid::AmdPackageType::Server(_));
     // The no-panic overlay (P6-02, frozen): populates `gdm` + the 27
     // `timings` from the driver `smn` attribute when readable; never
     // fails the branch and never touches the PM-table fields.
@@ -1385,6 +1391,7 @@ mod tests {
             pm_exposed: true,
             smn_setpoint_unverified: false,
             threadripper: false,
+            siod: false,
             mclk_mhz: 1800,
             uclk_mhz: 1800,
             fclk_mhz: 1792,

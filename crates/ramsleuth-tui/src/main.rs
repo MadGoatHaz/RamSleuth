@@ -2203,6 +2203,7 @@ mod tests {
             pm_exposed: true,
             smn_setpoint_unverified: false,
             threadripper: false,
+            siod: false,
             mclk_mhz: 1800,
             uclk_mhz: 1600,
             fclk_mhz: 1600,

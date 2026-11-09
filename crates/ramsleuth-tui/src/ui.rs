@@ -82,7 +82,7 @@ use ratatui::Frame;
 use ramsleuth_bench::{BenchOp, BenchmarkGrid, Metric, StreamProgress, Tier};
 use ramsleuth_display::{
     age_fragment, cell_text, channel_mode, dimm_summary, ecc_label, format_capacity, format_clock,
-    format_elapsed, mclk_derived_speed, na_cell_text, na_section_text, slot_note,
+    format_elapsed, mclk_derived_speed, na_cell_text, na_section_text, slot_note, timing_source,
 };
 use ramsleuth_telemetry::amd_readout::{
     CadBus, ClockReadout, CommandRate, DivMode, MemoryChannelMode, RttValue, TimingSet, VoltageSet,
@@ -940,8 +940,17 @@ fn zone1_columns(
         Section::Na(_) if matches!(telemetry.cpu.vendor, CpuVendor::Intel(_)) => {}
         Section::Na(reason) => left.push(section_na("AMD", reason)),
         Section::Value(readout) => {
+            // Phase 4: the timing-source annotation in the section label
+            // (a small `[APOB]` / `[SMN]` badge — the probe report carries
+            // the full text).
+            let source = timing_source(telemetry);
+            let label = match source {
+                ramsleuth_telemetry::amd_readout::TimingSource::Apob => "AMD [APOB]".to_owned(),
+                ramsleuth_telemetry::amd_readout::TimingSource::Smn => "AMD [SMN]".to_owned(),
+                ramsleuth_telemetry::amd_readout::TimingSource::Unavailable => "AMD".to_owned(),
+            };
             let (l, r) = readout_columns(
-                "AMD",
+                &label,
                 &readout.clocks,
                 &readout.timings,
                 &readout.cad_bus,

@@ -29,6 +29,7 @@
 //! [`dump`] is the thin RPC half: one `GetTelemetry` round trip over
 //! [`Client`], then [`render`] to stdout.
 
+use ramsleuth_display::timing_source;
 use ramsleuth_protocol::{Request, Response};
 use ramsleuth_telemetry::amd_readout::{
     AmdReadout, CadBus, ClockReadout, DivMode, GearMode, RttValue, TimingSet, VoltageSet,
@@ -346,9 +347,17 @@ fn cpu_section(out: &mut String, cpu: &CpuInfo) {
     out.push('\n');
 }
 
-/// The `=== AMD ===` section: the four display sets in dashboard order, or
+/// The `=== AMD ===` section: the timing-source annotation (Phase 4:
+/// `Timings: APOB (AGESA Pre-Output Buffer)` / `Timings: SMN registers` /
+/// `Timings: unavailable`), the four display sets in dashboard order, or
 /// one `N/A (<reason>)` line when the branch degraded.
-fn amd_section(out: &mut String, section: &Section<AmdReadout>, vendor: &CpuVendor) {
+fn amd_section(
+    out: &mut String,
+    section: &Section<AmdReadout>,
+    vendor: &CpuVendor,
+    brand: &str,
+    telemetry: &SystemMemoryTelemetry,
+) {
     header(out, "AMD");
     match section {
         Section::Na(reason) => {
@@ -356,6 +365,13 @@ fn amd_section(out: &mut String, section: &Section<AmdReadout>, vendor: &CpuVend
             out.push('\n');
         }
         Section::Value(readout) => {
+            // Phase 4: the timing-source annotation.
+            let source = timing_source(telemetry);
+            rows(
+                out,
+                "  ",
+                &[("Timing source", source.long_label().to_owned())],
+            );
             subheader(out, "Clocks & ratios");
             rows(out, "  ", &clocks_rows(&readout.clocks));
             let timings = timings_rows(&readout.timings);
@@ -372,6 +388,7 @@ fn amd_section(out: &mut String, section: &Section<AmdReadout>, vendor: &CpuVend
             out.push('\n');
         }
     }
+    let _ = brand; // kept for future per-platform annotation refinements
 }
 
 /// The `=== Intel ===` section: a readout-level `channel mode` line (the
@@ -509,7 +526,13 @@ pub fn render(telemetry: &SystemMemoryTelemetry) -> String {
     out.push('\n');
     cpu_section(&mut out, &telemetry.cpu);
     vcore_section(&mut out, &telemetry.vcore);
-    amd_section(&mut out, &telemetry.amd, &telemetry.cpu.vendor);
+    amd_section(
+        &mut out,
+        &telemetry.amd,
+        &telemetry.cpu.vendor,
+        &telemetry.cpu.brand,
+        telemetry,
+    );
     intel_section(&mut out, &telemetry.intel, &telemetry.cpu.vendor);
     spd_section(&mut out, &telemetry.spd);
     out

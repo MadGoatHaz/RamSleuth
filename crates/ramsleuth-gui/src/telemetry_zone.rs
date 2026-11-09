@@ -53,8 +53,10 @@
 //! [`render_telemetry_zone`] is the thin `egui` surface over it (the
 //! live render is verified in the QA phase).
 
+use ramsleuth_display::timing_source;
 use ramsleuth_telemetry::amd_readout::{
-    CadBus, ClockReadout, CommandRate, DivMode, GearMode, RttValue, TimingSet, VoltageSet,
+    CadBus, ClockReadout, CommandRate, DivMode, GearMode, RttValue, TimingSource, TimingSet,
+    VoltageSet,
 };
 use ramsleuth_telemetry::cpuid::CpuVendor;
 use ramsleuth_telemetry::error::{NaReason, Section};
@@ -179,8 +181,17 @@ pub fn timing_cells(telemetry: &SystemMemoryTelemetry, units: &Units) -> Vec<Ven
     if show_amd {
         match &telemetry.amd {
             Section::Value(readout) => {
+                // Phase 4: the timing-source annotation in the block
+                // header (a small `[APOB]` / `[SMN]` badge — the probe
+                // report carries the full text).
+                let source = timing_source(telemetry);
+                let header = match source {
+                    TimingSource::Apob => "AMD [APOB]".to_owned(),
+                    TimingSource::Smn => "AMD [SMN]".to_owned(),
+                    TimingSource::Unavailable => AMD.to_owned(),
+                };
                 blocks.push(VendorTiming {
-                    header: AMD.to_owned(),
+                    header,
                     sections: readout_sections(
                         &readout.clocks,
                         &readout.timings,
@@ -1196,7 +1207,7 @@ mod tests {
         // is omitted.
         let blocks = timing_cells(&representative(), &Units::default());
         assert!(
-            blocks.iter().any(|block| block.header == "AMD"),
+            blocks.iter().any(|block| block.header.starts_with("AMD")),
             "the AMD block header is expected: {blocks:?}"
         );
         assert!(
@@ -1217,7 +1228,7 @@ mod tests {
             "the Intel channel block headers are expected: {blocks:?}"
         );
         assert!(
-            !blocks.iter().any(|block| block.header == "AMD"),
+            !blocks.iter().any(|block| block.header.starts_with("AMD")),
             "an Intel-detected host must not render an AMD block: {blocks:?}"
         );
 
@@ -1225,7 +1236,7 @@ mod tests {
         // render — the current vendor-claim-free behavior.
         let blocks = timing_cells(&all_na(), &Units::default());
         assert!(
-            blocks.iter().any(|block| block.header == "AMD"),
+            blocks.iter().any(|block| block.header.starts_with("AMD")),
             "the AMD block header is expected: {blocks:?}"
         );
         assert!(

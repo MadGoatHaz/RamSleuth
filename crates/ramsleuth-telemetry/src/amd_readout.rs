@@ -141,16 +141,21 @@ const SMN_50200_UNVERIFIED_REASON: &str = "0x50200 layout unverified on this pla
 const SMN_50200_UNVERIFIED_TRX40_REASON: &str =
     "No active memory channel detected on Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable";
 
-/// The specific N/A reason for all 27 SMN-derived DRAM timing fields on
-/// a Threadripper (Castle Peak / TRX40) platform. The bit-field layout
-/// of the timing registers (0x50204–0x50264) has not been verified
-/// against AMD-published UMC maps for this platform; a previous
-/// per-field arithmetic offset (reverse-engineered from one DDR4-3200
-/// data point) was removed because it fabricated wrong values on other
-/// systems. Raw registers remain available via
-/// `ramsleuth-telemetry --raw-smn` for manual analysis.
+/// The specific N/A reason for all 27 DRAM timing fields on a server /
+/// workstation I/O Die (sIOD) platform — Threadripper (TRX40 / WRX80 /
+/// sTRX Pro) or EPYC (SP3 / SP5) — when the APOB (AGESA Pre-Output
+/// Buffer) is not available. On sIOD platforms the SMN shadow registers
+/// hold static JEDEC bootstrap straps and are not updated post-training,
+/// so they are not a live timing source; the APOB (the firmware's
+/// trained-timing snapshot in physical RAM) is the only OS-accessible
+/// live source, exposed by the `ryzen-smu` kernel module. When the APOB
+/// is absent (module not loaded, APOB not found at any candidate
+/// address, encrypted entry, or no active channel), all 27 timing
+/// fields render this honest N/A rather than fabricated values. Raw
+/// registers remain available via `ramsleuth-telemetry --raw-smn` for
+/// manual analysis.
 pub const SMN_TIMINGS_UNVERIFIED_TRX40_REASON: &str =
-    "SMN timing layout not verified on Threadripper/TRX40 (Castle Peak). Raw registers available via `ramsleuth-telemetry --raw-smn` for manual analysis.";
+    "DRAM timings not available — APOB not found and SMN shadow registers not updated post-training on this sIOD platform. Try updating the ryzen-smu kernel module. Raw registers available via `ramsleuth-telemetry --raw-smn` for manual analysis.";
 
 // ---------------------------------------------------------------------------
 // Vendor-neutral display types (frozen here; P2-07 + P2-10 consume them).
@@ -190,6 +195,114 @@ pub enum GearMode {
     Two,
     /// Gear 4.
     Four,
+}
+
+/// The data source of the DRAM timing fields in [`AmdReadout`].
+///
+/// This is derived by the display layer (it is not a wire field):
+///
+/// - [`Self::Smn`] — the timings come from the SMN shadow registers
+///   (desktop Ryzen cIOD platforms, the existing path).
+/// - [`Self::Apob`] — the timings come from the APOB (AGESA Pre-Output
+///   Buffer — sIOD Threadripper / EPYC platforms, the Phase 3 path).
+/// - [`Self::Unavailable`] — no timing source produced values (the
+///   timing cells are all `Na`).
+///
+/// The display layer can derive this from the platform type
+/// (sIOD vs cIOD, via the CPU brand / package type) and whether any
+/// timing cell carries a value — no wire-protocol change is needed,
+/// and older clients continue to work (Phase 4 constraint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TimingSource {
+    /// SMN shadow registers (cIOD desktop Ryzen; the existing path).
+    Smn,
+    /// APOB — AGESA Pre-Output Buffer (sIOD Threadripper / EPYC).
+    Apob,
+    /// No timing source produced values (all cells are `Na`).
+    Unavailable,
+}
+
+impl TimingSource {
+    /// The short display label (the frontends render it verbatim).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Smn => "SMN",
+            Self::Apob => "APOB",
+            Self::Unavailable => "N/A",
+        }
+    }
+
+    /// The long display label (probe report / verbose surfaces).
+    pub fn long_label(self) -> &'static str {
+        match self {
+            Self::Smn => "SMN registers",
+            Self::Apob => "APOB (AGESA Pre-Output Buffer)",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Derive the [`TimingSource`] for an AMD readout from the CPU brand
+/// and whether any timing cell carries a value.
+///
+/// - **sIOD** (brand contains "Threadripper" or "EPYC") with any timing
+///   value → [`TimingSource::Apob`] (the Phase 3 APOB overlay succeeded;
+///   the SMN shadow registers are not updated post-training on sIOD, so
+///   any live timing must be from the APOB).
+/// - **cIOD** (desktop Ryzen) with any timing value →
+///   [`TimingSource::Smn`] (the SMN shadow registers are the live source
+///   on cIOD).
+/// - No timing value (all cells `Na`) → [`TimingSource::Unavailable`]
+///   (APOB not found on sIOD, or SMN unreadable on cIOD).
+///
+/// Pure (no I/O); never panics. This is the single source of truth for
+/// the timing-source annotation (Phase 4) — the display crate, the
+/// probe report, and the frontends all derive from this.
+pub fn timing_source(brand: &str, readout: &AmdReadout) -> TimingSource {
+    // Any of the 27 timing cells carrying a value means a source
+    // succeeded. (On sIOD the APOB overlay replaces the all-Na SMN
+    // state; on cIOD the SMN overlay populates from the driver.)
+    let has_value = [
+        !readout.timings.cl.is_na(),
+        !readout.timings.rcwdwr.is_na(),
+        !readout.timings.rcdrd.is_na(),
+        !readout.timings.rp.is_na(),
+        !readout.timings.ras.is_na(),
+        !readout.timings.rc.is_na(),
+        !readout.timings.rrds.is_na(),
+        !readout.timings.rrld.is_na(),
+        !readout.timings.faw.is_na(),
+        !readout.timings.wtrs.is_na(),
+        !readout.timings.wtrl.is_na(),
+        !readout.timings.wr.is_na(),
+        !readout.timings.rfc1.is_na(),
+        !readout.timings.rfc2.is_na(),
+        !readout.timings.rfcsb.is_na(),
+        !readout.timings.cwl.is_na(),
+        !readout.timings.rtp.is_na(),
+        !readout.timings.rdwr.is_na(),
+        !readout.timings.wrrd.is_na(),
+        !readout.timings.rdrd_sd.is_na(),
+        !readout.timings.rdrd_dd.is_na(),
+        !readout.timings.rdrd_scl.is_na(),
+        !readout.timings.rdrd_sc.is_na(),
+        !readout.timings.wrwr_sd.is_na(),
+        !readout.timings.wrwr_dd.is_na(),
+        !readout.timings.wrwr_scl.is_na(),
+        !readout.timings.wrwr_sc.is_na(),
+    ]
+    .into_iter()
+    .any(|v| v);
+    if !has_value {
+        return TimingSource::Unavailable;
+    }
+    // sIOD (Threadripper / EPYC): any live timing must be APOB-sourced.
+    // cIOD (desktop Ryzen): the live timings are SMN-sourced.
+    if brand.contains("Threadripper") || brand.contains("EPYC") {
+        TimingSource::Apob
+    } else {
+        TimingSource::Smn
+    }
 }
 
 /// A raw-data ODT / RTT resistance value.
@@ -685,6 +798,7 @@ fn build_readout(snap: &AmdPmSnapshot, ch: &ChannelSmnFields) -> AmdReadout {
     let c = &snap.cad_bus;
     let v = &snap.voltages;
     let tr = snap.threadripper;
+    let siod = snap.siod;
 
     AmdReadout {
         clocks: ClockReadout {
@@ -721,11 +835,15 @@ fn build_readout(snap: &AmdPmSnapshot, ch: &ChannelSmnFields) -> AmdReadout {
                 map_command_rate(snap.command_rate)
             },
         },
-        timings: if tr {
-            // Threadripper / Castle Peak: the SMN timing-register layout
-            // is unverified on this platform (see
-            // `SMN_TIMINGS_UNVERIFIED_TRX40_REASON`), so all 27 fields
-            // render as honest N/A rather than fabricated values.
+        timings: if siod {
+            // sIOD (Threadripper / EPYC): the SMN shadow registers are
+            // not updated post-training on sIOD platforms (they hold
+            // static JEDEC bootstrap straps), so they are not a live
+            // timing source. The APOB (AGESA Pre-Output Buffer) is the
+            // only OS-accessible live source on sIOD; when it is not
+            // available (the facade's Phase 3 APOB routing failed), all
+            // 27 fields render as honest N/A rather than fabricated
+            // values (see `SMN_TIMINGS_UNVERIFIED_TRX40_REASON`).
             timing_set_unverified()
         } else {
             TimingSet {
@@ -795,6 +913,7 @@ mod tests {
             pm_exposed: true,
             smn_setpoint_unverified: false,
             threadripper: false,
+            siod: false,
             mclk_mhz: 1600,
             uclk_mhz: 1600,
             fclk_mhz: 1600,
@@ -1346,16 +1465,17 @@ mod tests {
         }
     }
 
-    /// (i″′) Threadripper / Castle Peak: all 27 timing fields render N/A
-    /// with the unverified-SMN-layout reason — the previous per-field
-    /// arithmetic offsets (reverse-engineered from one data point) were
-    /// removed as fabricated values. The reason names the platform and
-    /// points to `--raw-smn` for the raw registers. Non-Threadripper
-    /// platforms keep the normal timing mapping (regression check).
+    /// (i″′) sIOD (Threadripper / EPYC): all 27 timing fields render N/A
+    /// with the APOB-not-found reason — on sIOD platforms the SMN shadow
+    /// registers are not updated post-training, and the APOB (the only
+    /// OS-accessible live source) was not available. The reason names
+    /// the sIOD platform, mentions APOB, and points to `--raw-smn`.
+    /// Non-sIOD (cIOD desktop Ryzen) platforms keep the normal timing
+    /// mapping (regression check).
     #[test]
-    fn threadripper_timings_render_unverified_na() {
+    fn siod_timings_render_unverified_na() {
         let mut s = good_snapshot();
-        s.threadripper = true;
+        s.siod = true;
         let ro = map_amd(&s);
 
         // Every one of the 27 timing fields is N/A with the specific reason.
@@ -1390,14 +1510,18 @@ mod tests {
         ];
         for cell in timing_cells {
             let detail =
-                parse_error_detail(cell).expect("a Threadripper timing must be Na(ParseError)");
+                parse_error_detail(cell).expect("an sIOD timing must be Na(ParseError)");
             assert!(
-                detail.contains("SMN timing layout not verified on Threadripper/TRX40"),
-                "the reason names the platform: {detail}"
+                detail.contains("DRAM timings not available"),
+                "the reason names the condition: {detail}"
             );
             assert!(
-                detail.contains("Castle Peak"),
-                "the reason names the codename: {detail}"
+                detail.contains("APOB not found"),
+                "the reason names APOB: {detail}"
+            );
+            assert!(
+                detail.contains("sIOD platform"),
+                "the reason names the sIOD platform: {detail}"
             );
             assert!(
                 detail.contains("--raw-smn"),
@@ -1405,7 +1529,7 @@ mod tests {
             );
         }
 
-        // Non-Threadripper: the normal mapping (timings are values).
+        // cIOD (non-sIOD): the normal mapping (timings are values).
         let ro = map_amd(&good_snapshot());
         assert_eq!(ro.timings.cl, Section::Value(16));
         assert_eq!(ro.timings.ras, Section::Value(32));
@@ -1685,5 +1809,82 @@ mod tests {
         assert_eq!(EccStatus::Enabled.label(), "ECC: Enabled");
         assert_eq!(EccStatus::EnabledChipKill.label(), "ECC: ChipKill");
         assert_eq!(EccStatus::Unknown.label(), "ECC: Unknown");
+    }
+
+    // ------------------------------------------------------------------
+    // (i) Phase 4: timing-source derivation.
+    // ------------------------------------------------------------------
+
+    /// (i1) cIOD (Ryzen brand) with values → SMN.
+    #[test]
+    fn timing_source_ciod_with_values_is_smn() {
+        let ro = map_amd(&good_snapshot());
+        assert_eq!(
+            timing_source("AMD Ryzen 9 5950X", &ro),
+            TimingSource::Smn
+        );
+    }
+
+    /// (i2) sIOD (Threadripper brand) with values → APOB.
+    #[test]
+    fn timing_source_siod_threadripper_with_values_is_apob() {
+        let ro = map_amd(&good_snapshot());
+        assert_eq!(
+            timing_source("AMD Ryzen Threadripper 3990X", &ro),
+            TimingSource::Apob
+        );
+    }
+
+    /// (i3) sIOD (EPYC brand) with values → APOB.
+    #[test]
+    fn timing_source_siod_epyc_with_values_is_apob() {
+        let ro = map_amd(&good_snapshot());
+        assert_eq!(
+            timing_source("AMD EPYC 7742", &ro),
+            TimingSource::Apob
+        );
+    }
+
+    /// (i4) All-Na timings (the sIOD APOB-not-found state) → Unavailable.
+    #[test]
+    fn timing_source_all_na_is_unavailable() {
+        let mut s = good_snapshot();
+        s.siod = true; // all 27 timings → Na
+        let ro = map_amd(&s);
+        assert_eq!(
+            timing_source("AMD Ryzen Threadripper 3990X", &ro),
+            TimingSource::Unavailable
+        );
+    }
+
+    /// (i5) The `TimingSource` labels are pinned.
+    #[test]
+    fn timing_source_labels() {
+        assert_eq!(TimingSource::Smn.label(), "SMN");
+        assert_eq!(TimingSource::Apob.label(), "APOB");
+        assert_eq!(TimingSource::Unavailable.label(), "N/A");
+
+        assert_eq!(TimingSource::Smn.long_label(), "SMN registers");
+        assert_eq!(
+            TimingSource::Apob.long_label(),
+            "APOB (AGESA Pre-Output Buffer)"
+        );
+        assert_eq!(TimingSource::Unavailable.long_label(), "unavailable");
+    }
+
+    /// (i6) `TimingSource` round-trips through bincode (it is a display
+    /// enum, but pinning the wire form prevents accidental reordering).
+    #[test]
+    fn timing_source_arms_round_trip() {
+        let values = vec![
+            TimingSource::Smn,
+            TimingSource::Apob,
+            TimingSource::Unavailable,
+        ];
+        let bytes = bincode::serialize(&values)
+            .expect("TimingSource must serialize (no-panic contract)");
+        let back: Vec<TimingSource> =
+            bincode::deserialize(&bytes).expect("TimingSource must deserialize");
+        assert_eq!(values, back);
     }
 }
