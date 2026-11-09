@@ -12,6 +12,7 @@
 // Phase 2 modules land one per chunk (wiring only, not counted against the
 // per-chunk line budget). Each is `pub mod` so its frozen interface is
 // reachable (`crate::cpuid::CpuInfo`, …); P2-10 adds root re-exports.
+pub mod amd_apob; // APOB — AGESA Pre-Output Buffer acquisition + Castle Peak timing parse (sIOD/Threadripper).
 pub mod amd_pm; // P2-04 — version-guarded, bounds-checked AMD PM-table parse (AmdPmSnapshot).
 pub mod amd_readout; // P2-05 — shared display types + AMD mapping (sanity-gated, no I/O).
 pub mod amd_smn; // P6-02 — ryzen_smu `smn` sysfs accessor + verified SMN bitfield table + no-panic overlay.
