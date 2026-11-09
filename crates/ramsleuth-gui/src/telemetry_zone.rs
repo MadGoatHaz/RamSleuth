@@ -55,7 +55,7 @@
 
 use ramsleuth_display::timing_source;
 use ramsleuth_telemetry::amd_readout::{
-    CadBus, ClockReadout, CommandRate, DivMode, GearMode, RttValue, TimingSource, TimingSet,
+    CadBus, ClockReadout, CommandRate, DivMode, GearMode, RttValue, TimingSet, TimingSource,
     VoltageSet,
 };
 use ramsleuth_telemetry::cpuid::CpuVendor;

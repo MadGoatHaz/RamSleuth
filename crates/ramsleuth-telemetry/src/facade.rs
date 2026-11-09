@@ -413,10 +413,7 @@ fn try_apob_timings() -> Option<amd_apob::ApobChannelTimings> {
 ///
 /// Pure (no I/O); never panics. This is a purely additive operation —
 /// it never degrades existing data.
-fn overlay_apob_timings(
-    readout: &mut AmdReadout,
-    ch: &amd_apob::ApobChannelTimings,
-) {
+fn overlay_apob_timings(readout: &mut AmdReadout, ch: &amd_apob::ApobChannelTimings) {
     let t = &mut readout.timings;
     // Helper: overlay a timing value if it is in the plausible range
     // (the same sanity gate as `amd_readout::map_timing`).
@@ -2396,7 +2393,10 @@ mod tests {
         assert_eq!(readout.timings.cwl, Section::Value(18));
         assert_eq!(readout.timings.rtp, Section::Value(14));
         // Command rate overlaid from APOB (was Na).
-        assert_eq!(readout.clocks.command_rate, Section::Value(CommandRate::OneT));
+        assert_eq!(
+            readout.clocks.command_rate,
+            Section::Value(CommandRate::OneT)
+        );
 
         // Non-APOB fields remain Na (the sIOD unverified state).
         assert!(readout.timings.rrds.is_na());
@@ -2489,11 +2489,11 @@ mod tests {
         // tRAS — neither should be overlaid.
         let apob_ch = amd_apob::ApobChannelTimings {
             channel: 0,
-            tcl: 0,          // zero → skip
-            trcdw: 18,       // in-range → overlay
+            tcl: 0,    // zero → skip
+            trcdw: 18, // in-range → overlay
             trcdr: 18,
             trp: 18,
-            tras: 5000,      // >2048 → skip
+            tras: 5000, // >2048 → skip
             trc: 56,
             tfaw: 39,
             twtr_s: 4,
@@ -2504,7 +2504,7 @@ mod tests {
             trfc_pb: 132,
             tcwl: 18,
             trtp: 14,
-            cmd_rate: 3,     // reserved → skip
+            cmd_rate: 3, // reserved → skip
         };
 
         overlay_apob_timings(&mut readout, &apob_ch);
@@ -2516,7 +2516,10 @@ mod tests {
         // In-range trcdw → overlaid.
         assert_eq!(readout.timings.rcwdwr, Section::Value(18));
         // Reserved cmd_rate → existing OneT stands.
-        assert_eq!(readout.clocks.command_rate, Section::Value(CommandRate::OneT));
+        assert_eq!(
+            readout.clocks.command_rate,
+            Section::Value(CommandRate::OneT)
+        );
     }
 
     /// The `detect_amd_package_type` classification drives the APOB
@@ -2537,7 +2540,11 @@ mod tests {
         );
         // Desktop Ryzen → Client (the SMN path only).
         assert_eq!(
-            cpuid::detect_amd_package_type("AMD Ryzen 9 5950X", cpuid::PkgType::ClientAm4, AmdZen::Zen3),
+            cpuid::detect_amd_package_type(
+                "AMD Ryzen 9 5950X",
+                cpuid::PkgType::ClientAm4,
+                AmdZen::Zen3
+            ),
             cpuid::AmdPackageType::Client(AmdZen::Zen3)
         );
         // EPYC → Server.

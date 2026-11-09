@@ -691,12 +691,7 @@ fn render_cpu(out: &mut String, cpu: &CpuInfo, vcore: &Section<VoltageTelemetry>
 /// The `### AMD` subsection: a "Timing source" annotation line
 /// (APOB / SMN registers / unavailable — Phase 4), the four display
 /// sets, or one `N/A (<reason>)` line when the branch degraded.
-fn render_amd(
-    out: &mut String,
-    vendor: &CpuVendor,
-    brand: &str,
-    section: &Section<AmdReadout>,
-) {
+fn render_amd(out: &mut String, vendor: &CpuVendor, brand: &str, section: &Section<AmdReadout>) {
     out.push_str("### AMD\n\n");
     match section {
         Section::Na(reason) => out.push_str(&format!("{}\n\n", na_cell(reason))),
@@ -705,10 +700,7 @@ fn render_amd(
             // platform type and whether any timing cell carries a
             // value — no wire-protocol change).
             let source = crate::amd_readout::timing_source(brand, readout);
-            out.push_str(&format!(
-                "| Timing source | {} |\n\n",
-                source.long_label()
-            ));
+            out.push_str(&format!("| Timing source | {} |\n\n", source.long_label()));
             render_display_sets(
                 out,
                 vendor,

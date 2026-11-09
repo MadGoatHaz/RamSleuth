@@ -532,11 +532,7 @@ pub enum AmdPackageType {
 ///    tries APOB (a no-op if absent) before the SMN path.
 ///
 /// Pure (no CPUID, no I/O); never panics.
-pub fn detect_amd_package_type(
-    brand: &str,
-    pkg_type: PkgType,
-    zen: AmdZen,
-) -> AmdPackageType {
+pub fn detect_amd_package_type(brand: &str, pkg_type: PkgType, zen: AmdZen) -> AmdPackageType {
     // Primary signal: the brand string (unambiguous on retail silicon).
     if brand.contains("Threadripper") || brand.contains("EPYC") {
         return AmdPackageType::Server(zen);
@@ -1867,7 +1863,7 @@ mod tests {
     #[test]
     fn read_pkg_type_is_total() {
         let _ = read_pkg_type(); // non-panic check
-        // Every PkgType variant is constructible (exhaustive match).
+                                 // Every PkgType variant is constructible (exhaustive match).
         match read_pkg_type() {
             PkgType::Mobile
             | PkgType::ClientAm4
@@ -1894,11 +1890,7 @@ mod tests {
         );
         // EPYC → Server.
         assert_eq!(
-            detect_amd_package_type(
-                "AMD EPYC 7742",
-                PkgType::Unknown,
-                AmdZen::Zen2
-            ),
+            detect_amd_package_type("AMD EPYC 7742", PkgType::Unknown, AmdZen::Zen2),
             AmdPackageType::Server(AmdZen::Zen2)
         );
         // Desktop Ryzen → Client (even with a Server PkgType — the

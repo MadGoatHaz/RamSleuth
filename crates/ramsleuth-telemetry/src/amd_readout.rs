@@ -1509,8 +1509,7 @@ mod tests {
             &ro.timings.wrwr_sc,
         ];
         for cell in timing_cells {
-            let detail =
-                parse_error_detail(cell).expect("an sIOD timing must be Na(ParseError)");
+            let detail = parse_error_detail(cell).expect("an sIOD timing must be Na(ParseError)");
             assert!(
                 detail.contains("DRAM timings not available"),
                 "the reason names the condition: {detail}"
@@ -1819,10 +1818,7 @@ mod tests {
     #[test]
     fn timing_source_ciod_with_values_is_smn() {
         let ro = map_amd(&good_snapshot());
-        assert_eq!(
-            timing_source("AMD Ryzen 9 5950X", &ro),
-            TimingSource::Smn
-        );
+        assert_eq!(timing_source("AMD Ryzen 9 5950X", &ro), TimingSource::Smn);
     }
 
     /// (i2) sIOD (Threadripper brand) with values → APOB.
@@ -1839,10 +1835,7 @@ mod tests {
     #[test]
     fn timing_source_siod_epyc_with_values_is_apob() {
         let ro = map_amd(&good_snapshot());
-        assert_eq!(
-            timing_source("AMD EPYC 7742", &ro),
-            TimingSource::Apob
-        );
+        assert_eq!(timing_source("AMD EPYC 7742", &ro), TimingSource::Apob);
     }
 
     /// (i4) All-Na timings (the sIOD APOB-not-found state) → Unavailable.
@@ -1881,8 +1874,8 @@ mod tests {
             TimingSource::Apob,
             TimingSource::Unavailable,
         ];
-        let bytes = bincode::serialize(&values)
-            .expect("TimingSource must serialize (no-panic contract)");
+        let bytes =
+            bincode::serialize(&values).expect("TimingSource must serialize (no-panic contract)");
         let back: Vec<TimingSource> =
             bincode::deserialize(&bytes).expect("TimingSource must deserialize");
         assert_eq!(values, back);

@@ -268,7 +268,11 @@ pub enum ApobError {
     /// The APOB format version is not supported.
     UnsupportedVersion(u32),
     /// An entry's payload extends beyond the table boundary.
-    EntryOverrun { entry_index: usize, group: u16, type_id: u16 },
+    EntryOverrun {
+        entry_index: usize,
+        group: u16,
+        type_id: u16,
+    },
     /// The timing entry (Group 1 Type 3) was not found.
     TimingsNotFound,
     /// The timing entry is encrypted (Group ID 0xFFFF or flags bit 7).
@@ -283,7 +287,10 @@ pub enum ApobError {
 impl std::fmt::Display for ApobError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotFound => write!(f, "APOB not found (no valid signature at any candidate address)"),
+            Self::NotFound => write!(
+                f,
+                "APOB not found (no valid signature at any candidate address)"
+            ),
             Self::BadSignature => write!(f, "APOB signature mismatch"),
             Self::Truncated { expected, actual } => write!(
                 f,
@@ -291,7 +298,11 @@ impl std::fmt::Display for ApobError {
                 expected, actual
             ),
             Self::UnsupportedVersion(v) => write!(f, "APOB unsupported version: 0x{:08x}", v),
-            Self::EntryOverrun { entry_index, group, type_id } => write!(
+            Self::EntryOverrun {
+                entry_index,
+                group,
+                type_id,
+            } => write!(
                 f,
                 "APOB entry {} (group 0x{:04x}, type 0x{:04x}) overruns table boundary",
                 entry_index, group, type_id
@@ -583,7 +594,8 @@ pub fn extract_castle_peak_timings(apob: &ApobData) -> Result<ApobTimings, ApobE
     // Find the Group 1 Type 3 (APOB_MEM_TIMINGS) entry.
     // Source: architecture doc §A.2, type 0x0003.
     const TIMINGS_TYPE_ID: u16 = 0x0003;
-    let timings_entry = apob.entries
+    let timings_entry = apob
+        .entries
         .iter()
         .find(|e| e.header.group == ApobGroup::Mem && e.header.type_id == TIMINGS_TYPE_ID);
 
@@ -725,8 +737,7 @@ mod tests {
         assert_eq!(apob.entries[0].header.group, ApobGroup::Mem);
         assert_eq!(apob.entries[0].header.type_id, 3);
 
-        let timings =
-            extract_castle_peak_timings(&apob).expect("Castle Peak timings must extract");
+        let timings = extract_castle_peak_timings(&apob).expect("Castle Peak timings must extract");
         assert_eq!(timings.channels.len(), 8);
 
         let ch0 = &timings.channels[0];
@@ -795,8 +806,7 @@ mod tests {
     fn test_parse_entry_overrun() {
         let mut blob = synthetic_castle_peak_apob();
         // Set type_size to a value that overruns the table.
-        blob[APOB_HEADER_SIZE + 4..APOB_HEADER_SIZE + 8]
-            .copy_from_slice(&0xFFFFu32.to_le_bytes());
+        blob[APOB_HEADER_SIZE + 4..APOB_HEADER_SIZE + 8].copy_from_slice(&0xFFFFu32.to_le_bytes());
         let err = parse_apob(&blob).unwrap_err();
         assert!(matches!(err, ApobError::EntryOverrun { .. }));
     }
@@ -854,14 +864,19 @@ mod tests {
     fn test_extract_timings_too_short() {
         let mut blob = synthetic_castle_peak_apob();
         // Set type_size to 432 (4 channels × 108).
-        blob[APOB_HEADER_SIZE + 4..APOB_HEADER_SIZE + 8]
-            .copy_from_slice(&432u32.to_le_bytes());
+        blob[APOB_HEADER_SIZE + 4..APOB_HEADER_SIZE + 8].copy_from_slice(&432u32.to_le_bytes());
         // Also adjust the table_size in the header to match.
         let new_table_size = (APOB_HEADER_SIZE + APOB_ENTRY_HEADER_SIZE + 432) as u32;
         blob[8..12].copy_from_slice(&new_table_size.to_le_bytes());
         let apob = parse_apob(&blob).expect("APOB must parse");
         let err = extract_castle_peak_timings(&apob).unwrap_err();
-        assert!(matches!(err, ApobError::TimingsTooShort { expected: 864, actual: 432 }));
+        assert!(matches!(
+            err,
+            ApobError::TimingsTooShort {
+                expected: 864,
+                actual: 432
+            }
+        ));
     }
 
     /// Multiple entries: the parser handles more than one entry.
@@ -911,12 +926,22 @@ mod tests {
         let errors = vec![
             ApobError::NotFound,
             ApobError::BadSignature,
-            ApobError::Truncated { expected: 100, actual: 50 },
+            ApobError::Truncated {
+                expected: 100,
+                actual: 50,
+            },
             ApobError::UnsupportedVersion(0x99),
-            ApobError::EntryOverrun { entry_index: 0, group: 1, type_id: 3 },
+            ApobError::EntryOverrun {
+                entry_index: 0,
+                group: 1,
+                type_id: 3,
+            },
             ApobError::TimingsNotFound,
             ApobError::TimingsEncrypted,
-            ApobError::TimingsTooShort { expected: 864, actual: 432 },
+            ApobError::TimingsTooShort {
+                expected: 864,
+                actual: 432,
+            },
             ApobError::Io("test".to_string()),
         ];
         for e in errors {
