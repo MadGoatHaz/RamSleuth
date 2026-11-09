@@ -829,10 +829,8 @@ fn main() {
                 // before/after BIOS comparisons (the register layout
                 // may be unverified on this platform, but the raw words
                 // are always true).
-                let regs = ramsleuth_telemetry::amd_smn::dump_smn_range(
-                    opts.smn_start,
-                    opts.smn_end,
-                );
+                let regs =
+                    ramsleuth_telemetry::amd_smn::dump_smn_range(opts.smn_start, opts.smn_end);
                 if regs.is_empty() {
                     eprintln!(
                         "ramsleuth-telemetry: no SMN registers read in \
@@ -1359,14 +1357,13 @@ mod tests {
             "not-a-number".to_owned(),
             "0x50400".to_owned(),
         ];
-        assert!(parse_opts(&bad_addr).is_err(), "non-numeric address must be rejected");
+        assert!(
+            parse_opts(&bad_addr).is_err(),
+            "non-numeric address must be rejected"
+        );
 
         // Missing END.
-        let missing_end = [
-            prog.clone(),
-            "--smn-range".to_owned(),
-            "0x50200".to_owned(),
-        ];
+        let missing_end = [prog.clone(), "--smn-range".to_owned(), "0x50200".to_owned()];
         assert!(
             parse_opts(&missing_end).is_err(),
             "missing END must be rejected"

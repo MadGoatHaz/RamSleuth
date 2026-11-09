@@ -994,10 +994,7 @@ fn render_amd_raw_table(out: &mut String, raw: &ProbeRaw) {
         } else {
             out.push_str("| Register | Value |\n|---|---|\n");
             for (address, value) in non_zero {
-                out.push_str(&format!(
-                    "| SMN_{:#X} | 0x{:08X} |\n",
-                    address, value
-                ));
+                out.push_str(&format!("| SMN_{:#X} | 0x{:08X} |\n", address, value));
             }
             out.push('\n');
         }

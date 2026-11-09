@@ -1,4 +1,4 @@
-# RamSleuth v2.4.20
+# RamSleuth v2.4.21
 
 Live memory-controller telemetry and a native Memory & Latency Benchmark for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
 
@@ -10,10 +10,11 @@ RamSleuth is a 9-crate Rust workspace (8 product crates + the `tools/gen-icon` d
 
 Every privileged read flows through a single root daemon that holds only `CAP_SYS_RAWIO` — all clients (the CLI, the TUI, the GUI) run fully unprivileged — and the no-panic contract means a missing driver, privilege, or piece of hardware never crashes anything: the affected fields render as a structured `N/A (<reason>)` and the process exits 0.
 
-## What's new in v2.4.20
+## What's new in v2.4.21
 
-- **Threadripper 3000 (Castle Peak / TRX40) DRAM timing decode** — tCL, tCWL, tWR, tFAW, tRAS, tRC now read correctly using platform-specific SMN register layout (8-channel UMC scan with per-field offsets; fixes "JEDEC defaults instead of XMP timings" on TRX40 boards).
-- **CLI/TUI discovery improvements** — related tools now appear in all help outputs, smart flag suggestions for common typos, and parity fixes across the CLI and TUI interfaces.
+- **Reverted unverified Threadripper/TRX40 (Castle Peak) timing decode** — the v2.4.20 per-field arithmetic offsets were a curve-fit to a single data point and produced wrong values on other systems; tCL and other SMN-derived timings now correctly report N/A with an explanation until a proper register mapping is completed.
+- **`ramsleuth-telemetry --raw-smn`** — new diagnostic flag that dumps all readable SMN registers (0x50000–0x50400) for hardware analysis, with `--smn-range <start> <end>` to customize the range.
+- **Expanded raw register section in probe reports** — the 0x50000–0x50400 SMN range is now included to enable before/after comparison for register-level debugging.
 
 ## Why RamSleuth
 
@@ -62,8 +63,8 @@ yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest i
 **Debian/Ubuntu/Mint — `.deb` package:**
 
 ```sh
-wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.20/ramsleuth_2.4.20_amd64.deb
-sudo dpkg -i ramsleuth_2.4.20_amd64.deb
+wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.21/ramsleuth_2.4.21_amd64.deb
+sudo dpkg -i ramsleuth_2.4.21_amd64.deb
 sudo usermod -aG ramsleuth $USER
 newgrp ramsleuth        # or log out and back in
 ramsleuth-tui
@@ -104,10 +105,10 @@ The full walkthrough — every zone, key, flag, N/A reason, and day-2 troublesho
 - [Packaging & AUR](packaging/README.md) — the two-package AUR model, the unified version-bump flow, the `ryzen-smu-dkms` extra, and the CI/release artifact contracts.
 - [Changelog](CHANGELOG.md) — release history.
 
-**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.20**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
+**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.21**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
 
 ## License
 
 MIT — the workspace `Cargo.toml` declares `license = "MIT"`. Repository: <https://github.com/MadGoatHaz/RamSleuth>.
 
-RamSleuth v2.4.20 · branch `v2-development`
+RamSleuth v2.4.21 · branch `v2-development`

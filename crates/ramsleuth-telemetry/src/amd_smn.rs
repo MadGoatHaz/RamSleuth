@@ -1164,9 +1164,7 @@ fn apply_smn_castle_peak_with<R: FnMut(u32) -> TelemetryResult<u32>>(
     // so for channel 0 they are identical; for other channels we use the
     // stride to address the correct physical word).
     let stride = base - SMN_CH0_BASE;
-    let mclk_word = probe_word.unwrap_or_else(|| {
-        read_word(reader(SMN_MCLK + stride)).unwrap_or(0)
-    });
+    let mclk_word = probe_word.unwrap_or_else(|| read_word(reader(SMN_MCLK + stride)).unwrap_or(0));
 
     snap.gdm = gdm_flag(mclk_word);
     snap.command_rate = command_rate(mclk_word);
@@ -2341,7 +2339,7 @@ mod tests {
         assert!(!snap.smn_setpoint_unverified);
         assert_eq!(snap.gdm, 1); // GDM bit 11 set in 0x0830
         assert_eq!(snap.command_rate, 0); // bit 10 clear
-        // Timings keep the PM-table parse values (zero in the fixture).
+                                          // Timings keep the PM-table parse values (zero in the fixture).
         assert_eq!(snap.timings.cl, 0);
         assert_eq!(snap.timings.ras, 0);
         assert_eq!(snap.timings.rc, 0);

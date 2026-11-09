@@ -1639,10 +1639,7 @@ mod tests {
                 Some(0x7E08_20A0),
                 None, // 0x50264: a failed read
             ],
-            smn_raw_range: vec![
-                (0x50200, 0x0000_1539),
-                (0x50204, 0x1010_2410),
-            ],
+            smn_raw_range: vec![(0x50200, 0x0000_1539), (0x50204, 0x1010_2410)],
             pm_version: Some(0x0038_0805),
             pm_blob: blob,
         }
