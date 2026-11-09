@@ -481,13 +481,19 @@ struct ProbeRawSource {
 }
 
 /// The raw AMD register set, normalized from the `ryzen_smu` driver: the
-/// 13 SMN DRAM timing words + the PM-table blob (from which the key f32
-/// values are extracted) + the PM version.
+/// 13 SMN DRAM timing words + the expanded SMN raw range (0x50000–0x50400)
+/// + the PM-table blob (from which the key f32 values are extracted) + the
+/// PM version.
 #[derive(Debug, Clone)]
 struct ProbeAmdSource {
     /// The 13 SMN DRAM register words in address order (`None` per failed
     /// read); empty when no `smn` attribute was available.
     smn_regs: Vec<Option<u32>>,
+    /// The expanded SMN raw-register dump (the `--raw-smn` aperture):
+    /// every readable, non-sentinel word in 0x50000–0x50400 (step 4) as
+    /// `(address, value)` pairs; empty when no `smn` attribute was
+    /// available or every read failed.
+    smn_raw_range: Vec<(u32, u32)>,
     /// The PM-table `TableVersionId` (`None` when no blob was acquired).
     pm_version: Option<u32>,
     /// The raw PM-table blob (headerless f32 array); empty when unavailable.
@@ -657,9 +663,9 @@ fn probe_raw_from_source(source: &ProbeRawSource) -> ProbeRaw {
 }
 
 /// Flatten one [`ProbeAmdSource`] into the wire [`ProbeRaw`] AMD section:
-/// the 13 SMN words + the PM version / blob length + the five key f32
-/// values (extracted from the blob). Every Intel field is absent (an AMD
-/// report carries no Intel raw).
+/// the 13 SMN words + the expanded SMN raw range + the PM version / blob
+/// length + the five key f32 values (extracted from the blob). Every
+/// Intel field is absent (an AMD report carries no Intel raw).
 fn probe_raw_from_amd_source(source: &ProbeAmdSource) -> ProbeRaw {
     let key_values = ramsleuth_telemetry::amd_smu::read_pm_key_values(&source.pm_blob);
     ProbeRaw {
@@ -672,6 +678,7 @@ fn probe_raw_from_amd_source(source: &ProbeAmdSource) -> ProbeRaw {
         amd_pm_fclk: key_values[2],
         amd_pm_uclk: key_values[3],
         amd_pm_mclk: key_values[4],
+        amd_smn_raw_range: source.smn_raw_range.clone(),
         // All Intel raw: absent (an AMD report carries none).
         ..Default::default()
     }
@@ -831,10 +838,15 @@ fn acquire_amd_raw() -> RawAcquisition {
     let pm = ramsleuth_telemetry::amd_smu::acquire().ok();
     // The 13 SMN DRAM words: empty when no `smn` attribute is available.
     let smn_regs = ramsleuth_telemetry::amd_smn::read_all_dram_registers();
+    // The expanded SMN raw range (the `--raw-smn` aperture): every
+    // readable word in 0x50000–0x50400 (step 4). Empty when no `smn`
+    // attribute is available (the vendor gate fires first).
+    let smn_raw_range = ramsleuth_telemetry::amd_smn::dump_smn_range(0x50000, 0x50400);
 
-    if pm.is_some() || !smn_regs.is_empty() {
+    if pm.is_some() || !smn_regs.is_empty() || !smn_raw_range.is_empty() {
         RawAcquisition::Amd(ProbeAmdSource {
             smn_regs,
+            smn_raw_range,
             pm_version: pm.as_ref().map(|ctx| ctx.version),
             // `ctx.pm` is `Option` (a loaded driver with no `pm_table`
             // attribute — e.g. Castle Peak / 3990X — yields `None`):
@@ -1626,6 +1638,10 @@ mod tests {
                 Some(0x0400_0000),
                 Some(0x7E08_20A0),
                 None, // 0x50264: a failed read
+            ],
+            smn_raw_range: vec![
+                (0x50200, 0x0000_1539),
+                (0x50204, 0x1010_2410),
             ],
             pm_version: Some(0x0038_0805),
             pm_blob: blob,

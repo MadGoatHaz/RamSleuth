@@ -1079,8 +1079,22 @@ benchmark failure, `2` an unknown flag.
 ```sh
 ramsleuth-telemetry
 ramsleuth-telemetry --json
+ramsleuth-telemetry --raw-smn
+ramsleuth-telemetry --raw-smn --smn-range 0x50000 0x50400
 ramsleuth-telemetry -h
 ```
+
+The `--raw-smn` flag is a **diagnostic** that dumps all readable AMD SMN
+memory-controller registers in the given address range (one per line:
+`SMN_0xADDR = 0xVALUE`) and exits — no decode is applied, only raw 32-bit
+words. This is the tool for before/after BIOS comparisons: capture a dump
+with one BIOS setting, change the setting, capture again, and diff. The
+default range is `0x50000`–`0x50400` (step 4, ~256 registers), which
+covers the UMC timing and channel registers; customize it with
+`--smn-range START END` (hex with `0x` prefix or decimal). Only
+successfully-read, non-error registers are printed; if the `ryzen_smu`
+driver is absent or the system is not AMD, the dump is empty and the
+command still exits `0` with a note on stderr.
 
 A thin front end for the telemetry collector: it **reads the hardware
 directly — no daemon, no socket** — and prints the full
@@ -1540,9 +1554,9 @@ stays sandboxed and the driver stays an explicit, audited opt-in.
 ### 10.1 Threadripper / TRX40 / WRX80 known limitations
 
 On AMD Threadripper (Castle Peak / TRX40, Threadripper PRO / WRX80, and
-future Threadripper platforms) two fields may show `N/A` even when the
-`ryzen_smu` module is installed and working correctly. **These are known
-platform limitations, not bugs:**
+future Threadripper platforms) several fields may show `N/A` even when
+the `ryzen_smu` module is installed and working correctly. **These are
+known platform limitations, not bugs:**
 
 - **PM table (MCLK / UCLK / FCLK / divide mode / voltages)** — the
   `ryzen_smu` driver does not expose the `pm_table` sysfs attribute on
@@ -1550,8 +1564,7 @@ platform limitations, not bugs:**
   field reads:
   `N/A (PM table not exposed by ryzen-smu driver on this platform (known limitation for Threadripper 3000/WRX80))`
   This is a limitation of the driver's AGESA support matrix, not of
-  RamSleuth. The SMN-overlay fields (DRAM subtimings, command rate, GDM)
-  are read through a separate interface and are **not affected** by this.
+  RamSleuth.
 
 - **GDM / command rate (channel topology)** — the `0x50200` UMC register
   layout (MCLK set-point, Gear Down Mode, DRAM command rate) is
@@ -1559,19 +1572,31 @@ platform limitations, not bugs:**
   Vermeer. The earlier confusion came from reading channel 0, which is
   electrically dormant on TRX40 boards (they route DIMMs to the
   odd-indexed channels 1/3/5/7) and holds JEDEC fallback data with a
-  zero clock multiplier. RamSleuth now scans all eight UMC channel
+  zero clock multiplier. RamSleuth scans all eight UMC channel
   instances and decodes from the first active one. When an active
   channel is present, GDM and command rate populate normally. Only when
   **every** channel is dormant (no active memory detected) does
   RamSleuth report:
   `N/A (No active memory channel detected on Threadripper/TRX40 (Castle Peak); GDM and command rate unavailable)`
-  The remaining 27 DRAM subtimings are read from the same active channel
-  and are **not affected** by this gate.
+
+- **DRAM subtimings (tCL, tRCD, tRP, tRAS, tRC, … all 27)** — the bit-field
+  layout of the SMN timing registers (0x50204–0x50264) has not been
+  verified against AMD-published UMC maps for Threadripper / TRX40. A
+  previous per-field arithmetic offset (reverse-engineered from a single
+  DDR4-3200 data point) was removed because it produced wrong values on
+  systems with different timings. All 27 SMN-derived timing fields now
+  render as honest N/A:
+  `N/A (SMN timing layout not verified on Threadripper/TRX40 (Castle Peak). Raw registers available via `ramsleuth-telemetry --raw-smn` for manual analysis.)`
+  If you need the raw register values (for manual decode or before/after
+  BIOS comparisons), use `ramsleuth-telemetry --raw-smn` — it dumps every
+  readable word in the 0x50000–0x50400 range with no decode applied.
 
 All other telemetry (SPD, platform info, benchmarks, CPU temperature)
 works normally on Threadripper. If your Threadripper system *does*
-expose the PM table (some AGESA versions do), all fields will populate
-as on desktop Ryzen.
+expose the PM table (some AGESA versions do), the PM-derived fields
+(MCLK / UCLK / FCLK / voltages) will populate as on desktop Ryzen,
+though the SMN-derived subtimings remain N/A until the layout is
+verified.
 
 ---
 
@@ -1838,14 +1863,15 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   **board-delivered** from the Super-I/O `in0` (not the MCHBAR window), with
   the confidence badge from Section 8.3 — it reads `N/A` only on enterprise
   / out-of-bounds / no-Super-I/O boards.
-- **Threadripper / TRX40 / WRX80** — two known platform limitations
+- **Threadripper / TRX40 / WRX80** — three known platform limitations
   (Section 10.1): the `ryzen_smu` driver may not expose the PM table on
   some Threadripper AGESA versions (MCLK / UCLK / FCLK / voltages read
-  `N/A` with a platform-specific reason), and the `0x50200` UMC register
-  layout differs from desktop Ryzen (GDM / command rate read `N/A` with a
-  "layout not validated" reason). The 27 DRAM subtimings, SPD, benchmarks,
-  and all other telemetry work normally — these are driver / silicon
-  limitations, not RamSleuth faults.
+  `N/A` with a platform-specific reason); GDM / command rate read `N/A`
+  when every UMC channel is dormant; and the 27 DRAM subtimings read
+  `N/A` because the SMN timing-register layout is not yet verified on
+  Threadripper / TRX40 (use `ramsleuth-telemetry --raw-smn` for the raw
+  registers). SPD, benchmarks, and all other telemetry work normally —
+  these are driver / silicon limitations, not RamSleuth faults.
 - **Some Vermeer (Zen 3) boards read the PM-table subtiming block as 0** —
   the 27 subtimings come back zeroed (the firmware leaves the block
   unpopulated) while the clocks, voltages, and SPD all read normally — a

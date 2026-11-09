@@ -183,6 +183,14 @@ pub struct ProbeRaw {
     pub amd_pm_uclk: Option<u32>,
     /// `MCLK` f32 bit pattern @ `0x0CC`.
     pub amd_pm_mclk: Option<u32>,
+    /// The expanded SMN raw-register dump (the `--raw-smn` aperture):
+    /// every readable, non-sentinel word in the 0x50000–0x50400 range
+    /// (step 4) as `(address, value)` pairs. Appended last (OQ-10
+    /// append-only). Empty when no `smn` attribute was available or every
+    /// read failed / was the `0xFFFF_FFFF` sentinel. Zero-valued registers
+    /// are included (they are valid data — the probe report renderer
+    /// filters them for display).
+    pub amd_smn_raw_range: Vec<(u32, u32)>,
 }
 
 /// The operator-facing system identity for a probe report: the CPU
@@ -942,14 +950,18 @@ fn has_intel_raw(raw: &ProbeRaw) -> bool {
 }
 
 /// `true` when the AMD raw section is populated (a non-empty SMN register
-/// list, or a PM-table version).
+/// list, a non-empty expanded SMN raw range, or a PM-table version).
 fn has_amd_raw(raw: &ProbeRaw) -> bool {
-    !raw.amd_smn_regs.is_empty() || raw.amd_pm_version.is_some()
+    !raw.amd_smn_regs.is_empty()
+        || !raw.amd_smn_raw_range.is_empty()
+        || raw.amd_pm_version.is_some()
 }
 
 /// The AMD raw section of the `## Raw Registers` table: the 13 SMN DRAM
-/// register words (named by their base address) + the PM-table key values
-/// (version, blob length, and the five f32 bit patterns).
+/// register words (named by their base address) + the expanded SMN raw
+/// range (every readable word in 0x50000–0x50400, zero values filtered
+/// for readability) + the PM-table key values (version, blob length, and
+/// the five f32 bit patterns).
 fn render_amd_raw_table(out: &mut String, raw: &ProbeRaw) {
     // The 13 SMN register words, in address order.
     out.push_str("### AMD SMN Registers\n\n");
@@ -966,6 +978,30 @@ fn render_amd_raw_table(out: &mut String, raw: &ProbeRaw) {
         ));
     }
     out.push('\n');
+    // The expanded SMN raw range (the `--raw-smn` aperture): every
+    // readable, non-zero word in 0x50000–0x50400 (step 4). Zero values
+    // are filtered for readability; a full unfiltered dump is available
+    // via `ramsleuth-telemetry --raw-smn`.
+    if !raw.amd_smn_raw_range.is_empty() {
+        let non_zero: Vec<&(u32, u32)> = raw
+            .amd_smn_raw_range
+            .iter()
+            .filter(|(_, value)| *value != 0)
+            .collect();
+        out.push_str("### AMD SMN Raw Range (0x50000–0x50400, non-zero only)\n\n");
+        if non_zero.is_empty() {
+            out.push_str("(all readable registers in range were zero)\n\n");
+        } else {
+            out.push_str("| Register | Value |\n|---|---|\n");
+            for (address, value) in non_zero {
+                out.push_str(&format!(
+                    "| SMN_{:#X} | 0x{:08X} |\n",
+                    address, value
+                ));
+            }
+            out.push('\n');
+        }
+    }
     // The PM-table key values.
     out.push_str("### AMD PM Table\n\n");
     out.push_str("| Field | Value |\n|---|---|\n");
