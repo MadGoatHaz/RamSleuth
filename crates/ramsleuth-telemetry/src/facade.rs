@@ -47,8 +47,9 @@
 //! truth) over the SPD sum, which survives as the non-meminfo fallback
 //! (D-C9, D-3).
 
+use crate::amd_apob;
 use crate::amd_pm;
-use crate::amd_readout::{self, AmdReadout};
+use crate::amd_readout::{self, AmdReadout, CommandRate};
 use crate::amd_smn;
 use crate::amd_smu;
 use crate::board_vrm::{self, BoardVrmReadout, RailConfidence, VoltageTelemetry};
@@ -329,6 +330,12 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
     // P2-05 mapping to emit platform-specific N/A reasons for the known
     // PM-table and `0x50200` limitations.
     snap.threadripper = cpuid::is_threadripper(&cpu.brand);
+    // Phase 3: platform classification for APOB routing. The brand
+    // string is the primary signal (Threadripper/EPYC → Server); the
+    // CPUID PkgType (leaf 0x80000001 EBX[31:28]) is the secondary
+    // signal for ambiguous brands.
+    let pkg_type = cpuid::read_pkg_type();
+    let platform = cpuid::detect_amd_package_type(&cpu.brand, pkg_type, zen);
     // The no-panic overlay (P6-02, frozen): populates `gdm` + the 27
     // `timings` from the driver `smn` attribute when readable; never
     // fails the branch and never touches the PM-table fields.
@@ -340,7 +347,104 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
     // `absent()` state (both `Unknown`) — never failing the branch.
     let ch_regs = amd_smn::read_all_channel_registers();
     let ch = amd_smn::decode_channel_registers(&ch_regs);
-    Ok(amd_readout::map_amd_with(&snap, &ch))
+    let mut readout = amd_readout::map_amd_with(&snap, &ch);
+    // Phase 3: sIOD routing. On server/workstation I/O Die platforms
+    // (Threadripper TRX40/WRX80, EPYC SP3/SP5), the SMN UMC registers
+    // hold static JEDEC defaults (post-training values are not written
+    // back), so the APOB (AGESA Pre-Output Buffer — the firmware's
+    // trained-timing snapshot in physical RAM) is the primary source
+    // for DRAM timings. Try APOB first; if it succeeds, overlay its
+    // trained values onto the readout (replacing the Na from the
+    // unverified SMN layout). If APOB fails (driver not loaded, APOB
+    // not found, encrypted entry, etc.), the SMN-derived readout
+    // stands as-is (the existing path — honest Na on sIOD).
+    //
+    // On cIOD platforms (desktop Ryzen AM4/AM5), the SMN registers are
+    // the live source — APOB is not consulted (no behavior change).
+    if matches!(platform, cpuid::AmdPackageType::Server(_)) {
+        if let Some(apob_ch) = try_apob_timings() {
+            overlay_apob_timings(&mut readout, &apob_ch);
+        }
+    }
+    Ok(readout)
+}
+
+/// Try to read and parse APOB timings from the `ryzen_smu` sysfs
+/// interface.
+///
+/// Returns the first *active* channel's timings, or `None` if any step
+/// fails: the driver is not loaded, the APOB is not found at any
+/// candidate address, the blob fails validation, the timing entry is
+/// missing/encrypted/truncated, or no channel is active (a trained
+/// channel has a non-zero tCL; dormant channels on TRX40's 8-UMC
+/// topology are all zeros).
+///
+/// All errors are contained: a failure here never propagates past this
+/// function — the facade degrades to the SMN path (the existing
+/// behavior). Never panics.
+fn try_apob_timings() -> Option<amd_apob::ApobChannelTimings> {
+    let blob = amd_apob::read_apob_from_sysfs().ok()?;
+    let apob = amd_apob::parse_apob(&blob).ok()?;
+    let timings = amd_apob::extract_castle_peak_timings(&apob).ok()?;
+    // The first active (non-dormant) channel. TRX40 routes DIMMs to
+    // odd-indexed UMC instances and leaves channel 0 dormant with
+    // JEDEC bootstrap straps, so scan for the first channel with a
+    // non-zero tCL.
+    timings.channels.iter().find(|ch| ch.tcl != 0).copied()
+}
+
+/// Overlay APOB-sourced timing values onto the readout's timing fields.
+///
+/// Only the fields the APOB provides are overwritten; the rest (which
+/// are Na on sIOD due to the unverified SMN layout) remain unchanged.
+/// Each value is sanity-gated: a timing of 0 or above the plausible
+/// ceiling (2048 ticks) is not overlaid (the existing state stands).
+///
+/// The APOB command rate is also overlaid when it is a defined
+/// encoding (0=1T, 1=2T); it is Na on sIOD due to the unverified
+/// `0x50200` layout, so this is a pure upgrade. Reserved encodings
+/// (not 0/1) are not overlaid.
+///
+/// Pure (no I/O); never panics. This is a purely additive operation —
+/// it never degrades existing data.
+fn overlay_apob_timings(
+    readout: &mut AmdReadout,
+    ch: &amd_apob::ApobChannelTimings,
+) {
+    let t = &mut readout.timings;
+    // Helper: overlay a timing value if it is in the plausible range
+    // (the same sanity gate as `amd_readout::map_timing`).
+    let overlay = |cell: &mut Section<u16>, value: u16| {
+        if (1..=2048).contains(&value) {
+            *cell = Section::Value(value);
+        }
+    };
+    // APOB → TimingSet field mapping (explicit, per architecture doc §A.3).
+    // u8 fields need the widening conversion; u16 fields pass through.
+    overlay(&mut t.cl, u16::from(ch.tcl));
+    overlay(&mut t.rcwdwr, u16::from(ch.trcdw));
+    overlay(&mut t.rcdrd, u16::from(ch.trcdr));
+    overlay(&mut t.rp, u16::from(ch.trp));
+    overlay(&mut t.ras, ch.tras);
+    overlay(&mut t.rc, ch.trc);
+    overlay(&mut t.faw, ch.tfaw);
+    overlay(&mut t.wtrs, u16::from(ch.twtr_s));
+    overlay(&mut t.wtrl, u16::from(ch.twtr_l));
+    overlay(&mut t.wr, ch.twr);
+    overlay(&mut t.rfc1, ch.trfc_s);
+    overlay(&mut t.rfc2, ch.trfc_f);
+    overlay(&mut t.rfcsb, ch.trfc_pb);
+    overlay(&mut t.cwl, u16::from(ch.tcwl));
+    // tRTP is provided by the APOB (offset 0x17).
+    overlay(&mut t.rtp, u16::from(ch.trtp));
+    // Command rate from the APOB (overrides the Na from the unverified
+    // 0x50200 layout on sIOD). Only the two defined encodings are
+    // overlaid; reserved values leave the existing state.
+    match ch.cmd_rate {
+        0 => readout.clocks.command_rate = Section::Value(CommandRate::OneT),
+        1 => readout.clocks.command_rate = Section::Value(CommandRate::TwoT),
+        _ => {}
+    }
 }
 
 /// Intel branch: the two-source acquisition of plan §3.5 —
@@ -2152,6 +2256,287 @@ mod tests {
         assert_eq!(
             vcore_section(&amd, &Section::Value(amd_na), &BoardVrmReadout::all_na()),
             Section::na(NaReason::NotApplicable)
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (i) Phase 3: APOB routing (sIOD → APOB first, SMN fallback).
+    // ------------------------------------------------------------------
+
+    /// `try_apob_timings` is total: it never panics. On this host (no
+    /// APOB in physical RAM / no ryzen_smu driver with APOB support),
+    /// it returns `None` — the facade degrades to the SMN path. The
+    /// non-panic property is the assertion; the `None` outcome is
+    /// host-dependent and expected here.
+    #[test]
+    fn try_apob_timings_is_panic_free() {
+        // Running this to completion is the no-panic check. On a host
+        // without the APOB sysfs interface, this returns None.
+        let _ = try_apob_timings();
+    }
+
+    /// `overlay_apob_timings` maps the APOB channel timings onto the
+    /// readout's timing fields with the explicit APOB→TimingSet
+    /// mapping (architecture doc §A.3): in-range values are overlaid,
+    /// the non-APOB fields (rrds, rrld, rdwr, wrrd, rdrd_*, wrwr_*)
+    /// remain unchanged, and the command rate is overlaid for defined
+    /// encodings.
+    #[test]
+    fn overlay_apob_timings_maps_fields_correctly() {
+        // Start from a fully-Na timing set (the sIOD state after
+        // `timing_set_unverified()`).
+        let na = Section::na(NaReason::ParseError(
+            "SMN timing layout not verified".to_owned(),
+        ));
+        let mut readout = AmdReadout {
+            clocks: ClockReadout {
+                mclk_mhz: Section::Value(1600.0),
+                uclk_mhz: Section::Value(1600.0),
+                fclk_mhz: Section::Value(1600.0),
+                div_mode: Section::Value(DivMode::OneToOne),
+                gear_mode: Section::na(NaReason::NotApplicable),
+                gdm: Section::na(NaReason::ParseError("unverified".to_owned())),
+                pdm: Section::Value(false),
+                command_rate: Section::na(NaReason::ParseError("unverified".to_owned())),
+            },
+            timings: TimingSet {
+                cl: na.clone(),
+                rcwdwr: na.clone(),
+                rcdrd: na.clone(),
+                rp: na.clone(),
+                ras: na.clone(),
+                rc: na.clone(),
+                rrds: na.clone(),
+                rrld: na.clone(),
+                faw: na.clone(),
+                wtrs: na.clone(),
+                wtrl: na.clone(),
+                wr: na.clone(),
+                rfc1: na.clone(),
+                rfc2: na.clone(),
+                rfcsb: na.clone(),
+                cwl: na.clone(),
+                rtp: na.clone(),
+                rdwr: na.clone(),
+                wrrd: na.clone(),
+                rdrd_sd: na.clone(),
+                rdrd_dd: na.clone(),
+                rdrd_scl: na.clone(),
+                rdrd_sc: na.clone(),
+                wrwr_sd: na.clone(),
+                wrwr_dd: na.clone(),
+                wrwr_scl: na.clone(),
+                wrwr_sc: na.clone(),
+            },
+            cad_bus: CadBus {
+                proc_odt: Section::na(NaReason::NotApplicable),
+                rtt_nom: Section::na(NaReason::NotApplicable),
+                rtt_wr: Section::na(NaReason::NotApplicable),
+                rtt_park: Section::na(NaReason::NotApplicable),
+                clk_drv: Section::na(NaReason::NotApplicable),
+                addr_cmd_drv: Section::na(NaReason::NotApplicable),
+                cs_odt_drv: Section::na(NaReason::NotApplicable),
+                cke_drv: Section::na(NaReason::NotApplicable),
+            },
+            voltages: VoltageSet {
+                vddcr_soc_mv: Section::na(NaReason::NotApplicable),
+                vddio_mem_mv: Section::na(NaReason::NotApplicable),
+                vdd_misc_mv: Section::na(NaReason::NotApplicable),
+                vpp_mv: Section::na(NaReason::NotApplicable),
+                vcore_mv: Section::na(NaReason::NotApplicable),
+            },
+            channel_mode: MemoryChannelMode::Unknown,
+            ecc_status: EccStatus::Unknown,
+        };
+
+        // Synthetic APOB channel (Sea_Monkey's known-good DDR4-3200 CL14).
+        let apob_ch = amd_apob::ApobChannelTimings {
+            channel: 1,
+            tcl: 14,
+            trcdw: 18,
+            trcdr: 18,
+            trp: 18,
+            tras: 38,
+            trc: 56,
+            tfaw: 39,
+            twtr_s: 4,
+            twtr_l: 12,
+            twr: 24,
+            trfc_s: 312,
+            trfc_f: 192,
+            trfc_pb: 132,
+            tcwl: 18,
+            trtp: 14,
+            cmd_rate: 0, // 1T
+        };
+
+        overlay_apob_timings(&mut readout, &apob_ch);
+
+        // APOB-provided fields are now Values.
+        assert_eq!(readout.timings.cl, Section::Value(14));
+        assert_eq!(readout.timings.rcwdwr, Section::Value(18));
+        assert_eq!(readout.timings.rcdrd, Section::Value(18));
+        assert_eq!(readout.timings.rp, Section::Value(18));
+        assert_eq!(readout.timings.ras, Section::Value(38));
+        assert_eq!(readout.timings.rc, Section::Value(56));
+        assert_eq!(readout.timings.faw, Section::Value(39));
+        assert_eq!(readout.timings.wtrs, Section::Value(4));
+        assert_eq!(readout.timings.wtrl, Section::Value(12));
+        assert_eq!(readout.timings.wr, Section::Value(24));
+        assert_eq!(readout.timings.rfc1, Section::Value(312));
+        assert_eq!(readout.timings.rfc2, Section::Value(192));
+        assert_eq!(readout.timings.rfcsb, Section::Value(132));
+        assert_eq!(readout.timings.cwl, Section::Value(18));
+        assert_eq!(readout.timings.rtp, Section::Value(14));
+        // Command rate overlaid from APOB (was Na).
+        assert_eq!(readout.clocks.command_rate, Section::Value(CommandRate::OneT));
+
+        // Non-APOB fields remain Na (the sIOD unverified state).
+        assert!(readout.timings.rrds.is_na());
+        assert!(readout.timings.rrld.is_na());
+        assert!(readout.timings.rdwr.is_na());
+        assert!(readout.timings.wrrd.is_na());
+        assert!(readout.timings.rdrd_sd.is_na());
+        assert!(readout.timings.rdrd_dd.is_na());
+        assert!(readout.timings.rdrd_scl.is_na());
+        assert!(readout.timings.rdrd_sc.is_na());
+        assert!(readout.timings.wrwr_sd.is_na());
+        assert!(readout.timings.wrwr_dd.is_na());
+        assert!(readout.timings.wrwr_scl.is_na());
+        assert!(readout.timings.wrwr_sc.is_na());
+
+        // GDM is still Na (APOB does not provide it).
+        assert!(readout.clocks.gdm.is_na());
+        // Clocks are untouched.
+        assert_eq!(readout.clocks.mclk_mhz, Section::Value(1600.0));
+    }
+
+    /// `overlay_apob_timings` is a no-op for out-of-range values: a
+    /// zero or absurdly large APOB timing is not overlaid (the
+    /// existing state stands — the sanity gate matches
+    /// `amd_readout::map_timing`).
+    #[test]
+    fn overlay_apob_timings_skips_out_of_range_values() {
+        let mut readout = AmdReadout {
+            clocks: ClockReadout {
+                mclk_mhz: Section::Value(1600.0),
+                uclk_mhz: Section::Value(1600.0),
+                fclk_mhz: Section::Value(1600.0),
+                div_mode: Section::Value(DivMode::OneToOne),
+                gear_mode: Section::na(NaReason::NotApplicable),
+                gdm: Section::Value(false),
+                pdm: Section::Value(false),
+                command_rate: Section::Value(CommandRate::OneT),
+            },
+            timings: TimingSet {
+                cl: Section::Value(16), // existing in-band value
+                rcwdwr: Section::na(NaReason::NotApplicable),
+                rcdrd: Section::na(NaReason::NotApplicable),
+                rp: Section::na(NaReason::NotApplicable),
+                ras: Section::na(NaReason::NotApplicable),
+                rc: Section::na(NaReason::NotApplicable),
+                rrds: Section::na(NaReason::NotApplicable),
+                rrld: Section::na(NaReason::NotApplicable),
+                faw: Section::na(NaReason::NotApplicable),
+                wtrs: Section::na(NaReason::NotApplicable),
+                wtrl: Section::na(NaReason::NotApplicable),
+                wr: Section::na(NaReason::NotApplicable),
+                rfc1: Section::na(NaReason::NotApplicable),
+                rfc2: Section::na(NaReason::NotApplicable),
+                rfcsb: Section::na(NaReason::NotApplicable),
+                cwl: Section::na(NaReason::NotApplicable),
+                rtp: Section::na(NaReason::NotApplicable),
+                rdwr: Section::na(NaReason::NotApplicable),
+                wrrd: Section::na(NaReason::NotApplicable),
+                rdrd_sd: Section::na(NaReason::NotApplicable),
+                rdrd_dd: Section::na(NaReason::NotApplicable),
+                rdrd_scl: Section::na(NaReason::NotApplicable),
+                rdrd_sc: Section::na(NaReason::NotApplicable),
+                wrwr_sd: Section::na(NaReason::NotApplicable),
+                wrwr_dd: Section::na(NaReason::NotApplicable),
+                wrwr_scl: Section::na(NaReason::NotApplicable),
+                wrwr_sc: Section::na(NaReason::NotApplicable),
+            },
+            cad_bus: CadBus {
+                proc_odt: Section::na(NaReason::NotApplicable),
+                rtt_nom: Section::na(NaReason::NotApplicable),
+                rtt_wr: Section::na(NaReason::NotApplicable),
+                rtt_park: Section::na(NaReason::NotApplicable),
+                clk_drv: Section::na(NaReason::NotApplicable),
+                addr_cmd_drv: Section::na(NaReason::NotApplicable),
+                cs_odt_drv: Section::na(NaReason::NotApplicable),
+                cke_drv: Section::na(NaReason::NotApplicable),
+            },
+            voltages: VoltageSet {
+                vddcr_soc_mv: Section::na(NaReason::NotApplicable),
+                vddio_mem_mv: Section::na(NaReason::NotApplicable),
+                vdd_misc_mv: Section::na(NaReason::NotApplicable),
+                vpp_mv: Section::na(NaReason::NotApplicable),
+                vcore_mv: Section::na(NaReason::NotApplicable),
+            },
+            channel_mode: MemoryChannelMode::Unknown,
+            ecc_status: EccStatus::Unknown,
+        };
+
+        // APOB channel with a zero tCL (dormant) and an out-of-range
+        // tRAS — neither should be overlaid.
+        let apob_ch = amd_apob::ApobChannelTimings {
+            channel: 0,
+            tcl: 0,          // zero → skip
+            trcdw: 18,       // in-range → overlay
+            trcdr: 18,
+            trp: 18,
+            tras: 5000,      // >2048 → skip
+            trc: 56,
+            tfaw: 39,
+            twtr_s: 4,
+            twtr_l: 12,
+            twr: 24,
+            trfc_s: 312,
+            trfc_f: 192,
+            trfc_pb: 132,
+            tcwl: 18,
+            trtp: 14,
+            cmd_rate: 3,     // reserved → skip
+        };
+
+        overlay_apob_timings(&mut readout, &apob_ch);
+
+        // Zero tCL → existing Value(16) stands.
+        assert_eq!(readout.timings.cl, Section::Value(16));
+        // Out-of-range tRAS → Na stands.
+        assert!(readout.timings.ras.is_na());
+        // In-range trcdw → overlaid.
+        assert_eq!(readout.timings.rcwdwr, Section::Value(18));
+        // Reserved cmd_rate → existing OneT stands.
+        assert_eq!(readout.clocks.command_rate, Section::Value(CommandRate::OneT));
+    }
+
+    /// The `detect_amd_package_type` classification drives the APOB
+    /// routing: a Threadripper brand → Server (APOB tried), a desktop
+    /// Ryzen brand → Client (APOB not tried). This test pins the
+    /// classification itself; the routing gate is the
+    /// `matches!(platform, Server(_))` in `amd_branch`.
+    #[test]
+    fn apob_routing_classification() {
+        // Threadripper → Server (the APOB path is taken).
+        assert_eq!(
+            cpuid::detect_amd_package_type(
+                "AMD Ryzen Threadripper 3990X",
+                cpuid::PkgType::Unknown,
+                AmdZen::Zen2
+            ),
+            cpuid::AmdPackageType::Server(AmdZen::Zen2)
+        );
+        // Desktop Ryzen → Client (the SMN path only).
+        assert_eq!(
+            cpuid::detect_amd_package_type("AMD Ryzen 9 5950X", cpuid::PkgType::ClientAm4, AmdZen::Zen3),
+            cpuid::AmdPackageType::Client(AmdZen::Zen3)
+        );
+        // EPYC → Server.
+        assert_eq!(
+            cpuid::detect_amd_package_type("AMD EPYC 7742", cpuid::PkgType::Server, AmdZen::Zen2),
+            cpuid::AmdPackageType::Server(AmdZen::Zen2)
         );
     }
 }

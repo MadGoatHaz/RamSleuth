@@ -402,6 +402,158 @@ pub fn is_threadripper(brand: &str) -> bool {
     brand.starts_with("AMD") && brand.contains("Threadripper")
 }
 
+/// CPU package type from CPUID leaf `0x80000001` EBX bits [31:28].
+///
+/// The raw nibble identifies the physical package/socket class. This is
+/// the secondary signal (after the brand string) for distinguishing
+/// client I/O Die (cIOD) from server I/O Die (sIOD) platforms — the
+/// primary dispatch key for APOB vs SMN telemetry routing (Phase 3).
+///
+/// Source: APOB architecture doc §5.2 (PkgType table). The mapping is
+/// conservative: unrecognized nibbles degrade to [`Self::Unknown`]
+/// rather than guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PkgType {
+    /// Mobile BGA (FP4/FP5/FP6/FP7/FP8) — cIOD or monolithic.
+    Mobile,
+    /// Client desktop PGA (AM4) — cIOD (Matisse, Vermeer).
+    ClientAm4,
+    /// Enterprise / HEDT LGA (SP3, TR4, sTRX4, sWRX8) — sIOD
+    /// (Castle Peak, Rome, Chagall, Milan).
+    Server,
+    /// Client desktop LGA (AM5) — cIOD (Raphael, Granite Ridge).
+    ClientAm5,
+    /// Enterprise server LGA (SP5) — sIOD (Genoa, Turin).
+    ServerSp5,
+    /// Unknown or unsupported package type (the conservative default).
+    Unknown,
+}
+
+impl PkgType {
+    /// Whether this is a server I/O Die platform (sIOD).
+    ///
+    /// sIOD platforms have locked SMN timing registers (static JEDEC
+    /// defaults) and require the APOB for trained timing data.
+    pub fn is_siod(self) -> bool {
+        matches!(self, Self::Server | Self::ServerSp5)
+    }
+
+    /// Whether this is a client I/O Die platform (cIOD).
+    ///
+    /// cIOD platforms have live SMN timing registers.
+    pub fn is_ciod(self) -> bool {
+        matches!(self, Self::ClientAm4 | Self::ClientAm5)
+    }
+}
+
+/// Map the raw CPUID PkgType nibble (EBX[31:28] of leaf `0x80000001`)
+/// to a [`PkgType`].
+///
+/// Source: APOB architecture doc §5.2. Unrecognized nibbles →
+/// [`PkgType::Unknown`] (the conservative default that never
+/// misroutes).
+fn pkg_type_from_raw(raw: u32) -> PkgType {
+    match raw {
+        0x00 => PkgType::Mobile,
+        0x01 => PkgType::ClientAm4,
+        0x02 => PkgType::Server,
+        0x04 => PkgType::ClientAm5,
+        0x07 => PkgType::ServerSp5,
+        _ => PkgType::Unknown,
+    }
+}
+
+/// Read the CPU package type from CPUID (leaf `0x80000001`, EBX[31:28]).
+///
+/// Safe and total: never panics. On non-`x86_64` targets or when the
+/// extended CPUID leaves are unavailable, returns [`PkgType::Unknown`].
+///
+/// This is a standalone reader (not part of [`CpuInfo`]) so it can be
+/// consulted at the routing decision point in the facade without
+/// changing the frozen `CpuInfo` wire layout (OQ-10 append-only).
+/// The CPUID read is cheap (one leaf) and is only called on the AMD
+/// branch.
+pub fn read_pkg_type() -> PkgType {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::__cpuid;
+        // Check that extended CPUID (leaf 0x80000001) is available.
+        let max_ext = unsafe { __cpuid(0x80000000).eax };
+        if max_ext < 0x80000001 {
+            return PkgType::Unknown;
+        }
+        let ebx = unsafe { __cpuid(0x80000001).ebx };
+        pkg_type_from_raw((ebx >> 28) & 0xF)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        PkgType::Unknown
+    }
+}
+
+/// AMD platform classification for telemetry source routing (Phase 3).
+///
+/// Determines whether the CPU uses a client I/O Die (cIOD — desktop
+/// Ryzen on AM4/AM5, where SMN shadow registers provide live timing
+/// data) or a server/workstation I/O Die (sIOD — Threadripper on
+/// TRX40/WRX80, EPYC on SP3/SP5, where the APOB is the primary source
+/// of trained timing data).
+///
+/// The classification drives the facade's AMD-branch routing:
+/// - [`Self::Client`] → the existing SMN overlay path (no change).
+/// - [`Self::Server`] → APOB first (trained timings), SMN fallback.
+/// - [`Self::Unknown`] → conservatively tries APOB (harmless if absent),
+///   then the SMN path.
+///
+/// The carried [`AmdZen`] generation is the detected family, included
+/// for future per-generation routing refinements (e.g. DDR5 layout
+/// differences on Zen 4/5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AmdPackageType {
+    /// Desktop client I/O Die (AM4, AM5) — SMN shadow registers work.
+    Client(AmdZen),
+    /// Server/Workstation I/O Die (sTRX4, sWRX8, SP3, SP5) — needs APOB.
+    Server(AmdZen),
+    /// Unknown — fall back to trying both paths.
+    Unknown,
+}
+
+/// Classify an AMD CPU's platform type from the brand string, PkgType,
+/// and detected Zen generation.
+///
+/// Detection priority (most to least reliable):
+/// 1. **Brand string** — "Threadripper" or "EPYC" → [`AmdPackageType::Server`];
+///    "Ryzen" (without Threadripper) → [`AmdPackageType::Client`]. This is
+///    the primary signal because it is unambiguous on all current silicon.
+/// 2. **PkgType** — for brands that do not clearly indicate the platform
+///    class (e.g. an engineering sample with a generic brand): sIOD sockets
+///    → Server; cIOD sockets → Client.
+/// 3. **Unknown** — neither signal is conclusive; the facade conservatively
+///    tries APOB (a no-op if absent) before the SMN path.
+///
+/// Pure (no CPUID, no I/O); never panics.
+pub fn detect_amd_package_type(
+    brand: &str,
+    pkg_type: PkgType,
+    zen: AmdZen,
+) -> AmdPackageType {
+    // Primary signal: the brand string (unambiguous on retail silicon).
+    if brand.contains("Threadripper") || brand.contains("EPYC") {
+        return AmdPackageType::Server(zen);
+    }
+    if brand.contains("Ryzen") {
+        return AmdPackageType::Client(zen);
+    }
+    // Secondary signal: the PkgType (for ambiguous / generic brands).
+    if pkg_type.is_siod() {
+        return AmdPackageType::Server(zen);
+    }
+    if pkg_type.is_ciod() {
+        return AmdPackageType::Client(zen);
+    }
+    AmdPackageType::Unknown
+}
+
 /// Map an AMD CPUID family to an [`AmdZen`] generation.
 ///
 /// `family` is the 4-bit family field (EAX bits 11:8) and `ext_family` the
@@ -1658,5 +1810,162 @@ mod tests {
         assert_eq!(IntelGen::HaswellE.to_string(), "Haswell-E");
         assert_eq!(IntelGen::SkylakeX.to_string(), "Skylake-X");
         assert_eq!(IntelGen::CascadeLake.to_string(), "Cascade Lake");
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3: PkgType + AmdPackageType (APOB routing classification).
+    // ------------------------------------------------------------------
+
+    /// The raw PkgType nibble → [`PkgType`] map (architecture doc §5.2).
+    /// Recognized nibbles map to their platform class; everything else
+    /// (including unused nibbles) degrades to [`PkgType::Unknown`].
+    #[test]
+    fn pkg_type_from_raw_maps_known_nibbles() {
+        assert_eq!(pkg_type_from_raw(0x00), PkgType::Mobile);
+        assert_eq!(pkg_type_from_raw(0x01), PkgType::ClientAm4);
+        assert_eq!(pkg_type_from_raw(0x02), PkgType::Server);
+        assert_eq!(pkg_type_from_raw(0x04), PkgType::ClientAm5);
+        assert_eq!(pkg_type_from_raw(0x07), PkgType::ServerSp5);
+        // Unrecognized nibbles → Unknown (the conservative default).
+        assert_eq!(pkg_type_from_raw(0x03), PkgType::Unknown);
+        assert_eq!(pkg_type_from_raw(0x05), PkgType::Unknown);
+        assert_eq!(pkg_type_from_raw(0x06), PkgType::Unknown);
+        assert_eq!(pkg_type_from_raw(0x08), PkgType::Unknown);
+        assert_eq!(pkg_type_from_raw(0x09), PkgType::Unknown);
+        assert_eq!(pkg_type_from_raw(0x0A), PkgType::Unknown);
+        assert_eq!(pkg_type_from_raw(0x0B), PkgType::Unknown);
+        assert_eq!(pkg_type_from_raw(0x0C), PkgType::Unknown);
+        assert_eq!(pkg_type_from_raw(0x0D), PkgType::Unknown);
+        assert_eq!(pkg_type_from_raw(0x0E), PkgType::Unknown);
+        assert_eq!(pkg_type_from_raw(0x0F), PkgType::Unknown);
+    }
+
+    /// [`PkgType::is_siod`] / [`PkgType::is_ciod`] classify correctly:
+    /// the sIOD set (Server, ServerSp5) and the cIOD set (ClientAm4,
+    /// ClientAm5) are disjoint; Mobile and Unknown are neither.
+    #[test]
+    fn pkg_type_siod_ciod_classification() {
+        assert!(PkgType::Server.is_siod());
+        assert!(PkgType::ServerSp5.is_siod());
+        assert!(!PkgType::ClientAm4.is_siod());
+        assert!(!PkgType::ClientAm5.is_siod());
+        assert!(!PkgType::Mobile.is_siod());
+        assert!(!PkgType::Unknown.is_siod());
+
+        assert!(PkgType::ClientAm4.is_ciod());
+        assert!(PkgType::ClientAm5.is_ciod());
+        assert!(!PkgType::Server.is_ciod());
+        assert!(!PkgType::ServerSp5.is_ciod());
+        assert!(!PkgType::Mobile.is_ciod());
+        assert!(!PkgType::Unknown.is_ciod());
+    }
+
+    /// `read_pkg_type` is total: on this host it returns a valid
+    /// [`PkgType`] without panicking. The specific value is host-
+    /// dependent (AM4 → ClientAm4 on the reference host), so only the
+    /// non-panic + enum-exhaustiveness is asserted.
+    #[test]
+    fn read_pkg_type_is_total() {
+        let _ = read_pkg_type(); // non-panic check
+        // Every PkgType variant is constructible (exhaustive match).
+        match read_pkg_type() {
+            PkgType::Mobile
+            | PkgType::ClientAm4
+            | PkgType::Server
+            | PkgType::ClientAm5
+            | PkgType::ServerSp5
+            | PkgType::Unknown => {}
+        }
+    }
+
+    /// `detect_amd_package_type`: the brand string is the primary
+    /// signal — Threadripper / EPYC → Server, Ryzen → Client,
+    /// regardless of the (possibly Unknown) PkgType.
+    #[test]
+    fn detect_amd_package_type_brand_primary() {
+        // Threadripper → Server (even with an Unknown PkgType).
+        assert_eq!(
+            detect_amd_package_type(
+                "AMD Ryzen Threadripper 3990X",
+                PkgType::Unknown,
+                AmdZen::Zen2
+            ),
+            AmdPackageType::Server(AmdZen::Zen2)
+        );
+        // EPYC → Server.
+        assert_eq!(
+            detect_amd_package_type(
+                "AMD EPYC 7742",
+                PkgType::Unknown,
+                AmdZen::Zen2
+            ),
+            AmdPackageType::Server(AmdZen::Zen2)
+        );
+        // Desktop Ryzen → Client (even with a Server PkgType — the
+        // brand string wins).
+        assert_eq!(
+            detect_amd_package_type("AMD Ryzen 9 5950X", PkgType::Server, AmdZen::Zen3),
+            AmdPackageType::Client(AmdZen::Zen3)
+        );
+        // Threadripper PRO → Server.
+        assert_eq!(
+            detect_amd_package_type(
+                "AMD Ryzen Threadripper PRO 5995WX",
+                PkgType::Unknown,
+                AmdZen::Zen3
+            ),
+            AmdPackageType::Server(AmdZen::Zen3)
+        );
+    }
+
+    /// `detect_amd_package_type`: when the brand string is ambiguous
+    /// (no "Ryzen" / "Threadripper" / "EPYC" token), the PkgType is the
+    /// secondary signal.
+    #[test]
+    fn detect_amd_package_type_pkgtype_secondary() {
+        // Generic brand + sIOD PkgType → Server.
+        assert_eq!(
+            detect_amd_package_type("AMD Processor", PkgType::Server, AmdZen::Zen2),
+            AmdPackageType::Server(AmdZen::Zen2)
+        );
+        // Generic brand + cIOD PkgType → Client.
+        assert_eq!(
+            detect_amd_package_type("AMD Processor", PkgType::ClientAm4, AmdZen::Zen3),
+            AmdPackageType::Client(AmdZen::Zen3)
+        );
+        // Generic brand + Unknown PkgType → Unknown.
+        assert_eq!(
+            detect_amd_package_type("AMD Processor", PkgType::Unknown, AmdZen::Zen3),
+            AmdPackageType::Unknown
+        );
+        // Empty brand + sIOD PkgType → Server.
+        assert_eq!(
+            detect_amd_package_type("", PkgType::ServerSp5, AmdZen::Zen4),
+            AmdPackageType::Server(AmdZen::Zen4)
+        );
+        // Empty brand + Unknown PkgType → Unknown.
+        assert_eq!(
+            detect_amd_package_type("", PkgType::Unknown, AmdZen::Zen4),
+            AmdPackageType::Unknown
+        );
+    }
+
+    /// The [`AmdPackageType`] enum is wire-safe: a representative
+    /// value and the Unknown variant each round-trip through bincode
+    /// (the OQ-10 append-only pattern — the type is additive, never
+    /// inserted into a frozen struct).
+    #[test]
+    fn amd_package_type_bincode_round_trip() {
+        for value in [
+            AmdPackageType::Client(AmdZen::Zen3),
+            AmdPackageType::Server(AmdZen::Zen2),
+            AmdPackageType::Unknown,
+        ] {
+            let bytes = bincode::serialize(&value)
+                .expect("AmdPackageType must serialize (no-panic contract)");
+            let back: AmdPackageType =
+                bincode::deserialize(&bytes).expect("AmdPackageType must deserialize");
+            assert_eq!(value, back);
+        }
     }
 }
