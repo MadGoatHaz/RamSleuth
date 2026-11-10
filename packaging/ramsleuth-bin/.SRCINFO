@@ -1,1 +1,24 @@
-sha256sums=('5f7edf754fc960a587bdd724885c5f3d0dca2b9e5cba449f44519f074db4b82a')
+pkgbase = ramsleuth-bin
+	pkgdesc = Pure-Rust RAM latency/bandwidth telemetry: privileged daemon + unprivileged CLI/TUI/GUI clients (precompiled binary)
+	pkgver = 2.4.28
+	pkgrel = 3
+	url = https://github.com/MadGoatHaz/RamSleuth
+	install = ramsleuth-bin.install
+	arch = x86_64
+	license = MIT
+	license = GPL-2.0-only
+	depends = libx11
+	depends = libxkbcommon
+	depends = wayland
+	depends = libxrandr
+	depends = libxi
+	depends = libxcursor
+	depends = libxinerama
+	depends = mesa
+	conflicts = ramsleuth
+	conflicts = ramsleuth-intel-dkms
+	conflicts = ryzen-smu-dkms
+	source = https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.28/ramsleuth-2.4.28-x86_64.tar.zst
+	sha256sums = 5f7edf754fc960a587bdd724885c5f3d0dca2b9e5cba449f44519f074db4b82a
+
+pkgname = ramsleuth-bin

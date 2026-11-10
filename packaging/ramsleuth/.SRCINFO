@@ -1,1 +1,36 @@
-sha256sums=('26dea7a08fde646e853df95558e8bd8c39786a3be972b0e64841b8576aa908ff')
+pkgbase = ramsleuth
+	pkgdesc = Pure-Rust RAM latency/bandwidth telemetry: privileged daemon + unprivileged CLI/TUI/GUI clients
+	pkgver = 2.4.28
+	pkgrel = 3
+	url = https://github.com/MadGoatHaz/RamSleuth
+	install = ramsleuth.install
+	arch = x86_64
+	license = MIT
+	license = GPL-2.0-only
+	makedepends = rust
+	makedepends = cargo
+	makedepends = pkgconf
+	makedepends = libx11
+	makedepends = libxkbcommon
+	makedepends = wayland
+	makedepends = wayland-protocols
+	makedepends = libxrandr
+	makedepends = libxi
+	makedepends = libxcursor
+	makedepends = libxinerama
+	makedepends = mesa
+	depends = libx11
+	depends = libxkbcommon
+	depends = wayland
+	depends = libxrandr
+	depends = libxi
+	depends = libxcursor
+	depends = libxinerama
+	depends = mesa
+	conflicts = ramsleuth-bin
+	conflicts = ramsleuth-intel-dkms
+	conflicts = ryzen-smu-dkms
+	source = ramsleuth::git+https://github.com/MadGoatHaz/RamSleuth.git#commit=66a28912d25a13b548a79cf85e7fa55a32b5a4ed
+	sha256sums = 26dea7a08fde646e853df95558e8bd8c39786a3be972b0e64841b8576aa908ff
+
+pkgname = ramsleuth
