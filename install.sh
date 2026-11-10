@@ -126,7 +126,7 @@ Usage: ./install.sh [--build] [--version <ver>]
                      GitHub — no Rust toolchain, no build required
   --build            force the source-build path (installs the distro
                      build prerequisites, then cargo build --locked)
-  --version <ver>    install a specific release (e.g. 2.4.22) instead of
+  --version <ver>    install a specific release (e.g. 2.4.23) instead of
                      the latest
   -h, --help         show this help
 
@@ -138,7 +138,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --build) MODE="build" ;;
     --version)
-      [[ $# -ge 2 ]] || { usage >&2; die "--version requires a value (e.g. 2.4.22)" 2; }
+      [[ $# -ge 2 ]] || { usage >&2; die "--version requires a value (e.g. 2.4.23)" 2; }
       WANT_VERSION="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" 2 ;;
@@ -232,7 +232,7 @@ extract_zst() {
 resolve_version() {
   if [[ -n "$WANT_VERSION" ]]; then
     [[ "$WANT_VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]] \
-      || die "invalid --version '$WANT_VERSION' (expected MAJOR.MINOR.PATCH, e.g. 2.4.22)" 2
+      || die "invalid --version '$WANT_VERSION' (expected MAJOR.MINOR.PATCH, e.g. 2.4.23)" 2
     VERSION="$WANT_VERSION"
     step "version: v$VERSION (pinned by --version)"
     return 0

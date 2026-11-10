@@ -4,23 +4,14 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing four artifacts: the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`, and the Debian/Ubuntu/Mint package `ramsleuth_<ver>_amd64.deb` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project — with one deliberate exception: the `ryzen-smu-dkms` extra keeps its own `1.0` pkgver line (re-pinned per release wave via the commit pin + `pkgrel`, not version-bumped) and does not track the workspace version.
 
-## Unreleased
+## v2.4.23 (2026-11-10)
 
 ### Fixed
-- AMD Zen 4 (Raphael) misidentified as Zen 3 — CPU generation detection now uses
-  family+model (matching the Linux kernel `arch/x86/kernel/cpu/amd.c` table)
-  instead of family-only; family `0x19` spans both Zen 3 (models `0x00`–`0x0F`,
-  `0x20`–`0x5F`) and Zen 4 (models `0x10`–`0x1F`, `0x60`–`0xAF`), and family
-  `0x1A` spans Zen 5 and Zen 6. Pre-Zen family `0x15` and the non-existent
-  family `0x1C` are no longer mapped to Zen generations.
-- Ryzen 9 7000/9000 series PM table (v0x540004) not recognized — added the
-  Raphael (Zen 4) layout with its distinct field offsets (FCLK/UCLK/MCLK at
-  0x118/0x128/0x138, SVI3 rails VDD/SOC/MISC at 0x0B8/0x0CC/0x0E0), so
-  `UnknownPmTableVersion` no longer degrades the whole AMD section to N/A on
-  AM5 desktops.
-- Added `AmdZen::Zen6` variant (family `0x1A`, models `0x50`–`0x5F`,
-  `0x80`–`0xAF`, `0xC0`–`0xCF`, `0xD8`–`0xEF`); the TUI platform tag now maps
-  Zen 4/5/6 to "AMD AM5 Platform".
+- AMD Zen 4 (Raphael) and Zen 5/6 misidentified — CPU generation detection now uses family+model number (matching the Linux kernel) instead of family-only. Previously all family 0x19 CPUs were reported as Zen 3 and all 0x1A as Zen 4.
+- Ryzen 9 7000/9000 series (Raphael, PM table v0x540004) showing "N/A (new PM table)" — added the complete Raphael PM table layout: FCLK/UCLK/MCLK, SVI3 core/SOC/misc rail voltages, package power, core current, and temperature.
+
+### Added
+- Zen 6 generation detection (family 0x1A, models 0x50+)
 
 ## v2.4.22 (2026-11-09)
 
