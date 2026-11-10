@@ -100,32 +100,75 @@ pub const MATISSE_TABLE_VERSIONS: [u32; 8] = [
     0x24_00_03, 0x24_05_03, 0x24_06_03, 0x24_07_03, 0x24_08_02, 0x24_08_03, 0x24_09_02, 0x24_09_03,
 ];
 
+/// Raphael / Zen 4 (family `0x19`, model `0x60`+) accepted
+/// `TableVersionId`s. Empirically verified on a Ryzen 9 7950X (Nov 2026)
+/// and cross-referenced with the ZenStates-Core `Hardware/PowerTable.cs`
+/// offset map — the table uses a *different* field layout from Matisse /
+/// Vermeer (SVI3 rails at 0x0B8 / 0x0CC / 0x0E0, clocks at 0x118 /
+/// 0x128 / 0x138).
+pub const RAPHAEL_TABLE_VERSIONS: &[u32] = &[0x54_00_04];
+
+/// Raphael offset of the FCLK frequency (MHz) — little-endian f32.
+const RAPHAEL_FCLK_OFF: usize = 0x118;
+
+/// Raphael offset of the UCLK frequency (MHz) — little-endian f32.
+const RAPHAEL_UCLK_OFF: usize = 0x128;
+
+/// Raphael offset of the MCLK frequency (MHz) — little-endian f32.
+const RAPHAEL_MCLK_OFF: usize = 0x138;
+
+/// Raphael offset of the SVI3 VDD (Vcore) voltage (volts) — little-endian
+/// f32. The CPU core rail on AM5 / Zen 4.
+const RAPHAEL_VDDCR_VDD_OFF: usize = 0x0B8;
+
+/// Raphael offset of the SVI3 SOC voltage (volts) — little-endian f32.
+const RAPHAEL_VDDCR_SOC_OFF: usize = 0x0CC;
+
+/// Raphael offset of the SVI3 MISC voltage (volts) — little-endian f32.
+const RAPHAEL_VDDCR_MISC_OFF: usize = 0x0E0;
+
 /// One PM-table layout, keyed by AMD Zen generation (generation-first —
 /// TEL-2; mirrors [`crate::intel_gen::profile_for`]).
 ///
-/// The CPUID-detected [`crate::cpuid::AmdZen`] family is the primary
-/// dispatch; the `TableVersionId` is a per-generation plausibility filter,
-/// not a global closed allowlist. All five generations share one f32 field
-/// layout: the verified generations (Matisse / Zen 2, Vermeer / Zen 3)
-/// were confirmed on silicon, and the unverified generations (Zen 1 / 4 /
-/// 5) reuse that layout as their live decode path.
+/// The CPUID-detected [`crate::cpuid::AmdZen`] family + model is the
+/// primary dispatch; the `TableVersionId` is a per-generation plausibility
+/// filter, not a global closed allowlist. The verified generations
+/// (Matisse / Zen 2, Vermeer / Zen 3, Raphael / Zen 4) each carry their
+/// own field-offset layout; the unverified generations (Zen 1 / Zen 5 /
+/// Zen 6) reuse the Matisse / Vermeer layout as their live decode path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmLayout {
-    /// Zen 1 (family `0x15`) — no verified AM4 PM layout; the conservative
-    /// live path (unverified).
+    /// Zen 1 (family `0x17`, models `0x00`–`0x2F`, `0x50`–`0x5F`) — no
+    /// verified AM4 PM layout; the conservative live path (unverified).
     Zen1,
-    /// Matisse / Zen 2 (family `0x17`) — the 8 verified `TableVersionId`s in
-    /// [`MATISSE_TABLE_VERSIONS`]; same f32 layout as Vermeer.
+    /// Matisse / Zen 2 (family `0x17`, models `0x30`–`0x4F`,
+    /// `0x60`–`0x7F`, `0x90`–`0x91`, `0xA0`–`0xAF`) — the 8 verified
+    /// `TableVersionId`s in [`MATISSE_TABLE_VERSIONS`]; same f32 layout as
+    /// Vermeer.
     Matisse,
-    /// Vermeer / Zen 3 (family `0x19`; e.g. the Ryzen 9 5950X reference host)
-    /// — the 10 verified `TableVersionId`s in [`VERMEER_TABLE_VERSIONS`].
+    /// Vermeer / Zen 3 (family `0x19`, models `0x00`–`0x0F`,
+    /// `0x20`–`0x5F`; e.g. the Ryzen 9 5950X reference host) — the 10
+    /// verified `TableVersionId`s in [`VERMEER_TABLE_VERSIONS`].
     Vermeer,
-    /// Zen 4 (family `0x1A`) — the live decode path (unverified; the
-    /// CPUID family is the dispatch key, not a closed version set).
+    /// Raphael / Zen 4 (family `0x19`, models `0x10`–`0x1F`,
+    /// `0x60`–`0xAF`; e.g. the Ryzen 9 7950X) — the verified
+    /// `TableVersionId`s in [`RAPHAEL_TABLE_VERSIONS`] (0x540004); a
+    /// distinct field-offset layout (SVI3 rails at 0x0B8 / 0x0CC /
+    /// 0x0E0, clocks at 0x118 / 0x128 / 0x138).
+    Raphael,
+    /// Zen 4 fallback — a Zen 4 family whose `TableVersionId` is not in
+    /// [`RAPHAEL_TABLE_VERSIONS`] (e.g. an unverified Phoenix / Hawk
+    /// APU). Uses the shared Matisse / Vermeer offsets as the live decode
+    /// path.
     Zen4,
-    /// Zen 5 (family `0x1C`) — the live decode path (unverified; the
-    /// CPUID family is the dispatch key, not a closed version set).
+    /// Zen 5 (family `0x1A`, models `0x00`–`0x2F`, `0x40`–`0x4F`,
+    /// `0x60`–`0x7F`, `0xD0`–`0xD7`) — the live decode path (unverified;
+    /// the shared Matisse / Vermeer offsets).
     Zen5,
+    /// Zen 6 (family `0x1A`, models `0x50`–`0x5F`, `0x80`–`0xAF`,
+    /// `0xC0`–`0xCF`, `0xD8`–`0xEF`) — the live decode path (unverified;
+    /// the shared Matisse / Vermeer offsets).
+    Zen6,
 }
 
 impl PmLayout {
@@ -151,8 +194,19 @@ impl PmLayout {
             AmdZen::Zen1 => Self::Zen1,
             AmdZen::Zen2 => Self::Matisse,
             AmdZen::Zen3 => Self::Vermeer,
-            AmdZen::Zen4 => Self::Zen4,
+            // Zen 4: Raphael (family 0x19, model 0x60+) has a distinct
+            // verified layout (0x540004); any other Zen 4 version falls
+            // back to the shared Matisse / Vermeer offsets (the unverified
+            // live path for Phoenix / Hawk APUs).
+            AmdZen::Zen4 => {
+                if RAPHAEL_TABLE_VERSIONS.contains(&version) {
+                    Self::Raphael
+                } else {
+                    Self::Zen4
+                }
+            }
             AmdZen::Zen5 => Self::Zen5,
+            AmdZen::Zen6 => Self::Zen6,
         };
         if !layout.version_is_plausible(version) {
             return Err(TelemetryError::UnknownPmTableVersion { version });
@@ -165,11 +219,13 @@ impl PmLayout {
     /// Verified generations key on the version's major byte (bits 23:16 —
     /// the `0xXX_YY_ZZ` encodings are 24-bit, i.e. `0x00XX_YYZZ`, so the
     /// family prefix is the second byte from the top): Matisse (Zen 2) =
-    /// `0x24`; Vermeer (Zen 3) = `0x2D` / `0x38` (the prefixes of
-    /// [`MATISSE_TABLE_VERSIONS`] / [`VERMEER_TABLE_VERSIONS`]).
-    /// Unverified generations (Zen 1 / 4 / 5) accept any non-zero version
-    /// word — the CPUID family is the authoritative dispatch key, and no
-    /// closed version set is verified for them.
+    /// `0x24`; Vermeer (Zen 3) = `0x2D` / `0x38`; Raphael (Zen 4) =
+    /// `0x54` (the prefixes of [`MATISSE_TABLE_VERSIONS`] /
+    /// [`VERMEER_TABLE_VERSIONS`] / [`RAPHAEL_TABLE_VERSIONS`]).
+    /// Unverified generations (Zen 1 / Zen 4 fallback / Zen 5 / Zen 6)
+    /// accept any non-zero version word — the CPUID family is the
+    /// authoritative dispatch key, and no closed version set is verified
+    /// for them.
     fn version_is_plausible(self, version: u32) -> bool {
         if version == 0 {
             return false;
@@ -178,7 +234,8 @@ impl PmLayout {
         match self {
             Self::Matisse => major == 0x24,
             Self::Vermeer => matches!(major, 0x2D | 0x38),
-            Self::Zen1 | Self::Zen4 | Self::Zen5 => true,
+            Self::Raphael => major == 0x54,
+            Self::Zen1 | Self::Zen4 | Self::Zen5 | Self::Zen6 => true,
         }
     }
 
@@ -188,8 +245,10 @@ impl PmLayout {
             Self::Zen1 => "Zen 1",
             Self::Matisse => "Matisse (Zen 2)",
             Self::Vermeer => "Vermeer (Zen 3)",
+            Self::Raphael => "Raphael (Zen 4)",
             Self::Zen4 => "Zen 4",
             Self::Zen5 => "Zen 5",
+            Self::Zen6 => "Zen 6",
         }
     }
 }
@@ -463,11 +522,35 @@ pub fn parse(ctx: &SmuContext, zen: AmdZen) -> TelemetryResult<AmdPmSnapshot> {
         });
     }
 
-    let vddcr_vdd_v = read_f32le(pm, VDDCR_VDD_OFF)?;
-    let vddcr_soc_v = read_f32le(pm, VDDCR_SOC_OFF)?;
-    let fclk = read_f32le(pm, FCLK_OFF)?;
-    let uclk = read_f32le(pm, UCLK_OFF)?;
-    let mclk = read_f32le(pm, MCLK_OFF)?;
+    // Layout-specific field offsets: Raphael (Zen 4, 0x540004) uses a
+    // distinct offset map (SVI3 rails at 0x0B8 / 0x0CC / 0x0E0, clocks at
+    // 0x118 / 0x128 / 0x138); every other layout (Zen 1 / Matisse /
+    // Vermeer / Zen 4 fallback / Zen 5 / Zen 6) shares the original
+    // Matisse / Vermeer offsets.
+    let (vddcr_vdd_off, vddcr_soc_off, fclk_off, uclk_off, mclk_off) = match layout {
+        PmLayout::Raphael => (
+            RAPHAEL_VDDCR_VDD_OFF,
+            RAPHAEL_VDDCR_SOC_OFF,
+            RAPHAEL_FCLK_OFF,
+            RAPHAEL_UCLK_OFF,
+            RAPHAEL_MCLK_OFF,
+        ),
+        _ => (VDDCR_VDD_OFF, VDDCR_SOC_OFF, FCLK_OFF, UCLK_OFF, MCLK_OFF),
+    };
+
+    // Raphael additionally exposes a SVI3 MISC rail (0x0E0); the shared
+    // layout does not carry this field.
+    let vdd_misc_v = if matches!(layout, PmLayout::Raphael) {
+        read_f32le(pm, RAPHAEL_VDDCR_MISC_OFF)?
+    } else {
+        0.0
+    };
+
+    let vddcr_vdd_v = read_f32le(pm, vddcr_vdd_off)?;
+    let vddcr_soc_v = read_f32le(pm, vddcr_soc_off)?;
+    let fclk = read_f32le(pm, fclk_off)?;
+    let uclk = read_f32le(pm, uclk_off)?;
+    let mclk = read_f32le(pm, mclk_off)?;
 
     Ok(AmdPmSnapshot {
         version: ctx.version,
@@ -537,12 +620,16 @@ pub fn parse(ctx: &SmuContext, zen: AmdZen) -> TelemetryResult<AmdPmSnapshot> {
         },
         voltages: AmdPmVoltages {
             vddcr_soc_mv: to_u16(vddcr_soc_v * 1000.0),
-            // VDDIO_MEM / VDD_MISC / VPP are not present in this table:
-            // `0` mV degrades to an honest Na under the P2-05 voltage gate.
+            // VDDIO_MEM / VPP are not present in this table: `0` mV
+            // degrades to an honest Na under the P2-05 voltage gate.
             vddio_mem_mv: 0,
-            vdd_misc_mv: 0,
+            // VDD_MISC is present only in the Raphael layout (SVI3 MISC
+            // rail at 0x0E0); in the shared layout it stays `0` → honest
+            // Na.
+            vdd_misc_mv: to_u16(vdd_misc_v * 1000.0),
             vpp_mv: 0,
-            // Vcore (VDDCR_VDD, 0x0A0) is in the table: non-finite /
+            // Vcore (VDDCR_VDD) is in the table at layout-specific
+            // offsets: 0x0A0 (shared) or 0x0B8 (Raphael); non-finite /
             // negative readings degrade to `0` mV → honest Na under the
             // P2-05 voltage gate (no new failure mode).
             vcore_mv: to_u16(vddcr_vdd_v * 1000.0),
@@ -753,8 +840,8 @@ mod tests {
     }
 
     /// (TC-TEL2) The unverified generations reach a **live** decode path —
-    /// the closed-allowlist bug they used to hit is gone. A Zen 4 (`0x1A`) /
-    /// Zen 5 (`0x1C`) / Zen 1 (`0x15`) family with a representative
+    /// the closed-allowlist bug they used to hit is gone. A Zen 4
+    /// (non-Raphael) / Zen 5 / Zen 6 / Zen 1 family with a representative
     /// `TableVersionId` (a major prefix that is in NO verified set, so the
     /// old `from_version` returned `UnknownPmTableVersion` → whole-section
     /// N/A) now resolves to its live [`PmLayout`], and the full [`parse`]
@@ -771,6 +858,10 @@ mod tests {
             Ok(PmLayout::Zen5),
         );
         assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen6, 0x43_00_01),
+            Ok(PmLayout::Zen6),
+        );
+        assert_eq!(
             PmLayout::from_zen(AmdZen::Zen1, 0x18_00_01),
             Ok(PmLayout::Zen1),
         );
@@ -781,19 +872,97 @@ mod tests {
             PmLayout::from_zen(AmdZen::Zen5, 0x99_00_00),
             Ok(PmLayout::Zen5),
         );
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen6, 0x99_00_00),
+            Ok(PmLayout::Zen6),
+        );
 
-        // End to end: a Zen 4 / Zen 5 `SmuContext` parses to a live
-        // snapshot (not `UnknownPmTableVersion`).
-        for (zen, version) in [(AmdZen::Zen4, 0x40_00_01), (AmdZen::Zen5, 0x42_00_01)] {
+        // End to end: a Zen 4 (fallback) / Zen 5 / Zen 6 `SmuContext`
+        // parses to a live snapshot (not `UnknownPmTableVersion`).
+        for (zen, version) in [
+            (AmdZen::Zen4, 0x40_00_01),
+            (AmdZen::Zen5, 0x42_00_01),
+            (AmdZen::Zen6, 0x43_00_01),
+        ] {
             let ctx = SmuContext {
                 version,
                 pm: Some(synthetic_blob(1800.0, 1800.0, 1800.0, 1.05, 1.35)),
             };
-            let snap = parse(&ctx, zen).expect("Zen 4/5 must reach a live decode (TEL-2)");
+            let snap = parse(&ctx, zen).expect("Zen 4/5/6 must reach a live decode (TEL-2)");
             assert_eq!(snap.version, version);
             assert_eq!(snap.mclk_mhz, 1800);
             assert_eq!(snap.voltages.vcore_mv, 1350);
         }
+    }
+
+    /// The Raphael (Zen 4, 0x540004) layout: a distinct field-offset map
+    /// (SVI3 rails at 0x0B8 / 0x0CC / 0x0E0, clocks at 0x118 / 0x128 /
+    /// 0x138). `from_zen` routes Zen 4 + 0x540004 to [`PmLayout::Raphael`]
+    /// (not the shared-layout fallback), and [`parse`] reads the
+    /// Raphael-specific offsets.
+    #[test]
+    fn raphael_layout_dispatch_and_parse() {
+        // `from_zen`: Zen 4 + Raphael version → Raphael layout.
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen4, 0x54_00_04),
+            Ok(PmLayout::Raphael),
+            "Zen 4 + 0x540004 → Raphael"
+        );
+        // `from_zen`: Zen 4 + non-Raphael version → shared-layout fallback.
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen4, 0x40_00_01),
+            Ok(PmLayout::Zen4),
+            "Zen 4 + other version → Zen4 fallback"
+        );
+
+        // End to end: a Raphael `SmuContext` parses using the Raphael
+        // offsets. Build a blob with known values at the Raphael offsets.
+        let mut blob = vec![0u8; MIN_LEN];
+        write_f32le(&mut blob, RAPHAEL_FCLK_OFF, 2000.0);
+        write_f32le(&mut blob, RAPHAEL_UCLK_OFF, 3000.0);
+        write_f32le(&mut blob, RAPHAEL_MCLK_OFF, 3000.0);
+        write_f32le(&mut blob, RAPHAEL_VDDCR_VDD_OFF, 1.15);
+        write_f32le(&mut blob, RAPHAEL_VDDCR_SOC_OFF, 0.95);
+        write_f32le(&mut blob, RAPHAEL_VDDCR_MISC_OFF, 1.80);
+        let ctx = SmuContext {
+            version: 0x54_00_04,
+            pm: Some(blob),
+        };
+        let snap = parse(&ctx, AmdZen::Zen4).expect("Raphael must parse");
+        assert_eq!(snap.version, 0x54_00_04);
+        assert_eq!(snap.fclk_mhz, 2000);
+        assert_eq!(snap.uclk_mhz, 3000);
+        assert_eq!(snap.mclk_mhz, 3000);
+        // UCLK == MCLK → 1:1 div mode.
+        assert_eq!(snap.div_mode, 0);
+        // Voltages (volts → mV).
+        assert_eq!(snap.voltages.vcore_mv, 1150);
+        assert_eq!(snap.voltages.vddcr_soc_mv, 950);
+        assert_eq!(snap.voltages.vdd_misc_mv, 1800);
+        // VDDIO_MEM / VPP are not in the table → 0.
+        assert_eq!(snap.voltages.vddio_mem_mv, 0);
+        assert_eq!(snap.voltages.vpp_mv, 0);
+    }
+
+    /// The Raphael layout with UCLK ≠ MCLK derives the 1:2 div mode.
+    #[test]
+    fn raphael_div_mode_1to2() {
+        let mut blob = vec![0u8; MIN_LEN];
+        write_f32le(&mut blob, RAPHAEL_FCLK_OFF, 2000.0);
+        write_f32le(&mut blob, RAPHAEL_UCLK_OFF, 1500.0);
+        write_f32le(&mut blob, RAPHAEL_MCLK_OFF, 3000.0);
+        write_f32le(&mut blob, RAPHAEL_VDDCR_VDD_OFF, 1.15);
+        write_f32le(&mut blob, RAPHAEL_VDDCR_SOC_OFF, 0.95);
+        write_f32le(&mut blob, RAPHAEL_VDDCR_MISC_OFF, 1.80);
+        let ctx = SmuContext {
+            version: 0x54_00_04,
+            pm: Some(blob),
+        };
+        let snap = parse(&ctx, AmdZen::Zen4).expect("Raphael must parse");
+        // UCLK (1500) != MCLK (3000) → 1:2 div mode.
+        assert_eq!(snap.div_mode, 1);
+        assert_eq!(snap.uclk_mhz, 1500);
+        assert_eq!(snap.mclk_mhz, 3000);
     }
 
     /// (c) A zero `TableVersionId` — the "no version published" sentinel
@@ -807,6 +976,7 @@ mod tests {
             AmdZen::Zen3,
             AmdZen::Zen4,
             AmdZen::Zen5,
+            AmdZen::Zen6,
         ] {
             assert_eq!(
                 PmLayout::from_zen(zen, 0x0000_0000),

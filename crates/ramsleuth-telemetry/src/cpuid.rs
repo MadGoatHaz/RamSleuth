@@ -20,20 +20,35 @@
 
 /// AMD Zen microarchitecture generation.
 ///
-/// Keyed by the CPUID family observed on real Zen silicon (the reference test
-/// host, a Ryzen 9 5950X / Zen 3, reports family `0x19`).
+/// Keyed by the CPUID family + model (the reference test host, a Ryzen 9
+/// 5950X / Zen 3, reports family `0x19`, model `0x21`). The family alone is
+/// ambiguous: family `0x17` spans Zen 1 *and* Zen 2, family `0x19` spans Zen
+/// 3 *and* Zen 4, and family `0x1A` spans Zen 5 *and* Zen 6 — the model
+/// number disambiguates within each family (Linux kernel
+/// `arch/x86/kernel/cpu/amd.c`, "Figure out Zen generations", v7.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AmdZen {
-    /// Zen 1 (family `0x15`).
+    /// Zen 1 (family `0x17`, models `0x00`–`0x2F`, `0x50`–`0x5F`).
     Zen1,
-    /// Zen 2 (family `0x17`).
+    /// Zen 2 (family `0x17`, models `0x30`–`0x4F`, `0x60`–`0x7F`,
+    /// `0x90`–`0x91`, `0xA0`–`0xAF`).
     Zen2,
-    /// Zen 3 (family `0x19`) — e.g. the Ryzen 9 5950X reference host.
+    /// Zen 3 (family `0x19`, models `0x00`–`0x0F`, `0x20`–`0x5F`) — e.g.
+    /// the Ryzen 9 5950X reference host (family `0x19`, model `0x21`).
     Zen3,
-    /// Zen 4 (family `0x1A`).
+    /// Zen 4 (family `0x19`, models `0x10`–`0x1F`, `0x60`–`0xAF`) — e.g.
+    /// Raphael (family `0x19`, model `0x61`).
     Zen4,
-    /// Zen 5 (family `0x1C`).
+    /// Zen 5 (family `0x1A`, models `0x00`–`0x2F`, `0x40`–`0x4F`,
+    /// `0x60`–`0x7F`, `0xD0`–`0xD7`) — e.g. Granite Ridge (family `0x1A`,
+    /// model `0x44`).
     Zen5,
+    /// Zen 6 (family `0x1A`, models `0x50`–`0x5F`, `0x80`–`0xAF`,
+    /// `0xC0`–`0xCF`, `0xD8`–`0xEF`).
+    ///
+    /// Appended after [`Self::Zen5`] so the existing variant indices (and
+    /// the frozen wire encoding) are preserved.
+    Zen6,
 }
 
 /// The stable, human-readable name of an AMD Zen generation (DAEMON-2):
@@ -50,6 +65,7 @@ impl std::fmt::Display for AmdZen {
             Self::Zen3 => "Zen 3",
             Self::Zen4 => "Zen 4",
             Self::Zen5 => "Zen 5",
+            Self::Zen6 => "Zen 6",
         };
         f.write_str(name)
     }
@@ -285,9 +301,30 @@ fn detect_x86() -> CpuInfo {
         VendorKind::Amd => {
             let zen = if max_ext >= 0x80000001 {
                 let eax = unsafe { __cpuid(0x80000001).eax };
-                // Kernel-compatible family decode: 4-bit field + 8-bit
-                // extension (bits 27:20) once the field saturates at 0xF.
-                amd_zen_from_family((eax >> 8) & 0xF, (eax >> 20) & 0xFF)
+                // AMD family decode: the 4-bit base field (bits 11:8) + the
+                // 8-bit extension (bits 27:20) once the field saturates at
+                // 0xF. For the AMD Zen families (0x17–0x1A) the extension is
+                // added directly (no shift), matching the encoding observed
+                // on real silicon (e.g. 5950X: base 0xF + ext 0xA = 0x19).
+                let base_family = (eax >> 8) & 0xF;
+                let ext_family = (eax >> 20) & 0xFF;
+                let family = if base_family >= 0xF {
+                    base_family + ext_family
+                } else {
+                    base_family
+                };
+                // AMD model decode: the 4-bit base field (bits 7:4) + the
+                // 4-bit extension (bits 19:16, shifted) when the family is
+                // extended — the standard kernel formula
+                // (`arch/x86/kernel/cpu/amd.c`).
+                let base_model = (eax >> 4) & 0xF;
+                let ext_model = (eax >> 16) & 0xF;
+                let model = if base_family >= 0xF {
+                    base_model + (ext_model << 4)
+                } else {
+                    base_model
+                };
+                amd_zen_from_family_model(family, model)
             } else {
                 None
             };
@@ -550,26 +587,73 @@ pub fn detect_amd_package_type(brand: &str, pkg_type: PkgType, zen: AmdZen) -> A
     AmdPackageType::Unknown
 }
 
-/// Map an AMD CPUID family to an [`AmdZen`] generation.
+/// Map an AMD CPUID family + model to an [`AmdZen`] generation.
 ///
-/// `family` is the 4-bit family field (EAX bits 11:8) and `ext_family` the
-/// 8-bit extension (EAX bits 27:20) from leaf `0x80000001`. The full family
-/// is `family + ext_family` when `family == 0xF`, else `family`.
+/// `family` is the full CPUID family (bits 11:8 + bits 27:20 when the
+/// 4-bit field saturates at `0xF`) and `model` is the full CPUID model
+/// (bits 7:4 + bits 19:16) from leaf `0x80000001`.
 ///
-/// Family map: `0x15`→Zen 1, `0x17`→Zen 2, `0x19`→Zen 3 (5950X),
-/// `0x1A`→Zen 4, `0x1C`→Zen 5; anything else is `None`.
-fn amd_zen_from_family(family: u32, ext_family: u32) -> Option<AmdZen> {
-    let full = if family < 0xF {
-        family
-    } else {
-        family + (ext_family & 0xFF)
-    };
-    match full {
-        0x15 => Some(AmdZen::Zen1),
-        0x17 => Some(AmdZen::Zen2),
-        0x19 => Some(AmdZen::Zen3),
-        0x1A => Some(AmdZen::Zen4),
-        0x1C => Some(AmdZen::Zen5),
+/// The family alone is ambiguous — family `0x17` spans Zen 1 *and* Zen 2,
+/// family `0x19` spans Zen 3 *and* Zen 4, and family `0x1A` spans Zen 5
+/// *and* Zen 6 — so the model number is required to disambiguate. The
+/// mapping mirrors the Linux kernel's "Figure out Zen generations" table
+/// (`arch/x86/kernel/cpu/amd.c`, v7.3, lines 480–531):
+///
+/// | Family | Models                           | Generation |
+/// |--------|----------------------------------|------------|
+/// | `0x17` | `0x00`–`0x2F`, `0x50`–`0x5F`     | Zen 1      |
+/// | `0x17` | `0x30`–`0x4F`, `0x60`–`0x7F`,    |            |
+/// |        | `0x90`–`0x91`, `0xA0`–`0xAF`     | Zen 2      |
+/// | `0x19` | `0x00`–`0x0F`, `0x20`–`0x5F`     | Zen 3      |
+/// | `0x19` | `0x10`–`0x1F`, `0x60`–`0xAF`     | Zen 4      |
+/// | `0x1A` | `0x00`–`0x2F`, `0x40`–`0x4F`,    |            |
+/// |        | `0x60`–`0x7F`, `0xD0`–`0xD7`     | Zen 5      |
+/// | `0x1A` | `0x50`–`0x5F`, `0x80`–`0xAF`,    |            |
+/// |        | `0xC0`–`0xCF`, `0xD8`–`0xEF`     | Zen 6      |
+///
+/// Anything else is `None` (pre-Zen families like `0x15` are not Zen; the
+/// kernel has no family `0x1C`).
+fn amd_zen_from_family_model(family: u32, model: u32) -> Option<AmdZen> {
+    match family {
+        0x17 => {
+            if (0x00..=0x2F).contains(&model) || (0x50..=0x5F).contains(&model) {
+                Some(AmdZen::Zen1)
+            } else if (0x30..=0x4F).contains(&model)
+                || (0x60..=0x7F).contains(&model)
+                || (0x90..=0x91).contains(&model)
+                || (0xA0..=0xAF).contains(&model)
+            {
+                Some(AmdZen::Zen2)
+            } else {
+                None
+            }
+        }
+        0x19 => {
+            if (0x00..=0x0F).contains(&model) || (0x20..=0x5F).contains(&model) {
+                Some(AmdZen::Zen3)
+            } else if (0x10..=0x1F).contains(&model) || (0x60..=0xAF).contains(&model) {
+                Some(AmdZen::Zen4)
+            } else {
+                None
+            }
+        }
+        0x1A => {
+            if (0x00..=0x2F).contains(&model)
+                || (0x40..=0x4F).contains(&model)
+                || (0x60..=0x7F).contains(&model)
+                || (0xD0..=0xD7).contains(&model)
+            {
+                Some(AmdZen::Zen5)
+            } else if (0x50..=0x5F).contains(&model)
+                || (0x80..=0xAF).contains(&model)
+                || (0xC0..=0xCF).contains(&model)
+                || (0xD8..=0xEF).contains(&model)
+            {
+                Some(AmdZen::Zen6)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -1075,15 +1159,6 @@ pub fn intel_gen_from_brand(brand: &str, model: u32) -> Option<IntelGen> {
 mod tests {
     use super::*;
 
-    /// Build the `(family_field, ext_family)` pair that decodes to `full`.
-    fn fam_args(full: u32) -> (u32, u32) {
-        if full < 0xF {
-            (full, 0)
-        } else {
-            (0xF, (full - 0xF) & 0xFF)
-        }
-    }
-
     /// Split a 12-char vendor string into the `(bx, cx, dx)` u32 words.
     fn vendor_words(s: &str) -> (u32, u32, u32) {
         let b = s.as_bytes();
@@ -1114,23 +1189,203 @@ mod tests {
         }
     }
 
-    /// (b) The pure AMD family → [`AmdZen`] map, exercised with synthetic
-    /// families (keyed by the family the hardware actually reports).
+    /// (b) The pure AMD family+model → [`AmdZen`] map (Linux kernel
+    /// `arch/x86/kernel/cpu/amd.c` v7.3, "Figure out Zen generations").
+    ///
+    /// The family alone is ambiguous (0x17 spans Zen 1/2, 0x19 spans Zen
+    /// 3/4, 0x1A spans Zen 5/6); the model disambiguates. Key test cases:
+    /// - 0x19/0x21 → Zen 3 (Vermeer — the reference host)
+    /// - 0x19/0x61 → Zen 4 (Raphael — the 7000-series fix)
+    /// - 0x1A/0x44 → Zen 5 (Granite Ridge)
+    /// - 0x17/0x98 → Zen 2 (Matisse)
     #[test]
-    fn amd_zen_family_map() {
-        let zen = |full: u32| {
-            let (f, e) = fam_args(full);
-            amd_zen_from_family(f, e)
-        };
-        assert_eq!(zen(0x15), Some(AmdZen::Zen1));
-        assert_eq!(zen(0x17), Some(AmdZen::Zen2));
-        assert_eq!(zen(0x19), Some(AmdZen::Zen3));
-        assert_eq!(zen(0x1A), Some(AmdZen::Zen4));
-        assert_eq!(zen(0x1C), Some(AmdZen::Zen5));
-        // Unrecognized families (incl. the clean-numbering gaps) map to None.
-        assert_eq!(zen(0x16), None);
-        assert_eq!(zen(0x18), None);
-        assert_eq!(zen(0x06), None); // legacy (non-Zen)
+    fn amd_zen_family_model_map() {
+        // Zen 1 (family 0x17, models 0x00–0x2F, 0x50–0x5F).
+        assert_eq!(
+            amd_zen_from_family_model(0x17, 0x00),
+            Some(AmdZen::Zen1),
+            "0x17/0x00 → Zen 1"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x17, 0x18),
+            Some(AmdZen::Zen1),
+            "0x17/0x18 (Summit Ridge) → Zen 1"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x17, 0x50),
+            Some(AmdZen::Zen1),
+            "0x17/0x50 → Zen 1"
+        );
+
+        // Zen 2 (family 0x17, models 0x30–0x4F, 0x60–0x7F, 0x90–0x91,
+        // 0xA0–0xAF).
+        assert_eq!(
+            amd_zen_from_family_model(0x17, 0x30),
+            Some(AmdZen::Zen2),
+            "0x17/0x30 (Rome/Castle Peak) → Zen 2"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x17, 0x71),
+            Some(AmdZen::Zen2),
+            "0x17/0x71 (Matisse) → Zen 2"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x17, 0x31),
+            Some(AmdZen::Zen2),
+            "0x17/0x31 (Rome / Castle Peak) → Zen 2"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x17, 0x90),
+            Some(AmdZen::Zen2),
+            "0x17/0x90 → Zen 2"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x17, 0x91),
+            Some(AmdZen::Zen2),
+            "0x17/0x91 → Zen 2"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x17, 0xA0),
+            Some(AmdZen::Zen2),
+            "0x17/0xA0 → Zen 2"
+        );
+
+        // Zen 3 (family 0x19, models 0x00–0x0F, 0x20–0x5F).
+        assert_eq!(
+            amd_zen_from_family_model(0x19, 0x01),
+            Some(AmdZen::Zen3),
+            "0x19/0x01 (Milan) → Zen 3"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x19, 0x21),
+            Some(AmdZen::Zen3),
+            "0x19/0x21 (Vermeer / 5950X) → Zen 3"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x19, 0x50),
+            Some(AmdZen::Zen3),
+            "0x19/0x50 (Cezanne) → Zen 3"
+        );
+
+        // Zen 4 (family 0x19, models 0x10–0x1F, 0x60–0xAF).
+        assert_eq!(
+            amd_zen_from_family_model(0x19, 0x11),
+            Some(AmdZen::Zen4),
+            "0x19/0x11 (Genoa) → Zen 4"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x19, 0x60),
+            Some(AmdZen::Zen4),
+            "0x19/0x60 → Zen 4"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x19, 0x61),
+            Some(AmdZen::Zen4),
+            "0x19/0x61 (Raphael / 7950X) → Zen 4"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x19, 0x71),
+            Some(AmdZen::Zen4),
+            "0x19/0x71 (Barcelo) → Zen 4"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x19, 0x74),
+            Some(AmdZen::Zen4),
+            "0x19/0x74 (Phoenix) → Zen 4"
+        );
+
+        // Zen 5 (family 0x1A, models 0x00–0x2F, 0x40–0x4F, 0x60–0x7F,
+        // 0xD0–0xD7).
+        assert_eq!(
+            amd_zen_from_family_model(0x1A, 0x00),
+            Some(AmdZen::Zen5),
+            "0x1A/0x00 → Zen 5"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x1A, 0x20),
+            Some(AmdZen::Zen5),
+            "0x1A/0x20 (Turin) → Zen 5"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x1A, 0x24),
+            Some(AmdZen::Zen5),
+            "0x1A/0x24 (Strix Point) → Zen 5"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x1A, 0x44),
+            Some(AmdZen::Zen5),
+            "0x1A/0x44 (Granite Ridge / 9950X) → Zen 5"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x1A, 0x60),
+            Some(AmdZen::Zen5),
+            "0x1A/0x60 → Zen 5"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x1A, 0xD0),
+            Some(AmdZen::Zen5),
+            "0x1A/0xD0 → Zen 5"
+        );
+
+        // Zen 6 (family 0x1A, models 0x50–0x5F, 0x80–0xAF, 0xC0–0xCF,
+        // 0xD8–0xEF).
+        assert_eq!(
+            amd_zen_from_family_model(0x1A, 0x50),
+            Some(AmdZen::Zen6),
+            "0x1A/0x50 → Zen 6"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x1A, 0x80),
+            Some(AmdZen::Zen6),
+            "0x1A/0x80 → Zen 6"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x1A, 0xC0),
+            Some(AmdZen::Zen6),
+            "0x1A/0xC0 → Zen 6"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x1A, 0xD8),
+            Some(AmdZen::Zen6),
+            "0x1A/0xD8 → Zen 6"
+        );
+
+        // Unrecognized families (pre-Zen 0x15, gaps, and the kernel's
+        // non-existent 0x1C) map to None.
+        assert_eq!(
+            amd_zen_from_family_model(0x15, 0x00),
+            None,
+            "0x15 (pre-Zen) → None"
+        );
+        assert_eq!(amd_zen_from_family_model(0x16, 0x00), None, "0x16 → None");
+        assert_eq!(amd_zen_from_family_model(0x18, 0x00), None, "0x18 → None");
+        assert_eq!(
+            amd_zen_from_family_model(0x1C, 0x00),
+            None,
+            "0x1C (kernel: no such family) → None"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x06, 0x00),
+            None,
+            "0x06 (legacy) → None"
+        );
+
+        // Out-of-range models within a known family map to None.
+        assert_eq!(
+            amd_zen_from_family_model(0x17, 0x80),
+            None,
+            "0x17/0x80 → None"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x19, 0xB0),
+            None,
+            "0x19/0xB0 → None"
+        );
+        assert_eq!(
+            amd_zen_from_family_model(0x1A, 0xF0),
+            None,
+            "0x1A/0xF0 → None"
+        );
     }
 
     /// (c) The pure vendor-string helper maps the three leaf-0 u32 words.

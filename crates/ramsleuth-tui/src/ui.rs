@@ -753,7 +753,9 @@ fn platform_tag(vendor: Option<&CpuVendor>) -> String {
         Some(CpuVendor::Amd(AmdZen::Zen1 | AmdZen::Zen2 | AmdZen::Zen3)) => {
             "AMD AM4 Platform".to_owned()
         }
-        Some(CpuVendor::Amd(AmdZen::Zen4 | AmdZen::Zen5)) => "AMD AM5 Platform".to_owned(),
+        Some(CpuVendor::Amd(AmdZen::Zen4 | AmdZen::Zen5 | AmdZen::Zen6)) => {
+            "AMD AM5 Platform".to_owned()
+        }
         Some(CpuVendor::Intel(_)) => "Intel LGA Platform".to_owned(),
         _ => "Platform".to_owned(),
     }

@@ -3062,6 +3062,7 @@ mod tests {
             AmdZen::Zen3,
             AmdZen::Zen4,
             AmdZen::Zen5,
+            AmdZen::Zen6,
         ] {
             assert_eq!(platform_badge(&CpuVendor::Amd(zen)), "AMD");
         }
