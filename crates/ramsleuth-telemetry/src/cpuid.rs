@@ -2243,7 +2243,7 @@ mod tests {
 
     /// (QA) Boundary sweep of the family 0x1A (Zen 5 / Zen 6) model table.
     #[test]
-    fn test_zen_detection_family_0x1A_boundaries() {
+    fn test_zen_detection_family_0x1a_boundaries() {
         // Zen 5: 0x00-0x2F, 0x40-0x4F, 0x60-0x7F, 0xD0-0xD7.
         assert_eq!(amd_zen_from_family_model(0x1A, 0x00), Some(AmdZen::Zen5));
         assert_eq!(amd_zen_from_family_model(0x1A, 0x2F), Some(AmdZen::Zen5));
