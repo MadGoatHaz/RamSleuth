@@ -1213,12 +1213,8 @@ mod tests {
     /// - 3 u16 tRFC values
     ///
     /// The stride between blocks is `stride`.
-    type Ddr4BlockFields =
-        (u16, u8, u8, u8, u8, u16, u16, u8, u8, u8, u8, u8, u16, u16);
-    fn build_ddr4_timing_payload(
-        blocks: &[Ddr4BlockFields],
-        stride: usize,
-    ) -> Vec<u8> {
+    type Ddr4BlockFields = (u16, u8, u8, u8, u8, u16, u16, u8, u8, u8, u8, u8, u16, u16);
+    fn build_ddr4_timing_payload(blocks: &[Ddr4BlockFields], stride: usize) -> Vec<u8> {
         // blocks: (memclk, cl, cwl, rcw, rp, ras, rc, wr, rrds, wtrs, faw, rrld, trfc_s, trfc_f)
         let mut data = Vec::new();
         for (memclk, cl, cwl, rcw, rp, ras, rc, wr, rrds, wtrs, faw, rrld, trfc_s, trfc_f) in blocks
