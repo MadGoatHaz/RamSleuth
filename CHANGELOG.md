@@ -4,6 +4,24 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing four artifacts: the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`, and the Debian/Ubuntu/Mint package `ramsleuth_<ver>_amd64.deb` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project — with one deliberate exception: the `ryzen-smu-dkms` extra keeps its own `1.0` pkgver line (re-pinned per release wave via the commit pin + `pkgrel`, not version-bumped) and does not track the workspace version.
 
+## v2.4.26 (2026-11-10)
+
+### Added
+- AGESA firmware version detection via SMBIOS Type 40 (Additional Information), per DMTF DSP0134. Displays the full AGESA string (e.g., "AGESA!V9 ComboAm5PI 1.2.8.0") in the Platform section.
+- APOB (AGESA Pre-Output Buffer) is now a primary data source for platforms where it's available.
+
+### Fixed
+- APOB parser completely rewritten with the correct binary format (48-byte chained entry headers, variable-size header with OffsetOfFirstEntry, Group 7 Type 3 timing location). The previous parser used an incorrect 12-byte entry format and would not parse real APOB tables.
+- APOB kernel module: removed incorrect 12–64 byte header size validation (real headers are ~168 bytes); now uses AMD's openSIL validation rules (version ≥ 5, valid OffsetOfFirstEntry).
+- APOB kernel module: no longer ioremaps System RAM candidates (which triggered kernel warnings and could panic on panic_on_warn=1 systems). Candidates in System RAM are now skipped.
+- APOB parser version gate: accepts version ≥ 5 (was restricted to 1 or 2; real tables are version 0x18).
+- Ryzen 9 7000/9000 (Zen 4 Raphael) PM table support and correct generation detection (from v2.4.23).
+- Threadripper/TRX40 (Castle Peak) generation detection (from v2.4.24).
+
+### Notes
+- On Threadripper/TRX40 (sIOD) platforms, DRAM timing readout via APOB is now functional pending hardware validation.
+- On desktop (cIOD) platforms, SMN register timing readout continues to work as before; APOB provides additional data (SPD copies, event logs) where available.
+
 ## v2.4.25 (2026-11-10)
 
 ### Fixed
