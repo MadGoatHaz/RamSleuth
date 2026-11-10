@@ -134,32 +134,31 @@ const DDR4_MEMCLK_MIN: u16 = 400;
 /// Maximum plausible DDR4 memory clock (MHz) for scan validation.
 const DDR4_MEMCLK_MAX: u16 = 2400;
 
-/// APOB format versions (source: research doc §1.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApobVersion {
-    /// Legacy format (pre-Zen).
-    V1,
-    /// Modern Zen format (Zen 1+).
-    V2,
-}
+/// Minimum supported APOB format version.
+///
+/// Versions 5+ use the modern chained 48-byte entry format. Versions
+/// 1-4 are legacy (pre-chained-entry format) and not supported by this
+/// parser. Source: AMD openSIL xUSL/Apob.c.
+pub const APOB_MIN_VERSION: u32 = 5;
 
 /// A parsed APOB header (variable size).
 ///
-/// The header size is given by `header_size` (the offset of the first
-/// entry). The region from `APOB_HEADER_FIXED_SIZE` (0x30) to
-/// `header_size - APOB_HEADER_HMAC_SIZE` (32) contains the Config Offset
-/// List — an array of u32 offsets to additional entry chains. The last
-/// 32 bytes of the header are an HMAC (ignored for parsing).
+/// The header size is given by `header_size` (AMD's `OffsetOfFirstEntry`
+/// — the byte offset where the first entry starts). The region from
+/// `APOB_HEADER_FIXED_SIZE` (0x30) to `header_size -
+/// APOB_HEADER_HMAC_SIZE` (32) contains the Config Offset List — an
+/// array of u32 offsets to additional entry chains. The last 32 bytes
+/// of the header are an HMAC (ignored for parsing).
 ///
 /// Source: research doc §1.2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApobHeader {
-    /// APOB format version.
-    pub version: ApobVersion,
+    /// APOB format version (raw u32 from the header; must be >= 5).
+    pub version: u32,
     /// Total table size in bytes (including header and all entries).
     pub table_size: u32,
-    /// Size of the header in bytes; also the offset of the first entry
-    /// in the main chain.
+    /// Offset of the first entry in the main chain (AMD's
+    /// `OffsetOfFirstEntry`); equivalent to the header size.
     pub header_size: u32,
     /// Config Offset List: u32 offsets to additional entry chains that
     /// are not reachable by following the main chain.
@@ -485,9 +484,11 @@ fn read_u16_le(blob: &[u8], offset: usize) -> Option<u16> {
 /// 1. The blob must be at least large enough for the fixed header portion
 ///    (48 bytes) plus the 32-byte HMAC (80 bytes total minimum).
 /// 2. The signature (first 4 bytes, LE) must be [`APOB_SIGNATURE`].
-/// 3. The version must be supported (currently V1 or V2).
+/// 3. The version must be ≥ [`APOB_MIN_VERSION`] (5) — versions 1-4 are
+///    legacy and not supported.
 /// 4. The table size must be ≤ the blob length and ≤ [`APOB_MAX_SIZE`].
-/// 5. The header size must be ≥ 80 (fixed + HMAC) and ≤ the table size.
+/// 5. The header size (OffsetOfFirstEntry) must be ≥ 80 (fixed + HMAC)
+///    and ≤ the table size.
 /// 6. Each entry's payload must fit within the table boundary.
 /// 7. Encrypted entries (upper 16 bits of RawGroupId or RawDataTypeId
 ///    are 0xFFFF) are included but marked — their payloads are not
@@ -527,15 +528,15 @@ pub fn parse_apob(blob: &[u8]) -> Result<ApobData, ApobError> {
     }
 
     // 3. Version check (little-endian u32 at offset 4).
-    let raw_version = read_u32_le(blob, 4).ok_or(ApobError::Truncated {
+    // Versions 5+ use the modern chained 48-byte entry format; versions
+    // 1-4 are legacy and not supported (AMD openSIL xUSL/Apob.c rule).
+    let version = read_u32_le(blob, 4).ok_or(ApobError::Truncated {
         expected: 8,
         actual: blob.len(),
     })?;
-    let version = match raw_version {
-        0x0001 => ApobVersion::V1,
-        0x0002 => ApobVersion::V2,
-        _ => return Err(ApobError::UnsupportedVersion(raw_version)),
-    };
+    if version < APOB_MIN_VERSION {
+        return Err(ApobError::UnsupportedVersion(version));
+    }
 
     // 4. Table size check (little-endian u32 at offset 8).
     let table_size = read_u32_le(blob, 8).ok_or(ApobError::Truncated {
@@ -1175,7 +1176,7 @@ mod tests {
         // header_size (placeholder) + reserved (32) + config offsets
         // (none) + HMAC (32).
         blob.extend_from_slice(&APOB_SIGNATURE.to_le_bytes()); // 0x00
-        blob.extend_from_slice(&0x0002u32.to_le_bytes()); // 0x04 version V2
+        blob.extend_from_slice(&0x0018u32.to_le_bytes()); // 0x04 version (24, modern)
         blob.extend_from_slice(&0u32.to_le_bytes()); // 0x08 table_size (placeholder)
         let header_size = APOB_HEADER_FIXED_SIZE + APOB_HEADER_HMAC_SIZE; // 0x50 = 80
         blob.extend_from_slice(&(header_size as u32).to_le_bytes()); // 0x0C header_size
@@ -1279,7 +1280,7 @@ mod tests {
     fn test_parse_synthetic_apob() {
         let blob = synthetic_apob_with_ddr4_timings();
         let apob = parse_apob(&blob).expect("synthetic APOB must parse");
-        assert_eq!(apob.header.version, ApobVersion::V2);
+        assert_eq!(apob.header.version, 0x0018u32);
         assert_eq!(apob.entries.len(), 1);
         assert_eq!(apob.entries[0].group, 7);
         assert_eq!(apob.entries[0].entry_type, 3);
@@ -1304,13 +1305,13 @@ mod tests {
         assert!(matches!(err, ApobError::Truncated { .. }));
     }
 
-    /// Header parsing: unsupported version.
+    /// Header parsing: unsupported version (< 5).
     #[test]
     fn test_parse_unsupported_version() {
         let mut blob = synthetic_apob_with_ddr4_timings();
-        blob[4..8].copy_from_slice(&0x9999u32.to_le_bytes());
+        blob[4..8].copy_from_slice(&0x0002u32.to_le_bytes()); // legacy v2
         let err = parse_apob(&blob).unwrap_err();
-        assert!(matches!(err, ApobError::UnsupportedVersion(0x9999)));
+        assert!(matches!(err, ApobError::UnsupportedVersion(0x0002)));
     }
 
     /// Header parsing: table size larger than blob.
@@ -1329,7 +1330,7 @@ mod tests {
         // Build a blob with one entry whose Size extends past the table.
         let mut blob = Vec::new();
         blob.extend_from_slice(&APOB_SIGNATURE.to_le_bytes());
-        blob.extend_from_slice(&0x0002u32.to_le_bytes());
+        blob.extend_from_slice(&0x0018u32.to_le_bytes());
         let table_size = 200u32; // small table
         blob.extend_from_slice(&table_size.to_le_bytes());
         let header_size = 80u32;
@@ -1499,7 +1500,7 @@ mod tests {
         // Header: signature + version + table_size (placeholder) +
         // header_size + reserved (32) + config offsets (1 u32) + HMAC (32).
         blob.extend_from_slice(&APOB_SIGNATURE.to_le_bytes());
-        blob.extend_from_slice(&0x0002u32.to_le_bytes());
+        blob.extend_from_slice(&0x0018u32.to_le_bytes());
         blob.extend_from_slice(&0u32.to_le_bytes()); // table_size placeholder
         let header_size = APOB_HEADER_FIXED_SIZE + 4 + APOB_HEADER_HMAC_SIZE; // 84
         blob.extend_from_slice(&(header_size as u32).to_le_bytes());
@@ -1745,7 +1746,7 @@ mod tests {
     fn test_apob_zero_table_size() {
         let mut blob = vec![0u8; 128];
         blob[0..4].copy_from_slice(&APOB_SIGNATURE.to_le_bytes());
-        blob[4..8].copy_from_slice(&0x0002u32.to_le_bytes());
+        blob[4..8].copy_from_slice(&0x0018u32.to_le_bytes());
         blob[8..12].copy_from_slice(&0u32.to_le_bytes()); // table_size = 0
         let err = parse_apob(&blob).unwrap_err();
         assert!(matches!(err, ApobError::Truncated { .. }));
@@ -1756,7 +1757,7 @@ mod tests {
     fn test_apob_huge_table_size() {
         let mut blob = vec![0u8; 128];
         blob[0..4].copy_from_slice(&APOB_SIGNATURE.to_le_bytes());
-        blob[4..8].copy_from_slice(&0x0002u32.to_le_bytes());
+        blob[4..8].copy_from_slice(&0x0018u32.to_le_bytes());
         blob[8..12].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
         let err = parse_apob(&blob).unwrap_err();
         assert!(matches!(err, ApobError::Truncated { .. }));
@@ -1767,7 +1768,7 @@ mod tests {
     fn test_apob_header_size_too_small() {
         let mut blob = vec![0u8; 200];
         blob[0..4].copy_from_slice(&APOB_SIGNATURE.to_le_bytes());
-        blob[4..8].copy_from_slice(&0x0002u32.to_le_bytes());
+        blob[4..8].copy_from_slice(&0x0018u32.to_le_bytes());
         blob[8..12].copy_from_slice(&200u32.to_le_bytes()); // table_size
         blob[12..16].copy_from_slice(&40u32.to_le_bytes()); // header_size = 40 < 80
         let err = parse_apob(&blob).unwrap_err();
@@ -1779,7 +1780,7 @@ mod tests {
     fn test_apob_header_size_over_table() {
         let mut blob = vec![0u8; 200];
         blob[0..4].copy_from_slice(&APOB_SIGNATURE.to_le_bytes());
-        blob[4..8].copy_from_slice(&0x0002u32.to_le_bytes());
+        blob[4..8].copy_from_slice(&0x0018u32.to_le_bytes());
         blob[8..12].copy_from_slice(&200u32.to_le_bytes()); // table_size
         blob[12..16].copy_from_slice(&250u32.to_le_bytes()); // header_size > table_size
         let err = parse_apob(&blob).unwrap_err();
@@ -1791,7 +1792,7 @@ mod tests {
     fn test_apob_entry_size_zero() {
         let mut blob = Vec::new();
         blob.extend_from_slice(&APOB_SIGNATURE.to_le_bytes());
-        blob.extend_from_slice(&0x0002u32.to_le_bytes());
+        blob.extend_from_slice(&0x0018u32.to_le_bytes());
         let header_size = 80u32;
         blob.extend_from_slice(&0u32.to_le_bytes()); // table_size placeholder
         blob.extend_from_slice(&header_size.to_le_bytes());
@@ -1818,7 +1819,7 @@ mod tests {
     fn test_apob_entry_size_too_small() {
         let mut blob = Vec::new();
         blob.extend_from_slice(&APOB_SIGNATURE.to_le_bytes());
-        blob.extend_from_slice(&0x0002u32.to_le_bytes());
+        blob.extend_from_slice(&0x0018u32.to_le_bytes());
         let header_size = 80u32;
         blob.extend_from_slice(&0u32.to_le_bytes()); // table_size placeholder
         blob.extend_from_slice(&header_size.to_le_bytes());
