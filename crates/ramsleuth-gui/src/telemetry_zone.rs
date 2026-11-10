@@ -550,13 +550,14 @@ fn gdm_text(gdm: &Section<bool>) -> String {
 
 /// The `CR` row (C8-10, D-6 — the C6-21 `GDM / CR` combined row,
 /// D-7 format C7-13, split into two): the DRAM command rate's bare
-/// value — `1T` / `2T`; a not-applicable / failed cell degrades its
-/// own row to bare `N/A` (the C8-06 form, D-4 — the row colors gray
+/// value — `1T` / `2T` / `GDM`; a not-applicable / failed cell degrades
+/// its own row to bare `N/A` (the C8-06 form, D-4 — the row colors gray
 /// via [`cell_color`]). No panic on any Na.
 fn cr_text(command_rate: &Section<CommandRate>) -> String {
     match command_rate {
         Section::Value(CommandRate::OneT) => "1T".to_owned(),
         Section::Value(CommandRate::TwoT) => "2T".to_owned(),
+        Section::Value(CommandRate::Gdm) => "GDM".to_owned(),
         Section::Na(reason) => na_text(reason),
     }
 }

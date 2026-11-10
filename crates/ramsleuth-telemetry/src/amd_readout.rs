@@ -173,14 +173,19 @@ pub enum DivMode {
 /// DRAM command rate (the "1T / 2T" bus encoding shown on the dashboard).
 ///
 /// Sourced from the SMN `0x50200` command-rate bit via the raw
-/// [`AmdPmSnapshot::command_rate`] slot (C6-04) and mapped by [`map_amd`];
-/// a reserved encoding degrades to [`NaReason::ParseError`].
+/// [`AmdPmSnapshot::command_rate`] slot (C6-04) and mapped by [`map_amd`]
+/// (SMN reports only 0/1 → 1T/2T); the APOB path additionally reports
+/// `cmd_rate == 2` → [`CommandRate::Gdm`] (Gear Down Mode, common on
+/// EPYC). A reserved encoding degrades to [`NaReason::ParseError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CommandRate {
     /// One transaction per clock (1T).
     OneT,
     /// Two transactions per clock (2T).
     TwoT,
+    /// Gear Down Mode (APOB `cmd_rate == 2`; command/address bus is
+    /// decoupled from the data bus — neither pure 1T nor 2T).
+    Gdm,
 }
 
 /// Memory-controller gear mode (SA:MEM clock multiplier).
@@ -1743,7 +1748,7 @@ mod tests {
     /// both bare and as the `Section` cells the clock readout uses.
     #[test]
     fn command_rate_arms_round_trip() {
-        let values = vec![CommandRate::OneT, CommandRate::TwoT];
+        let values = vec![CommandRate::OneT, CommandRate::TwoT, CommandRate::Gdm];
         let bytes =
             bincode::serialize(&values).expect("CommandRate must serialize (no-panic contract)");
         let back: Vec<CommandRate> =
@@ -1753,6 +1758,7 @@ mod tests {
         let sections: Vec<Section<CommandRate>> = vec![
             Section::Value(CommandRate::OneT),
             Section::Value(CommandRate::TwoT),
+            Section::Value(CommandRate::Gdm),
             Section::na(NaReason::NotApplicable),
             Section::na(NaReason::ParseError("reserved encoding".to_owned())),
         ];

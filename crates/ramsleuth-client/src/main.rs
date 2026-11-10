@@ -103,8 +103,8 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Suggest a related RamSleuth binary when the user types a flag or
 /// positional that looks like they meant to invoke a different tool.
 fn suggest_for_unknown(arg: &str) -> Option<&'static str> {
-    let normalized = arg.trim_start_matches('-');
-    match normalized {
+    let normalized = arg.trim_start_matches('-').to_ascii_lowercase();
+    match normalized.as_str() {
         "tui" => Some("Did you mean `ramsleuth-tui`? (run `ramsleuth-tui --help`)"),
         "client" => Some("Did you mean `ramsleuth-client`? (run `ramsleuth-client --help`)"),
         "bench" => None, // ramsleuth-client has a `bench` subcommand
@@ -291,7 +291,7 @@ where
 
 /// One subcommand name (the first positional): `dump` / `bench` /
 /// `status` / `probe` / `burn`; anything else is an error naming the
-/// offending value.
+/// offending value, with a related-tool suggestion when one applies.
 fn parse_subcommand(arg: &str) -> Result<Subcommand, String> {
     match arg {
         "dump" => Ok(Subcommand::Dump),
@@ -299,10 +299,16 @@ fn parse_subcommand(arg: &str) -> Result<Subcommand, String> {
         "status" => Ok(Subcommand::Status),
         "probe" => Ok(Subcommand::Probe),
         "burn" => Ok(Subcommand::Burn),
-        other => Err(format!(
-            "unknown subcommand `{other}` (expected `dump`, `bench`, `status`, `probe`, \
-             or `burn`)"
-        )),
+        other => {
+            let mut msg = format!(
+                "unknown subcommand `{other}` (expected `dump`, `bench`, `status`, `probe`, \
+                 or `burn`)"
+            );
+            if let Some(sug) = suggest_for_unknown(other) {
+                msg.push_str(&format!("\n  {sug}"));
+            }
+            Err(msg)
+        }
     }
 }
 

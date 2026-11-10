@@ -4,6 +4,27 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing four artifacts: the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`, and the Debian/Ubuntu/Mint package `ramsleuth_<ver>_amd64.deb` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project — with one deliberate exception: the `ryzen-smu-dkms` extra keeps its own `1.0` pkgver line (re-pinned per release wave via the commit pin + `pkgrel`, not version-bumped) and does not track the workspace version.
 
+## v2.4.24 (2026-11-10)
+
+### Fixed
+- **.deb package missing APOB kernel sources** — `packaging/build-deb.sh` now includes `apob.c` and `apob.h` in the `ryzen-smu-dkms` vendor tree copy, so the APOB feature builds correctly from the .deb package on Debian/Ubuntu/Mint.
+- **SMBIOS DIMM ordering on 10+ slot systems** — Type 17 entries are now sorted numerically by handle number (`17-0`, `17-1`, …, `17-9`, `17-10`, `17-11`) instead of lexicographically (`17-10` before `17-2`), fixing incorrect DIMM slot indices on EPYC/Xeon workstations with 10+ slots.
+- **Threadripper 3990X (Castle Peak) not detected as Zen 2** — the family 0x17 model range for Zen 2 is now `0x90`–`0x9F` (previously `0x90`–`0x91`), covering the full Threadripper 3000 series (0x98–0x9F).
+- **Skylake-X Extreme Edition CPUs misidentified** — the brand detector now accepts 9-character tokens like `i9-7980XE` (the `xe` suffix), not just 8-character `x`-suffixed tokens.
+- **Raphael PM table version too strict** — Zen 4 PM table dispatch now accepts any version with major byte `0x54` (not just the exact `0x540004`), so future BIOS/AGESA updates that bump the version continue to use the verified Raphael layout instead of falling back to incorrect offsets.
+- **APOB Gear Down Mode (GDM) silently ignored** — APOB `cmd_rate == 2` now maps to a new `CommandRate::Gdm` variant (displayed as "GDM") instead of being dropped; the variant is added to the wire protocol (backward-compatible, append-only).
+- **CLI suggestions case-sensitive** — `suggest_for_unknown` in all 6 binaries now lowercases the argument before matching, so `--TUI`, `--Tui`, and `--tui` all produce a suggestion.
+- **No suggestion for unknown ramsleuth-client subcommands** — unknown subcommands (e.g., `ramsleuth-client tui`) now get a related-tool suggestion when one applies.
+- **APOB parser stopped on first malformed entry** — a single corrupt entry header (size outside 12..=64) now skips that entry and continues parsing subsequent entries, instead of discarding the rest of the table.
+- **APOB kernel: weak signature validation** — the driver now additionally validates the `header_size` field (offset 0x0C, range 12..=64) after the 4-byte "APOB" signature match, reducing false-positive risk from coincidental byte patterns.
+- **APOB kernel: non-page-aligned ioremap** — the full-table `ioremap_cache()` size is now rounded up to the page boundary (the reported size stays the firmware's original value).
+- **SMBIOS total capacity u32 overflow risk** — `total_capacity_mib` is now `u64` (future-proofing; the sum of per-DIMM sizes was already computed as u64).
+- **.deb version validation too strict** — the version regex now accepts pre-release and build suffixes (`2.4.24-beta1`, `2.4.24+build`).
+
+### Added
+- `CommandRate::Gdm` variant (Gear Down Mode) for APOB-sourced command rate on EPYC platforms.
+- SMBIOS numeric sort test (verifies `17-2` sorts before `17-10`).
+
 ## v2.4.23 (2026-11-10)
 
 ### Fixed

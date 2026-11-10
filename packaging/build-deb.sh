@@ -84,9 +84,9 @@ if [ -z "$VERSION" ]; then
 fi
 
 case "$VERSION" in
-    [0-9]*.[0-9]*.[0-9]*) ;;
+    [0-9]*.[0-9]*.[0-9]*[-+a-zA-Z0-9.]*) ;;
     *)
-        echo "Error: invalid version '$VERSION' (expected MAJOR.MINOR.PATCH)" >&2
+        echo "Error: invalid version '$VERSION' (expected MAJOR.MINOR.PATCH, optional -pre/+build)" >&2
         exit 1 ;;
 esac
 
@@ -280,7 +280,7 @@ echo "  (12) Intel DKMS source tree"
 
 # (13) AMD ryzen_smu vendor tree (guarded)
 if [ -d "$SRC_ROOT/packaging/ryzen-smu-dkms/vendor/ryzen-smu" ]; then
-    for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
+    for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h apob.c apob.h; do
         if [ -f "$SRC_ROOT/packaging/ryzen-smu-dkms/vendor/ryzen-smu/$f" ]; then
             install -Dm644 "$SRC_ROOT/packaging/ryzen-smu-dkms/vendor/ryzen-smu/$f" "$PKG_DIR/usr/share/ryzen-smu-dkms/vendor/ryzen-smu/$f"
         fi
