@@ -13,8 +13,9 @@
 # distinctness avoids a file conflict on that ONE binary only — the
 # packages as a whole cannot coinstall, see the conflict note below),
 # (3) the VENDED
-# pinned ryzen_smu source (packaging/ryzen-smu-dkms/vendor/: the 6
-# files frozen at upstream commit d298366 + SUMS.sha256 + NOTICE.md)
+# pinned ryzen_smu source (packaging/ryzen-smu-dkms/vendor/: the 8
+# module files (6 frozen at upstream commit d298366 + 2 APOB
+# additions) + SUMS.sha256 + NOTICE.md)
 # to /usr/share/ryzen-smu-dkms/vendor/ — the exact installed path the
 # C21-08 helper resolves (the offline build path, zero network), and
 # (4) a short README.
@@ -46,7 +47,7 @@
 
 pkgname=ryzen-smu-dkms
 pkgver=1.0
-pkgrel=15
+pkgrel=16
 pkgdesc="Provisioning tools for the optional ryzen_smu DKMS module (RamSleuth live AMD subtimings)"
 arch=(x86_64)
 url="https://github.com/MadGoatHaz/RamSleuth"
@@ -99,7 +100,7 @@ package() {
   #    (the exact path the C21-08 helper verifies with SUMS.sha256
   #    before any build).
   local v
-  for v in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
+  for v in LICENSE Makefile dkms.conf drv.c smu.c smu.h apob.c apob.h; do
     install -Dm644 "$srcdir/ramsleuth/packaging/ryzen-smu-dkms/vendor/ryzen-smu/$v" \
       "$pkgdir/usr/share/ryzen-smu-dkms/vendor/ryzen-smu/$v"
   done

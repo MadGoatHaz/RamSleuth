@@ -345,9 +345,9 @@ if [[ "${USE_VENDOR}" -eq 0 ]]; then
   log "Pinned source: $(git -C "${SRC_DIR}" log -1 --format='%h  %ad  %an  %s' --date=short)"
 fi
 # Provenance AFTER the source resolution (auditable, both paths): the
-# sha256sum fingerprint of the six files that get staged (the staged copies
+# sha256sum fingerprint of the eight files that get staged (the staged copies
 # land verbatim in ${STAGE_DIR}).
-for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
+for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h apob.c apob.h; do
   if [[ -f "${SRC_DIR}/${f}" ]]; then
     sha256sum "${SRC_DIR}/${f}"
   else
@@ -367,7 +367,7 @@ if [[ "${USE_VENDOR}" -eq 0 ]]; then
 fi
 STAGE_DIR="/usr/src/${MODULE}-${PKGVER}"
 install -d "${STAGE_DIR}"
-for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
+for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h apob.c apob.h; do
   [[ -f "${SRC_DIR}/${f}" ]] || continue      # tolerate absent extras
   install -m 644 "${SRC_DIR}/${f}" "${STAGE_DIR}/${f}"
 done

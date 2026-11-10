@@ -58,7 +58,8 @@
 #     /usr/share/ramsleuth-intel-dkms/src/ (the path the Intel helper resolves as its
 #     installed copy; GUARDED: absent in pre-Intel tags)
 #   - the vendored ryzen_smu DKMS module source tree packaging/ryzen-smu-dkms/
-#     vendor/ (the 6 module files frozen at upstream d298366, GPL-2.0-only —
+#     vendor/ (the 8 module files (6 frozen at upstream d298366 + 2 APOB
+#     additions), GPL-2.0-only —
 #     a separate work; + vendor/SUMS.sha256 + vendor/NOTICE.md) ->
 #     /usr/share/ryzen-smu-dkms/vendor/ (the path the AMD helper (step 4)
 #     resolves as its offline vendored source — every file SUMS-verified
@@ -86,7 +87,7 @@
 
 pkgname=ramsleuth
 pkgver=2.4.26   # FIXED — taken from the git tag v$pkgver (no pkgver())
-pkgrel=1
+pkgrel=2
 pkgdesc="Pure-Rust RAM latency/bandwidth telemetry: privileged daemon + unprivileged CLI/TUI/GUI clients"
 arch=(x86_64)
 url="https://github.com/MadGoatHaz/RamSleuth"
@@ -246,15 +247,16 @@ package() {
     # vendor-first, every file verified against the sibling vendor/SUMS.sha256
     # before any build — zero network; this is what makes the in-app one-click
     # work on a clean source-package install without the extra). The git-tag
-    # source carries packaging/ryzen-smu-dkms/vendor/ (the 6 module files
-    # frozen at upstream d298366 + SUMS.sha256 + NOTICE.md) from the vendor
+    # source carries packaging/ryzen-smu-dkms/vendor/ (the 8 module files
+    # (6 frozen at upstream d298366 + 2 APOB additions) + SUMS.sha256 +
+    # NOTICE.md) from the vendor
     # landing on v2-development; GUARDED with an existence test: a build
     # against a pre-vendor tag (no packaging/ryzen-smu-dkms/vendor/) skips it
     # cleanly — the no-panic contract; the per-file guards cover each file
     # present in the tag tree.
     if [ -d "packaging/ryzen-smu-dkms/vendor/ryzen-smu" ]; then
         local f
-        for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
+        for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h apob.c apob.h; do
             if [ -f "packaging/ryzen-smu-dkms/vendor/ryzen-smu/$f" ]; then
                 install -Dm644 "packaging/ryzen-smu-dkms/vendor/ryzen-smu/$f" \
                     "$pkgdir/usr/share/ryzen-smu-dkms/vendor/ryzen-smu/$f"

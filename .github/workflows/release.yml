@@ -171,7 +171,7 @@ jobs:
           for f in dkms.conf Makefile ramsleuth_intel.c README.md; do
             cp "kernel/ramsleuth-intel/$f" "$S/kernel/ramsleuth-intel/"
           done
-          for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h; do
+          for f in LICENSE Makefile dkms.conf drv.c smu.c smu.h apob.c apob.h; do
             cp "packaging/ryzen-smu-dkms/vendor/ryzen-smu/$f" "$S/packaging/ryzen-smu-dkms/vendor/ryzen-smu/"
           done
           cp packaging/ryzen-smu-dkms/vendor/SUMS.sha256 "$S/packaging/ryzen-smu-dkms/vendor/"
