@@ -620,7 +620,7 @@ fn amd_zen_from_family_model(family: u32, model: u32) -> Option<AmdZen> {
                 Some(AmdZen::Zen1)
             } else if (0x30..=0x4F).contains(&model)
                 || (0x60..=0x7F).contains(&model)
-                || (0x90..=0x91).contains(&model)
+                || (0x90..=0x9F).contains(&model)
                 || (0xA0..=0xAF).contains(&model)
             {
                 Some(AmdZen::Zen2)
@@ -1041,13 +1041,14 @@ fn server_gen_from_brand(brand: &str) -> Option<IntelGen> {
         return None;
     }
 
-    // Skylake-X Core: `i7-78<NN>x` / `i9-79<NN>x` (8 chars, `x` suffix).
+    // Skylake-X Core: `i7-78<NN>x` / `i9-79<NN>x` (8 chars) plus the
+    // Extreme Edition `i9-79<NN>xe` (9 chars, e.g. i9-7980XE).
     for t in &toks {
-        if t.len() == 8
+        if t.len() >= 8
             && (t.starts_with("i7-78") || t.starts_with("i9-79"))
             && t.as_bytes()[5].is_ascii_digit()
             && t.as_bytes()[6].is_ascii_digit()
-            && t.ends_with('x')
+            && (t.ends_with('x') || t.ends_with("xe"))
         {
             return Some(IntelGen::SkylakeX);
         }
@@ -2214,5 +2215,105 @@ mod tests {
                 bincode::deserialize(&bytes).expect("AmdPackageType must deserialize");
             assert_eq!(value, back);
         }
+    }
+
+    // ====================================================================
+    // QA edge-case battery: boundary sweeps of the AMD family+model → Zen
+    // map (every model value 0x00–0xFF is explicitly covered by these
+    // ranges plus the gap assertions below).
+    // ====================================================================
+
+    /// (QA) Boundary sweep of the family 0x19 (Zen 3 / Zen 4) model table.
+    #[test]
+    fn test_zen_detection_family_0x19_boundaries() {
+        // Zen 3: 0x00-0x0F, 0x20-0x5F.
+        assert_eq!(amd_zen_from_family_model(0x19, 0x00), Some(AmdZen::Zen3));
+        assert_eq!(amd_zen_from_family_model(0x19, 0x0F), Some(AmdZen::Zen3));
+        assert_eq!(amd_zen_from_family_model(0x19, 0x20), Some(AmdZen::Zen3));
+        assert_eq!(amd_zen_from_family_model(0x19, 0x5F), Some(AmdZen::Zen3));
+        // Zen 4: 0x10-0x1F, 0x60-0xAF.
+        assert_eq!(amd_zen_from_family_model(0x19, 0x10), Some(AmdZen::Zen4));
+        assert_eq!(amd_zen_from_family_model(0x19, 0x1F), Some(AmdZen::Zen4));
+        assert_eq!(amd_zen_from_family_model(0x19, 0x60), Some(AmdZen::Zen4));
+        assert_eq!(amd_zen_from_family_model(0x19, 0xAF), Some(AmdZen::Zen4));
+        // Gaps: 0xB0 and 0xFF are not in the table.
+        assert_eq!(amd_zen_from_family_model(0x19, 0xB0), None);
+        assert_eq!(amd_zen_from_family_model(0x19, 0xFF), None);
+    }
+
+    /// (QA) Boundary sweep of the family 0x1A (Zen 5 / Zen 6) model table.
+    #[test]
+    fn test_zen_detection_family_0x1A_boundaries() {
+        // Zen 5: 0x00-0x2F, 0x40-0x4F, 0x60-0x7F, 0xD0-0xD7.
+        assert_eq!(amd_zen_from_family_model(0x1A, 0x00), Some(AmdZen::Zen5));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0x2F), Some(AmdZen::Zen5));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0x40), Some(AmdZen::Zen5));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0x4F), Some(AmdZen::Zen5));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0x60), Some(AmdZen::Zen5));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0x7F), Some(AmdZen::Zen5));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0xD0), Some(AmdZen::Zen5));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0xD7), Some(AmdZen::Zen5));
+        // Zen 6: 0x50-0x5F, 0x80-0xAF, 0xC0-0xCF, 0xD8-0xEF.
+        assert_eq!(amd_zen_from_family_model(0x1A, 0x50), Some(AmdZen::Zen6));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0x5F), Some(AmdZen::Zen6));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0x80), Some(AmdZen::Zen6));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0xAF), Some(AmdZen::Zen6));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0xC0), Some(AmdZen::Zen6));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0xCF), Some(AmdZen::Zen6));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0xD8), Some(AmdZen::Zen6));
+        assert_eq!(amd_zen_from_family_model(0x1A, 0xEF), Some(AmdZen::Zen6));
+        // Gaps: 0x30, 0xF0, 0xFF are not in the table.
+        assert_eq!(amd_zen_from_family_model(0x1A, 0x30), None);
+        assert_eq!(amd_zen_from_family_model(0x1A, 0xF0), None);
+        assert_eq!(amd_zen_from_family_model(0x1A, 0xFF), None);
+    }
+
+    /// (QA) Boundary sweep of the family 0x17 (Zen 1 / Zen 2) model table.
+    #[test]
+    fn test_zen_detection_family_0x17_boundaries() {
+        // Zen 1: 0x00-0x2F, 0x50-0x5F.
+        assert_eq!(amd_zen_from_family_model(0x17, 0x00), Some(AmdZen::Zen1));
+        assert_eq!(amd_zen_from_family_model(0x17, 0x2F), Some(AmdZen::Zen1));
+        assert_eq!(amd_zen_from_family_model(0x17, 0x50), Some(AmdZen::Zen1));
+        assert_eq!(amd_zen_from_family_model(0x17, 0x5F), Some(AmdZen::Zen1));
+        // Zen 2: 0x30-0x4F, 0x60-0x7F, 0x90-0x91, 0xA0-0xAF.
+        assert_eq!(amd_zen_from_family_model(0x17, 0x30), Some(AmdZen::Zen2));
+        assert_eq!(amd_zen_from_family_model(0x17, 0x4F), Some(AmdZen::Zen2));
+        assert_eq!(amd_zen_from_family_model(0x17, 0x60), Some(AmdZen::Zen2));
+        assert_eq!(amd_zen_from_family_model(0x17, 0x7F), Some(AmdZen::Zen2));
+        assert_eq!(amd_zen_from_family_model(0x17, 0x90), Some(AmdZen::Zen2));
+        assert_eq!(amd_zen_from_family_model(0x17, 0x91), Some(AmdZen::Zen2));
+        assert_eq!(amd_zen_from_family_model(0x17, 0xA0), Some(AmdZen::Zen2));
+        assert_eq!(amd_zen_from_family_model(0x17, 0xAF), Some(AmdZen::Zen2));
+        // Gaps: 0x80, 0x8F, 0xB0, 0xFF are not in the table.
+        assert_eq!(amd_zen_from_family_model(0x17, 0x80), None);
+        assert_eq!(amd_zen_from_family_model(0x17, 0x8F), None);
+        assert_eq!(amd_zen_from_family_model(0x17, 0xB0), None);
+        assert_eq!(amd_zen_from_family_model(0x17, 0xFF), None);
+    }
+
+    /// (QA) Families outside the Zen set yield None.
+    #[test]
+    fn test_zen_detection_unknown_family() {
+        assert_eq!(amd_zen_from_family_model(0x15, 0x00), None); // Bulldozer
+        assert_eq!(amd_zen_from_family_model(0x16, 0x00), None); // gap
+        assert_eq!(amd_zen_from_family_model(0x18, 0x00), None); // gap
+        assert_eq!(amd_zen_from_family_model(0x1B, 0x00), None); // unknown
+        assert_eq!(amd_zen_from_family_model(0x1F, 0x00), None); // unknown
+        assert_eq!(amd_zen_from_family_model(0x06, 0x00), None); // legacy
+    }
+
+    /// (QA) Known real CPUs resolve to the expected generation.
+    ///
+    /// Boundary probe: `0x17/0x98` is the CPUID of the Threadripper 3990X
+    /// (Castle Peak, a genuine Zen 2 part). The current table only covers
+    /// 0x90–0x91 in that range, so if this assertion fails it flags a
+    /// coverage gap in the family 0x17 model table.
+    #[test]
+    fn test_zen_detection_real_cpus() {
+        assert_eq!(amd_zen_from_family_model(0x19, 0x21), Some(AmdZen::Zen3)); // Vermeer (5950X)
+        assert_eq!(amd_zen_from_family_model(0x19, 0x61), Some(AmdZen::Zen4)); // Raphael (7950X)
+        assert_eq!(amd_zen_from_family_model(0x17, 0x71), Some(AmdZen::Zen2)); // Matisse (3600X)
+        assert_eq!(amd_zen_from_family_model(0x17, 0x98), Some(AmdZen::Zen2)); // Castle Peak (3990X)
     }
 }

@@ -556,11 +556,13 @@ fn overlay_apob_timings(readout: &mut AmdReadout, ch: &amd_apob::ApobChannelTimi
     overlay(&mut t.rdwr, u16::from(ch.trdwr));
     overlay(&mut t.wrrd, u16::from(ch.twrtr));
     // Command rate from the APOB (overrides the Na from the unverified
-    // 0x50200 layout on sIOD). Only the two defined encodings are
-    // overlaid; reserved values leave the existing state.
+    // 0x50200 layout on sIOD). All three defined encodings are overlaid
+    // (0 = 1T, 1 = 2T, 2 = Gear Down Mode); reserved values leave the
+    // existing state.
     match ch.cmd_rate {
         0 => readout.clocks.command_rate = Section::Value(CommandRate::OneT),
         1 => readout.clocks.command_rate = Section::Value(CommandRate::TwoT),
+        2 => readout.clocks.command_rate = Section::Value(CommandRate::Gdm),
         _ => {}
     }
 }

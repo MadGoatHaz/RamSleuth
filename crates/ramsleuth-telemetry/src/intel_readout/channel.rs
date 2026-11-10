@@ -597,7 +597,7 @@ mod tests {
         SmbiosTopology {
             populated_count: populated,
             dimm_sizes: (0..populated).map(|_| 16384).collect(),
-            total_capacity_mib: (populated as u32) * 16384,
+            total_capacity_mib: (populated as u64) * 16384,
             memory_type: tech,
             speed_mts: None,
             locators: (0..populated).map(|i| format!("Ch{i}")).collect(),

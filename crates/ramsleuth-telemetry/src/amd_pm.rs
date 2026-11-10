@@ -100,12 +100,17 @@ pub const MATISSE_TABLE_VERSIONS: [u32; 8] = [
     0x24_00_03, 0x24_05_03, 0x24_06_03, 0x24_07_03, 0x24_08_02, 0x24_08_03, 0x24_09_02, 0x24_09_03,
 ];
 
-/// Raphael / Zen 4 (family `0x19`, model `0x60`+) accepted
-/// `TableVersionId`s. Empirically verified on a Ryzen 9 7950X (Nov 2026)
-/// and cross-referenced with the ZenStates-Core `Hardware/PowerTable.cs`
-/// offset map — the table uses a *different* field layout from Matisse /
-/// Vermeer (SVI3 rails at 0x0B8 / 0x0CC / 0x0E0, clocks at 0x118 /
-/// 0x128 / 0x138).
+/// The Raphael / Zen 4 `TableVersionId` empirically verified on a Ryzen 9
+/// 7950X (Nov 2026) and cross-referenced with the ZenStates-Core
+/// `Hardware/PowerTable.cs` offset map — the table uses a *different*
+/// field layout from Matisse / Vermeer (SVI3 rails at 0x0B8 / 0x0CC /
+/// 0x0E0, clocks at 0x118 / 0x128 / 0x138).
+///
+/// The dispatch key is the version's **major byte** (bits 23:16 = `0x54`),
+/// not this closed set: any `0x54xxxx` revision (including future BIOS /
+/// AGESA updates) selects the Raphael layout. This constant is retained
+/// as the reference version and is consulted by the
+/// `version_is_plausible` filter for the [`PmLayout::Raphael`] variant.
 pub const RAPHAEL_TABLE_VERSIONS: &[u32] = &[0x54_00_04];
 
 /// Raphael offset of the FCLK frequency (MHz) — little-endian f32.
@@ -151,15 +156,16 @@ pub enum PmLayout {
     /// verified `TableVersionId`s in [`VERMEER_TABLE_VERSIONS`].
     Vermeer,
     /// Raphael / Zen 4 (family `0x19`, models `0x10`–`0x1F`,
-    /// `0x60`–`0xAF`; e.g. the Ryzen 9 7950X) — the verified
-    /// `TableVersionId`s in [`RAPHAEL_TABLE_VERSIONS`] (0x540004); a
-    /// distinct field-offset layout (SVI3 rails at 0x0B8 / 0x0CC /
-    /// 0x0E0, clocks at 0x118 / 0x128 / 0x138).
+    /// `0x60`–`0xAF`; e.g. the Ryzen 9 7950X) — selected by any
+    /// `TableVersionId` with major byte `0x54` (the verified reference is
+    /// [`RAPHAEL_TABLE_VERSIONS`] = 0x540004); a distinct field-offset
+    /// layout (SVI3 rails at 0x0B8 / 0x0CC / 0x0E0, clocks at 0x118 /
+    /// 0x128 / 0x138).
     Raphael,
-    /// Zen 4 fallback — a Zen 4 family whose `TableVersionId` is not in
-    /// [`RAPHAEL_TABLE_VERSIONS`] (e.g. an unverified Phoenix / Hawk
-    /// APU). Uses the shared Matisse / Vermeer offsets as the live decode
-    /// path.
+    /// Zen 4 fallback — a Zen 4 family whose `TableVersionId` major byte
+    /// is not `0x54` (e.g. an unverified Phoenix / Hawk APU reporting a
+    /// different major). Uses the shared Matisse / Vermeer offsets as the
+    /// live decode path.
     Zen4,
     /// Zen 5 (family `0x1A`, models `0x00`–`0x2F`, `0x40`–`0x4F`,
     /// `0x60`–`0x7F`, `0xD0`–`0xD7`) — the live decode path (unverified;
@@ -194,12 +200,14 @@ impl PmLayout {
             AmdZen::Zen1 => Self::Zen1,
             AmdZen::Zen2 => Self::Matisse,
             AmdZen::Zen3 => Self::Vermeer,
-            // Zen 4: Raphael (family 0x19, model 0x60+) has a distinct
-            // verified layout (0x540004); any other Zen 4 version falls
-            // back to the shared Matisse / Vermeer offsets (the unverified
-            // live path for Phoenix / Hawk APUs).
+            // Zen 4: any version with major byte 0x54 dispatches to the
+            // distinct verified Raphael layout (the current `0x540004`
+            // plus any future 0x54xxxx BIOS/AGESA revision — consistent
+            // with `version_is_plausible`); any other Zen 4 version
+            // falls back to the shared Matisse / Vermeer offsets (the
+            // unverified live path for Phoenix / Hawk APUs).
             AmdZen::Zen4 => {
-                if RAPHAEL_TABLE_VERSIONS.contains(&version) {
+                if (version >> 16) & 0xFF == 0x54 {
                     Self::Raphael
                 } else {
                     Self::Zen4
@@ -1256,5 +1264,100 @@ mod tests {
         assert_eq!(to_u16(f32::NEG_INFINITY), 0);
         assert_eq!(to_u16(-5.0), 0);
         assert_eq!(to_u16(-0.0), 0);
+    }
+
+    // ====================================================================
+    // QA edge-case battery: Raphael PM-table boundaries and failure modes.
+    // ====================================================================
+
+    /// (QA) A blob shorter than MIN_LEN is rejected with Err(Parse) — no
+    /// panic, no out-of-bounds read.
+    #[test]
+    fn test_raphael_pm_table_too_small() {
+        let ctx = SmuContext {
+            version: 0x54_00_04,
+            pm: Some(vec![0u8; 100]), // < MIN_LEN (0x518)
+        };
+        let res = parse(&ctx, AmdZen::Zen4);
+        assert!(
+            matches!(res, Err(TelemetryError::Parse { .. })),
+            "short blob must be Err(Parse), got {res:?}"
+        );
+    }
+
+    /// (QA) A NaN in a clock field degrades to 0 MHz (no panic, no
+    /// poisoning of the snapshot).
+    #[test]
+    fn test_raphael_pm_table_nan_values() {
+        let mut blob = vec![0u8; MIN_LEN];
+        // Write NaN at the Raphael FCLK offset (0x118).
+        blob[RAPHAEL_FCLK_OFF..RAPHAEL_FCLK_OFF + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        let ctx = SmuContext {
+            version: 0x54_00_04,
+            pm: Some(blob),
+        };
+        let snap = parse(&ctx, AmdZen::Zen4).expect("NaN must not panic");
+        assert_eq!(snap.fclk_mhz, 0, "NaN degrades to 0");
+    }
+
+    /// (QA) A negative voltage degrades to 0 mV (no panic).
+    #[test]
+    fn test_raphael_pm_table_negative_values() {
+        let mut blob = vec![0u8; MIN_LEN];
+        // Write -1.0 V at the Raphael VDD offset (0x0B8).
+        blob[RAPHAEL_VDDCR_VDD_OFF..RAPHAEL_VDDCR_VDD_OFF + 4]
+            .copy_from_slice(&(-1.0f32).to_le_bytes());
+        let ctx = SmuContext {
+            version: 0x54_00_04,
+            pm: Some(blob),
+        };
+        let snap = parse(&ctx, AmdZen::Zen4).expect("negative must not panic");
+        assert_eq!(snap.voltages.vcore_mv, 0, "negative degrades to 0");
+    }
+
+    /// (QA) An extreme-but-finite clock (100000 MHz, far above u16::MAX)
+    /// saturates at u16::MAX (no panic, no wrap).
+    #[test]
+    fn test_raphael_pm_table_extreme_values() {
+        let mut blob = vec![0u8; MIN_LEN];
+        blob[RAPHAEL_FCLK_OFF..RAPHAEL_FCLK_OFF + 4].copy_from_slice(&100000.0f32.to_le_bytes());
+        let ctx = SmuContext {
+            version: 0x54_00_04,
+            pm: Some(blob),
+        };
+        let snap = parse(&ctx, AmdZen::Zen4).expect("extreme value must not panic");
+        assert_eq!(snap.fclk_mhz, u16::MAX, "100000 MHz saturates at u16::MAX");
+    }
+
+    /// (QA) Version boundaries: any version with major byte 0x54 selects
+    /// the Raphael layout (the current 0x540004 plus any future 0x54xxxx
+    /// BIOS/AGESA revision — consistent with `version_is_plausible`);
+    /// non-0x54 majors fall back to the shared Zen 4 layout (which still
+    /// decodes, using the Matisse/Vermeer offsets).
+    #[test]
+    fn test_raphael_pm_table_version_boundaries() {
+        // 0x540004 (the verified version) → Raphael.
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen4, 0x54_00_04),
+            Ok(PmLayout::Raphael),
+            "0x540004 → Raphael"
+        );
+        // 0x540003 / 0x540005 (other 0x54xxxx revisions) → Raphael.
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen4, 0x54_00_03),
+            Ok(PmLayout::Raphael),
+            "0x540003 → Raphael (any 0x54xxxx major)"
+        );
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen4, 0x54_00_05),
+            Ok(PmLayout::Raphael),
+            "0x540005 → Raphael (any 0x54xxxx major)"
+        );
+        // 0x2D0001 (Vermeer major, not 0x54) → Zen 4 fallback.
+        assert_eq!(
+            PmLayout::from_zen(AmdZen::Zen4, 0x2D_00_01),
+            Ok(PmLayout::Zen4),
+            "0x2D0001 → Zen 4 fallback (non-0x54 major)"
+        );
     }
 }

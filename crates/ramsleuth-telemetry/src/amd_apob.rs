@@ -532,8 +532,16 @@ pub fn parse_apob(blob: &[u8]) -> Result<ApobData, ApobError> {
 
         // Validate the entry header size (should be 12, but be lenient).
         if !(APOB_ENTRY_HEADER_SIZE..=64).contains(&header_size) {
-            // Malformed entry header size — stop parsing.
-            break;
+            // Malformed entry header size — skip past the minimum header
+            // and try the next entry (a single corrupt entry should not
+            // discard all subsequent valid ones).
+            eprintln!(
+                "warning: APOB: skipping malformed entry header at offset {offset} \
+                 (header_size {header_size} outside 12..=64)"
+            );
+            offset += APOB_ENTRY_HEADER_SIZE;
+            entry_index += 1;
+            continue;
         }
 
         // Check bounds: the payload must fit within the table.
@@ -1051,5 +1059,226 @@ mod tests {
             let text = e.to_string();
             assert!(!text.is_empty(), "Display must be non-empty: {:?}", e);
         }
+    }
+
+    // ====================================================================
+    // QA edge-case battery: boundaries and failure modes of parse_apob and
+    // extract_siod_ddr4_timings.
+    // ====================================================================
+
+    /// (QA) An empty blob is rejected as truncated (shorter than the
+    /// 16-byte header).
+    #[test]
+    fn test_apob_empty_blob() {
+        let blob = vec![];
+        let err = parse_apob(&blob).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApobError::Truncated {
+                    expected: 16,
+                    actual: 0
+                }
+            ),
+            "empty blob must be Truncated {{expected:16, actual:0}}, got {err:?}"
+        );
+    }
+
+    /// (QA) A blob shorter than the header is rejected as truncated.
+    #[test]
+    fn test_apob_short_blob() {
+        let blob = vec![0u8; 10]; // too small for the 16-byte header
+        let err = parse_apob(&blob).unwrap_err();
+        assert!(matches!(err, ApobError::Truncated { .. }));
+    }
+
+    /// (QA) A blob with a valid length but a wrong signature is rejected.
+    #[test]
+    fn test_apob_bad_signature() {
+        let mut blob = vec![0u8; 64];
+        blob[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes()); // wrong sig
+        let err = parse_apob(&blob).unwrap_err();
+        assert!(matches!(err, ApobError::BadSignature));
+    }
+
+    /// (QA) A zero table_size is rejected even when the signature and
+    /// version are valid.
+    #[test]
+    fn test_apob_zero_table_size() {
+        let mut blob = vec![0u8; 64];
+        blob[0..4].copy_from_slice(&APOB_SIGNATURE.to_le_bytes());
+        blob[4..8].copy_from_slice(&0x0002u32.to_le_bytes()); // version V2
+        blob[8..12].copy_from_slice(&0u32.to_le_bytes()); // table_size = 0
+        blob[12..16].copy_from_slice(&0u32.to_le_bytes()); // flags
+        let err = parse_apob(&blob).unwrap_err();
+        assert!(matches!(err, ApobError::Truncated { .. }));
+    }
+
+    /// (QA) A huge table_size (0xFFFFFFFF) is rejected as truncated
+    /// (greater than the APOB_MAX_SIZE cap).
+    #[test]
+    fn test_apob_huge_table_size() {
+        let mut blob = vec![0u8; 64];
+        blob[0..4].copy_from_slice(&APOB_SIGNATURE.to_le_bytes());
+        blob[4..8].copy_from_slice(&0x0002u32.to_le_bytes());
+        blob[8..12].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // max u32
+        blob[12..16].copy_from_slice(&0u32.to_le_bytes());
+        let err = parse_apob(&blob).unwrap_err();
+        assert!(matches!(err, ApobError::Truncated { .. }));
+    }
+
+    /// (QA) An entry whose declared payload extends past the table
+    /// boundary is rejected as an overrun (not a panic).
+    #[test]
+    fn test_apob_entry_overrun() {
+        // A valid 16-byte header declaring table_size = 28 (header + one
+        // 12-byte entry header). The entry then claims a 100-byte payload,
+        // so payload_end = 28 + 100 = 128 > 28 → EntryOverrun.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&APOB_SIGNATURE.to_le_bytes());
+        blob.extend_from_slice(&0x0002u32.to_le_bytes()); // V2
+        blob.extend_from_slice(&28u32.to_le_bytes()); // table_size
+        blob.extend_from_slice(&0u32.to_le_bytes()); // flags
+                                                     // Entry header (12 bytes).
+        blob.extend_from_slice(&1u16.to_le_bytes()); // group Mem
+        blob.extend_from_slice(&3u16.to_le_bytes()); // type Timings
+        blob.extend_from_slice(&100u32.to_le_bytes()); // size → overrun
+        blob.push(0); // instance
+        blob.push(0); // flags
+        blob.extend_from_slice(&12u16.to_le_bytes()); // header_size
+        assert_eq!(blob.len(), 28);
+        let err = parse_apob(&blob).unwrap_err();
+        assert!(matches!(err, ApobError::EntryOverrun { .. }));
+    }
+
+    /// (QA) An entry whose group is 0xFFFF (encrypted) is included in the
+    /// parsed table (marked encrypted) — the parser does not error on it.
+    /// Because it is no longer a Group Mem entry, the timings extractor
+    /// reports `TimingsNotFound` (the encrypted entry is effectively
+    /// skipped, not a hard error).
+    #[test]
+    fn test_apob_encrypted_group_entry_parsed_but_not_extracted() {
+        let mut blob = synthetic_castle_peak_apob();
+        // Change the group to 0xFFFF (encrypted).
+        blob[APOB_HEADER_SIZE..APOB_HEADER_SIZE + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let apob = parse_apob(&blob).expect("encrypted entry should still parse");
+        assert_eq!(apob.entries.len(), 1);
+        assert!(apob.entries[0].header.is_encrypted());
+        // The extractor looks for Group Mem — a 0xFFFF group is not Mem,
+        // so it is skipped (TimingsNotFound), not a parse error.
+        let err = extract_siod_ddr4_timings(&apob).unwrap_err();
+        assert!(matches!(err, ApobError::TimingsNotFound));
+    }
+
+    /// (QA) A timings payload whose length is not a multiple of 108 bytes
+    /// yields the floor number of channels; the trailing remainder is
+    /// ignored (no error, no panic).
+    #[test]
+    fn test_apob_channel_remainder_ignored() {
+        let payload_len = 806usize; // 7 * 108 + 50
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&APOB_SIGNATURE.to_le_bytes());
+        blob.extend_from_slice(&0x0002u32.to_le_bytes());
+        let table_size = (APOB_HEADER_SIZE + APOB_ENTRY_HEADER_SIZE + payload_len) as u32;
+        blob.extend_from_slice(&table_size.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes()); // flags
+        blob.extend_from_slice(&1u16.to_le_bytes()); // group Mem
+        blob.extend_from_slice(&3u16.to_le_bytes()); // type Timings
+        blob.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        blob.push(0); // instance
+        blob.push(0); // flags
+        blob.extend_from_slice(&12u16.to_le_bytes()); // header_size
+        blob.extend_from_slice(&vec![0u8; payload_len]);
+        let apob = parse_apob(&blob).expect("APOB must parse");
+        let timings =
+            extract_siod_ddr4_timings(&apob).expect("7 complete channel blocks must extract");
+        assert_eq!(
+            timings.channels.len(),
+            7,
+            "806/108 = 7 channels, remainder ignored"
+        );
+    }
+
+    /// (QA) A timings payload shorter than one channel block (108 bytes)
+    /// is rejected as invalid timing data.
+    #[test]
+    fn test_apob_channel_count_zero() {
+        let payload_len = 50usize;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&APOB_SIGNATURE.to_le_bytes());
+        blob.extend_from_slice(&0x0002u32.to_le_bytes());
+        let table_size = (APOB_HEADER_SIZE + APOB_ENTRY_HEADER_SIZE + payload_len) as u32;
+        blob.extend_from_slice(&table_size.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&1u16.to_le_bytes());
+        blob.extend_from_slice(&3u16.to_le_bytes());
+        blob.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        blob.push(0);
+        blob.push(0);
+        blob.extend_from_slice(&12u16.to_le_bytes());
+        blob.extend_from_slice(&vec![0u8; payload_len]);
+        let apob = parse_apob(&blob).expect("APOB must parse");
+        let err = extract_siod_ddr4_timings(&apob).unwrap_err();
+        assert!(matches!(err, ApobError::InvalidTimingData(_)));
+    }
+
+    /// (QA) A timings payload implying more than 16 channels is rejected
+    /// as invalid (the sanity cap).
+    #[test]
+    fn test_apob_channel_count_exceeds_cap() {
+        let payload_len = 108 * 20; // 20 channels > 16 cap
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&APOB_SIGNATURE.to_le_bytes());
+        blob.extend_from_slice(&0x0002u32.to_le_bytes());
+        let table_size = (APOB_HEADER_SIZE + APOB_ENTRY_HEADER_SIZE + payload_len) as u32;
+        blob.extend_from_slice(&table_size.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&1u16.to_le_bytes());
+        blob.extend_from_slice(&3u16.to_le_bytes());
+        blob.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        blob.push(0);
+        blob.push(0);
+        blob.extend_from_slice(&12u16.to_le_bytes());
+        blob.extend_from_slice(&vec![0u8; payload_len]);
+        let apob = parse_apob(&blob).expect("APOB must parse");
+        let err = extract_siod_ddr4_timings(&apob).unwrap_err();
+        assert!(matches!(err, ApobError::InvalidTimingData(_)));
+    }
+
+    /// (QA) A timing value of 0 (e.g. tCL=0, physically impossible) parses
+    /// without panic; the field simply carries 0.
+    #[test]
+    fn test_apob_timing_value_zero() {
+        let mut blob = synthetic_castle_peak_apob();
+        // Channel 0's tCL is the first byte of the payload.
+        blob[APOB_HEADER_SIZE + APOB_ENTRY_HEADER_SIZE] = 0;
+        let apob = parse_apob(&blob).expect("APOB must parse");
+        let timings = extract_siod_ddr4_timings(&apob).expect("timings must extract");
+        assert_eq!(timings.channels[0].tcl, 0);
+    }
+
+    /// (QA) All u8/u16 timing fields at their maximum (0xFF / 0xFFFF) parse
+    /// without panic or overflow.
+    #[test]
+    fn test_apob_timing_value_max() {
+        let payload_len = 108usize;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&APOB_SIGNATURE.to_le_bytes());
+        blob.extend_from_slice(&0x0002u32.to_le_bytes());
+        let table_size = (APOB_HEADER_SIZE + APOB_ENTRY_HEADER_SIZE + payload_len) as u32;
+        blob.extend_from_slice(&table_size.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&1u16.to_le_bytes());
+        blob.extend_from_slice(&3u16.to_le_bytes());
+        blob.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        blob.push(0);
+        blob.push(0);
+        blob.extend_from_slice(&12u16.to_le_bytes());
+        blob.extend_from_slice(&vec![0xFFu8; payload_len]);
+        let apob = parse_apob(&blob).expect("APOB must parse");
+        let timings = extract_siod_ddr4_timings(&apob).expect("timings must extract");
+        assert_eq!(timings.channels[0].tcl, 255);
+        assert_eq!(timings.channels[0].tras, 0xFFFF);
+        assert_eq!(timings.channels[0].trc, 0xFFFF);
     }
 }

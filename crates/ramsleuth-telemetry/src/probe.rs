@@ -465,11 +465,12 @@ fn flag(section: &Section<bool>) -> String {
     }
 }
 
-/// The DRAM command rate: `1T` / `2T` or `N/A (<reason>)`.
+/// The DRAM command rate: `1T` / `2T` / `GDM` or `N/A (<reason>)`.
 fn command_rate(section: &Section<CommandRate>) -> String {
     match section {
         Section::Value(CommandRate::OneT) => "1T".to_owned(),
         Section::Value(CommandRate::TwoT) => "2T".to_owned(),
+        Section::Value(CommandRate::Gdm) => "GDM".to_owned(),
         Section::Na(reason) => na_cell(reason),
     }
 }

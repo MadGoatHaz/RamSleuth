@@ -311,7 +311,7 @@ pub struct SmbiosTopology {
     /// Per-populated-DIMM capacity in MiB (parallel to [`locators`]).
     pub dimm_sizes: Vec<u64>,
     /// Total installed capacity in MiB (the sum of [`dimm_sizes`]).
-    pub total_capacity_mib: u32,
+    pub total_capacity_mib: u64,
     /// The active memory technology of the first populated DIMM
     /// (`0x1A` → DDR4, `0x22` → DDR5); `None` when no populated DIMM
     /// carries a recognized type.
@@ -447,7 +447,16 @@ fn collect_topology_and_entries_from(
                 .is_some_and(|n| n.starts_with(TYPE17_PREFIX))
         })
         .collect();
-    paths.sort();
+    // Sort numerically by the handle number (`17-<n>`) so that a 12-DIMM
+    // system orders as 0,1,…,9,10,11 — not lexicographically as
+    // 0,1,10,11,2,…,9 (which would misassign the per-slot indices).
+    paths.sort_by_key(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(TYPE17_PREFIX))
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+    });
     // M-17: a present-but-corrupt structure (or an unreadable `raw` file)
     // is a parse failure, distinct from a valid unpopulated DIMM.
     let mut saw_invalid = false;
@@ -507,7 +516,7 @@ fn collect_topology_and_entries_from(
         }
     }
     // Total capacity = the sum of the per-DIMM sizes (MiB).
-    topology.total_capacity_mib = topology.dimm_sizes.iter().sum::<u64>() as u32;
+    topology.total_capacity_mib = topology.dimm_sizes.iter().sum::<u64>();
     // Channel grammar (M-15): the data-driven [`CHANNEL_PATTERNS`] table is
     // vendor-neutral, so no DMI board name is needed to resolve channels.
     topology.derived_mode = derive_mode(&topology.locators);
@@ -1516,5 +1525,64 @@ mod tests {
         let e2 = e.clone();
         assert_eq!(e, e2);
         assert!(format!("{e:?}").contains("SmbiosModuleEntry"));
+    }
+
+    // ====================================================================
+    // QA edge-case battery: SMBIOS string-table boundaries and failure
+    // modes.
+    // ====================================================================
+
+    /// (QA) Zero Type 17 entries → the empty topology, not an error.
+    #[test]
+    fn test_smbios_zero_entries() {
+        let dmi = TempDmi::new("zero-entries");
+        let (t, status) = collect_from(&dmi.root);
+        assert_eq!(t, SmbiosTopology::empty());
+        assert_eq!(
+            status,
+            SmbiosSourceStatus::Ok,
+            "an empty (but present) dir is Ok, not an error"
+        );
+    }
+
+    /// (QA) A null string reference (index 0) yields None — no panic.
+    #[test]
+    fn test_smbios_null_string_ref() {
+        let table = b"string1\0string2\0string3\0";
+        assert_eq!(string_at(table, 0), None);
+        // Sanity: ref 1 is the first string in the table.
+        assert_eq!(string_at(table, 1), Some("string1".to_owned()));
+    }
+
+    /// (QA) An out-of-range string reference (beyond the number of
+    /// strings in the table) yields None — no panic, no out-of-bounds
+    /// read.
+    #[test]
+    fn test_smbios_out_of_range_string_ref() {
+        let table = b"string1\0string2\0string3\0string4\0string5\0";
+        // Only 5 strings exist; ref 6 and ref 255 are out of range.
+        assert_eq!(string_at(table, 6), None);
+        assert_eq!(string_at(table, 255), None);
+    }
+
+    /// (QA) The `17-<n>` entries are sorted **numerically** by handle, not
+    /// lexicographically — on a 12-DIMM system the order must be
+    /// 0,1,2,…,9,10,11 (so slot 2 keeps index 2), not 0,1,10,11,2,…
+    #[test]
+    fn test_smbios_numeric_sort() {
+        let dmi = TempDmi::new("numeric-sort");
+        // Write entries out of order with distinct locators.
+        for n in [10u8, 2, 0, 11, 1] {
+            write_entry(&dmi.root, n, &populated_ddr4(&format!("DIMM{n}")));
+        }
+        let (t, status) = collect_from(&dmi.root);
+        assert_eq!(status, SmbiosSourceStatus::Ok);
+        assert_eq!(t.populated_count, 5);
+        // Numeric order: 0, 1, 2, 10, 11 — not lexicographic 0,1,10,11,2.
+        assert_eq!(
+            t.locators,
+            vec!["DIMM0", "DIMM1", "DIMM2", "DIMM10", "DIMM11"],
+            "17-2 must sort before 17-10 (numeric, not lexicographic)"
+        );
     }
 }

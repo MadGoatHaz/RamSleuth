@@ -364,8 +364,8 @@ where
 /// Suggest a related RamSleuth binary when the user types a flag or
 /// positional that looks like they meant to invoke a different tool.
 fn suggest_for_unknown(arg: &str) -> Option<&'static str> {
-    let normalized = arg.trim_start_matches('-');
-    match normalized {
+    let normalized = arg.trim_start_matches('-').to_ascii_lowercase();
+    match normalized.as_str() {
         "tui" => Some("Did you mean `ramsleuth-tui`? (run `ramsleuth-tui --help`)"),
         "client" => Some("Did you mean `ramsleuth-client`? (run `ramsleuth-client --help`)"),
         "bench" => Some("Did you mean `ramsleuth-bench`? (run `ramsleuth-bench --help`)"),

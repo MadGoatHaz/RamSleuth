@@ -78,8 +78,11 @@ int apob_init(struct apob_data *apob)
              *   +0x08: table_size (u32) - total size of APOB table
              *   +0x0C: header_size (u32) - size of header + offset array
              */
+            u32 header_size;
+
             version = readl(page + 0x04);
             table_size = readl(page + 0x08);
+            header_size = readl(page + 0x0C);
 
             /* Sanity checks */
             if (table_size == 0 || table_size > APOB_MAX_TABLE_SIZE) {
@@ -91,14 +94,32 @@ int apob_init(struct apob_data *apob)
                 continue;
             }
 
+            /* Defense-in-depth: the 4-byte "APOB" signature alone is a
+             * weak discriminator; also require the header_size field
+             * to be within the documented range (12..=64 bytes). A
+             * coincidental byte match with a plausible table_size but
+             * an implausible header_size is rejected. */
+            if (header_size < 12 || header_size > 64) {
+                pr_warn("APOB: implausible header size %u at 0x%llx "
+                        "(expected 12..64) — rejecting\n",
+                        header_size, (unsigned long long)addr);
+                iounmap(page);
+                continue;
+            }
+
             /* If the table spans multiple pages, remap the full size.
-             * If table_size <= PAGE_SIZE, the initial mapping already
-             * covers the entire table, so we reuse it. */
+             * ioremap_cache() on some architectures requires the size to
+             * be page-aligned, so round up for the mapping; the
+             * *reported* size (apob->size) stays the firmware's original
+             * table_size so userspace knows the real extent. If
+             * table_size <= PAGE_SIZE the initial mapping already covers
+             * the entire table, so we reuse it. */
             if (table_size > PAGE_SIZE) {
                 u8 __iomem *full_map;
+                size_t map_size = ALIGN(table_size, PAGE_SIZE);
 
                 iounmap(page);
-                full_map = ioremap_cache(addr, table_size);
+                full_map = ioremap_cache(addr, map_size);
                 if (!full_map) {
                     pr_err("APOB: failed to map full table at 0x%llx "
                            "(%u bytes)\n",

@@ -2058,11 +2058,12 @@ fn fmt_gear_down(v: &bool) -> String {
 }
 
 /// The `CR` row value (the GUI's D-6 form): the DRAM command rate's
-/// bare `1T` / `2T`.
+/// bare `1T` / `2T` / `GDM`.
 fn fmt_cr(v: &CommandRate) -> String {
     match v {
         CommandRate::OneT => "1T".to_owned(),
         CommandRate::TwoT => "2T".to_owned(),
+        CommandRate::Gdm => "GDM".to_owned(),
     }
 }
 
