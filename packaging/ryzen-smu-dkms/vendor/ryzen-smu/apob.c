@@ -17,6 +17,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/errno.h>
 
 #include "apob.h"
@@ -56,6 +57,17 @@ int apob_init(struct apob_data *apob)
         pr_debug("APOB: probing candidate %d at phys 0x%llx\n",
                  i, (unsigned long long)addr);
 
+        /* Skip candidates that overlap System RAM — ioremap on System
+         * RAM triggers kernel warnings and can panic on panic_on_warn=1
+         * systems. The APOB lives in ACPI Non-volatile Storage (NVS)
+         * regions, not System RAM. */
+        if (region_intersects(addr, PAGE_SIZE, IORESOURCE_SYSTEM_RAM,
+                              IORES_DESC_NONE) != REGION_DISJOINT) {
+            pr_debug("APOB: 0x%llx is in System RAM, skipping\n",
+                     (unsigned long long)addr);
+            continue;
+        }
+
         /* Map one page to check the signature.
          * ioremap_cache() is the correct API for mapping system RAM
          * (cacheable). It is used by the existing PM table path in
@@ -72,19 +84,28 @@ int apob_init(struct apob_data *apob)
 
         if (sig == APOB_SIGNATURE) {
             /* Signature found! Read the header fields.
-             * Header layout (source: ZenStates-Core ApobHeader.cs):
+             * Header layout (AMD openSIL xUSL/Apob.c APOB_BASE_HEADER):
              *   +0x00: signature (u32) = "APOB"
              *   +0x04: version (u32)
              *   +0x08: table_size (u32) - total size of APOB table
-             *   +0x0C: header_size (u32) - size of header + offset array
+             *   +0x0C: OffsetOfFirstEntry (u32) - byte offset where the
+             *          first entry starts; equivalent to the header size
              */
-            u32 header_size;
+            u32 offset_of_first_entry;
 
             version = readl(page + 0x04);
             table_size = readl(page + 0x08);
-            header_size = readl(page + 0x0C);
+            offset_of_first_entry = readl(page + 0x0C);
 
-            /* Sanity checks */
+            /* Validate the APOB header using AMD's openSIL rules:
+             * - Signature must be "APOB" (already checked)
+             * - Version must be >= 5 (versions 1-4 are legacy,
+             *   pre-chained-entry format)
+             * - OffsetOfFirstEntry must be >= 16 (minimum header:
+             *   sig+ver+size+offset)
+             * - OffsetOfFirstEntry must be < table_size
+             * - table_size must be reasonable (> 0 and < some max)
+             */
             if (table_size == 0 || table_size > APOB_MAX_TABLE_SIZE) {
                 pr_warn("APOB: invalid table size %u at 0x%llx "
                         "(expected 1..%d)\n",
@@ -94,15 +115,18 @@ int apob_init(struct apob_data *apob)
                 continue;
             }
 
-            /* Defense-in-depth: the 4-byte "APOB" signature alone is a
-             * weak discriminator; also require the header_size field
-             * to be within the documented range (12..=64 bytes). A
-             * coincidental byte match with a plausible table_size but
-             * an implausible header_size is rejected. */
-            if (header_size < 12 || header_size > 64) {
-                pr_warn("APOB: implausible header size %u at 0x%llx "
-                        "(expected 12..64) — rejecting\n",
-                        header_size, (unsigned long long)addr);
+            if (version < 5) {
+                pr_debug("APOB: version %u < 5, not supported\n",
+                         version);
+                iounmap(page);
+                continue;
+            }
+
+            if (offset_of_first_entry < 16 ||
+                offset_of_first_entry >= table_size) {
+                pr_debug("APOB: implausible OffsetOfFirstEntry %u "
+                         "(table size %u) — rejecting\n",
+                         offset_of_first_entry, table_size);
                 iounmap(page);
                 continue;
             }
@@ -137,8 +161,9 @@ int apob_init(struct apob_data *apob)
             apob->found = true;
 
             pr_info("APOB: found at phys 0x%llx, version 0x%08x, "
-                    "size %u bytes\n",
-                    (unsigned long long)addr, version, table_size);
+                    "size %u bytes, OffsetOfFirstEntry %u\n",
+                    (unsigned long long)addr, version, table_size,
+                    offset_of_first_entry);
             ret = 0;
             break;
         }
