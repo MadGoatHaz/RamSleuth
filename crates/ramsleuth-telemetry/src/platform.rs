@@ -331,7 +331,7 @@ fn smu_version_from(smu_version: Option<&str>) -> Section<String> {
 /// The match is deliberately conservative: a token that does not fully
 /// validate is skipped, and a string with no valid token yields `None` →
 /// honest N/A, never a fabricated value.
-fn parse_agesa(s: &str) -> Option<String> {
+pub(crate) fn parse_agesa(s: &str) -> Option<String> {
     let mut iter = s.split_whitespace().peekable();
     while let Some(token) = iter.next() {
         if token.eq_ignore_ascii_case("AGESA") {

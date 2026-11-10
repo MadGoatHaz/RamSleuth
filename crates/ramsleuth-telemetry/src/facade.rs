@@ -367,7 +367,7 @@ fn amd_branch(cpu: &CpuInfo) -> TelemetryResult<AmdReadout> {
     // On cIOD platforms (desktop Ryzen AM4/AM5), the SMN registers are
     // the live source — APOB is not consulted (no behavior change).
     if matches!(platform, cpuid::AmdPackageType::Server(_)) {
-        match try_apob_timings() {
+        match try_apob_timings(zen) {
             Ok(Some(apob_ch)) => {
                 overlay_apob_timings(&mut readout, &apob_ch);
             }
@@ -454,12 +454,18 @@ fn apob_error_to_outcome(e: &amd_apob::ApobError) -> ApobProbeOutcome {
 /// Try to read and parse APOB timings from the `ryzen_smu` sysfs
 /// interface.
 ///
+/// The `zen` parameter selects the DDR4 P-state stride used by the
+/// scan-based block locator (Zen 1/2: 0x70, Zen 3: 0x108). Zen 4/5
+/// (DDR5) returns `Ok(None)` since the DDR5 layout is not yet
+/// supported.
+///
 /// Returns:
 /// - `Ok(Some(ch))` — the first *active* channel's timings (a trained
 ///   channel has a non-zero tCL; dormant channels on TRX40's 8-UMC
 ///   topology are all zeros).
 /// - `Ok(None)` — the APOB was read and parsed successfully, but no
-///   channel is active (all tCL values are zero).
+///   channel is active (all tCL values are zero), or the platform uses
+///   DDR5 (Zen 4/5).
 /// - `Err(outcome)` — the APOB probe failed with a specific outcome
 ///   (module not ready, APOB not found, or timings unavailable) that
 ///   drives the N/A reason on the timing fields (M2).
@@ -467,7 +473,9 @@ fn apob_error_to_outcome(e: &amd_apob::ApobError) -> ApobProbeOutcome {
 /// All errors are contained: a failure here never propagates past this
 /// function — the facade degrades to the SMN path (the existing
 /// behavior). Never panics.
-fn try_apob_timings() -> Result<Option<amd_apob::ApobChannelTimings>, ApobProbeOutcome> {
+fn try_apob_timings(
+    zen: crate::cpuid::AmdZen,
+) -> Result<Option<amd_apob::ApobChannelTimings>, ApobProbeOutcome> {
     // First, check if the APOB is available (lightweight probe).
     match amd_apob::apob_is_available() {
         Ok(true) => {
@@ -475,10 +483,16 @@ fn try_apob_timings() -> Result<Option<amd_apob::ApobChannelTimings>, ApobProbeO
             // found. Read and parse it.
             let blob = amd_apob::read_apob_from_sysfs().map_err(|e| apob_error_to_outcome(&e))?;
             let apob = amd_apob::parse_apob(&blob).map_err(|e| apob_error_to_outcome(&e))?;
-            let timings = amd_apob::extract_siod_ddr4_timings(&apob)
-                .map_err(|e| apob_error_to_outcome(&e))?;
-            // The first active (non-dormant) channel.
-            Ok(timings.channels.iter().find(|ch| ch.tcl != 0).copied())
+            // Extract DDR4 timings using the platform-appropriate
+            // stride. Returns None when no valid blocks are found or
+            // when the platform uses DDR5 (Zen 4/5).
+            match amd_apob::extract_ddr4_timings(&apob.entries, zen) {
+                Some(channels) => {
+                    // The first active (non-dormant) channel.
+                    Ok(channels.iter().find(|ch| ch.tcl != 0).copied())
+                }
+                None => Ok(None),
+            }
         }
         Ok(false) => {
             // The module is loaded and has APOB support, but the APOB
@@ -2393,7 +2407,7 @@ mod tests {
     fn try_apob_timings_is_panic_free() {
         // Running this to completion is the no-panic check. On a host
         // without the APOB sysfs interface, this returns None.
-        let _ = try_apob_timings();
+        let _ = try_apob_timings(crate::cpuid::AmdZen::Zen3);
     }
 
     /// `overlay_apob_timings` maps the APOB channel timings onto the
@@ -2473,6 +2487,7 @@ mod tests {
         // Synthetic APOB channel (Sea_Monkey's known-good DDR4-3200 CL14).
         let apob_ch = amd_apob::ApobChannelTimings {
             channel: 1,
+            memclk_mhz: 800, // DDR4-3200 = 800 MHz memory clock
             tcl: 14,
             trcdw: 18,
             trcdr: 18,
@@ -2611,6 +2626,7 @@ mod tests {
         // tRAS — neither should be overlaid.
         let apob_ch = amd_apob::ApobChannelTimings {
             channel: 0,
+            memclk_mhz: 800,
             tcl: 0,    // zero → skip
             trcdw: 18, // in-range → overlay
             trcdr: 18,
