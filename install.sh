@@ -704,6 +704,32 @@ amd_walk() {
   local helper
   if [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
     header "AMD — optional ryzen_smu kernel module"
+
+    # Auto-rebuild on update: if the ryzen_smu module is currently loaded but
+    # its DKMS version doesn't match the version we just installed, rebuild it
+    # automatically. The DKMS version now tracks the RamSleuth version, so a
+    # version change is detected by comparing the registered DKMS version
+    # against $VERSION. This makes ./install.sh (the one-liner) auto-update
+    # the kernel module without a separate manual step.
+    if lsmod | grep -q "^ryzen_smu"; then
+      local current_dkms_ver=""
+      if command -v dkms >/dev/null 2>&1; then
+        current_dkms_ver="$(dkms status 2>/dev/null | grep "^ryzen_smu/" | head -n1 | sed 's|^ryzen_smu/||; s|[, ].*||')"
+      fi
+      if [[ -n "$current_dkms_ver" && "$current_dkms_ver" != "$VERSION" ]]; then
+        printf '  The ryzen_smu module is loaded (DKMS version %s), but RamSleuth is now v%s.\n' "$current_dkms_ver" "$VERSION"
+        printf '  Auto-rebuilding the module for the new version…\n\n'
+        helper="/usr/bin/ramsleuth-install-ryzen-smu-dkms"
+        [[ -x "$helper" ]] || helper="$SRC/scripts/install-ryzen-smu-dkms.sh"
+        step "Handing off to: $helper"
+        exec "$helper" --version "$VERSION"
+      else
+        printf '  The ryzen_smu module is already loaded and up to date (v%s).\n' "${current_dkms_ver:-$VERSION}"
+        DKMS_STATE="skipped"
+        return 0
+      fi
+    fi
+
     printf '  ryzen_smu enables LIVE AMD subtimings. It is OPTIONAL: without it the app\n'
     printf '  runs fine — the AMD section reads N/A (DriverMissing), exit 0, no panic.\n'
     printf '  Installing it now runs the shared pinned helper, which uses the OFFLINE\n'

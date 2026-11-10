@@ -94,7 +94,7 @@
 
 pkgname=ramsleuth-bin
 pkgver=2.4.27   # FIXED — the tarball is downloaded from the GitHub Release for this exact version
-pkgrel=2
+pkgrel=3
 pkgdesc="Pure-Rust RAM latency/bandwidth telemetry: privileged daemon + unprivileged CLI/TUI/GUI clients (precompiled binary)"
 arch=(x86_64)
 url="https://github.com/MadGoatHaz/RamSleuth"
