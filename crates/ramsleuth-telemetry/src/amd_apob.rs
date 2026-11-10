@@ -1213,8 +1213,10 @@ mod tests {
     /// - 3 u16 tRFC values
     ///
     /// The stride between blocks is `stride`.
+    type Ddr4BlockFields =
+        (u16, u8, u8, u8, u8, u16, u16, u8, u8, u8, u8, u8, u16, u16);
     fn build_ddr4_timing_payload(
-        blocks: &[(u16, u8, u8, u8, u8, u16, u16, u8, u8, u8, u8, u8, u16, u16)],
+        blocks: &[Ddr4BlockFields],
         stride: usize,
     ) -> Vec<u8> {
         // blocks: (memclk, cl, cwl, rcw, rp, ras, rc, wr, rrds, wtrs, faw, rrld, trfc_s, trfc_f)
@@ -1567,7 +1569,7 @@ mod tests {
     /// AGESA extraction: a bare dotted-numeric AGESA version.
     #[test]
     fn test_agesa_extraction_bare_version() {
-        let payload = b"BOARD ID STRING\0PCB REV 2.1\05.06.01.00\0".to_vec();
+        let payload = b"BOARD ID STRING\0PCB REV 2.1\x005.06.01.00\0".to_vec();
         let blob = build_apob_blob(&[(4u32, 1u32, 0u32, payload)]);
         let apob = parse_apob(&blob).expect("APOB must parse");
         let agesa = extract_agesa_from_apob(&apob);
