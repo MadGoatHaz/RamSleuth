@@ -140,4 +140,4 @@ Rust MSRV 1.75. Produces the 6 binaries above.
 
 MIT — see [LICENSE](LICENSE).
 
-RamSleuth v2.4.27
+RamSleuth v2.4.28
