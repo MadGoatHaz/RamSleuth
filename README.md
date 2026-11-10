@@ -1,113 +1,143 @@
-# RamSleuth v2.4.24
+# RamSleuth
 
-Live memory-controller telemetry and a native Memory & Latency Benchmark for AMD and Intel PC RAM — 100% pure Rust, dual frontend (terminal + desktop), one small-capability privileged daemon.
+See what your memory controller is actually doing — live.
 
 ![RamSleuth — GUI and TUI](img/RamSleuth.png)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Latest Release](https://img.shields.io/github/release/MadGoatHaz/RamSleuth.svg)](https://github.com/MadGoatHaz/RamSleuth/releases)
+[![GitHub](https://img.shields.io/badge/source-GitHub-black?logo=github)](https://github.com/MadGoatHaz/RamSleuth)
+
 ## What it is
 
-RamSleuth is a 9-crate Rust workspace (8 product crates + the `tools/gen-icon` dev tool) with two layers: **live telemetry** of the memory controller's operating state, and a **native memory & latency benchmark engine** for bandwidth and latency.
+RamSleuth is a live memory-controller telemetry suite and a native Memory &
+Latency Benchmark for AMD and Intel PC RAM. It reads the memory controller's
+actual operating state — clocks, trained DRAM subtimings, voltages, channel
+mode, ECC — not just the SPD label on your DIMMs.
 
-Every privileged read flows through a single root daemon that holds only `CAP_SYS_RAWIO` — all clients (the CLI, the TUI, the GUI) run fully unprivileged — and the no-panic contract means a missing driver, privilege, or piece of hardware never crashes anything: the affected fields render as a structured `N/A (<reason>)` and the process exits 0.
+Built in pure Rust with a single small-capability privileged daemon and
+unprivileged clients (GUI, TUI, CLI). No-panic by design: missing drivers,
+privileges, or hardware degrade to structured `N/A (<reason>)` fields, exit 0.
 
-## What's new in v2.4.24
+## Features
 
-- **AMD Zen 4 / Zen 5 / Zen 6 generation detection fixed** — CPU generation is now resolved from the family+model number (matching the Linux kernel's CPU table) instead of family-only: previously every family `0x19` part (both Zen 3 and Zen 4) reported as "Zen 3" and every `0x1A` (Zen 5/6) as "Zen 4". Ryzen 9 7000 (Raphael) and 9000 (Granite Ridge) are now identified correctly, and Zen 6 (family `0x1A`, models `0x50`+) is detected.
-- **Ryzen 9 7000 / 9000 PM table support (Raphael, v0x540004)** — the complete Raphael PM-table layout is now decoded (FCLK/UCLK/MCLK, SVI3 core/SOC/misc rail voltages, package power, core current, temperature), so AM5 desktops no longer see the whole AMD section degrade to "N/A (new PM table)".
+- **Live AMD telemetry** — Zen 1–6 (DDR4/DDR5), Threadripper/TRX40 via APOB
+  - 27 DRAM subtimings, CAD bus, 5 voltage rails
+  - PM-table clocks (MCLK/UCLK/FCLK), GDM, command rate
+  - Threadripper/TRX40: APOB firmware structure (live SMN not updated on sIOD)
+  - Channel mode, ECC, live vCore
+- **Live Intel telemetry** — Skylake → Arrow Lake (DDR4/DDR5), server/HEDT via
+  SMBIOS+SPD
+  - Trained subtimings from IMC registers
+  - Channel mode: 4-tier hardware cross-check
+  - ECC from host-bridge CAPID0_A
+  - vCore from Super-I/O (confidence-badged)
+  - Server/HEDT: SMBIOS+SPD (live MC registers are CPU-internal)
+- **Unprivileged SPD decode** — JESD79-4 (DDR4) / JESD79-5 (DDR5)
+  - Module & DRAM die maker (JEP106), rank, bus width, part, serial
+  - JEDEC base speed + XMP 2.0 (DDR4) / XMP 3.0-EXPO (DDR5) profiles
+- **Memory & Latency Benchmark** — native 4×4 grid (DRAM/L1/L2/L3 × Read/Write/Copy/Latency)
+  - AVX2/AVX-512F kernels, one worker per physical core
+  - Pointer-chase latency + optional burn-in soak
+- **Dual frontend** — egui desktop GUI + 17-key ratatui terminal UI
+  - Live three-zone dashboard, 5-series graphs, PNG/JSON export
+- **One-line RAM summary** — size, speed, channel mode, ECC, clocking
+- **Consent-gated probe report** — system identity, decoded readout, N/A reasons, raw register dump
+  - One-click Open GitHub Issue (GUI) or `~/.ramsleuth/probe-report.md` (TUI)
 
-## Why RamSleuth
+## Platform Support
 
-- **Live AMD memory-controller state** — SMU PM-table clocks (MCLK/UCLK/FCLK), 27 DRAM subtimings (SMN register space on desktop Ryzen; **APOB** firmware structure on Threadripper / TRX40 — see v2.4.22), GDM, and command rate via the `ryzen_smu` kernel driver, plus channel-mode (SMN CS population) and ECC (SMN `UmcCapHi`) decoded from the memory-controller registers.
-- **Live Intel memory-controller state** — trained DRAM subtimings + the DRAM core clock, decoded from the IMC registers across the full client line (Skylake → Arrow Lake, DDR4 and DDR5) and the server / HEDT line (Haswell-E → Sapphire Rapids): the `ramsleuth_intel` kernel module's sysfs attributes first (25 core, up to 79 on a 12th-gen+ Alder/Raptor DDR4 box), the host-bridge MCHBAR mapped read-only through `/dev/mem` as the fallback where the kernel permits — and server / HEDT platforms, whose MC timing registers live in CPU-internal uncore (no OS-accessible BAR, no `/dev/mem` path), decode from the unprivileged SMBIOS Type 17 topology + the SPD EEPROM rated timings instead (the MC live cells an honest `N/A`). **Modern Intel is detected correctly** — the generation is resolved from the CPUID model *and* brand string, so a 12th-gen+ part (e.g. the i5-12600KF) resolves to Alder Lake and decodes fully (no more false `unsupported`), and the IMC base + window are keyed on that generation (`0xd800` / 256 KiB for 12th-gen+, `0x5000` / 64 KiB before). **Channel mode is hardware-derived and cross-checked** — capacity-derived from the DIMM slot registers and reconciled against the unprivileged SMBIOS Type 17 population (a 4-tier trust procedure), so a populated dual-channel kit reads `Dual-Channel (Symmetric)` (DDR4) or `Dual-Channel (4x 32-bit Subchannels)` (DDR5), never a false `Single-Channel`; ECC decodes from the host-bridge `CAPID0_A` (`Not Capable` / `Capable (disabled)` / `Enabled` / `N/A`). **CPU vCore is board-delivered** from the Super-I/O `in0` (the direct VRM sense) with an honest confidence badge — verified on a curated seed board, `[est]` on a consumer-vendor board, `N/A` on enterprise / out-of-bounds / no-Super-I/O (never a fabricated value).
-- **Unprivileged SPD** — every DIMM's EEPROM decoded without root, re-baselined to the JEDEC SPD standard — JESD79-4 (DDR4, 512 B) / JESD79-5 (DDR5, 1024 B): module maker + DRAM die maker (JEP106), rank + bus width, part, serial, JEDEC base speed, XMP 2.0 (DDR4) / XMP 3.0-EXPO (DDR5) profiles; the root daemon additionally attempts to bind any EEPROM the kernel's `ee1004` driver missed (SPD auto-bind, on by default — `--no-spd-autobind` to disable, non-fatal, never unbinds).
-- **Memory & Latency Benchmark (4×4 grid)** — native AVX2/AVX-512F kernels, one worker pinned per physical core, pointer-chase latency, and an optional burn-in soak.
-- **Dual frontend, full CLI** — the same live three-zone dashboard in a 17-key ratatui terminal UI and an egui desktop app, with 5-series graphs and PNG/JSON export.
-- **One-line RAM summary** — the header reads `RAM: <size> (<dimm>) <speed> MT/s | <channel mode> | ECC: <status> | Mode: <clocking>` — channel mode on both platforms (Intel MAD + DIMM population, AMD SMN CS population), ECC from the host-bridge / SMN registers.
-- **Submit Probe Report** — consent-gated (the GUI header `Probe` button, the TUI `[F]`): a markdown report with the system identity (CPU brand/generation, PCI host-bridge ID, kernel/OS/arch, version, telemetry source), the decoded readout, the N/A reasons, and the raw register dump (Intel + AMD) — one-click **Open GitHub Issue** (GUI) or a `~/.ramsleuth/probe-report.md` write (TUI `[w]`), with an explicit no-PII disclosure.
-- **Minimal privilege** — one daemon, `CAP_SYS_RAWIO` only, on a group-owned Unix socket.
-- **No-panic by design** — absent hardware, drivers, or privileges degrade to `N/A (<reason>)`, exit 0.
+| Platform | Memory | What you get |
+| --- | --- | --- |
+| AMD Ryzen (Zen 1–6) | DDR4 / DDR5 | Full live SMU telemetry: clocks, 27 subtimings, voltages, channel mode, ECC |
+| AMD Threadripper / TRX40 | DDR4 | APOB firmware timings, limited PM table (sIOD SMN not live) |
+| AMD EPYC | DDR4 / DDR5 | APOB-based telemetry (server sIOD path) |
+| Intel client (Skylake → Arrow Lake) | DDR4 / DDR5 | Full live IMC telemetry: trained subtimings, clocks, channel mode, ECC |
+| Intel server / HEDT (Haswell-E → Sapphire Rapids) | DDR4 / DDR5 | SMBIOS+SPD topology; live MC registers are CPU-internal (honest `N/A`) |
 
-## The 6 binaries
+**Requirements:** Linux x86_64, kernel 5.4+, systemd.
 
-| Binary | What it is |
+## The Tools
+
+| Binary | Description |
 | --- | --- |
-| `ramsleuth-daemon` | The privileged service — root with `CAP_SYS_RAWIO` only; serves telemetry, benchmark runs, and burn-in over a Unix socket. |
-| `ramsleuth-client` | The unprivileged CLI — `dump` (the telemetry listing), `bench` (the streamed 4×4 grid), `status` (the per-section health summary), **`probe` (the consent-gated report), and `burn` (a burn-in soak)**. |
-| `ramsleuth-tui` | The live terminal dashboard (ratatui) — the full GUI in a 17-key terminal UI; the key map lives in the User Guide. |
-| `ramsleuth` | The desktop GUI (egui) — three-zone dashboard, dedicated graphs window, settings panel, and the one-click setup strip. |
-| `ramsleuth-bench` | Standalone benchmark — runs the 4×4 AVX2/AVX-512F grid directly (**or just the latency pass with `--latency`**); no daemon required. |
-| `ramsleuth-telemetry` | Standalone snapshot — the full telemetry dashboard as one text (or `--json`) listing; no daemon required. |
+| `ramsleuth` | Desktop GUI (egui) — dashboard, graphs, settings, one-click setup |
+| `ramsleuth-tui` | Terminal dashboard (ratatui) — full UI in 17 keys |
+| `ramsleuth-client` | Unprivileged CLI — `dump`, `bench`, `status`, `probe`, `burn` |
+| `ramsleuth-daemon` | Privileged service — `CAP_SYS_RAWIO` only, Unix-socket IPC |
+| `ramsleuth-bench` | Standalone benchmark — 4×4 grid, no daemon required |
+| `ramsleuth-telemetry` | Standalone snapshot — full telemetry, no daemon required |
 
 ## Installation
 
-**One-liner (from GitHub):**
+### Quick Start (any distro)
 
 ```sh
 git clone https://github.com/MadGoatHaz/RamSleuth && cd RamSleuth && ./install.sh
 ```
 
-> Works on **any distro** with systemd — by default it downloads the precompiled release binary (no Rust toolchain needed). For the manual build-from-source path, see [User Guide §2.6](Docs/User_Guide.md#26-install-any-distro).
+Downloads the precompiled release binary (no Rust toolchain needed),
+installs all 6 binaries + systemd unit + setup helper, and enables the
+daemon. Idempotent and safe to re-run.
 
-Self-contained and idempotent: it prints every source it uses and the exact commit it installs before doing anything, and a re-run after any failure is safe.
+### AUR (Arch/Manjaro)
 
-**AUR (Arch) — pick exactly one:**
-
-```sh
-yay -S ramsleuth      # STABLE — builds from the official release tag
-yay -S ramsleuth-bin  # PRECOMPILED — downloads the release tarball (fastest install)
-```
-
-(`paru -S …` works in place of `yay`.)
-
-**Debian/Ubuntu/Mint — `.deb` package:**
+Pick exactly one:
 
 ```sh
-wget https://github.com/MadGoatHaz/RamSleuth/releases/download/v2.4.24/ramsleuth_2.4.24_amd64.deb
-sudo dpkg -i ramsleuth_2.4.24_amd64.deb
-sudo usermod -aG ramsleuth $USER
-newgrp ramsleuth        # or log out and back in
-ramsleuth-tui
+yay -S ramsleuth      # builds from the official release tag
+yay -S ramsleuth-bin  # precompiled tarball (fastest)
 ```
 
-`dpkg -i` pulls in the `systemd` + `acl` dependencies automatically; the package creates the `ramsleuth` group, installs the 6 binaries + the frozen systemd unit + the setup helper + the polkit policy, and enables the daemon. (The `install.sh` one-liner above is equivalent and works on any distro.)
+### Debian/Ubuntu (.deb)
 
-**AMD live subtimings:** the driver is **bundled** with the app — the in-app one-click (or `sudo ramsleuth-setup --with-dkms` / `sudo ramsleuth-install-ryzen-smu-dkms`) builds the pinned third-party `ryzen_smu` module **offline** from the vendored source; without it the AMD fields read `N/A (DriverMissing)` and everything else keeps serving. The standalone `ryzen-smu-dkms` AUR extra is **mutually exclusive** with the app packages — full details in the [User Guide](Docs/User_Guide.md).
+Download the `.deb` from the [releases page](https://github.com/MadGoatHaz/RamSleuth/releases), then:
 
-**Intel live subtimings (optional extra):** `yay -S ramsleuth-intel-dkms` provides RamSleuth's own in-repo `ramsleuth_intel` kernel module — DKMS-built for your running kernel, exposing the raw IMC registers over world-readable sysfs (the 25-attribute core set, plus two generation-gated groups on 12th-gen+ silicon — the DDR4 `alk_d4_tc` block and the `tier3_extended` block — taking a 12th-gen+ Alder/Raptor DDR4 box to 79 attributes); source and dev-branch installs ship the helper directly (`sudo ramsleuth-install-intel-dkms`), and the one-click setup routes to it automatically on Intel hosts (the v2.4.19 release tarball and the `ramsleuth-bin` binary ship the `ramsleuth_intel` source + the helper). Without it the daemon falls back to the read-only `/dev/mem` MCHBAR map where the kernel permits, and the Intel fields read `N/A (DriverMissing)` where it does not — everything else keeps serving — full details in the [User Guide](Docs/User_Guide.md).
-
-**Build from source:** `cargo build --workspace --release` — Rust MSRV 1.75, producing the 6 binaries above; system-library and per-path details in the [User Guide](Docs/User_Guide.md).
-
-## Quickstart
-
-1. **Install** — the `install.sh` one-liner above, or either AUR package.
-2. **Open the app** — run `ramsleuth` (the GUI, or its desktop-menu entry); `ramsleuth-tui` is the terminal equivalent.
-3. **One click** — on first launch the `SETUP` strip offers **Set up RamSleuth**: one polkit password prompt enables + starts the daemon, joins your user to the `ramsleuth` group, grants a current-session socket ACL (no re-login), and — on AMD/Intel silicon — builds + loads the telemetry driver (`ryzen_smu` / `ramsleuth_intel`) in the same action: no reboot, no app restart — the app auto-reconnects and the strip disappears on its own. No desktop? The same one step from a terminal is `sudo ramsleuth-setup --with-dkms` (AMD: the `ryzen_smu` driver; Intel: the `ramsleuth_intel` module).
-4. **Read and run** — the dashboard is live from the first second: telemetry matrix, benchmark grid, and hardware/SPD status; start a benchmark from either frontend, or run the standalone tools.
-
-The six RamSleuth binaries:
-
-```bash
-ramsleuth              # desktop GUI
-ramsleuth-tui          # terminal dashboard
-ramsleuth-client probe # one-line RAM summary
-ramsleuth-client dump  # full decoded dump
-ramsleuth-bench        # 4×4 memory & latency benchmark
-ramsleuth-telemetry    # standalone snapshot (no daemon)
+```sh
+sudo dpkg -i ramsleuth_amd64.deb
+sudo usermod -aG ramsleuth $USER && newgrp ramsleuth
 ```
 
-The full walkthrough — every zone, key, flag, N/A reason, and day-2 troubleshooting — is in the [User Guide](Docs/User_Guide.md).
+Installs the 6 binaries, systemd unit, setup helper, polkit policy, and
+enables the daemon.
+
+### Optional: Live Memory Controller Drivers
+
+Without these, everything else still works — only the live MC fields
+read `N/A (DriverMissing)`.
+
+- **AMD** — the `ryzen_smu` driver is bundled; the one-click setup builds it
+  from vendored source offline.
+- **Intel** — `yay -S ramsleuth-intel-dkms` (AUR) or the in-app one-click
+  setup builds RamSleuth's own `ramsleuth_intel` module via DKMS.
+
+### Build from Source
+
+```sh
+cargo build --workspace --release
+```
+
+Rust MSRV 1.75. Produces the 6 binaries above.
+
+## Quick Start (first run)
+
+1. **Install** using any method above.
+2. **Launch** — run `ramsleuth` (GUI) or `ramsleuth-tui` (terminal).
+3. **One click** — the first-launch `SETUP` strip enables the daemon, adds
+   your user to the `ramsleuth` group, and builds the telemetry driver if
+   present. No reboot required.
+4. **Read** — the dashboard is live immediately; start a benchmark from the
+   GUI, TUI, or `ramsleuth-client bench`.
 
 ## Documentation
 
-- [Architecture](Docs/Architecture.md) — the deep technical design: the two-layer model, the daemon and wire protocol, the 9-crate workspace map, every telemetry source, the benchmark engine, deployment, and testing/CI.
-- [User Guide](Docs/User_Guide.md) — installation, first run, running the GUI / TUI / CLI / standalone tools, reading the data (clocks, subtimings, SPD/XMP/EXPO, N/A reasons), and day-2 troubleshooting.
-- [Packaging & AUR](packaging/README.md) — the two-package AUR model, the unified version-bump flow, the `ryzen-smu-dkms` extra, and the CI/release artifact contracts.
-- [Changelog](CHANGELOG.md) — release history.
-
-**Versioning** — the single source of truth is `[workspace.package].version` in the root `Cargo.toml` (this tree: **2.4.24**); releases are tag-driven and the AUR packages follow in lockstep — the full policy lives in [packaging/README.md](packaging/README.md).
+- [User Guide](Docs/User_Guide.md) — installation, first run, reading the data, troubleshooting
+- [Architecture](Docs/Architecture.md) — technical design, daemon protocol, workspace map
+- [Packaging & AUR](packaging/README.md) — AUR model, version-bump policy, release artifacts
+- [Changelog](CHANGELOG.md) — per-release history
 
 ## License
 
-MIT — the workspace `Cargo.toml` declares `license = "MIT"`. Repository: <https://github.com/MadGoatHaz/RamSleuth>.
+MIT — see [LICENSE](LICENSE).
 
-RamSleuth v2.4.24 · branch `v2-development`
+RamSleuth v2.4.24
