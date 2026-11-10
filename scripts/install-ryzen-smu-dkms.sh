@@ -49,6 +49,32 @@
 
 set -euo pipefail
 
+# --- Argument parsing ----------------------------------------------------------
+# Optional: --version <ramslueuth-version> forces the DKMS version (used by the
+# AUR post_upgrade hook, which knows the new package version). Without it, the
+# version is auto-detected (Cargo.toml / ramsleuth-client / fallback).
+EXPLICIT_VERSION=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --version)
+      if [[ $# -lt 2 ]]; then
+        echo '[ryzen-smu-dkms] ERROR: --version requires a value' >&2
+        exit 1
+      fi
+      EXPLICIT_VERSION="$2"
+      shift 2
+      ;;
+    -h|--help)
+      printf 'Usage: %s [--version <ramslueuth-version>]\n' "$0"
+      exit 0
+      ;;
+    *)
+      echo "[ryzen-smu-dkms] ERROR: unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
 # --- Durable setup-log capture (no-op standalone) ----------------------------
 # When invoked via `ramsleuth-setup` (which exports RAMSLEUTH_SETUP_LOG and
 # `exec`s us over its tee'd stdout), our output ALREADY reaches the log
@@ -122,6 +148,41 @@ list_kernel_headers() {
     elif command -v dnf &>/dev/null; then
         dnf list installed 2>/dev/null | grep "kernel-devel"
     fi
+}
+
+# Detect the RamSleuth version to use as the DKMS version.
+# Priority: (1) the explicit --version argument (the AUR post_upgrade hook
+# passes the new package version), (2) Cargo.toml when running from a dev
+# checkout, (3) the installed ramsleuth-client binary's --version output,
+# (4) the legacy upstream-commit scheme (1.<short>) as a last resort.
+# Tracking the RamSleuth version (not the upstream commit) is what makes
+# package updates trigger a DKMS rebuild: the new version string is a new
+# DKMS entry, and the self-heal below removes the old one.
+detect_ramsleuth_version() {
+    local ver
+    if [[ -n "${EXPLICIT_VERSION:-}" ]]; then
+        printf '%s\n' "$EXPLICIT_VERSION"
+        return 0
+    fi
+    # Dev checkout: the workspace version in Cargo.toml.
+    if [[ -f "${REPO_ROOT}/Cargo.toml" ]]; then
+        ver="$(awk -F'"' '$1 ~ /^version/{print $2; exit}' "${REPO_ROOT}/Cargo.toml" 2>/dev/null || true)"
+        if [[ -n "$ver" && "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            printf '%s\n' "$ver"
+            return 0
+        fi
+    fi
+    # Installed package: the version the ramsleuth-client binary reports.
+    if command -v ramsleuth-client >/dev/null 2>&1; then
+        ver="$(ramsleuth-client --version 2>/dev/null | head -n1 | awk '{print $NF}' || true)"
+        if [[ -n "$ver" && "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            printf '%s\n' "$ver"
+            return 0
+        fi
+    fi
+    # Legacy fallback: the old upstream-commit-based scheme.
+    printf '1.%s\n' "${UPSTREAM_PIN:0:7}"
+    return 0
 }
 
 # Secure Boot detection (read-only): prints "enabled" or "disabled".
@@ -290,9 +351,10 @@ if [[ -n "${VENDOR_SRC}" ]]; then
   else
     USE_VENDOR=1
     SRC_DIR="${VENDOR_SRC}"
-    PKGVER="1.${UPSTREAM_PIN:0:7}"    # fixed version — no git rev-list on the vendor path
+    PKGVER="$(detect_ramsleuth_version)"    # DKMS version tracks the RamSleuth version
     log "Vendored source (offline, no network fetch): ${SRC_DIR}"
     log "Pinned commit: ${UPSTREAM_PIN} (short: ${UPSTREAM_PIN:0:7}) — vendored copy (no git metadata)"
+    log "DKMS version: ${PKGVER} (tracks the RamSleuth version — a package update rebuilds the module)"
     SUMS_FILE="$(dirname -- "${SRC_DIR}")/SUMS.sha256"
     [[ -f "${SUMS_FILE}" ]] \
       || die "vendor tree found at ${SRC_DIR} but its ${SUMS_FILE} manifest is missing — refusing to build from unverified source"
@@ -363,7 +425,10 @@ done
 # ryzen_smu-dkms-git PKGBUILD (pkgver = rev-count . short-hash; the vendor
 # path above uses the fixed 1.<short> — no git rev-list).
 if [[ "${USE_VENDOR}" -eq 0 ]]; then
-  PKGVER="$(cd -- "${SRC_DIR}" && printf '%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)")"
+  # Even for the git-fetched (non-vendor) source, the DKMS version tracks the
+  # RamSleuth version — not the upstream ryzen_smu commit — so that a RamSleuth
+  # package update triggers a rebuild.
+  PKGVER="$(detect_ramsleuth_version)"
 fi
 STAGE_DIR="/usr/src/${MODULE}-${PKGVER}"
 install -d "${STAGE_DIR}"
