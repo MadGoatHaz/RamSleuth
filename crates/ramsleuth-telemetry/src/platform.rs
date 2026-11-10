@@ -21,7 +21,7 @@
 //! | `cpu_clock_mhz` | `/proc/cpuinfo` `cpu MHz` (first core) | `Na(NotApplicable)` |
 //! | `motherboard` | DMI `board_name` → `board_vendor` → `product_name` | `Na(NotApplicable)` (VM/container) |
 //! | `bios` | DMI `bios_version` (` + <bios_date>` when present) | `Na(NotApplicable)` |
-//! | `agesa` | true AGESA token from the DMI BIOS string only (the real AGESA string is root-gated, so commonly absent, D-1); the SMU firmware version rides `smu_version` | `Na(NotApplicable)` |
+//! | `agesa` | SMBIOS Type 40 AGESA string (authoritative, e.g. "V9 ComboAm5PI 1.2.8.0"), falling back to the DMI BIOS string token scan; the SMU firmware version rides `smu_version` | `Na(NotApplicable)` |
 //! | `smu_version` | the `ryzen_smu` driver `version` attribute, shape-checked (never verbatim, D-1) | `Na(NotApplicable)` (driver absent, or the payload fails the shape) |
 //!
 //! The `ryzen_smu` `version` attribute is a plain text file (not an SMN
@@ -32,6 +32,7 @@
 //! to N/A (the module still compiles).
 
 use crate::error::{NaReason, Section};
+use crate::intel_smbios;
 
 /// DMI sysfs directory: the kernel-exposed SMBIOS strings (unprivileged).
 const DMI_ID_DIR: &str = "/sys/class/dmi/id";
@@ -61,10 +62,11 @@ pub struct SystemPlatform {
     /// BIOS version (DMI `bios_version`, with ` + <bios_date>` appended
     /// when the date attribute is present).
     pub bios: Section<String>,
-    /// True AMD AGESA version token, from the DMI BIOS string only (the
-    /// real AGESA string lives in the root-gated SMBIOS Type 11 / raw
-    /// DMI table, so commonly N/A — D-1); the SMU firmware version
-    /// rides [`smu_version`] under its own label.
+    /// AMD AGESA version: the SMBIOS Type 40 AGESA string (e.g.
+    /// "V9 ComboAm5PI 1.2.8.0") when available, falling back to a
+    /// token scan of the DMI BIOS version string; N/A when neither
+    /// source yields a value (D-1). The SMU firmware version rides
+    /// [`smu_version`] under its own label.
     pub agesa: Section<String>,
     /// SMU firmware version from the `ryzen_smu` driver `version`
     /// attribute, shape-checked (the dotted-numeric guarantee, never
@@ -198,12 +200,20 @@ fn read_bios() -> Section<String> {
     }
 }
 
-/// `agesa` source: the true AGESA token from the DMI `bios_version`
-/// string only (the unchanged best-effort scan); `Na(NotApplicable)`
-/// when the string carries no token (common — the real AGESA string is
-/// root-gated, D-1). The SMU firmware version that previously served as
-/// a fallback now rides [`SystemPlatform::smu_version`].
+/// `agesa` source: SMBIOS Type 40 ("Additional Information") first
+/// (the authoritative AGESA string, e.g. "AGESA!V9 ComboAm5PI 1.2.8.0"),
+/// then the best-effort DMI `bios_version` token scan as a fallback;
+/// `Na(NotApplicable)` when neither yields a token (D-1). The SMU
+/// firmware version that previously served as a fallback now rides
+/// [`SystemPlatform::smu_version`].
 fn read_agesa() -> Section<String> {
+    // Primary source: SMBIOS Type 40 (authoritative AGESA string).
+    if let Some(info) = intel_smbios::read_agesa_from_smbios() {
+        if let Some(display) = info.display_string() {
+            return Section::Value(display);
+        }
+    }
+    // Fallback: the DMI `bios_version` token scan.
     let bios = read_dmi("bios_version");
     agesa_from_sources(bios.as_deref())
 }
@@ -289,12 +299,10 @@ fn bios_from_sources(version: Option<&str>, date: Option<&str>) -> Option<String
     })
 }
 
-/// The AGESA source (frozen, D-1): the true AGESA token from the DMI
-/// `bios_version` string only — the real AGESA string (SMBIOS Type 11 /
-/// the raw DMI table) is root-gated and unobtainable unprivileged, so
-/// this commonly degrades to `Na(NotApplicable)`. The SMU firmware
-/// version is no longer a fallback here; it rides
-/// [`SystemPlatform::smu_version`] under its own label.
+/// The AGESA fallback source (D-1): the true AGESA token from the DMI
+/// `bios_version` string — used when SMBIOS Type 40 carries no AGESA
+/// string. The SMU firmware version is no longer a fallback here; it
+/// rides [`SystemPlatform::smu_version`] under its own label.
 fn agesa_from_sources(bios_version: Option<&str>) -> Section<String> {
     match bios_version.and_then(parse_agesa) {
         Some(token) => Section::Value(token),
@@ -331,7 +339,7 @@ fn smu_version_from(smu_version: Option<&str>) -> Section<String> {
 /// The match is deliberately conservative: a token that does not fully
 /// validate is skipped, and a string with no valid token yields `None` →
 /// honest N/A, never a fabricated value.
-fn parse_agesa(s: &str) -> Option<String> {
+pub(crate) fn parse_agesa(s: &str) -> Option<String> {
     let mut iter = s.split_whitespace().peekable();
     while let Some(token) = iter.next() {
         if token.eq_ignore_ascii_case("AGESA") {
