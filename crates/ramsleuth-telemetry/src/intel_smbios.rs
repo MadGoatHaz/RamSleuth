@@ -1,5 +1,6 @@
-//! SMBIOS Type 17 cross-check (Intel memory-channel detection, Chunk 2) and
-//! vendor-neutral SPD fallback (Chunk 4).
+//! SMBIOS Type 17 cross-check (Intel memory-channel detection, Chunk 2),
+//! vendor-neutral SPD fallback (Chunk 4), and AGESA version from SMBIOS
+//! Type 40 ("Additional Information").
 //!
 //! The hardware MMIO decode ([`crate::intel_readout::decode`]) can misreport
 //! a populated dual-channel kit as single-channel when the IMC registers are
@@ -851,6 +852,284 @@ fn read_bios_major(root: &Path) -> u8 {
     let text = base.and_then(|b| std::fs::read_to_string(b.join("id").join("bios_major")).ok());
     text.and_then(|t| t.trim().parse().ok()).unwrap_or(3)
 }
+
+// ---------------------------------------------------------------------------
+// AGESA version from SMBIOS Type 40 ("Additional Information")
+// ---------------------------------------------------------------------------
+
+/// The file-name prefix of a raw SMBIOS Type 40 structure (`40-<n>`).
+const TYPE40_PREFIX: &str = "40-";
+
+/// The SMBIOS Type 40 structure type byte (0x28 = 40).
+const TYPE40_TYPE: u8 = 0x28;
+
+/// Parsed AGESA version information from SMBIOS Type 40.
+///
+/// SMBIOS Type 40 ("Additional Information", DMTF DSP0134 v3.8.0 §7.41)
+/// is used by AMD OEMs (e.g. Gigabyte) to annotate the BIOS version
+/// field with the AGESA firmware version. The entry references Type 0
+/// (BIOS Information) at offset 0x05 (Firmware Version field) and
+/// carries the AGESA string in its string table.
+///
+/// The AGESA string format: `AGESA!<Line> <Project> <Version>` (e.g.
+/// `AGESA!V9 ComboAm5PI 1.2.8.0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgesaInfo {
+    /// Full AGESA string as found in the SMBIOS Type 40 entry
+    /// (e.g., "AGESA!V9 ComboAm5PI 1.2.8.0").
+    pub raw: String,
+    /// AGESA line (e.g., "V9").
+    pub line: Option<String>,
+    /// PI project name (e.g., "ComboAm5PI").
+    pub project: Option<String>,
+    /// Version number (e.g., "1.2.8.0").
+    pub version: Option<String>,
+}
+
+impl AgesaInfo {
+    /// Format the AGESA info for display (e.g., "V9 ComboAm5PI 1.2.8.0").
+    ///
+    /// Joins the available fields (line, project, version) with spaces.
+    /// Returns `None` when no useful fields are present (e.g. a bare
+    /// "AGESA!" marker with no version content).
+    pub fn display_string(&self) -> Option<String> {
+        let parts: Vec<String> = vec![
+            self.line.clone(),
+            self.project.clone(),
+            self.version.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
+    }
+}
+
+/// Read AGESA version from SMBIOS Type 40 entries.
+///
+/// SMBIOS Type 40 ("Additional Information") is used by AMD/Gigabyte to
+/// annotate the BIOS version field with the AGESA firmware version.
+/// The entry references Type 0 (BIOS Information) at offset 0x05
+/// (Firmware Version field) and carries the AGESA string.
+///
+/// Multiple Type 40 entries are legal; they are scanned in handle-number
+/// order and the first one carrying a valid AGESA string is returned.
+///
+/// Source: DMTF DSP0134 v3.8.0 §7.41, verified on Gigabyte B850 AI TOP.
+///
+/// # No-panic contract
+///
+/// A missing `dmi` directory (VM / container), an unreadable `raw` file,
+/// or a corrupt Type 40 structure all yield `None` — never a panic, never
+/// an invented AGESA version.
+pub fn read_agesa_from_smbios() -> Option<AgesaInfo> {
+    read_agesa_from(Path::new(DMI_ENTRIES_DIR))
+}
+
+/// The injectable-root version of [`read_agesa_from_smbios`] (the fixture
+/// tests pass a temp directory holding synthetic `40-*` files).
+fn read_agesa_from(root: &Path) -> Option<AgesaInfo> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return None,
+    };
+    // Collect the Type 40 entries and sort numerically by handle number
+    // (`40-0`, `40-1`, …; numeric so `40-2` precedes `40-10`).
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(TYPE40_PREFIX))
+        })
+        .collect();
+    paths.sort_by_key(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(TYPE40_PREFIX))
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+    });
+    // Try each Type 40 entry in order; return the first that yields an
+    // AGESA string.
+    for path in paths {
+        let bytes = match std::fs::read(path.join("raw")) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Some(agesa) = parse_type40_entry(&bytes) {
+            return Some(agesa);
+        }
+    }
+    None
+}
+
+/// Parse one SMBIOS Type 40 ("Additional Information") structure and
+/// extract the AGESA version if present.
+///
+/// Type 40 layout (DMTF DSP0134 v3.8.0 §7.41):
+/// - Offset 0: Type (0x28)
+/// - Offset 1: Length (formatted area size in bytes)
+/// - Offset 2-3: Handle (16-bit LE)
+/// - Offset 4: NumEntries
+/// - Offset 5+: Entries (variable length, each:
+///   - Length (1 byte, includes this byte)
+///   - RefHandle (2 bytes LE — the referenced structure's handle)
+///   - RefOffset (1 byte — offset into the referenced structure)
+///   - StringRef (1 byte — index into this Type 40's string table)
+///   - Value (variable — Length - 5 bytes)
+/// - After the formatted area (at offset `Length`): the string table
+///   (null-separated, double-null terminated).
+///
+/// # No-panic contract
+///
+/// Every read is bounds-checked; a short / corrupt structure yields
+/// `None` rather than a panic.
+fn parse_type40_entry(raw: &[u8]) -> Option<AgesaInfo> {
+    // Validate minimum size: type (1) + length (1) + handle (2) +
+    // num_entries (1) = 5 bytes.
+    if raw.len() < 5 {
+        return None;
+    }
+    // Validate type byte (0x28 = Type 40).
+    if raw[0] != TYPE40_TYPE {
+        return None;
+    }
+    let length = raw[1] as usize;
+    // The formatted area must be at least 5 bytes (the header fields)
+    // and must not exceed the total raw size.
+    if length < 5 || length > raw.len() {
+        return None;
+    }
+    let num_entries = raw[4] as usize;
+    // The string table starts immediately after the formatted area.
+    let table = &raw[length..];
+
+    // Walk the variable-length entries.
+    let mut pos = 5;
+    for _ in 0..num_entries {
+        if pos >= length {
+            break;
+        }
+        let entry_len = raw[pos] as usize;
+        // Each entry needs at least 5 bytes: length (1) + ref_handle (2)
+        // + ref_offset (1) + str_ref (1).
+        if entry_len < 5 || pos + entry_len > length {
+            break;
+        }
+        let str_ref = raw[pos + 4];
+
+        // If str_ref > 0, look up the string in the table and try to
+        // parse it as an AGESA string.
+        if str_ref > 0 {
+            if let Some(s) = string_at(table, str_ref) {
+                if let Some(agesa) = parse_agesa_string(&s) {
+                    return Some(agesa);
+                }
+            }
+        }
+        pos += entry_len;
+    }
+    None
+}
+
+/// Parse an AGESA string in the format `AGESA!<Line> <Project> <Version>`
+/// or `AGESA <Line> <Project> <Version>`.
+///
+/// The "AGESA" prefix is case-insensitive. After the prefix, an optional
+/// "!" separator is consumed, then the remaining whitespace-delimited
+/// tokens are parsed as:
+/// - First token: the AGESA line (e.g., "V9")
+/// - Second token: the PI project name (e.g., "ComboAm5PI")
+/// - Last token: the version number (e.g., "1.2.8.0")
+///
+/// The version is identified by containing a dot (dotted version
+/// notation). A token without a dot is not treated as a version:
+/// - "AGESA!V9" → line="V9", project=None, version=None
+/// - "AGESA!V9 1.2.3.4" → line="V9", project=None, version="1.2.3.4"
+/// - "AGESA!V9 ComboAm5PI" → line="V9", project="ComboAm5PI", version=None
+/// - "AGESA!V9 ComboAm5PI 1.2.8.0" → all three fields populated
+///
+/// A string with just the "AGESA" prefix (and optional "!") and no
+/// content tokens is accepted and yields `Some(AgesaInfo)` with all
+/// sub-fields `None`.
+///
+/// Returns `None` for strings that do not start with "AGESA".
+fn parse_agesa_string(s: &str) -> Option<AgesaInfo> {
+    let upper = s.to_uppercase();
+    if !upper.starts_with("AGESA") {
+        return None;
+    }
+
+    // After "AGESA", strip an optional "!" and leading whitespace.
+    let rest = s.get(5..)?.trim_start();
+    let rest = rest.strip_prefix('!').unwrap_or(rest).trim_start();
+
+    // Split into whitespace-delimited tokens.
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+
+    if tokens.is_empty() {
+        // Just "AGESA!" or "AGESA" with no content.
+        return Some(AgesaInfo {
+            raw: s.to_string(),
+            line: None,
+            project: None,
+            version: None,
+        });
+    }
+
+    // A token is a version candidate only if it contains a dot
+    // (dotted version notation like "1.2.8.0"; "V9" is not a version).
+    let is_version = |t: &&str| t.contains('.');
+
+    let (line, project, version) = match tokens.len() {
+        1 => {
+            let t = tokens[0];
+            if is_version(&t) {
+                (None, None, Some(t.to_string()))
+            } else {
+                (Some(t.to_string()), None, None)
+            }
+        }
+        2 => {
+            let (t0, t1) = (tokens[0], tokens[1]);
+            if is_version(&t1) {
+                // line + version (no project)
+                (Some(t0.to_string()), None, Some(t1.to_string()))
+            } else if is_version(&t0) {
+                // version + other (unlikely, but handle it)
+                (None, Some(t1.to_string()), Some(t0.to_string()))
+            } else {
+                // line + project (no version)
+                (Some(t0.to_string()), Some(t1.to_string()), None)
+            }
+        }
+        _ => {
+            // 3+ tokens: line, project, ..., version (last dotted token)
+            let line = Some(tokens[0].to_string());
+            let project = Some(tokens[1].to_string());
+            let version = tokens
+                .last()
+                .filter(|t| is_version(t))
+                .map(|t| t.to_string());
+            (line, project, version)
+        }
+    };
+
+    Some(AgesaInfo {
+        raw: s.to_string(),
+        line,
+        project,
+        version,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1584,5 +1863,263 @@ mod tests {
             vec!["DIMM0", "DIMM1", "DIMM2", "DIMM10", "DIMM11"],
             "17-2 must sort before 17-10 (numeric, not lexicographic)"
         );
+    }
+
+    // ====================================================================
+    // AGESA from SMBIOS Type 40 tests
+    // ====================================================================
+
+    /// Write a synthetic `40-<n>` entry into `dir`, mirroring the kernel's
+    /// dmi-sysfs layout: a directory `40-<n>` whose payload file is
+    /// `40-<n>/raw`.
+    fn write_type40_entry(dir: &Path, n: u8, bytes: &[u8]) {
+        let entry = dir.join(format!("40-{n}"));
+        std::fs::create_dir_all(&entry).expect("type40 entry dir create");
+        let mut f = std::fs::File::create(entry.join("raw")).expect("type40 raw create");
+        f.write_all(bytes).expect("type40 raw write");
+    }
+
+    /// The verbatim SMBIOS Type 40 structure from ZandoBob's research on
+    /// the Gigabyte B850 AI TOP (AGESA!V9 ComboAm5PI 1.2.8.0).
+    ///
+    /// Bytes: 28 0e 1d 00 01 09 00 00 05 01 00 00 00 00
+    ///        41 47 45 53 41 21 56 39 20 43 6f 6d 62 6f 41 6d 35 50 49
+    ///        20 31 2e 32 2e 38 2e 30 00 00
+    ///
+    /// Layout:
+    /// - 0x00: Type = 0x28 (40)
+    /// - 0x01: Length = 0x0E (14, formatted area size)
+    /// - 0x02-0x03: Handle = 0x001D
+    /// - 0x04: NumEntries = 1
+    /// - 0x05: Entry[0].Length = 9
+    /// - 0x06-0x07: Entry[0].RefHandle = 0x0000
+    /// - 0x08: Entry[0].RefOffset = 0x05
+    /// - 0x09: Entry[0].StringRef = 1
+    /// - 0x0A-0x0D: Entry[0].Value = 4 bytes of zeros
+    /// - 0x0E+: String table: "AGESA!V9 ComboAm5PI 1.2.8.0\0\0"
+    const REAL_TYPE40_AGESA: &[u8] = &[
+        0x28, 0x0E, 0x1D, 0x00, 0x01, 0x09, 0x00, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, b'A',
+        b'G', b'E', b'S', b'A', b'!', b'V', b'9', b' ', b'C', b'o', b'm', b'b', b'o', b'A', b'm',
+        b'5', b'P', b'I', b' ', b'1', b'.', b'2', b'.', b'8', b'.', b'0', 0x00, 0x00,
+    ];
+
+    /// (Type 40) The verbatim Gigabyte B850 AI TOP structure parses to the
+    /// expected AGESA fields.
+    #[test]
+    fn test_parse_type40_agesa() {
+        let agesa = parse_type40_entry(REAL_TYPE40_AGESA).expect("must parse");
+        assert_eq!(agesa.line, Some("V9".to_string()));
+        assert_eq!(agesa.project, Some("ComboAm5PI".to_string()));
+        assert_eq!(agesa.version, Some("1.2.8.0".to_string()));
+        assert_eq!(agesa.raw, "AGESA!V9 ComboAm5PI 1.2.8.0");
+    }
+
+    /// (Type 40) `display_string` formats the fields for the platform
+    /// readout.
+    #[test]
+    fn test_type40_display_string() {
+        let agesa = parse_type40_entry(REAL_TYPE40_AGESA).expect("must parse");
+        assert_eq!(
+            agesa.display_string(),
+            Some("V9 ComboAm5PI 1.2.8.0".to_string())
+        );
+
+        // Partial info: line + version only.
+        let partial = AgesaInfo {
+            raw: "AGESA!V9 1.2.3.4".to_string(),
+            line: Some("V9".to_string()),
+            project: None,
+            version: Some("1.2.3.4".to_string()),
+        };
+        assert_eq!(partial.display_string(), Some("V9 1.2.3.4".to_string()));
+
+        // Version only.
+        let version_only = AgesaInfo {
+            raw: "AGESA!1.2.3.4".to_string(),
+            line: None,
+            project: None,
+            version: Some("1.2.3.4".to_string()),
+        };
+        assert_eq!(version_only.display_string(), Some("1.2.3.4".to_string()));
+
+        // No useful fields (bare marker) → None.
+        let bare = AgesaInfo {
+            raw: "AGESA!".to_string(),
+            line: None,
+            project: None,
+            version: None,
+        };
+        assert_eq!(bare.display_string(), None);
+    }
+
+    /// (Type 40) AGESA string parsing variants.
+    #[test]
+    fn test_parse_agesa_string_variants() {
+        // With !
+        let a = parse_agesa_string("AGESA!V9 ComboAm5PI 1.2.8.0").expect("with !");
+        assert_eq!(a.line, Some("V9".to_string()));
+        assert_eq!(a.project, Some("ComboAm5PI".to_string()));
+        assert_eq!(a.version, Some("1.2.8.0".to_string()));
+
+        // Without !
+        let b = parse_agesa_string("AGESA V9 ComboAm5PI 1.2.8.0").expect("without !");
+        assert_eq!(b.line, Some("V9".to_string()));
+        assert_eq!(b.project, Some("ComboAm5PI".to_string()));
+        assert_eq!(b.version, Some("1.2.8.0".to_string()));
+
+        // Case insensitive
+        let c = parse_agesa_string("agesa!v9 comboam5pi 1.2.8.0").expect("lowercase");
+        assert_eq!(c.line, Some("v9".to_string()));
+        assert_eq!(c.project, Some("comboam5pi".to_string()));
+        assert_eq!(c.version, Some("1.2.8.0".to_string()));
+
+        // Not AGESA
+        assert!(parse_agesa_string("BIOS Version F10").is_none());
+        assert!(parse_agesa_string("American Megatrends Inc.").is_none());
+
+        // Just marker
+        let d = parse_agesa_string("AGESA!").expect("bare marker");
+        assert_eq!(d.line, None);
+        assert_eq!(d.project, None);
+        assert_eq!(d.version, None);
+        assert_eq!(d.raw, "AGESA!");
+
+        // Single token after marker (line only, no version — "V9" has no dot)
+        let e = parse_agesa_string("AGESA!V9").expect("line only");
+        assert_eq!(e.line, Some("V9".to_string()));
+        assert_eq!(e.project, None);
+        assert_eq!(
+            e.version, None,
+            "a non-dotted token is a line, not a version"
+        );
+
+        // Single dotted token (version only, no line)
+        let e2 = parse_agesa_string("AGESA!1.2.3.4").expect("version only");
+        assert_eq!(e2.line, None);
+        assert_eq!(e2.project, None);
+        assert_eq!(e2.version, Some("1.2.3.4".to_string()));
+
+        // Two tokens (line + version, no project)
+        let f = parse_agesa_string("AGESA!V9 1.2.3.4").expect("line + version");
+        assert_eq!(f.line, Some("V9".to_string()));
+        assert_eq!(f.project, None);
+        assert_eq!(f.version, Some("1.2.3.4".to_string()));
+
+        // Two tokens (line + project, no version — neither has a dot)
+        let g = parse_agesa_string("AGESA!V9 ComboAm5PI").expect("line + project");
+        assert_eq!(g.line, Some("V9".to_string()));
+        assert_eq!(g.project, Some("ComboAm5PI".to_string()));
+        assert_eq!(g.version, None);
+    }
+
+    /// (Type 40) A corrupt / too-short structure yields None — no panic.
+    #[test]
+    fn test_type40_corrupt_is_none() {
+        // Too short (no length field).
+        assert!(parse_type40_entry(&[0x28]).is_none());
+        // Wrong type byte.
+        assert!(parse_type40_entry(&[0x11, 0x0E, 0x00, 0x00, 0x00]).is_none());
+        // Length smaller than the minimum header.
+        assert!(parse_type40_entry(&[0x28, 0x03, 0x00, 0x00, 0x00]).is_none());
+        // Length exceeds the raw buffer.
+        assert!(parse_type40_entry(&[0x28, 0xFF, 0x00, 0x00, 0x00]).is_none());
+    }
+
+    /// (Type 40) A Type 40 structure with a non-AGESA string yields None.
+    #[test]
+    fn test_type40_no_agesa_string_is_none() {
+        // Type 40 with one entry referencing string "BIOS Version F10".
+        let mut raw = vec![
+            0x28, // Type 40
+            0x0E, // Length = 14 (formatted area)
+            0x00, 0x00, // Handle
+            0x01, // NumEntries = 1
+            0x09, // Entry[0].Length = 9
+            0x00, 0x00, // Entry[0].RefHandle = 0
+            0x05, // Entry[0].RefOffset = 5
+            0x01, // Entry[0].StringRef = 1
+            0x00, 0x00, 0x00, 0x00, // Entry[0].Value (4 bytes)
+        ];
+        // String table: "BIOS Version F10\0\0"
+        raw.extend_from_slice(b"BIOS Version F10\0\0");
+        assert!(parse_type40_entry(&raw).is_none());
+    }
+
+    /// (Type 40) Multiple entries in one Type 40 structure: the first
+    /// entry with an AGESA string wins.
+    #[test]
+    fn test_type40_multiple_entries_first_agesa_wins() {
+        // Two entries: first is non-AGESA, second is AGESA.
+        let mut raw = vec![
+            0x28, // Type 40
+            0x19, // Length = 25 (formatted area: 5 header + 9 + 11)
+            0x00, 0x00, // Handle
+            0x02, // NumEntries = 2
+            // Entry 0: non-AGESA string
+            0x09, // Length = 9
+            0x00, 0x00, // RefHandle = 0
+            0x05, // RefOffset = 5
+            0x01, // StringRef = 1
+            0x00, 0x00, 0x00, 0x00, // Value (4 bytes)
+            // Entry 1: AGESA string
+            0x0B, // Length = 11
+            0x00, 0x00, // RefHandle = 0
+            0x05, // RefOffset = 5
+            0x02, // StringRef = 2
+            0x00, 0x00, 0x00, 0x00, // Value (4 bytes)
+            0x00, // Value extra byte (11 - 5 = 6 bytes of value)
+            0x00,
+        ];
+        // String table: "SomeOther\0AGESA!V9 ComboAm5PI 1.2.8.0\0\0"
+        raw.extend_from_slice(b"SomeOther\0");
+        raw.extend_from_slice(b"AGESA!V9 ComboAm5PI 1.2.8.0\0\0");
+        let agesa = parse_type40_entry(&raw).expect("second entry has AGESA");
+        assert_eq!(agesa.line, Some("V9".to_string()));
+        assert_eq!(agesa.version, Some("1.2.8.0".to_string()));
+    }
+
+    /// (Type 40) End-to-end: a temp DMI directory with a `40-0` entry
+    /// yields the AGESA info via `read_agesa_from`.
+    #[test]
+    fn test_read_agesa_from_temp_dir() {
+        let dmi = TempDmi::new("type40-e2e");
+        write_type40_entry(&dmi.root, 0, REAL_TYPE40_AGESA);
+        let agesa = read_agesa_from(&dmi.root).expect("must find AGESA");
+        assert_eq!(agesa.line, Some("V9".to_string()));
+        assert_eq!(agesa.project, Some("ComboAm5PI".to_string()));
+        assert_eq!(agesa.version, Some("1.2.8.0".to_string()));
+    }
+
+    /// (Type 40) End-to-end: a temp DMI directory with only Type 17
+    /// entries (no Type 40) yields None — no panic, no false positive.
+    #[test]
+    fn test_read_agesa_from_no_type40_is_none() {
+        let dmi = TempDmi::new("type40-none");
+        write_entry(&dmi.root, 0, &populated_ddr4("A2"));
+        assert!(read_agesa_from(&dmi.root).is_none());
+    }
+
+    /// (Type 40) End-to-end: a missing DMI directory yields None.
+    #[test]
+    fn test_read_agesa_from_missing_dir_is_none() {
+        assert!(read_agesa_from(Path::new("/nonexistent/dmi/entries-type40")).is_none());
+    }
+
+    /// (Type 40) Numeric sort: `40-2` is scanned before `40-10` (the
+    /// first AGESA found wins, so the ordering matters).
+    #[test]
+    fn test_type40_numeric_sort_order() {
+        let dmi = TempDmi::new("type40-sort");
+        // 40-10 has an AGESA string; 40-2 does not.
+        write_type40_entry(&dmi.root, 10, REAL_TYPE40_AGESA);
+        // 40-2: a non-AGESA Type 40.
+        let mut raw2 = vec![
+            0x28, 0x0E, 0x00, 0x00, 0x01, 0x09, 0x00, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        raw2.extend_from_slice(b"NotAGESA\0\0");
+        write_type40_entry(&dmi.root, 2, &raw2);
+        // Numeric order: 40-2 first (no AGESA), then 40-10 (AGESA found).
+        let agesa = read_agesa_from(&dmi.root).expect("40-10 has AGESA");
+        assert_eq!(agesa.version, Some("1.2.8.0".to_string()));
     }
 }
