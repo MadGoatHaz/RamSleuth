@@ -4,6 +4,12 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing four artifacts: the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`, and the Debian/Ubuntu/Mint package `ramsleuth_<ver>_amd64.deb` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project — with one deliberate exception: the `ryzen-smu-dkms` extra keeps its own `1.0` pkgver line (re-pinned per release wave via the commit pin + `pkgrel`, not version-bumped) and does not track the workspace version.
 
+## v2.4.32 (2026-11-11)
+
+### Added
+- **`.deb` package now auto-rebuilds the ryzen_smu DKMS module on upgrade** (Ubuntu/Debian users). Previously only the AUR `.install` hooks had this logic — `.deb` users had to run `sudo ramsleuth-install-ryzen-smu-dkms` manually after every update.
+- **Both DKMS helper scripts now detect dpkg/apt package transactions** (not just pacman) and skip the build-dep installation when called from inside one, preventing database lock conflicts on Ubuntu/Debian.
+
 ## v2.4.31 (2026-11-11)
 
 ### Fixed
