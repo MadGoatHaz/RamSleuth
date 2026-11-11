@@ -333,13 +333,45 @@ chmod 0755 "$DEBIAN_DIR/preinst"
 echo "  DEBIAN/preinst"
 
 # --- Generate DEBIAN/postinst ---
+# postinst args: $1 = old version (empty on fresh install), $2 = new version
 cat > "$DEBIAN_DIR/postinst" <<'EOF'
 #!/bin/sh
 set -e
+
+OLD_VERSION="$1"
+NEW_VERSION="$2"
+
 systemctl daemon-reload 2>/dev/null || true
 # polkit: (re)install the one-click policy; restart polkitd so the
 # branded org.freedesktop.ramsleuth.setup action is live.
 systemctl restart polkit 2>/dev/null || true
+
+# --- DKMS module auto-rebuild on upgrade ---
+# When upgrading (OLD_VERSION is set and different from NEW_VERSION), rebuild
+# the ryzen_smu DKMS module so it picks up any new source (e.g. APOB support).
+# This mirrors the post_upgrade() logic in the AUR .install files.
+if [ -n "$OLD_VERSION" ] && [ "$OLD_VERSION" != "$NEW_VERSION" ]; then
+    # Only rebuild on AMD systems where the module is registered
+    if command -v dkms >/dev/null 2>&1 && \
+       dkms status 2>/dev/null | grep -q "^ryzen_smu/"; then
+        echo "ramsleuth: RamSleuth updated ($OLD_VERSION → $NEW_VERSION) — rebuilding the ryzen_smu DKMS module…"
+        log_file="/var/log/ramsleuth-dkms-rebuild.log"
+        if command -v /usr/bin/ramsleuth-install-ryzen-smu-dkms >/dev/null 2>&1; then
+            # Run helper with output to log file (not a pipe) so the exit
+            # status is the helper's, not tee's.
+            if /usr/bin/ramsleuth-install-ryzen-smu-dkms --version "$NEW_VERSION" >>"$log_file" 2>&1; then
+                echo "ramsleuth: ryzen_smu DKMS module rebuilt successfully"
+            else
+                echo "ramsleuth: WARNING: ryzen_smu DKMS auto-rebuild failed (see $log_file)"
+                echo "ramsleuth:   run manually: sudo ramsleuth-install-ryzen-smu-dkms" >&2
+            fi
+        else
+            echo "ramsleuth: WARNING: ramsleuth-install-ryzen-smu-dkms not found — cannot auto-rebuild the DKMS module" >&2
+        fi
+    fi
+fi
+# --- End DKMS auto-rebuild ---
+
 if ! systemctl enable --now ramsleuth.service 2>/dev/null; then
     echo "ramsleuth: ramsleuth.service not started (non-fatal);" \
          "run: systemctl enable --now ramsleuth" >&2

@@ -126,7 +126,44 @@ die() { printf '[intel-dkms] ERROR: %s\n' "$*" >&2; exit 1; }
 
 # Distro-aware build-dep install (pacman / apt / dnf): DKMS + the compiler
 # toolchain + the running kernel's headers package.
+# When called from inside a package manager transaction (pacman post_upgrade
+# or dpkg/apt postinst), the database is locked — skip the install and verify
+# the tools exist instead.
 install_build_deps() {
+    local in_pkg_tx=0
+    local pkg_mgr_name=""
+
+    # Detect if we're inside a pacman transaction (lock file exists)
+    if [[ -e /var/lib/pacman/db.lck ]]; then
+        in_pkg_tx=1
+        pkg_mgr_name="pacman"
+    # Detect if we're inside a dpkg/apt transaction (lock file exists)
+    elif [[ -e /var/lib/dpkg/lock || -e /var/lib/dpkg/lock-frontend ]]; then
+        in_pkg_tx=1
+        pkg_mgr_name="dpkg/apt"
+    fi
+
+    if [[ $in_pkg_tx -eq 1 ]]; then
+        log "Detected ${pkg_mgr_name} transaction in progress — skipping build-dep install, verifying existing tools..."
+        # Verify required tools exist; warn if missing but don't fail
+        local missing=()
+        command -v dkms &>/dev/null || missing+=("dkms")
+        command -v make &>/dev/null || missing+=("make")
+        command -v gcc &>/dev/null || missing+=("gcc")
+        if [[ ${#missing[@]} -gt 0 ]]; then
+            log "WARNING: missing build tools: ${missing[*]}"
+            if [[ "$pkg_mgr_name" == "pacman" ]]; then
+                log "  After this update completes, run: sudo pacman -S ${missing[*]}"
+            else
+                log "  After this update completes, run: sudo apt-get install ${missing[*]}"
+            fi
+        else
+            log "Build tools present (dkms, make, gcc) — proceeding with DKMS build"
+        fi
+        return 0
+    fi
+
+    # Normal path: not inside a package transaction, install as needed
     if command -v pacman &>/dev/null; then
         pacman -S --needed --noconfirm dkms base-devel
     elif command -v apt-get &>/dev/null; then
