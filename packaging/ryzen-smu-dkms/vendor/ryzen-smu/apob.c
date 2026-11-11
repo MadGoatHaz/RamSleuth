@@ -57,17 +57,6 @@ int apob_init(struct apob_data *apob)
         pr_debug("APOB: probing candidate %d at phys 0x%llx\n",
                  i, (unsigned long long)addr);
 
-        /* Skip candidates that overlap System RAM — ioremap on System
-         * RAM triggers kernel warnings and can panic on panic_on_warn=1
-         * systems. The APOB lives in ACPI Non-volatile Storage (NVS)
-         * regions, not System RAM. */
-        if (region_intersects(addr, PAGE_SIZE, IORESOURCE_SYSTEM_RAM,
-                              IORES_DESC_NONE) != REGION_DISJOINT) {
-            pr_debug("APOB: 0x%llx is in System RAM, skipping\n",
-                     (unsigned long long)addr);
-            continue;
-        }
-
         /* Map one page to check the signature.
          * ioremap_cache() is the correct API for mapping system RAM
          * (cacheable). It is used by the existing PM table path in
