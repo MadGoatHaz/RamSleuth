@@ -126,7 +126,34 @@ die() { printf '[ryzen-smu-dkms] ERROR: %s\n' "$*" >&2; exit 1; }
 
 # Distro-aware build-dep install (pacman / apt / dnf): DKMS + the compiler
 # toolchain + the running kernel's headers package.
+# When called from inside a pacman transaction (post_upgrade hook), the
+# database is locked — skip the install and verify the tools exist instead.
 install_build_deps() {
+    local in_pacman_tx=0
+    # Detect if we're inside a pacman transaction (lock file exists)
+    if [[ -e /var/lib/pacman/db.lck ]]; then
+        in_pacman_tx=1
+        log "Detected pacman transaction in progress — skipping build-dep install, verifying existing tools..."
+    fi
+
+    if [[ $in_pacman_tx -eq 1 ]]; then
+        # Verify required tools exist; warn if missing but don't fail
+        # (the DKMS build needs these, but if they're missing the build
+        # step will fail with a clear error anyway)
+        local missing=()
+        command -v dkms &>/dev/null || missing+=("dkms")
+        command -v make &>/dev/null || missing+=("make")
+        command -v gcc &>/dev/null || missing+=("gcc")
+        if [[ ${#missing[@]} -gt 0 ]]; then
+            log "WARNING: missing build tools: ${missing[*]}"
+            log "  After this update completes, run: sudo pacman -S ${missing[*]}"
+        else
+            log "Build tools present (dkms, make, gcc) — proceeding with DKMS build"
+        fi
+        return 0
+    fi
+
+    # Normal path: not inside a pacman transaction, install as needed
     if command -v pacman &>/dev/null; then
         pacman -S --needed --noconfirm dkms base-devel
     elif command -v apt-get &>/dev/null; then
