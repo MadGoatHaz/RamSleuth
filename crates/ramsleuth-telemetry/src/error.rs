@@ -161,6 +161,9 @@ pub enum NaReason {
     NotApplicable,
     /// A payload read from hardware was malformed.
     ParseError(String),
+    /// The hardware did not report a value for this field (register read as
+    /// 0x00; the field is optional and the firmware left it blank).
+    NotReported,
 }
 
 /// The stable, human-readable phrase of an [`NaReason`] (DAEMON-2): the
@@ -179,6 +182,7 @@ impl std::fmt::Display for NaReason {
             Self::UnknownPmTableVersion => "new PM table",
             Self::NotApplicable => "not applicable",
             Self::ParseError(_) => "decode failed",
+            Self::NotReported => "not reported",
         };
         f.write_str(phrase)
     }
@@ -409,6 +413,7 @@ mod tests {
             NaReason::UnknownPmTableVersion,
             NaReason::NotApplicable,
             NaReason::ParseError("x".to_owned()),
+            NaReason::NotReported,
         ] {
             assert!(!format!("{r:?}").is_empty());
         }
@@ -484,6 +489,16 @@ mod tests {
         assert!(err().is_err());
     }
 
+    /// (CHUNK-B) The `NotReported` variant's stable `Display` phrase is
+    /// "not reported" (the daemon `cpu_gen` / CLI / TUI / GUI render
+    /// through this single source; the phrase is the bare reason — the
+    /// `N/A (` prefix and the verbose section sentence are added by the
+    /// presentation layer).
+    #[test]
+    fn na_reason_not_reported_display() {
+        assert_eq!(NaReason::NotReported.to_string(), "not reported");
+    }
+
     /// (P3-01) The no-panic contract types are wire-serializable:
     /// every `NaReason` arm — including the `ParseError(String)`
     /// payload arm — round-trips through bincode (the Phase 3 frame
@@ -497,6 +512,7 @@ mod tests {
             NaReason::UnknownPmTableVersion,
             NaReason::NotApplicable,
             NaReason::ParseError("truncated at 0x1A".to_owned()),
+            NaReason::NotReported,
         ];
         let bytes =
             bincode::serialize(&reasons).expect("NaReason must serialize (no-panic contract)");
@@ -545,6 +561,7 @@ mod tests {
             NaReason::ParseError("x".to_owned()).to_string(),
             "decode failed"
         );
+        assert_eq!(NaReason::NotReported.to_string(), "not reported");
         // Display is NOT the Debug form (the silent-drift guard):
         let ald_debug = format!("{:?}", IntelGen::AlderLake);
         assert_ne!(

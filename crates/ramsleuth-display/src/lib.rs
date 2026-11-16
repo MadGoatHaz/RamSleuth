@@ -358,11 +358,12 @@ pub fn cell_text<T: std::fmt::Display>(cell: &Section<T>) -> String {
 pub fn na_cell_text(reason: &NaReason) -> String {
     match reason {
         NaReason::NotApplicable => "N/A".to_owned(),
+        NaReason::NotReported => "N/A (not reported)".to_owned(),
         NaReason::ParseError(detail) => {
             if detail.is_empty() {
                 "N/A (decode failed)".to_owned()
             } else {
-                format!("N/A ({detail})")
+                format!("N/A (decode failed: {detail})")
             }
         }
         r => format!("N/A ({r})"),
@@ -384,6 +385,10 @@ pub fn na_section_text(reason: &NaReason) -> String {
         }
         NaReason::UnknownPmTableVersion => {
             "No data — this CPU's memory-firmware version isn't in the supported set yet. The driver is loaded and working."
+                .to_owned()
+        }
+        NaReason::NotReported => {
+            "No data — the firmware did not report a value for this field. Expected on some platforms."
                 .to_owned()
         }
         NaReason::ParseError(detail) => {
@@ -789,30 +794,38 @@ mod tests {
             na_cell_text(&NaReason::UnknownPmTableVersion),
             "N/A (new PM table)"
         );
-        // A non-empty `ParseError` detail is surfaced verbatim (the fix).
+        // A non-empty `ParseError` detail is surfaced with the
+        // "decode failed:" prefix (the CHUNK-B clarity fix).
         assert_eq!(
             na_cell_text(&NaReason::ParseError("x".to_owned())),
-            "N/A (x)"
+            "N/A (decode failed: x)"
         );
         // An empty detail falls back to the terse "decode failed" tag.
         assert_eq!(
             na_cell_text(&NaReason::ParseError(String::new())),
             "N/A (decode failed)"
         );
+        // The new CHUNK-B variant.
+        assert_eq!(
+            na_cell_text(&NaReason::NotReported),
+            "N/A (not reported)"
+        );
     }
 
-    /// A non-empty [`NaReason::ParseError`] detail is surfaced verbatim in
-    /// the per-cell form (the fix) — a 3990X user sees the true reason
-    /// (e.g. the PM-table-not-exposed note), not a generic "decode failed".
-    /// An empty detail falls back to the terse tag; `NotApplicable` stays
-    /// the one bare `N/A` (unchanged).
+    /// A non-empty [`NaReason::ParseError`] detail is surfaced with the
+    /// "decode failed:" prefix in the per-cell form (the CHUNK-B clarity
+    /// fix) — a 3990X user sees the true reason (e.g. the
+    /// PM-table-not-exposed note), not a bare detail string. An empty
+    /// detail falls back to the terse tag; `NotApplicable` stays the one
+    /// bare `N/A` (unchanged); `NotReported` renders the blank-register
+    /// form.
     #[test]
     fn na_cell_text_surfaces_the_parse_error_detail() {
         let detail =
             "PM table not exposed by driver (AGESA version may be unsupported by ryzen-smu)";
         let text = na_cell_text(&NaReason::ParseError(detail.to_owned()));
         assert!(text.contains("PM table not exposed"), "{text}");
-        assert_eq!(text, format!("N/A ({detail})"));
+        assert_eq!(text, format!("N/A (decode failed: {detail})"));
         // Empty detail → the terse fallback.
         assert_eq!(
             na_cell_text(&NaReason::ParseError(String::new())),
@@ -820,6 +833,11 @@ mod tests {
         );
         // `NotApplicable` → the one bare `N/A` (unchanged).
         assert_eq!(na_cell_text(&NaReason::NotApplicable), "N/A");
+        // `NotReported` → the blank-register form (CHUNK-B).
+        assert_eq!(
+            na_cell_text(&NaReason::NotReported),
+            "N/A (not reported)"
+        );
     }
 
     #[test]
@@ -830,6 +848,7 @@ mod tests {
             NaReason::InsufficientPrivilege,
             NaReason::UnknownPmTableVersion,
             NaReason::NotApplicable,
+            NaReason::NotReported,
         ] {
             let text = na_section_text(&reason);
             assert!(text.starts_with("No data —"), "{reason:?}: {text}");
@@ -839,7 +858,8 @@ mod tests {
                     || text.contains("platform")
                     || text.contains("driver")
                     || text.contains("privilege")
-                    || text.contains("decoded"),
+                    || text.contains("decoded")
+                    || text.contains("reported"),
                 "{reason:?}: {text}"
             );
         }
@@ -858,6 +878,26 @@ mod tests {
         assert_ne!(
             na_section_text(&NaReason::DriverMissing),
             na_cell_text(&NaReason::DriverMissing)
+        );
+    }
+
+    /// (CHUNK-B) The `NotReported` variant renders the blank-register
+    /// form in the compact per-cell form.
+    #[test]
+    fn na_cell_text_not_reported() {
+        assert_eq!(
+            na_cell_text(&NaReason::NotReported),
+            "N/A (not reported)"
+        );
+    }
+
+    /// (CHUNK-B) The `NotReported` variant renders the verbose,
+    /// self-explanatory "firmware did not report" note in the section form.
+    #[test]
+    fn na_section_text_not_reported() {
+        assert_eq!(
+            na_section_text(&NaReason::NotReported),
+            "No data — the firmware did not report a value for this field. Expected on some platforms."
         );
     }
 
@@ -967,6 +1007,7 @@ mod tests {
             NaReason::UnknownPmTableVersion,
             NaReason::NotApplicable,
             NaReason::ParseError("x".to_owned()),
+            NaReason::NotReported,
         ];
         for reason in &reasons {
             // Every reason has a non-empty cell + section form.
