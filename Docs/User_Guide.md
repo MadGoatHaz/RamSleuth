@@ -1310,8 +1310,10 @@ single vs dual channel).
 SPD is the serial presence-detect EEPROM on each module, read over `ee1004`
 (unprivileged). The two generations in play are **DDR4** (the SPD5118
 layout, **JESD79-4** — a 512-byte image) and **DDR5** (SPD5378,
-**JESD79-5** — a 1024-byte image); the two share the `0x02 = 0x0C`
-memory-type code and are told apart by image length. Per slot you get:
+**JESD79-5** — a 1024-byte image). DDR5 is spec-defined as byte
+`0x02 = 0x11` (JESD79-5). RamSleuth checks for `0x11` first; the legacy
+`0x0C` + image-length heuristic is kept as a fallback for compatibility
+with any non-conforming modules. Per slot you get:
 
 - **maker** — the module manufacturer (its JEP106 manufacturer ID decoded
   to a name — Samsung, SK hynix, Micron, G.Skill, …; on DDR4 the ID is a
@@ -1339,6 +1341,10 @@ memory-type code and are told apart by image length. Per slot you get:
   bus ÷ width) — the figure that feeds the per-DIMM capacity
   (density × devices);
 - **density** — DRAM density per die (Mbit, shown as Gb);
+- **die_type** — a human-readable label derived from the die manufacturer
+  and density (e.g. `SK hynix 16384 Mbit`). This is an inference, not a
+  standard SPD field — it combines two decoded values into a single
+  display string;
 - **speed** — the module's rated data rate in MT/s: on DDR4, the first
   factory profile's (XMP 2.0) rated speed, falling back to the JEDEC base
   speed from `tCKAVGmin` (byte `0x12`, in 125 ps memory-time-base units +
@@ -1348,14 +1354,16 @@ memory-type code and are told apart by image length. Per slot you get:
   module: **XMP 2.0** (DDR4; two 47-byte profile blocks at `0x189` /
   `0x1B8`, under the `0x180` header gate) or **XMP 3.0 / EXPO** (DDR5;
   the 256-byte region at `0x300`, four 32-byte profile blocks), each
-  rendered as `<speed> MT/s <CL>-<tRCD>-<tRP>-<tRAS> @ <volts>`. Two
-  decode details keep the rates honest: the DDR4 XMP 2.0 data rate is
+  rendered as `<speed> MT/s <CL>-<tRCD>-<tRP>-<tRAS> @ <volts>`. Three
+  decode details keep the values honest: the DDR4 XMP 2.0 data rate is
   read from the profile's **fine-corrected tCK** (the coarse 125 ps
   memory-time-base byte *plus* the signed fine-timebase byte), so a
   DDR4-3600 kit (tCK 5 with a −70 ps fine) reports **3600**, not the 3200
-  a coarse-only read would give; and the DDR5 XMP 3.0 / EXPO frequency is
+  a coarse-only read would give; the DDR5 XMP 3.0 / EXPO frequency is
   read as a **16-bit** little-endian MHz value (×2 for MT/s, sanity-gated
-  to 3200–10666), not the old 8-bit field that read it off by 25×.
+  to 3200–10666), not the old 8-bit field that read it off by 25×; and the
+  XMP 3.0 / EXPO profile voltages are read as a **16-bit little-endian
+  value in millivolts** from bytes `+18`/`+19` of the profile block.
   Enabling one in BIOS is what moves the live data rate — and the
    dashboard then shows you *what the controller actually settled on* live.
 
@@ -1456,7 +1464,7 @@ when the rest of the Intel section is fully live.
 RamSleuth follows a **no-panic contract**: a missing driver, a missing
 privilege, or unsupported hardware never crashes the daemon or a client —
 the affected field degrades to a structured **`N/A (<reason>)`** and every
-process exits `0`. The reason is one of exactly **six** variants, and the
+process exits `0`. The reason is one of exactly **seven** variants, and the
 reason tells you precisely what is (or is not) wrong.
 
 The frontends do not print the reason's name. Since 2.4.9 the GUI and the
@@ -1476,7 +1484,7 @@ renderings: `ramsleuth-client status` shows it in debug form
 (`N/A (DriverMissing)`); the `ramsleuth-client dump` listing and
 `ramsleuth-telemetry` show the human-readable phrase
 (`N/A (driver missing)`). The reason itself never leaves the wire as
-anything but the six variants.
+anything but the seven variants.
 
 | Reason (wire name · CLI phrase) | What it means | What to do |
 |---|---|---|
@@ -1485,9 +1493,10 @@ anything but the six variants.
 | **`InsufficientPrivilege`** — *insufficient privilege* | The operation needs more privilege than the caller has (e.g. a `/dev/mem` open/map permission denial, or a `STRICT_DEVMEM` range rejection). | Run the read through the **daemon** (it holds the one capability this needs) — i.e. use the GUI/TUI/`ramsleuth-client` against a running `ramsleuth.service` rather than a bare unprivileged read. |
 | **`UnknownPmTableVersion`** — *unknown PM table version* | The AMD SMU PM-table version the firmware reports is outside the layout set RamSleuth knows how to parse. | Update the **AGESA/firmware** (the table versions move with the SMU firmware) or the `ryzen_smu` driver, and retry. If it persists, it is a genuine "newer firmware than supported" case — report the version word upstream. |
 | **`NotApplicable`** — *not applicable* | This field does not apply to the detected platform by design — e.g. Intel does not expose the CAD bus or voltage rails through MCHBAR, AMD does not report gear mode, Intel voltages are out of the readout's scope. | Nothing — it is a *correct* blank, not a failure. |
-| **`ParseError("<detail>")`** — *parse error: \<detail\>* | A payload read from hardware was malformed or outside its plausible range; the detail names the field (e.g. a clock reading of 0, a truncated block). | Usually transient or firmware-specific; check `journalctl -u ramsleuth`. A persistent one on a specific field is worth reporting with the detail text. |
+| **`NotReported`** — *not reported* | Firmware did not report a value for this field (the register read as zero; the field is optional and the BIOS/SMU left it blank). This is not an error — it simply means the hardware didn't populate this particular value. Common on optional AMD registers such as tRFC2, VDDIO_MEM, and VPP on some platforms. | Nothing — it is an honest blank; the field is optional on this platform/firmware. |
+| **`ParseError("<detail>")`** — *decode failed: \<detail\>* | A payload read from hardware was malformed or outside its plausible range; the detail names the field (e.g. a clock reading of 0, a truncated block). | Usually transient or firmware-specific; check `journalctl -u ramsleuth`. A persistent one on a specific field is worth reporting with the detail text. |
 
-Beyond the six reason variants, a few specific fields read `N/A` for
+Beyond the seven reason variants, a few specific fields read `N/A` for
 **platform/firmware** reasons that are not RamSleuth bugs — on such systems
 everything else stays live and every process still exits `0`:
 
@@ -1900,6 +1909,13 @@ group"* row, or `Permission denied (os error 13)` in the CLI diagnostic.
   unpopulated) while the clocks, voltages, and SPD all read normally — a
   board-firmware condition, not a RamSleuth fault; the remaining fields
   stay live.
+- **Several AMD fields show `N/A (not reported)`** (e.g. tRFC2, VDDIO_MEM,
+  VPP) — this is normal on many platforms. `NotReported` means the
+  firmware (BIOS/SMU) did not populate the value in that register — it is
+  optional and was left at zero. This is distinct from `N/A (decode
+  failed)`, which indicates a value was present but was malformed.
+  **Action:** none required — the fields are simply not available on this
+  platform/firmware version.
 - **Meteor / Arrow Lake tile routing (OQ-5)** — on those tiled parts the
   memory controller can sit behind a tile whose MCHBAR window is fully
   degenerate; the guard degrades the Intel section to an honest `N/A`

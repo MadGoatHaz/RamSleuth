@@ -267,6 +267,7 @@ The reason a field is absent is itself data. The frozen `NaReason` set
 | `InsufficientPrivilege`| The read needs more privilege than the caller has (e.g. `/dev/mem` without `CAP_SYS_RAWIO`). |
 | `UnknownPmTableVersion`| The SMU PM table's `TableVersionId` is outside the verified layout sets. |
 | `NotApplicable`        | The field does not apply to this platform (e.g. gear mode on AMD, Intel voltages). |
+| `NotReported`          | Firmware did not report a value (zero in an optional register). Distinct from `ParseError` (value present but malformed) and `NotApplicable` (field does not apply to this platform). |
 | `ParseError(String)`   | A hardware payload was malformed; the string names the field/byte range. |
 
 The renderer layer owns the compact `N/A (…)` display strings, so the same
@@ -341,7 +342,7 @@ section is N/A, exit 2 on a bad flag).
 |-------------|----------------|
 | `lib.rs` | Crate root: re-exports `collect`, `SystemMemoryTelemetry`, and the public provider types. |
 | `cpuid.rs` | `CpuInfo::detect()` — vendor (`AuthenticAMD` / `GenuineIntel` / unknown), microarchitecture (`AmdZen` Zen1–Zen5 by CPUID family; `IntelGen` the 22-variant set — client Skylake–Arrow Lake *and* the server / HEDT line Haswell-E / Broadwell-E / Skylake-X / Cascade Lake / Sapphire Rapids), brand string. Pure `__cpuid` intrinsic; the dispatch key of the whole crate. |
-| `error.rs` | The contract types: `TelemetryError` (rich cause: vendor, driver, privilege hint, PM-table version, `io::Error`, parse detail), `NaReason` (the six display reasons, §3.3), `Section<T>` (`Value`/`Na`). |
+| `error.rs` | The contract types: `TelemetryError` (rich cause: vendor, driver, privilege hint, PM-table version, `io::Error`, parse detail), `NaReason` (the seven display reasons, §3.3), `Section<T>` (`Value`/`Na`). |
 | `amd_smu.rs` | The single privileged gateway to the `ryzen_smu` driver: sysfs-first PM-blob acquisition, version sourcing, the char-device fallback, and safe `nix` wrappers (no `unsafe`). |
 | `amd_pm.rs` | **Generation-first** parse of the raw PM blob (dispatch on the CPUID `AmdZen` family; the `TableVersionId` is a **per-generation plausibility filter, not a closed allowlist**) into clocks (MCLK/UCLK/FCLK) and voltages (VDDCR_VDD/VDDCR_SOC). |
 | `amd_smn.rs` | The `smn` accessor protocol plus the verified SMN register tables — the 13-register timing block (the 27 subtimings, GDM, command rate) and the 14-register channel set (per-UMC CS base/mask + `UmcCapHi` → channel mode + ECC). |
@@ -405,6 +406,7 @@ library (the daemon runs it on a blocking thread) and a standalone binary
 | `lib.rs` | Crate root: re-exports the frame codec and message types. |
 | `messages.rs` | `Message` (`Request` \| `Response`), the `Request`/`Response`/`BenchMode` enums, and the frozen `DEFAULT_SOCKET_PATH` constant. Payloads are the telemetry/bench types verbatim. The payload layouts are **byte-pinned and append-only-at-the-tail**; the wire is **versioned** (`PROTOCOL_VERSION`) and a layout change is a version bump. |
 | `frame.rs` | The **versioned, length-prefixed** bincode 1.3 codec — an **8-byte header `[4-byte LE length][4-byte LE PROTOCOL_VERSION]`** + payload: `encode_frame` / `decode_frame`, the incremental-reader contract, the 16 MiB `MAX_FRAME_SIZE` guard, and `FrameError` (**incl. `VersionMismatch`**). |
+| `cli_common.rs` | Shared CLI boilerplate for all 6 binaries: `version_line()`, `short_circuit()`, `ShortCircuit`, `suggest_for_unknown()` (Levenshtein), `USAGE_COMMON` (Related tools block). Deduplicates ~300 lines that were previously copied byte-identical into each `main.rs`. |
 
 ### 4.5 `ramsleuth-daemon`
 
@@ -1821,8 +1823,11 @@ a length that is neither 512 nor 1024 → skipped.
 
 The **pure decode** (no I/O at all) is a straight transcription of the
 governing JEDEC SPD layouts — **DDR4 = JESD79-4 (SPD5118)** and **DDR5 =
-JESD79-5 (SPD5378)**, with **JEP106** makers (DDR4's 16-bit (bank, code)
-pair, DDR5's 8-bit vendor / continuation nibbles) — and yields, per module:
+JESD79-5 (SPD5378)** (DDR5 is identified by byte `0x02 == 0x11`; the
+legacy `0x0C` + 1024-byte image length is kept as a fallback for any
+non-conforming modules) — with **JEP106** makers (DDR4's 16-bit (bank,
+code) pair, DDR5's 8-bit vendor / continuation nibbles) — and yields, per
+module:
 **JEP106 maker**
 (DDR4: a 16-bit (bank, code) pair — `bank = (0x140 & 0x7F) + 1`,
 `code = 0x141` — for the module, and the same encoding at `0x15E` / `0x15F`
@@ -1831,8 +1836,12 @@ for the DRAM die; DDR5: the historical 8-bit vendor/continuation nibbles at
 unknown code rendering its raw form, an absent module ID falling back to the
 die maker), **rank** count and device width (DDR4: byte `0x0C` — bits 5:3 =
 ranks − 1, bits 2:0 = x4 / x8 / x16 / x32 — with the `0x0D` bus code; DDR5:
-the `0x80` / `0x81` hub model), **density** (DDR4: byte `0x04` bits 3:0 →
-the 10-entry Mbit table; DDR5: byte `0x13`), **base speed** in MT/s (DDR4:
+rank count from byte `0x80` bits 3:0 (N-1 encoding), device width from
+byte `0x81` bits 2:0 (0=x4, 1=x8, 2=x16), total devices = rank ×
+(64 / width)), **density** (DDR4: byte `0x04` bits 3:0 → the 10-entry
+Mbit table; DDR5: byte `0x13` bits 3:0, JESD79-5 table) and the **DDR5
+die_type** (a display convenience, not a standard SPD field: die
+manufacturer from byte `0x01` (8-bit JEP106) + density), **base speed** in MT/s (DDR4:
 the XMP 2.0 profile-1 data rate, falling back to the JEDEC `tCKAVGmin` rate
 (byte `0x12` in 125 ps MTB units + the signed fine-timebase byte `0x7D`)
 floored to the nearest standard bin; DDR5: byte `0x20` × 100), part /

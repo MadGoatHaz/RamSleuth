@@ -34,8 +34,9 @@ privileges, or hardware degrade to structured `N/A (<reason>)` fields, exit 0.
   - vCore from Super-I/O (confidence-badged)
   - Server/HEDT: SMBIOS+SPD (live MC registers are CPU-internal)
 - **Unprivileged SPD decode** — JESD79-4 (DDR4) / JESD79-5 (DDR5)
-  - Module & DRAM die maker (JEP106), rank, bus width, part, serial
+  - Module & DRAM die maker (JEP106), density, die_type, rank, bus width, part, serial
   - JEDEC base speed + XMP 2.0 (DDR4) / XMP 3.0-EXPO (DDR5) profiles
+  - DDR5: full JESD79-5 SPD field support (die_type inference, density table)
 - **Memory & Latency Benchmark** — native 4×4 grid (DRAM/L1/L2/L3 × Read/Write/Copy/Latency)
   - AVX2/AVX-512F kernels, one worker per physical core
   - Pointer-chase latency + optional burn-in soak
