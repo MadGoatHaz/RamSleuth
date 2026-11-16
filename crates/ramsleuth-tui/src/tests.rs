@@ -5,14 +5,20 @@
 //! `UnixListener` on a unique temp socket, the ramsleuth-client
 //! P3-18 precedent) plus a non-existent socket path.
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::AtomicUsize;
 use std::thread;
+use std::time::Instant;
 
-use ramsleuth_bench::{BenchmarkGrid, StreamProgress};
-use ramsleuth_protocol::{decode_frame, encode_frame, FrameError, Message};
+use ramsleuth_bench::{BenchOp, BenchmarkGrid, BurnInTick, StreamProgress, StreamTarget, Tier};
+use ramsleuth_protocol::{
+    decode_frame, encode_frame, BenchMode, FrameError, Message, Request, Response,
+    DEFAULT_SOCKET_PATH,
+};
 use ramsleuth_telemetry::amd_pm::{AmdPmCadBus, AmdPmSnapshot, AmdPmTimings, AmdPmVoltages};
 use ramsleuth_telemetry::amd_readout::map_amd;
 use ramsleuth_telemetry::cpuid::{AmdZen, CpuInfo, CpuVendor};
@@ -20,7 +26,19 @@ use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::SystemMemoryTelemetry;
 use ramsleuth_telemetry::SystemPlatform;
 use ramsleuth_telemetry::{RailConfidence, VoltageTelemetry};
+use ramsleuth_tui::probe::{NoticeTone, ProbeOverlayState};
+use ramsleuth_tui::{Action, BenchState};
 
+use super::bench_worker::{run_bench, run_burn_in, TuiBenchCmd};
+use super::cli::{parse_args, TuiArgs};
+use super::dispatch::{
+    apply_requirements_auto_open, cycle_poll, cycle_window, dispatch_action, strip_visibility,
+    SideEffect, RUN_IN_FLIGHT_NOTE,
+};
+use super::export::{export_json, out_dir_from_home, perform_export, record_export_result};
+use super::polling::{latest_memory_read_bw, poll_once, run_in_flight};
+use super::probe_overlay::{handle_probe_overlay_key, probe_report_fetch};
+use super::updater::spawn_updater;
 use super::*;
 
 /// TC-FE3 (the poison-cascade confirming test): poison the shared-state
