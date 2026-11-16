@@ -48,15 +48,18 @@
 //!   system), GDM / command rate carry the specific "0x50200 layout
 //!   unverified on this platform" reason instead of the coincidental bits.
 //! - **Timings** — raw tick counts pass through as `u16` (the plan's display
-//!   unit is ticks); `0` or above the plausible ceiling →
-//!   [`NaReason::ParseError`].
+//!   unit is ticks); `0` (a blank, optional register the firmware did not
+//!   populate) → [`NaReason::NotReported`]; a non-zero value above the
+//!   plausible ceiling → [`NaReason::ParseError`].
 //! - **CAD bus** — raw RZQ/driver codes map to ohms via the RZQ = 240 Ω base
 //!   code table ([`RZQ_KNOWN_CODES`]); an unknown code (or code `0` for a
 //!   pure-ohm field) → [`NaReason::NotApplicable`]. The three RTT fields use
 //!   [`RttValue`]: code `0` → [`RttValue::Disabled`], a known code →
 //!   [`RttValue::Rzq`], unknown → [`NaReason::NotApplicable`].
-//! - **Voltages** — raw millivolts pass through as `u16`; below the plausible
-//!   floor or above the ceiling → [`NaReason::ParseError`].
+//! - **Voltages** — raw millivolts pass through as `u16`; `0` (a blank,
+//!   optional register the firmware did not populate) →
+//!   [`NaReason::NotReported`]; a non-zero value below the plausible floor
+//!   or above the ceiling → [`NaReason::ParseError`].
 //!
 //! # Design notes / deliberate deviations from the plan sketch
 //!
@@ -636,9 +639,14 @@ fn map_mode_flag(raw: u8) -> Section<bool> {
 }
 
 /// Maps a raw tick count to a sanity-gated [`Section<u16>`] (ticks are the
-/// plan's display unit).
+/// plan's display unit). A raw value of `0` means the firmware did not
+/// populate the field (a blank, optional register) → [`NaReason::NotReported`];
+/// a non-zero value above the plausible ceiling is a genuine decode failure
+/// → [`NaReason::ParseError`].
 fn map_timing(ticks: u16) -> Section<u16> {
-    if (TIMING_MIN_TICKS..=TIMING_MAX_TICKS).contains(&ticks) {
+    if ticks == 0 {
+        Section::na(NaReason::NotReported)
+    } else if (TIMING_MIN_TICKS..=TIMING_MAX_TICKS).contains(&ticks) {
         Section::Value(ticks)
     } else {
         Section::na(NaReason::ParseError(format!(
@@ -718,9 +726,14 @@ fn map_rtt(code: u16) -> Section<RttValue> {
 }
 
 /// Maps a raw millivolt reading to a sanity-gated [`Section<u16>`] (mV are
-/// passed through; the P2-11 CLI formats them as volts).
+/// passed through; the P2-11 CLI formats them as volts). A raw value of `0`
+/// means the firmware did not populate the rail (a blank, optional register)
+/// → [`NaReason::NotReported`]; a non-zero value below the plausible floor or
+/// above the ceiling is a genuine decode failure → [`NaReason::ParseError`].
 fn map_voltage(mv: u16) -> Section<u16> {
-    if (VOLTAGE_MIN_MV..=VOLTAGE_MAX_MV).contains(&mv) {
+    if mv == 0 {
+        Section::na(NaReason::NotReported)
+    } else if (VOLTAGE_MIN_MV..=VOLTAGE_MAX_MV).contains(&mv) {
         Section::Value(mv)
     } else {
         Section::na(NaReason::ParseError(format!(
@@ -1257,8 +1270,10 @@ mod tests {
         }
     }
 
-    /// Timing + voltage sanity gates: 0 and out-of-band → `Na(ParseError)`;
-    /// in-band (incl. the inclusive upper bound) → `Value`.
+    /// Timing + voltage sanity gates: a raw `0` (blank, optional register)
+    /// → `Na(NotReported)`; a non-zero value out-of-band →
+    /// `Na(ParseError)`; in-band (incl. the inclusive upper bound) →
+    /// `Value`.
     #[test]
     fn timing_and_voltage_sanity_gates() {
         // timings
@@ -1267,7 +1282,10 @@ mod tests {
             map_timing(TIMING_MAX_TICKS),
             Section::Value(TIMING_MAX_TICKS)
         );
-        for t in [0u16, TIMING_MAX_TICKS + 1, 65535] {
+        // 0 → NotReported (blank optional register)
+        assert_eq!(map_timing(0), Section::na(NaReason::NotReported));
+        // non-zero out-of-band → ParseError
+        for t in [TIMING_MAX_TICKS + 1u16, 65535] {
             assert!(
                 matches!(map_timing(t), Section::Na(NaReason::ParseError(_))),
                 "{t}"
@@ -1278,10 +1296,46 @@ mod tests {
         assert_eq!(map_voltage(1350), Section::Value(1350));
         assert_eq!(map_voltage(VOLTAGE_MIN_MV), Section::Value(VOLTAGE_MIN_MV));
         assert_eq!(map_voltage(VOLTAGE_MAX_MV), Section::Value(VOLTAGE_MAX_MV));
-        for mv in [0u16, VOLTAGE_MIN_MV - 1, VOLTAGE_MAX_MV + 1, 65535] {
+        // 0 → NotReported (blank optional register)
+        assert_eq!(map_voltage(0), Section::na(NaReason::NotReported));
+        // non-zero out-of-band → ParseError
+        for mv in [VOLTAGE_MIN_MV - 1, VOLTAGE_MAX_MV + 1, 65535u16] {
             assert!(
                 matches!(map_voltage(mv), Section::Na(NaReason::ParseError(_))),
                 "{mv}"
+            );
+        }
+    }
+
+    /// (CHUNK-B) A raw timing of `0` (a blank, optional register the firmware
+    /// did not populate) → `Na(NotReported)`, not `Na(ParseError)`.
+    #[test]
+    fn zero_timing_is_not_reported() {
+        assert_eq!(map_timing(0), Section::na(NaReason::NotReported));
+    }
+
+    /// (CHUNK-B) A raw voltage of `0` (a blank, optional register the firmware
+    /// did not populate) → `Na(NotReported)`, not `Na(ParseError)`.
+    #[test]
+    fn zero_voltage_is_not_reported() {
+        assert_eq!(map_voltage(0), Section::na(NaReason::NotReported));
+    }
+
+    /// (CHUNK-B) A non-zero timing or voltage outside the plausible range →
+    /// `Na(ParseError)` (a genuine decode failure, distinct from the blank
+    /// `NotReported` case).
+    #[test]
+    fn nonzero_out_of_range_is_parse_error() {
+        for t in [TIMING_MAX_TICKS + 1u16, 65535] {
+            assert!(
+                matches!(map_timing(t), Section::Na(NaReason::ParseError(_))),
+                "timing {t} must be ParseError"
+            );
+        }
+        for mv in [VOLTAGE_MIN_MV - 1, VOLTAGE_MAX_MV + 1, 65535u16] {
+            assert!(
+                matches!(map_voltage(mv), Section::Na(NaReason::ParseError(_))),
+                "voltage {mv} mV must be ParseError"
             );
         }
     }
