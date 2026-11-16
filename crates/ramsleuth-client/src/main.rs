@@ -78,6 +78,7 @@ use std::time::Duration;
 
 use ramsleuth_bench::{StreamTarget, Tier};
 use ramsleuth_client::{bench, burn, dump, probe, status, Client, ClientError};
+use ramsleuth_protocol::cli_common::{short_circuit, suggest_for_unknown, version_line, ShortCircuit, USAGE_COMMON};
 use ramsleuth_protocol::{BenchMode, DEFAULT_SOCKET_PATH};
 
 /// Read timeout for the one-round-trip subcommands (`dump` /
@@ -102,7 +103,10 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Suggest a related RamSleuth binary when the user types a flag or
 /// positional that looks like they meant to invoke a different tool.
-fn suggest_for_unknown(arg: &str) -> Option<&'static str> {
+/// (The shared `suggest_for_unknown` in `ramsleuth_protocol::cli_common`
+/// is a Levenshtein-based subcommand suggester; this binary-name alias
+/// lookup stays local because its result text is tool-specific.)
+fn suggest_related_binary(arg: &str) -> Option<&'static str> {
     let normalized = arg.trim_start_matches('-').to_ascii_lowercase();
     match normalized.as_str() {
         "tui" => Some("Did you mean `ramsleuth-tui`? (run `ramsleuth-tui --help`)"),
@@ -239,55 +243,9 @@ const USAGE: &str = concat!(
     "\n",
     "Exit codes: 0 success, 1 daemon/client error, 2 usage error\n",
     "\n",
-    "Related tools:\n",
-    "  ramsleuth              Desktop GUI (egui)\n",
-    "  ramsleuth-tui          Terminal dashboard (ratatui)\n",
-    "  ramsleuth-client       CLI client (probe, dump, status, bench, burn)\n",
-    "  ramsleuth-bench        Standalone memory & latency benchmark\n",
-    "  ramsleuth-telemetry    Standalone telemetry snapshot (no daemon)\n",
-    "  ramsleuth-daemon       Privileged root daemon (CAP_SYS_RAWIO)\n",
 );
 
-/// The `--version`/`-V` output line: `ramSleuth <bin> v<version>` —
-/// the version is the crate's `CARGO_PKG_VERSION` (the workspace
-/// release, so it tracks it automatically).
-fn version_line() -> String {
-    format!("ramSleuth ramsleuth-client v{}", env!("CARGO_PKG_VERSION"))
-}
 
-/// The startup short-circuit for a raw argument (checked by `main`
-/// *before* the full [`parse_cli`]): `Help` prints the usage text
-/// (exit 0), `Version` prints [`version_line`] (exit 0), `None` means
-/// the full parse proceeds (a genuinely unknown flag stays a usage
-/// error, exit 2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShortCircuit {
-    /// `--help` / `-h` — print the usage text.
-    Help,
-    /// `--version` / `-V` — print [`version_line`].
-    Version,
-    /// Neither — continue to the full parse.
-    None,
-}
-
-/// Classify a raw argument list (the program name already removed) for
-/// the startup short-circuit: the *first* `--help`/`-h` or
-/// `--version`/`-V`, in argv order, wins; a list without either is
-/// `None`.
-fn short_circuit<I, S>(args: I) -> ShortCircuit
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    for arg in args {
-        match arg.as_ref() {
-            "--help" | "-h" => return ShortCircuit::Help,
-            "--version" | "-V" => return ShortCircuit::Version,
-            _ => {}
-        }
-    }
-    ShortCircuit::None
-}
 
 /// One subcommand name (the first positional): `dump` / `bench` /
 /// `status` / `probe` / `burn`; anything else is an error naming the
@@ -304,8 +262,12 @@ fn parse_subcommand(arg: &str) -> Result<Subcommand, String> {
                 "unknown subcommand `{other}` (expected `dump`, `bench`, `status`, `probe`, \
                  or `burn`)"
             );
-            if let Some(sug) = suggest_for_unknown(other) {
+            if let Some(sug) = suggest_related_binary(other) {
                 msg.push_str(&format!("\n  {sug}"));
+            } else if let Some(close) =
+                suggest_for_unknown(other, &["dump", "bench", "status", "probe", "burn"])
+            {
+                msg.push_str(&format!("\n  did you mean `{close}`?"));
             }
             Err(msg)
         }
@@ -418,7 +380,7 @@ where
                          `--tier <memory|l1|l2|l3|full>`, `--mode <full|memory-only>`, \
                          `--stdout`, `--json`, or `--duration <minutes>`)"
                     );
-                    if let Some(sug) = suggest_for_unknown(other) {
+                    if let Some(sug) = suggest_related_binary(other) {
                         msg.push_str(&format!("\n  {sug}"));
                     }
                     return Err(msg);
@@ -455,11 +417,11 @@ fn main() {
     // [`version_line`].
     match short_circuit(std::env::args().skip(1)) {
         ShortCircuit::Help => {
-            println!("{USAGE}");
+            print!("{USAGE}{USAGE_COMMON}");
             std::process::exit(0);
         }
         ShortCircuit::Version => {
-            println!("{}", version_line());
+            println!("{}", version_line("ramsleuth-client"));
             std::process::exit(0);
         }
         ShortCircuit::None => {}
@@ -471,7 +433,7 @@ fn main() {
         Ok(args) => args,
         Err(message) => {
             eprintln!("ramsleuth-client: {message}");
-            eprint!("{USAGE}");
+            eprint!("{USAGE}{USAGE_COMMON}");
             std::process::exit(2);
         }
     };
@@ -722,16 +684,6 @@ mod tests {
         assert_eq!(parsed.mode, BenchMode::MemoryOnly);
     }
 
-    /// (k) The `--version`/`-V` line is the package version, exactly
-    /// (`env!` — it tracks the workspace release).
-    #[test]
-    fn version_line_is_the_package_version() {
-        assert_eq!(
-            version_line(),
-            format!("ramSleuth ramsleuth-client v{}", env!("CARGO_PKG_VERSION"))
-        );
-    }
-
     /// (l) `probe` → `Probe`; no flags set.
     #[test]
     fn probe_subcommand_parses() {
@@ -806,32 +758,4 @@ mod tests {
         assert!(!args.probe_stdout);
     }
 
-    /// (k) `--help`/`-h` and `--version`/`-V` are the short-circuits:
-    /// the first occurrence, in argv order, wins; anything else
-    /// (including the subcommand + flags) is `None`.
-    #[test]
-    fn short_circuit_classifies_help_version_and_none() {
-        for h in ["--help", "-h"] {
-            assert_eq!(short_circuit([h]), ShortCircuit::Help, "{h} → Help");
-        }
-        for v in ["--version", "-V"] {
-            assert_eq!(short_circuit([v]), ShortCircuit::Version, "{v} → Version");
-        }
-        assert_eq!(short_circuit(Vec::<&str>::new()), ShortCircuit::None);
-        assert_eq!(
-            short_circuit(["dump", "--socket", "/tmp/x"]),
-            ShortCircuit::None,
-            "a plain subcommand + flag list is None"
-        );
-        assert_eq!(
-            short_circuit(["--help", "--version"]),
-            ShortCircuit::Help,
-            "the first occurrence wins"
-        );
-        assert_eq!(
-            short_circuit(["--version", "--help"]),
-            ShortCircuit::Version,
-            "the first occurrence wins"
-        );
-    }
 }
