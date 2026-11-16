@@ -4,6 +4,19 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing four artifacts: the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`, and the Debian/Ubuntu/Mint package `ramsleuth_<ver>_amd64.deb` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project — with one deliberate exception: the `ryzen-smu-dkms` extra keeps its own `1.0` pkgver line (re-pinned per release wave via the commit pin + `pkgrel`, not version-bumped) and does not track the workspace version.
 
+## v2.4.34 (2026-11-16)
+
+### Changed
+- **Code structure: major file splits for maintainability.** The three largest source files have been split into logical modules:
+  - `ramsleuth-tui/src/main.rs`: 5,469 → ~500 lines (split into 8 modules: cli, terminal, polling, bench_worker, updater, export, probe_overlay, dispatch)
+  - `ramsleuth-gui/src/main.rs`: 5,674 → ~490 lines (split into 7 modules: cli, icon, text, probe_ui, setup_worker, graphs_viewport, app)
+  - `ramsleuth-telemetry/src/intel_readout/mod.rs`: 4,025 → ~880 lines (split into 4 submodules: constants, regs, gen_gate, clock)
+- **~9,129 lines of inline test code** extracted from the three largest files into dedicated test modules (`tests.rs`), making the source files far more navigable.
+- **Documentation updated** to reflect all v2.4.33 changes: README feature list now includes DDR5 density/die_type; User_Guide §9 documents the new `NotReported` N/A reason (7 variants total) and the refined "decode failed" text; §8.5 corrected DDR5 type detection (JESD79-5 `0x11`) and added die_type/EXPO voltage documentation; §11 added troubleshooting entry for "not reported" fields; Architecture §3.3/§4.4/§10.4 updated with NotReported, cli_common module, and DDR5 decode details.
+
+### No user-visible behavior changes
+This release is purely internal restructuring and documentation. All telemetry, benchmarks, and display output are identical to v2.4.33.
+
 ## v2.4.33 (2026-11-16)
 
 ### Added
