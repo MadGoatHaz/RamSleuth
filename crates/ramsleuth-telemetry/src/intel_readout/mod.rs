@@ -1213,7 +1213,7 @@ pub fn decode(regs: &IntelImcRegs, gen: IntelGen, smbios: &SmbiosTopology) -> In
                     if !effective_res.annotation.is_empty() {
                         effective_res.annotation.push(' ');
                     }
-                    let _ = write!(effective_res.annotation, 
+                    let _ = write!(effective_res.annotation,
                         "[C-3: MAD-derived tech {mad:?} disagrees with SMBIOS Type 17 ({smb:?}) — trusting the firmware-written SMBIOS source for the 0xD800 page policy]"
                     );
                     Some(smb)

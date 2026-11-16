@@ -181,8 +181,8 @@
 //! Exit codes: 0 quit, 1 terminal init failure, 2 usage error
 //! ```
 
-use std::fmt::Write as _;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

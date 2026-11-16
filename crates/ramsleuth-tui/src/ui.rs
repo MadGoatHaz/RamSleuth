@@ -1697,7 +1697,8 @@ fn zone3_content(state: &AppState) -> (Vec<&SpdModule>, Vec<ListItem<'static>>) 
     };
     let mut text = format!("daemon: {status}");
     if let Some(last) = state.last_update {
-        let _ = write!(text, 
+        let _ = write!(
+            text,
             " · {secs:.1}s ago",
             secs = last.elapsed().as_secs_f64()
         );

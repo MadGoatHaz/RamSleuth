@@ -30,7 +30,9 @@ pub mod cli_common;
 pub mod frame;
 pub mod messages;
 
-pub use cli_common::{short_circuit, suggest_for_unknown, version_line, ShortCircuit, USAGE_COMMON};
+pub use cli_common::{
+    short_circuit, suggest_for_unknown, version_line, ShortCircuit, USAGE_COMMON,
+};
 
 pub use frame::{decode_frame, encode_frame, Frame, FrameError, MAX_FRAME_SIZE, PROTOCOL_VERSION};
 pub use messages::{BenchMode, Message, Request, Response, DEFAULT_SOCKET_PATH};

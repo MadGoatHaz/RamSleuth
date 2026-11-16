@@ -29,7 +29,6 @@
 //! [`dump`] is the thin RPC half: one `GetTelemetry` round trip over
 //! [`Client`], then [`render`] to stdout.
 
-use std::fmt::Write as _;
 use ramsleuth_display::timing_source;
 use ramsleuth_protocol::{Request, Response};
 use ramsleuth_telemetry::amd_readout::{
@@ -40,6 +39,7 @@ use ramsleuth_telemetry::error::{NaReason, Section};
 use ramsleuth_telemetry::intel_readout::{IntelChannel, IntelReadout};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
 use ramsleuth_telemetry::{SystemMemoryTelemetry, VoltageTelemetry};
+use std::fmt::Write as _;
 
 use crate::client::{Client, ClientError};
 
@@ -221,10 +221,7 @@ fn na_line(out: &mut String, reason: &NaReason) {
 fn rows(out: &mut String, indent: &str, pairs: &[(&str, String)]) {
     let key_pad = pairs.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
     for (key, value) in pairs {
-        let _ = writeln!(out, 
-            "{indent}{key:<key_pad$}  {value}",
-            key_pad = key_pad
-        );
+        let _ = writeln!(out, "{indent}{key:<key_pad$}  {value}", key_pad = key_pad);
     }
 }
 
@@ -501,7 +498,8 @@ fn spd_profile(out: &mut String, is_ddr5: bool, profile: &SpdProfile) {
     let trp = cell(&profile.trp);
     let tras = cell(&profile.tras);
     let voltage = volts(&profile.voltage);
-    let _ = writeln!(out, 
+    let _ = writeln!(
+        out,
         "  profile {index} ({scheme}): {speed}, {cas}-{trcd}-{trp}-{tras} @ {voltage}"
     );
 }
@@ -805,7 +803,7 @@ mod tests {
         // AMD primary + tertiary timings (the rfc2 `ParseError("fixture")`
         // cell now surfaces its detail — the fix).
         assert!(text.contains("tCL     16"));
-        assert!(text.contains("N/A (fixture)"));
+        assert!(text.contains("N/A (decode failed: fixture)"));
         // AMD CAD bus (RZQ code resolved to ohms + a direct-ohms RTT)
         assert!(text.contains("RZQ/10 (24.0 Ω)"));
         assert!(text.contains("45.0 Ω"));
@@ -885,7 +883,7 @@ mod tests {
         assert!(text.contains("1x")); // gear 1 (MC_BIOS_REQ gear bits 00b)
                                       // The SPD module's `ParseError("fixture")` cells now surface their
                                       // detail (the fix).
-        assert!(text.contains("N/A (fixture)"));
+        assert!(text.contains("N/A (decode failed: fixture)"));
         // channel 0 RTL: the live map has no RTL register (the
         // `NotApplicable` cell keeps the one bare `N/A`, D-4).
         assert!(text.contains("RTL (ticks)  N/A"));

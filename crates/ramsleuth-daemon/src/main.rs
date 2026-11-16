@@ -505,5 +505,4 @@ mod tests {
         assert_eq!(parsed.socket_path, PathBuf::from("/tmp/y.sock"));
         assert_eq!(parsed.max_age, Duration::from_secs(4));
     }
-
 }

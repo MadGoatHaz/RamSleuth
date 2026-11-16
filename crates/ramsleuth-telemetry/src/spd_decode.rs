@@ -1665,7 +1665,10 @@ mod tests {
     #[test]
     fn legacy_ddr5_image_fallback_still_works() {
         let m = decode(&ddr5_image());
-        assert!(m.is_ddr5, "0x0C + 1024 B must classify DDR5 (legacy fallback)");
+        assert!(
+            m.is_ddr5,
+            "0x0C + 1024 B must classify DDR5 (legacy fallback)"
+        );
         assert_eq!(m.die_maker, Section::Value("Micron".to_owned()));
         assert_eq!(m.density_mbit, Section::Value(16384));
         assert_eq!(m.rank, Section::Value(1));

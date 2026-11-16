@@ -817,9 +817,9 @@ fn dimm_sizes(spd: &[SpdModule], smbios: &SmbiosTopology) -> Vec<Section<f64>> {
         .map(|module| match (&module.density_mbit, &module.devices) {
             (Section::Na(reason), _) => Section::na(reason.clone()),
             (Section::Value(_), Section::Na(reason)) => Section::na(reason.clone()),
-            (Section::Value(density_mbit), Section::Value(devices)) => {
-                Section::Value((*density_mbit as f64) * (*devices as f64) / f64::from(MBIT_TO_GIB_DIVISOR))
-            }
+            (Section::Value(density_mbit), Section::Value(devices)) => Section::Value(
+                (*density_mbit as f64) * (*devices as f64) / f64::from(MBIT_TO_GIB_DIVISOR),
+            ),
         })
         .collect();
     // Chunk 4: when the SMBIOS fallback is active, the SPD-derived sizes
@@ -1838,6 +1838,7 @@ mod tests {
                         assert!((1..=2048).contains(ticks), "out-of-band timing {ticks}")
                     }
                     Section::Na(NaReason::ParseError(_)) => {}
+                    Section::Na(NaReason::NotReported) => {}
                     other => panic!("unexpected timing cell: {other:?}"),
                 };
                 let all = [

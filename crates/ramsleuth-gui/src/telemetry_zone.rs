@@ -1077,7 +1077,10 @@ mod tests {
         assert_eq!(displays(&rows, "tFAW"), vec!["16"]);
         // The fixture's rfc2 Na(ParseError("fixture")) cell: the non-empty
         // detail is now surfaced in the terse per-cell tag (the fix).
-        assert_eq!(displays(&rows, "tRFC2"), vec!["N/A (fixture)"]);
+        assert_eq!(
+            displays(&rows, "tRFC2"),
+            vec!["N/A (decode failed: fixture)"]
+        );
         assert_eq!(displays(&rows, "RTT nom"), vec!["RZQ/10 (24.0 Ω)"]);
         assert_eq!(displays(&rows, "RTT wr"), vec!["45.0 Ω"]);
         assert_eq!(displays(&rows, "RTT park"), vec!["N/A"]);
@@ -1601,7 +1604,7 @@ mod tests {
         );
         assert_eq!(
             na_text(&NaReason::ParseError("truncated at 0x1A".to_owned())),
-            "N/A (truncated at 0x1A)"
+            "N/A (decode failed: truncated at 0x1A)"
         );
         // An empty `ParseError` detail falls back to the terse tag.
         assert_eq!(
@@ -1632,12 +1635,16 @@ mod tests {
         for snapshot in [representative(), intel_populated(), all_na()] {
             let blocks = timing_cells(&snapshot, &Units::default());
             for (label, display) in all_rows(&blocks) {
-                // A surfaced detail and the empty-detail "decode failed"
-                // fallback are mutually exclusive in one display.
-                assert!(
-                    !(display.contains("decode failed") && display.contains("fixture")),
-                    "a surfaced detail and the empty-detail fallback never co-occur: {label} = {display:?}"
-                );
+                // Every ParseError display carries the "decode failed"
+                // prefix (empty detail: bare tag; non-empty: with the
+                // detail after a colon).
+                if display.contains("decode failed") {
+                    assert!(
+                        display == "N/A (decode failed)"
+                            || display.starts_with("N/A (decode failed: "),
+                        "ParseError display must be well-formed: {label} = {display:?}"
+                    );
+                }
             }
             for block in &blocks {
                 if let Some(display) = &block.degraded {
@@ -1656,7 +1663,7 @@ mod tests {
             assert!(
                 displays
                     .iter()
-                    .any(|(_, display)| display == "N/A (fixture)"),
+                    .any(|(_, display)| display == "N/A (decode failed: fixture)"),
                 "the non-empty ParseError detail must be surfaced: {displays:?}"
             );
         }

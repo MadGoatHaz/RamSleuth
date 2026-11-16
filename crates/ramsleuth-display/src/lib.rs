@@ -806,10 +806,7 @@ mod tests {
             "N/A (decode failed)"
         );
         // The new CHUNK-B variant.
-        assert_eq!(
-            na_cell_text(&NaReason::NotReported),
-            "N/A (not reported)"
-        );
+        assert_eq!(na_cell_text(&NaReason::NotReported), "N/A (not reported)");
     }
 
     /// A non-empty [`NaReason::ParseError`] detail is surfaced with the
@@ -834,10 +831,7 @@ mod tests {
         // `NotApplicable` → the one bare `N/A` (unchanged).
         assert_eq!(na_cell_text(&NaReason::NotApplicable), "N/A");
         // `NotReported` → the blank-register form (CHUNK-B).
-        assert_eq!(
-            na_cell_text(&NaReason::NotReported),
-            "N/A (not reported)"
-        );
+        assert_eq!(na_cell_text(&NaReason::NotReported), "N/A (not reported)");
     }
 
     #[test]
@@ -885,10 +879,7 @@ mod tests {
     /// form in the compact per-cell form.
     #[test]
     fn na_cell_text_not_reported() {
-        assert_eq!(
-            na_cell_text(&NaReason::NotReported),
-            "N/A (not reported)"
-        );
+        assert_eq!(na_cell_text(&NaReason::NotReported), "N/A (not reported)");
     }
 
     /// (CHUNK-B) The `NotReported` variant renders the verbose,

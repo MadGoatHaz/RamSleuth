@@ -197,12 +197,14 @@ const ROWS: [(&str, usize); 4] = [("Memory (DRAM)", 0), ("L3", 3), ("L2", 2), ("
 pub(crate) fn render_grid(grid: &BenchmarkGrid) -> String {
     const COL: usize = 12;
     let mut out = String::new();
-    let _ = writeln!(out, 
+    let _ = writeln!(
+        out,
         "{:<15} {:>COL$} {:>COL$} {:>COL$} {:>COL$}",
         "Tier", "Read (GB/s)", "Write (GB/s)", "Copy (GB/s)", "Latency (ns)"
     );
     for (label, slot) in ROWS {
-        let _ = writeln!(out, 
+        let _ = writeln!(
+            out,
             "{label:<15} {:>COL$.2} {:>COL$.2} {:>COL$.2} {:>COL$.1}",
             grid.read_gbps[slot],
             grid.write_gbps[slot],

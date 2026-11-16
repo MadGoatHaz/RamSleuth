@@ -79,7 +79,9 @@ use std::time::Duration;
 
 use ramsleuth_bench::{StreamTarget, Tier};
 use ramsleuth_client::{bench, burn, dump, probe, status, Client, ClientError};
-use ramsleuth_protocol::cli_common::{short_circuit, suggest_for_unknown, version_line, ShortCircuit, USAGE_COMMON};
+use ramsleuth_protocol::cli_common::{
+    short_circuit, suggest_for_unknown, version_line, ShortCircuit, USAGE_COMMON,
+};
 use ramsleuth_protocol::{BenchMode, DEFAULT_SOCKET_PATH};
 
 /// Read timeout for the one-round-trip subcommands (`dump` /
@@ -245,8 +247,6 @@ const USAGE: &str = concat!(
     "Exit codes: 0 success, 1 daemon/client error, 2 usage error\n",
     "\n",
 );
-
-
 
 /// One subcommand name (the first positional): `dump` / `bench` /
 /// `status` / `probe` / `burn`; anything else is an error naming the
@@ -758,5 +758,4 @@ mod tests {
         assert!(args.probe_json);
         assert!(!args.probe_stdout);
     }
-
 }
