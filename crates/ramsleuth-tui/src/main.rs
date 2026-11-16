@@ -181,6 +181,7 @@
 //! Exit codes: 0 quit, 1 terminal init failure, 2 usage error
 //! ```
 
+use std::fmt::Write as _;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -394,14 +395,14 @@ where
         } else if arg.starts_with("--") {
             let mut msg = format!("unknown flag `{arg}` (expected `--socket <path>`)");
             if let Some(sug) = suggest_related_binary(arg) {
-                msg.push_str(&format!("\n  {sug}"));
+                let _ = write!(msg, "\n  {sug}");
             }
             return Err(msg);
         } else {
             let mut msg =
                 format!("unexpected argument `{arg}` (no positional arguments are accepted)");
             if let Some(sug) = suggest_related_binary(arg) {
-                msg.push_str(&format!("\n  {sug}"));
+                let _ = write!(msg, "\n  {sug}");
             }
             return Err(msg);
         }

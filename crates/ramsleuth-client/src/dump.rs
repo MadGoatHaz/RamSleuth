@@ -29,6 +29,7 @@
 //! [`dump`] is the thin RPC half: one `GetTelemetry` round trip over
 //! [`Client`], then [`render`] to stdout.
 
+use std::fmt::Write as _;
 use ramsleuth_display::timing_source;
 use ramsleuth_protocol::{Request, Response};
 use ramsleuth_telemetry::amd_readout::{
@@ -161,7 +162,7 @@ fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
                 // when the wire omits it (an older daemon). The
                 // recompute no longer masks the wire value.
                 let delta_mv = v.delta_volts.unwrap_or(v.delivered_volts - vid) * 1000.0;
-                s.push_str(&format!(" (VID: {:.3} V, Δ {:+.0} mV)", vid, delta_mv));
+                let _ = write!(s, " (VID: {:.3} V, Δ {:+.0} mV)", vid, delta_mv);
             }
             s
         }
@@ -173,7 +174,7 @@ fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
 /// sense, AMD = the SMU PM-table vCore), one line.
 fn vcore_section(out: &mut String, vcore: &Section<VoltageTelemetry>) {
     out.push_str("=== Vcore ===\n");
-    out.push_str(&format!("CPU Core Voltage: {}\n", vcore_display(vcore)));
+    let _ = writeln!(out, "CPU Core Voltage: {}", vcore_display(vcore));
     out.push('\n');
 }
 
@@ -199,12 +200,12 @@ fn density(section: &Section<u16>) -> String {
 
 /// One `=== SECTION ===` header line.
 fn header(out: &mut String, title: &str) {
-    out.push_str(&format!("=== {title} ===\n"));
+    let _ = writeln!(out, "=== {title} ===");
 }
 
 /// One `  --- subgroup ---` header line (two-space indent).
 fn subheader(out: &mut String, title: &str) {
-    out.push_str(&format!("  --- {title} ---\n"));
+    let _ = writeln!(out, "  --- {title} ---");
 }
 
 /// One `  N/A (<reason>)` line under a section header (two-space indent).
@@ -220,10 +221,10 @@ fn na_line(out: &mut String, reason: &NaReason) {
 fn rows(out: &mut String, indent: &str, pairs: &[(&str, String)]) {
     let key_pad = pairs.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
     for (key, value) in pairs {
-        out.push_str(&format!(
-            "{indent}{key:<key_pad$}  {value}\n",
+        let _ = writeln!(out, 
+            "{indent}{key:<key_pad$}  {value}",
             key_pad = key_pad
-        ));
+        );
     }
 }
 
@@ -500,9 +501,9 @@ fn spd_profile(out: &mut String, is_ddr5: bool, profile: &SpdProfile) {
     let trp = cell(&profile.trp);
     let tras = cell(&profile.tras);
     let voltage = volts(&profile.voltage);
-    out.push_str(&format!(
-        "  profile {index} ({scheme}): {speed}, {cas}-{trcd}-{trp}-{tras} @ {voltage}\n"
-    ));
+    let _ = writeln!(out, 
+        "  profile {index} ({scheme}): {speed}, {cas}-{trcd}-{trp}-{tras} @ {voltage}"
+    );
 }
 
 // ---------------------------------------------------------------------------

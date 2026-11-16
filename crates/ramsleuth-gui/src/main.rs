@@ -121,6 +121,7 @@
 //! Exit codes: 0 quit, 1 eframe/display failure, 2 usage error
 //! ```
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -380,14 +381,14 @@ where
         } else if arg.starts_with("--") {
             let mut msg = format!("unknown flag `{arg}` (expected `--socket <path>`)");
             if let Some(sug) = suggest_related_binary(arg) {
-                msg.push_str(&format!("\n  {sug}"));
+                let _ = write!(msg, "\n  {sug}");
             }
             return Err(msg);
         } else {
             let mut msg =
                 format!("unexpected argument `{arg}` (no positional arguments are accepted)");
             if let Some(sug) = suggest_related_binary(arg) {
-                msg.push_str(&format!("\n  {sug}"));
+                let _ = write!(msg, "\n  {sug}");
             }
             return Err(msg);
         }
@@ -1126,7 +1127,7 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
         .map(|mts| format!("{mts} MT/s"))
         .or_else(|| mclk_derived_speed(t));
     if let Some(speed) = speed {
-        line.push_str(&format!(" {speed}"));
+        let _ = write!(line, " {speed}");
     }
     // Single source of truth (Chunk 2): the Intel readout's trust-resolved
     // channel label ([`IntelReadout::channel_display_label`] — the same
@@ -1143,11 +1144,11 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, units: &Units) -> String {
         },
         (None, None) => channel_mode(t.dimm_sizes.len()),
     };
-    line.push_str(&format!(" | {channel}"));
+    let _ = write!(line, " | {channel}");
     if let Some(note) = slot_note(&t.total_capacity, &t.dimm_sizes) {
-        line.push_str(&format!(" | {note}"));
+        let _ = write!(line, " | {note}");
     }
-    line.push_str(&format!(" | {}", ecc_label(t)));
+    let _ = write!(line, " | {}", ecc_label(t));
     line.push_str(" | Mode: ");
     line
 }

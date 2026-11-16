@@ -213,6 +213,8 @@ pub use server_uncore::*;
 pub(crate) use gates::is_present_word;
 
 // Module-local imports for the decode paths and the tests below.
+use std::fmt::Write as _;
+
 use gates::*;
 
 use crate::amd_readout::{EccStatus, GearMode, TimingSet};
@@ -1211,9 +1213,9 @@ pub fn decode(regs: &IntelImcRegs, gen: IntelGen, smbios: &SmbiosTopology) -> In
                     if !effective_res.annotation.is_empty() {
                         effective_res.annotation.push(' ');
                     }
-                    effective_res.annotation.push_str(&format!(
+                    let _ = write!(effective_res.annotation, 
                         "[C-3: MAD-derived tech {mad:?} disagrees with SMBIOS Type 17 ({smb:?}) — trusting the firmware-written SMBIOS source for the 0xD800 page policy]"
-                    ));
+                    );
                     Some(smb)
                 }
                 _ => res.tech,

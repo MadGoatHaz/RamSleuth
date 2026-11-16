@@ -10,6 +10,7 @@
 //! cargo run -p ramsleuth-bench [--avx512] [--json] [--latency] [--help] [--version]
 //! ```
 //!
+use std::fmt::Write as _;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -139,7 +140,7 @@ pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
             other => {
                 let mut msg = format!("unknown flag: {other} (see --help)");
                 if let Some(sug) = suggest_for_unknown(other) {
-                    msg.push_str(&format!("\n  {sug}"));
+                    let _ = write!(msg, "\n  {sug}");
                 }
                 return Err(msg);
             }
@@ -196,18 +197,18 @@ const ROWS: [(&str, usize); 4] = [("Memory (DRAM)", 0), ("L3", 3), ("L2", 2), ("
 pub(crate) fn render_grid(grid: &BenchmarkGrid) -> String {
     const COL: usize = 12;
     let mut out = String::new();
-    out.push_str(&format!(
-        "{:<15} {:>COL$} {:>COL$} {:>COL$} {:>COL$}\n",
+    let _ = writeln!(out, 
+        "{:<15} {:>COL$} {:>COL$} {:>COL$} {:>COL$}",
         "Tier", "Read (GB/s)", "Write (GB/s)", "Copy (GB/s)", "Latency (ns)"
-    ));
+    );
     for (label, slot) in ROWS {
-        out.push_str(&format!(
-            "{label:<15} {:>COL$.2} {:>COL$.2} {:>COL$.2} {:>COL$.1}\n",
+        let _ = writeln!(out, 
+            "{label:<15} {:>COL$.2} {:>COL$.2} {:>COL$.2} {:>COL$.1}",
             grid.read_gbps[slot],
             grid.write_gbps[slot],
             grid.copy_gbps[slot],
             grid.latency_ns[slot],
-        ));
+        );
     }
     out
 }

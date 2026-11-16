@@ -43,6 +43,7 @@
 //! (capturing this process's own stdout in a test is not reliable: std
 //! dups fd 1 on first use). The P3-21 bin ignores the return value.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use ramsleuth_bench::{BenchOp, BenchmarkGrid, Metric, StreamProgress, StreamTarget, Tier};
@@ -153,14 +154,14 @@ pub fn render_grid(grid: &BenchmarkGrid) -> String {
     // shape as the rows, so every line comes out the same width.
     out.push_str(&" ".repeat(tier_width));
     for (col, name) in METRIC_NAMES.iter().enumerate() {
-        out.push_str(&format!("  {:<width$}", name, width = widths[col]));
+        let _ = write!(out, "  {:<width$}", name, width = widths[col]);
     }
     out.push('\n');
     // One line per tier: the name + the four cells, column by column.
     for (row, tier) in TIER_ORDER.iter().enumerate() {
-        out.push_str(&format!("{:<width$}", tier_name(tier), width = tier_width));
+        let _ = write!(out, "{:<width$}", tier_name(tier), width = tier_width);
         for (col, cell) in cells[row].iter().enumerate() {
-            out.push_str(&format!("  {:<width$}", cell, width = widths[col]));
+            let _ = write!(out, "  {:<width$}", cell, width = widths[col]);
         }
         out.push('\n');
     }
@@ -331,16 +332,16 @@ pub fn status(client: &mut Client) -> Result<String, ClientError> {
 fn summarize(telemetry: &SystemMemoryTelemetry, socket_path: &Path) -> String {
     let mut out = String::new();
     out.push_str("CPU: ok\n");
-    out.push_str(&format!("AMD: {}\n", section_state(&telemetry.amd)));
-    out.push_str(&format!("Intel: {}\n", section_state(&telemetry.intel)));
+    let _ = writeln!(out, "AMD: {}", section_state(&telemetry.amd));
+    let _ = writeln!(out, "Intel: {}", section_state(&telemetry.intel));
     if telemetry.spd.is_empty() {
         out.push_str("SPD: N/A (no modules)\n");
     } else {
         let modules = telemetry.spd.len();
         let unit = if modules == 1 { "module" } else { "modules" };
-        out.push_str(&format!("SPD: ok ({modules} {unit})\n"));
+        let _ = writeln!(out, "SPD: ok ({modules} {unit})");
     }
-    out.push_str(&format!("daemon: {}\n", socket_path.display()));
+    let _ = writeln!(out, "daemon: {}", socket_path.display());
     out
 }
 

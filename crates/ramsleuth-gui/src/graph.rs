@@ -95,6 +95,7 @@
 //! context); [`render_graphs_window`] is the thin `egui` surface
 //! over them (the live render is gated by C7-21).
 
+use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use egui::{
@@ -812,7 +813,7 @@ pub fn render_graphs_window(ctx: &egui::Context, graph: &GraphState, poll_interv
                 samples.len()
             );
             if pan > 0.0 {
-                subtitle.push_str(&format!(" · −{pan:.0} s"));
+                let _ = write!(subtitle, " · −{pan:.0} s");
             }
             ui.label(RichText::new(subtitle).color(dim));
             // The parity note (FE-8): the GUI window vs the TUI sparkline
