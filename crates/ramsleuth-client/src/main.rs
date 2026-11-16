@@ -73,6 +73,7 @@
 //! Exit codes: 0 success, 1 daemon/client error, 2 usage error
 //! ```
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -305,7 +306,7 @@ fn parse_subcommand(arg: &str) -> Result<Subcommand, String> {
                  or `burn`)"
             );
             if let Some(sug) = suggest_for_unknown(other) {
-                msg.push_str(&format!("\n  {sug}"));
+                let _ = write!(msg, "\n  {sug}");
             }
             Err(msg)
         }
@@ -419,7 +420,7 @@ where
                          `--stdout`, `--json`, or `--duration <minutes>`)"
                     );
                     if let Some(sug) = suggest_for_unknown(other) {
-                        msg.push_str(&format!("\n  {sug}"));
+                        let _ = write!(msg, "\n  {sug}");
                     }
                     return Err(msg);
                 }

@@ -71,6 +71,7 @@
 //! or the default [`AppState`] draws without panicking (the tests assert
 //! through ratatui's in-memory `TestBackend`).
 
+use std::fmt::Write as _;
 use std::time::Instant;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -731,13 +732,13 @@ fn ram_line_prefix(t: &SystemMemoryTelemetry, capacity_gib: bool) -> String {
     let ecc = ecc_label(t);
     let mut line = format!("RAM: {total} ({summary})");
     if let Some(speed) = speed {
-        line.push_str(&format!(" {speed}"));
+        let _ = write!(line, " {speed}");
     }
-    line.push_str(&format!(" | {channel}"));
+    let _ = write!(line, " | {channel}");
     if let Some(note) = note {
-        line.push_str(&format!(" | {note}"));
+        let _ = write!(line, " | {note}");
     }
-    line.push_str(&format!(" | {ecc}"));
+    let _ = write!(line, " | {ecc}");
     line.push_str(" | Mode: ");
     line
 }
@@ -1696,10 +1697,10 @@ fn zone3_content(state: &AppState) -> (Vec<&SpdModule>, Vec<ListItem<'static>>) 
     };
     let mut text = format!("daemon: {status}");
     if let Some(last) = state.last_update {
-        text.push_str(&format!(
+        let _ = write!(text, 
             " · {secs:.1}s ago",
             secs = last.elapsed().as_secs_f64()
-        ));
+        );
     }
     let color = if state.error.is_some() {
         CRIMSON

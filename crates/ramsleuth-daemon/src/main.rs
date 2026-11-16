@@ -51,6 +51,7 @@
 //!   -V, --version      print the version and exit
 //! ```
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -254,7 +255,7 @@ where
                     "unknown argument `{other}` (expected `--socket <path>`, `--max-age <secs>`, `--no-spd-autobind`, or `--help`)"
                 );
                 if let Some(sug) = suggest_for_unknown(other) {
-                    msg.push_str(&format!("\n  {sug}"));
+                    let _ = write!(msg, "\n  {sug}");
                 }
                 return Err(msg);
             }
