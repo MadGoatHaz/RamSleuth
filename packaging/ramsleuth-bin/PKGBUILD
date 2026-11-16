@@ -103,7 +103,7 @@ source=("https://github.com/MadGoatHaz/RamSleuth/releases/download/v$pkgver/rams
 # v2.4.34: finalized — the sha256 of the published v2.4.34 release
 # tarball (ramsleuth-2.4.34-x86_64.tar.zst) from the official GitHub
 # Release, taken from the published .sha256 sidecar.
-sha256sums=('e6447798503adf7ae67c53c485d5031c842dfe9b37bf80f0ad6e9655bc3ad003')
+sha256sums=('0b450040c186d68399f2125b42b9d02f94b416e891ed74fdfeb07cd745257446')
 install=ramsleuth-bin.install
 # The in-repo ramsleuth_intel DKMS source ships bundled (package() step (12))
 # and would file-conflict with the standalone ramsleuth-intel-dkms extra, so the
