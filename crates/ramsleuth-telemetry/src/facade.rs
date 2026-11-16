@@ -63,6 +63,15 @@ use crate::platform::{self, SystemPlatform};
 use crate::spd_decode::{self, SpdModule};
 use crate::spd_eeprom::{self, SpdAcquireStatus};
 
+/// Maximum plausible DRAM timing value in clock ticks. Values above this
+/// are considered corrupt or misdecoded (e.g., a 16-bit field read as a
+/// timing when it is actually a flags byte).
+const TIMING_CEILING_TICKS: u16 = 2048;
+
+/// Divisor for converting total Mbit (density_mbit × device_count) to GiB.
+/// 1 GiB = 8192 Mbit (1024 MiB × 8 Mbit/MiB).
+const MBIT_TO_GIB_DIVISOR: u32 = 8192;
+
 /// The full system memory telemetry snapshot — the Phase 2 exit-criteria
 /// struct (v2 §2.2.1), extended in Cycle 6 with the platform branch
 /// (C6-01) and the derived capacities (D-C3/D-C9).
@@ -541,7 +550,7 @@ fn overlay_apob_timings(readout: &mut AmdReadout, ch: &amd_apob::ApobChannelTimi
     // Helper: overlay a timing value if it is in the plausible range
     // (the same sanity gate as `amd_readout::map_timing`).
     let overlay = |cell: &mut Section<u16>, value: u16| {
-        if (1..=2048).contains(&value) {
+        if (1..=TIMING_CEILING_TICKS).contains(&value) {
             *cell = Section::Value(value);
         }
     };
@@ -809,7 +818,7 @@ fn dimm_sizes(spd: &[SpdModule], smbios: &SmbiosTopology) -> Vec<Section<f64>> {
             (Section::Na(reason), _) => Section::na(reason.clone()),
             (Section::Value(_), Section::Na(reason)) => Section::na(reason.clone()),
             (Section::Value(density_mbit), Section::Value(devices)) => {
-                Section::Value((*density_mbit as f64) * (*devices as f64) / 8192.0)
+                Section::Value((*density_mbit as f64) * (*devices as f64) / f64::from(MBIT_TO_GIB_DIVISOR))
             }
         })
         .collect();
