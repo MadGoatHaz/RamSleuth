@@ -4,6 +4,24 @@ All notable per-release changes to RamSleuth. Newest first.
 
 **Versioning policy.** The single source of truth for the version is `[workspace.package].version` in the root `Cargo.toml`; every member crate inherits it. A release = a version bump + the git tag `v<ver>` + the release workflow (`.github/workflows/release.yml`) publishing four artifacts: the binary tarball `ramsleuth-<ver>-x86_64.tar.zst` + its `.sha256`, and the Debian/Ubuntu/Mint package `ramsleuth_<ver>_amd64.deb` + its `.sha256`. The AUR packages (`ramsleuth`, `ramsleuth-bin`, and the `ramsleuth-intel-dkms` extra) track this versioning and are maintained at the same pace as the project — with one deliberate exception: the `ryzen-smu-dkms` extra keeps its own `1.0` pkgver line (re-pinned per release wave via the commit pin + `pkgrel`, not version-bumped) and does not track the workspace version.
 
+## v2.4.33 (2026-11-16)
+
+### Added
+- **DDR5 SPD parsing now uses the correct JESD79-5 spec offsets.** DDR5 modules (7950X/9950X/etc.) now correctly report: die manufacturer (byte 0x01), density (JESD79-5 table, byte 0x13), rank count (N-1 encoding, byte 0x80), device width (byte 0x81), and total device count. Previously these all showed N/A on DDR5 systems.
+- **DDR5 `die_type` field** now shows a human-readable label (e.g., "SK hynix 16384 Mbit") inferred from the die manufacturer + density, instead of always showing N/A.
+- **XMP 3.0 / EXPO profile voltage** is now read from the correct offset (+18/+19, 16-bit LE mV) — previously off by one byte.
+- **New `NaReason::NotReported` variant** distinguishes "the firmware did not report a value for this field" (zero in an optional register) from "decode failed" (value present but malformed). Optional AMD registers that read zero (tRFC2, VDDIO_MEM, VPP on some platforms) now show `N/A (not reported)` instead of the confusing `N/A (parse error: ...)`.
+
+### Changed
+- **N/A display text refined:** `ParseError` now renders as "decode failed" (was "parse error") to more accurately describe what happened.
+- **CLI boilerplate deduplicated:** The ~300 lines of byte-identical code (version_line, short_circuit, suggest_for_unknown, USAGE) that was copied across all 6 binaries is now a single shared module in `ramsleuth-protocol::cli_common`. 12 per-binary test functions consolidated to 3 shared tests.
+- **Zero-allocation string formatting:** Replaced 53 instances of `push_str(&format!(...))` with `write!(...)` across the codebase — eliminates unnecessary intermediate String allocations in the probe report, dump output, and all formatting paths.
+- **Magic numbers replaced with named constants:** `TIMING_CEILING_TICKS` (2048), `MBIT_TO_GIB_DIVISOR` (8192), `SMN_DEFAULT_START` (0x50000), `SMN_DEFAULT_END` (0x50400) — each with doc comments explaining the origin.
+
+### Fixed
+- **DDR5 type detection:** Now checks for the spec-defined `0x02 == 0x11` first, with the legacy `0x0C` + image-length heuristic as fallback for compatibility.
+- **DDR5 density codes:** Corrected from the non-spec `0x11..=0x18` mapping to the JESD79-5 `0x01..=0x0C` table (1 Gb through 128 Gb).
+
 ## v2.4.32 (2026-11-11)
 
 ### Added
