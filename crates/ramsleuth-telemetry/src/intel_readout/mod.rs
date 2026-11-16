@@ -169,7 +169,7 @@
 //! reserved / overflow gates, the gen gate, and bincode round-trips —
 //! all without hardware, root, or I/O.
 //!
-//! # Module layout (step 2 of the directory split)
+//! # Module layout (step 3 of the directory split)
 //!
 //! The frozen type shapes live in [`types`] and the shared sanity
 //! gates / degenerate-word screening helpers in [`gates`] (both are
@@ -180,15 +180,21 @@
 //! (Alder Lake DDR4, Phase 1), and [`server_uncore`] (Haswell-E /
 //! Broadwell-E / Skylake-X / Cascade Lake). Channel resolution
 //! (the 4-tier trust procedure, the C-3 aliasing policy) lives in
-//! [`channel`]. The register readers, the shared MCLK / gear / uclk
-//! decoders, and the profile-dispatch [`decode`] entry point stay in
-//! this file.
+//! [`channel`]. The register offset constants live in [`constants`],
+//! the register readers in [`regs`], the generation gates in
+//! [`gen_gate`], and the shared MCLK / gear / uclk decoders in
+//! [`clock`]. The profile-dispatch [`decode`] entry point and the
+//! live read / fixture helpers stay in this file.
 
 pub mod channel;
+pub mod clock;
+pub mod constants;
 pub mod gates;
+pub mod gen_gate;
 pub mod legacy_ddr4;
 pub mod modern_ddr4;
 pub mod modern_ddr5;
+pub mod regs;
 pub mod server_uncore;
 pub mod types;
 
@@ -199,6 +205,10 @@ pub(crate) mod fixtures;
 // paths still work (step 1 of the directory-module split).
 pub use types::*;
 
+// Re-export the register offset constants so external
+// `use ...intel_readout::MCHBAR_WINDOW` paths still work (step 3).
+pub use constants::*;
+
 // Re-export the channel resolution helpers so external
 // `use ...intel_readout::resolve_channel` paths still work.
 pub use channel::*;
@@ -207,684 +217,42 @@ pub use channel::*;
 // `use ...intel_readout::decode_server` / `is_server_gen` paths still work.
 pub use server_uncore::*;
 
+// Re-export the generation gate functions so external
+// `use ...intel_readout::gen_gate` / `channel_count` / `intel_gen_gate`
+// paths still work (step 3 of the directory-module split).
+pub use gen_gate::*;
+
+// Re-export the public clock decode functions so external
+// `use ...intel_readout::mcbios_gear` / `decode_uclk` paths still work
+// (step 3 of the directory-module split).
+pub use clock::{decode_uclk, mcbios_gear};
+
 // The gate helpers are module-local (`pub(super)` in `gates`); the
 // degenerate-word screeners keep their crate-visible contract (N-05)
 // at this module root.
 pub(crate) use gates::is_present_word;
+
+// The `pub(crate)` clock decode helpers used by the `decode` dispatch
+// in this file (step 3 of the directory-module split).
+use clock::{decode_mclk, gear_uclk_cells};
 
 // Module-local imports for the decode paths and the tests below.
 use std::fmt::Write as _;
 
 use gates::*;
 
-use crate::amd_readout::{EccStatus, GearMode, TimingSet};
-use crate::cpuid::{CpuInfo, CpuVendor, IntelGen};
-use crate::error::{NaReason, Section, TelemetryError, TelemetryResult};
+#[cfg(test)]
+use crate::amd_readout::GearMode;
+use crate::amd_readout::{EccStatus, TimingSet};
+#[cfg(test)]
+use crate::cpuid::CpuVendor;
+use crate::cpuid::{CpuInfo, IntelGen};
+#[cfg(test)]
+use crate::error::TelemetryError;
+use crate::error::{NaReason, Section, TelemetryResult};
 use crate::intel_gen::{profile_for, GearCap, GenMap, ALDER_CHANNELS};
 use crate::intel_mchbar::MchBar;
 use crate::intel_smbios::SmbiosTopology;
-
-// ---------------------------------------------------------------------------
-// Hardware-authoritative Tier-1 register table (MCHBAR-relative offsets).
-// ---------------------------------------------------------------------------
-
-/// Tier-1 MCHBAR window is 64 KiB (0x10000) per datasheet.
-///
-/// Compile-check boundary for this module's register table (every Tier-1
-/// and legacy offset must fit it). The runtime `/dev/mem` mmap in
-/// `intel_mchbar.rs` uses the same 64 KiB size. Tier-2 (Alder/Raptor)
-/// will require 256 KiB (0x40000).
-pub const MCHBAR_WINDOW: usize = 1 << 16;
-
-/// Tier-3 (Alder/Raptor Lake and later) MCHBAR window is 256 KiB
-/// (0x40000) — the profiled window of the Alder family (IG-03;
-/// Research roadmap Tier 3: "Expand window to 256 KiB"). The wide
-/// `/dev/mem` map ([`IntelImcRegs::from_bar_wide`], IG-25) and
-/// `intel_mchbar::acquire` (via `intel_mchbar::window_size_for`) use it.
-pub const MCHBAR_WINDOW_TIER3: usize = 1 << 18;
-
-/// Global register: the BIOS request word carrying the DRAM clock ratio
-/// (bits 7:0), the reference-clock select (bit 8), the gear ratio (bits
-/// 17:16 — Rocket Lake and later; decoded by the Rocket Lake profile),
-/// and RUN_BUSY (bit 31).
-pub const MC_BIOS_REQ_OFFSET: usize = 0x5E00;
-
-/// Per-channel IMC block bases: channel 0 at `0x4000`, channel 1 at
-/// `0x4400` (single memory controller, Tier 1).
-pub const CHANNEL0_BASE: usize = 0x4000;
-pub const CHANNEL1_BASE: usize = 0x4400;
-
-/// Stride between the two per-channel blocks (Tier 1).
-pub const CHANNEL_STRIDE: usize = 0x400;
-
-/// Offsets within a channel's IMC block (4-byte registers, in decode
-/// order).
-pub const TC_DBP_OFFSET: usize = 0x00;
-pub const TC_RAP_OFFSET: usize = 0x04;
-pub const TC_RFP_OFFSET: usize = 0x08;
-pub const TC_RAP2_OFFSET: usize = 0x0C;
-pub const TC_RDRD_OFFSET: usize = 0x20;
-pub const TC_RDWR_OFFSET: usize = 0x24;
-pub const TC_WRRD_OFFSET: usize = 0x28;
-pub const TC_WRWR_OFFSET: usize = 0x2C;
-
-/// Reference clock for `MC_BIOS_REQ` REF_CLK = 0 (the 400 MHz bus clock
-/// divided by 3, i.e. 133.3333… MHz).
-const REF_CLK_133_MHZ: f64 = 400.0 / 3.0;
-
-/// Reference clock for `MC_BIOS_REQ` REF_CLK = 1 (100 MHz).
-const REF_CLK_100_MHZ: f64 = 100.0;
-
-/// Highest MCHBAR-relative offset this module reads (a 4-byte access at
-/// `MC_BIOS_REQ`).
-pub const MAX_IMC_OFFSET: usize = MC_BIOS_REQ_OFFSET + 4;
-
-/// Highest per-channel offset (channel 1's `TC_WRWR`, 4-byte access).
-pub const MAX_CHANNEL_OFFSET: usize = CHANNEL1_BASE + TC_WRWR_OFFSET + 4;
-
-// Compile-time proof that every register read in this module
-// (the hardware-authoritative Tier-1 table) fits the 64 KiB Tier-1
-// MCHBAR window (each read is a 4-byte access). A violated bound
-// fails const evaluation (division by zero).
-const _ASSERT_IMC_READS_IN_WINDOW: () = {
-    let in_window = MAX_IMC_OFFSET <= MCHBAR_WINDOW && MAX_CHANNEL_OFFSET <= MCHBAR_WINDOW;
-    let _proof: usize = 1 / if in_window { 1 } else { 0 };
-};
-
-// ---------------------------------------------------------------------------
-// Tier-3 (Alder/Raptor Lake) offset set — the 256 KiB wide window (IG-25).
-// ---------------------------------------------------------------------------
-
-/// Native MCL block bases (per controller; Research lines 107, 329,
-/// OQ-4 — subchannels 1 and 3 have no MCL base): MC0 @ `0xD000`,
-/// MC1 @ `0xD800`.
-pub const MCL0_BASE: usize = 0xD000;
-pub const MCL1_BASE: usize = 0xD800;
-
-/// Offsets within a native MCL block (4-byte registers; the Alder
-/// layout per `ALDER_FIELDS`, in decode order).
-pub const MCL_TC_PRE_OFFSET: usize = 0x00;
-pub const MCL_TC_ACT_OFFSET: usize = 0x04;
-pub const MCL_TC_ACT2_OFFSET: usize = 0x08;
-pub const MCL_TC_WTR_OFFSET: usize = 0x10;
-pub const MCL_TC_RFP_OFFSET: usize = 0x14;
-pub const MCL_TC_RFP2_OFFSET: usize = 0x18;
-pub const MCL_TC_RDRD_OFFSET: usize = 0x20;
-pub const MCL_TC_WRWR_OFFSET: usize = 0x28;
-
-/// `MAD_DIMM_CH2` / `MAD_DIMM_CH3` intra-IMC-base offsets. The full
-/// address is [`imc_base_for`] + this: `0x5000` pre-12th-gen (→ the
-/// legacy `0x5060` / `0x5064`) or `0xD800` 12th-gen+ (→ `0xD860` /
-/// `0xD864`). The `+0x60` / `+0x64` intra-base position is preserved from
-/// the legacy map — it is **not** the `+0x0C` / `+0x10`
-/// `MAD_INTER_CHANNEL` / `MAD_DIMM_CH0/1` stride [`read_intel`] reads, and
-/// reusing that stride would collide with the native MCL1 block (also at
-/// `0xD800`, whose `TC_RFP` / `TC_RFP2` sit at `+0x14` / `+0x18`).
-pub const MAD_DIMM_CH2_INTRA: usize = 0x60;
-pub const MAD_DIMM_CH3_INTRA: usize = 0x64;
-
-/// The pre-12th-gen (`imc_base` = `0x5000`) `MAD_DIMM_CH2` /
-/// `MAD_DIMM_CH3` absolute offsets — the legacy `0x5060` / `0x5064`, kept
-/// for the window compile-assert and the reader test fixtures.
-pub const MAD_DIMM_CH2_OFFSET: usize = 0x5000 + MAD_DIMM_CH2_INTRA;
-pub const MAD_DIMM_CH3_OFFSET: usize = 0x5000 + MAD_DIMM_CH3_INTRA;
-
-/// Highest Tier-3 MCL offset (MC1's `TC_WRWR`, 4-byte access).
-pub const MAX_MCL_OFFSET: usize = MCL1_BASE + MCL_TC_WRWR_OFFSET + 4;
-
-/// Highest Tier-3 global/MAD offset (`MAD_DIMM_CH3`, 4-byte access).
-pub const MAX_MAD_DIMM_OFFSET: usize = MAD_DIMM_CH3_OFFSET + 4;
-
-// ---------------------------------------------------------------------------
-// Phase 1 (Intel MC fix): the Alder Lake **DDR4** TC offset set.
-//
-// On DDR4 Alder Lake the TC timing registers live at `MCHBAR + 0xE000`
-// (MC0) / `MCHBAR + 0x1E000` (MC1) — **not** the `0x4000` legacy mirror
-// window the Tier-1 map reads (which returns `0xFFFFFFFF` on DDR4). MC1 is
-// MC0's block offset by the inter-controller stride `0x10000`.
-// ---------------------------------------------------------------------------
-
-/// Per-MC TC block bases (relative to MCHBAR): MC0 @ `0xE000`,
-/// MC1 @ `0x1E000` (`0xE000 + 0x10000`).
-pub const ALK_D4_TC0_BASE: usize = 0xE000;
-pub const ALK_D4_TC1_BASE: usize = 0x1E000;
-
-/// Offsets within an Alder Lake DDR4 TC block (4-byte registers; the
-/// datasheet §3.2.66–3.2.87 layout). `TC_PRE` is a 64-bit register read as
-/// two words: the low word @ `+0x00` and the high word @ `+0x04`.
-pub const ALK_D4_TC_PRE: usize = 0x00;
-pub const ALK_D4_TC_PRE_HI: usize = 0x04;
-pub const ALK_D4_TC_ACT: usize = 0x08;
-pub const ALK_D4_TC_RDRD: usize = 0x0C;
-pub const ALK_D4_TC_RDWR: usize = 0x10;
-pub const ALK_D4_TC_WRRD: usize = 0x14;
-pub const ALK_D4_TC_WRWR: usize = 0x18;
-pub const ALK_D4_TC_ODT: usize = 0x70;
-pub const ALK_D4_TC_RFP: usize = 0x438;
-pub const ALK_D4_TC_RFTP: usize = 0x43C;
-
-/// Highest Alder Lake DDR4 TC offset (MC1's `TC_RFTP`, 4-byte access).
-pub const MAX_ALK_D4_OFFSET: usize = ALK_D4_TC1_BASE + ALK_D4_TC_RFTP + 4;
-
-// Compile-time proof that the Tier-3 offset set (IG-25) fits the 256 KiB
-// wide window (every read is a 4-byte access). A violated bound fails
-// const evaluation (division by zero).
-const _ASSERT_TIER3_READS_IN_WIDE_WINDOW: () = {
-    let in_window = MAX_MCL_OFFSET <= MCHBAR_WINDOW_TIER3
-        && MAX_MAD_DIMM_OFFSET <= MCHBAR_WINDOW_TIER3
-        && MAX_IMC_OFFSET <= MCHBAR_WINDOW_TIER3
-        && MAX_CHANNEL_OFFSET <= MCHBAR_WINDOW_TIER3
-        && MAX_ALK_D4_OFFSET <= MCHBAR_WINDOW_TIER3;
-    let _proof: usize = 1 / if in_window { 1 } else { 0 };
-};
-
-impl IntelImcRegs {
-    /// Read the 9-register IMC set from a live, read-only [`MchBar`]
-    /// map: the global `MC_BIOS_REQ` plus the two per-channel blocks.
-    ///
-    /// Per-register containment (D5): each read degrades independently
-    /// to `None` on failure (bounds, unmap, …) — one bad read never
-    /// poisons the rest and never panics. The thin `MchBar` shell of
-    /// the pure reader core [`from_reader`] (the 64 KiB Tier 1 /
-    /// Rocket Lake `/dev/mem` read set).
-    pub fn from_bar(bar: &MchBar) -> Self {
-        Self::from_reader(|off| bar.read_u32(off).ok())
-    }
-
-    /// The [`from_bar`] read set over an abstract register reader:
-    /// `read(offset) -> Option<u32>` (a failed / out-of-bounds read is
-    /// `None` — the same per-register containment (D5) as
-    /// [`MchBar::read_u32`]'s `.ok()`).
-    ///
-    /// The pure, I/O-free core of the 64 KiB Tier 1 / Rocket Lake
-    /// `/dev/mem` path — the unit-testable half of the reader contract
-    /// (the 9-register set: the global `MC_BIOS_REQ` plus the two
-    /// `0x4000` / `0x4400` channel blocks; every Tier-3 extension
-    /// field stays `None`).
-    pub(crate) fn from_reader<R>(mut read: R) -> Self
-    where
-        R: FnMut(usize) -> Option<u32>,
-    {
-        let mut ch0 = ChannelRegs::default();
-        let mut ch1 = ChannelRegs::default();
-        read_channel_regs(&mut read, CHANNEL0_BASE, &mut ch0);
-        read_channel_regs(&mut read, CHANNEL1_BASE, &mut ch1);
-        Self {
-            mcbios_req: read(MC_BIOS_REQ_OFFSET),
-            ch0,
-            ch1,
-            // The Tier-3 extension fields (ch2 / ch3, mcl0 / mcl1,
-            // mad_dimm_ch2 / mad_dimm_ch3) stay default (all `None`):
-            // `from_bar` reads only the 64 KiB Tier-1 window (offsets
-            // <= 0x5E04); the Tier-3 `/dev/mem` reads route through
-            // [`IntelImcRegs::from_bar_wide`] (the 256 KiB wide map,
-            // IG-25).
-            ..Self::default()
-        }
-    }
-
-    /// Read the full Tier-3 (Alder/Raptor Lake) offset set from a live,
-    /// read-only [`MchBar`] map: the global `MC_BIOS_REQ`, the four
-    /// legacy mirror blocks (the `ALDER_CHANNELS` subchannel mirrors at
-    /// `0x4000` / `0x4400` / `0x4800` / `0x4C00`), the two native MCL
-    /// blocks (`mcl0` @ `0xD000` / `mcl1` @ `0xD800`, OQ-4), and the
-    /// two Alder/DDR5 `MAD_DIMM_CH2` / `MAD_DIMM_CH3` raws — the full
-    /// 74-slot [`IntelImcRegs`] set (the wide `/dev/mem` half of plan
-    /// §3.5; IG-25).
-    ///
-    /// The map is profile-sized ([`intel_mchbar::window_size_for`]:
-    /// 256 KiB for the Alder family, 64 KiB for Tier 1/2); every
-    /// offset in this set fits both sizes (highest `0xD82C` ≤ the
-    /// 64 KiB Tier-1 window — compile-proven by
-    /// `_ASSERT_TIER3_READS_IN_WIDE_WINDOW`), so a profile-sized map
-    /// never bounds-fails; the 64 KiB 9-register [`from_bar`] is
-    /// untouched (Tier 1/2 reads route through it, never this set).
-    ///
-    /// Per-register containment (D5) mirrors [`from_bar`]: each read
-    /// degrades independently to `None` on failure (bounds, unmap, …) —
-    /// one bad read never poisons the rest and never panics. The thin
-    /// `MchBar` shell of the pure reader core [`from_wide_reader`].
-    ///
-    /// `imc_base` is the gen-keyed IMC MAD base the caller derives
-    /// ([`imc_base_for`]: `0xD800` for 12th-gen+, `0x5000` for
-    /// pre-12th-gen) — the `MAD_DIMM_CH2/CH3` raws key off it (N-10:
-    /// the base is caller-supplied, mirroring [`from_wide_reader`],
-    /// never hard-coded to one generation's value).
-    pub fn from_bar_wide(bar: &MchBar, imc_base: usize) -> Self {
-        Self::from_wide_reader(imc_base, |off| bar.read_u32(off).ok())
-    }
-
-    /// The [`from_bar_wide`] read set over an abstract register reader:
-    /// `read(offset) -> Option<u32>` (a failed / out-of-bounds read is
-    /// `None` — the same per-register containment (D5) as
-    /// [`MchBar::read_u32`]'s `.ok()`).
-    ///
-    /// The pure, I/O-free core of the 256 KiB wide `/dev/mem` path
-    /// (IG-25 + Phase 1): the full set — the global `MC_BIOS_REQ`, the
-    /// four `ALDER_CHANNELS` mirror blocks, the two native MCL blocks
-    /// (`0xD000`/`0xD800` — the uncore fallbacks the 9-register
-    /// `from_bar` never reads), the two `MAD_DIMM_CH2` /
-    /// `MAD_DIMM_CH3` raws (gen-keyed: the `imc_base` argument + the
-    /// `0x60` / `0x64` intra-base offset), and the two Alder Lake DDR4
-    /// TC blocks (`0xE000`/`0x1E000`, Phase 1) — the unit-testable half
-    /// of the reader contract.
-    pub(crate) fn from_wide_reader<R>(imc_base: usize, mut read: R) -> Self
-    where
-        R: FnMut(usize) -> Option<u32>,
-    {
-        let mut ch0 = ChannelRegs::default();
-        let mut ch1 = ChannelRegs::default();
-        let mut ch2 = ChannelRegs::default();
-        let mut ch3 = ChannelRegs::default();
-        for (i, map) in ALDER_CHANNELS.iter().enumerate() {
-            let block = match i {
-                0 => &mut ch0,
-                1 => &mut ch1,
-                2 => &mut ch2,
-                _ => &mut ch3,
-            };
-            read_channel_regs(&mut read, map.mirror_base as usize, block);
-        }
-        let mut mcl0 = MclRegs::default();
-        let mut mcl1 = MclRegs::default();
-        read_mcl_regs(&mut read, MCL0_BASE, &mut mcl0);
-        read_mcl_regs(&mut read, MCL1_BASE, &mut mcl1);
-        // Phase 1: the two Alder Lake DDR4 TC blocks (MC0 @ 0xE000,
-        // MC1 @ 0x1E000) — the 64-bit TC_PRE split into two words each.
-        let mut alk_d4_tc0 = AlderDdr4TcRegs::default();
-        let mut alk_d4_tc1 = AlderDdr4TcRegs::default();
-        read_alder_ddr4_tc_regs(&mut read, ALK_D4_TC0_BASE, &mut alk_d4_tc0);
-        read_alder_ddr4_tc_regs(&mut read, ALK_D4_TC1_BASE, &mut alk_d4_tc1);
-        // H-12: the `MAD_DIMM_CH2` / `CH3` raws sit at the gen-keyed IMC
-        // base (`0xD800` 12th-gen+, `0x5000` pre-12th-gen) + the `0x60` /
-        // `0x64` intra-base offset — the legacy `0x5060` / `0x5064`
-        // preserved relative to the base (NOT the `+0x0C` / `+0x10`
-        // `MAD_INTER_CHANNEL` / `MAD_DIMM_CH0/1` stride [`read_intel`]
-        // reads, which would collide with the native MCL1 block).
-        Self {
-            mcbios_req: read(MC_BIOS_REQ_OFFSET),
-            ch0,
-            ch1,
-            ch2,
-            ch3,
-            mcl0,
-            mcl1,
-            // L-10: the gen-keyed MAD base (0x5000 / 0xD800) is set by
-            // `read_intel_with` after this pure reader (which reads fixed
-            // offsets only) — `None` here.
-            mad_inter_channel: None,
-            mad_dimm_ch0: None,
-            mad_dimm_ch1: None,
-            mad_dimm_ch2: read(imc_base + MAD_DIMM_CH2_INTRA),
-            mad_dimm_ch3: read(imc_base + MAD_DIMM_CH3_INTRA),
-            alk_d4_tc0,
-            alk_d4_tc1,
-        }
-    }
-}
-
-/// Read one channel's eight raw registers through `read` into `regs`
-/// (per-register containment: a failed / out-of-bounds read → `None`).
-fn read_channel_regs<R: FnMut(usize) -> Option<u32>>(
-    read: &mut R,
-    base: usize,
-    regs: &mut ChannelRegs,
-) {
-    regs.tc_dbp = read(base + TC_DBP_OFFSET);
-    regs.tc_rap = read(base + TC_RAP_OFFSET);
-    regs.tc_rfp = read(base + TC_RFP_OFFSET);
-    regs.tc_rap2 = read(base + TC_RAP2_OFFSET);
-    regs.tc_rdrd = read(base + TC_RDRD_OFFSET);
-    regs.tc_rdwr = read(base + TC_RDWR_OFFSET);
-    regs.tc_wrrd = read(base + TC_WRRD_OFFSET);
-    regs.tc_wrwr = read(base + TC_WRWR_OFFSET);
-}
-
-/// Read one native MCL block's eight raw registers through `read` into
-/// `regs` (per-register containment: a failed / out-of-bounds read →
-/// `None`).
-fn read_mcl_regs<R: FnMut(usize) -> Option<u32>>(read: &mut R, base: usize, regs: &mut MclRegs) {
-    regs.tc_pre = read(base + MCL_TC_PRE_OFFSET);
-    regs.tc_act = read(base + MCL_TC_ACT_OFFSET);
-    regs.tc_act2 = read(base + MCL_TC_ACT2_OFFSET);
-    regs.tc_wtr = read(base + MCL_TC_WTR_OFFSET);
-    regs.tc_rfp = read(base + MCL_TC_RFP_OFFSET);
-    regs.tc_rfp2 = read(base + MCL_TC_RFP2_OFFSET);
-    regs.tc_rdrd = read(base + MCL_TC_RDRD_OFFSET);
-    regs.tc_wrwr = read(base + MCL_TC_WRWR_OFFSET);
-}
-
-/// Read one Alder Lake DDR4 memory controller's TC block through `read`
-/// into `regs` (per-register containment: a failed / out-of-bounds read
-/// → `None`). The 64-bit `TC_PRE` is read as two 32-bit words
-/// (`+0x00` low / `+0x04` high); the remaining eight registers are single
-/// 32-bit words at their datasheet offsets (Phase 1).
-fn read_alder_ddr4_tc_regs<R: FnMut(usize) -> Option<u32>>(
-    read: &mut R,
-    base: usize,
-    regs: &mut AlderDdr4TcRegs,
-) {
-    regs.tc_pre_lo = read(base + ALK_D4_TC_PRE);
-    regs.tc_pre_hi = read(base + ALK_D4_TC_PRE_HI);
-    regs.tc_act = read(base + ALK_D4_TC_ACT);
-    regs.tc_rdrd = read(base + ALK_D4_TC_RDRD);
-    regs.tc_rdwr = read(base + ALK_D4_TC_RDWR);
-    regs.tc_wrrd = read(base + ALK_D4_TC_WRRD);
-    regs.tc_wrwr = read(base + ALK_D4_TC_WRWR);
-    regs.tc_odt = read(base + ALK_D4_TC_ODT);
-    regs.tc_rfp = read(base + ALK_D4_TC_RFP);
-    regs.tc_rftp = read(base + ALK_D4_TC_RFTP);
-}
-
-// ---------------------------------------------------------------------------
-// Gates (vendor + v1 Tier-1 generation).
-// ---------------------------------------------------------------------------
-
-/// The pure vendor gate for the Intel branch: Intel passes with its
-/// [`IntelGen`]; AMD and unknown vendors yield
-/// [`TelemetryError::UnsupportedHardware`] (no register access is
-/// possible or attempted once this returns `Err`).
-pub fn intel_gen_gate(info: &CpuInfo) -> TelemetryResult<IntelGen> {
-    match info.vendor {
-        CpuVendor::Intel(gen) => Ok(gen),
-        CpuVendor::Amd(_) => Err(TelemetryError::UnsupportedHardware {
-            vendor: "AMD (Intel IMC decode requires an Intel CPU)".to_owned(),
-        }),
-        CpuVendor::Unknown => Err(TelemetryError::UnsupportedHardware {
-            vendor: "unknown CPU vendor".to_owned(),
-        }),
-    }
-}
-
-/// The Tier-1 set: the generations the hardware-authoritative register
-/// map above is verified for. A compatibility alias kept from the
-/// pre-dispatch name — use [`gen_supported`] for "does this generation
-/// have a decode profile" (Tier 1 plus Rocket Lake as of this build).
-pub fn tier1_supported(gen: IntelGen) -> bool {
-    matches!(
-        gen,
-        IntelGen::Skylake | IntelGen::KabyLake | IntelGen::CoffeeLake | IntelGen::CometLake
-    )
-}
-
-/// Profile dispatch: `true` for every generation that
-/// [`intel_gen::profile_for`] resolves to a decode profile (Tier 1 —
-/// Skylake / Kaby Lake / Coffee Lake / Comet Lake — plus Rocket Lake
-/// (Tier 2) and the Tier-3 Alder family — Alder / Raptor / Meteor /
-/// Arrow Lake — as of IG-03).
-pub fn gen_supported(gen: IntelGen) -> bool {
-    profile_for(gen).is_some()
-}
-
-/// The rich v1 Tier-1 generation gate (the facade's branch-level
-/// gate): `Ok(())` for Tier 1 only, else
-/// [`TelemetryError::UnsupportedHardware`] whose `vendor` detail names
-/// the detected generation and its research-roadmap tier (Rocket Lake =
-/// Tier 2; Alder/Raptor/Arrow = Tier 3) — the facade surfaces this as
-/// the branch-level `Na(UnsupportedHardware)` (plan §3.4: never garbage
-/// data from a mismatched register map).
-pub fn tier1_gate(gen: IntelGen) -> TelemetryResult<()> {
-    if tier1_supported(gen) {
-        return Ok(());
-    }
-    let tier = match gen {
-        IntelGen::AlderLake | IntelGen::RaptorLake => {
-            "Tier 3 (dual-MC DDR4/DDR5, decoded on the Alder profile — outside this Tier-1 gate)"
-        }
-        IntelGen::MeteorLake | IntelGen::ArrowLake => {
-            "Tier 3 (DDR5, decoded on the Alder profile — outside this Tier-1 gate)"
-        }
-        IntelGen::RocketLake => "Tier 2 (Gear Mode + turnaround parity; outside this Tier-1 gate)",
-        _ => "beyond Tier 1",
-    };
-    Err(TelemetryError::UnsupportedHardware {
-        vendor: format!(
-            "Intel {gen:?} is {tier}; v1 decodes Tier 1 (Skylake/Kaby Lake/Coffee Lake/Comet Lake) only"
-        ),
-    })
-}
-
-/// The profile-based generation gate (the facade's branch-level gate
-/// as of IG-16): `Ok(())` for every generation [`gen_supported`]
-/// admits — Tier 1 (Skylake / Kaby Lake / Coffee Lake / Comet Lake /
-/// Ice Lake / Tiger Lake), Rocket Lake (Tier 2), the Tier-3 Alder
-/// family (Alder / Raptor / Meteor / Arrow Lake), and the Server
-/// profile (Sapphire Rapids) — else
-/// [`TelemetryError::UnsupportedHardware`] whose `vendor` detail names
-/// the detected generation and the profiled set it is absent from (the
-/// unprofiled generations — Jasper Lake / Lunar Lake / Core Series 1
-/// Mobile / `Unrecognized`) — the facade surfaces this as the
-/// branch-level `Na(UnsupportedHardware)` (plan §3.4: never garbage
-/// data from a mismatched register map).
-///
-/// This is the gate that lets Rocket Lake reach [`decode`]'s profile
-/// dispatch for the first time (IG-14/IG-15 make `detect()` emit it;
-/// IG-12 wires the profile). [`tier1_gate`] is retained as the
-/// Tier-1-only compatibility alias for other callers.
-pub fn gen_gate(gen: IntelGen) -> TelemetryResult<()> {
-    if gen_supported(gen) {
-        return Ok(());
-    }
-    Err(TelemetryError::UnsupportedHardware {
-        vendor: format!(
-            "Intel {gen:?} has no decode profile; v1 decodes Tier 1 (Skylake/Kaby Lake/Coffee Lake/Comet Lake/Ice Lake/Tiger Lake), Tier 2 (Rocket Lake), Tier 3 (Alder/Raptor/Meteor/Arrow Lake), and Server (Sapphire Rapids) only"
-        ),
-    })
-}
-
-/// OQ-5's branch-level tile-routing detail (IG-28): the
-/// [`TelemetryError::UnsupportedHardware`] that accompanies a Meteor /
-/// Arrow Lake readout whose primary window is fully degenerate
-/// ([`IntelImcRegs::primary_window_degenerate`]). Per Research line
-/// 328, on disaggregated SoC/compute tiles the physical IMC can sit
-/// behind the secondary uncore range (MCHBAR + 0x180000) that the
-/// module does not expose; the honest degradation is the all-Na
-/// readout ([`decode`] returns the all-`Na(UnsupportedHardware)` shape
-/// at the generation's channel count) with this message — never a
-/// value fabricated from the secondary range.
-pub fn tile_routing_suspected(gen: IntelGen) -> TelemetryError {
-    TelemetryError::UnsupportedHardware {
-        vendor: format!(
-            "Intel {gen:?}: SoC-tile IMC routing suspected (MCHBAR + 0x180000 secondary range) — primary window empty; see OQ-5"
-        ),
-    }
-}
-
-/// The fixed channel-count model for an [`IntelGen`] (plan: per-channel
-/// 0–3): the profiled generations take their count from their
-/// [`intel_gen::GenProfile`] (Tier 1 and Rocket Lake: 2; the Alder
-/// family: 2 for Alder/Raptor Lake — the DDR4 default — and 4 for
-/// Meteor/Arrow Lake, as of IG-03); the non-profiled generations keep
-/// the legacy model — DDR4-class generations expose 2 channels and an
-/// unrecognized family-6 Intel falls back to the common 2-channel
-/// desktop layout. Same values as before this dispatch, so no wire
-/// change. (The Tier-3 *decode* may expose a different decode-time
-/// subchannel count for the Alder family — OQ-11's DDR5 condition
-/// flips [`decode`] to the 4-subchannel geometry; this function stays
-/// the static model.)
-pub fn channel_count(gen: IntelGen) -> u8 {
-    if let Some(p) = profile_for(gen) {
-        return p.channel_count;
-    }
-    // No decode profile: the common 2-channel desktop fallback. Every
-    // profiled generation (Tier 1 + Rocket Lake + the Alder family + the
-    // server gens) returns above via `profile_for`, so the specific-gen
-    // arms that used to live here are dead (C-4 made Arrow / Meteor
-    // Lake 2-channel; the profile is now the single source of truth for
-    // the count).
-    2
-}
-
-// ---------------------------------------------------------------------------
-// Shared MCLK / gear / uclk decoders (used by all three decode paths).
-// ---------------------------------------------------------------------------
-
-/// The `MC_BIOS_REQ` analog DRAM clock (MCLK) in MHz — the ratio
-/// semantics are generation-dependent (the Alder Lake MC_BIOS_REQ
-/// decode):
-///
-/// - **Skylake–Comet Lake (6th–10th gen)**: `CLK_RATIO` (bits [7:0])
-///   is a physical DRAM-clock multiplier → `mclk = ratio × refclk`
-///   (e.g. ratio 18 × 133.3333 = 2400 MHz; for DDR, MT/s = MCLK × 2
-///   = 4800).
-/// - **11th gen (Rocket Lake) and later**: Intel redefined
-///   `CLK_RATIO` as the effective DDR data-rate multiplier in
-///   half-cycle steps (one step = one data transfer beat — the
-///   restructuring that lets every bin on both reference clocks map
-///   to a whole integer), so the true core clock is `mclk = ratio ×
-///   refclk / 2` (e.g. the 12600KF DDR4-3600 word 0x79E00124:
-///   36 × 100 MHz / 2 = 1800 MHz → 3600 MT/s).
-///
-/// The bit-8 reference-clock select is unchanged across generations
-/// (1 = 100 MHz, 0 = 133.3333 MHz — the PLL base inputs); the result
-/// is sanity-gated to [1, 5333] MHz.
-///
-/// Containment: an absent register → `Na(ParseError)`; a ratio of 0 =
-/// unconfigured → `Na(ParseError)`; the GEAR_RATIO bits (17:16,
-/// Rocket+ only) do not affect the MCLK decode — on the Rocket Lake
-/// profile they feed the gear cells via [`mcbios_gear`], not MCLK.
-pub(crate) fn decode_mclk(reg: Option<u32>, gen: IntelGen) -> Section<f64> {
-    match reg {
-        None => Section::na(NaReason::ParseError(
-            "MC_BIOS_REQ: register read failed".to_owned(),
-        )),
-        Some(raw) => {
-            let ratio = raw & 0xFF;
-            if ratio == 0 {
-                return Section::na(NaReason::ParseError(
-                    "MC_BIOS_REQ: CLK_RATIO unconfigured (0)".to_owned(),
-                ));
-            }
-            let refclk = if mcbios_refclk_100(raw) {
-                REF_CLK_100_MHZ
-            } else {
-                REF_CLK_133_MHZ
-            };
-            let product = f64::from(ratio) * refclk;
-            // 11th gen and later: the ratio is the data-rate
-            // multiplier (half-cycle steps) — halve it to the true
-            // core clock (the Alder Lake MC_BIOS_REQ decode).
-            let mclk = if mclk_half_step(gen) {
-                product / 2.0
-            } else {
-                product
-            };
-            clock_section(mclk)
-        }
-    }
-}
-
-/// The 11th-gen (Rocket Lake) and later `CLK_RATIO` semantics: the
-/// field is the effective DDR data-rate multiplier in half-cycle
-/// steps (the Alder Lake MC_BIOS_REQ decode), so the true MCLK is
-/// half the `ratio × refclk` product. Skylake–Comet Lake keep the
-/// legacy physical-clock multiplier (the full product); the unprofiled
-/// generations never reach [`decode_mclk`] from [`decode`] (they
-/// degrade all-Na before any MCLK decode).
-fn mclk_half_step(gen: IntelGen) -> bool {
-    matches!(
-        gen,
-        IntelGen::RocketLake
-            | IntelGen::AlderLake
-            | IntelGen::RaptorLake
-            | IntelGen::MeteorLake
-            | IntelGen::ArrowLake
-    )
-}
-
-/// The `MC_BIOS_REQ` reference-clock select (bit 8): `true` = 100 MHz,
-/// `false` = 133.3333 MHz.
-fn mcbios_refclk_100(raw: u32) -> bool {
-    raw & 0x0100 != 0
-}
-
-/// The `MC_BIOS_REQ` gear-ratio field (bits [17:16] — Rocket+ only)
-/// decoded to a [`GearMode`], verbatim per Breakdown §3D:
-///
-/// - bits `[17:16] = 00b` → [`GearMode::One`] (1:1, the synchronous
-///   default) **for every cap, including `GearCap::None`** (L-3): `00b`
-///   means "no gear divider set" = the 1× mode, the normal valid state on
-///   a Tier-1 platform that has no gear register. This is distinct from a
-///   *set* gear bit on a `GearCap::None` platform (below), which is
-///   over-cap → `None`;
-/// - bit 16 = 1b → [`GearMode::Two`] (the `Gear2` and `Gear4` caps);
-/// - bit 17 = 1b (with bit 16 = 0b) → [`GearMode::Four`], allowed ONLY
-///   when `cap == GearCap::Gear4` (Alder Lake and later); on a `Gear2`
-///   cap (Rocket Lake) a set bit 17 is over-cap → `None` (documented);
-/// - any other reserved / over-cap encoding (notably a gear bit *set* on
-///   a `GearCap::None` Tier-1 platform, which has no gear register) →
-///   `None`.
-///
-/// A `11b` field follows the bit-16 rule (gear 2) — the pinned
-/// Breakdown §4 example D reading. Pure and cap-parameterized (IG-11);
-/// wired into [`decode`] by IG-12 for the Rocket Lake profile.
-pub fn mcbios_gear(raw: u32, cap: GearCap) -> Option<GearMode> {
-    if raw & 0x0001_0000 != 0 {
-        // Gear 2 (bit 16 = 1b): every 2×-gear-capable platform.
-        matches!(cap, GearCap::Gear2 | GearCap::Gear4).then_some(GearMode::Two)
-    } else if raw & 0x0002_0000 != 0 {
-        // Gear 4 (bit 17 = 1b, bit 16 = 0b): only the 4× cap (Alder+).
-        (cap == GearCap::Gear4).then_some(GearMode::Four)
-    } else {
-        // Gear 1 (bits [17:16] = 00b): 1:1 — every cap.
-        Some(GearMode::One)
-    }
-}
-
-/// The SA:MEM divisor for a decoded [`GearMode`] (`uclk = mclk /
-/// gear`).
-fn gear_divisor(gear: GearMode) -> f64 {
-    match gear {
-        GearMode::One => 1.0,
-        GearMode::Two => 2.0,
-        GearMode::Four => 4.0,
-    }
-}
-
-/// The internal controller clock (f_UCLK) for the decoded gear, per
-/// Breakdown §3D (f_UCLK = MCLK, MCLK/2, MCLK/4 for gears 1, 2, 4):
-/// `uclk = mclk / gear_divisor(gear)`, sanity-gated to the [1, 5333]
-/// MHz clock band via [`clock_section`].
-///
-/// Containment mirrors the legacy uclk rule: an `Na` gear cell (a
-/// failed register read, a reserved, or an over-cap encoding) →
-/// `Na(ParseError)` — never a bogus clock. Pure (IG-11); wired into
-/// [`decode`] by IG-12 for the Rocket Lake profile.
-pub fn decode_uclk(mclk: f64, gear: &Section<GearMode>) -> Section<f64> {
-    match gear.value().copied() {
-        Some(g) => clock_section(mclk / gear_divisor(g)),
-        None => Section::na(NaReason::ParseError(
-            "uclk = mclk / gear: gear unavailable or reserved encoding".to_owned(),
-        )),
-    }
-}
-
-/// The gear + uclk cells shared across channels (the same `MC_BIOS_REQ`
-/// word for every channel): decode once, layer on every channel.
-pub(crate) fn gear_uclk_cells(
-    gear_cap: GearCap,
-    mclk: &Section<f64>,
-    mcbios_req: Option<u32>,
-) -> (Section<GearMode>, Section<f64>) {
-    let gear = mcbios_req.and_then(|raw| mcbios_gear(raw, gear_cap));
-    let gear_mode = match gear {
-        Some(g) => Section::Value(g),
-        None => Section::na(NaReason::ParseError(
-            "MC_BIOS_REQ: gear unavailable (register read failed) or reserved/over-cap encoding"
-                .to_owned(),
-        )),
-    };
-    let uclk = match (gear, mclk.value().copied()) {
-        (Some(g), Some(m)) => decode_uclk(m, &Section::Value(g)),
-        (None, _) => Section::na(NaReason::ParseError(
-            "uclk = mclk / gear: gear unavailable or reserved encoding".to_owned(),
-        )),
-        (_, None) => Section::na(NaReason::ParseError(
-            "uclk = mclk / gear: mclk unavailable".to_owned(),
-        )),
-    };
-    (gear_mode, uclk)
-}
 
 // ---------------------------------------------------------------------------
 // Shared readout builders.
