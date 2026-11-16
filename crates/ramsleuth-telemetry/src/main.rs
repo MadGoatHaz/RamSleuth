@@ -29,6 +29,13 @@ use ramsleuth_telemetry::intel_smbios::{self, SmbiosTopology};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
 use ramsleuth_telemetry::{collect, SystemMemoryTelemetry, VoltageTelemetry};
 
+/// Default SMN register range start: the UMC (Unified Memory Controller)
+/// timing + channel aperture region on AMD platforms.
+const SMN_DEFAULT_START: u32 = 0x50000;
+
+/// Default SMN register range end (inclusive).
+const SMN_DEFAULT_END: u32 = 0x50400;
+
 /// Command-line options (parsed by hand — no clap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Opts {
@@ -152,8 +159,8 @@ pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut opts = Opts {
         json: false,
         raw_smn: false,
-        smn_start: 0x50000,
-        smn_end: 0x50400,
+        smn_start: SMN_DEFAULT_START,
+        smn_end: SMN_DEFAULT_END,
     };
     let mut i = 1;
     while i < args.len() {
