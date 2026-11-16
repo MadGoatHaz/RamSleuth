@@ -26,8 +26,11 @@
 //! for the daemon and every client (plan D5: the daemon accepts a
 //! `--socket` override so it can run unprivileged for local dev).
 
+pub mod cli_common;
 pub mod frame;
 pub mod messages;
+
+pub use cli_common::{short_circuit, suggest_for_unknown, version_line, ShortCircuit, USAGE_COMMON};
 
 pub use frame::{decode_frame, encode_frame, Frame, FrameError, MAX_FRAME_SIZE, PROTOCOL_VERSION};
 pub use messages::{BenchMode, Message, Request, Response, DEFAULT_SOCKET_PATH};
