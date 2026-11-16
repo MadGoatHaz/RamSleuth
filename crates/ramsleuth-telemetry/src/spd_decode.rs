@@ -90,11 +90,14 @@ const MEM_TYPE_DDR4: u8 = 0x0A;
 const MEM_TYPE_DDR5: u8 = 0x0C;
 
 /// Byte `0x02`: the basic-info memory type (JESD79-4/5) - the primary
-/// classification (C8-02): `0x0C` = DDR4 (512 B image) / DDR5 (1024 B
-/// image; the two generations share the code, disambiguated by the
-/// image length), `0x0B` = DDR3 (legacy).
+/// classification (C8-02): `0x11` = DDR5 (JESD79-5 spec-defined type),
+/// `0x0C` = DDR4 (512 B image) / DDR5 legacy (1024 B image; the two
+/// generations share the code, disambiguated by the image length),
+/// `0x0B` = DDR3 (legacy).
 const BYTE_SPD_TYPE: usize = 0x02;
-/// DDR4 / DDR5 memory-type key at byte `0x02` (C8-02).
+/// DDR5 (JESD79-5) memory-type key at byte `0x02`.
+const SPD_TYPE_DDR5_JESD: u8 = 0x11;
+/// DDR4 / DDR5 legacy memory-type key at byte `0x02` (C8-02).
 const SPD_TYPE_DDR4: u8 = 0x0C;
 /// DDR3 memory-type code at byte `0x02` (the legacy `0x81` part
 /// location, C8-02).
@@ -185,26 +188,26 @@ pub const JEP106_BCD: &[(u8, u8, &str)] = &[
 
 // ---- DDR5 (JESD79-5, SPD5378) + legacy -------------------------------------
 
-/// Byte `0x01`: module manufacturer JEP106 vendor nibble (DDR5).
+/// Byte `0x01`: DRAM die manufacturer JEP106 code (8-bit, JESD79-5).
+const BYTE_DIE5_MAKER: usize = 0x01;
+/// Byte `0x01`: module manufacturer JEP106 vendor nibble (DDR5 legacy
+/// nibble model; the byte also carries the die maker under JESD79-5).
 const BYTE_MODULE_MAKER: usize = 0x01;
-/// Byte `0x02`: module manufacturer JEP106 continuation nibble (DDR5;
-/// the byte also carries the basic-info memory type, [`BYTE_SPD_TYPE`]).
+/// Byte `0x02`: module manufacturer JEP106 continuation nibble (DDR5
+/// legacy; the byte also carries the basic-info memory type,
+/// [`BYTE_SPD_TYPE`]).
 const BYTE_MODULE_MAKER_CONT: usize = 0x02;
 
-/// DDR5 byte `0x2E`: DRAM die manufacturer JEP106 vendor nibble.
-const BYTE_DDR5_DIE_MAKER: usize = 0x2E;
-/// DDR5 byte `0x2F`: DRAM die manufacturer JEP106 continuation nibble.
-const BYTE_DDR5_DIE_MAKER_CONT: usize = 0x2F;
-
-/// Byte `0x13`: DDR5 SDRAM density code (the DDR5 documented model).
+/// Byte `0x13`: DDR5 SDRAM density code (JESD79-5, bits 3:0).
 const BYTE_DENSITY: usize = 0x13;
 /// Byte `0x20`: minimum data rate, in 100 MT/s units (DDR5).
 const BYTE_BASE_SPEED: usize = 0x20;
-/// Byte `0x80`: rank config (hub model, DDR5): per-rank device count
-/// (bits 3:0); bits 7:4 carry the rank.
+/// Byte `0x80`: DDR5 module organization (JESD79-5): bits 3:0 = number
+/// of ranks - 1 (`0` = 1 rank ... `7` = 8 ranks).
 const BYTE_RANK_CONFIG: usize = 0x80;
-/// Byte `0x81`: SDRAM device width (bits 2:0, DDR5): the width primary
-/// (the byte also opens the DDR2/DDR3 part-number region).
+/// Byte `0x81`: SDRAM device width (JESD79-5, bits 2:0): the width
+/// primary (`0 = x4 / 1 = x8 / 2 = x16`; the byte also opens the
+/// DDR2/DDR3 part-number region).
 const BYTE_DEVICE_WIDTH: usize = 0x81;
 
 /// `0x81..=0x90`: module part number (16 ASCII chars) - the DDR2/DDR3
@@ -348,20 +351,29 @@ pub struct SpdModule {
 pub fn decode(image: &SpdImage) -> SpdModule {
     let data = &image.data;
     let is_ddr5 = classify_ddr5(data);
+    let die_maker = decode_die_maker(data, is_ddr5);
+    let density_mbit = decode_density(data, is_ddr5);
+    // Die-type inference (C6-02): a die variant is not a standard SPD
+    // field, so derive a human-readable label from the decoded die
+    // maker + density when both are available (e.g. "Samsung 16384
+    // Mbit"); otherwise Na(NotApplicable).
+    let die_type = match (&die_maker, &density_mbit) {
+        (Section::Value(maker), Section::Value(mbit)) => {
+            Section::Value(format!("{maker} {mbit} Mbit"))
+        }
+        _ => Section::na(NaReason::NotApplicable),
+    };
     SpdModule {
         index: image.index,
         is_ddr5,
         maker: decode_maker(data, is_ddr5),
-        die_maker: decode_die_maker(data, is_ddr5),
-        // A die variant is not a standard SPD field: the label stays
-        // Na until a documented die_maker + density mapping exists
-        // (C6-02).
-        die_type: Section::na(NaReason::NotApplicable),
+        die_maker,
+        die_type,
         devices: decode_devices(data, is_ddr5),
         part: decode_part(data, is_ddr5),
         serial: decode_serial(data, is_ddr5),
         rank: decode_rank(data, is_ddr5),
-        density_mbit: decode_density(data, is_ddr5),
+        density_mbit,
         speed_mts: decode_base_speed(data, is_ddr5),
         profiles: decode_profiles(data, is_ddr5),
     }
@@ -383,14 +395,16 @@ fn oob(off: usize) -> NaReason {
 }
 
 /// Classify the module: the primary check is the basic-info memory type
-/// (byte `0x02`, C8-02) - `0x0C` -> DDR5 iff the image is 1024 B (the
-/// DDR4 / DDR5 generations share the code, disambiguated by the image
-/// length), `0x0B` -> DDR3. An unrecognized / absent `0x02` falls back
-/// to the legacy byte-`0x00` check (bits 4:0: `0x0C` -> DDR5, `0x0A`
-/// -> DDR4), then to the image length (1024 B -> DDR5, otherwise
+/// (byte `0x02`, C8-02) - `0x11` -> DDR5 (JESD79-5 spec-defined type),
+/// `0x0C` -> DDR5 iff the image is 1024 B (the DDR4 / DDR5 generations
+/// share the code, disambiguated by the image length - the legacy
+/// fallback), `0x0B` -> DDR3. An unrecognized / absent `0x02` falls
+/// back to the legacy byte-`0x00` check (bits 4:0: `0x0C` -> DDR5,
+/// `0x0A` -> DDR4), then to the image length (1024 B -> DDR5, otherwise
 /// DDR4) - the current last resort.
 fn classify_ddr5(data: &[u8]) -> bool {
     match get(data, BYTE_SPD_TYPE) {
+        Some(SPD_TYPE_DDR5_JESD) => true,
         Some(SPD_TYPE_DDR4) => data.len() == SPD_IMAGE_LEN_DDR5,
         Some(SPD_TYPE_DDR3) => false,
         _ => match get(data, BYTE_MEMORY_TYPE).map(|b| b & 0x1F) {
@@ -615,23 +629,18 @@ fn decode_maker(data: &[u8], is_ddr5: bool) -> Section<String> {
 /// - DDR4: the 16-bit (bank, code) pair at `0x15E`/`0x15F`
 ///   ([`maker_from_bank_code`]); an absent pair (both zero) ->
 ///   `Na(NotApplicable)`;
-/// - DDR5: JEP106 vendor + continuation nibbles at `0x2E`/`0x2F` - the
-///   source [`decode_maker`] reads as its fallback, now carried
-///   separately in [`SpdModule.die_maker`] (C6-02).
+/// - DDR5: the 8-bit JEP106 code at byte `0x01` (JESD79-5) - the source
+///   now carried separately in [`SpdModule.die_maker`] (C6-02).
 ///
 /// A present-but-unknown code renders as its raw form (still a `Value`),
 /// never a panic.
 fn decode_die_maker(data: &[u8], is_ddr5: bool) -> Section<String> {
     if is_ddr5 {
-        let (dv, dc) = (
-            get(data, BYTE_DDR5_DIE_MAKER).unwrap_or(0),
-            get(data, BYTE_DDR5_DIE_MAKER_CONT).unwrap_or(0),
-        );
-        let dcode = jep106_code(dv, dc);
-        if dcode == 0x00 {
+        let code = get(data, BYTE_DIE5_MAKER).unwrap_or(0);
+        if code == 0x00 {
             Section::na(NaReason::NotApplicable)
         } else {
-            maker_string(dcode)
+            maker_string(code)
         }
     } else {
         maker_from_bank_code(data, BYTE_DIE4_LO, BYTE_DIE4_HI)
@@ -685,15 +694,19 @@ fn device_width(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
 /// The module's rank count (C8-03, D-2), generation-scoped:
 /// - DDR4 = byte `0x0C` bits 5:3 + 1 (the JESD79-4 number-of-ranks code
 ///   `0` = 1 ... `7` = 8); a blank (`0x00`) / absent `0x0C` ->
-///   `NaReason` naming `0x0C` (the byte `0x80` hub nibble is the
-///   DDR5-only fallback now);
-/// - DDR5 = byte `0x80` bits 7:4 (the documented hub model).
+///   `NaReason` naming `0x0C`;
+/// - DDR5 = byte `0x80` bits 3:0 + 1 (the JESD79-5 number-of-ranks code,
+///   N-1 encoding: `0` = 1 rank ... `7` = 8 ranks).
 ///
 /// Never a panic.
 fn rank_count(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
     if is_ddr5 {
-        let hub = get(data, BYTE_RANK_CONFIG).ok_or_else(|| oob(BYTE_RANK_CONFIG))?;
-        return rank_from_nibble(hub, BYTE_RANK_CONFIG);
+        let Some(b) = get(data, BYTE_RANK_CONFIG) else {
+            return Err(oob(BYTE_RANK_CONFIG));
+        };
+        let encoded = b & 0x0F;
+        // JESD79-5: N-1 encoding, 0 = 1 rank.
+        return Ok(encoded + 1);
     }
     let org = get(data, BYTE_ORG4).ok_or_else(|| oob(BYTE_ORG4))?;
     if org == 0x00 {
@@ -704,57 +717,10 @@ fn rank_count(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
     Ok(((org >> 3) & 0x07) + 1)
 }
 
-/// The rank from a hub nibble (byte `0x80` bits 7:4, DDR5): zero ->
-/// `NaReason` naming the byte.
-fn rank_from_nibble(hub: u8, byte: usize) -> Result<u8, NaReason> {
-    let rank = hub >> 4;
-    if rank == 0 {
-        return Err(NaReason::ParseError(format!(
-            "rank byte 0x{byte:02X} = 0x{hub:02X} carries rank 0 (invalid)"
-        )));
-    }
-    Ok(rank)
-}
-
-/// The per-rank device count (C8-03, D-2, DDR5 hub model): the byte
-/// `0x80` bits 3:0 hub nibble, trusted only when it is consistent with
-/// the bus (`per_rank x width == bus`); otherwise it is derived as
-/// `bus / width` (the non-compliant vendor hub - e.g. the live `0x80 =
-/// 0x11` per-rank 1 on the 64-bit bus with x8 devices - is worked
-/// around, never trusted). Per-rank `0` or a non-dividing bus ->
-/// `NaReason` naming the byte; never a panic.
-fn per_rank_count(data: &[u8], width: u8, bus: u8) -> Result<u8, NaReason> {
-    let hub = get(data, BYTE_RANK_CONFIG).ok_or_else(|| oob(BYTE_RANK_CONFIG))?;
-    let per_rank = hub & 0x0F;
-    if per_rank == 0 {
-        return Err(NaReason::ParseError(format!(
-            "rank config byte 0x80 = 0x{hub:02X} carries per-rank 0 (invalid)"
-        )));
-    }
-    if (per_rank as u16) * (width as u16) == bus as u16 {
-        return Ok(per_rank);
-    }
-    if bus % width != 0 {
-        return Err(NaReason::ParseError(format!(
-            "bus width {bus} bits is not divisible by the {width}-bit device width (bytes 0x0C/0x81)"
-        )));
-    }
-    Ok(bus / width)
-}
-
-/// The bus width in bits, generation-scoped:
-/// - DDR4: byte `0x0D` bits 2:0 - `3` = the 64-bit desktop bus; any
-///   other code -> `NaReason` naming `0x0D`;
-/// - DDR5: the 64-bit desktop bus, extended to 128 when the byte `0x0D`
-///   bit 4 is set (the documented hub model; a missing `0x0D` keeps the
-///   base 64).
-fn bus_width(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
-    if is_ddr5 {
-        return Ok(match get(data, BYTE_BUS4) {
-            Some(b) if b & 0x10 != 0 => 128,
-            _ => 64,
-        });
-    }
+/// The bus width in bits (DDR4 only, JESD79-4): byte `0x0D` bits 2:0 -
+/// `3` = the 64-bit desktop bus; any other code -> `NaReason` naming
+/// `0x0D`.
+fn bus_width(data: &[u8]) -> Result<u8, NaReason> {
     let b = get(data, BYTE_BUS4).ok_or_else(|| oob(BYTE_BUS4))?;
     match b & 0x07 {
         3 => Ok(64),
@@ -765,28 +731,28 @@ fn bus_width(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
 }
 
 /// The total device count (C8-03, D-2) = rank x per-rank, where the
-/// rank is generation-scoped ([`rank_count`]) and the per-rank count is:
-/// - DDR4: `bus / width` (the 64-bit bus from `0x0D` divided by the
-///   `0x0C` width - no hub arithmetic);
-/// - DDR5: the byte `0x80` hub nibble, derived when it fails the
-///   consistency rule ([`per_rank_count`]).
+/// rank is generation-scoped ([`rank_count`]) and the per-rank count is
+/// `bus / width`:
+/// - DDR4: the 64-bit bus from `0x0D` divided by the `0x0C` width;
+/// - DDR5: the 64-bit desktop bus (JESD79-5) divided by the `0x81`
+///   width - no hub arithmetic.
 ///
 /// Any organization failure -> `NaReason` naming the byte; never a
 /// panic.
 fn total_devices(data: &[u8], is_ddr5: bool) -> Result<u8, NaReason> {
     let rank = rank_count(data, is_ddr5)?;
     let width = device_width(data, is_ddr5)?;
-    let bus = bus_width(data, is_ddr5)?;
-    let per_rank = if is_ddr5 {
-        per_rank_count(data, width, bus)?
+    let bus = if is_ddr5 {
+        64u8 // JESD79-5 desktop bus
     } else {
-        if bus % width != 0 {
-            return Err(NaReason::ParseError(format!(
-                "bus width {bus} bits is not divisible by the {width}-bit device width (bytes 0x0C/0x0D)"
-            )));
-        }
-        bus / width
+        bus_width(data)?
     };
+    if bus % width != 0 {
+        return Err(NaReason::ParseError(format!(
+            "bus width {bus} bits is not divisible by the {width}-bit device width"
+        )));
+    }
+    let per_rank = bus / width;
     rank.checked_mul(per_rank).ok_or_else(|| {
         NaReason::ParseError(format!(
             "device total (rank {rank} x per-rank {per_rank}) exceeds the u8 cell"
@@ -820,36 +786,41 @@ fn decode_devices(data: &[u8], is_ddr5: bool) -> Section<u8> {
 /// - DDR4 (JESD79-4): byte `0x04` bits 3:0 -> the 10-entry
 ///   [`DENSITY4_TABLE`] (`0` = 256 ... `6` = 16384, `8` = 12288, `9` =
 ///   24576 Mbit); codes `0xA..=0xF` -> `Na(ParseError)` naming the code;
-/// - DDR5: documented model at byte `0x13`, code `0x11..=0x18` -> 1..64
-///   Gb (a result >= 64 Gb = 65536 Mbit overflows the u16 cell ->
-///   `Na(ParseError)`).
+/// - DDR5 (JESD79-5): byte `0x13` bits 3:0 -> the 12-entry density code
+///   table (`0x01` = 1 Gb ... `0x0C` = 128 Gb); codes `0x00` and
+///   `0x0D..=0x0F` -> `Na(ParseError)` naming the code. A result > 64
+///   Gb (65536 Mbit) overflows the u16 cell -> `Na(ParseError)`.
 ///
 /// An absent byte -> `Na(ParseError)`; never a panic.
 fn decode_density(data: &[u8], is_ddr5: bool) -> Section<u16> {
     if is_ddr5 {
-        let Some(code) = get(data, BYTE_DENSITY) else {
+        let Some(code_byte) = get(data, BYTE_DENSITY) else {
             return Section::na(oob(BYTE_DENSITY));
         };
-        let gb: u32 = match code {
-            0x11 => 1,
-            0x12 => 2,
-            0x13 => 4,
-            0x14 => 8,
-            0x15 => 16,
-            0x16 => 24,
-            0x17 => 32,
-            0x18 => 64,
+        let code = code_byte & 0x0F;
+        let mbit: u32 = match code {
+            0x01 => 1024,
+            0x02 => 2048,
+            0x03 => 4096,
+            0x04 => 8192,
+            0x05 => 12288,
+            0x06 => 16384,
+            0x07 => 24576,
+            0x08 => 32768,
+            0x09 => 49152,
+            0x0A => 65536,
+            0x0B => 98304,
+            0x0C => 131072,
             _ => {
                 return Section::na(NaReason::ParseError(format!(
-                    "DDR5 density code 0x{code:02X} not recognized"
+                    "DDR5 density code 0x{code:02X} (byte 0x13 bits 3:0) not recognized (JESD79-5)"
                 )))
             }
         };
-        let mbit = gb * 1024;
         return match u16::try_from(mbit) {
             Ok(v) => Section::Value(v),
             Err(_) => Section::na(NaReason::ParseError(format!(
-                "{gb} Gb = {mbit} Mbit exceeds the u16 density cell"
+                "{mbit} Mbit exceeds the u16 density cell (JESD79-5 64 Gb+)"
             ))),
         };
     }
@@ -1223,7 +1194,9 @@ fn decode_xmp3(data: &[u8]) -> Vec<SpdProfile> {
                 trcd: non_zero_u8(b[5], "XMP 3.0 tRCD"),
                 trp: non_zero_u8(b[6], "XMP 3.0 tRP"),
                 tras: non_zero_u8(b[7], "XMP 3.0 tRAS"),
-                voltage: non_zero_u16(u16::from_le_bytes([b[19], b[20]]), "XMP 3.0 voltage"),
+                // VDD: 16-bit LE value in mV at block offsets +18/+19
+                // (JESD82-51 / XMP 3.0 layout).
+                voltage: non_zero_u16(u16::from_le_bytes([b[18], b[19]]), "XMP 3.0 voltage"),
             }
         }) {
             out.push(p);
@@ -1444,27 +1417,27 @@ mod tests {
         SpdImage { index: 0x52, data }
     }
 
-    /// A full synthetic DDR5 image (1024 B): Micron module (the C8-02
-    /// re-anchor - byte `0x02` = `0x0C` is both the DDR5 type key and
-    /// the JEP106 continuation, so the maker is `0xC2`, not the former
-    /// Samsung `0x92`), 16 Gb, 6400 MT/s minimum, 1 rank x 8 devices
-    /// (8 total -> 16 GiB), one valid XMP 3.0 / EXPO block, blank rest.
+    /// A full synthetic DDR5 image (1024 B): the legacy `0x0C` type-key
+    /// classification (C8-02) with JESD79-5 decode fields - Micron die
+    /// (8-bit JEP106 `0xC2` at `0x01`), 16 Gb (JESD79-5 code `0x06`),
+    /// 6400 MT/s minimum, 1 rank (`0x80` = 0, N-1) x 8 devices (x8
+    /// width -> 64/8 = 8 total -> 16 GiB), one valid XMP 3.0 / EXPO
+    /// block (VDD at block +18/+19), blank rest.
     fn ddr5_image() -> SpdImage {
         let mut data = vec![0u8; 1024];
         data[0x00] = 0x0C; // legacy memory-type check: DDR5 (agrees with 0x02, C8-02)
-                           // Module manufacturer: Micron 0xC2 (vendor 0x02, continuation 0x0C).
-        data[0x01] = 0x02;
+                           // DRAM die maker: Micron 0xC2 (8-bit JEP106, JESD79-5).
+        data[0x01] = 0xC2;
         data[0x02] = 0x0C; // DDR5 type key (1024 B image, C8-02) + JEP106 continuation
-                           // 16 Gb density (DDR5 code 0x15).
-        data[0x13] = 0x15;
+                           // 16 Gb density (JESD79-5 code 0x06).
+        data[0x13] = 0x06;
         // Minimum data rate 6400 MT/s (64 x 100).
         data[0x20] = 0x40;
-        // Module organization (C8-03 hub model): 1 rank (0x80 bits
-        // 7:4), 8 devices per rank (0x80 bits 3:0), x8 width (0x81
-        // bits 2:0, code 1). 8 x 8 = the 64-bit bus -> consistent ->
-        // 1 x 8 = 8 total.
+        // Module organization (JESD79-5): 1 rank (`0x80` bits 3:0 = 0,
+        // N-1 encoding), x8 width (`0x81` bits 2:0, code 1).
+        // 1 x (64 / 8) = 8 total devices.
+        data[0x80] = 0x00;
         data[0x81] = 0x01;
-        data[0x80] = 0x18;
         // DDR5 part at 0x200 (32-char field, JESD79-5) + serial at 0x91.
         data[0x200..0x200 + 13].copy_from_slice(b"S5H1G8719011A");
         data[0x91..0x91 + 16].copy_from_slice(b"2208ABCDEF123456");
@@ -1475,7 +1448,7 @@ mod tests {
         data[0x302..0x305].copy_from_slice(&XMP3_SIGNATURE);
         // Profile 0 @ 0x310: index 0, validity mask 1, 4800 MT/s
         // (2400 MHz = 0x0960 LE),
-        // CL/tRCD/tRP/tRAS = 20/20/20/40, 1250 mV.
+        // CL/tRCD/tRP/tRAS = 20/20/20/40, 1250 mV (VDD at block +18/+19).
         data[0x310] = 0x00;
         data[0x311] = 0x01;
         data[0x312] = 0x60; // 2400 MHz LE low byte -> 4800 MT/s
@@ -1484,9 +1457,23 @@ mod tests {
         data[0x315] = 20;
         data[0x316] = 20;
         data[0x317] = 40;
-        data[0x323] = 0xE2; // 1250 mV little-endian (block 19/20)
-        data[0x324] = 0x04;
+        data[0x322] = 0xE2; // 1250 mV LE low byte (block offset +18)
+        data[0x323] = 0x04; // 1250 mV LE high byte (block offset +19)
         SpdImage { index: 0x53, data }
+    }
+
+    /// A synthetic JESD79-5 DDR5 image (1024 B) with the spec-defined
+    /// type key `0x11`: Samsung die (`0x92` at `0x01`), 16 Gb
+    /// (`0x13` = `0x06`), 2 ranks (`0x80` = `0x01`, N-1), x8 width
+    /// (`0x81` = `0x01`) -> 2 x (64 / 8) = 16 devices.
+    fn jesd79_5_image() -> SpdImage {
+        let mut data = vec![0u8; 1024];
+        data[0x02] = SPD_TYPE_DDR5_JESD; // JESD79-5 DDR5 type
+        data[0x01] = 0x92; // Samsung die maker (8-bit JEP106)
+        data[0x13] = 0x06; // 16 Gb (JESD79-5 code 0x06)
+        data[0x80] = 0x01; // 2 ranks (N-1 encoding: 1 = 2 ranks)
+        data[0x81] = 0x01; // x8 width
+        SpdImage { index: 0x54, data }
     }
 
     // ------------------------------------------------------------------
@@ -1537,7 +1524,8 @@ mod tests {
     /// The synthetic DDR5 image decodes to full ground truth: the part at
     /// `0x200` (C7-02) and the XMP 3.0 / EXPO profile at `0x300` (C7-03
     /// moved `XMP3_BASE` to the region's JESD79-5 home) coexist and both
-    /// decode.
+    /// decode. The fixture uses the legacy `0x0C` type-key
+    /// classification but the JESD79-5 decode fields.
     #[test]
     fn synthetic_ddr5_decodes_to_ground_truth() {
         let m = decode(&ddr5_image());
@@ -1551,12 +1539,11 @@ mod tests {
         assert_eq!(m.rank, Section::Value(1));
         assert_eq!(m.density_mbit, Section::Value(16384));
         assert_eq!(m.speed_mts, Section::Value(6400));
-        // C8-03: no die-ID bytes in this fixture -> absent die maker;
-        // the die-type label defaults to Na; the hub model (0x80 =
-        // 0x18: 1 rank / 8 per rank; 0x81 = 0x01: x8, consistent with
-        // the 64-bit bus) -> 1 x 8 = 8 total devices.
-        assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
-        assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
+        // JESD79-5: die maker from byte 0x01 (0xC2 = Micron); die type
+        // inferred as "Micron 16384 Mbit"; 1 rank x (64 / 8) = 8 total
+        // devices.
+        assert_eq!(m.die_maker, Section::Value("Micron".to_owned()));
+        assert_eq!(m.die_type, Section::Value("Micron 16384 Mbit".to_owned()));
         assert_eq!(m.devices, Section::Value(8));
         // C7-03: XMP3_BASE is 0x300, so the fixture's XMP 3.0 region
         // decodes alongside the part at 0x200 (the restored
@@ -1594,8 +1581,8 @@ mod tests {
         data[0x315] = 36;
         data[0x316] = 36;
         data[0x317] = 90;
-        data[0x323] = 0x78; // 1400 mV LE (block 19/20)
-        data[0x324] = 0x05;
+        data[0x322] = 0x78; // 1400 mV LE low byte (block offset +18)
+        data[0x323] = 0x05; // 1400 mV LE high byte (block offset +19)
         let m = decode(&SpdImage { index: 0x54, data });
         assert!(m.is_ddr5);
         assert_eq!(m.profiles.len(), 1, "profile 0 valid (6000 MT/s)");
@@ -1653,6 +1640,78 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // (k) JESD79-5 DDR5 decode correctness (CHUNK-A).
+    // ------------------------------------------------------------------
+
+    /// A JESD79-5-compliant DDR5 SPD image (byte `0x02` = `0x11`)
+    /// classifies as DDR5 and decodes: die maker from `0x01`, density
+    /// from `0x13` (JESD79-5 table), rank from `0x80` (N-1 encoding),
+    /// devices = rank x (64 / width).
+    #[test]
+    fn jesd79_5_ddr5_image_decodes_correctly() {
+        let m = decode(&jesd79_5_image());
+        assert_eq!(m.index, 0x54);
+        assert!(m.is_ddr5, "byte 0x02 = 0x11 must classify DDR5");
+        assert_eq!(m.die_maker, Section::Value("Samsung".to_owned()));
+        assert_eq!(m.density_mbit, Section::Value(16384));
+        assert_eq!(m.rank, Section::Value(2));
+        assert_eq!(m.devices, Section::Value(16));
+        assert_eq!(m.die_type, Section::Value("Samsung 16384 Mbit".to_owned()));
+    }
+
+    /// A legacy DDR5 image (byte `0x02` = `0x0C`, 1024 bytes) still
+    /// classifies as DDR5 via the fallback path and decodes with the
+    /// JESD79-5 field layout.
+    #[test]
+    fn legacy_ddr5_image_fallback_still_works() {
+        let m = decode(&ddr5_image());
+        assert!(m.is_ddr5, "0x0C + 1024 B must classify DDR5 (legacy fallback)");
+        assert_eq!(m.die_maker, Section::Value("Micron".to_owned()));
+        assert_eq!(m.density_mbit, Section::Value(16384));
+        assert_eq!(m.rank, Section::Value(1));
+        assert_eq!(m.devices, Section::Value(8));
+    }
+
+    /// The XMP 3.0 / EXPO profile voltage is read from block offsets
+    /// +18/+19 (16-bit LE mV), not +19/+20.
+    #[test]
+    fn xmp3_voltage_at_correct_offset() {
+        let mut data = vec![0u8; 1024];
+        data[0x02] = SPD_TYPE_DDR5_JESD;
+        data[0x300] = XMP3_REVISION;
+        data[0x302..0x305].copy_from_slice(&XMP3_SIGNATURE);
+        data[0x310] = 0x00;
+        data[0x311] = 0x01;
+        data[0x312] = 0xB8; // 3000 MHz LE low
+        data[0x313] = 0x0B; // 3000 MHz LE high
+        data[0x314] = 30; // CL
+        data[0x322] = 0x46; // 1350 mV LE low byte (block +18)
+        data[0x323] = 0x05; // 1350 mV LE high byte (block +19)
+        let m = decode(&SpdImage { index: 0x55, data });
+        assert_eq!(m.profiles.len(), 1);
+        assert_eq!(m.profiles[0].voltage, Section::Value(1350));
+    }
+
+    /// The die-type label is inferred from the die maker + density when
+    /// both are available; otherwise it is Na(NotApplicable).
+    #[test]
+    fn die_type_inferred_from_maker_and_density() {
+        let m = decode(&jesd79_5_image());
+        assert_eq!(m.die_type, Section::Value("Samsung 16384 Mbit".to_owned()));
+        let mut data = jesd79_5_image().data;
+        data[BYTE_DIE5_MAKER] = 0x00;
+        let m = decode(&SpdImage { index: 0x54, data });
+        assert_eq!(m.die_maker, Section::na(NaReason::NotApplicable));
+        assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
+        let m = decode(&SpdImage {
+            index: 0x54,
+            data: vec![0x00, 0x92, SPD_TYPE_DDR5_JESD],
+        });
+        assert_eq!(m.die_maker, Section::Value("Samsung".to_owned()));
+        assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
+    }
+
+    // ------------------------------------------------------------------
     // (e) LIVE: the real captured images decoded.
     // ------------------------------------------------------------------
 
@@ -1671,7 +1730,7 @@ mod tests {
         assert!(!m.is_ddr5);
         assert_eq!(m.maker, Section::Value("G.Skill".to_owned()));
         assert_eq!(m.die_maker, Section::Value("SK hynix".to_owned()));
-        assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
+        assert_eq!(m.die_type, Section::Value("SK hynix 16384 Mbit".to_owned()));
         assert_eq!(m.density_mbit, Section::Value(16384));
         assert_eq!(m.rank, Section::Value(2));
         assert_eq!(m.devices, Section::Value(16));
@@ -1818,13 +1877,15 @@ mod tests {
     }
 
     /// Sweep every prefix length of both fixture families (0..=512 and
-    /// 0..=1024) AND both real captures: `decode` never panics on any
-    /// truncation and always preserves the module index.
+    /// 0..=1024), the JESD79-5 fixture, AND both real captures:
+    /// `decode` never panics on any truncation and always preserves the
+    /// module index.
     #[test]
     fn every_prefix_length_never_panics() {
         for full in [
             ddr4_image(),
             ddr5_image(),
+            jesd79_5_image(),
             image_a_gskill(),
             image_b_pradeon(),
         ] {
@@ -2062,35 +2123,50 @@ mod tests {
         }
     }
 
-    /// Regression: the DDR5 density documented model `0x11..=0x18` is
-    /// unchanged: 1..32 Gb decode to their Mbit values and `0x18`
-    /// (64 Gb) overflows the u16 Mbit cell -> `Na(ParseError)`.
+    /// Regression: the DDR5 density JESD79-5 table (byte `0x13` bits
+    /// 3:0) decodes all 12 published codes to their Mbit values; codes
+    /// `0x00` and `0x0D..=0x0F` degrade to `Na(ParseError)` naming the
+    /// code. Codes `0x0A..=0x0C` (64/96/128 Gb) exceed the u16 cell ->
+    /// `Na(ParseError)`.
     #[test]
-    fn ddr5_density_regression_family() {
+    fn ddr5_density_jesd79_5_table() {
         for (code, mbit) in [
-            (0x11u8, 1024u16),
-            (0x12, 2048),
-            (0x13, 4096),
-            (0x14, 8192),
-            (0x15, 16384),
-            (0x16, 24576),
-            (0x17, 32768),
+            (0x01u8, 1024u16),
+            (0x02, 2048),
+            (0x03, 4096),
+            (0x04, 8192),
+            (0x05, 12288),
+            (0x06, 16384),
+            (0x07, 24576),
+            (0x08, 32768),
+            (0x09, 49152),
         ] {
             let mut data = vec![0u8; 1024];
-            data[0x00] = 0x0C; // DDR5 signature
+            data[0x02] = SPD_TYPE_DDR5_JESD;
             data[0x13] = code;
             let m = decode(&SpdImage { index: 0x51, data });
             assert_eq!(m.density_mbit, Section::Value(mbit), "DDR5 0x{code:02X}");
         }
-        // 0x18 = 64 Gb = 65536 Mbit overflows the u16 cell.
-        let mut data = vec![0u8; 1024];
-        data[0x00] = 0x0C;
-        data[0x13] = 0x18;
-        let m = decode(&SpdImage { index: 0x51, data });
-        assert!(matches!(
-            m.density_mbit,
-            Section::Na(NaReason::ParseError(_))
-        ));
+        for code in [0x0Au8, 0x0B, 0x0C] {
+            let mut data = vec![0u8; 1024];
+            data[0x02] = SPD_TYPE_DDR5_JESD;
+            data[0x13] = code;
+            let m = decode(&SpdImage { index: 0x51, data });
+            assert!(
+                matches!(m.density_mbit, Section::Na(NaReason::ParseError(_))),
+                "DDR5 0x{code:02X} must overflow the u16 cell"
+            );
+        }
+        for code in [0x00u8, 0x0D, 0x0E, 0x0F] {
+            let mut data = vec![0u8; 1024];
+            data[0x02] = SPD_TYPE_DDR5_JESD;
+            data[0x13] = code;
+            let m = decode(&SpdImage { index: 0x51, data });
+            let Section::Na(NaReason::ParseError(detail)) = &m.density_mbit else {
+                panic!("density code 0x{code:02X} must be Na(ParseError)");
+            };
+            assert!(detail.contains(&format!("0x{code:02X}")), "{detail}");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2139,33 +2215,39 @@ mod tests {
         );
     }
 
-    /// Regression: the DDR5 rank stays the `0x80` bits 7:4 hub nibble
-    /// (the documented model, unchanged); a zero rank nibble ->
-    /// `Na(ParseError)` naming `0x80`.
+    /// Regression: the DDR5 rank is `0x80` bits 3:0 + 1 (JESD79-5 N-1
+    /// encoding: 0 = 1 rank ... 7 = 8 ranks); an absent `0x80`
+    /// (truncation) -> `Na(ParseError)` naming the byte.
     #[test]
-    fn ddr5_rank_from_0x80_hub_nibble() {
-        // 0x80 = 0x38 -> rank 3.
-        let mut data = vec![0u8; 1024];
-        data[0x00] = 0x0C;
-        data[0x80] = 0x38;
-        data[0x81] = 0x01;
-        let m = decode(&SpdImage { index: 0x51, data });
-        assert_eq!(m.rank, Section::Value(3), "DDR5 0x80 = 0x38");
-        // A zero rank nibble -> Na naming 0x80.
-        let mut data = vec![0u8; 1024];
-        data[0x00] = 0x0C;
-        data[0x80] = 0x08;
-        let m = decode(&SpdImage { index: 0x51, data });
+    fn ddr5_rank_from_0x80_n_minus_1() {
+        for rank_code in 0..8u8 {
+            let mut data = vec![0u8; 1024];
+            data[0x02] = SPD_TYPE_DDR5_JESD;
+            data[0x80] = rank_code; // N-1 encoding
+            data[0x81] = 0x01; // x8 width
+            let m = decode(&SpdImage { index: 0x51, data });
+            assert_eq!(
+                m.rank,
+                Section::Value(rank_code + 1),
+                "0x80 bits 3:0 = {rank_code} -> rank {}",
+                rank_code + 1
+            );
+        }
+        let m = decode(&SpdImage {
+            index: 0x51,
+            data: vec![0x00, 0x00, SPD_TYPE_DDR5_JESD],
+        });
         assert!(
             matches!(&m.rank, Section::Na(NaReason::ParseError(d)) if d.contains("0x80")),
-            "rank 0 must name byte 0x80: {:?}",
+            "OOB 0x80 must name the byte: {:?}",
             m.rank
         );
     }
 
     /// Regression: the total device count is generation-scoped: the DDR4
-    /// arm is rank x (bus / width) from `0x0C`/`0x0D` (no hub
-    /// arithmetic); the DDR5 arm keeps the `0x80` hub model.
+    /// arm is rank x (bus / width) from `0x0C`/`0x0D`; the DDR5 arm is
+    /// rank x (64 / width) from `0x80`/`0x81` (JESD79-5, no hub
+    /// arithmetic).
     #[test]
     fn devices_total_generation_scoped() {
         // DDR4: 0x0C = 0x09 (rank 2, x8) + 0x0D = 0x03 (x64) ->
@@ -2178,8 +2260,6 @@ mod tests {
         let m = decode(&SpdImage { index: 0x50, data });
         assert_eq!(m.devices, Section::Value(16), "0x09 + 0x03 -> 2 x 8");
         assert_eq!(m.rank, Section::Value(2), "0x0C bits 5:3 + 1");
-        // DDR4: the width code set divides the bus (rank 1, non-blank
-        // 0x0C): x8 -> 8 per rank, x16 -> 4, x32 -> 2.
         for (org, width, per_rank) in [(0x01u8, 8u8, 8u8), (0x02, 16, 4), (0x03, 32, 2)] {
             let mut data = vec![0u8; 512];
             data[0x00] = 0x23;
@@ -2190,15 +2270,24 @@ mod tests {
             assert_eq!(m.devices, Section::Value(per_rank), "width {width}");
             assert_eq!(m.rank, Section::Value(1), "width {width}");
         }
-        // DDR5 hub model: 0x80 = 0x18 (rank 1 / per-rank 8) +
-        // 0x81 = 0x01 (x8; 8 x 8 = 64, consistent) -> 1 x 8 = 8 total.
+        // DDR5 JESD79-5: 0x80 = 0x00 (rank 1, N-1) + 0x81 = 0x01 (x8)
+        // -> 1 x (64 / 8) = 8 total.
         let mut data = vec![0u8; 1024];
-        data[0x00] = 0x0C;
-        data[0x80] = 0x18;
+        data[0x02] = SPD_TYPE_DDR5_JESD;
+        data[0x80] = 0x00;
         data[0x81] = 0x01;
         let m = decode(&SpdImage { index: 0x51, data });
-        assert_eq!(m.devices, Section::Value(8), "0x18 + 0x01");
-        assert_eq!(m.rank, Section::Value(1), "0x18 + 0x01");
+        assert_eq!(m.devices, Section::Value(8), "0x00 + 0x01 -> 1 x 8");
+        assert_eq!(m.rank, Section::Value(1), "0x80 = 0x00 -> rank 1");
+        // DDR5 JESD79-5: 0x80 = 0x01 (rank 2, N-1) + 0x81 = 0x00 (x4)
+        // -> 2 x (64 / 4) = 32 total.
+        let mut data = vec![0u8; 1024];
+        data[0x02] = SPD_TYPE_DDR5_JESD;
+        data[0x80] = 0x01;
+        data[0x81] = 0x00;
+        let m = decode(&SpdImage { index: 0x51, data });
+        assert_eq!(m.devices, Section::Value(32), "0x01 + 0x00 -> 2 x 16");
+        assert_eq!(m.rank, Section::Value(2), "0x80 = 0x01 -> rank 2");
     }
 
     /// Invalid DDR4 module-organization configs gate `devices` to
@@ -2269,7 +2358,7 @@ mod tests {
     /// The DRAM die maker is carried separately from the module maker:
     /// with both present, `maker` stays the module ID while `die_maker`
     /// decodes the die-ID bytes (DDR4 `0x15E`/`0x15F`), and the
-    /// die-type label stays its `Na(NotApplicable)` default.
+    /// die-type label is inferred from maker + density.
     #[test]
     fn die_maker_carried_separately_from_module_maker() {
         let mut data = ddr4_image().data; // module maker: Micron
@@ -2278,19 +2367,18 @@ mod tests {
         let m = decode(&SpdImage { index: 0x52, data });
         assert_eq!(m.maker, Section::Value("Micron".to_owned()));
         assert_eq!(m.die_maker, Section::Value("SK hynix".to_owned()));
-        assert_eq!(m.die_type, Section::na(NaReason::NotApplicable));
+        assert_eq!(m.die_type, Section::Value("SK hynix 8192 Mbit".to_owned()));
     }
 
-    /// The DDR5 die-ID bytes (`0x2E`/`0x2F`) decode the separately
+    /// The DDR5 die-ID byte (`0x01`, JESD79-5) decodes the separately
     /// carried die maker on a DDR5 module.
     #[test]
-    fn die_maker_decodes_ddr5_die_id_bytes() {
-        let mut data = ddr5_image().data; // module maker: Micron (C8-02)
-        data[0x2E] = 0x02; // Micron 0xC2 (vendor 0x02, continuation 0x0C)
-        data[0x2F] = 0x0C;
+    fn die_maker_decodes_ddr5_die_id_byte() {
+        let mut data = ddr5_image().data; // die maker: Micron (0xC2 at 0x01)
+        data[BYTE_DIE5_MAKER] = 0x89; // SK hynix (8-bit JEP106)
         let m = decode(&SpdImage { index: 0x53, data });
-        assert_eq!(m.maker, Section::Value("Micron".to_owned()));
-        assert_eq!(m.die_maker, Section::Value("Micron".to_owned()));
+        assert_eq!(m.die_maker, Section::Value("SK hynix".to_owned()));
+        assert_eq!(m.die_type, Section::Value("SK hynix 16384 Mbit".to_owned()));
     }
 
     /// A DDR4 die-ID (bank, code) pair absent from [`JEP106_BCD`]
@@ -2480,8 +2568,8 @@ mod tests {
         data[0x315] = 20;
         data[0x316] = 20;
         data[0x317] = 40;
-        data[0x323] = 0xE2; // 1250 mV little-endian (block 19/20)
-        data[0x324] = 0x04;
+        data[0x322] = 0xE2; // 1250 mV LE low byte (block offset +18)
+        data[0x323] = 0x04; // 1250 mV LE high byte (block offset +19)
         let m = decode(&SpdImage { index: 0x53, data });
         assert!(m.is_ddr5);
         assert_eq!(
