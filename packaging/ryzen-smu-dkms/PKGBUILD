@@ -73,14 +73,14 @@ conflicts=('ramsleuth' 'ramsleuth-bin')
 # this first AUR submission the source tracked the moving v2-development
 # branch (the pre-v2.4.5 integrity-gap class, closed for the siblings in
 # the v2.4.5 re-cut).
-source=("ramsleuth::git+https://github.com/MadGoatHaz/RamSleuth.git#commit=b60ffabf07952bc094d391e3d2f6e5cd997d26a8")
+source=("ramsleuth::git+https://github.com/MadGoatHaz/RamSleuth.git#commit=33857e63baa54e5d6400c74a1b50495434083805")
 # Content-addressed VCS pin: the sha256 of `git archive --format tar
 # <commit>` for the immutable #commit= ref above — exactly what makepkg
 # 7.x generates for tag/commit-pinned git sources (makepkg -g) and what
 # its integrity gate verifies (a *sums entry per source; '-' fails the
 # gate on 7.x, and SKIP passes only as a no-op — not the form 7.x
 # generates for #commit fragments).
-sha256sums=('fe4b0f89516daaa15df2dad09502d79cc05d483ca875492a00a7353b5d23b891')
+sha256sums=('556a9c4c056903929328cfc4a19075f1b7ef07b2527adcadbf37a7fefbf70329')
 
 package() {
   # 1) DKMS config (sourced by DKMS on the target; not at build time).
