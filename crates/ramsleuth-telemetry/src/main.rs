@@ -28,6 +28,7 @@ use ramsleuth_telemetry::intel_readout::{IntelChannel, IntelReadout};
 use ramsleuth_telemetry::intel_smbios::{self, SmbiosTopology};
 use ramsleuth_telemetry::spd_decode::{SpdModule, SpdProfile};
 use ramsleuth_telemetry::{collect, SystemMemoryTelemetry, VoltageTelemetry};
+use std::fmt::Write as _;
 
 /// Default SMN register range start: the UMC (Unified Memory Controller)
 /// timing + channel aperture region on AMD platforms.
@@ -193,7 +194,7 @@ pub(crate) fn parse_opts(args: &[String]) -> Result<Opts, String> {
             bad => {
                 let mut msg = bad.to_owned();
                 if let Some(sug) = suggest_for_unknown(bad) {
-                    msg.push_str(&format!("\n  {sug}"));
+                    let _ = write!(msg, "\n  {sug}");
                 }
                 return Err(msg);
             }
@@ -349,12 +350,12 @@ fn density(section: &Section<u16>) -> String {
 
 /// One `=== SECTION ===` header line.
 fn header(out: &mut String, title: &str) {
-    out.push_str(&format!("=== {title} ===\n"));
+    let _ = writeln!(out, "=== {title} ===");
 }
 
 /// One `  --- subgroup ---` header line (two-space indent).
 fn subheader(out: &mut String, title: &str) {
-    out.push_str(&format!("  --- {title} ---\n"));
+    let _ = writeln!(out, "  --- {title} ---");
 }
 
 /// One `  N/A (<reason>)` line under a section header (two-space indent).
@@ -369,10 +370,7 @@ fn na_line(out: &mut String, reason: &NaReason) {
 fn rows(out: &mut String, indent: &str, pairs: &[(&str, String)]) {
     let key_pad = pairs.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
     for (key, value) in pairs {
-        out.push_str(&format!(
-            "{indent}{key:<key_pad$}  {value}\n",
-            key_pad = key_pad
-        ));
+        let _ = writeln!(out, "{indent}{key:<key_pad$}  {value}", key_pad = key_pad);
     }
 }
 
@@ -512,7 +510,7 @@ fn vcore_display(vcore: &Section<VoltageTelemetry>) -> String {
             }
             if let Some(vid) = v.requested_vid {
                 let delta_mv = v.delta_volts.unwrap_or(v.delivered_volts - vid) * 1000.0;
-                s.push_str(&format!(" (VID: {:.3} V, Δ {:+.0} mV)", vid, delta_mv));
+                let _ = write!(s, " (VID: {:.3} V, Δ {:+.0} mV)", vid, delta_mv);
             }
             s
         }
@@ -760,7 +758,9 @@ fn json_escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }
